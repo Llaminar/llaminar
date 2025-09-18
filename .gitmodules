@@ -1,0 +1,6 @@
+[submodule "COSMA"]
+	path = COSMA
+	url = https://github.com/eth-cscs/COSMA.git
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = https://github.com/ggerganov/llama.cpp.git
