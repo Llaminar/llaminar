@@ -1,2 +1,2 @@
-# llaminar
-An LLM inferencing engine using COSMA / Open MPI for hyper-scalability and performance
+# Llaminar
+An LLM inferencing engine using COSMA / Open MPI for hyper-scalability 
