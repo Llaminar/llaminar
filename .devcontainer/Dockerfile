@@ -59,6 +59,15 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86
     rm -f cuda-keyring_1.1-1_all.deb && \
     rm -rf /var/lib/apt/lists/*
 
+# Install ROCm and AMD drivers
+RUN wget https://repo.radeon.com/amdgpu-install/7.0.1/ubuntu/jammy/amdgpu-install_7.0.1.70001-1_all.deb && \
+    apt install -y ./amdgpu-install_7.0.1.70001-1_all.deb && \
+    apt-get update && \
+    apt-get install -y python3-setuptools python3-wheel && \
+    apt-get install -y rocm && \
+    rm -f amdgpu-install_7.0.1.70001-1_all.deb && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install specific CMake version (latest stable)
 RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null && \
     echo 'deb https://apt.kitware.com/ubuntu/ jammy main' | tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
@@ -69,6 +78,7 @@ RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/nul
 # Create a non-root user
 RUN useradd -m -s /bin/bash vscode && \
     usermod -aG sudo vscode && \
+    usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # Set up workspace directory
@@ -89,6 +99,12 @@ ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+
+# Set ROCm environment variables
+ENV ROCM_HOME=/opt/rocm
+ENV PATH="${ROCM_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${ROCM_HOME}/lib:${LD_LIBRARY_PATH}"
+ENV HIP_PATH="${ROCM_HOME}"
 
 # Set PATH to include user local bin directory
 ENV PATH="/home/vscode/.local/bin:$PATH"
