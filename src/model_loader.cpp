@@ -1,5 +1,6 @@
 #include "model_loader.h"
-#include "kernel_manager.h"
+#include "graph_compute.h"
+#include "tensor.h"
 #include "logger.h"
 #include <iostream>
 #include <fstream>
@@ -199,7 +200,7 @@ bool ModelLoader::loadModel(const std::string &file_path)
     return true;
 }
 
-std::shared_ptr<Tensor> ModelLoader::loadTensor(const std::string &tensor_name)
+std::shared_ptr<llaminar::Tensor> ModelLoader::loadTensor(const std::string &tensor_name)
 {
     if (!loaded_)
     {
@@ -266,7 +267,7 @@ std::shared_ptr<Tensor> ModelLoader::loadTensor(const std::string &tensor_name)
         int_dimensions.push_back(static_cast<int>(dim));
     }
 
-    return std::make_shared<Tensor>(int_dimensions, double_data);
+    return std::make_shared<llaminar::Tensor>(int_dimensions, double_data);
 }
 
 void ModelLoader::printModelInfo() const

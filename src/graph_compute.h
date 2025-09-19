@@ -1,15 +1,18 @@
 #pragma once
 
 #include "common.h"
+#include "tensor.h" // For legacy Tensor struct
 #include <memory>
 #include <vector>
 #include <string>
 #include <functional>
 #include <unordered_map>
 
+// Bring Tensor from llaminar namespace to this scope for backward compatibility
+using llaminar::Tensor;
+
 // Forward declarations
 class ComputeNode;
-class Tensor;
 
 // Base class for all compute nodes in the graph
 class ComputeNode : public std::enable_shared_from_this<ComputeNode>
@@ -136,4 +139,146 @@ public:
 
 private:
     std::vector<double> result_;
+};
+
+// Transformer-specific compute nodes for LLM inference
+
+// RMS normalization node for neural network layers
+
+// Base class for transformer operations
+class TransformerNode : public ComputeNode
+{
+public:
+    TransformerNode(const std::string &name, const std::string &operation_type);
+
+    void setInput(std::shared_ptr<Tensor> input) { input_tensor_ = input; }
+    void setOutput(std::shared_ptr<Tensor> output) { output_tensor_ = output; }
+    std::shared_ptr<Tensor> getInputTensor() const { return input_tensor_; }
+    std::shared_ptr<Tensor> getOutputTensor() const { return output_tensor_; }
+
+protected:
+    std::shared_ptr<Tensor> input_tensor_;
+    std::shared_ptr<Tensor> output_tensor_;
+};
+
+// RMS Normalization node
+class RMSNormNode : public TransformerNode
+{
+public:
+    RMSNormNode(const std::string &name, std::shared_ptr<Tensor> weight, float eps = 1e-6f);
+
+    bool execute() override;
+    bool validate() const override;
+
+private:
+    std::shared_ptr<Tensor> weight_;
+    float eps_;
+};
+
+// Multi-head attention node
+class AttentionNode : public TransformerNode
+{
+public:
+    AttentionNode(const std::string &name,
+                  std::shared_ptr<Tensor> q_weight,
+                  std::shared_ptr<Tensor> k_weight,
+                  std::shared_ptr<Tensor> v_weight,
+                  std::shared_ptr<Tensor> out_weight,
+                  std::shared_ptr<Tensor> k_cache,
+                  std::shared_ptr<Tensor> v_cache,
+                  int n_head, int n_head_kv, int n_past);
+
+    bool execute() override;
+    bool validate() const override;
+
+    void setKVCache(std::shared_ptr<Tensor> k_cache, std::shared_ptr<Tensor> v_cache)
+    {
+        k_cache_ = k_cache;
+        v_cache_ = v_cache;
+    }
+
+private:
+    std::shared_ptr<Tensor> q_weight_;
+    std::shared_ptr<Tensor> k_weight_;
+    std::shared_ptr<Tensor> v_weight_;
+    std::shared_ptr<Tensor> out_weight_;
+    std::shared_ptr<Tensor> k_cache_, v_cache_;
+
+    int n_head_, n_head_kv_, n_past_;
+    int kv_seq_len_ = 0; // Current KV cache length
+};
+
+// MLP (Feed Forward) node
+class MLPNode : public TransformerNode
+{
+public:
+    MLPNode(const std::string &name,
+            std::shared_ptr<Tensor> gate_weight,
+            std::shared_ptr<Tensor> up_weight,
+            std::shared_ptr<Tensor> down_weight);
+
+    bool execute() override;
+    bool validate() const override;
+
+private:
+    std::shared_ptr<Tensor> gate_weight_;
+    std::shared_ptr<Tensor> up_weight_;
+    std::shared_ptr<Tensor> down_weight_;
+};
+
+// Complete transformer block node
+class TransformerBlockNode : public TransformerNode
+{
+public:
+    TransformerBlockNode(const std::string &name, int layer_idx,
+                         std::shared_ptr<RMSNormNode> attn_norm,
+                         std::shared_ptr<AttentionNode> attention,
+                         std::shared_ptr<RMSNormNode> ffn_norm,
+                         std::shared_ptr<MLPNode> mlp);
+
+    bool execute() override;
+    bool validate() const override;
+
+private:
+    int layer_idx_;
+    std::shared_ptr<RMSNormNode> attn_norm_;
+    std::shared_ptr<AttentionNode> attention_;
+    std::shared_ptr<RMSNormNode> ffn_norm_;
+    std::shared_ptr<MLPNode> mlp_;
+
+    // Temporary tensors for residual connections
+    std::shared_ptr<Tensor> attn_residual_;
+    std::shared_ptr<Tensor> ffn_residual_;
+};
+
+// Embedding lookup node
+class EmbeddingNode : public TransformerNode
+{
+public:
+    EmbeddingNode(const std::string &name, std::shared_ptr<Tensor> embedding_weights);
+
+    bool execute() override;
+    bool validate() const override;
+
+    void setTokenIds(const std::vector<int> &token_ids) { token_ids_ = token_ids; }
+
+private:
+    std::shared_ptr<Tensor> embedding_weights_;
+    std::vector<int> token_ids_;
+};
+
+// Linear projection node (matrix multiplication + optional bias)
+class LinearNode : public TransformerNode
+{
+public:
+    LinearNode(const std::string &name,
+               std::shared_ptr<Tensor> weight,
+               std::shared_ptr<Tensor> bias = nullptr);
+
+    bool execute() override;
+    bool validate() const override;
+
+private:
+    std::shared_ptr<Tensor> weight_;
+    std::shared_ptr<Tensor> bias_;
 };

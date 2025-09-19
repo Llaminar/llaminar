@@ -1,4 +1,6 @@
 #include "repacker.h"
+#include "graph_compute.h"
+#include "tensor.h"
 #include <iostream>
 #include <algorithm>
 #include <numeric>
@@ -10,18 +12,20 @@ COSMATensor::COSMATensor(const std::vector<int> &shape, const std::vector<double
                          const std::string &name)
     : shape_(shape), data_(data), name_(name), distributed_(false), optimized_(false) {}
 
-std::shared_ptr<Tensor> COSMATensor::toTensor() const
+std::shared_ptr<llaminar::Tensor> COSMATensor::toTensor() const
 {
-    return std::make_shared<Tensor>(shape_, data_);
+    return std::make_shared<llaminar::Tensor>(shape_, data_);
 }
 
-std::shared_ptr<COSMATensor> COSMATensor::fromTensor(const std::shared_ptr<Tensor> &tensor,
+std::shared_ptr<COSMATensor> COSMATensor::fromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
                                                      const std::string &name)
 {
     if (!tensor)
         return nullptr;
 
-    return std::make_shared<COSMATensor>(tensor->getShape(), tensor->getData(), name);
+    // Convert float data to double for COSMA
+    std::vector<double> double_data(tensor->data.begin(), tensor->data.end());
+    return std::make_shared<COSMATensor>(tensor->shape, double_data, name);
 }
 
 void COSMATensor::optimizeForCOSMA()
@@ -132,7 +136,7 @@ std::shared_ptr<COSMATensor> TensorRepacker::repackFromGGUF(const GGUFTensorInfo
     return cosma_tensor;
 }
 
-std::shared_ptr<COSMATensor> TensorRepacker::repackFromTensor(const std::shared_ptr<Tensor> &tensor,
+std::shared_ptr<COSMATensor> TensorRepacker::repackFromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
                                                               const std::string &name)
 {
     if (!tensor)

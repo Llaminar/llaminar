@@ -10,6 +10,8 @@
                 "${workspaceFolder}/build",
                 "-S",
                 "${workspaceFolder}",
+                "-G",
+                "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Debug",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
             ],
@@ -89,14 +91,14 @@
             "detail": "Clean and rebuild the CMake project"
         },
         {
-            "label": "cmake: build llama.cpp",
+            "label": "cmake: build core",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
                 "${workspaceFolder}/build",
                 "--target",
-                "llama",
+                "llaminar_core",
                 "--parallel"
             ],
             "group": "build",
@@ -110,7 +112,7 @@
             },
             "problemMatcher": [],
             "dependsOn": "cmake: configure",
-            "detail": "Build only the llama.cpp library"
+            "detail": "Build only the llaminar core library"
         },
         {
             "label": "cmake: build COSMA",
@@ -137,14 +139,14 @@
             "detail": "Build only the COSMA library"
         },
         {
-            "label": "cmake: build Llaminar",
+            "label": "cmake: build main",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
                 "${workspaceFolder}/build",
                 "--target",
-                "Llaminar",
+                "llaminar",
                 "--parallel"
             ],
             "group": "build",
@@ -158,7 +160,7 @@
             },
             "problemMatcher": [],
             "dependsOn": "cmake: configure",
-            "detail": "Build only the Llaminar executable"
+            "detail": "Build only the llaminar executable"
         },
         {
             "label": "cmake: configure Release",
@@ -169,6 +171,8 @@
                 "${workspaceFolder}/build",
                 "-S",
                 "${workspaceFolder}",
+                "-G",
+                "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Release",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DCOSMA_WITH_PROFILING=OFF",
@@ -232,7 +236,7 @@
                 "clear": false
             },
             "dependsOn": "cmake: build",
-            "detail": "Run all CTest tests with parallel execution"
+            "detail": "Run all CTest tests with parallel execution (Note: Some tests currently fail due to numerical precision and validation issues)"
         },
         {
             "label": "test: run ctest verbose",
@@ -256,6 +260,49 @@
             },
             "dependsOn": "cmake: build",
             "detail": "Run all CTest tests with verbose output"
+        },
+        {
+            "label": "test: run passing tests only",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "-R",
+                "^(BasicTest|NumaTest|GraphTest|LinearKernelTest)$"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run only the tests that are currently passing"
+        },
+        {
+            "label": "test: show test status",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo '=== TEST STATUS SUMMARY ===' && cd ${workspaceFolder} && ctest --test-dir build --output-on-failure --parallel | tail -20"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Show summary of test pass/fail status"
         },
         {
             "label": "mpi: run (2 processes)",
@@ -299,9 +346,6 @@
             },
             "problemMatcher": [],
             "detail": "Run the MPI functionality tests via CTest"
-        }
-    ],
-    "inputs": [
         },
         {
             "label": "mpi: run (4 processes)",
@@ -325,13 +369,13 @@
             "detail": "Run MPI application with 4 processes"
         },
         {
-            "label": "mpi: run Llaminar (2 processes)",
+            "label": "mpi: run llaminar (2 processes)",
             "type": "shell",
             "command": "mpirun",
             "args": [
                 "-np",
                 "2",
-                "${workspaceFolder}/build/Llaminar"
+                "${workspaceFolder}/build/llaminar"
             ],
             "group": "test",
             "presentation": {
@@ -342,8 +386,8 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build Llaminar",
-            "detail": "Run Llaminar with 2 MPI processes"
+            "dependsOn": "cmake: build main",
+            "detail": "Run llaminar with 2 MPI processes"
         }
     ],
     "inputs": [

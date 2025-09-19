@@ -9,9 +9,9 @@
 #include "argument_parser.h"
 #include "logger.h"
 #include "topology_manager.h"
-#include "kernel_manager.h"
-#include "model_loader.h"
 #include "graph_compute.h"
+#include "model_loader.h"
+// Note: inference_engine.h removed until llama.cpp dependency is resolved
 
 using namespace llaminar;
 
@@ -75,10 +75,76 @@ int main(int argc, char *argv[])
             topology_manager.printSystemTopology(topology);
         }
 
-        // 4. Initialize kernel manager and register kernels
-        KernelManager &kernel_manager = KernelManager::getInstance();
+        LOG_DEBUG("System initialization complete");
 
-        LOG_DEBUG("Kernel manager initialized");
+        // 4. Handle COSMA testing vs benchmark mode
+        if (params.inference_mode || !params.model_file.empty())
+        {
+            // COSMA testing mode (inference engine temporarily disabled)
+            LOG_INFO("Running COSMA testing mode");
+            LOG_INFO("Note: Full inference mode is temporarily disabled while removing llama.cpp dependency");
+            LOG_INFO("Use 'mpirun -np 2 ./build/tests/test_cosma' to test COSMA kernels");
+
+            if (rank == 0)
+            {
+                std::cout << "\n=== COSMA MatMul Kernel Available ===" << std::endl;
+                std::cout << "The refactored MatMulKernel is ready for use:" << std::endl;
+                std::cout << "- Uses high-performance COSMA library" << std::endl;
+                std::cout << "- Works with new Tensor architecture" << std::endl;
+                std::cout << "- No kernel manager registration needed" << std::endl;
+                std::cout << "- Compatible with other kernels (RMSNorm, Linear, etc.)" << std::endl;
+                std::cout << "======================================" << std::endl;
+            }
+        }
+        else
+        {
+            // COSMA benchmark mode
+            LOG_INFO("Running COSMA benchmark mode");
+
+            // Create compute graph for benchmarking
+            ComputeGraph graph;
+            auto node = std::make_shared<MatMulNode>(
+                "cosma_benchmark",
+                params.m, params.n, params.k);
+            graph.addNode(node);
+
+            // Execute benchmark
+            LOG_INFO("Executing compute graph...");
+            auto start_time = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < params.num_repeat; ++i)
+            {
+                bool success = graph.execute();
+                if (!success)
+                {
+                    LOG_ERROR("Compute graph execution failed on iteration " << i);
+                    MPI_Finalize();
+                    return 1;
+                }
+
+                LOG_DEBUG("Completed iteration " << (i + 1) << "/" << params.num_repeat);
+            }
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration<double, std::milli>(end_time - start_time);
+
+            // Report performance results
+            LOG_INFO("=== Performance Results ===");
+            LOG_INFO("Total execution time: " << duration.count() << " ms");
+            LOG_INFO("Average time per iteration: " << duration.count() / params.num_repeat << " ms");
+
+            // Calculate GFLOPS (2*m*n*k operations per matrix multiply)
+            double total_ops = 2.0 * params.m * params.n * params.k * params.num_repeat;
+            double gflops = total_ops / (duration.count() / 1000.0) / 1e9;
+
+            if (rank == 0)
+            {
+                LOG_INFO("Matrix dimensions: " << params.m << "x" << params.n << "x" << params.k);
+                LOG_INFO("Total operations: " << total_ops / 1e9 << " GFLOP");
+                LOG_INFO("Achieved performance: " << gflops << " GFLOPS");
+                LOG_INFO("Performance per MPI rank: " << gflops / size << " GFLOPS");
+            }
+        }
 
         // 5. Load model if specified
         std::unique_ptr<ModelLoader> model_loader;

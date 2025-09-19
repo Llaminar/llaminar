@@ -1,12 +1,9 @@
 #pragma once
 
 #include "common.h"
-#include "model_loader.h"
-#include "tensor.h"
-#include <memory>
+#include "model_loader.h"    std::shared_ptr<COSMATensor> repackFromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
+                                                  const std::string &name = \"\");include <memory>
 #include <vector>
-#include <string>
-#include <cstdint>
 
 // Forward declarations
 struct GGUFModel;
@@ -53,84 +50,59 @@ private:
 class TensorRepacker
 {
 public:
-    TensorRepacker(); // Constructor is defined (not defaulted)
+    TensorRepacker();
     ~TensorRepacker() = default;
 
     // Main repacking interface
     std::shared_ptr<COSMATensor> repackFromGGUF(const GGUFTensorInfo &tensor_info,
                                                 const std::vector<uint8_t> &raw_data);
 
-    std::shared_ptr<COSMATensor> repackFromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
+    std::shared_ptr<COSMATensor> repackFromTensor(const std::shared_ptr<Tensor> &tensor,
                                                   const std::string &name = "");
 
     // Batch operations
     std::vector<std::shared_ptr<COSMATensor>> repackModel(const GGUFModel &model,
                                                           ModelLoader &loader);
 
-    // Performance optimization
-    void setOptimizationLevel(int level) { optimization_level_ = level; }
-    int getOptimizationLevel() const { return optimization_level_; }
+    // Configuration
+    void setOptimizeMemoryLayout(bool optimize) { optimize_memory_layout_ = optimize; }
+    void setPreferredDataType(const std::string &data_type) { preferred_data_type_ = data_type; }
+    void setDistributionStrategy(const std::string &strategy) { distribution_strategy_ = strategy; }
 
-    // Memory management
-    void setMemoryLimit(size_t limit_bytes) { memory_limit_ = limit_bytes; }
-    size_t getMemoryLimit() const { return memory_limit_; }
-
-    // Debugging and profiling - note: function name matches implementation
+    // Information
     void printReppackingInfo() const;
-    void resetStats();
+    size_t getTotalMemoryUsage() const { return total_memory_usage_; }
+    size_t getProcessedTensorCount() const { return processed_tensor_count_; }
 
 private:
-    // Configuration
-    int optimization_level_ = 1;
-    size_t memory_limit_ = 0;            // 0 means no limit
-    bool optimize_memory_layout_ = true; // Member variable used in implementation
+    bool optimize_memory_layout_;
+    std::string preferred_data_type_;
+    std::string distribution_strategy_;
+    size_t total_memory_usage_;
+    size_t processed_tensor_count_;
 
-    // Statistics
-    mutable size_t total_tensors_repacked_ = 0;
-    mutable size_t total_bytes_processed_ = 0;
-    mutable double total_time_spent_ = 0.0;
-    mutable size_t processed_tensor_count_ = 0;
-    mutable size_t total_memory_usage_ = 0;
-
-    // Configuration for distribution and data types
-    std::string preferred_data_type_ = "float32";
-    std::string distribution_strategy_ = "auto";
-
-    // Helper methods that exist in the implementation
-    bool shouldDistribute(const std::vector<int> &shape) const;
-    void optimizeMemoryLayout(COSMATensor &tensor) const;
-    std::vector<double> convertToDouble(const std::vector<uint8_t> &raw_data,
-                                        uint32_t gguf_type) const;
-
-    // Quantization methods
+    // Dequantization functions
     std::vector<double> dequantizeQ8_0(const uint8_t *data, size_t n_elements);
     std::vector<double> dequantizeQ4_0(const uint8_t *data, size_t n_elements);
     std::vector<double> dequantizeF16(const uint8_t *data, size_t n_elements);
     std::vector<double> convertF32ToDouble(const uint8_t *data, size_t n_elements);
 
-    // Layout optimization methods
+    // Memory layout optimization
     void optimizeRowMajorLayout(std::vector<double> &data, const std::vector<int> &shape);
     void optimizeColumnMajorLayout(std::vector<double> &data, const std::vector<int> &shape);
+    void optimizeBlockLayout(std::vector<double> &data, const std::vector<int> &shape);
 
-    // Distribution strategy methods
+    // Distribution strategies
     void applyDistributionStrategy(COSMATensor &tensor);
     void distributeByRows(COSMATensor &tensor);
     void distributeByColumns(COSMATensor &tensor);
     void distributeByBlocks(COSMATensor &tensor);
 
-    // Utility methods
+    // Helper functions
     size_t calculateMemoryUsage(const std::vector<int> &shape) const;
+    bool validateTensorShape(const std::vector<int> &shape) const;
+    std::string getOptimalLayoutForShape(const std::vector<int> &shape) const;
+
+    // Statistics
     void updateStatistics(const COSMATensor &tensor);
 };
-
-namespace TensorConversion
-{
-    // Utility functions for tensor conversion
-    std::shared_ptr<COSMATensor> convert(const std::shared_ptr<llaminar::Tensor> &tensor,
-                                         const std::string &name = "");
-    std::shared_ptr<llaminar::Tensor> convert(const std::shared_ptr<COSMATensor> &cosma_tensor);
-
-    // Type conversion utilities
-    std::vector<double> floatToDouble(const std::vector<float> &float_data);
-    std::vector<float> doubleToFloat(const std::vector<double> &double_data);
-}

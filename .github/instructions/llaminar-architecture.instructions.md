@@ -4,16 +4,17 @@
 
 ## Overview
 
-Llaminar is a high-performance, distributed LLM inference engine built on a modular object-oriented architecture. It combines COSMA's high-performance matrix multiplication with GGUF model support, MPI distributed computing, and comprehensive system topology detection to create a scalable inference platform.
+Llaminar is a high-performance, distributed LLM inference engine built on a modular object-oriented architecture. It features a **hybrid tensor system** that provides zero-copy COSMA optimization while maintaining full backward compatibility. The engine combines COSMA's high-performance matrix multiplication with GGUF model support, MPI distributed computing, and comprehensive system topology detection to create a scalable inference platform.
 
 ## Core Design Principles
 
 1. **Modular Architecture**: Each component has a single responsibility and clear interfaces
-2. **Distributed Computing**: Built-in MPI support for multi-node inference
-3. **High Performance**: COSMA integration for optimized matrix operations
-4. **System Awareness**: Comprehensive CPU, NUMA, and GPU topology detection
-5. **Extensibility**: Plugin-based kernel registration system
-6. **Observability**: Multi-level logging and performance profiling
+2. **Hybrid Tensor System**: Zero-copy COSMA optimization with backward compatibility
+3. **Distributed Computing**: Built-in MPI support for multi-node inference
+4. **High Performance**: COSMA integration for optimized matrix operations
+5. **System Awareness**: Comprehensive CPU, NUMA, and GPU topology detection
+6. **Extensibility**: Plugin-based kernel registration system
+7. **Observability**: Multi-level logging and performance profiling
 
 ## Architecture Components
 
@@ -115,42 +116,83 @@ Node 0: 56 CPUs, 376 GB memory
 Node 1: 56 CPUs, 377 GB memory
 ```
 
-### 5. Kernel Management System
+### 6. Hybrid Tensor Architecture
 
-**Files**: `src/kernel_manager.h/cpp`
-- **Pattern**: Singleton with factory registration
-- **Class**: `KernelManager`
-- **Features**:
-  - Automatic kernel discovery and registration
-  - Runtime kernel selection and execution
-  - Performance profiling and optimization
-  - Plugin-based extensibility
+**Files**: `src/tensors/tensor_base.h`, `src/tensors/tensor_factory.cpp`, `src/tensor.h`
+- **Classes**: `TensorBase`, `SimpleTensor`, `COSMATensor`, `TensorFactory`
+- **Pattern**: Abstract interface with concrete implementations
+- **Purpose**: Zero-copy COSMA optimization with legacy compatibility
 
-**Kernel Interface**:
+**Key Components**:
+
+#### TensorBase Abstract Interface
 ```cpp
-class BaseKernel {
+class TensorBase {
 public:
-    virtual std::string getName() const = 0;
-    virtual bool execute() = 0;
-    virtual ~BaseKernel() = default;
+    virtual const std::vector<int>& shape() const = 0;
+    virtual float* data() = 0;
+    virtual const float* data() const = 0;
+    virtual std::string type_name() const = 0;
+    virtual bool is_distributed() const = 0;
 };
 ```
 
-**Registration System**:
-- Kernels self-register using static initialization
-- Factory pattern for kernel instantiation
-- Support for parameterized kernel creation
+#### SimpleTensor (Legacy Compatibility)
+- **Purpose**: Zero-copy wrapper around existing `Tensor` struct
+- **Data Storage**: Standard `std::vector<float>`
+- **Use Cases**: Small matrices, single-process operations, legacy code
+- **Performance**: No overhead compared to original Tensor
+
+#### COSMATensor (COSMA Optimization)
+- **Purpose**: Direct integration with `cosma::CosmaMatrix<float>`
+- **Data Storage**: COSMA-optimized distributed layout
+- **Use Cases**: Large matrices (≥256×256), multi-process operations
+- **Performance**: Zero-copy access to COSMA operations
+
+#### TensorFactory (Smart Selection)
+- **Auto-Selection Logic**:
+  - **Matrix Size**: COSMATensor for matrices ≥256×256 elements
+  - **MPI Context**: COSMATensor when multiple processes available
+  - **Operation Type**: COSMATensor preferred for matmul/attention
+  - **Fallback**: SimpleTensor for compatibility
+
+**Usage Examples**:
+```cpp
+// Automatic tensor selection
+auto tensor = TensorFactory::create_auto({1024, 1024});
+// → COSMATensor in MPI environment
+
+// Explicit type creation
+auto simple = TensorFactory::create_simple({512, 512});
+auto cosma = TensorFactory::create_cosma({2048, 2048}, "matmul_A", mpi_rank);
+
+// Legacy compatibility
+std::shared_ptr<Tensor> legacy = std::make_shared<Tensor>({256, 256});
+auto upgraded = TensorFactory::from_tensor(legacy);
+```
+
+**Performance Benefits**:
+- **Zero-Copy COSMA**: Direct `cosma::multiply()` calls without data copying
+- **Automatic Optimization**: Large matrices automatically use COSMA layout
+- **Legacy Compatibility**: No performance penalty for existing code
+- **Smart Conversion**: Only copies data when necessary
 
 ### 6. Compute Graph Engine
 
-**Files**: `src/graph_compute.h/cpp`
+**Files**: `src/graph_compute.h/cpp`, `src/tensor.h`
 - **Classes**: `ComputeNode`, `MatMulNode`, `ComputeGraph`
 - **Pattern**: Composite pattern with execution engine
 - **Features**:
   - Node-based computation representation
+  - **Tensor Integration**: Uses legacy `llaminar::Tensor` with hybrid bridge
   - Dependency tracking and scheduling
   - Operator overloading for graph construction
   - Performance measurement per node
+
+**Hybrid Tensor Bridge**:
+- `GraphTensorBridge::optimize_for_kernel()`: Converts legacy Tensor to optimal TensorBase
+- `GraphTensorBridge::auto_upgrade()`: Zero-copy promotion for large matrices
+- Seamless integration between graph system and optimized kernels
 
 **Node Hierarchy**:
 ```cpp
@@ -169,20 +211,34 @@ graph.execute();
 
 ### 7. Matrix Operations
 
-**Files**: `src/kernels/mul_mat.h/cpp`
+**Files**: `src/kernels/MatMulKernel.h/cpp`
 - **Class**: `MatMulKernel`
-- **Integration**: COSMA library wrapper
+- **Integration**: Hybrid tensor system with COSMA optimization
 - **Features**:
+  - **Zero-Copy COSMA Path**: Direct operations on COSMATensor inputs
+  - **Legacy Compatibility**: Automatic tensor conversion for SimpleTensor
   - High-performance distributed matrix multiplication
   - Automatic COSMA configuration
   - MPI-aware execution
   - Performance monitoring
 
-**COSMA Integration**:
-- Leverages COSMA's optimized PDGEMM implementation
-- Automatic memory layout optimization
-- Distributed execution across MPI ranks
-- ScaLAPACK compatibility layer
+**Hybrid Execution Paths**:
+```cpp
+// Zero-copy COSMA execution (optimal)
+if (canUseZeroCopyCOSMA(inputs, outputs)) {
+    auto cosma_A = std::dynamic_pointer_cast<COSMATensor>(A);
+    success = executeCOSMANative(cosma_A->cosma_matrix(), ...);
+} else {
+    // Legacy path with data copying
+    success = executeCOSMA(*A, *B, *C);
+}
+```
+
+**Performance Optimization**:
+- **Zero-Copy Operations**: COSMATensor → `cosma::multiply()` with no data copying
+- **Automatic Detection**: `canUseZeroCopyCOSMA()` checks for optimal execution path
+- **Fallback Support**: Legacy path maintains compatibility with existing code
+- **COSMA Integration**: Leverages COSMA's optimized PDGEMM implementation
 
 ### 8. Model Loading System
 
@@ -192,6 +248,7 @@ graph.execute();
 - **Features**:
   - GGUF file parsing and validation
   - Metadata extraction (architecture, parameters)
+  - **Hybrid Tensor Creation**: Automatic selection of optimal tensor types
   - Tensor loading with format conversion
   - Quantization support (Q8_0 implemented)
 
@@ -200,15 +257,17 @@ graph.execute();
 - **Quantization**: Q8_0, F16, F32 (extensible)
 - **Metadata**: Model parameters, tokenizer info, training details
 - **Validation**: Magic number verification, version compatibility
+- **Tensor Optimization**: Large weight matrices automatically use COSMATensor
 
 ### 9. Data Format Conversion
 
 **Files**: `src/repacker.h/cpp`
 - **Class**: `Repacker`
-- **Purpose**: Convert between GGUF and COSMA tensor formats
+- **Purpose**: Convert between GGUF and hybrid tensor formats
 - **Features**:
   - Memory layout transformation
   - Type conversion (F16 ↔ F32, quantized formats)
+  - **Tensor Type Selection**: Automatic SimpleTensor vs COSMATensor choice
   - Efficient memory management
   - Distributed data placement
 
@@ -257,8 +316,11 @@ test_*          # Unit test executables
 - **Thread Parallel**: OpenMP integration for shared-memory scaling
 
 ### Memory Management
-- **Distributed Tensors**: Automatic sharding across MPI ranks
+- **Hybrid Tensor System**: Zero-copy optimization with backward compatibility
+- **Distributed Tensors**: Automatic sharding across MPI ranks (COSMATensor)
 - **Format Optimization**: COSMA layout for optimal cache utilization
+- **Legacy Compatibility**: SimpleTensor maintains existing memory patterns
+- **Smart Allocation**: TensorFactory selects optimal memory layout
 - **Quantization**: Reduced precision for memory efficiency
 
 ### Compute Optimization
@@ -321,11 +383,11 @@ CUDA_VISIBLE_DEVICES  # GPU device selection
 ## Future Architecture Enhancements
 
 ### Planned Components
-1. **Attention Kernels**: Multi-head attention implementation
-2. **Transformer Blocks**: Complete layer implementations
-3. **Memory Manager**: Advanced tensor memory management
+1. **Attention Kernels**: Multi-head attention with hybrid tensor optimization
+2. **Transformer Blocks**: Complete layer implementations using TensorBase interface
+3. **Advanced Tensor Operations**: Extend hybrid system to all kernel types
 4. **Communication Layer**: Optimized MPI communication patterns
-5. **Inference Engine**: Complete LLM inference pipeline
+5. **Inference Engine**: Complete LLM inference pipeline with zero-copy optimization
 6. **Model Zoo**: Pre-trained model repository integration
 
 ### Performance Optimizations

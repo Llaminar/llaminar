@@ -17,6 +17,14 @@ struct LlaminarParams
     // LLM inference parameters
     std::string model_file = "";         // -m, --model
     LogLevel log_level = LogLevel::INFO; // -v, -vv, -vvv
+    bool inference_mode = false;         // --inference, -i
+    std::string prompt = "";             // -p, --prompt
+    int32_t n_ctx = 2048;                // --ctx-size
+    int32_t n_predict = 128;             // --predict
+    float temperature = 0.7f;            // --temperature
+    int32_t top_k = 40;                  // --top-k
+    float top_p = 0.9f;                  // --top-p
+    bool interactive = false;            // --interactive
 
     // System configuration
     bool use_hyperthreading = false;

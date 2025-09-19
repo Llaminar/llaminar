@@ -1,11 +1,11 @@
 {
-    "cmake.configureOnOpen": true,
+    "cmake.configureOnOpen": false,
     "cmake.buildBeforeRun": true,
     "cmake.clearOutputBeforeBuild": true,
-    "cmake.generator": "Ninja",
+    "cmake.generator": "Unix Makefiles",
     "cmake.preferredGenerators": [
-        "Ninja",
-        "Unix Makefiles"
+        "Unix Makefiles",
+        "Ninja"
     ],
     "cmake.buildDirectory": "${workspaceFolder}/build",
     "cmake.installPrefix": "${workspaceFolder}/install",
@@ -36,7 +36,24 @@
         "*.cxx": "cpp",
         "CMakeLists.txt": "cmake",
         "*.cmake": "cmake",
-        "*.md": "markdown"
+        "*.md": "markdown",
+        "any": "cpp",
+        "array": "cpp",
+        "charconv": "cpp",
+        "chrono": "cpp",
+        "compare": "cpp",
+        "functional": "cpp",
+        "ratio": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp",
+        "utility": "cpp",
+        "variant": "cpp",
+        "bitset": "cpp",
+        "string_view": "cpp",
+        "initializer_list": "cpp",
+        "ranges": "cpp",
+        "regex": "cpp",
+        "valarray": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,
@@ -80,5 +97,6 @@
     },
     "git.autofetch": true,
     "git.confirmSync": false,
-    "extensions.ignoreRecommendations": false
+    "extensions.ignoreRecommendations": false,
+    "chat.tools.global.autoApprove": true
 }

@@ -92,6 +92,47 @@ bool ArgumentParser::parse(LlaminarParams &params)
         {
             params.use_cosma = false;
         }
+        // Inference parameters
+        else if (arg == "--inference" || arg == "-i")
+        {
+            params.inference_mode = true;
+        }
+        else if ((arg == "--prompt" || arg == "-p") && i + 1 < argc_)
+        {
+            params.prompt = argv_[i + 1];
+            params.inference_mode = true; // Auto-enable inference mode
+            i++;
+        }
+        else if (arg == "--ctx-size" && i + 1 < argc_)
+        {
+            params.n_ctx = std::stoi(argv_[i + 1]);
+            i++;
+        }
+        else if (arg == "--predict" && i + 1 < argc_)
+        {
+            params.n_predict = std::stoi(argv_[i + 1]);
+            i++;
+        }
+        else if (arg == "--temperature" && i + 1 < argc_)
+        {
+            params.temperature = std::stof(argv_[i + 1]);
+            i++;
+        }
+        else if (arg == "--top-k" && i + 1 < argc_)
+        {
+            params.top_k = std::stoi(argv_[i + 1]);
+            i++;
+        }
+        else if (arg == "--top-p" && i + 1 < argc_)
+        {
+            params.top_p = std::stof(argv_[i + 1]);
+            i++;
+        }
+        else if (arg == "--interactive")
+        {
+            params.interactive = true;
+            params.inference_mode = true; // Auto-enable inference mode
+        }
         // Performance options
         else if (arg == "--profile")
         {
@@ -155,6 +196,15 @@ void ArgumentParser::printUsage() const
     std::cout << "  --verbose                Same as -v" << std::endl;
     std::cout << "  --debug                  Same as -vv" << std::endl;
     std::cout << "  --trace                  Same as -vvv" << std::endl;
+    std::cout << "\nInference Mode:" << std::endl;
+    std::cout << "  -i, --inference          Enable inference mode" << std::endl;
+    std::cout << "  -p, --prompt <text>      Text prompt to process" << std::endl;
+    std::cout << "  --interactive            Interactive chat mode" << std::endl;
+    std::cout << "  --ctx-size <size>        Context window size (default: 2048)" << std::endl;
+    std::cout << "  --predict <tokens>       Max tokens to generate (default: 128)" << std::endl;
+    std::cout << "  --temperature <float>    Sampling temperature (default: 0.7)" << std::endl;
+    std::cout << "  --top-k <int>            Top-K sampling (default: 40)" << std::endl;
+    std::cout << "  --top-p <float>          Top-P sampling (default: 0.9)" << std::endl;
     std::cout << "\nSystem Configuration:" << std::endl;
     std::cout << "  --enable-hyperthreading  Use hyperthreaded cores (default: physical cores only)" << std::endl;
     std::cout << "  --ht                     Short form of --enable-hyperthreading" << std::endl;

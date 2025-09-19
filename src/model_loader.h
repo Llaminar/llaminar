@@ -1,14 +1,12 @@
 #pragma once
 
 #include "common.h"
+#include "tensor.h"
 #include <string>
 #include <vector>
 #include <memory>
 #include <unordered_map>
 #include <fstream>
-
-// Forward declarations
-class Tensor;
 
 // GGUF metadata value types
 enum class GGUFValueType : uint32_t
@@ -119,8 +117,8 @@ public:
     const GGUFModel &getModel() const { return model_; }
 
     // Tensor loading
-    std::shared_ptr<Tensor> loadTensor(const std::string &tensor_name);
-    std::vector<std::shared_ptr<Tensor>> loadAllTensors();
+    std::shared_ptr<llaminar::Tensor> loadTensor(const std::string &tensor_name);
+    std::vector<std::shared_ptr<llaminar::Tensor>> loadAllTensors();
 
     // Model information
     void printModelInfo() const;
