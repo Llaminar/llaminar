@@ -155,6 +155,10 @@ namespace llaminar
             std::atomic<long long> peak_resident_bytes{0};
             std::atomic<long long> allocations_tracked{0};
             std::atomic<long long> allocations_denied{0};
+            // Phase 1b minor: preflight projection counters
+            std::atomic<long long> preflight_invocations{0};
+            std::atomic<long long> preflight_denied{0};
+            std::atomic<long long> preflight_estimated_bytes_last{0};
         } stats_;
         const PrefillStats &stats() const { return stats_; }
         const StrategyCache::Stats &strategy_stats() const { return strategy_cache_.stats; }
@@ -195,6 +199,7 @@ namespace llaminar
                                         int m, int k, int n);
         bool should_log(int lvl) const { return lvl <= log_level_; }
         bool memory_budget_allows(size_t bytes_needed) const;
+        bool preflight_allows(int seq_len, int d_model, int d_ff, int n_proj = 3) const; // attention: Q,K,V by default
     };
 
 } // namespace llaminar

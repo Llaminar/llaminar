@@ -2570,7 +2570,10 @@ namespace llaminar
         q("current_resident_bytes", stats_.current_resident_bytes.load());
         q("peak_resident_bytes", stats_.peak_resident_bytes.load());
         q("allocations_tracked", stats_.allocations_tracked.load());
-        q("allocations_denied", stats_.allocations_denied.load(), false);
+    q("allocations_denied", stats_.allocations_denied.load());
+    q("preflight_invocations", stats_.preflight_invocations.load());
+    q("preflight_denied", stats_.preflight_denied.load());
+    q("preflight_estimated_bytes_last", stats_.preflight_estimated_bytes_last.load(), false);
         ofs << "}\n";
         if (should_log(3))
             LOG_DEBUG("[CosmaPrefill][stats] Wrote JSON stats to " << path);
@@ -2592,6 +2595,9 @@ namespace llaminar
         stats_.peak_resident_bytes = 0;
         stats_.allocations_tracked = 0;
         stats_.allocations_denied = 0;
+        stats_.preflight_invocations = 0;
+        stats_.preflight_denied = 0;
+        stats_.preflight_estimated_bytes_last = 0;
         strategy_cache_.stats.hits = 0;
         strategy_cache_.stats.misses = 0;
         allocations_.clear();
@@ -2641,7 +2647,10 @@ namespace llaminar
             "LLAMINAR_COSMA_RECON_FORCE_LEGACY",
             "LLAMINAR_COSMA_DIAG_SKIP_NORM",
             "LLAMINAR_COSMA_FORCE_UNIFIED",
-            "LLAMINAR_COSMA_RECON_FORCE_LEGACY" // (duplicate acceptable; audit can de-dupe)
+            "LLAMINAR_COSMA_RECON_FORCE_LEGACY", // (duplicate acceptable; audit can de-dupe)
+            // Phase 1b minor preflight env
+            "LLAMINAR_COSMA_PREFLIGHT_DISABLE",
+            "LLAMINAR_COSMA_PREFLIGHT_SAFETY_FACTOR"
         };
         return vars;
     }
@@ -2659,6 +2668,55 @@ namespace llaminar
         long long peak = stats_.peak_resident_bytes.load();
         if (sum > peak)
             stats_.peak_resident_bytes = sum;
+    }
+
+    bool CosmaPrefillManager::preflight_allows(int seq_len, int d_model, int d_ff, int n_proj) const
+    {
+        // Skip if disabled by env or single-rank trivial case
+        if (std::getenv("LLAMINAR_COSMA_PREFLIGHT_DISABLE") || world_size_ == 1)
+            return true;
+        const double safety = [&]() {
+            if (const char *s = std::getenv("LLAMINAR_COSMA_PREFLIGHT_SAFETY_FACTOR"))
+            {
+                try { return std::max(0.5, std::min(4.0, std::stod(s))); } catch (...) { return 1.2; }
+            }
+            return 1.2; // default 20% headroom
+        }();
+        // Estimate major working set components for a typical attention+MLP block:
+        //  - Activation input (seq_len * d_model)
+        //  - Q,K,V projections intermediates (n_proj * seq_len * d_model) (reuse of activation layout not counted separately)
+        //  - Attention scores (seq_len * seq_len) transient (worst-case; large!)
+        //  - MLP intermediates (seq_len * d_ff * 2 for gate+up)
+        //  - Output buffers (seq_len * d_model) * 2 (residual staging)
+        long long bytes_activation = 1ll * seq_len * d_model * sizeof(float);
+        long long bytes_qkv = 1ll * n_proj * seq_len * d_model * sizeof(float);
+        long long bytes_scores = 1ll * seq_len * seq_len * sizeof(float); // may be tiled later
+        long long bytes_mlp = 2ll * seq_len * d_ff * sizeof(float);
+        long long bytes_output = 2ll * seq_len * d_model * sizeof(float);
+        long long estimate = bytes_activation + bytes_qkv + bytes_scores + bytes_mlp + bytes_output;
+        estimate = (long long)(estimate * safety);
+        // Update stats (mutable in const via cast because instrumentation)
+        const_cast<CosmaPrefillManager *>(this)->stats_.preflight_invocations++;
+        const_cast<CosmaPrefillManager *>(this)->stats_.preflight_estimated_bytes_last = estimate;
+        long long budget_bytes = max_resident_mb_ * 1024ll * 1024ll;
+        if (estimate > budget_bytes)
+        {
+            if (rank_ == 0 && should_log(1))
+            {
+                LOG_WARN("[CosmaPrefill][preflight] Estimated working set " << (estimate / (1024.0*1024.0))
+                                                                              << " MB exceeds budget "
+                                                                              << max_resident_mb_ << " MB (seq=" << seq_len
+                                                                              << ", d_model=" << d_model << ", d_ff=" << d_ff << ")");
+            }
+            const_cast<CosmaPrefillManager *>(this)->stats_.preflight_denied++;
+            return false;
+        }
+        if (rank_ == 0 && should_log(3))
+        {
+            LOG_DEBUG("[CosmaPrefill][preflight] estimate=" << (estimate / (1024.0*1024.0))
+                                                             << " MB within budget " << max_resident_mb_ << " MB");
+        }
+        return true;
     }
 
 } // namespace llaminar
