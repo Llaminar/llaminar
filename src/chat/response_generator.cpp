@@ -1,5 +1,6 @@
 #include "response_generator.h"
 #include "../logger.h"
+#include "../tensors/tensor_factory.h"
 #include <algorithm>
 #include <random>
 #include <numeric>
@@ -14,7 +15,7 @@ namespace llaminar
         ResponseGenerator::ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
                                              std::shared_ptr<MPITransformerPipeline> pipeline,
                                              const LlaminarParams &params)
-            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.max_tokens > 0 ? params.max_tokens : 512)
+            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
         {
             if (!pipeline_)
             {
@@ -48,7 +49,7 @@ namespace llaminar
                                              std::shared_ptr<MPITransformerPipeline> pipeline,
                                              const LlaminarParams &params,
                                              const MPITransformerPipeline::ModelWeights &weights)
-            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), weights_(weights), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.max_tokens > 0 ? params.max_tokens : 512)
+            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), weights_(weights), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
         {
             if (!pipeline_)
             {
@@ -96,8 +97,20 @@ namespace llaminar
 
                 for (int32_t step = 0; step < max_tokens_; ++step)
                 {
+                    // Create output tensor with appropriate shape [seq_len, vocab_size]
+                    size_t seq_len = current_sequence.size();
+                    size_t vocab_size = pipeline_->getConfig().vocab_size;
+                    auto output = TensorFactory::create_auto({static_cast<int>(seq_len), static_cast<int>(vocab_size)},
+                                                             false /* prefer_distributed */);
+
+                    // CRITICAL: Zero the output tensor to prevent NaN logits from uninitialized memory
+                    output->zero();
+
+                    // Debug: Verify tensor is zeroed
+                    const float *test_data = output->data();
+                    LOG_INFO("Post-zero check - First 5 values: " << test_data[0] << " " << test_data[1] << " " << test_data[2] << " " << test_data[3] << " " << test_data[4]);
+
                     // Run inference to get next token probabilities
-                    std::shared_ptr<TensorBase> output;
                     bool success = pipeline_->execute(current_sequence, weights_, output);
 
                     if (!success || !output)
@@ -105,6 +118,10 @@ namespace llaminar
                         LOG_ERROR("Pipeline execution failed at step " << step);
                         break;
                     }
+
+                    // Debug: Check tensor values immediately after pipeline execution
+                    const float *post_pipeline_data = output->data();
+                    LOG_INFO("Post-pipeline check - First 5 values: " << post_pipeline_data[0] << " " << post_pipeline_data[1] << " " << post_pipeline_data[2] << " " << post_pipeline_data[3] << " " << post_pipeline_data[4]);
 
                     // Extract logits for next token prediction
                     // The output should be [seq_len, vocab_size], we want the last position
@@ -117,12 +134,33 @@ namespace llaminar
                         break;
                     }
 
-                    size_t seq_len = shape[0];
-                    size_t vocab_size = shape[1];
+                    // Use shape directly instead of declaring new variables
+                    size_t actual_seq_len = shape[0];
+                    size_t actual_vocab_size = shape[1];
+
+                    // Debug tensor data after pipeline execution
+                    LOG_INFO("Output tensor shape: [" << actual_seq_len << ", " << actual_vocab_size << "]");
+                    LOG_INFO("First 10 raw output values: ");
+                    for (size_t i = 0; i < std::min(size_t(10), actual_vocab_size); ++i)
+                    {
+                        std::cout << output_data[i] << " ";
+                    }
+                    std::cout << std::endl;
+
+                    // Check for NaN/inf in first 100 values
+                    int nan_count = 0, inf_count = 0;
+                    for (size_t i = 0; i < std::min(size_t(100), actual_seq_len * actual_vocab_size); ++i)
+                    {
+                        if (std::isnan(output_data[i]))
+                            nan_count++;
+                        if (std::isinf(output_data[i]))
+                            inf_count++;
+                    }
+                    LOG_INFO("NaN count in first 100 values: " << nan_count << ", Inf count: " << inf_count);
 
                     // Get logits for the last token position
-                    std::vector<float> logits(output_data + (seq_len - 1) * vocab_size,
-                                              output_data + seq_len * vocab_size);
+                    std::vector<float> logits(output_data + (actual_seq_len - 1) * actual_vocab_size,
+                                              output_data + actual_seq_len * actual_vocab_size);
 
                     // Sample next token
                     int32_t next_token = sampleToken(logits);

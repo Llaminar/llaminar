@@ -1,5 +1,6 @@
 #include "MPIRMSNormKernel.h"
 #include "../logger.h"
+#include "../debug_utils.h"
 #include <cmath>
 #include <chrono>
 #include <algorithm>
@@ -29,6 +30,21 @@ namespace llaminar
         auto weight = inputs[1];
         auto global_output = outputs[0];
 
+        // === COMPREHENSIVE TENSOR VALIDATION ===
+        ASSERT_TENSOR_VALID(global_input, "RMSNorm input");
+        ASSERT_TENSOR_VALID(weight, "RMSNorm weight");
+        ASSERT_TENSOR_VALID(global_output, "RMSNorm output");
+
+        // Check for NaN in inputs before computation
+        ASSERT_TENSOR_NOT_NAN(global_input, "RMSNorm input");
+        ASSERT_TENSOR_NOT_NAN(weight, "RMSNorm weight");
+
+        // Log detailed tensor information
+        TensorLogger::logNormalizationOperation(global_input, weight, global_output, "MPIRMSNormKernel");
+
+        // Additional epsilon logging
+        LOG_INFO("[MPIRMSNormKernel] Using epsilon=" << epsilon_);
+
         // Extract dimensions
         size_t global_seq_len = static_cast<size_t>(global_input->shape()[0]);
         size_t hidden_size = static_cast<size_t>(global_input->shape()[1]);
@@ -53,6 +69,13 @@ namespace llaminar
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+        // === POST-COMPUTATION VALIDATION ===
+        ASSERT_TENSOR_NOT_NAN(global_output, "RMSNorm output after computation");
+
+        // Log output tensor statistics
+        TensorLogger::logTensorStats(global_output, "RMSNorm final_output", "MPIRMSNormKernel_COMPLETE");
+
         LOG_DEBUG("MPIRMSNormKernel executed successfully on rank " << getRank()
                                                                     << " in " << duration.count() << " microseconds");
 
@@ -175,16 +198,30 @@ namespace llaminar
                                                      float *local_output, size_t local_seq_len,
                                                      size_t hidden_size, size_t global_seq_len)
     {
-        // Compute local contribution to global RMS
-        float local_sum_sq = 0.0f;
-        for (size_t i = 0; i < local_seq_len; ++i)
+        // Instrumentation: compute basic stats of local input before normalization (parallelized)
+        float local_min = std::numeric_limits<float>::infinity();
+        float local_max = -std::numeric_limits<float>::infinity();
+        double local_sum = 0.0;
+        size_t local_count = local_seq_len * hidden_size;
+#pragma omp parallel for reduction(min:local_min) reduction(max:local_max) reduction(+:local_sum) schedule(static)
+        for (long long i = 0; i < (long long)local_count; ++i)
         {
-            for (size_t j = 0; j < hidden_size; ++j)
+            float v = local_input[i];
+            if (v < local_min) local_min = v;
+            if (v > local_max) local_max = v;
+            local_sum += v;
+        }
+        double local_mean = local_count ? (local_sum / local_count) : 0.0;
+
+        // Compute local contribution to global RMS (parallel)
+        float local_sum_sq = 0.0f;
+#pragma omp parallel for reduction(+:local_sum_sq) collapse(2) schedule(static)
+        for (long long i = 0; i < (long long)local_seq_len; ++i)
+            for (long long j = 0; j < (long long)hidden_size; ++j)
             {
-                float val = local_input[i * hidden_size + j];
+                float val = local_input[i * (long long)hidden_size + j];
                 local_sum_sq += val * val;
             }
-        }
 
         // Compute global RMS via MPI reduction
         float global_sum_sq = 0.0f;
@@ -193,14 +230,72 @@ namespace llaminar
 
         float rms = std::sqrt(global_sum_sq / (global_seq_len * hidden_size) + epsilon_);
 
-        // Apply normalization to local data
-        for (size_t i = 0; i < local_seq_len; ++i)
+        // Gather global stats for debugging (min, max, mean)
+        float global_min = 0.0f, global_max = 0.0f;
+        double global_mean_sum = 0.0;
+        double global_mean = 0.0;
+        checkMPIError(MPI_Allreduce(&local_min, &global_min, 1, MPI_FLOAT, MPI_MIN, getComm()), "MPI_Allreduce min in RMSNorm");
+        checkMPIError(MPI_Allreduce(&local_max, &global_max, 1, MPI_FLOAT, MPI_MAX, getComm()), "MPI_Allreduce max in RMSNorm");
+        checkMPIError(MPI_Allreduce(&local_sum, &global_mean_sum, 1, MPI_DOUBLE, MPI_SUM, getComm()), "MPI_Allreduce mean sum in RMSNorm");
+        global_mean = (global_seq_len * hidden_size) ? (global_mean_sum / (double)(global_seq_len * hidden_size)) : 0.0;
+
+        // Weight stats (local - identical across ranks expected). Just compute once and broadcast rank 0's view.
+        float w_min = std::numeric_limits<float>::infinity();
+        float w_max = -std::numeric_limits<float>::infinity();
+        double w_sum = 0.0;
+        for (size_t j = 0; j < hidden_size; ++j)
         {
-            for (size_t j = 0; j < hidden_size; ++j)
+            float w = weight[j];
+            if (w < w_min)
+                w_min = w;
+            if (w > w_max)
+                w_max = w;
+            w_sum += w;
+        }
+        double w_sum_global = 0.0;
+        float w_min_global = 0.0f, w_max_global = 0.0f;
+        checkMPIError(MPI_Allreduce(&w_min, &w_min_global, 1, MPI_FLOAT, MPI_MIN, getComm()), "MPI_Allreduce weight min");
+        checkMPIError(MPI_Allreduce(&w_max, &w_max_global, 1, MPI_FLOAT, MPI_MAX, getComm()), "MPI_Allreduce weight max");
+        checkMPIError(MPI_Allreduce(&w_sum, &w_sum_global, 1, MPI_DOUBLE, MPI_SUM, getComm()), "MPI_Allreduce weight sum");
+        double w_mean_global = (double)w_sum_global / (double)(hidden_size * getSize());
+
+        if (getRank() == 0)
+        {
+            LOG_INFO("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
+                                                               << " global_sum_sq=" << global_sum_sq << " rms=" << rms);
+            LOG_INFO("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
+        }
+
+        // Apply normalization to local data (parallel)
+#pragma omp parallel for collapse(2) schedule(static)
+        for (long long i = 0; i < (long long)local_seq_len; ++i)
+            for (long long j = 0; j < (long long)hidden_size; ++j)
             {
-                size_t idx = i * hidden_size + j;
+                size_t idx = (size_t)i * hidden_size + (size_t)j;
                 local_output[idx] = (local_input[idx] / rms) * weight[j];
             }
+
+        // Post-norm local stats to detect zeroing (parallel)
+        float out_local_min = std::numeric_limits<float>::infinity();
+        float out_local_max = -std::numeric_limits<float>::infinity();
+        double out_local_sum = 0.0;
+#pragma omp parallel for reduction(min:out_local_min) reduction(max:out_local_max) reduction(+:out_local_sum) schedule(static)
+        for (long long i = 0; i < (long long)local_count; ++i)
+        {
+            float v = local_output[i];
+            if (v < out_local_min) out_local_min = v;
+            if (v > out_local_max) out_local_max = v;
+            out_local_sum += v;
+        }
+        float out_global_min = 0.0f, out_global_max = 0.0f;
+        double out_global_sum = 0.0;
+        checkMPIError(MPI_Allreduce(&out_local_min, &out_global_min, 1, MPI_FLOAT, MPI_MIN, getComm()), "MPI_Allreduce out min");
+        checkMPIError(MPI_Allreduce(&out_local_max, &out_global_max, 1, MPI_FLOAT, MPI_MAX, getComm()), "MPI_Allreduce out max");
+        checkMPIError(MPI_Allreduce(&out_local_sum, &out_global_sum, 1, MPI_DOUBLE, MPI_SUM, getComm()), "MPI_Allreduce out sum");
+        double out_global_mean = (global_seq_len * hidden_size) ? (out_global_sum / (double)(global_seq_len * hidden_size)) : 0.0;
+        if (getRank() == 0)
+        {
+            LOG_INFO("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean);
         }
 
         LOG_DEBUG("Computed distributed RMS normalization: rms=" << rms

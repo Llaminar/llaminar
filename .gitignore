@@ -43,6 +43,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+Testing/
 
 # Package managers
 node_modules/

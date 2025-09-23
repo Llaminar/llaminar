@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../mpi_kernel_base.h"
-#include "MatMulKernel.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -40,8 +39,10 @@ namespace llaminar
          * @param seq_len Sequence length
          * @param embedding_dim Embedding dimension
          */
-        void computeLocalEmbedding(const int *token_ids, const float *local_embedding_table,
-                                   float *output, size_t seq_len, size_t embedding_dim);
+        void computeLocalEmbedding(const int *token_ids, const float *embedding_table,
+                                   float *output, size_t seq_len, size_t embedding_dim,
+                                   bool full_table_mode, bool transposed,
+                                   size_t table_rows, size_t table_cols);
 
         /**
          * @brief Gather embeddings from all ranks using MPI_Allgather
@@ -52,7 +53,8 @@ namespace llaminar
          */
         void gatherEmbeddings(const std::shared_ptr<TensorBase> &local_output,
                               std::shared_ptr<TensorBase> &global_output,
-                              size_t seq_len, size_t embedding_dim);
+                              size_t seq_len, size_t embedding_dim,
+                              bool full_table_mode);
 
         /**
          * @brief Determine which rank owns a particular vocabulary entry
@@ -79,8 +81,9 @@ namespace llaminar
         size_t local_vocab_start_; // Start index of this rank's vocabulary partition
         size_t local_vocab_end_;   // End index of this rank's vocabulary partition
         size_t local_vocab_size_;  // Number of vocabulary entries on this rank
-
-        MatMulKernel matmul_kernel_; // COSMA-powered matrix multiplication
+        // Orientation / mode flags (set during validate, used in execute)
+        mutable bool full_table_mode_ = false; // True if embedding table contains full vocab on each rank
+        mutable bool transposed_ = false;      // True if table shape is [embedding_dim, vocab]
     };
 
 } // namespace llaminar

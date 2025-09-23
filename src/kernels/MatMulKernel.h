@@ -1,116 +1,101 @@
+// Legacy MatMulKernel compatibility wrapper
+// This file restores the previous test dependency while routing all
+// matrix multiplications through the unified AdaptiveMatMulManager.
+//
+// STATUS: DEPRECATED. New code should call adaptiveMatMul()/AdaptiveMatMulManager
+// directly. This wrapper exists only so older tests (test_cosma, etc.) build
+// without re-writing them immediately. It intentionally does NOT expose any
+// COSMA specific knobs beyond a minimal strategy string accepted previously.
+//
+// Unification notes:
+//  - All decisions (OpenBLAS vs COSMA) now happen in AdaptiveMatMulManager.
+//  - The test_cosma benchmark still exercises COSMA when thresholds permit.
+//  - Remove this file once tests are migrated to adaptive API.
+
 #pragma once
 
-#include "../tensors/tensor_base.h"
 #include <vector>
 #include <memory>
-#include <string>
-
-// Forward declarations
-namespace cosma
-{
-    template <typename T>
-    class CosmaMatrix;
-    class Strategy;
-}
+#include "../tensors/tensor_base.h"
+#include "../logger.h"
+#include "../adaptive_matmul.h"
 
 namespace llaminar
 {
 
-    /**
-     * @brief High-performance matrix multiplication kernel using COSMA
-     *
-     * Implements distributed matrix multiplication using the COSMA library
-     * for optimal communication patterns and performance on MPI systems.
-     *
-     * Now supports hybrid tensor types:
-     * - COSMATensor: Zero-copy operations with optimal COSMA performance
-     * - SimpleTensor: Fallback with data conversion for compatibility
-     *
-     * Expected inputs:
-     * - A: [m, k] - left matrix
-     * - B: [k, n] - right matrix
-     *
-     * Expected outputs:
-     * - C: [m, n] - result matrix (C = A × B)
-     */
     class MatMulKernel
     {
     public:
-        MatMulKernel();
+        MatMulKernel() = default;
 
-        /**
-         * @brief Execute matrix multiplication using COSMA with hybrid tensor support
-         * @param inputs Vector containing A and B matrices (TensorBase-derived)
-         * @param outputs Vector containing result matrix C (TensorBase-derived)
-         * @return true if execution succeeded, false otherwise
-         */
-        bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                     std::vector<std::shared_ptr<TensorBase>> &outputs);
-
-        /**
-         * @brief Validate input and output tensor shapes for matrix multiplication
-         * @param inputs Input tensors to validate
-         * @param outputs Output tensors to validate
-         * @return true if tensors are valid, false otherwise
-         */
-        bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const;
-
-        // COSMA-specific configuration
+        // Retained for backward compatibility; currently ignored except for logging.
         void setStrategy(const std::string &strategy) { strategy_ = strategy; }
-        void setBlockSizes(int block_m, int block_n, int block_k)
+        void setBlockSizes(int /*mb*/, int /*nb*/, int /*kb*/) { /* ignored in unified path */ }
+
+        bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const
         {
-            block_m_ = block_m;
-            block_n_ = block_n;
-            block_k_ = block_k;
+            if (inputs.size() != 2 || outputs.size() != 1)
+            {
+                LOG_ERROR("MatMulKernel (compat): expected 2 inputs, 1 output");
+                return false;
+            }
+            if (!inputs[0] || !inputs[1] || !outputs[0])
+            {
+                LOG_ERROR("MatMulKernel (compat): null tensor provided");
+                return false;
+            }
+            const auto &A_shape = inputs[0]->shape();
+            const auto &B_shape = inputs[1]->shape();
+            const auto &C_shape = outputs[0]->shape();
+            if (A_shape.size() != 2 || B_shape.size() != 2 || C_shape.size() != 2)
+            {
+                LOG_ERROR("MatMulKernel (compat): all tensors must be 2D");
+                return false;
+            }
+            if (A_shape[1] != B_shape[0])
+            {
+                LOG_ERROR("MatMulKernel (compat): inner dimension mismatch");
+                return false;
+            }
+            if (C_shape[0] != A_shape[0] || C_shape[1] != B_shape[1])
+            {
+                LOG_ERROR("MatMulKernel (compat): output shape mismatch");
+                return false;
+            }
+            return true;
         }
 
-        const std::string &getStrategy() const { return strategy_; }
-        void getBlockSizes(int &block_m, int &block_n, int &block_k) const
+        bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                     std::vector<std::shared_ptr<TensorBase>> &outputs)
         {
-            block_m = block_m_;
-            block_n = block_n_;
-            block_k = block_k_;
+            if (!validate(inputs, outputs))
+                return false;
+
+            auto A = inputs[0];
+            auto B = inputs[1];
+            auto C = outputs[0];
+            int m = static_cast<int>(A->shape()[0]);
+            int k = static_cast<int>(A->shape()[1]);
+            int n = static_cast<int>(B->shape()[1]);
+
+            // Determine if this looks like a prefill (sequence length heuristic)
+            bool is_prefill = (m >= 64); // mirrors COSMA_MIN_SEQ_LEN threshold
+
+            LOG_DEBUG("MatMulKernel (compat): delegating " << m << "x" << k << " * " << k << "x" << n
+                                                           << (is_prefill ? " (prefill heuristic)" : ""));
+
+            bool ok = adaptiveMatMul(A->data(), B->data(), const_cast<float *>(C->data()),
+                                     m, n, k, is_prefill, /*distributed_partition*/ false);
+            if (!ok)
+            {
+                LOG_ERROR("MatMulKernel (compat): adaptiveMatMul failed");
+            }
+            return ok;
         }
 
     private:
-        std::string strategy_;            ///< COSMA strategy ("auto", "custom", etc.)
-        int block_m_, block_n_, block_k_; ///< Block sizes for COSMA algorithm
-
-        /**
-         * @brief Zero-copy COSMA matrix multiplication for COSMATensor inputs
-         * @param A Left COSMA matrix
-         * @param B Right COSMA matrix
-         * @param C Result COSMA matrix
-         * @return true if COSMA execution succeeded
-         */
-        bool executeCOSMANative(cosma::CosmaMatrix<float> &A,
-                                cosma::CosmaMatrix<float> &B,
-                                cosma::CosmaMatrix<float> &C,
-                                const cosma::Strategy &strategy);
-
-        /**
-         * @brief Legacy COSMA execution with data copying (for SimpleTensor)
-         * @param A Left matrix
-         * @param B Right matrix
-         * @param C Result matrix
-         * @return true if COSMA execution succeeded
-         */
-        bool executeCOSMA(const TensorBase &A, const TensorBase &B, TensorBase &C);
-
-        /**
-         * @brief Detect optimal execution path based on tensor types
-         * @param inputs Input tensors to analyze
-         * @param outputs Output tensors to analyze
-         * @return true if zero-copy COSMA execution is possible
-         */
-        bool canUseZeroCopyCOSMA(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                 const std::vector<std::shared_ptr<TensorBase>> &outputs) const;
-
-        /**
-         * @brief Initialize COSMA context and configuration
-         */
-        void initializeCOSMAContext();
+        std::string strategy_{"auto"};
     };
 
 } // namespace llaminar

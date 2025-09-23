@@ -403,27 +403,78 @@ CUDA_VISIBLE_DEVICES  # GPU device selection
 3. **Asynchronous Execution**: Overlapped computation/communication
 4. **Elastic Scaling**: Runtime process addition/removal
 
-## Usage Examples
+## Canonical Runtime Configuration
 
-### Basic Matrix Benchmarking
+### Optimal Launch Settings
+
+Llaminar includes a canonical launch script with empirically-optimized settings:
+
 ```bash
-# Single node execution
-./build/llaminar -v --print-topology
+# Always use the canonical launcher
+./run-llaminar.sh [arguments]
 
-# Multi-node MPI execution  
-mpirun -np 4 ./build/llaminar -vv --matrix-size 2048
-
-# GPU detection and profiling
-./build/llaminar --detect-gpus --profile --trace
+# The script automatically configures:
+# - OpenMP: Auto-detected cores per socket, socket placement, close binding
+# - MPI: 1 process per socket, memory pinning, NUMA-aware binding  
+# - Threading: Single-threaded for small ops, multi-threaded for medium, distributed for large
+# - Topology Detection: Mirrors C++ logic from src/common.cpp for consistent results
 ```
 
-### Model Inference (Planned)
-```bash
-# Load and run inference
-./build/llaminar -m models/qwen2.5-7b.gguf -v
+### Environment Configuration
 
-# Distributed inference
-mpirun -np 8 ./build/llaminar -m models/llama3.1-70b.gguf --profile
+**OpenMP Settings** (automatically configured):
+```bash
+OMP_NUM_THREADS=<detected>       # Auto-detected physical cores per socket
+OMP_PLACES=sockets               # Thread placement strategy
+OMP_PROC_BIND=close              # Bind threads close together
+KMP_AFFINITY=granularity=fine,compact,1,0  # Intel threading
+KMP_BLOCKTIME=0                  # Minimize thread blocking
+```
+
+**MPI Settings** (automatically configured):
+```bash
+OMPI_MCA_mpi_leave_pinned=1                     # Memory pinning
+OMPI_MCA_btl_vader_single_copy_mechanism=none   # NUMA optimization
+OMPI_MCA_btl_openib_allow_ib=1                  # InfiniBand support
+```
+
+### System Requirements
+
+- **CPU**: Multi-socket x86_64 with NUMA support
+- **Memory**: 16GB+ RAM, preferably balanced across NUMA nodes
+- **MPI**: OpenMPI 4.0+ with thread support
+- **OpenMP**: libgomp or Intel OpenMP runtime
+- **Optimal**: 2-socket system, 1 MPI process per socket
+
+## Usage Examples
+
+### Basic Execution
+```bash
+# Topology detection and system info
+./run-llaminar.sh -v --print-topology
+
+# Performance benchmarking
+./run-llaminar.sh -vv --matrix-size 2048
+
+# GPU detection and profiling
+./run-llaminar.sh --detect-gpus --profile --trace
+```
+
+### Model Inference
+```bash
+# Load and run inference with Qwen 2.5 model
+./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
+
+# Verbose inference with profiling
+./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -vv --profile
+```
+
+### Advanced Usage (Manual MPI)
+```bash
+# Manual MPI execution (if canonical script unavailable)
+mpirun -np 2 --bind-to socket --map-by socket \
+  --mca mpi_leave_pinned 1 --report-bindings \
+  ./build/llaminar -m models/qwen2.5-0.5b-instruct-q4_0.gguf
 ```
 
 This architecture provides a solid foundation for high-performance, distributed LLM inference while maintaining modularity, extensibility, and observability throughout the system.

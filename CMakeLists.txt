@@ -107,23 +107,26 @@ set(LLAMINAR_CORE_SOURCES
     src/topology_manager.cpp
     src/graph_compute.cpp
     src/mpi_kernel_base.cpp
-    src/kernels/MatMulKernel.cpp
-    src/kernels/RMSNormKernel.cpp
-    src/kernels/LinearKernel.cpp
+    src/cosma_prefill_manager.cpp
     src/kernels/MPILinearKernel.cpp
     src/kernels/MPIRMSNormKernel.cpp
     src/kernels/MPIAttentionKernel.cpp
     src/kernels/MPIEmbeddingKernel.cpp
     src/kernels/MPIMLPKernel.cpp
-    src/kernels/EmbeddingKernel.cpp
-    src/kernels/MLPKernel.cpp
-    src/kernels/AttentionKernel.cpp
+    src/kernels/MPIResidualKernel.cpp
+    src/kernels/MPIRoPEKernel.cpp
+    src/kernels/MPISwiGLUKernel.cpp
     src/mpi_transformer_pipeline.cpp
+    src/pipeline_base.cpp
     src/tensors/simple_tensor.cpp
     src/tensors/cosma_tensor.cpp
     src/tensors/tensor_factory.cpp
     src/model_loader.cpp
     src/repacker.cpp
+    src/socket_aware_inference.cpp
+    # Adaptive architecture components
+    src/adaptive_matmul.h
+    src/adaptive_transformer_pipeline.h
     # Chat interface components
     src/chat/gguf_tokenizer.cpp
     src/chat/bpe_processor.cpp
@@ -181,13 +184,43 @@ target_include_directories(llaminar_core PUBLIC
 add_executable(llaminar src/main.cpp)
 target_link_libraries(llaminar llaminar_core)
 
+# Adaptive architecture demonstration
+add_executable(adaptive_demo src/adaptive_demo.cpp)
+target_link_libraries(adaptive_demo llaminar_core)
+
+# Production adaptive architecture demonstration
+add_executable(production_demo src/production_demo.cpp)
+target_link_libraries(production_demo llaminar_core)
+
 # Add DEBUG flag to main executable when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(llaminar PRIVATE DEBUG)
+    target_compile_definitions(adaptive_demo PRIVATE DEBUG)
+    target_compile_definitions(production_demo PRIVATE DEBUG)
 endif()
 
 # Enable testing
 enable_testing()
+
+# Minimal ggml reference library for golden quant/dequant (Option A)
+add_library(ggml_min STATIC
+    llama.cpp/ggml/src/ggml.c
+    llama.cpp/ggml/src/ggml-quants.c
+    tests/ggml_backend_stubs.c
+)
+target_include_directories(ggml_min PUBLIC
+    llama.cpp/ggml/src
+    llama.cpp/ggml/include
+    llama.cpp/ggml
+)
+target_compile_definitions(ggml_min PRIVATE GGML_USE_FAKE_DEPS=1)
+target_compile_definitions(ggml_min PRIVATE
+    GGML_VERSION="0.0.0"
+    GGML_COMMIT="llaminar-min"
+    GGML_USE_K_QUANTS=1
+    GGML_USE_QKK_64=1
+)
+
 
 # Test sources and executables
 add_executable(test_basic tests/test_basic.cpp)
@@ -206,69 +239,19 @@ add_executable(test_graph tests/test_graph.cpp)
 target_link_libraries(test_graph llaminar_core)
 add_test(NAME GraphTest COMMAND test_graph)
 
-# Test our custom transformer compute nodes
-add_executable(test_transformer src/test_transformer.cpp)
-target_link_libraries(test_transformer llaminar_core)
-add_test(NAME TransformerTest COMMAND test_transformer)
-
 # Kernel unit tests (if Google Test is available)
 if(GTEST_FOUND)
     message(STATUS "Building kernel unit tests with Google Test")
     
-    # RMSNorm kernel test
-    add_executable(test_rmsnorm_kernel tests/test_rmsnorm_kernel.cpp)
-    target_link_libraries(test_rmsnorm_kernel llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_rmsnorm_kernel GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_rmsnorm_kernel PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_rmsnorm_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME RMSNormKernelTest COMMAND test_rmsnorm_kernel)
+
     
-    # Linear kernel test
-    add_executable(test_linear_kernel tests/test_linear_kernel.cpp)
-    target_link_libraries(test_linear_kernel llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_linear_kernel GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_linear_kernel PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_linear_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME LinearKernelTest COMMAND test_linear_kernel)
+
     
-    # Embedding kernel test
-    add_executable(test_embedding_kernel tests/test_embedding_kernel.cpp)
-    target_link_libraries(test_embedding_kernel llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_embedding_kernel GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_embedding_kernel PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_embedding_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME EmbeddingKernelTest COMMAND test_embedding_kernel)
+
     
-    # MLP kernel test
-    add_executable(test_mlp_kernel tests/test_mlp_kernel.cpp)
-    target_link_libraries(test_mlp_kernel llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_mlp_kernel GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_mlp_kernel PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_mlp_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME MLPKernelTest COMMAND test_mlp_kernel)
+
     
-    # Attention kernel test
-    add_executable(test_attention_kernel tests/test_attention_kernel.cpp)
-    target_link_libraries(test_attention_kernel llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_attention_kernel GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_attention_kernel PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_attention_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME AttentionKernelTest COMMAND test_attention_kernel)
+
     
     # MPI linear kernel test
     add_executable(test_mpi_linear_kernel tests/test_mpi_linear_kernel.cpp)
@@ -311,20 +294,131 @@ if(GTEST_FOUND)
         target_link_libraries(test_mpi_transformer_pipeline ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
     add_test(NAME MPITransformerPipelineTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_transformer_pipeline)
+    # Ensure this long-running MPI test cannot hang indefinitely; internal watchdog < 60s, external timeout at 60s
+    set_tests_properties(MPITransformerPipelineTest PROPERTIES TIMEOUT 60)
     
-    set(KERNEL_TEST_TARGETS test_rmsnorm_kernel test_linear_kernel test_embedding_kernel test_mlp_kernel test_attention_kernel test_mpi_linear_kernel test_mpi_rmsnorm_kernel test_mpi_attention_kernel test_mpi_transformer_pipeline)
+    # Adaptive Matrix Multiplication test
+    # Shared logging bootstrap (object library) to unify test logging levels
+    add_library(test_logging_bootstrap OBJECT tests/test_logging_bootstrap.cpp)
+    
+    add_executable(test_adaptive_matmul tests/test_adaptive_matmul.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_adaptive_matmul llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_adaptive_matmul GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_adaptive_matmul PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_adaptive_matmul ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME AdaptiveMatMulTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_adaptive_matmul)
+    
+    # Minimal COSMA Custom Layout test
+    add_executable(test_cosma_minimal tests/test_cosma_minimal.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_minimal llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_cosma_minimal GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_cosma_minimal PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_cosma_minimal ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME CosmaMinimalTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_cosma_minimal)
+
+    # Cosma Prefill Manager correctness (single rank baseline)
+    add_executable(test_cosma_prefill_manager tests/test_cosma_prefill_manager.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_cosma_prefill_manager GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_cosma_prefill_manager PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_cosma_prefill_manager ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME CosmaPrefillManagerTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager)
+    set_tests_properties(CosmaPrefillManagerTest PROPERTIES TIMEOUT 60)
+
+    add_executable(test_cosma_prefill_manager_multi tests/test_cosma_prefill_manager_multi.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_multi PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaPrefillManagerMultiTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_multi>)
+    set_tests_properties(CosmaPrefillManagerMultiTest PROPERTIES TIMEOUT 60)
+
+    # Cosma Prefill Manager distributed full-path (large GEMM) correctness test
+    add_executable(test_cosma_prefill_manager_distributed tests/test_cosma_prefill_manager_distributed.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_distributed PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaPrefillManagerDistributedFullTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_distributed>)
+    set_tests_properties(CosmaPrefillManagerDistributedFullTest PROPERTIES TIMEOUT 60)
+
+    # Population regression (destination-local round-trip invariants)
+    add_executable(test_cosma_prefill_population_regression tests/test_cosma_prefill_population_regression.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_population_regression PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaPrefillManagerPopulationRegressionTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_population_regression>)
+    set_tests_properties(CosmaPrefillManagerPopulationRegressionTest PROPERTIES TIMEOUT 60)
+
+    # Population performance benchmark (env-gated)
+    add_executable(test_cosma_prefill_population_perf tests/test_cosma_prefill_population_perf.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_population_perf PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaPrefillManagerPopulationPerfTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_population_perf>)
+    set_tests_properties(CosmaPrefillManagerPopulationPerfTest PROPERTIES TIMEOUT 120)
+
+    # Dequantization tests (Q4_0 correctness + Q4_K placeholder sanity)
+    add_executable(test_dequant tests/test_dequant.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_dequant llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_dequant GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_dequant PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_dequant ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME DequantTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_dequant)
+
+    # Extra quantization tests (all types)
+    add_executable(test_dequant_extra tests/test_dequant_extra.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_dequant_extra llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_dequant_extra GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_dequant_extra PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_dequant_extra ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME DequantExtraTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_dequant_extra)
+
+    # Golden reference comparison test (ggml quant vs llaminar dequant)
+    add_executable(test_dequant_golden tests/test_dequant_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_include_directories(test_dequant_golden PRIVATE
+        llama.cpp/ggml/src
+        llama.cpp/ggml/include
+        llama.cpp/ggml
+    )
+    target_link_libraries(test_dequant_golden llaminar_core ggml_min)
+    if(GTest_FOUND)
+        target_link_libraries(test_dequant_golden GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_dequant_golden PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_dequant_golden ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME DequantGoldenTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_dequant_golden)
+
+    # Integration test for real Q4_K tensors (statistical sanity)
+    add_executable(test_integration_q4k tests/test_integration_q4k.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_integration_q4k llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_integration_q4k GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_integration_q4k PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_integration_q4k ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME IntegrationQ4K COMMAND ${CMAKE_BINARY_DIR}/tests/test_integration_q4k)
+    
+    set(KERNEL_TEST_TARGETS test_mpi_linear_kernel test_mpi_rmsnorm_kernel test_mpi_attention_kernel test_mpi_transformer_pipeline test_adaptive_matmul test_cosma_minimal test_cosma_prefill_manager test_dequant test_dequant_extra test_dequant_golden test_integration_q4k)
 else()
     message(STATUS "Google Test not found - kernel unit tests disabled")
     set(KERNEL_TEST_TARGETS "")
 endif()
 
 # Set output directories
-set_target_properties(llaminar
+set_target_properties(llaminar adaptive_demo
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-set_target_properties(test_basic test_numa test_cosma test_graph test_transformer ${KERNEL_TEST_TARGETS}
+set_target_properties(test_basic test_numa test_cosma test_graph ${KERNEL_TEST_TARGETS}
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
@@ -332,14 +426,14 @@ set_target_properties(test_basic test_numa test_cosma test_graph test_transforme
 # Custom test target to run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_basic test_numa test_cosma test_graph test_transformer ${KERNEL_TEST_TARGETS}
+    DEPENDS test_basic test_numa test_cosma test_graph ${KERNEL_TEST_TARGETS}
     COMMENT "Running all tests"
 )
 
 # Add DEBUG flag to all test targets when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     # List of all test targets
-    set(TEST_TARGETS test_basic test_numa test_cosma test_graph test_transformer)
+    set(TEST_TARGETS test_basic test_numa test_cosma test_graph)
     
     # Add any kernel test targets if they exist
     if(GTEST_FOUND)

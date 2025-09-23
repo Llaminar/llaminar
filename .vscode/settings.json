@@ -68,7 +68,8 @@
         "vector": "cpp",
         "iterator": "cpp",
         "memory_resource": "cpp",
-        "stop_token": "cpp"
+        "stop_token": "cpp",
+        "cmath": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,

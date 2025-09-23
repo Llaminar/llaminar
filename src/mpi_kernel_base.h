@@ -220,6 +220,27 @@ namespace llaminar
          * @return Shared pointer to the created tensor
          */
         std::shared_ptr<TensorBase> createLocalTensor(const std::vector<size_t> &shape) const;
+
+        /**
+         * Creates a simple tensor that's guaranteed to be compatible for MPI broadcast.
+         * Use this for tensors that will be broadcast between ranks.
+         * @param shape Vector of dimensions for the tensor
+         * @return Shared pointer to the created SimpleTensor
+         */
+        std::shared_ptr<TensorBase> createBroadcastTensor(const std::vector<size_t> &shape) const;
+
+        /**
+         * Create a distributed COSMA tensor with optimal strategy for matrix operations.
+         * @param shape Tensor shape as vector of dimensions
+         * @param label COSMA label for the tensor (A, B, or C)
+         * @param m Matrix multiplication M dimension
+         * @param n Matrix multiplication N dimension
+         * @param k Matrix multiplication K dimension
+         * @return Shared pointer to the created COSMA tensor
+         */
+        std::shared_ptr<TensorBase> createDistributedTensor(const std::vector<size_t> &shape,
+                                                            const std::string &label,
+                                                            int m, int n, int k) const;
     };
 
 } // namespace llaminar

@@ -1,7 +1,11 @@
 #include "MPILinearKernel.h"
 #include "../logger.h"
+#include "../debug_utils.h"
+#include "../adaptive_matmul.h"
 #include <algorithm>
 #include <cstring>
+#include <chrono>
+#include <omp.h>
 
 namespace llaminar
 {
@@ -23,6 +27,18 @@ namespace llaminar
         auto input = inputs[0];
         auto global_weight = inputs[1];
         auto global_output = outputs[0];
+
+        // === COMPREHENSIVE TENSOR VALIDATION ===
+        ASSERT_TENSOR_VALID(input, "Linear input");
+        ASSERT_TENSOR_VALID(global_weight, "Linear weight");
+        ASSERT_TENSOR_VALID(global_output, "Linear output");
+
+        // Check for NaN in inputs before computation
+        ASSERT_TENSOR_NOT_NAN(input, "Linear input");
+        ASSERT_TENSOR_NOT_NAN(global_weight, "Linear weight");
+
+        // Log detailed tensor information
+        TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearKernel");
 
         // Extract dimensions
         size_t seq_len = input->shape()[0];
@@ -52,14 +68,32 @@ namespace llaminar
 
         // Perform local computation using COSMA
         // Matrix multiplication: local_output = input * local_weight
-        std::vector<std::shared_ptr<TensorBase>> matmul_inputs = {input, local_weight};
-        std::vector<std::shared_ptr<TensorBase>> matmul_outputs = {local_output};
+        // Use adaptive matrix multiplication for optimal performance
+        const float *input_data = input->data();
+        const float *weight_data = local_weight->data();
+        float *output_data = local_output->data();
 
-        if (!matmul_kernel_.execute(matmul_inputs, matmul_outputs))
+        int seq_len_int = static_cast<int>(seq_len);
+        int d_model = static_cast<int>(input_size);
+        int d_out = static_cast<int>(local_output_size);
+
+        // Use adaptive matrix multiplication
+        auto start = std::chrono::high_resolution_clock::now();
+        // We pass distributed_partition=true because weights are column-partitioned across ranks.
+        // This prevents the adaptive path from invoking COSMA (which expects full global matrices)
+        // and instead uses local OpenBLAS for correctness.
+        bool matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
+                                             seq_len_int, d_out, d_model, false, 1.0f, 0.0f, false, true);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        if (!matmul_success)
         {
-            LOG_ERROR("COSMA matrix multiplication failed on rank " << getRank());
+            LOG_ERROR("Adaptive matrix multiplication failed on rank " << getRank());
             return false;
         }
+
+        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+        LOG_DEBUG("MPILinear matmul: " << ms << "ms for " << seq_len_int << "x" << d_model << " * " << d_model << "x" << d_out);
 
         // Add bias if provided
         if (local_bias)
@@ -69,6 +103,12 @@ namespace llaminar
 
         // Gather results from all processes
         gatherOutput(local_output, global_output, seq_len, output_size);
+
+        // === POST-COMPUTATION VALIDATION ===
+        ASSERT_TENSOR_NOT_NAN(global_output, "Linear output after computation");
+
+        // Log output tensor statistics
+        TensorLogger::logTensorStats(global_output, "Linear final_output", "MPILinearKernel_COMPLETE");
 
         LOG_DEBUG("MPILinearKernel executed successfully on rank " << getRank());
         return true;
@@ -91,7 +131,9 @@ namespace llaminar
 
         if (!input || !weight || !output)
         {
-            LOG_ERROR("MPILinearKernel: Null tensor provided");
+            LOG_ERROR("MPILinearKernel: Null tensor provided - input: " << (input ? "valid" : "null")
+                                                                        << ", weight: " << (weight ? "valid" : "null")
+                                                                        << ", output: " << (output ? "valid" : "null"));
             return false;
         }
 
@@ -224,13 +266,19 @@ namespace llaminar
                                        size_t seq_len, size_t local_output_size)
     {
         // Add bias to each sequence position: output[i, j] += bias[j]
+        auto omp_start = std::chrono::high_resolution_clock::now();
+#pragma omp parallel for
         for (size_t i = 0; i < seq_len; ++i)
         {
+#pragma omp simd
             for (size_t j = 0; j < local_output_size; ++j)
             {
                 output[i * local_output_size + j] += bias[j];
             }
         }
+        auto omp_end = std::chrono::high_resolution_clock::now();
+        double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
+        LOG_DEBUG("OpenMP bias addition: " << omp_time << "ms, threads: " << omp_get_max_threads() << ", rank: " << getRank());
 
         LOG_DEBUG("Local bias addition completed: [" << seq_len << ", " << local_output_size
                                                      << "] on rank " << getRank());

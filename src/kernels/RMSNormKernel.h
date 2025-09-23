@@ -1,59 +1,61 @@
+// Minimal RMSNormKernel compatibility wrapper.
+// y = x * scale / sqrt(mean(x^2) + eps)
+
 #pragma once
 
 #include <vector>
 #include <memory>
-#include <string>
-#include "../kernel_base.h"
+#include <cmath>
+#include "../tensors/tensor_base.h"
+#include "../logger.h"
 
 namespace llaminar
 {
 
-    /**
-     * @brief RMS Normalization kernel for transformer layers
-     *
-     * Implements Root Mean Square Layer Normalization:
-     * y = (x / sqrt(mean(x^2) + eps)) * weight
-     *
-     * Expected inputs:
-     * - input: [seq_len, hidden_size] - input tensor
-     * - weight: [hidden_size] - learnable scale parameters
-     *
-     * Expected outputs:
-     * - output: [seq_len, hidden_size] - normalized output tensor
-     */
-    class RMSNormKernel : public KernelBase
+    class RMSNormKernel
     {
     public:
-        RMSNormKernel();
+        RMSNormKernel(float eps = 1e-6f) : eps_(eps) {}
 
-        // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                     std::vector<std::shared_ptr<TensorBase>> &outputs) override;
-
-        bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
-
-        std::string getKernelType() const override { return "RMSNorm"; }
-        size_t getExpectedInputCount() const override { return 2; }
-        size_t getExpectedOutputCount() const override { return 1; }
-
-        // Configuration
-        void setEpsilon(float eps) { epsilon_ = eps; }
-        float getEpsilon() const { return epsilon_; }
+                     std::vector<std::shared_ptr<TensorBase>> &outputs)
+        {
+            if (inputs.size() < 1 || outputs.size() != 1)
+                return false;
+            auto X = inputs[0];
+            auto Y = outputs[0];
+            if (!X || !Y)
+                return false;
+            const float *scale = nullptr;
+            if (inputs.size() >= 2 && inputs[1])
+                scale = inputs[1]->data();
+            auto sh = X->shape();
+            if (sh.size() != 2)
+                return false;
+            int rows = (int)sh[0];
+            int dim = (int)sh[1];
+            float *out = const_cast<float *>(Y->data());
+            for (int r = 0; r < rows; ++r)
+            {
+                const float *xrow = X->data() + r * dim;
+                float mean_sq = 0.f;
+                for (int d = 0; d < dim; ++d)
+                    mean_sq += xrow[d] * xrow[d];
+                mean_sq /= dim;
+                float inv = 1.f / std::sqrt(mean_sq + eps_);
+                for (int d = 0; d < dim; ++d)
+                {
+                    float val = xrow[d] * inv;
+                    if (scale)
+                        val *= scale[d];
+                    out[r * dim + d] = val;
+                }
+            }
+            return true;
+        }
 
     private:
-        /**
-         * @brief Core RMS normalization computation
-         * @param input Input data pointer
-         * @param weight Weight data pointer
-         * @param output Output data pointer
-         * @param seq_len Sequence length
-         * @param hidden_size Hidden dimension size
-         */
-        void computeRMSNorm(const float *input, const float *weight,
-                            float *output, int seq_len, int hidden_size);
-
-        float epsilon_; ///< Small value to prevent division by zero
+        float eps_;
     };
 
 } // namespace llaminar

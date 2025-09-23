@@ -32,7 +32,6 @@ struct LlaminarParams
     std::string system_prompt = "";     // --system
     std::string chat_template = "";     // --chat-template
     bool save_conversation = false;     // --save-chat
-    int32_t max_response_tokens = 512;  // --max-response
     bool streaming_output = true;       // --stream / --no-stream
     std::string conversation_file = ""; // --load-conversation
 

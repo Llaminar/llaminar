@@ -32,6 +32,10 @@
             "env": {
                 "BRAVE_API_KEY": "${input:brave-api-key}"
             }
+        },
+        "github": {
+            "type": "http",
+            "url": "https://api.githubcopilot.com/mcp/"
         }
     }
 }

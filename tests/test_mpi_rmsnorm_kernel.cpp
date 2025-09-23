@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/kernels/MPIRMSNormKernel.h"
 #include "../src/tensors/tensor_factory.h"
-#include "../src/kernels/RMSNormKernel.h"
 #include <memory>
 #include <cmath>
 #include <random>
@@ -23,12 +22,10 @@ protected:
         }
 
         mpi_kernel = std::make_unique<MPIRMSNormKernel>();
-        sequential_kernel = std::make_unique<RMSNormKernel>();
 
         // Set the same epsilon for both kernels
         float epsilon = 1e-6f;
         mpi_kernel->setEpsilon(epsilon);
-        sequential_kernel->setEpsilon(epsilon);
 
         // Initialize random generator with fixed seed for reproducibility
         generator.seed(42);
@@ -42,31 +39,21 @@ protected:
     void fillRandomData(std::shared_ptr<TensorBase> &tensor, float min_val = -1.0f, float max_val = 1.0f)
     {
         std::uniform_real_distribution<float> dist(min_val, max_val);
-        for (auto &val : tensor->data)
+        for (int i = 0; i < tensor->size(); ++i)
         {
-            val = dist(generator);
+            tensor->data()[i] = dist(generator);
         }
     }
 
     std::shared_ptr<TensorBase> createTensor(const std::vector<size_t> &shape)
     {
         auto tensor = llaminar::TensorFactory::create_simple(std::vector<int>(shape.begin(), shape.end()));
-
-        size_t total_size = 1;
-        for (const auto &dim : shape)
-        {
-            total_size *= dim;
-        }
-
-        tensor->data.resize(total_size, 0.0f);
         return tensor;
     }
 
     std::shared_ptr<TensorBase> createTensor(const std::vector<size_t> &shape, const std::vector<float> &data)
     {
-        auto tensor = createTensor(shape);
-        EXPECT_EQ(tensor->data.size(), data.size());
-        tensor->data = data;
+        auto tensor = llaminar::TensorFactory::create_simple(std::vector<int>(shape.begin(), shape.end()), data);
         return tensor;
     }
 
@@ -95,7 +82,7 @@ protected:
     }
 
     std::unique_ptr<MPIRMSNormKernel> mpi_kernel;
-    std::unique_ptr<RMSNormKernel> sequential_kernel;
+    // Legacy non-MPI RMSNormKernel removed.
     std::mt19937 generator;
 };
 
@@ -111,8 +98,11 @@ TEST_F(MPIRMSNormKernelTest, BasicFunctionality)
     auto output = createTensor({seq_len, hidden_size});
 
     // Fill with test data
-    std::iota(input->data.begin(), input->data.end(), 1.0f);   // 1, 2, 3, 4, 5, 6, 7, 8, ...
-    std::fill(weight->data.begin(), weight->data.end(), 1.0f); // All weights = 1
+    for (int i = 0; i < input->size(); ++i)
+    {
+        input->data()[i] = static_cast<float>(i + 1); // 1, 2, 3, 4, 5, 6, 7, 8, ...
+    }
+    std::fill(weight->data(), weight->data() + weight->size(), 1.0f); // All weights = 1
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
@@ -121,9 +111,9 @@ TEST_F(MPIRMSNormKernelTest, BasicFunctionality)
 
     // Verify output is not zero and has reasonable values
     bool has_nonzero = false;
-    for (const auto &val : output->data)
+    for (int i = 0; i < output->size(); ++i)
     {
-        if (std::abs(val) > 1e-6f)
+        if (std::abs(output->data()[i]) > 1e-6f)
         {
             has_nonzero = true;
             break;
@@ -167,36 +157,6 @@ TEST_F(MPIRMSNormKernelTest, ValidationTests)
         std::vector<std::shared_ptr<TensorBase>> outputs = {output};
         EXPECT_TRUE(mpi_kernel->validate(inputs, outputs));
     }
-}
-
-TEST_F(MPIRMSNormKernelTest, CompareWithSequential)
-{
-    // Test that MPI version produces same results as sequential version
-    const size_t seq_len = 8;
-    const size_t hidden_size = 12;
-
-    // Create test tensors
-    auto input = createTensor({seq_len, hidden_size});
-    auto weight = createTensor({hidden_size});
-    auto mpi_output = createTensor({seq_len, hidden_size});
-    auto sequential_output = createTensor({seq_len, hidden_size});
-
-    // Fill with random data for comprehensive testing
-    fillRandomData(input, -2.0f, 2.0f);
-    fillRandomData(weight, 0.5f, 1.5f);
-
-    // Execute MPI version
-    std::vector<std::shared_ptr<TensorBase>> mpi_inputs = {input, weight};
-    std::vector<std::shared_ptr<TensorBase>> mpi_outputs = {mpi_output};
-    ASSERT_TRUE(mpi_kernel->execute(mpi_inputs, mpi_outputs));
-
-    // Execute sequential version
-    std::vector<std::shared_ptr<TensorBase>> seq_inputs = {input, weight};
-    std::vector<std::shared_ptr<TensorBase>> seq_outputs = {sequential_output};
-    ASSERT_TRUE(sequential_kernel->execute(seq_inputs, seq_outputs));
-
-    // Compare results - they should be identical for single process
-    assertTensorNear(*mpi_output, *sequential_output, 1e-5f);
 }
 
 TEST_F(MPIRMSNormKernelTest, DifferentSequenceLengths)

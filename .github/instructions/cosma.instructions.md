@@ -2,6 +2,7 @@
 
 ## Table of Contents
 - [Overview](#overview)
+- [Performance Analysis and Recommendations](#performance-analysis-and-recommendations)
 - [COSMA Fundamentals](#cosma-fundamentals)
 - [Tensor Formats and Data Layouts](#tensor-formats-and-data-layouts)
 - [Practical Usage Examples](#practical-usage-examples)
@@ -9,6 +10,7 @@
 - [Compute Graph Adaptation](#compute-graph-adaptation)
 - [Multi-NUMA Xeon Deployment](#multi-numa-xeon-deployment)
 - [Qwen 2.5 0.5B GGUF Integration](#qwen-25-05b-gguf-integration)
+- [Hybrid Architecture Implementation](#hybrid-architecture-implementation)
 - [Build and Configuration](#build-and-configuration)
 
 ## Overview
@@ -16,14 +18,168 @@
 This document provides comprehensive guidance for integrating COSMA (Communication-Optimal Matrix Algorithm) into the Llaminar inference engine for distributed LLM inference on multi-NUMA systems.
 
 **Key Benefits for Llaminar:**
-- Communication-optimal matrix operations (up to 8.3x speedup)
+- Communication-optimal matrix operations for large matrices (>64 token sequences)
 - NUMA-aware process distribution
 - GPU acceleration support
 - Custom compute grid for scheduling inference kernels
 - Memory-efficient tensor management
 - ScaLAPACK compatibility for existing BLAS code
+- **Hybrid deployment**: OpenBLAS for small ops, COSMA for prefill/large batch
+
+## Performance Analysis and Recommendations
+
+### Executive Summary
+
+Based on comprehensive testing with Qwen 2.5 0.5B transformer operations using 2-MPI-process configuration, COSMA shows distinct performance characteristics that inform optimal deployment strategies.
+
+### Key Performance Findings
+
+#### ❌ **Poor Performance for Single Token Generation**
+- **Q/K/V projection**: 23.07 ms/token (unacceptable for real-time chat)
+- **FFN operations**: 136.84 ms/token (prohibitively slow)
+- **Vocabulary projection**: 3,908.65 ms/token (nearly 4 seconds per token!)
+
+#### ✅ **Excellent Performance for Prefill Operations**
+
+**Efficiency Threshold**: COSMA becomes efficient (>1 GFLOPS) starting at **seq_len=64**
+
+**Peak Performance**: **56 GFLOPS** at seq_len=65,536 (FFN down projection)
+
+**Performance Scaling by Operation Type**:
+
+| Operation | seq_len=64 | seq_len=1024 | seq_len=65536 | Scaling Factor |
+|-----------|------------|--------------|---------------|----------------|
+| Q/K/V Projections (896×896) | 1.2 GFLOPS | 9.6 GFLOPS | 18.1 GFLOPS | **15x** |
+| FFN Down (4864×896) | 1.5 GFLOPS | 17.8 GFLOPS | 55.6 GFLOPS | **37x** |
+| FFN Up (896×4864) | 1.4 GFLOPS | 10.9 GFLOPS | 15.3 GFLOPS | **11x** |
+| Attention (seq_len×64) | 0.4 GFLOPS | 1.2 GFLOPS | N/A | **3x** |
+
+### Architectural Recommendations
+
+#### 1. **Hybrid Deployment Strategy**
+```cpp
+// Use OpenBLAS for:
+- Single token generation (typical inference)
+- Small batch inference (<64 tokens)
+- Real-time chat applications
+- Interactive code completion
+
+// Use COSMA for:
+- Prefill operations (>64 tokens)
+- Long document processing (>1K tokens)
+- Batch prefill (multiple sequences)
+- Training workloads
+```
+
+#### 2. **Performance Thresholds**
+- **< 64 tokens**: OpenBLAS (communication overhead dominates)
+- **64-1K tokens**: COSMA becomes competitive
+- **1K+ tokens**: Strong COSMA performance advantage
+- **16K+ tokens**: Peak COSMA efficiency range
+
+#### 3. **Memory Considerations**
+- Large sequences (65K tokens) require significant memory (1.4GB+ per operation)
+- Plan memory allocation for peak prefill scenarios
+- Consider memory-aware batching strategies
+
+#### 4. **Practical Use Cases**
+
+**COSMA Excels In**:
+- Long document processing and summarization
+- Code generation with large context windows
+- Batch prefill for multiple user requests
+- Research/analysis tasks with long prompts
+- Fine-tuning and training workloads
+
+**OpenBLAS Better For**:
+- Interactive chat (single token generation)
+- Real-time applications requiring low latency
+- Small context applications
+- Resource-constrained deployments
 
 ## COSMA Fundamentals
+
+> Important 2025-09 Update (Destination-Local Population Default)
+>
+> Earlier revisions of Llaminar attempted to populate COSMA distributed layouts by iterating all global (row, col) coordinates and calling `local_coordinates(gi, gj)` to scatter into the local buffer. For some strategies this produced severe operand distortions (large relative L2 error ~1.2 vs original) because the forward mapping was not a pure permutation – some global rows became fragmented across processes. The fix (now the default) is to populate via destination‑local iteration: iterate each process's local linear indices `li`, obtain the authoritative `(gi, gj)` with `global_coordinates(li)`, then pull the correct element from the original row‑major tensor. This guarantees exact reconstruction because it uses COSMA's inverse mapping, avoiding assumptions about forward ownership patterns.
+>
+> New behavior:
+> - Destination-local population is the default for activations and rebuilt weight matrices.
+> - Legacy forward population can be re-enabled only for regression via `LLAMINAR_COSMA_POP_FORWARD_LEGACY=1` (expect correctness failures on some strategies – use only to replicate historical bugs).
+> - Environment variable `LLAMINAR_COSMA_POP_DEST_LOCAL` is no longer required; the path is always active unless the legacy override is set.
+> - Deep diagnostic environment flags (`LLAMINAR_COSMA_DIAG_DEEP`, etc.) can be used to confirm `relA=0` and `relB=0` on large distributed shapes.
+
+### Practical GEMM Flow Inside Llaminar (Prefill Path)
+
+1. Gate: check prefill conditions (sequence length >= threshold, COSMA not disabled).
+2. Choose per-operand strategies (A: m×k, B: k×n, C: m×n) unless `LLAMINAR_COSMA_FORCE_UNIFIED` is set.
+3. (If needed) Rebuild A and/or B into COSMA layout:
+   - Allocate `CosmaMatrix` via strategy.
+   - Destination-local populate: for each local linear index li: `(gi, gj) = mat->global_coordinates(li)`; write `local[li] = src_row_major[gi*ld + gj]`.
+4. Perform distributed multiply:
+   ```cpp
+   cosma::multiply(*A.mat, *B.mat, *C.mat, stratC, MPI_COMM_WORLD, alpha, beta);
+   ```
+5. Convert result back to row-major only when leaving COSMA domain (e.g., handing off to elementwise kernels still implemented in row-major).
+6. Reconstruction for diagnostics or fallback uses either gather-based triplet collection or brute force (only in debug flags). Production path avoids reconstruction unless explicitly requested.
+
+### Translating Between Row-Major and COSMA Layout
+
+| Direction | Method | Notes |
+|-----------|--------|-------|
+| Row-major → COSMA | Destination-local population (default) | Exact; O(local_n) per rank; no global coordination required. |
+| COSMA → Row-major (output) | `reconstruct_matrix(view, dst, normalize=false)` | For result C we skip normalization unless duplicates expected. |
+| COSMA → Row-major (inputs, diagnostics) | `reconstruct_matrix(view, dst, normalize=true)` | Normalization divides by replication counts. |
+| Row-major reference vs distributed | `LLAMINAR_COSMA_COMPARE_REPLICATED=1` | Rank 0 forms reference GEMM, compares rel L2. |
+
+Minimal snippet illustrating end-to-end mapping in current pipeline:
+```cpp
+CosmaView A = allocate_matrix('A', m, k, stratA, false);
+// destination-local populate
+float *a_local = A.mat->matrix_pointer(); size_t asz = A.mat->matrix_size();
+for (size_t li=0; li<asz; ++li) {
+    auto gc = A.mat->global_coordinates((int)li);
+    int gi = gc.first, gj = gc.second;
+    if (gi < m && gj < k) a_local[li] = A_row_major[ (size_t)gi * k + gj ];
+}
+
+CosmaView B = allocate_matrix('B', k, n, stratB, false);
+float *b_local = B.mat->matrix_pointer(); size_t bsz = B.mat->matrix_size();
+for (size_t li=0; li<bsz; ++li) {
+    auto gc = B.mat->global_coordinates((int)li);
+    int gi = gc.first, gj = gc.second; // B dims k x n
+    if (gi < k && gj < n) b_local[li] = B_row_major[ (size_t)gi * n + gj ];
+}
+
+CosmaView C = allocate_matrix('C', m, n, stratC, true /* zero if beta==0 */);
+cosma::multiply(*A.mat, *B.mat, *C.mat, stratC, MPI_COMM_WORLD, alpha, beta);
+
+// Convert C back to row-major for downstream (if needed)
+std::vector<float> C_row_major((size_t)m * n);
+reconstruct_matrix(C, C_row_major.data(), false);
+```
+
+### When to Reconstruct
+- Only reconstruct outputs crossing from distributed linear algebra into unfused elementwise kernels (e.g., softmax, RMSNorm) until those are COSMA-native.
+- Keep intermediate projections (Q/K/V, MLP up/down) in COSMA layout across chained GEMMs to avoid back-and-forth conversions.
+- Use validation / compare flags only in debug or CI; disable for performance benchmarking.
+
+### Key Environment Flags (Population / Reconstruction)
+| Flag | Purpose | Current Default |
+|------|---------|-----------------|
+| `LLAMINAR_COSMA_POP_FORWARD_LEGACY` | Force old forward (global->local) scatter (may be incorrect) | Off |
+| `LLAMINAR_COSMA_COMPARE_REPLICATED` | Post-multiply rel L2 vs row-major reference | Off |
+| `LLAMINAR_COSMA_DIAG_DEEP` | Emit deep operand reconstruction & stats | Off |
+| `LLAMINAR_COSMA_DIAG_RECON_BRUTE` | Brute-force reconstruction path for debugging | Off |
+| `LLAMINAR_COSMA_RECON_FORCE_LEGACY` | Force legacy (non-gather) reconstruction | Off |
+
+### Gotchas & Lessons Learned
+1. Forward scatter using `local_coordinates` can silently mis-map data under certain strategies—always prefer inverse mapping for initial population.
+2. Reconstruction correctness does not guarantee population correctness; validate operands pre-GEMM when introducing new layouts.
+3. Keep population O(local_n); avoid global loops (m*n) that add unnecessary cost on large matrices.
+4. Once correctness is proven, reduce INFO-level logging to minimize noise; retain TRACE gates for forensic debugging.
+5. Always bracket COSMA collectives with `MPI_Barrier` for deterministic timing in diagnostics phases (not required for correctness, but reduces variance).
+
 
 ### What COSMA Provides
 
@@ -1109,6 +1265,390 @@ private:
 
 } // namespace llaminar
 ```
+
+## Hybrid Architecture Implementation
+
+### Adaptive Matrix Multiplication Backend
+
+Based on the performance analysis, Llaminar should use an adaptive approach that selects the optimal backend based on operation characteristics:
+
+```cpp
+// adaptive_matmul.hpp
+#pragma once
+
+#include <memory>
+#include <cblas.h>
+#include <cosma/multiply.hpp>
+#include "kernels/MatMulKernel.h"
+
+namespace llaminar {
+
+enum class MatMulBackend {
+    OPENBLAS,    // For small operations and single token inference
+    COSMA        // For large operations and prefill
+};
+
+class AdaptiveMatMulManager {
+private:
+    std::unique_ptr<MatMulKernel> cosma_kernel_;
+    bool mpi_initialized_;
+    int mpi_rank_, mpi_size_;
+    
+    // Performance thresholds based on empirical testing
+    static constexpr size_t COSMA_MIN_ELEMENTS = 57344;  // 64 * 896 (seq_len=64, hidden=896)
+    static constexpr size_t COSMA_MIN_SEQ_LEN = 64;      // Minimum sequence length for COSMA efficiency
+    static constexpr double MEMORY_LIMIT_GB = 8.0;       // Max memory per process for COSMA
+    
+public:
+    AdaptiveMatMulManager() {
+        int flag;
+        MPI_Initialized(&flag);
+        mpi_initialized_ = (flag != 0);
+        
+        if (mpi_initialized_) {
+            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank_);
+            MPI_Comm_size(MPI_COMM_WORLD, &mpi_size_);
+            
+            // Initialize COSMA kernel for distributed operations
+            cosma_kernel_ = std::make_unique<MatMulKernel>();
+            cosma_kernel_->setStrategy("auto");
+        }
+    }
+    
+    // Determine optimal backend based on operation characteristics
+    MatMulBackend selectBackend(int m, int n, int k, bool is_prefill = false) {
+        // Always use OpenBLAS if MPI is not available
+        if (!mpi_initialized_ || mpi_size_ == 1) {
+            return MatMulBackend::OPENBLAS;
+        }
+        
+        size_t total_elements = static_cast<size_t>(m) * n * k;
+        size_t memory_usage_gb = (static_cast<size_t>(m) * k + k * n + m * n) * sizeof(float) / (1024 * 1024 * 1024);
+        
+        // Use COSMA for large operations or prefill scenarios
+        if (is_prefill && m >= COSMA_MIN_SEQ_LEN) {
+            return MatMulBackend::COSMA;
+        }
+        
+        // Use COSMA for large matrix operations (good compute-to-communication ratio)
+        if (total_elements >= COSMA_MIN_ELEMENTS && memory_usage_gb <= MEMORY_LIMIT_GB) {
+            return MatMulBackend::COSMA;
+        }
+        
+        // Default to OpenBLAS for small operations
+        return MatMulBackend::OPENBLAS;
+    }
+    
+    // High-level matrix multiplication interface
+    bool multiply(const float* A, const float* B, float* C,
+                  int m, int n, int k,
+                  bool transpose_A = false, bool transpose_B = false,
+                  float alpha = 1.0f, float beta = 0.0f,
+                  bool is_prefill = false) {
+        
+        MatMulBackend backend = selectBackend(m, n, k, is_prefill);
+        
+        if (mpi_rank_ == 0) {
+            LOG_DEBUG("Using " << (backend == MatMulBackend::COSMA ? "COSMA" : "OpenBLAS") 
+                     << " for matmul: " << m << "x" << n << "x" << k 
+                     << (is_prefill ? " (prefill)" : " (inference)"));
+        }
+        
+        switch (backend) {
+            case MatMulBackend::COSMA:
+                return multiply_cosma(A, B, C, m, n, k, transpose_A, transpose_B, alpha, beta);
+            case MatMulBackend::OPENBLAS:
+                return multiply_openblas(A, B, C, m, n, k, transpose_A, transpose_B, alpha, beta);
+        }
+        
+        return false;
+    }
+    
+private:
+    bool multiply_cosma(const float* A, const float* B, float* C,
+                       int m, int n, int k,
+                       bool transpose_A, bool transpose_B,
+                       float alpha, float beta) {
+        
+        // Create tensor wrappers for COSMA kernel
+        auto tensor_A = TensorFactory::create_simple({m, k}, 
+            std::vector<float>(A, A + m * k));
+        auto tensor_B = TensorFactory::create_simple({k, n},
+            std::vector<float>(B, B + k * n));
+        auto tensor_C = TensorFactory::create_simple({m, n},
+            std::vector<float>(C, C + m * n));
+        
+        std::vector<std::shared_ptr<TensorBase>> inputs = {tensor_A, tensor_B};
+        std::vector<std::shared_ptr<TensorBase>> outputs = {tensor_C};
+        
+        bool success = cosma_kernel_->execute(inputs, outputs);
+        
+        // Copy result back
+        if (success) {
+            const float* result = tensor_C->data();
+            std::copy(result, result + m * n, C);
+        }
+        
+        return success;
+    }
+    
+    bool multiply_openblas(const float* A, const float* B, float* C,
+                          int m, int n, int k,
+                          bool transpose_A, bool transpose_B,
+                          float alpha, float beta) {
+        
+        // Use single-threaded OpenBLAS to avoid conflicts with MPI
+        openblas_set_num_threads(1);
+        
+        CBLAS_TRANSPOSE trans_A = transpose_A ? CblasTrans : CblasNoTrans;
+        CBLAS_TRANSPOSE trans_B = transpose_B ? CblasTrans : CblasNoTrans;
+        
+        int lda = transpose_A ? m : k;
+        int ldb = transpose_B ? k : n;
+        int ldc = n;
+        
+        cblas_sgemm(CblasRowMajor, trans_A, trans_B,
+                    m, n, k,
+                    alpha, A, lda,
+                    B, ldb,
+                    beta, C, ldc);
+        
+        return true;
+    }
+};
+
+} // namespace llaminar
+```
+
+### Transformer Pipeline Integration
+
+Integrate the adaptive backend into the transformer pipeline:
+
+```cpp
+// adaptive_transformer_pipeline.hpp
+#pragma once
+
+#include "adaptive_matmul.hpp"
+#include "mpi_transformer_pipeline.h"
+
+namespace llaminar {
+
+class AdaptiveTransformerPipeline : public MPITransformerPipeline {
+private:
+    std::unique_ptr<AdaptiveMatMulManager> matmul_manager_;
+    
+public:
+    AdaptiveTransformerPipeline(const TransformerLayerConfig& config) 
+        : MPITransformerPipeline(config) {
+        matmul_manager_ = std::make_unique<AdaptiveMatMulManager>();
+    }
+    
+    // Override matrix operations to use adaptive backend
+    std::shared_ptr<TensorBase> computeAttentionProjection(
+        const std::shared_ptr<TensorBase>& input,
+        const std::shared_ptr<TensorBase>& weight,
+        bool is_prefill = false) override {
+        
+        const auto& input_shape = input->shape();
+        const auto& weight_shape = weight->shape();
+        
+        int seq_len = input_shape[0];
+        int hidden_dim = input_shape[1];
+        int output_dim = weight_shape[1];
+        
+        // Create output tensor
+        auto output = TensorFactory::create_simple({seq_len, output_dim});
+        
+        // Use adaptive matrix multiplication
+        bool success = matmul_manager_->multiply(
+            input->data(), weight->data(), const_cast<float*>(output->data()),
+            seq_len, output_dim, hidden_dim,
+            false, false, 1.0f, 0.0f, is_prefill
+        );
+        
+        if (!success) {
+            throw std::runtime_error("Adaptive matrix multiplication failed");
+        }
+        
+        return output;
+    }
+    
+    // Override FFN computation to use adaptive backend
+    std::shared_ptr<TensorBase> computeFFN(
+        const std::shared_ptr<TensorBase>& input,
+        const std::shared_ptr<TensorBase>& gate_weight,
+        const std::shared_ptr<TensorBase>& up_weight,
+        const std::shared_ptr<TensorBase>& down_weight,
+        bool is_prefill = false) override {
+        
+        const auto& input_shape = input->shape();
+        int seq_len = input_shape[0];
+        int hidden_dim = input_shape[1];
+        int intermediate_dim = gate_weight->shape()[1];
+        
+        // Gate projection (SwiGLU)
+        auto gate_proj = TensorFactory::create_simple({seq_len, intermediate_dim});
+        matmul_manager_->multiply(
+            input->data(), gate_weight->data(), const_cast<float*>(gate_proj->data()),
+            seq_len, intermediate_dim, hidden_dim,
+            false, false, 1.0f, 0.0f, is_prefill
+        );
+        
+        // Up projection
+        auto up_proj = TensorFactory::create_simple({seq_len, intermediate_dim});
+        matmul_manager_->multiply(
+            input->data(), up_weight->data(), const_cast<float*>(up_proj->data()),
+            seq_len, intermediate_dim, hidden_dim,
+            false, false, 1.0f, 0.0f, is_prefill
+        );
+        
+        // Apply SwiGLU activation: gate_proj * silu(up_proj)
+        applySwiGLU(gate_proj, up_proj);
+        
+        // Down projection
+        auto output = TensorFactory::create_simple({seq_len, hidden_dim});
+        matmul_manager_->multiply(
+            gate_proj->data(), down_weight->data(), const_cast<float*>(output->data()),
+            seq_len, hidden_dim, intermediate_dim,
+            false, false, 1.0f, 0.0f, is_prefill
+        );
+        
+        return output;
+    }
+    
+    // Override prefill to mark operations as prefill
+    std::vector<int> generateTokens(const std::vector<int>& prompt_tokens, 
+                                   int max_new_tokens) override {
+        
+        // Process prefill with COSMA (if beneficial)
+        auto prefill_output = forwardPrefill(prompt_tokens, true);  // is_prefill=true
+        
+        // Process autoregressive generation with OpenBLAS
+        std::vector<int> generated_tokens;
+        auto current_hidden = prefill_output;
+        
+        for (int i = 0; i < max_new_tokens; ++i) {
+            // Single token generation - use OpenBLAS
+            auto next_hidden = forwardSingleToken(current_hidden, false);  // is_prefill=false
+            
+            // Sample next token
+            int next_token = sampleToken(next_hidden);
+            if (next_token == getEOSToken()) break;
+            
+            generated_tokens.push_back(next_token);
+            current_hidden = next_hidden;
+        }
+        
+        return generated_tokens;
+    }
+
+private:
+    void applySwiGLU(std::shared_ptr<TensorBase>& gate, 
+                     const std::shared_ptr<TensorBase>& up) {
+        // Apply SwiGLU activation in-place
+        float* gate_data = const_cast<float*>(gate->data());
+        const float* up_data = up->data();
+        
+        size_t total_elements = gate->getTotalElements();
+        
+        for (size_t i = 0; i < total_elements; ++i) {
+            float x = up_data[i];
+            float silu = x / (1.0f + std::exp(-x));  // SiLU activation
+            gate_data[i] *= silu;
+        }
+    }
+};
+
+} // namespace llaminar
+```
+
+### Usage Example
+
+```cpp
+// main.cpp - Updated to use adaptive architecture
+#include "adaptive_transformer_pipeline.hpp"
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+    
+    // Load model configuration
+    TransformerLayerConfig config = loadQwenConfig();
+    
+    // Create adaptive transformer pipeline
+    auto pipeline = std::make_unique<AdaptiveTransformerPipeline>(config);
+    
+    // Load model weights
+    auto weights = loadModelWeights("qwen2.5-0.5b.gguf");
+    pipeline->loadWeights(weights);
+    
+    // Example usage scenarios
+    std::vector<int> short_prompt = {1, 2, 3, 4};           // 4 tokens - uses OpenBLAS
+    std::vector<int> long_prompt = get_long_document();      // >64 tokens - uses COSMA for prefill
+    
+    // Short prompt processing (fast, low latency)
+    auto short_response = pipeline->generateTokens(short_prompt, 50);
+    
+    // Long document processing (high throughput)
+    auto long_response = pipeline->generateTokens(long_prompt, 200);
+    
+    MPI_Finalize();
+    return 0;
+}
+```
+
+### Performance Monitoring
+
+```cpp
+// performance_monitor.hpp
+#pragma once
+
+namespace llaminar {
+
+class PerformanceMonitor {
+private:
+    struct OperationStats {
+        size_t count = 0;
+        double total_time_ms = 0.0;
+        double min_time_ms = std::numeric_limits<double>::max();
+        double max_time_ms = 0.0;
+    };
+    
+    std::map<std::string, OperationStats> backend_stats_;
+    
+public:
+    void recordOperation(const std::string& backend, double time_ms) {
+        auto& stats = backend_stats_[backend];
+        stats.count++;
+        stats.total_time_ms += time_ms;
+        stats.min_time_ms = std::min(stats.min_time_ms, time_ms);
+        stats.max_time_ms = std::max(stats.max_time_ms, time_ms);
+    }
+    
+    void printSummary() {
+        std::cout << "\n=== Adaptive Backend Performance Summary ===\n";
+        for (const auto& [backend, stats] : backend_stats_) {
+            double avg_time = stats.total_time_ms / stats.count;
+            std::cout << backend << ":\n";
+            std::cout << "  Operations: " << stats.count << "\n";
+            std::cout << "  Avg time: " << avg_time << " ms\n";
+            std::cout << "  Min time: " << stats.min_time_ms << " ms\n";
+            std::cout << "  Max time: " << stats.max_time_ms << " ms\n";
+            std::cout << "  Total time: " << stats.total_time_ms << " ms\n\n";
+        }
+    }
+};
+
+} // namespace llaminar
+```
+
+### Configuration Guidelines
+
+1. **Threshold Tuning**: Adjust `COSMA_MIN_ELEMENTS` and `COSMA_MIN_SEQ_LEN` based on your hardware
+2. **Memory Management**: Monitor memory usage for large sequences and adjust limits accordingly
+3. **MPI Configuration**: Use 1 process per NUMA node for optimal performance
+4. **Profiling**: Enable performance monitoring to validate backend selection decisions
+
+This hybrid architecture provides the best of both worlds: low-latency inference for interactive use cases and high-throughput processing for large documents and batch scenarios.
 
 
 ## Build and Configuration

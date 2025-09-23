@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../mpi_kernel_base.h"
-#include "MatMulKernel.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -118,8 +117,6 @@ namespace llaminar
          */
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
-
-        MatMulKernel matmul_kernel_; // COSMA-powered matrix multiplication
     };
 
 } // namespace llaminar

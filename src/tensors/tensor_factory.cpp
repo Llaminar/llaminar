@@ -62,9 +62,8 @@ namespace llaminar
 
         bool should_use_cosma = false;
 
-        if (mpi_size > 1 && shape.size() == 2)
+        if (mpi_initialized && mpi_size > 1)
         {
-            // Calculate total elements
             long total_elements = 1;
             for (int dim : shape)
             {
@@ -73,7 +72,15 @@ namespace llaminar
 
             // Use COSMA for large matrices or when explicitly preferred
             const long COSMA_THRESHOLD = 256 * 256; // 64K elements threshold
-            should_use_cosma = (total_elements >= COSMA_THRESHOLD) || prefer_distributed;
+
+            // Additional constraints for COSMA - minimum dimensions for distribution
+            bool has_sufficient_rows = (shape.size() >= 2 && shape[0] >= mpi_size);
+            bool has_sufficient_cols = (shape.size() >= 2 && shape[1] >= mpi_size);
+            bool dimensions_suitable = has_sufficient_rows || has_sufficient_cols;
+
+            should_use_cosma = (total_elements >= COSMA_THRESHOLD) &&
+                               dimensions_suitable &&
+                               prefer_distributed;
         }
 
         if (should_use_cosma)

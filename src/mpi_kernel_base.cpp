@@ -227,8 +227,52 @@ namespace llaminar
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());
-        // Use TensorFactory to create a modern tensor
+
+        // For multi-process MPI execution, prefer COSMA tensors for optimal distributed performance
+        if (size_ > 1 && shape.size() == 2)
+        {
+            // Create COSMA tensor for matrix operations
+            std::string label = "rank_" + std::to_string(rank_) + "_tensor";
+            return TensorFactory::create_cosma(int_shape, label, rank_);
+        }
+        else
+        {
+            // Single process or non-matrix tensors use SimpleTensor
+            return TensorFactory::create_simple(int_shape);
+        }
+    }
+
+    std::shared_ptr<TensorBase> MPIKernelBase::createBroadcastTensor(const std::vector<size_t> &shape) const
+    {
+        // Convert size_t vector to int vector for TensorFactory
+        std::vector<int> int_shape(shape.begin(), shape.end());
+
+        // Always use SimpleTensor for broadcast tensors to ensure compatibility
+        // between all MPI ranks (avoids buffer size mismatches during MPI_Bcast)
         return TensorFactory::create_simple(int_shape);
+    }
+
+    std::shared_ptr<TensorBase> MPIKernelBase::createDistributedTensor(const std::vector<size_t> &shape,
+                                                                       const std::string &label,
+                                                                       int m, int n, int k) const
+    {
+        // Convert size_t vector to int vector for TensorFactory
+        std::vector<int> int_shape(shape.begin(), shape.end());
+
+        if (shape.size() != 2)
+        {
+            LOG_WARN("createDistributedTensor called for non-matrix shape, falling back to simple tensor");
+            return TensorFactory::create_simple(int_shape);
+        }
+
+        // Create COSMA strategy optimized for the specific matrix multiplication
+        cosma::Strategy strategy(m, n, k, size_);
+
+        // Create COSMA tensor with optimal strategy
+        auto cosma_tensor = std::make_shared<COSMATensor>(int_shape, label, strategy, rank_, comm_);
+
+        LOG_DEBUG("Created distributed COSMA tensor [" << m << "x" << n << "] with strategy for " << size_ << " processes");
+        return cosma_tensor;
     }
 
 } // namespace llaminar

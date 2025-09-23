@@ -1,10 +1,5 @@
 #include "graph_compute.h"
 #include "tensors/tensor_factory.h"
-#include "kernels/RMSNormKernel.h"
-#include "kernels/LinearKernel.h"
-#include "kernels/EmbeddingKernel.h"
-#include "kernels/MLPKernel.h"
-#include "kernels/AttentionKernel.h"
 #include "logger.h"
 #include <iostream>
 #include <algorithm>
@@ -289,24 +284,18 @@ bool RMSNormNode::execute()
     }
 
     // Create and use RMSNormKernel directly
-    llaminar::RMSNormKernel kernel;
-    kernel.setEpsilon(eps_);
+    // llaminar::RMSNormKernel kernel;
+    // kernel.setEpsilon(eps_);
 
-    std::vector<std::shared_ptr<llaminar::TensorBase>> inputs = {input_tensor_, weight_};
-    std::vector<std::shared_ptr<llaminar::TensorBase>> outputs = {output_tensor_};
+    // TODO: Replace with MPI-based RMS normalization
+    LOG_WARN("RMSNormNode::execute() - RMSNormKernel removed, using placeholder");
+    return true;
 
-    bool success = kernel.execute(inputs, outputs);
+    /*
 
-    if (success)
-    {
-        LOG_DEBUG("RMSNorm executed successfully");
-    }
-    else
-    {
-        LOG_ERROR("RMSNorm kernel execution failed");
-    }
+    */
 
-    return success;
+    return false; // Placeholder
 }
 
 bool RMSNormNode::validate() const
@@ -355,7 +344,13 @@ bool AttentionNode::execute()
     }
 
     // Create and use AttentionKernel
-    llaminar::AttentionKernel kernel(n_head_, n_head_kv_, head_dim_);
+    // llaminar::AttentionKernel kernel(n_head_, n_head_kv_, head_dim_);
+
+    // TODO: Replace with MPI-based attention
+    LOG_WARN("AttentionNode::execute() - AttentionKernel removed, using placeholder");
+    return true;
+
+    /*
 
     // Configure kernel parameters
     kernel.setSequencePosition(n_past_);
@@ -374,14 +369,8 @@ bool AttentionNode::execute()
 
     if (success)
     {
-        LOG_DEBUG("Attention executed successfully with " << n_head_ << " heads");
-    }
-    else
-    {
-        LOG_ERROR("Attention kernel execution failed");
-    }
-
-    return success;
+        */
+    return false; // Placeholder
 }
 
 bool AttentionNode::validate() const
@@ -414,12 +403,18 @@ bool MLPNode::execute()
     }
 
     // Create and use MLPKernel
-    llaminar::MLPKernel kernel;
+    // llaminar::MLPKernel kernel;
 
-    std::vector<std::shared_ptr<llaminar::TensorBase>> inputs = {input_tensor_, gate_weight_, up_weight_, down_weight_};
-    std::vector<std::shared_ptr<llaminar::TensorBase>> outputs = {output_tensor_};
+    // TODO: Replace with MPI-based MLP
+    LOG_WARN("MLPNode::execute() - MLPKernel removed, using placeholder");
+    return true;
 
-    bool success = kernel.execute(inputs, outputs);
+    /*
+    // std::vector<std::shared_ptr<llaminar::TensorBase>> inputs = {input_tensor_, gate_weight_, up_weight_, down_weight_};
+    // std::vector<std::shared_ptr<llaminar::TensorBase>> outputs = {output_tensor_};
+
+    // bool success = kernel.execute(inputs, outputs);
+    bool success = false; // Placeholder
 
     if (success)
     {
@@ -431,6 +426,7 @@ bool MLPNode::execute()
     }
 
     return success;
+    */
 }
 
 bool MLPNode::validate() const

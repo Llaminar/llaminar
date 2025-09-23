@@ -1,4 +1,5 @@
 #include "MPIMLPKernel.h"
+#include "../adaptive_matmul.h"
 #include "../logger.h"
 #include <algorithm>
 #include <cmath>
@@ -143,15 +144,13 @@ namespace llaminar
                                              std::shared_ptr<TensorBase> &gate_output,
                                              size_t seq_len, size_t d_model, size_t local_d_ff)
     {
-        // Use COSMA for distributed matrix multiplication: gate_output = input * w_gate
+        // Use adaptive matrix multiplication: gate_output = input * w_gate
         // input: [seq_len, d_model], w_gate: [d_model, local_d_ff] -> gate_output: [seq_len, local_d_ff]
-        std::vector<std::shared_ptr<TensorBase>> inputs = {input, w_gate};
-        std::vector<std::shared_ptr<TensorBase>> outputs = {gate_output};
-
-        if (!matmul_kernel_.execute(inputs, outputs))
+        if (!adaptive_matmul(input->data(), w_gate->data(), gate_output->data(),
+                             seq_len, local_d_ff, d_model, false))
         {
-            LOG_ERROR("MPIMLPKernel: Gate projection COSMA multiplication failed");
-            throw std::runtime_error("Gate projection COSMA multiplication failed");
+            LOG_ERROR("MPIMLPKernel: Gate projection matrix multiplication failed");
+            throw std::runtime_error("Gate projection matrix multiplication failed");
         }
 
         LOG_DEBUG("Rank " << rank_ << " completed gate projection: ["
@@ -164,15 +163,13 @@ namespace llaminar
                                            std::shared_ptr<TensorBase> &up_output,
                                            size_t seq_len, size_t d_model, size_t local_d_ff)
     {
-        // Use COSMA for distributed matrix multiplication: up_output = input * w_up
+        // Use adaptive matrix multiplication: up_output = input * w_up
         // input: [seq_len, d_model], w_up: [d_model, local_d_ff] -> up_output: [seq_len, local_d_ff]
-        std::vector<std::shared_ptr<TensorBase>> inputs = {input, w_up};
-        std::vector<std::shared_ptr<TensorBase>> outputs = {up_output};
-
-        if (!matmul_kernel_.execute(inputs, outputs))
+        if (!adaptive_matmul(input->data(), w_up->data(), up_output->data(),
+                             seq_len, local_d_ff, d_model, false))
         {
-            LOG_ERROR("MPIMLPKernel: Up projection COSMA multiplication failed");
-            throw std::runtime_error("Up projection COSMA multiplication failed");
+            LOG_ERROR("MPIMLPKernel: Up projection matrix multiplication failed");
+            throw std::runtime_error("Up projection matrix multiplication failed");
         }
 
         LOG_DEBUG("Rank " << rank_ << " completed up projection: ["
@@ -192,9 +189,17 @@ namespace llaminar
         float *output_data = activated_output->data();
 
         size_t total_elements = seq_len * local_d_ff;
-        for (size_t i = 0; i < total_elements; ++i)
-        {
-            output_data[i] = silu(gate_data[i]) * up_data[i];
+        // OpenMP parallelization: use single thread for very small ops to avoid overhead
+        if (total_elements < 8192) {
+            for (size_t i = 0; i < total_elements; ++i) {
+                output_data[i] = silu(gate_data[i]) * up_data[i];
+            }
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < total_elements; ++i) {
+                // vectorization hint
+                output_data[i] = silu(gate_data[i]) * up_data[i];
+            }
         }
 
         LOG_DEBUG("Rank " << rank_ << " completed SwiGLU activation for "
@@ -206,15 +211,13 @@ namespace llaminar
                                              std::shared_ptr<TensorBase> &local_output,
                                              size_t seq_len, size_t local_d_ff, size_t d_model)
     {
-        // Use COSMA for distributed matrix multiplication: local_output = activated_input * w_down
+        // Use adaptive matrix multiplication: local_output = activated_input * w_down
         // activated_input: [seq_len, local_d_ff], w_down: [local_d_ff, d_model] -> local_output: [seq_len, d_model]
-        std::vector<std::shared_ptr<TensorBase>> inputs = {activated_input, w_down};
-        std::vector<std::shared_ptr<TensorBase>> outputs = {local_output};
-
-        if (!matmul_kernel_.execute(inputs, outputs))
+        if (!adaptive_matmul(activated_input->data(), w_down->data(), local_output->data(),
+                             seq_len, d_model, local_d_ff, false))
         {
-            LOG_ERROR("MPIMLPKernel: Down projection COSMA multiplication failed");
-            throw std::runtime_error("Down projection COSMA multiplication failed");
+            LOG_ERROR("MPIMLPKernel: Down projection matrix multiplication failed");
+            throw std::runtime_error("Down projection matrix multiplication failed");
         }
 
         LOG_DEBUG("Rank " << rank_ << " completed down projection: ["

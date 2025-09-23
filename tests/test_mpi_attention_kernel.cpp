@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/kernels/MPIAttentionKernel.h"
 #include "../src/tensors/tensor_factory.h"
-#include "../src/kernels/AttentionKernel.h"
 #include <memory>
 #include <cmath>
 #include <random>
@@ -28,7 +27,6 @@ protected:
         const int head_dim = 64;
 
         mpi_kernel = std::make_unique<MPIAttentionKernel>(n_head, n_head_kv, head_dim);
-        sequential_kernel = std::make_unique<AttentionKernel>(n_head, n_head_kv, head_dim);
 
         // Initialize random generator with fixed seed for reproducibility
         generator.seed(42);
@@ -42,56 +40,55 @@ protected:
     void fillRandomData(std::shared_ptr<TensorBase> &tensor, float min_val = -1.0f, float max_val = 1.0f)
     {
         std::uniform_real_distribution<float> dist(min_val, max_val);
-        for (auto &val : tensor->data)
+        for (int i = 0; i < tensor->size(); ++i)
         {
-            val = dist(generator);
+            tensor->data()[i] = dist(generator);
         }
     }
 
     std::shared_ptr<TensorBase> createTensor(const std::vector<size_t> &shape)
     {
-        auto tensor = llaminar::llaminar::TensorFactory::create_simple();
-
-        // Convert size_t to int for shape
-        tensor->shape.reserve(shape.size());
+        // Convert size_t to int for TensorFactory
+        std::vector<int> int_shape;
+        int_shape.reserve(shape.size());
         for (const auto &dim : shape)
         {
-            tensor->shape.push_back(static_cast<int>(dim));
+            int_shape.push_back(static_cast<int>(dim));
         }
 
-        size_t total_size = 1;
-        for (const auto &dim : shape)
-        {
-            total_size *= dim;
-        }
-
-        tensor->data.resize(total_size, 0.0f);
+        auto tensor = llaminar::TensorFactory::create_simple(int_shape);
         return tensor;
     }
 
     std::shared_ptr<TensorBase> createTensor(const std::vector<size_t> &shape, const std::vector<float> &data)
     {
-        auto tensor = createTensor(shape);
-        EXPECT_EQ(tensor->data.size(), data.size());
-        tensor->data = data;
+        // Convert size_t to int for TensorFactory
+        std::vector<int> int_shape;
+        int_shape.reserve(shape.size());
+        for (const auto &dim : shape)
+        {
+            int_shape.push_back(static_cast<int>(dim));
+        }
+
+        auto tensor = llaminar::TensorFactory::create_simple(int_shape, data);
         return tensor;
     }
 
-    void assertTensorNear(const Tensor &actual, const Tensor &expected, float tolerance = 1e-4f)
+    void assertTensorNear(const TensorBase &actual, const TensorBase &expected, float tolerance = 1e-4f)
     {
-        ASSERT_EQ(actual.shape, expected.shape);
-        ASSERT_EQ(actual.data.size(), expected.data.size());
+        ASSERT_EQ(actual.shape(), expected.shape());
+        ASSERT_EQ(actual.size(), expected.size());
 
-        for (size_t i = 0; i < expected.data.size(); ++i)
+        for (int i = 0; i < expected.size(); ++i)
         {
-            EXPECT_NEAR(actual.data[i], expected.data[i], tolerance)
-                << "Mismatch at index " << i << ": expected " << expected.data[i]
-                << ", got " << actual.data[i];
+            EXPECT_NEAR(actual.data()[i], expected.data()[i], tolerance)
+                << "Mismatch at index " << i << ": expected " << expected.data()[i]
+                << ", got " << actual.data()[i];
         }
     }
 
     std::unique_ptr<MPIAttentionKernel> mpi_kernel;
-    std::unique_ptr<AttentionKernel> sequential_kernel;
+    // Legacy non-MPI AttentionKernel removed.
     std::mt19937 generator;
 };
 
@@ -114,7 +111,10 @@ TEST_F(MPIAttentionKernelTest, BasicFunctionality)
     auto output = createTensor({seq_len, d_model});
 
     // Fill with simple test data
-    std::iota(input->data.begin(), input->data.end(), 0.01f);
+    for (int i = 0; i < input->size(); ++i)
+    {
+        input->data()[i] = 0.01f * (i + 1);
+    }
     fillRandomData(wq, -0.01f, 0.01f); // Scale down from -0.1, 0.1 to -0.01, 0.01
     fillRandomData(wk, -0.01f, 0.01f);
     fillRandomData(wv, -0.01f, 0.01f);
@@ -128,8 +128,9 @@ TEST_F(MPIAttentionKernelTest, BasicFunctionality)
     // Verify output is not zero and has reasonable values
     bool has_nonzero = false;
     bool has_reasonable_values = true;
-    for (const auto &val : output->data)
+    for (int i = 0; i < output->size(); ++i)
     {
+        float val = output->data()[i];
         if (std::abs(val) > 1e-6f)
         {
             has_nonzero = true;
@@ -269,13 +270,13 @@ TEST_F(MPIAttentionKernelTest, DifferentSequenceLengths)
             << "Failed for seq_len=" << seq_len;
 
         // Verify output has expected shape and non-zero values
-        EXPECT_EQ(output->shape[0], seq_len);
-        EXPECT_EQ(output->shape[1], d_model);
+        EXPECT_EQ(output->shape()[0], seq_len);
+        EXPECT_EQ(output->shape()[1], d_model);
 
         bool has_nonzero = false;
-        for (const auto &val : output->data)
+        for (int i = 0; i < output->size(); ++i)
         {
-            if (std::abs(val) > 1e-6f)
+            if (std::abs(output->data()[i]) > 1e-6f)
             {
                 has_nonzero = true;
                 break;
@@ -304,11 +305,11 @@ TEST_F(MPIAttentionKernelTest, ConsistencyAcrossRuns)
     auto output2 = createTensor({seq_len, d_model});
 
     // Set deterministic input data
-    std::fill(input->data.begin(), input->data.end(), 0.5f);
-    std::fill(wq->data.begin(), wq->data.end(), 0.1f);
-    std::fill(wk->data.begin(), wk->data.end(), 0.1f);
-    std::fill(wv->data.begin(), wv->data.end(), 0.1f);
-    std::fill(wo->data.begin(), wo->data.end(), 0.1f);
+    std::fill(input->data(), input->data() + input->size(), 0.5f);
+    std::fill(wq->data(), wq->data() + wq->size(), 0.1f);
+    std::fill(wk->data(), wk->data() + wk->size(), 0.1f);
+    std::fill(wv->data(), wv->data() + wv->size(), 0.1f);
+    std::fill(wo->data(), wo->data() + wo->size(), 0.1f);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {input, wq, wk, wv, wo, k_cache, v_cache};
 

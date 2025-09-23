@@ -149,11 +149,6 @@ bool ArgumentParser::parse(LlaminarParams &params)
             params.chat_template = argv_[i + 1];
             i++;
         }
-        else if (arg == "--max-response" && i + 1 < argc_)
-        {
-            params.max_response_tokens = std::stoi(argv_[i + 1]);
-            i++;
-        }
         else if (arg == "--save-chat")
         {
             params.save_conversation = true;
@@ -247,7 +242,6 @@ void ArgumentParser::printUsage() const
     std::cout << "\nChat Options:" << std::endl;
     std::cout << "  --system <text>          Set system prompt for chat" << std::endl;
     std::cout << "  --chat-template <name>   Chat template to use" << std::endl;
-    std::cout << "  --max-response <tokens>  Max tokens in response (default: 512)" << std::endl;
     std::cout << "  --save-chat              Save conversation to file" << std::endl;
     std::cout << "  --load-conversation <f>  Load previous conversation" << std::endl;
     std::cout << "  --stream                 Enable streaming output (default)" << std::endl;

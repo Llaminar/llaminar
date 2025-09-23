@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../mpi_kernel_base.h"
-#include "MatMulKernel.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -177,7 +176,7 @@ namespace llaminar
         void computeLocalOutputProjection(const std::shared_ptr<TensorBase> &local_attended_output,
                                           const std::shared_ptr<TensorBase> &local_wo,
                                           std::shared_ptr<TensorBase> &local_final_output,
-                                          size_t seq_len, int local_heads);
+                                          size_t seq_len, int local_heads, size_t d_model);
 
         /**
          * @brief Gather final outputs from all processes
@@ -191,7 +190,6 @@ namespace llaminar
                           size_t seq_len, size_t d_model);
 
         // Configuration parameters
-        MatMulKernel matmul_kernel_;    ///< COSMA-powered matrix multiplication
         int n_head_;                    ///< Total number of attention heads
         int n_head_kv_;                 ///< Number of key-value heads (grouped attention)
         int head_dim_;                  ///< Dimension per attention head

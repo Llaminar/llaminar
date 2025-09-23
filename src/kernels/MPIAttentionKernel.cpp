@@ -1,5 +1,7 @@
 #include "MPIAttentionKernel.h"
+#include "../adaptive_matmul.h"
 #include "../logger.h"
+#include "../performance_timer.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -23,6 +25,7 @@ namespace llaminar
     bool MPIAttentionKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                      std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
+        PERF_SCOPED_TIMER("MPIAttentionKernel::execute");
         auto start = std::chrono::high_resolution_clock::now();
 
         if (!validate(inputs, outputs))
@@ -54,8 +57,11 @@ namespace llaminar
         auto local_wo = createLocalTensor({local_head_dim, d_model});
 
         // Distribute weights according to head assignment
-        distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
-                         local_wq, local_wk, local_wv, local_wo, seq_len, d_model);
+        {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
+            distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
+                             local_wq, local_wk, local_wv, local_wo, seq_len, d_model);
+        }
 
         // Create local projection tensors
         auto local_q = createLocalTensor({seq_len, local_head_dim});
@@ -63,28 +69,43 @@ namespace llaminar
         auto local_v = createLocalTensor({seq_len, local_head_dim});
 
         // Compute Q, K, V projections for local heads using COSMA
-        computeLocalProjections(global_input, local_wq, local_wk, local_wv,
-                                local_q, local_k, local_v, seq_len, d_model);
+        {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalProjections");
+            computeLocalProjections(global_input, local_wq, local_wk, local_wv,
+                                    local_q, local_k, local_v, seq_len, d_model);
+        }
 
         // Apply RoPE to local Q and K
-        applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads);
+        {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::applyLocalRoPE");
+            applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads);
+        }
 
         // Create local attended output tensor
         auto local_attended_output = createLocalTensor({seq_len, local_head_dim});
 
         // Compute attention for local heads
-        computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
-                              local_attended_output->data(), seq_len, local_heads);
+        {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalAttention");
+            computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
+                                  local_attended_output->data(), seq_len, local_heads);
+        }
 
         // Create local final output tensor
         auto local_final_output = createLocalTensor({seq_len, d_model});
 
         // Compute output projection for local heads using COSMA
-        computeLocalOutputProjection(local_attended_output, local_wo,
-                                     local_final_output, seq_len, local_heads);
+        {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalOutputProjection");
+            computeLocalOutputProjection(local_attended_output, local_wo,
+                                         local_final_output, seq_len, local_heads, d_model);
+        }
 
         // Gather final outputs from all processes
-        gatherOutput(local_final_output, global_output, seq_len, d_model);
+        {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::gatherOutput");
+            gatherOutput(local_final_output, global_output, seq_len, d_model);
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         double execution_time = std::chrono::duration<double, std::milli>(end - start).count();
@@ -219,17 +240,32 @@ namespace llaminar
             memcpy(local_row, global_row + head_offset_dim, local_head_dim * sizeof(float));
         }
 
-        // For grouped attention, handle KV heads distribution
-        // For simplicity, assuming n_head_kv == n_head for now
-        // TODO: Implement proper grouped attention support
+        // SIMPLE FIX: For grouped attention where n_head_kv != n_head
+        // Just replicate the available KV heads to match the local Q heads
+        // This is not optimal but prevents buffer overruns and NaN values
+
         for (size_t i = 0; i < d_model; ++i)
         {
             const float *global_k_row = global_wk->data() + i * n_head_kv_ * head_dim_;
             const float *global_v_row = global_wv->data() + i * n_head_kv_ * head_dim_;
             float *local_k_row = local_wk->data() + i * local_head_dim;
             float *local_v_row = local_wv->data() + i * local_head_dim;
-            memcpy(local_k_row, global_k_row + head_offset_dim, local_head_dim * sizeof(float));
-            memcpy(local_v_row, global_v_row + head_offset_dim, local_head_dim * sizeof(float));
+
+            // For each local Q head, assign the corresponding KV head
+            // Use modulo to handle the case where we have more Q heads than KV heads
+            for (int local_head = 0; local_head < local_heads; ++local_head)
+            {
+                int global_q_head = head_offset + local_head;
+                int kv_head = global_q_head % n_head_kv_; // Map Q head to KV head
+
+                const float *src_k = global_k_row + kv_head * head_dim_;
+                const float *src_v = global_v_row + kv_head * head_dim_;
+                float *dst_k = local_k_row + local_head * head_dim_;
+                float *dst_v = local_v_row + local_head * head_dim_;
+
+                memcpy(dst_k, src_k, head_dim_ * sizeof(float));
+                memcpy(dst_v, src_v, head_dim_ * sizeof(float));
+            }
         }
 
         // Extract local output weights (rows for assigned heads)
@@ -252,31 +288,43 @@ namespace llaminar
                                                      std::shared_ptr<TensorBase> &local_v,
                                                      size_t seq_len, size_t d_model)
     {
-        // Compute Q = input @ local_wq using COSMA
-        std::vector<std::shared_ptr<TensorBase>> q_inputs = {input, local_wq};
-        std::vector<std::shared_ptr<TensorBase>> q_outputs = {local_q};
-        if (!matmul_kernel_.execute(q_inputs, q_outputs))
+        // Compute Q = input @ local_wq using adaptive matrix multiplication
         {
-            LOG_ERROR("COSMA Q projection failed on rank " << getRank());
-            return;
+            PERF_SCOPED_TIMER("COSMA::Q_projection");
+            auto [local_heads, head_offset] = getHeadDistribution();
+            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
+            if (!adaptive_matmul(input->data(), local_wq->data(), local_q->data(),
+                                 seq_len, local_head_dim, d_model, false))
+            {
+                LOG_ERROR("Q projection failed on rank " << getRank());
+                return;
+            }
         }
 
-        // Compute K = input @ local_wk using COSMA
-        std::vector<std::shared_ptr<TensorBase>> k_inputs = {input, local_wk};
-        std::vector<std::shared_ptr<TensorBase>> k_outputs = {local_k};
-        if (!matmul_kernel_.execute(k_inputs, k_outputs))
+        // Compute K = input @ local_wk using adaptive matrix multiplication
         {
-            LOG_ERROR("COSMA K projection failed on rank " << getRank());
-            return;
+            PERF_SCOPED_TIMER("COSMA::K_projection");
+            auto [local_heads, head_offset] = getHeadDistribution();
+            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
+            if (!adaptive_matmul(input->data(), local_wk->data(), local_k->data(),
+                                 seq_len, local_head_dim, d_model, false))
+            {
+                LOG_ERROR("K projection failed on rank " << getRank());
+                return;
+            }
         }
 
-        // Compute V = input @ local_wv using COSMA
-        std::vector<std::shared_ptr<TensorBase>> v_inputs = {input, local_wv};
-        std::vector<std::shared_ptr<TensorBase>> v_outputs = {local_v};
-        if (!matmul_kernel_.execute(v_inputs, v_outputs))
+        // Compute V = input @ local_wv using adaptive matrix multiplication
         {
-            LOG_ERROR("COSMA V projection failed on rank " << getRank());
-            return;
+            PERF_SCOPED_TIMER("COSMA::V_projection");
+            auto [local_heads, head_offset] = getHeadDistribution();
+            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
+            if (!adaptive_matmul(input->data(), local_wv->data(), local_v->data(),
+                                 seq_len, local_head_dim, d_model, false))
+            {
+                LOG_ERROR("V projection failed on rank " << getRank());
+                return;
+            }
         }
 
         auto [local_heads, head_offset] = getHeadDistribution();
@@ -439,15 +487,15 @@ namespace llaminar
     void MPIAttentionKernel::computeLocalOutputProjection(const std::shared_ptr<TensorBase> &local_attended_output,
                                                           const std::shared_ptr<TensorBase> &local_wo,
                                                           std::shared_ptr<TensorBase> &local_final_output,
-                                                          size_t seq_len, int local_heads)
+                                                          size_t seq_len, int local_heads, size_t d_model)
     {
-        // Compute attended_output @ local_wo using COSMA
-        std::vector<std::shared_ptr<TensorBase>> inputs = {local_attended_output, local_wo};
-        std::vector<std::shared_ptr<TensorBase>> outputs = {local_final_output};
-
-        if (!matmul_kernel_.execute(inputs, outputs))
+        // Compute attended_output @ local_wo using adaptive matrix multiplication
+        PERF_SCOPED_TIMER("COSMA::output_projection");
+        size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
+        if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(),
+                             seq_len, d_model, local_head_dim, false))
         {
-            LOG_ERROR("COSMA output projection failed on rank " << getRank());
+            LOG_ERROR("Output projection failed on rank " << getRank());
             return;
         }
 
@@ -458,10 +506,38 @@ namespace llaminar
                                           std::shared_ptr<TensorBase> &global_output,
                                           size_t seq_len, size_t d_model)
     {
-        // Sum all local outputs to get final result using MPI_Allreduce
-        checkMPIError(MPI_Allreduce(local_output->data(), global_output->data(),
-                                    static_cast<int>(seq_len * d_model), MPI_FLOAT, MPI_SUM, getComm()),
-                      "MPI_Allreduce in gatherOutput");
+        // PERFORMANCE WARNING: This MPI_Allreduce is extremely expensive!
+        // For production, this should be replaced with proper tensor sharding
+        // where each process only computes part of the output dimensions
+
+        int rank = getRank();
+        int size = getSize();
+
+        if (size == 1)
+        {
+            PERF_SCOPED_TIMER("gatherOutput::single_process_copy");
+            // Single process case - direct copy
+            std::copy(local_output->data(),
+                      local_output->data() + seq_len * d_model,
+                      global_output->data());
+        }
+        else
+        {
+            PERF_SCOPED_TIMER("gatherOutput::MPI_Allreduce");
+            LOG_WARN("PERFORMANCE: Using expensive MPI_Allreduce for " << (seq_len * d_model) << " elements");
+
+            // Multi-process case - use averaging instead of summing
+            checkMPIError(MPI_Allreduce(local_output->data(), global_output->data(),
+                                        static_cast<int>(seq_len * d_model), MPI_FLOAT, MPI_SUM, getComm()),
+                          "MPI_Allreduce in gatherOutput");
+
+            // Scale down by the number of processes to avoid value explosion
+            float scale = 1.0f / size;
+            for (size_t i = 0; i < seq_len * d_model; ++i)
+            {
+                global_output->data()[i] *= scale;
+            }
+        }
 
         LOG_DEBUG("Gathered output: [" << seq_len << ", " << d_model << "] on rank " << getRank());
     }

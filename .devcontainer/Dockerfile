@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     make \
     ninja-build \
     pkg-config \
+    bsdmainutils \
+    strace \
     # MPI dependencies for hyper-scalability
     openmpi-bin \
     openmpi-common \

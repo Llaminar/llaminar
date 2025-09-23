@@ -1,6 +1,5 @@
 #pragma once
 
-#include "RMSNormKernel.h"
 #include "../mpi_kernel_base.h"
 #include <vector>
 #include <memory>

@@ -80,6 +80,7 @@ struct GGUFModel
     uint32_t version;
     uint64_t tensor_count;
     uint64_t metadata_kv_count;
+    uint64_t data_offset; // Start of tensor data section
 
     std::unordered_map<std::string, GGUFValue> metadata;
     std::vector<GGUFTensorInfo> tensors;
@@ -126,10 +127,22 @@ public:
     void printTensorInfo() const;
     std::vector<std::string> getTensorNames() const;
 
+    // TESTING HOOKS: Expose specific dequant routines for unit tests (not part of stable public API).
+    // These enable constructing synthetic quantized blocks and verifying decode logic.
+    std::vector<float> dequantizeQ4_K(const uint8_t *data, size_t n_elements, GGUFTensorType type, const std::string &tensor_name);
+    std::vector<float> dequantizeQ4_0(const uint8_t *data, size_t n_elements);
+    // Newly added quantization formats (WIP implementations)
+    std::vector<float> dequantizeQ5_0(const uint8_t *data, const GGUFTensorInfo &info);                                                      // block_q5_0 (32 vals)
+    std::vector<float> dequantizeQ2_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info); // block_q2_K
+    std::vector<float> dequantizeQ3_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info); // block_q3_K
+    std::vector<float> dequantizeQ5_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info); // block_q5_K (256 super-block)
+    std::vector<float> dequantizeQ6_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info); // block_q6_K
+
     // Quantization support
     bool supportsQuantization(GGUFTensorType type) const;
     std::vector<float> dequantizeTensor(const GGUFTensorInfo &tensor_info,
-                                        const std::vector<uint8_t> &quantized_data);
+                                        const std::vector<uint8_t> &quantized_data,
+                                        const std::string &tensor_name);
 
     // Model configuration extraction
     TransformerLayerConfig createLayerConfig() const;
@@ -151,12 +164,45 @@ private:
     bool readValue(T &value);
     bool readString(std::string &str);
     bool readArray(GGUFValue &value);
+    size_t getFileSize() const;
 
     // Dequantization helpers
-    std::vector<float> dequantizeQ8_0(const uint8_t *data, size_t n_elements);
-    std::vector<float> dequantizeQ4_0(const uint8_t *data, size_t n_elements);
+    std::vector<float> dequantizeQ8_0(const uint8_t *data, size_t n_elements, const std::string &tensor_name);
     std::vector<float> dequantizeF16(const uint8_t *data, size_t n_elements);
+    // Instrumentation helper for dequantization output statistics
+    void logDequantStats(const std::string &tensor_name, GGUFTensorType type, const std::vector<float> &values, size_t max_samples) const;
+
+    // Polymorphic dequantization interface
+    struct IDequantizer
+    {
+        virtual ~IDequantizer() = default;
+        virtual std::vector<float> run(const GGUFTensorInfo &info, const std::vector<uint8_t> &data, const std::string &name, ModelLoader &loader) const = 0;
+    };
+
+    struct Q8_0Dequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &info, const std::vector<uint8_t> &data, const std::string &name, ModelLoader &loader) const override;
+    };
+    struct Q4_0Dequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &info, const std::vector<uint8_t> &data, const std::string &name, ModelLoader &loader) const override;
+    };
+    struct Q4KDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &info, const std::vector<uint8_t> &data, const std::string &name, ModelLoader &loader) const override;
+    };
+
+    const IDequantizer *selectDequantizer(GGUFTensorType type) const;
 
     // Model-specific parsing
     void extractModelMetadata();
 };
+
+// ---- Static size checks for ggml K-format block structs ----
+// These ensure we notice if the embedded/minimal ggml version changes block layouts.
+#ifdef GGML_QKK_MAX
+static_assert(sizeof(block_q2_K) == 2 * sizeof(ggml_half) + QK_K / 16 + QK_K / 4, "block_q2_K size diverged from ggml");
+static_assert(sizeof(block_q3_K) == sizeof(ggml_half) + QK_K / 4 + QK_K / 8 + 12, "block_q3_K size diverged from ggml");
+static_assert(sizeof(block_q5_K) == 2 * sizeof(ggml_half) + K_SCALE_SIZE + QK_K / 2 + QK_K / 8, "block_q5_K size diverged from ggml");
+static_assert(sizeof(block_q6_K) == sizeof(ggml_half) + QK_K / 16 + 3 * QK_K / 4, "block_q6_K size diverged from ggml");
+#endif
