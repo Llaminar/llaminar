@@ -2071,6 +2071,12 @@ namespace llaminar
                 std::memcpy(dst, src.host_owned->data(), total * sizeof(float));
                 return;
             }
+            // Single-rank direct row-major pointer case (no COSMA allocation)
+            if (!src.mat && src.original_row_major)
+            {
+                std::memcpy(dst, src.original_row_major, total * sizeof(float));
+                return;
+            }
             // Fallback to whatever COSMA local buffer holds
             if (src.mat)
             {
@@ -2721,6 +2727,136 @@ namespace llaminar
         {
             LOG_DEBUG("[CosmaPrefill][preflight] estimate=" << (estimate / (1024.0*1024.0))
                                                              << " MB within budget " << max_resident_mb_ << " MB");
+        }
+        return true;
+    }
+
+    // ================= In-layout Elementwise (Phase 2) =================
+    bool CosmaPrefillManager::rmsnorm_in_layout(const CosmaView &src, CosmaView &dst, const float *weight, int seq_len, int hidden_size, float eps)
+    {
+        if (!src.mat || !dst.mat || !weight || hidden_size <= 0 || seq_len <= 0)
+        {
+            // Single-rank row-major fallback (no COSMA allocation) when mat pointers absent
+            if (world_size_ == 1 && src.mat == nullptr && dst.mat == nullptr && src.original_row_major && dst.original_row_major && weight && hidden_size > 0 && seq_len > 0)
+            {
+                const float *in = src.original_row_major;
+                float *out = const_cast<float *>(dst.original_row_major); // destination buffer provided by caller
+                for (int r = 0; r < seq_len; ++r)
+                {
+                    const float *row = in + (size_t)r * hidden_size;
+                    double sum = 0.0;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        double v = row[c];
+                        sum += v * v;
+                    }
+                    double inv = 1.0 / std::sqrt(sum / hidden_size + eps);
+                    float *dst_row = out + (size_t)r * hidden_size;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        dst_row[c] = float(row[c] * inv * weight[c]);
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+        float *dst_local = dst.mat->matrix_pointer();
+        const float *src_local = src.mat->matrix_pointer();
+        if (!dst_local || !src_local)
+            return false;
+        size_t local_size = src.mat->matrix_size();
+        if (local_size == 0)
+            return true; // nothing owned on this rank
+        auto mat_ptr = src.mat.get();
+        // Gather local indices grouped by row (sequence position).
+        std::vector<std::vector<int>> row_indices(seq_len);
+        row_indices.reserve(seq_len);
+        for (size_t li = 0; li < local_size; ++li)
+        {
+            auto g = mat_ptr->global_coordinates(static_cast<int>(li));
+            int gi = g.first;
+            int gj = g.second;
+            if ((unsigned)gi < (unsigned)seq_len && (unsigned)gj < (unsigned)hidden_size)
+                row_indices[gi].push_back(static_cast<int>(li));
+        }
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < seq_len; ++r)
+        {
+            auto &idxs = row_indices[r];
+            if (idxs.empty())
+                continue;
+            double sum_sq = 0.0;
+            for (int li : idxs)
+            {
+                float v = src_local[li];
+                sum_sq += double(v) * double(v);
+            }
+            double inv_scale = 1.0 / std::sqrt(sum_sq / std::max(1, (int)idxs.size()) + eps);
+            for (int li : idxs)
+            {
+                int gj = mat_ptr->global_coordinates(li).second;
+                float gamma = (gj >= 0 && gj < hidden_size) ? weight[gj] : 1.f;
+                dst_local[li] = float(src_local[li] * inv_scale * gamma);
+            }
+        }
+        return true;
+    }
+
+    bool CosmaPrefillManager::swiglu_in_layout(const CosmaView &gate, const CosmaView &up, CosmaView &out, int seq_len, int hidden_size)
+    {
+        if (!gate.mat || !up.mat || !out.mat || hidden_size <= 0 || seq_len <= 0)
+        {
+            // Single-rank row-major fallback path
+            if (world_size_ == 1 && gate.mat == nullptr && up.mat == nullptr && out.mat == nullptr && gate.original_row_major && up.original_row_major && out.original_row_major && hidden_size > 0 && seq_len > 0)
+            {
+                const float *gptr = gate.original_row_major;
+                const float *uptr = up.original_row_major;
+                float *optr = const_cast<float *>(out.original_row_major);
+                auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
+                size_t stride = (size_t)hidden_size;
+                for (int r = 0; r < seq_len; ++r)
+                {
+                    const float *grow = gptr + r * stride;
+                    const float *urow = uptr + r * stride;
+                    float *orow = optr + r * stride;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        orow[c] = silu(urow[c]) * grow[c];
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+        const float *g_local = gate.mat->matrix_pointer();
+        const float *u_local = up.mat->matrix_pointer();
+        float *o_local = out.mat->matrix_pointer();
+        if (!g_local || !u_local || !o_local)
+            return false;
+        size_t local_size = gate.mat->matrix_size();
+        if (up.mat->matrix_size() != local_size || out.mat->matrix_size() != local_size)
+            return false; // shape mismatch on local partitions
+        auto mat_ptr = gate.mat.get();
+        std::vector<std::vector<int>> row_indices(seq_len);
+        for (size_t li = 0; li < local_size; ++li)
+        {
+            auto g = mat_ptr->global_coordinates(static_cast<int>(li));
+            int gi = g.first; int gj = g.second;
+            if ((unsigned)gi < (unsigned)seq_len && (unsigned)gj < (unsigned)hidden_size)
+                row_indices[gi].push_back(static_cast<int>(li));
+        }
+        auto silu = [](float x) -> float { return x / (1.0f + std::exp(-x)); };
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < seq_len; ++r)
+        {
+            auto &idxs = row_indices[r];
+            for (int li : idxs)
+            {
+                float u = u_local[li];
+                float gval = g_local[li];
+                o_local[li] = silu(u) * gval;
+            }
         }
         return true;
     }
