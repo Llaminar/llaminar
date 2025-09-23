@@ -159,6 +159,9 @@ namespace llaminar
             std::atomic<long long> preflight_invocations{0};
             std::atomic<long long> preflight_denied{0};
             std::atomic<long long> preflight_estimated_bytes_last{0};
+            // Phase 2: fused dequant + direct layout
+            std::atomic<long long> fused_dequant_invocations{0};
+            std::atomic<long long> fused_dequant_elements{0};
         } stats_;
         const PrefillStats &stats() const { return stats_; }
         const StrategyCache::Stats &strategy_stats() const { return strategy_cache_.stats; }

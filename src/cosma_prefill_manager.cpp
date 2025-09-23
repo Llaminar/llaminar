@@ -462,58 +462,60 @@ namespace llaminar
 
     void CosmaPrefillManager::stream_weight_blocks_quantized(CosmaView &dst, const WeightDescriptor &desc)
     {
-        // Proof-of-concept: support Q5_0 (quant_type==1) decoding for both single and multi-rank.
-        // If disabled via env or unknown quant_type, fall back to raw float streaming function.
-        if (std::getenv("LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT") || desc.quant_type != 1)
+        // Phase 2 fused path: directly dequantize each block and scatter owned elements
+        // Supported: quant_type==1 (synthetic Q5_0). Fallback otherwise or when disabled.
+        if (std::getenv("LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT") || desc.quant_type != 1 || !dst.mat)
         {
             stream_weight_blocks(dst, desc);
             return;
         }
-        if (!dst.mat)
-        {
-            return;
-        }
         auto t0 = std::chrono::high_resolution_clock::now();
         const size_t total = static_cast<size_t>(desc.rows) * desc.cols;
-        const uint8_t *qptr = static_cast<const uint8_t *>(desc.base_ptr);
-        const int block_vals = 32;
+        const int block_vals = 32; // Q5_0 block size
         const size_t n_blocks = (total + block_vals - 1) / block_vals;
-        std::vector<float> full(total, 0.f); // full row-major dequantized buffer
-        std::vector<float> tmp(block_vals);
-        size_t out_index = 0;
-        for (size_t b = 0; b < n_blocks; ++b)
-        {
-            llaminar::dequant_block_q5_0(qptr, tmp.data(), block_vals);
-            size_t to_copy = std::min<size_t>(block_vals, total - out_index);
-            std::memcpy(full.data() + out_index, tmp.data(), to_copy * sizeof(float));
-            out_index += to_copy;
-            qptr += desc.quant_block_size ? desc.quant_block_size : (size_t)(2 + 4 + 16);
-        }
-        // Scatter into distributed layout using local_coordinates mapping (same as float streaming path)
+        const uint8_t *qptr = static_cast<const uint8_t *>(desc.base_ptr);
+        size_t advanced = 0;
         float *local = dst.mat->matrix_pointer();
         size_t sz = dst.mat->matrix_size();
         if (local && sz)
-        {
             std::fill(local, local + sz, 0.f);
-            for (int gi = 0; gi < desc.rows; ++gi)
+        std::vector<float> tmp(block_vals, 0.f);
+        // Only allocate a row-major host buffer if an env desires reconstruction or fallback debugging.
+        bool keep_row_major = std::getenv("LLAMINAR_COSMA_DEBUG_RECON") || std::getenv("LLAMINAR_COSMA_COMPARE_REPLICATED");
+        if (keep_row_major)
+        {
+            dst.host_owned = std::make_shared<std::vector<float>>(total, 0.f);
+            dst.original_row_major = dst.host_owned->data();
+        }
+        for (size_t b = 0; b < n_blocks; ++b)
+        {
+            llaminar::dequant_block_q5_0(qptr, tmp.data(), block_vals);
+            size_t base_index = b * block_vals;
+            size_t remain = std::min<size_t>(block_vals, total - base_index);
+            // Scatter the portion of this block that maps to each (row,col)
+            for (size_t i = 0; i < remain; ++i)
             {
-                const float *row_ptr = full.data() + (size_t)gi * desc.cols;
-                for (int gj = 0; gj < desc.cols; ++gj)
+                size_t linear = base_index + i;
+                int gi = static_cast<int>(linear / desc.cols);
+                int gj = static_cast<int>(linear % desc.cols);
+                auto lc = dst.mat->local_coordinates(gi, gj);
+                int local_index = lc.first;
+                int owner = lc.second;
+                if (owner == rank_ && local_index >= 0 && (size_t)local_index < sz)
                 {
-                    auto lc = dst.mat->local_coordinates(gi, gj);
-                    int local_index = lc.first;
-                    int owner = lc.second;
-                    if (owner == rank_ && local_index >= 0 && (size_t)local_index < sz)
-                    {
-                        local[local_index] = row_ptr[gj];
-                    }
+                    local[local_index] = tmp[i];
+                }
+                if (keep_row_major)
+                {
+                    (*dst.host_owned)[linear] = tmp[i];
                 }
             }
+            qptr += desc.quant_block_size ? desc.quant_block_size : (size_t)(2 + 4 + 16);
+            advanced += remain;
         }
-        // Preserve a host-owned row-major copy for fallback GEMM correctness.
-        dst.host_owned = std::make_shared<std::vector<float>>(std::move(full));
-        dst.original_row_major = dst.host_owned->data();
         stats_.bytes_streamed_weights += static_cast<long long>(total * sizeof(float));
+        stats_.fused_dequant_invocations++;
+        stats_.fused_dequant_elements += static_cast<long long>(total);
         auto t1 = std::chrono::high_resolution_clock::now();
         stats_.us_stream_weights += (long long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     }
@@ -2573,7 +2575,9 @@ namespace llaminar
     q("allocations_denied", stats_.allocations_denied.load());
     q("preflight_invocations", stats_.preflight_invocations.load());
     q("preflight_denied", stats_.preflight_denied.load());
-    q("preflight_estimated_bytes_last", stats_.preflight_estimated_bytes_last.load(), false);
+    q("preflight_estimated_bytes_last", stats_.preflight_estimated_bytes_last.load());
+    q("fused_dequant_invocations", stats_.fused_dequant_invocations.load());
+    q("fused_dequant_elements", stats_.fused_dequant_elements.load(), false);
         ofs << "}\n";
         if (should_log(3))
             LOG_DEBUG("[CosmaPrefill][stats] Wrote JSON stats to " << path);
@@ -2598,6 +2602,8 @@ namespace llaminar
         stats_.preflight_invocations = 0;
         stats_.preflight_denied = 0;
         stats_.preflight_estimated_bytes_last = 0;
+    stats_.fused_dequant_invocations = 0;
+    stats_.fused_dequant_elements = 0;
         strategy_cache_.stats.hits = 0;
         strategy_cache_.stats.misses = 0;
         allocations_.clear();
