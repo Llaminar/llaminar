@@ -1,6 +1,7 @@
 // Clean, minimal includes and helpers
 #include "model_loader.h"
 #include "logger.h"
+#include "quant_dequant.h"
 #include <cstring>
 #include <numeric>
 #include <algorithm>
@@ -883,36 +884,26 @@ std::vector<float> ModelLoader::Q4KDequantizer::run(const GGUFTensorInfo &info, 
 // Blocks of 32 values: 2 bytes (fp16 scale) + 16 bytes packed 4-bit values
 std::vector<float> ModelLoader::dequantizeQ4_0(const uint8_t *data, size_t n_elements)
 {
-    const size_t qk = 32;             // values per block
-    const size_t block_size = 2 + 16; // scale + 16 bytes packed (2 values per byte)
+    const size_t qk = 32;
+    const size_t block_size = sizeof(uint16_t) + 16;
     size_t n_blocks = (n_elements + qk - 1) / qk;
     std::vector<float> out(n_blocks * qk, 0.0f);
     LOG_TRACE("dequantizeQ4_0: n_elements=" << n_elements << " n_blocks=" << n_blocks << " block_size_bytes=" << block_size);
+    if (n_elements == 0 || !data)
+        return out;
 
-    for (size_t b = 0; b < n_blocks; ++b)
+    llaminar::dequant_q4_0_rows(data, out.data(), n_elements);
+
+    if (n_blocks > 0)
     {
-        size_t offset = b * block_size;
-        // read fp16 scale
-        uint16_t scale_bits;
-        std::memcpy(&scale_bits, data + offset, sizeof(uint16_t));
+        uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, data, sizeof(uint16_t));
         float d = ggml_compute_fp16_to_fp32(scale_bits);
-        const uint8_t *qs = data + offset + 2;
-        size_t base = b * qk;
-        for (size_t i = 0; i < 16; ++i)
-        {
-            uint8_t packed = qs[i];
-            uint8_t low = packed & 0x0F;
-            uint8_t high = packed >> 4;
-            out[base + 2 * i + 0] = (low - 8) * d;
-            out[base + 2 * i + 1] = (high - 8) * d;
-        }
-        if (b == 0)
-        {
-            LOG_TRACE("dequantizeQ4_0: block0 scale_bits=" << scale_bits << " scale_float=" << d
-                                                           << " first_8_vals=" << out[0] << "," << out[1] << "," << out[2] << "," << out[3]
-                                                           << "," << out[4] << "," << out[5] << "," << out[6] << "," << out[7]);
-        }
+        LOG_TRACE("dequantizeQ4_0: block0 scale_bits=" << scale_bits << " scale_float=" << d
+                                                       << " first_8_vals=" << out[0] << "," << out[1] << "," << out[2] << "," << out[3]
+                                                       << "," << out[4] << "," << out[5] << "," << out[6] << "," << out[7]);
     }
+
     out.resize(n_elements);
     return out;
 }
@@ -1062,10 +1053,10 @@ std::vector<float> ModelLoader::dequantizeQ5_0(const uint8_t *data, const GGUFTe
 }
 
 // ---- Q2_K Dequant ----
-// Layout per super-block (256 values):
-//   uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[64];  (2-bit packed -> 256/4 = 64 bytes)
-// Unpack of scales/mins identical bit reshuffle pattern to Q4_K. For each 128-value half we have 8 *pairs* (scale/min) covering 16-value groups of 32? In dot kernel, values extracted via shifting q2 bytes.
-// Reconstruction: For each 2-bit value q in [0..3], produce: value = d * scale * q - dmin * min
+// Layout per super-block (256 values) mirrors ggml's block_q2_K:
+//   uint8_t scales[16]; uint8_t qs[64]; ggml_half d; ggml_half dmin
+// Each scale byte packs a 4-bit scale and 4-bit min for 16-value groups. Reconstruct values as:
+// value = (d * scale_nibble) * q - (dmin * min_nibble) where q is the 2-bit quantized value.
 std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
     (void)type;
@@ -1076,96 +1067,57 @@ std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorTy
     size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
     std::vector<float> out(n_blocks * QK_K);
     auto fp16 = [](const uint8_t *p)
-    { uint16_t h; std::memcpy(&h,p,2); return ggml_compute_fp16_to_fp32(h); };
+    {
+        uint16_t h;
+        std::memcpy(&h, p, 2);
+        return ggml_compute_fp16_to_fp32(h);
+    };
 
-    // Two supported serialized layouts:
-    //  A) Canonical (16 scale bytes): scales[16], qs[64], d(2), dmin(2) => 86 bytes per block
-    //  B) Compact test variant (12 scale bytes): d(2), dmin(2), scales[12], qs[64] => 80 bytes per block
-    // Detect by total byte size heuristic.
-    size_t assumed_bytes_A = n_blocks * (16 + 64 + 4);
-    size_t assumed_bytes_B = n_blocks * (4 + 12 + 64);
-    // We cannot know total buffer length directly; attempt to sniff first block for variant B: interpret first 4 bytes as (d,dmin) and next 12 as scales.
-    bool looks_variant_B = true;
+    const uint8_t *ptr = data;
+    size_t out_index = 0;
+    for (size_t b = 0; b < n_blocks; ++b)
     {
-        // Basic plausibility: half-precision exponents not all zero & scale bytes non-zero increasing pattern (test fixture uses 1..12)
-        uint16_t d_half, dmin_half;
-        std::memcpy(&d_half, data, 2);
-        std::memcpy(&dmin_half, data + 2, 2);
-        if (d_half == 0 && dmin_half == 0)
-            looks_variant_B = false; // unlikely real data
-    }
-    if (looks_variant_B)
-    {
-        // Attempt variant B decode; fallback to A if something implausible encountered.
-        const uint8_t *ptr = data;
-        for (size_t b = 0; b < n_blocks; ++b)
+        const uint8_t *scales = ptr;                // 16 bytes packed scale/min nibbles
+        const uint8_t *qs = scales + QK_K / 16;     // 64 bytes of 2-bit packed quants
+        const float d = fp16(qs + QK_K / 4);        // super-block scale (after quants)
+        const float dmin = fp16(qs + QK_K / 4 + 2); // super-block min scale
+
+        const uint8_t *q = qs;
+        int is = 0;
+        for (int n = 0; n < QK_K; n += 128)
         {
-            const float d = fp16(ptr);
-            const float dmin = fp16(ptr + 2);
-            const uint8_t *scales12 = ptr + 4; // 12 bytes (scale/min packed nibbles)
-            const uint8_t *qs = scales12 + 12; // 64 bytes packed 2-bit values
-            // Simple decode: sequentially unpack 2-bit groups; assign scale/min groups every 32 values cycling through scales12.
-            for (int i = 0; i < QK_K; ++i)
+            int shift = 0;
+            for (int j = 0; j < 4; ++j)
             {
-                int byte_index = i / 4;
-                int shift = 2 * (i % 4);
-                uint8_t raw2 = (qs[byte_index] >> shift) & 0x3; // 0..3
-                int scale_group = (i / 32) % 12;
-                uint8_t sc = scales12[scale_group];
+                uint8_t sc = scales[is++];
                 float dl = d * (sc & 0xF);
                 float ml = dmin * (sc >> 4);
-                out[b * QK_K + i] = dl * raw2 - ml;
-            }
-            ptr += 4 + 12 + 64;
-        }
-        // Trim extra (over-allocation) when n_elements not multiple of QK_K
-        out.resize(n_elements);
-        logDequantStats(tensor_name, type, out, 8);
-        return out;
-    }
-    // Fallback to canonical path (layout A)
-    {
-        const uint8_t *ptr = data;
-        size_t out_index = 0;
-        for (size_t b = 0; b < n_blocks; ++b)
-        {
-            const uint8_t *scales = ptr;                // 16 bytes
-            const uint8_t *qs = scales + QK_K / 16;     // +16 => 64 bytes of 2-bit packed
-            const float d = fp16(qs + QK_K / 4);        // after qs: d
-            const float dmin = fp16(qs + QK_K / 4 + 2); // dmin
-            const uint8_t *q = qs;
-            int is = 0;
-            for (int n = 0; n < QK_K; n += 128)
-            {
-                int shift = 0;
-                for (int j = 0; j < 4; ++j)
+                for (int l = 0; l < 16; ++l)
                 {
-                    uint8_t sc = scales[is++];
-                    float dl = d * (sc & 0xF);
-                    float ml = dmin * (sc >> 4);
-                    for (int l = 0; l < 16; ++l)
-                    {
-                        uint8_t v = (q[l] >> shift) & 0x3;
-                        out[out_index++] = dl * v - ml;
-                    }
-                    sc = scales[is++];
-                    dl = d * (sc & 0xF);
-                    ml = dmin * (sc >> 4);
-                    for (int l = 0; l < 16; ++l)
-                    {
-                        uint8_t v = (q[l + 16] >> shift) & 0x3;
-                        out[out_index++] = dl * v - ml;
-                    }
-                    shift += 2;
+                    uint8_t v = (q[l] >> shift) & 0x3;
+                    out[out_index++] = dl * v - ml;
                 }
-                q += 32;
+
+                sc = scales[is++];
+                dl = d * (sc & 0xF);
+                ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l)
+                {
+                    uint8_t v = (q[l + 16] >> shift) & 0x3;
+                    out[out_index++] = dl * v - ml;
+                }
+
+                shift += 2;
             }
-            ptr += (QK_K / 16) + (QK_K / 4) + 4;
+            q += 32; // advance 32 bytes of packed quants per 128 values
         }
-        out.resize(n_elements);
-        logDequantStats(tensor_name, type, out, 8);
-        return out;
+
+        ptr += (QK_K / 16) + (QK_K / 4) + 4; // consumed scales + quants + (d,dmin)
     }
+
+    out.resize(n_elements);
+    logDequantStats(tensor_name, type, out, 8);
+    return out;
 }
 
 // ---- Q3_K Dequant ----

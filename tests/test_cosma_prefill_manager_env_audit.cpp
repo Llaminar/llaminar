@@ -24,4 +24,5 @@ TEST(CosmaPrefillManagerEnvAuditTest, RecognizedVariablesDocumented)
     EXPECT_TRUE(set.count("LLAMINAR_COSMA_PREFILL_THRESHOLD"));
     EXPECT_TRUE(set.count("ADAPTIVE_DISABLE_COSMA"));
     EXPECT_TRUE(set.count("LLAMINAR_COSMA_MAX_RESIDENT_MB"));
+    EXPECT_TRUE(set.count("LLAMINAR_COSMA_DUMP_STATS_PATH"));
 }

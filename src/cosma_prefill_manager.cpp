@@ -1,11 +1,11 @@
-// COSMA Prefill Manager (Phase 1 Implementation)
+// COSMA Prefill Manager (Phase 1 / 1b Implementation)
 // See plan: .github/instructions/cosma-prefill-plan.instructions.md
 // Scope implemented here: gating, strategy cache, activation/weight streaming,
-// small-op fast path, validation tile, memory budget (single allocation),
+// small-op fast path, validation tile, cumulative memory budget guard,
 // instrumentation counters & log level mapping.
 // Additional debug: LLAMINAR_COSMA_DUMP_SMALL -> dump ownership & values for tiny matrices (<=8x8)
-// Deferred (future phases): fused dequant->layout, cumulative memory accounting,
-// in-layout elementwise kernels, overlap of stream + GEMM.
+// Deferred (future phases): fused dequant->layout, in-layout elementwise kernels,
+// overlap of stream + GEMM.
 #include "cosma_prefill_manager.h"
 #include "logger.h"
 #include "quant_dequant.h"
@@ -24,6 +24,8 @@
 #include <future>
 #include <limits>
 #include <cmath>
+#include <cctype>
+#include <iostream>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -83,12 +85,44 @@ namespace
 namespace llaminar
 {
 
+    FusedRmsnormQkvResult::WeightGuard::WeightGuard(CosmaPrefillManager *mgr, CosmaWeightHandle &&h)
+        : manager(mgr), handle(std::move(h))
+    {
+    }
+
+    FusedRmsnormQkvResult::WeightGuard::WeightGuard(WeightGuard &&other) noexcept
+        : manager(other.manager), handle(std::move(other.handle))
+    {
+        other.manager = nullptr;
+    }
+
+    FusedRmsnormQkvResult::WeightGuard &FusedRmsnormQkvResult::WeightGuard::operator=(WeightGuard &&other) noexcept
+    {
+        if (this != &other)
+        {
+            if (manager)
+            {
+                manager->release_weight(std::move(handle));
+            }
+            manager = other.manager;
+            handle = std::move(other.handle);
+            other.manager = nullptr;
+        }
+        return *this;
+    }
+
+    FusedRmsnormQkvResult::WeightGuard::~WeightGuard()
+    {
+        if (manager)
+        {
+            std::cerr << "[CosmaPrefill][weight-guard] releasing " << handle.desc.id << std::endl;
+            manager->release_weight(std::move(handle));
+        }
+    }
+
     std::string StrategyCache::make_key(int m, int n, int k, int p) const
     {
-        // Bucket dimensions to reduce cache churn (round up to multiples of 64)
-        auto bucket = [](int x)
-        { return (x + 63) / 64 * 64; };
-        return std::to_string(bucket(m)) + "x" + std::to_string(bucket(n)) + "x" + std::to_string(bucket(k)) + ":p=" + std::to_string(p);
+        return std::to_string(m) + "x" + std::to_string(n) + "x" + std::to_string(k) + ":p=" + std::to_string(p);
     }
 
     const cosma::Strategy &StrategyCache::get(int m, int n, int k, int p)
@@ -115,7 +149,17 @@ namespace llaminar
         return inst;
     }
 
-    CosmaPrefillManager::~CosmaPrefillManager() = default;
+    CosmaPrefillManager::~CosmaPrefillManager()
+    {
+        try
+        {
+            dump_stats_if_requested();
+        }
+        catch (...)
+        {
+            // Destructors must not throw; ignore failures on shutdown.
+        }
+    }
 
     CosmaPrefillManager::CosmaPrefillManager()
     {
@@ -340,7 +384,17 @@ namespace llaminar
         v.label = label;
         try
         {
-            auto mat = std::make_shared<cosma::CosmaMatrix<float>>(label, strat, rank_, false);
+            auto deleter = [label](cosma::CosmaMatrix<float> *ptr)
+            {
+                if (ptr)
+                {
+                    auto data_ptr = static_cast<void *>(ptr->matrix_pointer());
+                    std::cerr << "[CosmaPrefill][deallocate_matrix] label=" << label
+                              << " ptr=" << data_ptr << std::endl;
+                }
+                delete ptr;
+            };
+            std::shared_ptr<cosma::CosmaMatrix<float>> mat(new cosma::CosmaMatrix<float>(label, strat, rank_, false), deleter);
             // Phase 1b correction: we must allocate here so that fill_activation / stream_weight_blocks
             // can populate data; previously skipping allocation led to uninitialized distributed GEMM inputs.
             try
@@ -350,6 +404,8 @@ namespace llaminar
             catch (...)
             {
             }
+            std::cerr << "[CosmaPrefill][allocate_matrix] label=" << label << " m=" << m << " n=" << n
+                      << " ptr=" << static_cast<void *>(mat->matrix_pointer()) << std::endl;
             if (zero && mat->matrix_pointer())
             {
                 std::fill(mat->matrix_pointer(), mat->matrix_pointer() + mat->matrix_size(), 0.f);
@@ -1016,380 +1072,161 @@ namespace llaminar
         }
         if (!use_direct) // fallback path
         {
-            // Replicated full GEMM fallback for correctness (Phase 1).
             auto t0 = std::chrono::high_resolution_clock::now();
+            if (rank_ == 0 && should_log(2))
+            {
+                LOG_INFO("[CosmaPrefill][fallback-replicated] begin m=" << m << " n=" << n << " k=" << k
+                                                                        << " alpha=" << alpha << " beta=" << beta);
+            }
+            if (should_log(3))
+            {
+                LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " entering replicated fallback");
+            }
             CosmaView C_rep;
-            // (Fallback path diagnostics intentionally omitted to avoid referencing undeclared result view.)
             C_rep.global_rows = m;
             C_rep.global_cols = n;
             C_rep.label = 'C';
             C_rep.host_owned = std::make_shared<std::vector<float>>((size_t)m * n, 0.f);
-            // Gather-based reconstruction: assume each rank holds a contiguous slice of rows of A
-            // of size local_rows. We Allgatherv those slices into A_full. Detect duplication; if duplication
-            // detected (all ranks seemingly have full copy), use rank 0's buffer instead to avoid repeated rows.
-            int base_rows = m / world_size_;
-            int remainder = m % world_size_;
-            int local_rows = base_rows + (rank_ < remainder ? 1 : 0);
-            int row_start = rank_ * base_rows + std::min(rank_, remainder);
-            size_t local_elems = (size_t)local_rows * k;
-            const float *local_src = A.original_row_major;
-            std::vector<float> gathered_A((size_t)m * k, 0.f);
-            std::vector<int> recv_counts(world_size_);
-            std::vector<int> displs(world_size_);
-            for (int r = 0; r < world_size_; ++r)
+
+            std::vector<float> A_full_storage((size_t)m * k, 0.f);
+            std::vector<float> B_full_storage((size_t)k * n, 0.f);
+
+            auto broadcast_if_needed = [&](std::vector<float> &buffer, const float *source_ptr, size_t elements)
             {
-                int r_rows = base_rows + (r < remainder ? 1 : 0);
-                recv_counts[r] = r_rows * k;
-                int r_row_start = r * base_rows + std::min(r, remainder);
-                displs[r] = r_row_start * k;
-            }
-            if (!local_src)
-            {
-                // Fallback: reconstruct just our local slice from COSMA layout, then gather.
-                std::vector<float> temp_slice(local_elems, 0.f);
-                if (A.mat && A.mat->matrix_pointer())
+                if (world_size_ <= 1)
                 {
-                    float *amat = A.mat->matrix_pointer();
-                    size_t asz = A.mat->matrix_size();
-                    for (size_t li = 0; li < asz; ++li)
+                    if (source_ptr && source_ptr != buffer.data())
                     {
-                        auto gc = A.mat->global_coordinates((int)li);
-                        int gi = gc.first;
-                        int gj = gc.second;
-                        if (gi >= row_start && gi < row_start + local_rows && gj < k)
-                        {
-                            int local_row = gi - row_start;
-                            temp_slice[(size_t)local_row * k + gj] = amat[li];
-                        }
+                        std::memcpy(buffer.data(), source_ptr, elements * sizeof(float));
                     }
+                    return;
                 }
-                local_src = temp_slice.data();
-                // Perform gather
-                MPI_Allgatherv(local_src, (int)local_elems, MPI_FLOAT,
-                               gathered_A.data(), recv_counts.data(), displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
-            }
-            else
-            {
-                // Treat local_src as slice (first local_rows rows). Gather rows across all ranks.
-                MPI_Allgatherv(local_src, (int)local_elems, MPI_FLOAT,
-                               gathered_A.data(), recv_counts.data(), displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
-                // Duplication detection: compare first row of each segment with first global row
-                bool duplicate = true;
                 if (rank_ == 0)
                 {
-                    const float *row0 = gathered_A.data();
-                    for (int r = 1; r < world_size_ && duplicate; ++r)
+                    if (source_ptr && source_ptr != buffer.data())
                     {
-                        if (recv_counts[r] == 0)
-                            continue;
-                        const float *r_first = gathered_A.data() + displs[r];
-                        // Simple checksum compare
-                        double diff_sum = 0.0;
-                        for (int cj = 0; cj < k; ++cj)
-                        {
-                            diff_sum += std::abs((double)row0[cj] - (double)r_first[cj]);
-                            if (diff_sum > 1e-4)
-                            {
-                                duplicate = false;
-                                break;
-                            }
-                        }
+                        std::memcpy(buffer.data(), source_ptr, elements * sizeof(float));
                     }
                 }
-                MPI_Bcast(&duplicate, 1, MPI_CXX_BOOL, 0, MPI_COMM_WORLD);
-                if (duplicate && rank_ == 0 && should_log(1))
-                {
-                    LOG_WARN("[CosmaPrefill][fallback-gather] Detected duplicate row slices; assuming rank 0 had full activation");
-                }
-                if (duplicate)
-                {
-                    // Rank 0 assumed to have full activation pointer; broadcast that instead of gathered concatenation.
-                    if (rank_ == 0 && local_src)
-                    {
-                        std::memcpy(gathered_A.data(), local_src, (size_t)m * k * sizeof(float));
-                    }
-                    MPI_Bcast(gathered_A.data(), m * k, MPI_FLOAT, 0, MPI_COMM_WORLD);
-                }
-            }
-            // Handle B: prefer original row-major pointer if available everywhere.
-            std::vector<float> B_full((size_t)k * n, 0.f);
-            bool have_B = (W.view.original_row_major != nullptr);
-            int have_flag = have_B ? 1 : 0;
-            int all_have = 0;
-            MPI_Allreduce(&have_flag, &all_have, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-            if (all_have)
-            {
-                if (rank_ == 0)
-                {
-                    std::memcpy(B_full.data(), W.view.original_row_major, (size_t)k * n * sizeof(float));
-                }
-                MPI_Bcast(B_full.data(), k * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
-            }
-            else
-            {
-                reconstruct_matrix_impl(W.view, B_full.data(), true, env);
-            }
+                safe_bcast(buffer.data(), static_cast<int>(elements), MPI_FLOAT, 0);
+            };
+
+            int use_A_broadcast_flag = (rank_ == 0 && A.original_row_major) ? 1 : 0;
+            int use_B_broadcast_flag = (rank_ == 0 && W.view.original_row_major) ? 1 : 0;
+            safe_bcast(&use_A_broadcast_flag, 1, MPI_INT, 0);
+            safe_bcast(&use_B_broadcast_flag, 1, MPI_INT, 0);
+            bool use_A_broadcast = (use_A_broadcast_flag != 0);
+            bool use_B_broadcast = (use_B_broadcast_flag != 0);
+
             if (rank_ == 0 && should_log(2))
             {
-                double sumA = 0.0, sumB = 0.0;
-                for (float v : gathered_A)
-                    sumA += v;
-                for (float v : B_full)
-                    sumB += v;
-                LOG_INFO("[CosmaPrefill][fallback-gather] checksums sumA=" << sumA << " sumB=" << sumB);
-            }
-            std::vector<float> B_full_transposed;
-            auto ensure_B_transposed = [&]() -> const float *
-            {
-                if (B_full_transposed.empty() && n > 0 && k > 0)
-                {
-                    B_full_transposed.resize((size_t)n * k);
-                    for (int col = 0; col < n; ++col)
-                    {
-                        for (int row = 0; row < k; ++row)
-                        {
-                            B_full_transposed[(size_t)col * k + row] = B_full[(size_t)row * n + col];
-                        }
-                    }
-                }
-                return B_full_transposed.empty() ? nullptr : B_full_transposed.data();
-            };
-            auto compute_threads = [&](long long ops, int max_threads) -> int
-            {
-                static int env_override = []()
-                {
-                    const char *v1 = std::getenv("LLAMINAR_OPENBLAS_THREADS");
-                    const char *v2 = std::getenv("OPENBLAS_NUM_THREADS");
-                    const char *v = v1 ? v1 : v2;
-                    if (!v)
-                        return -1;
-                    int parsed = std::atoi(v);
-                    return parsed < 1 ? 1 : parsed;
-                }();
-                static int env_force = []()
-                {
-                    const char *v = std::getenv("LLAMINAR_COSMA_FORCE_REPLICATED_THREADS");
-                    if (!v)
-                        return -1;
-                    int parsed = std::atoi(v);
-                    return parsed < 1 ? 1 : parsed;
-                }();
-                if (max_threads <= 1)
-                    return 1;
-                if (env_force > 0)
-                {
-                    int forced = std::max(1, std::min(env_force, max_threads));
-                    if (rank_ == 0 && should_log(2))
-                    {
-                        LOG_INFO("[CosmaPrefill][fallback-replicated] forcing OpenMP threads=" << forced << " via LLAMINAR_COSMA_FORCE_REPLICATED_THREADS");
-                    }
-                    return forced;
-                }
-                if (env_override > 0)
-                {
-                    int forced = std::max(1, std::min(env_override, max_threads));
-                    if (rank_ == 0 && should_log(3))
-                    {
-                        LOG_DEBUG("[CosmaPrefill][fallback-replicated] honoring BLAS thread override=" << forced << " (max_local=" << max_threads << ")");
-                    }
-                    return forced;
-                }
-                double world = std::max(1, world_size_);
-                double local_ops = static_cast<double>(std::max<long long>(ops, 1LL)) / world;
-                int fair_share = std::max(1, max_threads / std::max(1, world_size_));
-                int volume_hint = static_cast<int>(std::ceil(std::sqrt(local_ops / 2048.0)));
-                volume_hint = std::max(1, volume_hint);
-                int min_floor = std::min(max_threads, std::max(4, fair_share));
-                int threads = std::max(volume_hint, min_floor);
-                threads = std::max(1, std::min(threads, max_threads));
-                if (rank_ == 0 && should_log(3))
-                {
-                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] heuristic local_ops=" << local_ops
-                                                                                         << " fair_share=" << fair_share
-                                                                                         << " volume_hint=" << volume_hint
-                                                                                         << " min_floor=" << min_floor
-                                                                                         << " max_local=" << max_threads
-                                                                                         << " selected=" << threads);
-                }
-                return threads;
-            };
-
-            auto perform_replicated_gemm = [&](CBLAS_TRANSPOSE transB, float beta_factor)
-            {
-                const bool use_trans = (transB == CblasTrans);
-                const float *b_ptr = B_full.data();
-                if (!b_ptr)
-                {
-                    if (rank_ == 0)
-                    {
-                        LOG_ERROR("[CosmaPrefill][fallback-replicated] Missing row-major B buffer for replicated GEMM");
-                    }
-                    return;
-                }
-                const float *a_ptr = gathered_A.data();
-                if (!a_ptr)
-                {
-                    if (rank_ == 0)
-                    {
-                        LOG_ERROR("[CosmaPrefill][fallback-replicated] Missing gathered A buffer for replicated GEMM");
-                    }
-                    return;
-                }
-
-                int lda = k;
-                int ldb = use_trans ? k : n;
-                float *c_ptr = C_rep.host_owned->data();
-#ifdef _OPENMP
-                int max_local = std::max(1, omp_get_max_threads());
-                int per_rank = compute_threads(full_volume, max_local);
-                per_rank = std::max(1, std::min(per_rank, max_local));
-#else
-                int per_rank = 1;
-#endif
-                cblas_sgemm(CblasRowMajor,
-                            CblasNoTrans,
-                            transB,
-                            m, n, k,
-                            alpha,
-                            a_ptr, lda,
-                            b_ptr, ldb,
-                            beta_factor,
-                            c_ptr, n);
-
-                if (rank_ == 0)
-                {
-                    if (per_rank > 1)
-                    {
-                        if (should_log(2))
-                        {
-                            LOG_INFO("[CosmaPrefill][fallback-replicated] BLAS threads target=" << per_rank
-                                                                                                << " m=" << m << " n=" << n << " k=" << k);
-                        }
-                    }
-                    else if (should_log(3))
-                    {
-                        LOG_DEBUG("[CosmaPrefill][fallback-replicated] BLAS threads target=" << per_rank
-                                                                                             << " m=" << m << " n=" << n << " k=" << k);
-                    }
-                }
-            };
-
-            std::vector<float> baseline_C;
-            if (beta != 0.f)
-            {
-                baseline_C = *C_rep.host_owned;
+                LOG_INFO("[CosmaPrefill][fallback-replicated] broadcast decisions A=" << use_A_broadcast
+                                                                                      << " B=" << use_B_broadcast);
             }
 
-            CBLAS_TRANSPOSE initial_transpose = transposeW ? CblasTrans : CblasNoTrans;
-            perform_replicated_gemm(initial_transpose, beta);
-
-            safe_barrier();
-
-            int rerun_flag = 0;
-            if (rank_ == 0)
+            if (use_A_broadcast)
             {
-                bool try_auto_fix = auto_fix_transpose;
-                int tile_m = std::min(m, 32);
-                int tile_n = std::min(n, 32);
-                int tile_k = std::min(k, 32);
-                const float *baseline_ptr = (beta != 0.f && !baseline_C.empty()) ? baseline_C.data() : nullptr;
-                auto sample_tile = [&](bool treat_transpose, std::vector<float> &out)
+                const float *src_ptr = (rank_ == 0) ? A.original_row_major : nullptr;
+                if (should_log(3))
                 {
-                    out.assign((size_t)tile_m * tile_n, 0.f);
-                    const float *b_source = treat_transpose ? ensure_B_transposed() : B_full.data();
-                    int b_stride = treat_transpose ? k : n;
-                    for (int ti = 0; ti < tile_m; ++ti)
-                    {
-                        const float *a_row = gathered_A.data() + (size_t)ti * k;
-                        for (int tj = 0; tj < tile_n; ++tj)
-                        {
-                            double acc = 0.0;
-                            for (int tt = 0; tt < tile_k; ++tt)
-                            {
-                                int b_row = treat_transpose ? tj : tt;
-                                int b_col = treat_transpose ? tt : tj;
-                                float b_val = b_source ? b_source[(size_t)b_row * b_stride + b_col] : 0.f;
-                                acc += (double)a_row[tt] * (double)b_val;
-                            }
-                            float result = static_cast<float>(acc) * alpha;
-                            if (baseline_ptr)
-                            {
-                                result += beta * baseline_ptr[(size_t)ti * n + tj];
-                            }
-                            out[(size_t)ti * tile_n + tj] = result;
-                        }
-                    }
-                };
-                std::vector<float> naive_noT;
-                std::vector<float> naive_trans;
-                sample_tile(false, naive_noT);
-                sample_tile(true, naive_trans);
-                auto rel_l2 = [&](const std::vector<float> &ref, const std::vector<float> &cmp)
-                {
-                    double num = 0.0, den = 0.0;
-                    for (size_t idx = 0; idx < ref.size(); ++idx)
-                    {
-                        double d = (double)cmp[idx] - (double)ref[idx];
-                        num += d * d;
-                        den += (double)ref[idx] * (double)ref[idx];
-                    }
-                    return std::sqrt(num / (den + 1e-30));
-                };
-                std::vector<float> produced_tile((size_t)tile_m * tile_n, 0.f);
-                for (int ti = 0; ti < tile_m; ++ti)
-                {
-                    const float *c_row = C_rep.host_owned->data() + (size_t)ti * n;
-                    std::memcpy(&produced_tile[(size_t)ti * tile_n], c_row, tile_n * sizeof(float));
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " preparing A via broadcast");
                 }
-                double r_noT = rel_l2(naive_noT, produced_tile);
-                double r_trans = rel_l2(naive_trans, produced_tile);
-                if (should_log(2))
+                broadcast_if_needed(A_full_storage, src_ptr, (size_t)m * k);
+                if (should_log(3))
                 {
-                    LOG_INFO("[CosmaPrefill][fallback-diagnostic] tile rel_l2(noT)=" << r_noT << " rel_l2(B^T)=" << r_trans << " transB=" << (initial_transpose == CblasTrans));
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " completed A broadcast");
                 }
-                bool prefer_trans = (initial_transpose == CblasNoTrans) && (r_trans >= 0.0) && (r_noT > r_trans * 5.0) && (r_trans < 1e-2);
-                bool prefer_notrans = (initial_transpose == CblasTrans) && (r_noT >= 0.0) && (r_trans > r_noT * 5.0) && (r_noT < 1e-2);
-                if (try_auto_fix && prefer_trans)
-                {
-                    rerun_flag = 1;
-                    if (should_log(1))
-                    {
-                        LOG_WARN("[CosmaPrefill][fallback-diagnostic] Detected probable orientation mismatch; retrying with transpose");
-                    }
-                }
-                else if (try_auto_fix && prefer_notrans && should_log(1))
-                {
-                    LOG_WARN("[CosmaPrefill][fallback-diagnostic] Diagnostic favors non-transposed orientation but current path already uses transpose");
-                }
-            }
-
-            safe_bcast(&rerun_flag, 1, MPI_INT, 0);
-
-            if (rerun_flag)
-            {
-                if (beta == 0.f)
-                {
-                    std::fill(C_rep.host_owned->begin(), C_rep.host_owned->end(), 0.f);
-                }
-                else if (!baseline_C.empty())
-                {
-                    std::copy(baseline_C.begin(), baseline_C.end(), C_rep.host_owned->begin());
-                }
-                perform_replicated_gemm(CblasTrans, beta);
-                safe_barrier();
             }
             else
             {
-                safe_barrier();
+                if (rank_ == 0 && should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] reconstructing A (missing shared row-major pointer)");
+                }
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " reconstructing A");
+                }
+                reconstruct_matrix_impl(A, A_full_storage.data(), true, env);
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " finished reconstructing A");
+                }
             }
 
-            MPI_Bcast(C_rep.host_owned->data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
+            if (use_B_broadcast)
+            {
+                const float *src_ptr = (rank_ == 0) ? W.view.original_row_major : nullptr;
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " preparing B via broadcast");
+                }
+                broadcast_if_needed(B_full_storage, src_ptr, (size_t)k * n);
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " completed B broadcast");
+                }
+            }
+            else
+            {
+                if (rank_ == 0 && should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] reconstructing B (missing shared row-major pointer)");
+                }
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " reconstructing B");
+                }
+                reconstruct_matrix_impl(W.view, B_full_storage.data(), true, env);
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " finished reconstructing B");
+                }
+            }
+
+            if (rank_ == 0)
+            {
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] executing cblas_sgemm");
+                }
+                cblas_sgemm(CblasRowMajor,
+                            CblasNoTrans,
+                            transposeW ? CblasTrans : CblasNoTrans,
+                            m, n, k,
+                            alpha,
+                            A_full_storage.data(), k,
+                            B_full_storage.data(), n,
+                            beta,
+                            C_rep.host_owned->data(), n);
+            }
+
+            if (mpi_is_initialized() && mpi_world_size_safe() > 1)
+            {
+                if (rank_ == 0 && should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] broadcasting result");
+                }
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " entering result broadcast");
+                }
+                safe_bcast(C_rep.host_owned->data(), m * n, MPI_FLOAT, 0);
+                if (should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] rank=" << rank_ << " completed result broadcast");
+                }
+            }
+
             auto t1 = std::chrono::high_resolution_clock::now();
             stats_.us_matmul += (long long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
             stats_.matmul_invocations++;
+
+            const float *A_validation = (rank_ == 0) ? (A_full_storage.empty() ? nullptr : A_full_storage.data()) : nullptr;
+            const float *B_validation = (rank_ == 0) ? (B_full_storage.empty() ? nullptr : B_full_storage.data()) : nullptr;
             if (validate_tile_tokens_ > 0)
             {
-                maybe_validation_tile_gemm(gathered_A.data(), B_full.data(), C_rep.host_owned->data(), m, k, n);
+                maybe_validation_tile_gemm(A_validation, B_validation, C_rep.host_owned->data(), m, k, n);
             }
             if (rank_ == 0 && should_log(2))
             {
@@ -1398,7 +1235,7 @@ namespace llaminar
             return C_rep;
         }
         // Experimental direct path (existing code) retained below
-        auto C = allocate_matrix('C', m, n, stratC, beta == 0.f);
+        CosmaView C;
         // If requested, reconstruct full B and redistribute identical values into each rank's local portion to isolate mapping issues.
         if (replicate_B && W.view.mat)
         {
@@ -1452,8 +1289,9 @@ namespace llaminar
         const auto &sA = strategy_cache_.get(m, k, k, world_size_);
         const auto &sB = strategy_cache_.get(k, n, k, world_size_);
         const auto &sC = strategy_cache_.get(m, n, k, world_size_);
-        const cosma::Strategy &chosenA = force_unified_strategy ? sC : sA;
-        const cosma::Strategy &chosenB = force_unified_strategy ? sC : sB;
+        const bool use_unified_strategy = force_unified_strategy || force_direct;
+        const cosma::Strategy &chosenA = use_unified_strategy ? sC : sA;
+        const cosma::Strategy &chosenB = use_unified_strategy ? sC : sB;
         const cosma::Strategy &stratC_ref = sC; // result always uses (m,n,k)
 
         CosmaView A_compat = A; // start with original view
@@ -1654,6 +1492,10 @@ namespace llaminar
             }
         }
         // Deep population diagnostics (gated) to determine mismatch cause before multiply
+        if (!C.mat)
+        {
+            C = allocate_matrix('C', m, n, stratC, beta == 0.f);
+        }
         bool deep_diag = diag_deep && (world_size_ > 1);
         std::vector<float> A_pop, B_pop, C_pop_ref, C_orig_ref; // buffers reused across diag
         if (deep_diag)
@@ -2256,16 +2098,36 @@ namespace llaminar
             LOG_TRACE("[CosmaPrefill][direct] pre-multiply diagnostics done");
         }
         auto t0 = std::chrono::high_resolution_clock::now();
+        if (rank_ == 0 && should_log(2))
+        {
+            LOG_INFO("[CosmaPrefill][direct] entering pre-multiply barrier");
+        }
         MPI_Barrier(MPI_COMM_WORLD);
+        if (rank_ == 0 && should_log(2))
+        {
+            LOG_INFO("[CosmaPrefill][direct] exited pre-multiply barrier");
+        }
+        if (rank_ == 0 && should_log(2))
+        {
+            LOG_INFO("[CosmaPrefill][direct] entering cosma::multiply");
+        }
         try
         {
             cosma::multiply(*A_compat.mat, *B_compat.mat, *C.mat, stratC, MPI_COMM_WORLD, alpha, beta);
+            if (rank_ == 0 && should_log(2))
+            {
+                LOG_INFO("[CosmaPrefill][direct] cosma::multiply completed");
+            }
         }
         catch (const std::exception &e)
         {
             LOG_ERROR("[CosmaPrefill][direct] cosma::multiply exception: " << e.what());
         }
         MPI_Barrier(MPI_COMM_WORLD);
+        if (rank_ == 0 && should_log(2))
+        {
+            LOG_INFO("[CosmaPrefill][direct] exited post-multiply barrier");
+        }
         auto t1 = std::chrono::high_resolution_clock::now();
         stats_.us_matmul += (long long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         stats_.matmul_invocations++;
@@ -2367,6 +2229,18 @@ namespace llaminar
             }
         }
         // Return distributed result
+        if (A_compat.mat)
+        {
+            C.release_chain.push_back(A_compat.mat);
+            std::cerr << "[CosmaPrefill][matmul-release-chain] label=" << A_compat.label
+                      << " ptr=" << static_cast<void *>(A_compat.mat->matrix_pointer()) << std::endl;
+        }
+        if (B_compat.mat)
+        {
+            C.release_chain.push_back(B_compat.mat);
+            std::cerr << "[CosmaPrefill][matmul-release-chain] label=" << B_compat.label
+                      << " ptr=" << static_cast<void *>(B_compat.mat->matrix_pointer()) << std::endl;
+        }
         return C;
     }
 
@@ -2796,24 +2670,63 @@ namespace llaminar
 
     void CosmaPrefillManager::release_weight(CosmaWeightHandle &&handle)
     {
-        // Phase 1b: adjust resident tracking if underlying storage exists
-        if (handle.view.mat && handle.view.mat->matrix_pointer())
+        float *mat_ptr = handle.view.mat ? handle.view.mat->matrix_pointer() : nullptr;
+        if (mat_ptr)
         {
-            long long bytes = (long long)handle.view.mat->matrix_size() * (long long)sizeof(float);
+            std::cerr << "[CosmaPrefill][release_weight] label=" << handle.desc.id
+                      << " ptr=" << static_cast<void *>(mat_ptr) << std::endl;
+        }
+
+        long long bytes = 0;
+        if (handle.view.mat && mat_ptr)
+        {
+            bytes = (long long)handle.view.mat->matrix_size() * (long long)sizeof(float);
+            handle.view.mat.reset();
+        }
+
+        for (auto it = handle.view.release_chain.rbegin(); it != handle.view.release_chain.rend(); ++it)
+        {
+            it->reset();
+        }
+        handle.view.release_chain.clear();
+
+        if (bytes > 0)
+        {
             stats_.current_resident_bytes -= bytes;
         }
-        handle.view.mat.reset();
         recalc_resident();
     }
     bool CosmaPrefillManager::memory_budget_allows(size_t bytes_needed) const
     {
-        // Simple additive model: we don't track current resident; Phase 1 conservative check.
-        // Assume each allocation stands alone; only deny if single allocation exceeds limit.
         long long limit_bytes = max_resident_mb_ * 1024ll * 1024ll;
-        bool ok = (long long)bytes_needed <= limit_bytes;
-        if (!ok)
+        if (limit_bytes <= 0)
+            return true;
+        long long request = static_cast<long long>(bytes_needed);
+        if (request > limit_bytes)
+        {
             const_cast<CosmaPrefillManager *>(this)->stats_.allocations_denied++;
-        return ok;
+            if (rank_ == 0 && should_log(1))
+            {
+                LOG_WARN("[CosmaPrefill] Denying allocation exceeding budget bytes=" << (request / (1024.0 * 1024.0))
+                                                                                     << " MB budget=" << max_resident_mb_ << " MB");
+            }
+            return false;
+        }
+        // Recalculate to prune expired weak_ptrs before evaluating cumulative usage.
+        const_cast<CosmaPrefillManager *>(this)->recalc_resident();
+        long long current = stats_.current_resident_bytes.load();
+        if (current + request > limit_bytes)
+        {
+            const_cast<CosmaPrefillManager *>(this)->stats_.allocations_denied++;
+            if (rank_ == 0 && should_log(1))
+            {
+                LOG_WARN("[CosmaPrefill] Denying allocation due to cumulative budget bytes_current="
+                         << (current / (1024.0 * 1024.0)) << " MB request=" << (request / (1024.0 * 1024.0))
+                         << " MB budget=" << max_resident_mb_ << " MB");
+            }
+            return false;
+        }
+        return true;
     }
 
     void CosmaPrefillManager::maybe_validation_tile_gemm(const float *A, const float *B, const float *C_full,
@@ -2921,6 +2834,38 @@ namespace llaminar
             LOG_DEBUG("[CosmaPrefill][stats] Wrote JSON stats to " << path);
     }
 
+    void CosmaPrefillManager::dump_stats_if_requested() const
+    {
+        const char *flag = std::getenv("LLAMINAR_COSMA_DUMP_STATS");
+        if (!flag)
+            return;
+        auto should_emit = [](const char *value) -> bool
+        {
+            if (!value)
+                return false;
+            std::string token;
+            token.reserve(std::strlen(value));
+            for (const char *p = value; *p; ++p)
+            {
+                if (!std::isspace(static_cast<unsigned char>(*p)))
+                    token.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+            }
+            if (token.empty())
+                return true; // treat empty as enabled when var present
+            return !(token == "0" || token == "false" || token == "off" || token == "no");
+        };
+        if (!should_emit(flag))
+            return;
+        std::string path = "cosma_prefill_stats.json";
+        if (const char *env_path = std::getenv("LLAMINAR_COSMA_DUMP_STATS_PATH"))
+        {
+            std::string candidate = env_path;
+            if (!candidate.empty())
+                path = std::move(candidate);
+        }
+        dump_stats_json(path);
+    }
+
     void CosmaPrefillManager::reset_stats()
     {
         stats_.single_rank_calls = 0;
@@ -2960,54 +2905,56 @@ namespace llaminar
     const std::vector<std::string> &CosmaPrefillManager::recognized_env_vars()
     {
         static std::vector<std::string> vars = {
-            // Newly added diagnostic env vars should be listed to satisfy audit tests
-            "LLAMINAR_COSMA_PREFILL_THRESHOLD",
             "ADAPTIVE_DISABLE_COSMA",
-            "LLAMINAR_COSMA_FAST_PATH_THRESHOLD",
-            "LLAMINAR_COSMA_VALIDATE_TILE",
-            "LLAMINAR_COSMA_LOG_LEVEL",
-            "LLAMINAR_COSMA_MAX_RESIDENT_MB",
-            "LLAMINAR_COSMA_FORCE",
-            "LLAMINAR_COSMA_DISABLE",
-            "LLAMINAR_COSMA_FAST_UNVERIFIED",
-            "LLAMINAR_COSMA_FORCE_REPLICATED_DIAG",
-            "LLAMINAR_COSMA_FORCE_REPLICATED",
-            "LLAMINAR_COSMA_FORCE_DIRECT",
-            "LLAMINAR_COSMA_DIRECT_THRESHOLD_OPS",
-            "LLAMINAR_COSMA_COMPARE_REPLICATED",
             "LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE",
+            "LLAMINAR_COSMA_COMPARE_REPLICATED",
             "LLAMINAR_COSMA_DEBUG_RECON",
-            "LLAMINAR_COSMA_DUMP_SMALL",
-            "LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT",
-            "LLAMINAR_COSMA_DUMP_STATS",
             "LLAMINAR_COSMA_DIAG",
-            "LLAMINAR_COSMA_TEST_TRACE",
-            "LLAMINAR_COSMA_DIAG_TAP",
-            "LLAMINAR_COSMA_REPLICATE_B",
-            "LLAMINAR_SKIP_MPI_IN_SINGLE_TEST",
-            "LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT",
-            // Extended diagnostics / population & reconstruction modes
-            "LLAMINAR_COSMA_POP_DEST_LOCAL",     // historical enable (now default/no-op)
-            "LLAMINAR_COSMA_POP_FORWARD_LEGACY", // force legacy forward population (for regression only)
-            "LLAMINAR_COSMA_DIAG_DEEP",
-            "LLAMINAR_COSMA_DIAG_PERM_INFER",
             "LLAMINAR_COSMA_DIAG_AXIS",
-            "LLAMINAR_COSMA_DIAG_RECON_BRUTE",
-            "LLAMINAR_COSMA_DIAG_RECON_TRANSPOSE",
-            "LLAMINAR_COSMA_DIAG_SWAPRC",
-            "LLAMINAR_COSMA_DIAG_TRY_TRANSPOSE",
+            "LLAMINAR_COSMA_DIAG_COORD_INVERT",
+            "LLAMINAR_COSMA_DIAG_DEEP",
             "LLAMINAR_COSMA_DIAG_LOCAL_PROBE",
             "LLAMINAR_COSMA_DIAG_LOCAL_PROBE_DEEP",
+            "LLAMINAR_COSMA_DIAG_PERM_INFER",
+            "LLAMINAR_COSMA_DIAG_RECON_BYPASS",
+            "LLAMINAR_COSMA_DIAG_RECON_BRUTE",
             "LLAMINAR_COSMA_DIAG_RECON_MAP",
-            "LLAMINAR_COSMA_RECON_FORCE_LEGACY",
+            "LLAMINAR_COSMA_DIAG_RECON_TRANSPOSE",
             "LLAMINAR_COSMA_DIAG_SKIP_NORM",
+            "LLAMINAR_COSMA_DIAG_SAMPLES",
+            "LLAMINAR_COSMA_DIAG_SWAPRC",
+            "LLAMINAR_COSMA_DIAG_TAP",
+            "LLAMINAR_COSMA_DIAG_TRY_TRANSPOSE",
+            "LLAMINAR_COSMA_DISABLE",
+            "LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT",
+            "LLAMINAR_COSMA_DIRECT_THRESHOLD_OPS",
+            "LLAMINAR_COSMA_DUMP_SMALL",
+            "LLAMINAR_COSMA_DUMP_STATS",
+            "LLAMINAR_COSMA_DUMP_STATS_PATH",
+            "LLAMINAR_COSMA_FAST_PATH_THRESHOLD",
+            "LLAMINAR_COSMA_FAST_UNVERIFIED",
+            "LLAMINAR_COSMA_FORCE",
+            "LLAMINAR_COSMA_FORCE_DIRECT",
+            "LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT",
+            "LLAMINAR_COSMA_FORCE_REPLICATED",
+            "LLAMINAR_COSMA_FORCE_REPLICATED_DIAG",
+            "LLAMINAR_COSMA_FORCE_REPLICATED_THREADS",
             "LLAMINAR_COSMA_FORCE_UNIFIED",
-            "LLAMINAR_COSMA_RECON_FORCE_LEGACY", // (duplicate acceptable; audit can de-dupe)
-            // Phase 1b minor preflight env
+            "LLAMINAR_COSMA_LOG_LEVEL",
+            "LLAMINAR_COSMA_MAX_RESIDENT_MB",
+            "LLAMINAR_COSMA_OVERLAP_STREAM",
+            "LLAMINAR_COSMA_OVERLAP_VERBOSE",
+            "LLAMINAR_COSMA_POP_FORWARD_LEGACY",
             "LLAMINAR_COSMA_PREFLIGHT_DISABLE",
             "LLAMINAR_COSMA_PREFLIGHT_SAFETY_FACTOR",
-            "LLAMINAR_COSMA_OVERLAP_STREAM",
-            "LLAMINAR_COSMA_OVERLAP_VERBOSE"};
+            "LLAMINAR_COSMA_PREFILL_THRESHOLD",
+            "LLAMINAR_COSMA_RECON_FORCE_LEGACY",
+            "LLAMINAR_COSMA_REPLICATE_B",
+            "LLAMINAR_COSMA_TEST_TRACE",
+            "LLAMINAR_COSMA_VALIDATE_TILE",
+            "LLAMINAR_OPENBLAS_THREADS",
+            "LLAMINAR_SKIP_MPI_IN_SINGLE_TEST",
+            "OPENBLAS_NUM_THREADS"};
         return vars;
     }
 
@@ -3294,25 +3241,31 @@ namespace llaminar
             return false;
         float *dst_local = dst.mat->matrix_pointer();
         const float *src_local = scores.mat->matrix_pointer();
-        if (!src_local || !dst_local)
-        {
-            size_t loc_size = scores.mat->matrix_size();
-            if (loc_size == 0)
-                return true;
-            return false;
-        }
-        if (dst.mat->matrix_size() != scores.mat->matrix_size())
-            return false;
         size_t local_size = scores.mat->matrix_size();
+        if (dst.mat->matrix_size() != local_size)
+            return false;
+        if ((!src_local || !dst_local) && local_size > 0)
+            return false;
         auto mat_ptr = scores.mat.get();
         std::vector<std::vector<int>> row_indices(rows);
-        for (size_t li = 0; li < local_size; ++li)
+        if (local_size > 0)
         {
-            auto g = mat_ptr->global_coordinates(static_cast<int>(li));
-            int gi = g.first;
-            int gj = g.second;
-            if ((unsigned)gi < (unsigned)rows && (unsigned)gj < (unsigned)cols)
-                row_indices[gi].push_back((int)li);
+            for (size_t li = 0; li < local_size; ++li)
+            {
+                auto g = mat_ptr->global_coordinates(static_cast<int>(li));
+                int gi = g.first;
+                int gj = g.second;
+                if ((unsigned)gi < (unsigned)rows && (unsigned)gj < (unsigned)cols)
+                    row_indices[gi].push_back((int)li);
+            }
+        }
+        if (should_log(4))
+        {
+            LOG_TRACE("[CosmaPrefill][softmax] rank=" << rank_ << " built row_indices local_size=" << local_size);
+        }
+        if (should_log(3))
+        {
+            LOG_DEBUG("[CosmaPrefill][softmax] rank=" << rank_ << " local_size=" << local_size << " rows=" << rows);
         }
         std::vector<float> row_max(rows, -std::numeric_limits<float>::infinity());
         for (int r = 0; r < rows; ++r)
@@ -3325,7 +3278,15 @@ namespace llaminar
                     row_max[r] = val;
             }
         }
+        if (should_log(4))
+        {
+            LOG_TRACE("[CosmaPrefill][softmax] rank=" << rank_ << " row_max local stage done");
+        }
         safe_allreduce_float_inplace(row_max.data(), rows, MPI_MAX);
+        if (should_log(4))
+        {
+            LOG_TRACE("[CosmaPrefill][softmax] rank=" << rank_ << " row_max reduced");
+        }
         std::vector<float> row_sum(rows, 0.f);
         for (int r = 0; r < rows; ++r)
         {
@@ -3338,7 +3299,15 @@ namespace llaminar
                 row_sum[r] += val;
             }
         }
+        if (should_log(4))
+        {
+            LOG_TRACE("[CosmaPrefill][softmax] rank=" << rank_ << " row_sum local stage done");
+        }
         safe_allreduce_float_inplace(row_sum.data(), rows, MPI_SUM);
+        if (should_log(4))
+        {
+            LOG_TRACE("[CosmaPrefill][softmax] rank=" << rank_ << " row_sum reduced");
+        }
         for (int r = 0; r < rows; ++r)
         {
             auto &idxs = row_indices[r];
@@ -3347,6 +3316,10 @@ namespace llaminar
             {
                 dst_local[li] /= denom;
             }
+        }
+        if (should_log(4))
+        {
+            LOG_TRACE("[CosmaPrefill][softmax] rank=" << rank_ << " normalization done");
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         stats_.softmax_invocations++;
@@ -3373,6 +3346,10 @@ namespace llaminar
         auto t0 = std::chrono::high_resolution_clock::now();
         const auto &act_strat = strategy_cache_.get(seq_len, hidden_size, hidden_size, world_size_);
         auto act_view = convert_activation_in_with_strategy(activation_row_major, seq_len, hidden_size, act_strat);
+        if (act_view.mat)
+        {
+            std::cerr << "[FusedRmsnormQkv][act_view] ptr=" << static_cast<void *>(act_view.mat->matrix_pointer()) << std::endl;
+        }
         CosmaView norm_view;
         if (world_size_ == 1)
         {
@@ -3386,6 +3363,10 @@ namespace llaminar
         else
         {
             norm_view = allocate_matrix('A', seq_len, hidden_size, act_strat, false);
+            if (norm_view.mat)
+            {
+                std::cerr << "[FusedRmsnormQkv][norm_view] ptr=" << static_cast<void *>(norm_view.mat->matrix_pointer()) << std::endl;
+            }
         }
         if (!rmsnorm_in_layout(act_view, norm_view, gamma, seq_len, hidden_size, eps))
         {
@@ -3428,6 +3409,10 @@ namespace llaminar
         }
 
         auto q_view = matmul(norm_view, wq_handle, seq_len, hidden_size, wq.cols);
+        if (q_view.mat)
+        {
+            std::cerr << "[FusedRmsnormQkv][q_view] ptr=" << static_cast<void *>(q_view.mat->matrix_pointer()) << std::endl;
+        }
 
         if (overlap_enabled)
         {
@@ -3442,11 +3427,19 @@ namespace llaminar
         }
 
         auto k_view = matmul(norm_view, wk_handle, seq_len, hidden_size, wk.cols, transpose_k);
-        auto v_view = matmul(norm_view, wv_handle, seq_len, hidden_size, wv.cols);
-
-        auto capture_host_owned = [&](CosmaView &view)
+        if (k_view.mat)
         {
-            size_t elements = static_cast<size_t>(view.global_rows) * view.global_cols;
+            std::cerr << "[FusedRmsnormQkv][k_view] ptr=" << static_cast<void *>(k_view.mat->matrix_pointer()) << std::endl;
+        }
+        auto v_view = matmul(norm_view, wv_handle, seq_len, hidden_size, wv.cols);
+        if (v_view.mat)
+        {
+            std::cerr << "[FusedRmsnormQkv][v_view] ptr=" << static_cast<void *>(v_view.mat->matrix_pointer()) << std::endl;
+        }
+
+        auto capture_host_owned = [&](CosmaView &view) -> bool
+        {
+            const size_t elements = static_cast<size_t>(view.global_rows) * view.global_cols;
             if (!view.mat)
             {
                 if (!view.host_owned && view.original_row_major && elements > 0)
@@ -3456,34 +3449,42 @@ namespace llaminar
                     view.host_owned = buf;
                     view.original_row_major = buf->data();
                 }
-                return;
+                return true;
             }
-            auto buf = std::make_shared<std::vector<float>>(elements, 0.f);
-            reconstruct_matrix(view, buf->data(), view.label != 'C');
-            view.host_owned = buf;
-            view.original_row_major = buf->data();
-            view.mat.reset();
+            if (world_size_ == 1)
+            {
+                auto buf = std::make_shared<std::vector<float>>(elements, 0.f);
+                reconstruct_matrix(view, buf->data(), view.label != 'C');
+                view.host_owned = buf;
+                view.original_row_major = buf->data();
+                if (view.mat)
+                {
+                    view.mat.reset();
+                }
+                for (auto it = view.release_chain.rbegin(); it != view.release_chain.rend(); ++it)
+                {
+                    it->reset();
+                }
+                view.release_chain.clear();
+                return true;
+            }
+            // Multi-rank path retains distributed layout; caller will reconstruct on demand.
+            return true;
         };
 
-        // Convert distributed outputs to host-owned buffers before releasing weights
-        // to maintain COSMA memory pool LIFO discipline.
+        // Convert distributed outputs to host-owned buffers before returning guards.
         capture_host_owned(v_view);
         capture_host_owned(k_view);
         capture_host_owned(q_view);
 
-        // Release in strict reverse allocation order (wv -> wk -> wq).
-        release_weight(std::move(wv_handle));
-        release_weight(std::move(wk_handle));
-        release_weight(std::move(wq_handle));
+        result.wv_guard = FusedRmsnormQkvResult::WeightGuard(this, std::move(wv_handle));
+        result.wk_guard = FusedRmsnormQkvResult::WeightGuard(this, std::move(wk_handle));
+        result.wq_guard = FusedRmsnormQkvResult::WeightGuard(this, std::move(wq_handle));
 
         // Normalize buffer must persist for caller; convert to host-owned as well.
         capture_host_owned(norm_view);
 
-        if (act_view.mat)
-        {
-            act_view.mat.reset();
-        }
-
+        result.activation_guard = act_view;
         result.normalized = norm_view;
         result.q = q_view;
         result.k = k_view;

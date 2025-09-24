@@ -355,6 +355,48 @@ if(GTEST_FOUND)
     add_test(NAME CosmaPrefillAttentionIntegrationTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_attention_integration>)
     set_tests_properties(CosmaPrefillAttentionIntegrationTest PROPERTIES TIMEOUT 120)
 
+    add_executable(test_cosma_prefill_manager_orientation_autofix tests/test_cosma_prefill_manager_orientation_autofix.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_orientation_autofix llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_cosma_prefill_manager_orientation_autofix GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_cosma_prefill_manager_orientation_autofix PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_cosma_prefill_manager_orientation_autofix ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME CosmaPrefillManagerOrientationAutoFixTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_orientation_autofix)
+    set_tests_properties(CosmaPrefillManagerOrientationAutoFixTest PROPERTIES TIMEOUT 60)
+
+    add_executable(test_cosma_prefill_manager_env_audit tests/test_cosma_prefill_manager_env_audit.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_env_audit llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_cosma_prefill_manager_env_audit GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_cosma_prefill_manager_env_audit PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_cosma_prefill_manager_env_audit ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME CosmaPrefillManagerEnvAuditTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_env_audit)
+
+    add_executable(test_cosma_prefill_manager_stats tests/test_cosma_prefill_manager_stats.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_stats llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_cosma_prefill_manager_stats GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_cosma_prefill_manager_stats PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_cosma_prefill_manager_stats ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME CosmaPrefillManagerStatsTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_stats)
+    set_tests_properties(CosmaPrefillManagerStatsTest PROPERTIES TIMEOUT 60)
+
+    add_executable(test_cosma_prefill_manager_stats_dump tests/test_cosma_prefill_manager_stats_dump.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_stats_dump llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_cosma_prefill_manager_stats_dump GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_cosma_prefill_manager_stats_dump PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_cosma_prefill_manager_stats_dump ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME CosmaPrefillManagerStatsDumpTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_stats_dump)
+
     # Population regression (destination-local round-trip invariants)
     add_executable(test_cosma_prefill_population_regression tests/test_cosma_prefill_population_regression.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_population_regression PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
@@ -434,7 +476,27 @@ if(GTEST_FOUND)
     add_test(NAME CosmaInLayoutElementwiseMultiTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_in_layout_elementwise_multi>)
     set_tests_properties(CosmaInLayoutElementwiseMultiTest PROPERTIES TIMEOUT 60)
 
-    set(KERNEL_TEST_TARGETS test_mpi_linear_kernel test_mpi_rmsnorm_kernel test_mpi_attention_kernel test_mpi_transformer_pipeline test_adaptive_matmul test_cosma_minimal test_cosma_prefill_manager test_cosma_prefill_manager_multi test_cosma_prefill_manager_distributed test_cosma_prefill_manager_paths test_dequant test_dequant_extra test_dequant_golden test_integration_q4k test_cosma_in_layout_elementwise test_cosma_in_layout_elementwise_multi)
+    set(KERNEL_TEST_TARGETS
+        test_mpi_linear_kernel
+        test_mpi_rmsnorm_kernel
+        test_mpi_attention_kernel
+        test_mpi_transformer_pipeline
+        test_adaptive_matmul
+        test_cosma_minimal
+        test_cosma_prefill_manager
+        test_cosma_prefill_manager_multi
+        test_cosma_prefill_manager_distributed
+        test_cosma_prefill_manager_paths
+        test_cosma_prefill_manager_orientation_autofix
+        test_cosma_prefill_manager_env_audit
+        test_cosma_prefill_manager_stats
+        test_cosma_prefill_manager_stats_dump
+        test_dequant
+        test_dequant_extra
+        test_dequant_golden
+        test_integration_q4k
+        test_cosma_in_layout_elementwise
+        test_cosma_in_layout_elementwise_multi)
 else()
     message(STATUS "Google Test not found - kernel unit tests disabled")
     set(KERNEL_TEST_TARGETS "")

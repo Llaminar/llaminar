@@ -1,7 +1,7 @@
 #pragma once
-// COSMA Prefill Manager (Phase 1)
+// COSMA Prefill Manager (Phase 1 / 1b)
 // --------------------------------------------------------------
-// This component implements the Phase 1 scope of the COSMA prefill
+// This component implements the Phase 1 + Phase 1b scope of the COSMA prefill
 // integration plan documented in:
 //   .github/instructions/cosma-prefill-plan.instructions.md
 // Phase 1 goals:
@@ -11,13 +11,15 @@
 //   - Provide instrumentation (bytes, timings, counters)
 //   - Optional validation tile GEMM for early corruption detection
 //   - Memory budget guard for single allocations
-// Non-goals (deferred): cumulative resident tracking, fused dequant, elementwise kernels in-place.
+// Phase 1b adds: cumulative resident tracking, JSON stats export, env audit helpers.
+// Non-goals (deferred): fused dequant, full in-layout elementwise kernels, stream overlap.
 // --------------------------------------------------------------
 #include <memory>
 #include <unordered_map>
 #include <vector>
 #include <string>
 #include <optional>
+#include <utility>
 #include <cosma/matrix.hpp>
 #include <cosma/strategy.hpp>
 #include <mpi.h>
@@ -28,6 +30,8 @@ namespace llaminar
 {
 
     // Forward declarations
+    class CosmaPrefillManager;
+
     struct WeightDescriptor
     {
         std::string id{};              // unique layer+projection key
@@ -42,6 +46,10 @@ namespace llaminar
 
     struct CosmaView
     {
+        // Retain prerequisite allocations (typically operand buffers rebuilt for COSMA layout)
+        // so their destruction occurs after this view releases its own matrix, preserving the
+        // COSMA memory pool's LIFO discipline.
+        std::vector<std::shared_ptr<cosma::CosmaMatrix<float>>> release_chain;
         std::shared_ptr<cosma::CosmaMatrix<float>> mat; // shared so temporary results survive chaining
         int global_rows = 0;
         int global_cols = 0;
@@ -49,6 +57,21 @@ namespace llaminar
         // Single-rank fallback support
         const float *original_row_major = nullptr;      // points to source data (A or B) if available
         std::shared_ptr<std::vector<float>> host_owned; // for outputs or copies when needed
+
+        ~CosmaView()
+        {
+            if (mat)
+            {
+                mat.reset();
+            }
+            for (auto it = release_chain.rbegin(); it != release_chain.rend(); ++it)
+            {
+                if (*it)
+                {
+                    it->reset();
+                }
+            }
+        }
     };
 
     struct CosmaWeightHandle
@@ -59,7 +82,27 @@ namespace llaminar
 
     struct FusedRmsnormQkvResult
     {
+        // Retains the activation matrix until final destruction to satisfy COSMA memory pool LIFO semantics.
+        CosmaView activation_guard;
+        struct WeightGuard
+        {
+            CosmaPrefillManager *manager{nullptr};
+            CosmaWeightHandle handle;
+
+            WeightGuard() = default;
+            WeightGuard(CosmaPrefillManager *mgr, CosmaWeightHandle &&h);
+            WeightGuard(WeightGuard &&other) noexcept;
+            WeightGuard &operator=(WeightGuard &&other) noexcept;
+            WeightGuard(const WeightGuard &) = delete;
+            WeightGuard &operator=(const WeightGuard &) = delete;
+            ~WeightGuard();
+        };
+
         CosmaView normalized;
+        WeightGuard wq_guard;
+        WeightGuard wk_guard;
+        WeightGuard wv_guard;
+
         CosmaView q;
         CosmaView k;
         CosmaView v;
@@ -211,6 +254,7 @@ namespace llaminar
 
         // Phase 1b additions
         void dump_stats_json(const std::string &path) const;          // structured stats export
+        void dump_stats_if_requested() const;                         // honour LLAMINAR_COSMA_DUMP_STATS
         void reset_stats();                                           // test isolation helper
         static const std::vector<std::string> &recognized_env_vars(); // env audit support
 

@@ -105,6 +105,7 @@ Phase 1 introduces an optional COSMA-backed prefill path focused on large contex
 | `LLAMINAR_COSMA_VALIDATE_TILE` | Tile size (tokens) for relative L2 correctness check. | Rank 0 warns if `rel_l2 > 1e-3`. |
 | `LLAMINAR_COSMA_LOG_LEVEL` | Prefill log verbosity (`trace,debug,info,warn,error`). | Independent of global logger. |
 | `LLAMINAR_COSMA_DUMP_STATS` | Emit aggregate counters at shutdown. | Use `1` or `true`. |
+| `LLAMINAR_COSMA_DUMP_STATS_PATH` | Override destination for JSON stats when dump enabled. | Defaults to `cosma_prefill_stats.json`. |
 | `LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT` | Disable fused quantized weight dequant + COSMA population (revert to two-step path). | Safety fallback for new fused path. |
 
 ### Instrumentation Counters
@@ -116,8 +117,8 @@ Exposed via `CosmaPrefillManager::stats()`:
 
 Strategy cache performance: `strategy_hits`, `strategy_misses` from `StrategyCache`.
 
-### Memory Budget (Phase 1 Behavior)
-The current implementation only rejects an activation or weight load if that single allocation would exceed `LLAMINAR_COSMA_MAX_RESIDENT_MB`. It does not yet maintain a running total of outstanding COSMA buffers. Future phases will implement pooled allocators and cumulative tracking.
+### Memory Budget (Phase 1b Behavior)
+Allocations are now tracked cumulatively. A request is denied when either the single allocation or the projected resident total would exceed `LLAMINAR_COSMA_MAX_RESIDENT_MB`. Releasing COSMA matrices updates the running total, ensuring large prefill sequences respect the soft budget.
 
 ### Validation Tile
 When enabled, rank 0 recomputes a top-left `(T x T)` GEMM using the original row-major operands with OpenBLAS and compares against the distributed result (after gathering), logging a warning if relative L2 > 1e-3 or NaN. This provides an inexpensive early corruption detector without full matrix duplication.

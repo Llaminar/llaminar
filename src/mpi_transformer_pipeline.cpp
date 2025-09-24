@@ -709,6 +709,8 @@ namespace llaminar
                 std::memcpy(v_head.data() + static_cast<size_t>(row) * head_dim, v_src, head_dim * sizeof(float));
             }
 
+            LOG_DEBUG("Attention head " << head << ": invoking adaptiveMatMul for QK^T (seq_len=" << seq_len
+                                          << ", head_dim=" << head_dim << ") on rank " << rank_);
             if (!adaptiveMatMul(q_head.data(), k_head.data(), scores.data(),
                                 seq_len, seq_len, head_dim,
                                 true, false, false, true))
@@ -716,20 +718,32 @@ namespace llaminar
                 LOG_ERROR("AdaptiveMatMul failed computing attention scores for head " << head);
                 return false;
             }
+            LOG_DEBUG("Attention head " << head << ": adaptiveMatMul for QK^T completed on rank " << rank_);
 
             for (float &value : scores)
             {
                 value *= scale;
             }
 
+            LOG_DEBUG("Attention head " << head << ": converting scores to COSMA layout on rank " << rank_);
             auto scores_view = manager.convert_activation_in_with_strategy(scores.data(), seq_len, seq_len, score_strategy);
+            LOG_DEBUG("Attention head " << head << ": scores view mat=" << (scores_view.mat ? 1 : 0)
+                                          << " local_size=" << (scores_view.mat ? scores_view.mat->matrix_size() : 0)
+                                          << " orig_ptr=" << (scores_view.original_row_major ? 1 : 0)
+                                          << " on rank " << rank_);
             auto softmax_view = manager.convert_activation_in_with_strategy(softmax_buf.data(), seq_len, seq_len, score_strategy);
+            LOG_DEBUG("Attention head " << head << ": softmax view mat=" << (softmax_view.mat ? 1 : 0)
+                                          << " local_size=" << (softmax_view.mat ? softmax_view.mat->matrix_size() : 0)
+                                          << " orig_ptr=" << (softmax_view.original_row_major ? 1 : 0)
+                                          << " on rank " << rank_);
 
+            LOG_DEBUG("Attention head " << head << ": softmax_in_layout start on rank " << rank_);
             if (!manager.softmax_in_layout(scores_view, softmax_view, seq_len, seq_len, 1.0f))
             {
                 LOG_ERROR("Distributed softmax failed for head " << head);
                 return false;
             }
+            LOG_DEBUG("Attention head " << head << ": softmax_in_layout complete on rank " << rank_);
             manager.to_row_major(softmax_view, softmax_buf.data());
 
             if (!adaptiveMatMul(softmax_buf.data(), v_head.data(), context_head.data(),

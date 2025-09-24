@@ -4,6 +4,8 @@
 #include <mpi.h>
 #include <fstream>
 #include <regex>
+#include <cstdio>
+#include <cstdlib>
 using namespace llaminar;
 
 TEST(CosmaPrefillManagerStatsDumpTest, JsonFileContainsCoreFields)
@@ -40,4 +42,32 @@ TEST(CosmaPrefillManagerStatsDumpTest, JsonFileContainsCoreFields)
         EXPECT_NE(content.find("\"cosma_path_calls\""), std::string::npos);
         EXPECT_NE(content.find("\"peak_resident_bytes\""), std::string::npos);
     }
+}
+
+TEST(CosmaPrefillManagerStatsDumpTest, EnvFlagHonoursCustomPath)
+{
+    int init = 0;
+    MPI_Initialized(&init);
+    if (!init)
+    {
+        int argc = 0;
+        char **argv = nullptr;
+        MPI_Init(&argc, &argv);
+    }
+    auto &mgr = CosmaPrefillManager::instance();
+    mgr.reset_stats();
+    const char *path = "cosma_prefill_stats_env.json";
+    std::remove(path);
+    setenv("LLAMINAR_COSMA_DUMP_STATS", "1", 1);
+    setenv("LLAMINAR_COSMA_DUMP_STATS_PATH", path, 1);
+    mgr.dump_stats_if_requested();
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank == 0)
+    {
+        std::ifstream ifs(path);
+        ASSERT_TRUE(ifs.is_open());
+    }
+    unsetenv("LLAMINAR_COSMA_DUMP_STATS");
+    unsetenv("LLAMINAR_COSMA_DUMP_STATS_PATH");
 }

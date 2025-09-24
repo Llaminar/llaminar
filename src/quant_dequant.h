@@ -56,6 +56,45 @@ namespace llaminar
         return u.f;
     }
 
+    // Q4_0: block size 32 values; layout: uint16_t d; uint8_t qs[16] (packed low/high nibbles)
+    inline void dequant_block_q4_0(const uint8_t *block, float *dst, int values = 32)
+    {
+        constexpr int QK = 32;
+        if (!block || !dst || values <= 0)
+            return;
+        uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, block, sizeof(uint16_t));
+        const float d = qd_fp16_to_fp32(scale_bits);
+        const uint8_t *qs = block + sizeof(uint16_t);
+        const int max_pairs = QK / 2;
+        for (int j = 0; j < max_pairs && (2 * j) < values; ++j)
+        {
+            const uint8_t packed = qs[j];
+            const int dst_idx0 = 2 * j;
+            const int dst_idx1 = dst_idx0 + 1;
+            if (dst_idx0 < values)
+                dst[dst_idx0] = (float)((packed & 0x0F) - 8) * d;
+            if (dst_idx1 < values)
+                dst[dst_idx1] = (float)((packed >> 4) - 8) * d;
+        }
+    }
+
+    inline void dequant_q4_0_rows(const uint8_t *data, float *dst, size_t n_elements)
+    {
+        if (!data || !dst || n_elements == 0)
+            return;
+        constexpr size_t QK = 32;
+        constexpr size_t BLOCK_BYTES = sizeof(uint16_t) + 16;
+        const size_t blocks = (n_elements + QK - 1) / QK;
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t *block = data + b * BLOCK_BYTES;
+            float *row = dst + b * QK;
+            const size_t remain = std::min<size_t>(QK, n_elements - b * QK);
+            dequant_block_q4_0(block, row, static_cast<int>(remain));
+        }
+    }
+
     // Q5_0: block size 32 values; layout: uint16_t d; uint8_t qh[4]; uint8_t qs[16]
     // Reconstruction mirrors ModelLoader::dequantizeQ5_0 (ggml parity):
     // raw5 = (low_nibble | ( (qh_bit)<<4)); signed_val = raw5 - 16; value = signed_val * d

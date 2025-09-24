@@ -197,7 +197,11 @@ namespace llaminar
                     if (transpose_A || transpose_B)
                     {
                         LOG_WARN("AdaptiveMatMul COSMA path: transpose not supported yet; falling back");
+                        LOG_DEBUG("AdaptiveMatMul transpose fallback -> OpenBLAS start rank=" << mpi_rank_
+                                                    << " m=" << m << " n=" << n << " k=" << k);
                         success = multiply_openblas(A, B, C, m, n, k, transpose_A, transpose_B, alpha, beta);
+                        LOG_DEBUG("AdaptiveMatMul transpose fallback -> OpenBLAS complete rank=" << mpi_rank_
+                                                    << " ok=" << success);
                         break;
                     }
                     // IMPORTANT: All COSMA matrices for a single GEMM must share the SAME strategy (m,n,k).
