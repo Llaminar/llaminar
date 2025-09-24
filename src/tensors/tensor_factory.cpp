@@ -4,6 +4,37 @@
 #include "cosma_tensor.h"
 #include "../logger.h"
 #include <mpi.h>
+#include <atomic>
+#include <array>
+#include <cctype>
+
+namespace
+{
+    // COSMA currently recognizes only matrix labels 'A', 'B', or 'C'.
+    // When callers provide arbitrary labels (e.g. "auto_512"), normalize
+    // them to a valid single-character label, cycling through A/B/C to
+    // minimize collisions when possible.
+    std::string normalize_cosma_label(const std::string &label)
+    {
+        static const std::array<char, 3> kAllowedLabels = {'A', 'B', 'C'};
+        static std::atomic<size_t> next_label{0};
+
+        if (!label.empty())
+        {
+            char c = static_cast<char>(std::toupper(label.front()));
+            for (char allowed : kAllowedLabels)
+            {
+                if (c == allowed)
+                {
+                    return std::string(1, allowed);
+                }
+            }
+        }
+
+        size_t idx = next_label.fetch_add(1, std::memory_order_relaxed) % kAllowedLabels.size();
+        return std::string(1, kAllowedLabels[idx]);
+    }
+}
 
 namespace llaminar
 {
@@ -25,9 +56,24 @@ namespace llaminar
                                                                       const std::string &label,
                                                                       int mpi_rank)
     {
+        if (shape.size() != 2)
+        {
+            LOG_WARN("COSMATensor requires 2D shape, received " + std::to_string(shape.size()) + "D. Falling back to SimpleTensor.");
+            return create_simple(shape);
+        }
+
+        std::string sanitized_label = normalize_cosma_label(label);
+
         try
         {
-            return std::make_shared<COSMATensor>(shape, label, mpi_rank);
+            auto tensor = std::make_shared<COSMATensor>(shape, sanitized_label, mpi_rank);
+            if (!tensor->data() || tensor->size() == 0)
+            {
+                LOG_WARN("COSMATensor allocated with zero local storage for label '" << sanitized_label
+                                                                                     << "' on rank " << mpi_rank << ". Falling back to SimpleTensor.");
+                return create_simple(shape);
+            }
+            return tensor;
         }
         catch (const std::exception &e)
         {
@@ -193,7 +239,7 @@ namespace llaminar
 
         try
         {
-            auto cosma_tensor = std::make_shared<COSMATensor>(tensor->shape(), "converted", mpi_rank);
+            auto cosma_tensor = std::make_shared<COSMATensor>(tensor->shape(), normalize_cosma_label("converted"), mpi_rank);
             std::copy(tensor->data(), tensor->data() + tensor->size(), cosma_tensor->data());
             return cosma_tensor;
         }

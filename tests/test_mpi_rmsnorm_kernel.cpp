@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
+#include "test_timeout_guard.h"
 #include "../src/kernels/MPIRMSNormKernel.h"
 #include "../src/tensors/tensor_factory.h"
 #include <memory>
+#include <chrono>
 #include <cmath>
 #include <random>
 #include <mpi.h>
@@ -252,7 +254,13 @@ int main(int argc, char **argv)
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
+    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
+        {"LLAMINAR_TEST_TIMEOUT_MS"}, std::chrono::milliseconds(60000));
+    llaminar::test_util::TestTimeoutGuard watchdog("MPIRMSNormKernelTest", timeout);
+
     int result = RUN_ALL_TESTS();
+
+    watchdog.disarm();
 
     // Finalize MPI
     MPI_Finalize();

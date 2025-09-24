@@ -60,6 +60,16 @@ namespace llaminar
             // Create COSMA matrix with the provided strategy
             cosma_matrix_ = std::make_unique<cosma::CosmaMatrix<float>>(
                 label[0], *strategy_, mpi_rank_);
+
+            // Ensure the underlying storage is materialized for direct data() access
+            try
+            {
+                cosma_matrix_->allocate();
+            }
+            catch (const std::exception &e)
+            {
+                throw std::runtime_error(std::string("COSMATensor failed to allocate matrix storage: ") + e.what());
+            }
         }
 
         // Constructor that creates strategy automatically
@@ -111,6 +121,15 @@ namespace llaminar
             // Create COSMA matrix
             cosma_matrix_ = std::make_unique<cosma::CosmaMatrix<float>>(
                 label[0], *strategy_, mpi_rank_);
+
+            try
+            {
+                cosma_matrix_->allocate();
+            }
+            catch (const std::exception &e)
+            {
+                throw std::runtime_error(std::string("COSMATensor failed to allocate matrix storage: ") + e.what());
+            }
         }
 
         // TensorBase interface implementation

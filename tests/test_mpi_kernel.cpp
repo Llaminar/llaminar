@@ -1,6 +1,8 @@
+#include "test_timeout_guard.h"
 #include "mpi_kernel_base.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <chrono>
 #include <memory>
 
 using namespace llaminar;
@@ -220,7 +222,13 @@ int main(int argc, char **argv)
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
+    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
+        {"LLAMINAR_TEST_TIMEOUT_MS"}, std::chrono::milliseconds(60000));
+    llaminar::test_util::TestTimeoutGuard watchdog("MPIKernelBaseTest", timeout);
+
     int result = RUN_ALL_TESTS();
+
+    watchdog.disarm();
 
     // Finalize MPI
     MPI_Finalize();

@@ -190,6 +190,21 @@ namespace llaminar
                                      const ModelWeights &weights,
                                      std::shared_ptr<TensorBase> &output);
 
+        struct PrefillAttentionTiming
+        {
+            double norm_ms{0.0};
+            double attention_ms{0.0};
+            double linear_ms{0.0};
+        };
+
+        bool shouldUseCosmaPrefill(int seq_len) const;
+        bool executePrefillAttentionCosma(int layer_idx,
+                                          std::shared_ptr<TensorBase> &input,
+                                          const ModelWeights &weights,
+                                          std::shared_ptr<TensorBase> &attn_norm_out,
+                                          std::shared_ptr<TensorBase> &attn_out,
+                                          PrefillAttentionTiming &timing);
+
         /**
          * @brief Initialize KV cache tensors for attention
          * @param seq_len Maximum sequence length

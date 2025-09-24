@@ -139,6 +139,7 @@ Core Gating & Thresholds:
 - `LLAMINAR_COSMA_DIRECT_THRESHOLD_OPS` (volume threshold for auto direct COSMA selection)
 - `LLAMINAR_COSMA_FORCE_DIRECT` (force direct COSMA path)
 - `LLAMINAR_COSMA_FORCE_REPLICATED` / `LLAMINAR_COSMA_FORCE_REPLICATED_DIAG`
+- `LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT` (force activation conversion to allocate COSMA matrices even when fast path would skip)
 
 Validation & Diagnostics:
 - `LLAMINAR_COSMA_VALIDATE_TILE` (tile size >0 enables)

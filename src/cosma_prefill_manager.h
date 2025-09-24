@@ -22,6 +22,7 @@
 #include <cosma/strategy.hpp>
 #include <mpi.h>
 #include <atomic>
+#include <mutex>
 
 namespace llaminar
 {
@@ -54,6 +55,14 @@ namespace llaminar
     {
         CosmaView view;
         WeightDescriptor desc;
+    };
+
+    struct FusedRmsnormQkvResult
+    {
+        CosmaView normalized;
+        CosmaView q;
+        CosmaView k;
+        CosmaView v;
     };
 
     struct GemmStrategies
@@ -121,6 +130,32 @@ namespace llaminar
                          float alpha = 1.f,
                          float beta = 0.f);
 
+        // Phase 2: In-layout elementwise kernels operating directly on distributed layout.
+        // Applies RMSNorm over the last dimension (feature axis) independently for each sequence position.
+        // Input/Output: src may equal dst for in-place; weight is length hidden_size.
+        // Returns false on validation failure.
+        bool rmsnorm_in_layout(const CosmaView &src, CosmaView &dst, const float *weight, int seq_len, int hidden_size, float eps = 1e-5f);
+
+        // Phase 2: SwiGLU activation: out = silu(up) * gate (both same shape [seq_len, hidden]) in layout.
+        // gate and up are CosmaView of identical dims; out may alias one of them (in-place not recommended for clarity).
+        bool swiglu_in_layout(const CosmaView &gate, const CosmaView &up, CosmaView &out, int seq_len, int hidden_size);
+
+        // Phase 2: In-layout softmax over columns for each row of distributed matrix.
+        // Optional scaling factor (commonly 1/sqrt(d_k)) applied before exponentiation.
+        bool softmax_in_layout(const CosmaView &scores, CosmaView &dst, int rows, int cols, float scale = 1.0f);
+
+        // Phase 2: Fused RMSNorm -> QKV matmul chain with optional weight streaming overlap.
+        FusedRmsnormQkvResult fused_rmsnorm_qkv(const float *activation_row_major,
+                                                const float *gamma,
+                                                const WeightDescriptor &wq,
+                                                const WeightDescriptor &wk,
+                                                const WeightDescriptor &wv,
+                                                int seq_len,
+                                                int hidden_size,
+                                                float eps = 1e-5f,
+                                                float softmax_scale = 1.0f,
+                                                bool transpose_k = false);
+
         void to_row_major(const CosmaView &src, float *dst) const;
         // Generic reconstruction helper (optionally normalization when overlapping ownership occurs)
         void reconstruct_matrix(const CosmaView &src, float *dst, bool normalize = true) const;
@@ -162,6 +197,14 @@ namespace llaminar
             // Phase 2: fused dequant + direct layout
             std::atomic<long long> fused_dequant_invocations{0};
             std::atomic<long long> fused_dequant_elements{0};
+            // Phase 2: in-layout softmax and fused chains
+            std::atomic<long long> softmax_invocations{0};
+            std::atomic<long long> softmax_rows_processed{0};
+            std::atomic<long long> us_softmax{0};
+            std::atomic<long long> fused_rmsnorm_qkv_invocations{0};
+            std::atomic<long long> us_fused_rmsnorm_qkv{0};
+            std::atomic<long long> overlap_stream_invocations{0};
+            std::atomic<long long> us_overlap_stream{0};
         } stats_;
         const PrefillStats &stats() const { return stats_; }
         const StrategyCache::Stats &strategy_stats() const { return strategy_cache_.stats; }
@@ -184,25 +227,81 @@ namespace llaminar
 
         StrategyCache strategy_cache_;
 
+        struct EnvSnapshot
+        {
+            bool cosma_disabled = false;
+            bool adaptive_disabled = false;
+            bool diag_enabled = false;
+            bool diag_deep = false;
+            bool diag_axis = false;
+            bool diag_coord_invert = false;
+            bool diag_local_probe = false;
+            bool diag_local_probe_deep = false;
+            bool diag_recon_bypass = false;
+            bool diag_recon_transpose = false;
+            bool diag_recon_brute = false;
+            bool diag_recon_map = false;
+            bool recon_force_legacy = false;
+            bool diag_swaprc = false;
+            bool diag_try_transpose = false;
+            bool diag_skip_norm = false;
+            bool debug_recon = false;
+            bool compare_replicated = false;
+            bool diag_dump_small = false;
+            bool pop_forward_legacy = false;
+            bool force_distributed_act = false;
+            bool fast_unverified = false;
+            bool disable_fused_dequant = false;
+            bool force_replicated_diag = false;
+            bool force_replicated = false;
+            bool force_direct = false;
+            bool replicate_B = false;
+            bool auto_fix_transpose = false;
+            bool force_unified_strategy = false;
+            bool overlap_enabled = false;
+            bool overlap_verbose = false;
+            bool preflight_disable = false;
+            bool diag_perm_infer_active = false;
+            bool diag_samples_active = false;
+            bool preflight_safety_override = false;
+            bool direct_threshold_override = false;
+            bool diag_tap_enabled = false;
+            int diag_tap_value = 0;
+            long long direct_threshold_ops = 0;
+            double preflight_safety = 1.2;
+            int forced_openblas_threads = -1;
+            int forced_replicated_threads = -1;
+            std::string diag_perm_spec;
+            std::string diag_samples_spec;
+        };
+
         struct AllocationRecord
         {
             std::weak_ptr<cosma::CosmaMatrix<float>> ref;
             long long bytes{0};
         };
         std::vector<AllocationRecord> allocations_; // tracked allocations for resident memory accounting
+        mutable std::mutex allocations_mutex_;
 
         void recalc_resident();
+        EnvSnapshot capture_env_snapshot() const;
+        const EnvSnapshot &resolve_env(const EnvSnapshot *override_env, EnvSnapshot &storage) const;
 
         // Internal helpers
         CosmaView allocate_matrix(char label, int m, int n, const cosma::Strategy &strat, bool zero = false);
-        void fill_activation(CosmaView &dst, const float *src_row_major, int m, int k);
-        void stream_weight_blocks(CosmaView &dst, const WeightDescriptor &desc);
-        void stream_weight_blocks_quantized(CosmaView &dst, const WeightDescriptor &desc);
+        void fill_activation(CosmaView &dst, const float *src_row_major, int m, int k, const EnvSnapshot &env);
+        void stream_weight_blocks(CosmaView &dst, const WeightDescriptor &desc, const EnvSnapshot &env);
+        void stream_weight_blocks_quantized(CosmaView &dst, const WeightDescriptor &desc, const EnvSnapshot &env);
         void maybe_validation_tile_gemm(const float *A, const float *B, const float *C_ref_full,
                                         int m, int k, int n);
         bool should_log(int lvl) const { return lvl <= log_level_; }
         bool memory_budget_allows(size_t bytes_needed) const;
         bool preflight_allows(int seq_len, int d_model, int d_ff, int n_proj = 3) const; // attention: Q,K,V by default
+        void debug_compare_original_impl(const CosmaView &src, int rows, int cols, const float *original, const EnvSnapshot &env) const;
+        void diag_global_checksum_impl(const CosmaView &src, const char *tag, const EnvSnapshot &env) const;
+        void diag_sample_points_impl(const CosmaView &src, const float *original, const char *tag, const EnvSnapshot &env) const;
+        void diag_compare_row_major_impl(const float *A, const float *B, int m, int n, const char *tagA, const char *tagB, const EnvSnapshot &env) const;
+        void reconstruct_matrix_impl(const CosmaView &src, float *dst, bool normalize, const EnvSnapshot &env) const;
     };
 
 } // namespace llaminar

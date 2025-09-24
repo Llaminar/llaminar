@@ -7,9 +7,13 @@
 #include "tensors/tensor_factory.h"
 #include "debug_utils.h"
 #include "performance_timer.h"
+#include "cosma_prefill_manager.h"
+#include "adaptive_matmul.h"
 #include <chrono>
 #include <iomanip>
 #include <cmath>
+#include <cstring>
+#include <numeric>
 #include <omp.h>
 
 namespace llaminar
@@ -422,56 +426,71 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(input, "Input tensor has NaN before layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(input, "layer_" + std::to_string(layer_idx) + "_input");
 
-        auto norm_start = std::chrono::high_resolution_clock::now();
-
-        // Attention pre-norm using registered RMSNorm kernel
-        std::vector<std::shared_ptr<TensorBase>> norm_inputs = {input, weights.attn_norm_weight[layer_idx]};
-        std::vector<std::shared_ptr<TensorBase>> norm_outputs = {attn_norm_out};
-
-        if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
+        PrefillAttentionTiming cosma_timing;
+        if (shouldUseCosmaPrefill(seq_len))
         {
-            LOG_ERROR("Layer " << layer_idx << " attention norm failed");
-            return false;
+            if (!executePrefillAttentionCosma(layer_idx, input, weights, attn_norm_out, attn_out, cosma_timing))
+            {
+                LOG_ERROR("Layer " << layer_idx << " COSMA prefill attention path failed");
+                return false;
+            }
+            total_norm_time_ += cosma_timing.norm_ms;
+            total_attention_time_ += cosma_timing.attention_ms;
+            total_linear_time_ += cosma_timing.linear_ms;
+        }
+        else
+        {
+            auto norm_start = std::chrono::high_resolution_clock::now();
+
+            // Attention pre-norm using registered RMSNorm kernel
+            std::vector<std::shared_ptr<TensorBase>> norm_inputs = {input, weights.attn_norm_weight[layer_idx]};
+            std::vector<std::shared_ptr<TensorBase>> norm_outputs = {attn_norm_out};
+
+            if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
+            {
+                LOG_ERROR("Layer " << layer_idx << " attention norm failed");
+                return false;
+            }
+
+            auto norm_end = std::chrono::high_resolution_clock::now();
+            total_norm_time_ += std::chrono::duration<double, std::milli>(norm_end - norm_start).count();
+
+            // Multi-head attention with MPI distribution using registered attention kernel
+            auto attn_start = std::chrono::high_resolution_clock::now();
+
+            // Set sequence position in attention kernel
+            auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
+            if (attention_kernel)
+            {
+                attention_kernel->setSequencePosition(n_past_);
+            }
+
+            std::vector<std::shared_ptr<TensorBase>> attn_inputs = {
+                attn_norm_out,                                                                                            // Input sequence
+                weights.wq[layer_idx],                                                                                    // Wq
+                weights.wk[layer_idx],                                                                                    // Wk
+                weights.wv[layer_idx],                                                                                    // Wv
+                weights.wo[layer_idx],                                                                                    // Wo
+                use_kv_cache_ ? k_cache_[layer_idx] : createLocalTensor({seq_len, config_.n_head_kv * config_.head_dim}), // K cache (or temp)
+                use_kv_cache_ ? v_cache_[layer_idx] : createLocalTensor({seq_len, config_.n_head_kv * config_.head_dim})  // V cache (or temp)
+            };
+            std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
+
+            if (!executeKernel("attention", attn_inputs, attn_outputs))
+            {
+                LOG_ERROR("Layer " << layer_idx << " attention failed");
+                return false;
+            }
+
+            auto attn_end = std::chrono::high_resolution_clock::now();
+            total_attention_time_ += std::chrono::duration<double, std::milli>(attn_end - attn_start).count();
         }
 
         ASSERT_TENSOR_NOT_NAN(attn_norm_out, "Attention norm output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(attn_norm_out, "layer_" + std::to_string(layer_idx) + "_attn_norm_out");
 
-        auto norm_end = std::chrono::high_resolution_clock::now();
-        total_norm_time_ += std::chrono::duration<double, std::milli>(norm_end - norm_start).count();
-
-        // Multi-head attention with MPI distribution using registered attention kernel
-        auto attn_start = std::chrono::high_resolution_clock::now();
-
-        // Set sequence position in attention kernel
-        auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
-        if (attention_kernel)
-        {
-            attention_kernel->setSequencePosition(n_past_);
-        }
-
-        std::vector<std::shared_ptr<TensorBase>> attn_inputs = {
-            attn_norm_out,                                                                                            // Input sequence
-            weights.wq[layer_idx],                                                                                    // Wq
-            weights.wk[layer_idx],                                                                                    // Wk
-            weights.wv[layer_idx],                                                                                    // Wv
-            weights.wo[layer_idx],                                                                                    // Wo
-            use_kv_cache_ ? k_cache_[layer_idx] : createLocalTensor({seq_len, config_.n_head_kv * config_.head_dim}), // K cache (or temp)
-            use_kv_cache_ ? v_cache_[layer_idx] : createLocalTensor({seq_len, config_.n_head_kv * config_.head_dim})  // V cache (or temp)
-        };
-        std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
-
-        if (!executeKernel("attention", attn_inputs, attn_outputs))
-        {
-            LOG_ERROR("Layer " << layer_idx << " attention failed");
-            return false;
-        }
-
         ASSERT_TENSOR_NOT_NAN(attn_out, "Attention output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(attn_out, "layer_" + std::to_string(layer_idx) + "_attn_out");
-
-        auto attn_end = std::chrono::high_resolution_clock::now();
-        total_attention_time_ += std::chrono::duration<double, std::milli>(attn_end - attn_start).count();
 
         // Attention residual connection using registered residual kernel
         std::vector<std::shared_ptr<TensorBase>> residual_inputs = {input, attn_out};
@@ -487,11 +506,11 @@ namespace llaminar
         TensorLogger::logTensorStats(residual_tmp, "layer_" + std::to_string(layer_idx) + "_attn_residual");
 
         // 2. Feed-forward path: RMSNorm -> Gate/Up -> SwiGLU -> Down -> Residual
-        norm_start = std::chrono::high_resolution_clock::now();
+        auto norm_start = std::chrono::high_resolution_clock::now();
 
         // FFN pre-norm using registered RMSNorm kernel
-        norm_inputs = {residual_tmp, weights.ffn_norm_weight[layer_idx]};
-        norm_outputs = {ffn_norm_out};
+        std::vector<std::shared_ptr<TensorBase>> norm_inputs = {residual_tmp, weights.ffn_norm_weight[layer_idx]};
+        std::vector<std::shared_ptr<TensorBase>> norm_outputs = {ffn_norm_out};
 
         if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
         {
@@ -502,7 +521,7 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(ffn_norm_out, "FFN norm output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(ffn_norm_out, "layer_" + std::to_string(layer_idx) + "_ffn_norm_out");
 
-        norm_end = std::chrono::high_resolution_clock::now();
+        auto norm_end = std::chrono::high_resolution_clock::now();
         total_norm_time_ += std::chrono::duration<double, std::milli>(norm_end - norm_start).count();
 
         // FFN computation using MPI linear kernels and SwiGLU activation
@@ -580,6 +599,173 @@ namespace llaminar
         TensorLogger::logTensorStats(output, "layer_" + std::to_string(layer_idx) + "_output");
 
         LOG_DEBUG("Layer " << layer_idx << " completed on rank " << getRank());
+        return true;
+    }
+
+    bool MPITransformerPipeline::shouldUseCosmaPrefill(int seq_len) const
+    {
+        if (seq_len <= 0)
+            return false;
+        if (n_past_ != 0)
+            return false;
+        if (getSize() <= 1)
+            return false;
+        auto &prefill_mgr = CosmaPrefillManager::instance();
+        return prefill_mgr.enabled_for(seq_len);
+    }
+
+    bool MPITransformerPipeline::executePrefillAttentionCosma(int layer_idx,
+                                                              std::shared_ptr<TensorBase> &input,
+                                                              const ModelWeights &weights,
+                                                              std::shared_ptr<TensorBase> &attn_norm_out,
+                                                              std::shared_ptr<TensorBase> &attn_out,
+                                                              PrefillAttentionTiming &timing)
+    {
+        auto fused_start = std::chrono::high_resolution_clock::now();
+        CosmaPrefillManager &manager = CosmaPrefillManager::instance();
+        const int seq_len = input->shape()[0];
+        const int hidden_size = config_.d_model;
+        const int head_dim = config_.head_dim;
+        const int n_heads = config_.n_head;
+        const int n_kv_heads = config_.n_head_kv;
+        const int total_head_dim = n_heads * head_dim;
+        const int kv_head_dim = n_kv_heads * head_dim;
+
+        auto make_desc = [&](const std::shared_ptr<TensorBase> &tensor, const std::string &id) -> WeightDescriptor
+        {
+            const auto &shape = tensor->shape();
+            WeightDescriptor desc{id,
+                                  shape.size() > 0 ? shape[0] : 0,
+                                  shape.size() > 1 ? shape[1] : 0,
+                                  static_cast<int64_t>(shape.size() > 1 ? shape[1] : 0),
+                                  1,
+                                  0,
+                                  tensor->data(),
+                                  0};
+            return desc;
+        };
+
+        WeightDescriptor wq_desc = make_desc(weights.wq[layer_idx], "layer" + std::to_string(layer_idx) + "_wq");
+        WeightDescriptor wk_desc = make_desc(weights.wk[layer_idx], "layer" + std::to_string(layer_idx) + "_wk");
+        WeightDescriptor wv_desc = make_desc(weights.wv[layer_idx], "layer" + std::to_string(layer_idx) + "_wv");
+
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        auto fused = manager.fused_rmsnorm_qkv(input->data(),
+                                               weights.attn_norm_weight[layer_idx]->data(),
+                                               wq_desc,
+                                               wk_desc,
+                                               wv_desc,
+                                               seq_len,
+                                               hidden_size,
+                                               config_.eps,
+                                               scale,
+                                               true);
+        auto fused_end = std::chrono::high_resolution_clock::now();
+
+        if ((!fused.normalized.mat && !fused.normalized.host_owned) ||
+            (!fused.q.mat && !fused.q.host_owned) ||
+            (!fused.k.mat && !fused.k.host_owned) ||
+            (!fused.v.mat && !fused.v.host_owned))
+        {
+            LOG_ERROR("CosmaPrefillManager returned incomplete fused result for layer " << layer_idx);
+            return false;
+        }
+
+        std::vector<float> norm_buf(static_cast<size_t>(seq_len) * hidden_size, 0.f);
+        manager.to_row_major(fused.normalized, norm_buf.data());
+        std::memcpy(attn_norm_out->data(), norm_buf.data(), norm_buf.size() * sizeof(float));
+
+        std::vector<float> q_buf(static_cast<size_t>(seq_len) * total_head_dim, 0.f);
+        std::vector<float> k_buf(static_cast<size_t>(seq_len) * kv_head_dim, 0.f);
+        std::vector<float> v_buf(static_cast<size_t>(seq_len) * kv_head_dim, 0.f);
+        manager.to_row_major(fused.q, q_buf.data());
+        manager.to_row_major(fused.k, k_buf.data());
+        manager.to_row_major(fused.v, v_buf.data());
+
+        timing.norm_ms = std::chrono::duration<double, std::milli>(fused_end - fused_start).count();
+
+        std::vector<float> context_concat(static_cast<size_t>(seq_len) * total_head_dim, 0.f);
+        std::vector<float> q_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
+        std::vector<float> k_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
+        std::vector<float> v_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
+        std::vector<float> scores(static_cast<size_t>(seq_len) * seq_len, 0.f);
+        std::vector<float> softmax_buf(static_cast<size_t>(seq_len) * seq_len, 0.f);
+        std::vector<float> context_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
+
+        auto attention_start = std::chrono::high_resolution_clock::now();
+        const auto &score_strategy = manager.strategy_for(seq_len, seq_len, head_dim);
+
+        for (int head = 0; head < n_heads; ++head)
+        {
+            const int kv_head = head % n_kv_heads;
+            for (int row = 0; row < seq_len; ++row)
+            {
+                const float *q_src = q_buf.data() + static_cast<size_t>(row) * total_head_dim + head * head_dim;
+                const float *k_src = k_buf.data() + static_cast<size_t>(row) * kv_head_dim + kv_head * head_dim;
+                const float *v_src = v_buf.data() + static_cast<size_t>(row) * kv_head_dim + kv_head * head_dim;
+                std::memcpy(q_head.data() + static_cast<size_t>(row) * head_dim, q_src, head_dim * sizeof(float));
+                std::memcpy(k_head.data() + static_cast<size_t>(row) * head_dim, k_src, head_dim * sizeof(float));
+                std::memcpy(v_head.data() + static_cast<size_t>(row) * head_dim, v_src, head_dim * sizeof(float));
+            }
+
+            if (!adaptiveMatMul(q_head.data(), k_head.data(), scores.data(),
+                                seq_len, seq_len, head_dim,
+                                true, false, false, true))
+            {
+                LOG_ERROR("AdaptiveMatMul failed computing attention scores for head " << head);
+                return false;
+            }
+
+            for (float &value : scores)
+            {
+                value *= scale;
+            }
+
+            auto scores_view = manager.convert_activation_in_with_strategy(scores.data(), seq_len, seq_len, score_strategy);
+            auto softmax_view = manager.convert_activation_in_with_strategy(softmax_buf.data(), seq_len, seq_len, score_strategy);
+
+            if (!manager.softmax_in_layout(scores_view, softmax_view, seq_len, seq_len, 1.0f))
+            {
+                LOG_ERROR("Distributed softmax failed for head " << head);
+                return false;
+            }
+            manager.to_row_major(softmax_view, softmax_buf.data());
+
+            if (!adaptiveMatMul(softmax_buf.data(), v_head.data(), context_head.data(),
+                                seq_len, head_dim, seq_len,
+                                true))
+            {
+                LOG_ERROR("AdaptiveMatMul failed computing attention context for head " << head);
+                return false;
+            }
+
+            for (int row = 0; row < seq_len; ++row)
+            {
+                float *dst = context_concat.data() + static_cast<size_t>(row) * total_head_dim + head * head_dim;
+                const float *src = context_head.data() + static_cast<size_t>(row) * head_dim;
+                std::memcpy(dst, src, head_dim * sizeof(float));
+            }
+        }
+
+        auto attention_end = std::chrono::high_resolution_clock::now();
+        timing.attention_ms = std::chrono::duration<double, std::milli>(attention_end - attention_start).count();
+
+        auto proj_start = std::chrono::high_resolution_clock::now();
+        if (!adaptiveMatMul(context_concat.data(),
+                            weights.wo[layer_idx]->data(),
+                            attn_out->data(),
+                            seq_len,
+                            hidden_size,
+                            total_head_dim,
+                            true))
+        {
+            LOG_ERROR("AdaptiveMatMul failed for output projection in layer " << layer_idx);
+            return false;
+        }
+        auto proj_end = std::chrono::high_resolution_clock::now();
+        timing.linear_ms = std::chrono::duration<double, std::milli>(proj_end - proj_start).count();
+
         return true;
     }
 

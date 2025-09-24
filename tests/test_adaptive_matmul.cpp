@@ -4,6 +4,7 @@
 // proper performance characteristics for different matrix operation sizes.
 
 #include <gtest/gtest.h>
+#include "test_timeout_guard.h"
 #include "../src/adaptive_matmul.h"
 #include "../src/adaptive_transformer_pipeline.h"
 #include "../src/transformer_config.h"
@@ -293,11 +294,17 @@ int main(int argc, char **argv)
     // Initialize MPI
     MPI_Init(&argc, &argv);
 
+    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
+        {"LLAMINAR_TEST_TIMEOUT_MS"}, std::chrono::milliseconds(60000));
+    llaminar::test_util::TestTimeoutGuard watchdog("AdaptiveMatMulTest", timeout);
+
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);
 
     // Run tests
     int result = RUN_ALL_TESTS();
+
+    watchdog.disarm();
 
     // Finalize MPI
     MPI_Finalize();

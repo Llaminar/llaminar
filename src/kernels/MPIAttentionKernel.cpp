@@ -232,11 +232,44 @@ namespace llaminar
         size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
         size_t head_offset_dim = static_cast<size_t>(head_offset * head_dim_);
 
+        const float *global_wq_ptr = global_wq ? global_wq->data() : nullptr;
+        const float *global_wk_ptr = global_wk ? global_wk->data() : nullptr;
+        const float *global_wv_ptr = global_wv ? global_wv->data() : nullptr;
+        const float *global_wo_ptr = global_wo ? global_wo->data() : nullptr;
+        float *local_wq_ptr = local_wq ? local_wq->data() : nullptr;
+        float *local_wk_ptr = local_wk ? local_wk->data() : nullptr;
+        float *local_wv_ptr = local_wv ? local_wv->data() : nullptr;
+        float *local_wo_ptr = local_wo ? local_wo->data() : nullptr;
+
+        auto require_data = [&](const char *name, const float *ptr)
+        {
+            if (ptr)
+                return;
+            LOG_ERROR("MPIAttentionKernel::distributeInputs null data pointer for " << name << " on rank " << getRank());
+            throw std::runtime_error("Null tensor data pointer");
+        };
+        auto require_data_mut = [&](const char *name, float *ptr)
+        {
+            if (ptr)
+                return;
+            LOG_ERROR("MPIAttentionKernel::distributeInputs null writable pointer for " << name << " on rank " << getRank());
+            throw std::runtime_error("Null tensor data pointer");
+        };
+
+        require_data("global_wq", global_wq_ptr);
+        require_data("global_wk", global_wk_ptr);
+        require_data("global_wv", global_wv_ptr);
+        require_data("global_wo", global_wo_ptr);
+        require_data_mut("local_wq", local_wq_ptr);
+        require_data_mut("local_wk", local_wk_ptr);
+        require_data_mut("local_wv", local_wv_ptr);
+        require_data_mut("local_wo", local_wo_ptr);
+
         // Extract local query weights (columns for assigned heads)
         for (size_t i = 0; i < d_model; ++i)
         {
-            const float *global_row = global_wq->data() + i * n_head_ * head_dim_;
-            float *local_row = local_wq->data() + i * local_head_dim;
+            const float *global_row = global_wq_ptr + i * n_head_ * head_dim_;
+            float *local_row = local_wq_ptr + i * local_head_dim;
             memcpy(local_row, global_row + head_offset_dim, local_head_dim * sizeof(float));
         }
 
@@ -246,10 +279,10 @@ namespace llaminar
 
         for (size_t i = 0; i < d_model; ++i)
         {
-            const float *global_k_row = global_wk->data() + i * n_head_kv_ * head_dim_;
-            const float *global_v_row = global_wv->data() + i * n_head_kv_ * head_dim_;
-            float *local_k_row = local_wk->data() + i * local_head_dim;
-            float *local_v_row = local_wv->data() + i * local_head_dim;
+            const float *global_k_row = global_wk_ptr + i * n_head_kv_ * head_dim_;
+            const float *global_v_row = global_wv_ptr + i * n_head_kv_ * head_dim_;
+            float *local_k_row = local_wk_ptr + i * local_head_dim;
+            float *local_v_row = local_wv_ptr + i * local_head_dim;
 
             // For each local Q head, assign the corresponding KV head
             // Use modulo to handle the case where we have more Q heads than KV heads
@@ -271,8 +304,8 @@ namespace llaminar
         // Extract local output weights (rows for assigned heads)
         for (size_t i = 0; i < local_head_dim; ++i)
         {
-            const float *global_row = global_wo->data() + (head_offset_dim + i) * d_model;
-            float *local_row = local_wo->data() + i * d_model;
+            const float *global_row = global_wo_ptr + (head_offset_dim + i) * d_model;
+            float *local_row = local_wo_ptr + i * d_model;
             memcpy(local_row, global_row, d_model * sizeof(float));
         }
 

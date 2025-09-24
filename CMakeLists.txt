@@ -345,6 +345,16 @@ if(GTEST_FOUND)
     add_test(NAME CosmaPrefillManagerDistributedFullTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_distributed>)
     set_tests_properties(CosmaPrefillManagerDistributedFullTest PROPERTIES TIMEOUT 60)
 
+    add_executable(test_cosma_prefill_manager_paths tests/test_cosma_prefill_manager_paths.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_manager_paths PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaPrefillManagerPathsTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_paths>)
+    set_tests_properties(CosmaPrefillManagerPathsTest PROPERTIES TIMEOUT 60)
+
+    add_executable(test_cosma_prefill_attention_integration tests/test_cosma_prefill_attention_integration.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_prefill_attention_integration PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaPrefillAttentionIntegrationTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_attention_integration>)
+    set_tests_properties(CosmaPrefillAttentionIntegrationTest PROPERTIES TIMEOUT 120)
+
     # Population regression (destination-local round-trip invariants)
     add_executable(test_cosma_prefill_population_regression tests/test_cosma_prefill_population_regression.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_population_regression PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
@@ -418,7 +428,13 @@ if(GTEST_FOUND)
     add_test(NAME CosmaInLayoutElementwiseTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_in_layout_elementwise)
     set_tests_properties(CosmaInLayoutElementwiseTest PROPERTIES TIMEOUT 30)
 
-    set(KERNEL_TEST_TARGETS test_mpi_linear_kernel test_mpi_rmsnorm_kernel test_mpi_attention_kernel test_mpi_transformer_pipeline test_adaptive_matmul test_cosma_minimal test_cosma_prefill_manager test_dequant test_dequant_extra test_dequant_golden test_integration_q4k test_cosma_in_layout_elementwise)
+    # Multi-rank in-layout elementwise (RMSNorm + SwiGLU) correctness
+    add_executable(test_cosma_in_layout_elementwise_multi tests/test_cosma_in_layout_elementwise_multi.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_in_layout_elementwise_multi PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME CosmaInLayoutElementwiseMultiTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_in_layout_elementwise_multi>)
+    set_tests_properties(CosmaInLayoutElementwiseMultiTest PROPERTIES TIMEOUT 60)
+
+    set(KERNEL_TEST_TARGETS test_mpi_linear_kernel test_mpi_rmsnorm_kernel test_mpi_attention_kernel test_mpi_transformer_pipeline test_adaptive_matmul test_cosma_minimal test_cosma_prefill_manager test_cosma_prefill_manager_multi test_cosma_prefill_manager_distributed test_cosma_prefill_manager_paths test_dequant test_dequant_extra test_dequant_golden test_integration_q4k test_cosma_in_layout_elementwise test_cosma_in_layout_elementwise_multi)
 else()
     message(STATUS "Google Test not found - kernel unit tests disabled")
     set(KERNEL_TEST_TARGETS "")

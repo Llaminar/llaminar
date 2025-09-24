@@ -609,6 +609,7 @@ This addendum documents additional environment toggles and watchdog policies add
 | `LLAMINAR_COSMA_FORCE_REPLICATED` | Force always replicated execution even when large. | Unset | Isolate COSMA issues by comparison. |
 | `LLAMINAR_COSMA_FORCE_REPLICATED_DIAG` | Replicated path + extra diagnostics. | Unset | Superset of FORCE_REPLICATED. |
 | `ADAPTIVE_DISABLE_COSMA` | Disable COSMA entirely (already documented). | Unset | Highest precedence bypass. |
+| `LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT` | Force COSMA activation allocation even when fast path would skip. | Unset | Useful for tests needing distributed elementwise views. |
 
 ### Correctness / Validation
 | Variable | Purpose | Notes |

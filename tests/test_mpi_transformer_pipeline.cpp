@@ -1,16 +1,15 @@
 #include "mpi_transformer_pipeline.h"
 #include "logger.h"
+#include "test_timeout_guard.h"
 #include "tensors/tensor_factory.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <random>
 #include <algorithm>
 #include <iomanip>
-#include <atomic>
-#include <thread>
 #include <chrono>
-#include <execinfo.h>
-#include <csignal>
+#include <cstdlib>
+#include <iostream>
 
 using namespace llaminar;
 
@@ -478,57 +477,10 @@ int main(int argc, char **argv)
     }
     initializeLogging(); // will apply env override if present
 
-    // ---------------- Internal Watchdog (Phase 1b) ----------------
-    // Purpose: Abort with stack traces if test binary exceeds internal timeout
-    // before the external CTest TIMEOUT (configured to 60s) triggers, so we get
-    // actionable diagnostics instead of a silent hang.
-    static std::atomic<bool> watchdog_done{false};
-    int internal_timeout_ms = 55000; // keep < external 60000ms timeout
-    if (const char *env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS"))
-    {
-        int v = std::atoi(env);
-        if (v > 0)
-            internal_timeout_ms = v;
-        else if (v == 0)
-            internal_timeout_ms = -1; // 0 disables
-    }
-    auto start_tp = std::chrono::steady_clock::now();
-    auto stack_dump = [](int rank)
-    {
-        void *frames[128];
-        int n = ::backtrace(frames, 128);
-        char **syms = ::backtrace_symbols(frames, n);
-        fprintf(stderr, "[WATCHDOG][MPITransformerPipelineTest][rank %d] === STACK TRACE (%d frames) ===\n", rank, n);
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, "[WATCHDOG][rank %d] %s\n", rank, syms[i]);
-        if (syms)
-            free(syms);
-        fflush(stderr);
-    };
-    std::thread watchdog([&]()
-                         {
-        if (internal_timeout_ms < 0) return; // disabled
-        while(!watchdog_done.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_tp).count();
-            if (elapsed > internal_timeout_ms && !watchdog_done.load()) {
-                int r=0,w=1; if (MPI_Initialized(nullptr)) { MPI_Comm_rank(MPI_COMM_WORLD,&r); MPI_Comm_size(MPI_COMM_WORLD,&w);} 
-                fprintf(stderr, "[WATCHDOG][MPITransformerPipelineTest][rank %d/%d] Elapsed %lld ms > %d ms. Aborting.\n", r,w,(long long)elapsed, internal_timeout_ms); fflush(stderr);
-                stack_dump(r);
-                ::raise(SIGABRT);
-            }
-        } });
-    struct WatchdogJoin
-    {
-        std::thread &t;
-        ~WatchdogJoin()
-        {
-            if (t.joinable())
-                t.join();
-        }
-    } _wd_join{watchdog};
-    // ------------------------------------------------------------------
+    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
+        {"LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS", "LLAMINAR_TEST_TIMEOUT_MS"},
+        std::chrono::milliseconds(60000));
+    llaminar::test_util::TestTimeoutGuard watchdog("MPITransformerPipelineTest", timeout);
 
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);
@@ -549,7 +501,7 @@ int main(int argc, char **argv)
     // Synchronize before finalizing
     MPI_Barrier(MPI_COMM_WORLD);
 
-    watchdog_done.store(true);
+    watchdog.disarm();
     // Finalize MPI (ensure all ranks either finished or watchdog aborted earlier)
     MPI_Finalize();
 

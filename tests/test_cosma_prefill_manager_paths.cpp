@@ -211,3 +211,55 @@ TEST(CosmaPrefillManagerPathsTest, AutoDirectThreshold)
     EXPECT_LT(r, 2e-2);
     EXPECT_GT(mgr.stats().cosma_path_calls.load(), before_cosma) << "Expected COSMA direct path based on volume";
 }
+
+TEST(CosmaPrefillManagerPathsTest, ReplicatedTransposeFallback)
+{
+    ensure_mpi();
+    int world = 1, rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (world < 2)
+        GTEST_SKIP() << "Need >=2 ranks";
+
+    unsetenv("LLAMINAR_COSMA_FORCE_DIRECT");
+    unsetenv("LLAMINAR_COSMA_FORCE_REPLICATED");
+    unsetenv("LLAMINAR_COSMA_FORCE_REPLICATED_DIAG");
+    unsetenv("LLAMINAR_COSMA_COMPARE_REPLICATED");
+
+    setenv("LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT", "1", 1);
+
+    int m = 64, k = 80, n = 72; // volume=368,640 > fast path threshold -> triggers replicated fallback
+    std::vector<float> A(m * k, 0.f), B(k * n, 0.f), C(m * n, 0.f), Cref(m * n, 0.f);
+    fill(A);
+    fill(B);
+    MPI_Bcast(A.data(), m * k, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(B.data(), k * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m, n, k, 1.f, A.data(), k, B.data(), k, 0.f, Cref.data(), n);
+    }
+    MPI_Bcast(Cref.data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    auto &mgr = CosmaPrefillManager::instance();
+    const auto &stratA = mgr.strategy_for(m, k, k);
+    const auto &stratB = mgr.strategy_for(k, n, k);
+    auto Av = mgr.convert_activation_in_with_strategy(A.data(), m, k, stratA);
+    WeightDescriptor desc{"Wtranspose", k, n, (int64_t)n, 1, 0, B.data()};
+    auto W = mgr.load_weight_with_strategy(desc, stratB);
+    auto Cv = mgr.matmul(Av, W, m, k, n, true, 1.f, 0.f);
+    mgr.to_row_major(Cv, C.data());
+
+    double num = 0.0, den = 0.0;
+    for (int i = 0; i < m * n; ++i)
+    {
+        double diff = (double)C[i] - (double)Cref[i];
+        num += diff * diff;
+        den += (double)Cref[i] * (double)Cref[i];
+    }
+    double rel_l2 = std::sqrt(num) / (std::sqrt(den) + 1e-30);
+    EXPECT_LT(rel_l2, 5e-3) << "Replicated fallback transpose rel L2 too large: " << rel_l2;
+
+    unsetenv("LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT");
+}

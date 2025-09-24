@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
+#include "test_timeout_guard.h"
 #include "../src/adaptive_matmul.h"
 #include <mpi.h>
+#include <chrono>
 #include <random>
 
 using namespace llaminar;
@@ -101,8 +103,12 @@ TEST_F(AdaptiveMatMulBatchTest, ForceOpenBLASBelowThreshold)
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
+    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
+        {"LLAMINAR_TEST_TIMEOUT_MS"}, std::chrono::milliseconds(60000));
+    llaminar::test_util::TestTimeoutGuard watchdog("AdaptiveMatMulBatchTest", timeout);
     ::testing::InitGoogleTest(&argc, argv);
     int rc = RUN_ALL_TESTS();
+    watchdog.disarm();
     MPI_Finalize();
     return rc;
 }
