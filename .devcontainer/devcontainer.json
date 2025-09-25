@@ -52,7 +52,7 @@
         3000,
         5000
     ],
-    "postCreateCommand": "sudo chown -R vscode:vscode /workspace && cmake --version && gcc --version",
+    "postCreateCommand": "sudo chown -R vscode:vscode /workspace && git config --global --add safe.directory /workspaces/llaminar && cmake --version && gcc --version",
     "remoteUser": "vscode",
     "mounts": [
         "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"

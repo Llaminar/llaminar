@@ -334,6 +334,7 @@ namespace llaminar
         // Internal helpers
         CosmaView allocate_matrix(char label, int m, int n, const cosma::Strategy &strat, bool zero = false);
         void fill_activation(CosmaView &dst, const float *src_row_major, int m, int k, const EnvSnapshot &env);
+        void scatter_row_major_dest_local(CosmaView &dst, const float *src_row_major, int rows, int cols);
         void stream_weight_blocks(CosmaView &dst, const WeightDescriptor &desc, const EnvSnapshot &env);
         void stream_weight_blocks_quantized(CosmaView &dst, const WeightDescriptor &desc, const EnvSnapshot &env);
         void maybe_validation_tile_gemm(const float *A, const float *B, const float *C_ref_full,

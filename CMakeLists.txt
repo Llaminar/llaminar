@@ -145,6 +145,7 @@ target_link_libraries(llaminar_core
     OpenMP::OpenMP_CXX
     cosma
     ${BLAS_LIBRARIES}
+    ggml_min
 )
 
 # Add NUMA if available
@@ -201,6 +202,48 @@ endif()
 
 # Enable testing
 enable_testing()
+
+function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
+    if(NOT MPIEXEC_EXECUTABLE)
+        message(FATAL_ERROR "MPI executable not available for ${TEST_NAME}")
+    endif()
+
+    set(_mpi_command ${MPIEXEC_EXECUTABLE})
+    if(MPIEXEC_NUMPROC_FLAG)
+        list(APPEND _mpi_command ${MPIEXEC_NUMPROC_FLAG} ${NUM_PROCS})
+    else()
+        list(APPEND _mpi_command -n ${NUM_PROCS})
+    endif()
+
+    foreach(flag ${MPIEXEC_PREFLAGS})
+        if(NOT flag)
+            continue()
+        endif()
+        if(flag MATCHES "^-?-oversubscribe$")
+            continue()
+        endif()
+        list(APPEND _mpi_command ${flag})
+    endforeach()
+
+    list(APPEND _mpi_command --oversubscribe)
+    list(APPEND _mpi_command $<TARGET_FILE:${TARGET_NAME}>)
+
+    foreach(flag ${MPIEXEC_POSTFLAGS})
+        if(NOT flag)
+            continue()
+        endif()
+        if(flag MATCHES "^-?-oversubscribe$")
+            continue()
+        endif()
+        list(APPEND _mpi_command ${flag})
+    endforeach()
+
+    add_test(NAME ${TEST_NAME}
+        COMMAND ${_mpi_command}
+    )
+
+    set_tests_properties(${TEST_NAME} PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")
+endfunction()
 
 # Minimal ggml reference library for golden quant/dequant (Option A)
 add_library(ggml_min STATIC
@@ -262,7 +305,7 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_linear_kernel PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_linear_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_test(NAME MPILinearKernelTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_linear_kernel)
+    add_llaminar_mpi_test(MPILinearKernelTest 2 test_mpi_linear_kernel)
 
     add_executable(test_mpi_rmsnorm_kernel tests/test_mpi_rmsnorm_kernel.cpp)
     target_link_libraries(test_mpi_rmsnorm_kernel llaminar_core)
@@ -272,7 +315,7 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_rmsnorm_kernel PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_rmsnorm_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_test(NAME MPIRMSNormKernelTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_rmsnorm_kernel)
+    add_llaminar_mpi_test(MPIRMSNormKernelTest 2 test_mpi_rmsnorm_kernel)
 
     add_executable(test_mpi_attention_kernel tests/test_mpi_attention_kernel.cpp)
     target_link_libraries(test_mpi_attention_kernel llaminar_core)
@@ -282,7 +325,7 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_attention_kernel PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_attention_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_test(NAME MPIAttentionKernelTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_attention_kernel)
+    add_llaminar_mpi_test(MPIAttentionKernelTest 2 test_mpi_attention_kernel)
     
     # MPI Transformer Pipeline test
     add_executable(test_mpi_transformer_pipeline tests/test_mpi_transformer_pipeline.cpp)
@@ -293,7 +336,7 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_transformer_pipeline PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_transformer_pipeline ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_test(NAME MPITransformerPipelineTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_transformer_pipeline)
+    add_llaminar_mpi_test(MPITransformerPipelineTest 2 test_mpi_transformer_pipeline)
     # Ensure this long-running MPI test cannot hang indefinitely; internal watchdog < 60s, external timeout at 60s
     set_tests_properties(MPITransformerPipelineTest PROPERTIES TIMEOUT 60)
     
@@ -309,7 +352,7 @@ if(GTEST_FOUND)
         target_include_directories(test_adaptive_matmul PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_adaptive_matmul ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_test(NAME AdaptiveMatMulTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_adaptive_matmul)
+    add_llaminar_mpi_test(AdaptiveMatMulTest 2 test_adaptive_matmul)
     
     # Minimal COSMA Custom Layout test
     add_executable(test_cosma_minimal tests/test_cosma_minimal.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -320,7 +363,7 @@ if(GTEST_FOUND)
         target_include_directories(test_cosma_minimal PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_cosma_minimal ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_test(NAME CosmaMinimalTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_cosma_minimal)
+    add_llaminar_mpi_test(CosmaMinimalTest 2 test_cosma_minimal)
 
     # Cosma Prefill Manager correctness (single rank baseline)
     add_executable(test_cosma_prefill_manager tests/test_cosma_prefill_manager.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -336,23 +379,23 @@ if(GTEST_FOUND)
 
     add_executable(test_cosma_prefill_manager_multi tests/test_cosma_prefill_manager_multi.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_multi PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaPrefillManagerMultiTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_multi>)
+    add_llaminar_mpi_test(CosmaPrefillManagerMultiTest 2 test_cosma_prefill_manager_multi)
     set_tests_properties(CosmaPrefillManagerMultiTest PROPERTIES TIMEOUT 60)
 
     # Cosma Prefill Manager distributed full-path (large GEMM) correctness test
     add_executable(test_cosma_prefill_manager_distributed tests/test_cosma_prefill_manager_distributed.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_distributed PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaPrefillManagerDistributedFullTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_distributed>)
+    add_llaminar_mpi_test(CosmaPrefillManagerDistributedFullTest 2 test_cosma_prefill_manager_distributed)
     set_tests_properties(CosmaPrefillManagerDistributedFullTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_cosma_prefill_manager_paths tests/test_cosma_prefill_manager_paths.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_paths PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaPrefillManagerPathsTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_manager_paths>)
+    add_llaminar_mpi_test(CosmaPrefillManagerPathsTest 2 test_cosma_prefill_manager_paths)
     set_tests_properties(CosmaPrefillManagerPathsTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_cosma_prefill_attention_integration tests/test_cosma_prefill_attention_integration.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_attention_integration PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaPrefillAttentionIntegrationTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_attention_integration>)
+    add_llaminar_mpi_test(CosmaPrefillAttentionIntegrationTest 2 test_cosma_prefill_attention_integration)
     set_tests_properties(CosmaPrefillAttentionIntegrationTest PROPERTIES TIMEOUT 120)
 
     add_executable(test_cosma_prefill_manager_orientation_autofix tests/test_cosma_prefill_manager_orientation_autofix.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -400,13 +443,13 @@ if(GTEST_FOUND)
     # Population regression (destination-local round-trip invariants)
     add_executable(test_cosma_prefill_population_regression tests/test_cosma_prefill_population_regression.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_population_regression PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaPrefillManagerPopulationRegressionTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_population_regression>)
+    add_llaminar_mpi_test(CosmaPrefillManagerPopulationRegressionTest 2 test_cosma_prefill_population_regression)
     set_tests_properties(CosmaPrefillManagerPopulationRegressionTest PROPERTIES TIMEOUT 60)
 
     # Population performance benchmark (env-gated)
     add_executable(test_cosma_prefill_population_perf tests/test_cosma_prefill_population_perf.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_population_perf PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaPrefillManagerPopulationPerfTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_prefill_population_perf>)
+    add_llaminar_mpi_test(CosmaPrefillManagerPopulationPerfTest 2 test_cosma_prefill_population_perf)
     set_tests_properties(CosmaPrefillManagerPopulationPerfTest PROPERTIES TIMEOUT 120)
 
     # Dequantization tests (Q4_0 correctness + Q4_K placeholder sanity)
@@ -473,7 +516,7 @@ if(GTEST_FOUND)
     # Multi-rank in-layout elementwise (RMSNorm + SwiGLU) correctness
     add_executable(test_cosma_in_layout_elementwise_multi tests/test_cosma_in_layout_elementwise_multi.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_in_layout_elementwise_multi PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME CosmaInLayoutElementwiseMultiTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_cosma_in_layout_elementwise_multi>)
+    add_llaminar_mpi_test(CosmaInLayoutElementwiseMultiTest 2 test_cosma_in_layout_elementwise_multi)
     set_tests_properties(CosmaInLayoutElementwiseMultiTest PROPERTIES TIMEOUT 60)
 
     set(KERNEL_TEST_TARGETS

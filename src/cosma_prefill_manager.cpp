@@ -448,7 +448,7 @@ namespace llaminar
         return v;
     }
 
-    void CosmaPrefillManager::fill_activation(CosmaView &dst, const float *src_row_major, int m, int k, const EnvSnapshot &env)
+    void CosmaPrefillManager::scatter_row_major_dest_local(CosmaView &dst, const float *src_row_major, int rows, int cols)
     {
         if (!dst.mat || !src_row_major)
             return;
@@ -457,6 +457,29 @@ namespace llaminar
         if (!local || sz == 0)
             return;
         std::fill(local, local + sz, 0.f);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (long long li = 0; li < static_cast<long long>(sz); ++li)
+        {
+            auto gc = dst.mat->global_coordinates(static_cast<int>(li));
+            int gi = gc.first;
+            int gj = gc.second;
+            if (gi >= 0 && gi < rows && gj >= 0 && gj < cols)
+            {
+                local[li] = src_row_major[(size_t)gi * cols + gj];
+            }
+        }
+    }
+
+    void CosmaPrefillManager::fill_activation(CosmaView &dst, const float *src_row_major, int m, int k, const EnvSnapshot &env)
+    {
+        if (!dst.mat || !src_row_major)
+            return;
+        float *local = dst.mat->matrix_pointer();
+        size_t sz = dst.mat->matrix_size();
+        if (!local || sz == 0)
+            return;
         bool trace_scatter = env.diag_deep && should_log(4);
         // Destination-local population is now the default (proved correct); legacy forward mode only if explicitly forced.
         bool legacy_forward = env.pop_forward_legacy;
@@ -471,23 +494,27 @@ namespace llaminar
             {
                 LOG_TRACE("[CosmaPrefill][pop] destination-local population (A) default");
             }
-            for (size_t li = 0; li < sz; ++li)
+            scatter_row_major_dest_local(dst, src_row_major, m, k);
+            if (trace_scatter && rank_ == 0)
             {
-                auto gc = dst.mat->global_coordinates(static_cast<int>(li));
-                int gi = gc.first;
-                int gj = gc.second;
-                if (gi >= 0 && gi < m && gj >= 0 && gj < k)
+                for (int gi = 0; gi < std::min(m, 8); ++gi)
                 {
-                    local[li] = src_row_major[(size_t)gi * k + gj];
-                    if (trace_scatter && gi < 8 && gj < 8 && rank_ == 0)
+                    for (int gj = 0; gj < std::min(k, 8); ++gj)
                     {
-                        LOG_TRACE("[CosmaPrefill][scatterA-dest] li=" << li << " (gi=" << gi << ",gj=" << gj << ") val=" << local[li]);
+                        auto lc = dst.mat->local_coordinates(gi, gj);
+                        int local_index = lc.first;
+                        int owner = lc.second;
+                        if (owner == rank_ && local_index >= 0 && (size_t)local_index < sz)
+                        {
+                            LOG_TRACE("[CosmaPrefill][scatterA-dest] li=" << local_index << " (gi=" << gi << ",gj=" << gj << ") val=" << local[local_index]);
+                        }
                     }
                 }
             }
         }
         else
         {
+            std::fill(local, local + sz, 0.f);
             int trace_rows = std::min(m, 8);
             int trace_cols = std::min(k, 8);
             for (int gi = 0; gi < m; ++gi)
@@ -593,38 +620,29 @@ namespace llaminar
     {
         auto t0 = std::chrono::high_resolution_clock::now();
         const float *base = static_cast<const float *>(desc.base_ptr);
-        float *local = dst.mat->matrix_pointer();
-        if (!local)
+        if (!dst.mat || !base)
             return;
         size_t sz = dst.mat->matrix_size();
         size_t total = static_cast<size_t>(desc.rows) * desc.cols;
-        if (env.fast_unverified)
+        const bool needs_copy = (desc.row_stride > 0 && desc.row_stride != desc.cols) ||
+                                (desc.col_stride > 0 && desc.col_stride != 1);
+        std::vector<float> scratch;
+        const float *row_major = base;
+        if (needs_copy)
         {
-            size_t to_copy = std::min(sz, total);
-            std::memcpy(local, base, to_copy * sizeof(float));
-            if (to_copy < sz)
-                std::fill(local + to_copy, local + sz, 0.f);
-            stats_.bytes_streamed_weights += static_cast<long long>(to_copy * sizeof(float));
-        }
-        else
-        {
-            std::fill(local, local + sz, 0.f);
+            scratch.resize(total, 0.f);
             for (int gi = 0; gi < desc.rows; ++gi)
             {
-                const float *row_ptr = base + (size_t)gi * desc.cols;
+                const float *row_ptr = base + (size_t)gi * (desc.row_stride > 0 ? desc.row_stride : desc.cols);
                 for (int gj = 0; gj < desc.cols; ++gj)
                 {
-                    auto lc = dst.mat->local_coordinates(gi, gj);
-                    int local_index = lc.first;
-                    int owner = lc.second;
-                    if (owner == rank_ && local_index >= 0 && (size_t)local_index < sz)
-                    {
-                        local[local_index] = row_ptr[gj];
-                    }
+                    scratch[(size_t)gi * desc.cols + gj] = row_ptr[gj * (desc.col_stride > 0 ? desc.col_stride : 1)];
                 }
             }
-            stats_.bytes_streamed_weights += static_cast<long long>(std::min(sz, total) * sizeof(float));
+            row_major = scratch.data();
         }
+        scatter_row_major_dest_local(dst, row_major, desc.rows, desc.cols);
+        stats_.bytes_streamed_weights += static_cast<long long>(std::min(sz, total) * sizeof(float));
         auto t1 = std::chrono::high_resolution_clock::now();
         stats_.us_stream_weights += (long long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     }
@@ -633,7 +651,7 @@ namespace llaminar
     {
         // Phase 2 fused path: directly dequantize each block and scatter owned elements
         // Supported: quant_type==1 (synthetic Q5_0). Fallback otherwise or when disabled.
-        if (env.disable_fused_dequant || desc.quant_type != 1 || !dst.mat)
+        if (env.disable_fused_dequant || desc.quant_type != 1 || !dst.mat || !desc.base_ptr)
         {
             stream_weight_blocks(dst, desc, env);
             return;
@@ -643,19 +661,9 @@ namespace llaminar
         const int block_vals = 32; // Q5_0 block size
         const size_t n_blocks = (total + block_vals - 1) / block_vals;
         const uint8_t *qptr = static_cast<const uint8_t *>(desc.base_ptr);
-        size_t advanced = 0;
-        float *local = dst.mat->matrix_pointer();
-        size_t sz = dst.mat->matrix_size();
-        if (local && sz)
-            std::fill(local, local + sz, 0.f);
+        std::vector<float> scratch(total, 0.f);
         std::vector<float> tmp(block_vals, 0.f);
-        // Only allocate a row-major host buffer if an env desires reconstruction or fallback debugging.
         bool keep_row_major = env.debug_recon || env.compare_replicated;
-        if (keep_row_major)
-        {
-            dst.host_owned = std::make_shared<std::vector<float>>(total, 0.f);
-            dst.original_row_major = dst.host_owned->data();
-        }
         for (size_t b = 0; b < n_blocks; ++b)
         {
             llaminar::dequant_block_q5_0(qptr, tmp.data(), block_vals);
@@ -665,23 +673,13 @@ namespace llaminar
             for (size_t i = 0; i < remain; ++i)
             {
                 size_t linear = base_index + i;
-                int gi = static_cast<int>(linear / desc.cols);
-                int gj = static_cast<int>(linear % desc.cols);
-                auto lc = dst.mat->local_coordinates(gi, gj);
-                int local_index = lc.first;
-                int owner = lc.second;
-                if (owner == rank_ && local_index >= 0 && (size_t)local_index < sz)
-                {
-                    local[local_index] = tmp[i];
-                }
-                if (keep_row_major)
-                {
-                    (*dst.host_owned)[linear] = tmp[i];
-                }
+                scratch[linear] = tmp[i];
             }
             qptr += desc.quant_block_size ? desc.quant_block_size : (size_t)(2 + 4 + 16);
-            advanced += remain;
         }
+        scatter_row_major_dest_local(dst, scratch.data(), desc.rows, desc.cols);
+        dst.host_owned = std::make_shared<std::vector<float>>(std::move(scratch));
+        dst.original_row_major = dst.host_owned->data();
         stats_.bytes_streamed_weights += static_cast<long long>(total * sizeof(float));
         stats_.fused_dequant_invocations++;
         stats_.fused_dequant_elements += static_cast<long long>(total);
@@ -726,7 +724,10 @@ namespace llaminar
         {
             stream_weight_blocks(view, desc, env);
         }
-        view.original_row_major = static_cast<const float *>(desc.base_ptr);
+        if (desc.quant_type == 0 && !view.original_row_major)
+        {
+            view.original_row_major = static_cast<const float *>(desc.base_ptr);
+        }
         return CosmaWeightHandle{view, desc};
     }
 
@@ -768,7 +769,10 @@ namespace llaminar
         {
             stream_weight_blocks(view, desc, env);
         }
-        view.original_row_major = static_cast<const float *>(desc.base_ptr);
+        if (desc.quant_type == 0 && !view.original_row_major)
+        {
+            view.original_row_major = static_cast<const float *>(desc.base_ptr);
+        }
         return CosmaWeightHandle{view, desc};
     }
 
@@ -2362,88 +2366,28 @@ namespace llaminar
             return;
         }
 
-        bool force_legacy = env.recon_force_legacy;
-        bool use_gather = !force_legacy;
-        if (use_gather)
-        {
-            float *local = src.mat->matrix_pointer();
-            size_t sz = src.mat->matrix_size();
-            int local_n = (int)sz;
-            std::vector<int> counts(world_size_, 0);
-            MPI_Gather(&local_n, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-            std::vector<int> displs(world_size_, 0);
-            int total_entries = 0;
-            if (rank_ == 0)
-            {
-                for (int i = 0; i < world_size_; ++i)
-                {
-                    displs[i] = total_entries;
-                    total_entries += counts[i];
-                }
-            }
-            std::vector<int> gi_send(local_n), gj_send(local_n);
-            std::vector<float> val_send(local_n);
-            for (size_t li = 0; li < sz; ++li)
-            {
-                auto gc = src.mat->global_coordinates(static_cast<int>(li));
-                gi_send[(int)li] = gc.first;
-                gj_send[(int)li] = gc.second;
-                val_send[(int)li] = local[li];
-            }
-            std::vector<int> gi_all, gj_all;
-            std::vector<float> val_all;
-            if (rank_ == 0)
-            {
-                gi_all.resize(total_entries);
-                gj_all.resize(total_entries);
-                val_all.resize(total_entries);
-            }
-            MPI_Gatherv(gi_send.data(), local_n, MPI_INT,
-                        rank_ == 0 ? gi_all.data() : nullptr, rank_ == 0 ? counts.data() : nullptr, rank_ == 0 ? displs.data() : nullptr, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Gatherv(gj_send.data(), local_n, MPI_INT,
-                        rank_ == 0 ? gj_all.data() : nullptr, rank_ == 0 ? counts.data() : nullptr, rank_ == 0 ? displs.data() : nullptr, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Gatherv(val_send.data(), local_n, MPI_FLOAT,
-                        rank_ == 0 ? val_all.data() : nullptr, rank_ == 0 ? counts.data() : nullptr, rank_ == 0 ? displs.data() : nullptr, MPI_FLOAT, 0, MPI_COMM_WORLD);
-            if (rank_ == 0)
-            {
-                std::fill(dst, dst + total, 0.f);
-                for (int i = 0; i < total_entries; ++i)
-                {
-                    int gi = gi_all[i];
-                    int gj = gj_all[i];
-                    if (gi >= 0 && gj >= 0 && gi < src.global_rows && gj < src.global_cols)
-                    {
-                        size_t write_index = (size_t)gi * src.global_cols + gj;
-                        dst[write_index] = val_all[i];
-                    }
-                }
-            }
-            MPI_Bcast(dst, static_cast<int>(total), MPI_FLOAT, 0, MPI_COMM_WORLD);
-            return;
-        }
-
-        std::fill(dst, dst + total, 0.f);
+        std::vector<float> local_acc(total, 0.f);
+        std::vector<int> ownership_counts(total, 0);
         float *local = src.mat->matrix_pointer();
         size_t sz = src.mat->matrix_size();
-        std::vector<int> ownership_counts(total, 0);
+        bool map_diag = env.diag_recon_map;
+        int map_samples = map_diag ? 32 : 0;
+        int emitted = 0;
         if (local && sz)
         {
-            bool map_diag = env.diag_recon_map;
-            int map_samples = map_diag ? 32 : 0;
-            int emitted = 0;
             for (size_t li = 0; li < sz; ++li)
             {
                 auto gc = src.mat->global_coordinates(static_cast<int>(li));
                 int gi = gc.first;
                 int gj = gc.second;
-                if (gi < src.global_rows && gj < src.global_cols)
+                if (gi >= 0 && gi < src.global_rows && gj >= 0 && gj < src.global_cols)
                 {
                     size_t write_index = recon_transpose ? (size_t)gj * src.global_rows + gi
                                                          : (size_t)gi * src.global_cols + gj;
                     if (write_index < total)
                     {
-                        dst[write_index] = local[li];
-                        ownership_counts[write_index] = 1;
+                        local_acc[write_index] += local[li];
+                        ownership_counts[write_index] += 1;
                     }
                 }
                 if (map_diag && emitted < map_samples && ((li & 127) == 0 || li < (size_t)map_samples))
@@ -2462,11 +2406,18 @@ namespace llaminar
                 }
             }
         }
+
+        std::vector<int> global_counts = ownership_counts;
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
         {
-            MPI_Allreduce(MPI_IN_PLACE, dst, static_cast<int>(total), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, ownership_counts.data(), static_cast<int>(total), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(local_acc.data(), dst, static_cast<int>(total), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(ownership_counts.data(), global_counts.data(), static_cast<int>(total), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         }
+        else
+        {
+            std::copy(local_acc.begin(), local_acc.end(), dst);
+        }
+        ownership_counts.swap(global_counts);
         if (env.diag_deep && rank_ == 0 && should_log(4))
         {
             long long multi_count = 0;

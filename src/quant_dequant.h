@@ -10,50 +10,66 @@
 #include <vector>
 #include <algorithm>
 
+#ifndef GGML_COMMON_DECL
+#define GGML_COMMON_DECL_CPP
+#endif
+#include "../llama.cpp/ggml/src/ggml-common.h"
+#undef GGML_COMMON_DECL_CPP
+#include "../llama.cpp/ggml/src/ggml-quants.h"
+
+extern "C"
+{
+    void dequantize_row_q2_K(const block_q2_K *x, float *y, int64_t k);
+}
+
 namespace llaminar
 {
 
-    // Minimal half -> float conversion (delegated in model_loader but replicated here for header-only use)
-    static inline float qd_fp16_to_fp32(uint16_t h)
+    static inline float qd_fp32_from_bits(uint32_t w)
     {
-        uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-        uint32_t exp = (h & 0x7C00u) >> 10;
-        uint32_t mant = (h & 0x03FFu);
-        uint32_t bits;
-        if (exp == 0)
-        {
-            if (mant == 0)
-            {
-                bits = sign;
-            }
-            else
-            {
-                while ((mant & 0x0400u) == 0)
-                {
-                    mant <<= 1;
-                    --exp;
-                }
-                ++exp;
-                mant &= 0x03FFu;
-                exp = exp + (127 - 15);
-                bits = sign | (exp << 23) | (mant << 13);
-            }
-        }
-        else if (exp == 0x1Fu)
-        {
-            bits = sign | 0x7F800000u | (mant << 13);
-        }
-        else
-        {
-            exp = exp + (127 - 15);
-            bits = sign | (exp << 23) | (mant << 13);
-        }
         union
         {
-            uint32_t u;
-            float f;
-        } u = {bits};
-        return u.f;
+            uint32_t as_bits;
+            float as_value;
+        } fp32;
+        fp32.as_bits = w;
+        return fp32.as_value;
+    }
+
+    static inline uint32_t qd_fp32_to_bits(float f)
+    {
+        union
+        {
+            float as_value;
+            uint32_t as_bits;
+        } fp32;
+        fp32.as_value = f;
+        return fp32.as_bits;
+    }
+
+    // Minimal half -> float conversion aligned with ggml implementation
+    static inline float qd_fp16_to_fp32(uint16_t h)
+    {
+        const uint32_t w = static_cast<uint32_t>(h) << 16;
+        const uint32_t sign = w & UINT32_C(0x80000000);
+        const uint32_t two_w = w + w;
+
+        const uint32_t exp_offset = UINT32_C(0xE0) << 23;
+#if (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || defined(__GNUC__) && !defined(__STRICT_ANSI__)) && (!defined(__cplusplus) || __cplusplus >= 201703L)
+        const float exp_scale = 0x1.0p-112f;
+#else
+        const float exp_scale = qd_fp32_from_bits(UINT32_C(0x7800000));
+#endif
+        const float normalized_value = qd_fp32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
+
+        const uint32_t magic_mask = UINT32_C(126) << 23;
+        const float magic_bias = 0.5f;
+        const float denormalized_value = qd_fp32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
+
+        const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
+        const uint32_t result = sign |
+                                (two_w < denormalized_cutoff ? qd_fp32_to_bits(denormalized_value) : qd_fp32_to_bits(normalized_value));
+        return qd_fp32_from_bits(result);
     }
 
     // Q4_0: block size 32 values; layout: uint16_t d; uint8_t qs[16] (packed low/high nibbles)
@@ -123,14 +139,24 @@ namespace llaminar
     }
 
     // Q2_K (256 vals) simplified dequant replication for fused streaming.
-    inline void dequant_block_q2_K(const uint8_t *block, float *dst)
+    inline void dequant_block_q2_K(const uint8_t *block, float *dst, int values = 256)
     {
-        // Layout aligns with model_loader logic; reuse that by calling into existing path would copy.
-        // For now, call through a minimal subset duplication not to depend on internal static lambdas.
-        // We can fallback to constructing temp vector via model loader if needed; omitted for brevity.
-        // (Phase 2 optimization placeholder) -- for Phase 1 fused path we may initially skip Q2_K.
-        (void)block;
-        (void)dst; // TODO: full inline implementation if required.
+        if (!block || !dst || values <= 0)
+            return;
+
+        block_q2_K blk{};
+        std::memcpy(&blk, block, sizeof(block_q2_K));
+
+        if (values >= QK_K)
+        {
+            dequantize_row_q2_K(&blk, dst, QK_K);
+        }
+        else
+        {
+            float tmp[QK_K];
+            dequantize_row_q2_K(&blk, tmp, QK_K);
+            std::memcpy(dst, tmp, sizeof(float) * static_cast<size_t>(values));
+        }
     }
 
     // Q3_K, Q5_K, Q6_K are more complex; to keep initial fused path safe we will

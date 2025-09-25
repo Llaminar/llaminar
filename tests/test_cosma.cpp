@@ -20,7 +20,7 @@
 
 #include "../src/common.h"
 #include "../src/argument_parser.h"
-#include "../src/kernels/MatMulKernel.h"
+#include "../src/adaptive_matmul.h"
 #include "../src/tensors/tensor_base.h"
 #include "../src/tensors/simple_tensor.h"
 #include "../src/tensors/tensor_factory.h"
@@ -106,14 +106,14 @@ bool runCOSMAKernelTest(int m, int n, int k, int rank, int size)
     std::vector<std::shared_ptr<TensorBase>> inputs = {tensor_A, tensor_B};
     std::vector<std::shared_ptr<TensorBase>> outputs = {tensor_C};
 
-    // Create MatMulKernel instance with COSMA backend
-    MatMulKernel kernel;
-    kernel.setStrategy("auto");          // Let COSMA choose optimal strategy
-    kernel.setBlockSizes(256, 256, 256); // Conservative block sizes
-
-    // Execute kernel and measure performance
+    // Execute adaptive matmul path (delegates to COSMA when beneficial)
+    AdaptiveMatMulManager matmul_manager;
     auto start = std::chrono::high_resolution_clock::now();
-    bool success = kernel.execute(inputs, outputs);
+    bool success = matmul_manager.multiply(tensor_A->data(), tensor_B->data(), tensor_C->data(),
+                                           m, n, k,
+                                           false, false,
+                                           1.0f, 0.0f,
+                                           /*is_prefill=*/(m > 1));
     auto end = std::chrono::high_resolution_clock::now();
 
     if (success)
@@ -192,27 +192,6 @@ int main(int argc, char *argv[])
         std::cout << "Testing COSMA matrix multiplication with Qwen 2.5 0.5B transformer dimensions" << std::endl;
         std::cout << "Model config: 896 hidden_size, 4864 FFN, 14 heads, 2 KV heads" << std::endl;
         std::cout << "Running with " << size << " MPI processes (target: 2 for NUMA evaluation)" << std::endl;
-    }
-
-    // Test kernel validation
-    if (rank == 0)
-    {
-        std::cout << "\nTesting kernel validation..." << std::endl;
-
-        MatMulKernel kernel;
-
-        // Test invalid input count
-        std::vector<std::shared_ptr<TensorBase>> empty_inputs;
-        std::vector<std::shared_ptr<TensorBase>> empty_outputs;
-
-        if (kernel.validate(empty_inputs, empty_outputs))
-        {
-            std::cerr << "Error: Validation should fail for empty inputs!" << std::endl;
-            MPI_Finalize();
-            return 1;
-        }
-
-        std::cout << "  ✓ Input validation working correctly" << std::endl;
     }
 
     // Run transformer-specific test cases for Qwen 2.5 0.5B model

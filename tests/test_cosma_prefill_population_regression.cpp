@@ -88,6 +88,18 @@ TEST(CosmaPrefillManagerPopulationRegressionTest, DestinationLocalExactRoundTrip
     WeightDescriptor desc{"W_regress", k, n, (int64_t)n, (int64_t)1, 0, B.data()};
     auto W_handle = mgr.load_weight_with_strategy(desc, strat);
 
+    if (rank == 0 && A_view.mat)
+    {
+        auto lc = A_view.mat->local_coordinates(0, 85);
+        LOG_INFO("[PopulationRegression] coord (0,85) local_index=" << lc.first << " owner=" << lc.second);
+    }
+    if (rank == 0 && W_handle.view.mat)
+    {
+        auto lcB = W_handle.view.mat->local_coordinates(0, 128);
+        LOG_INFO("[PopulationRegression] weight coord (0,128) local_index=" << lcB.first << " owner=" << lcB.second);
+        LOG_INFO("[PopulationRegression] weight matrix_size=" << W_handle.view.mat->matrix_size());
+    }
+
     // Reconstruct A & B from distributed layout back to row-major
     std::vector<float> A_round(m * k, 0.f), B_round(k * n, 0.f);
     mgr.to_row_major(A_view, A_round.data());

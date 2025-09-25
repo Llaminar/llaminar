@@ -1,11 +1,16 @@
-# Use Ubuntu 22.04 as the base image
-FROM ubuntu:22.04
+# Use Ubuntu 24.04 as the base image
+FROM ubuntu:24.04
+
+ARG INSTALL_CUDA=false
+ARG INSTALL_ROCM=false
+ENV INSTALL_CUDA=${INSTALL_CUDA}
+ENV INSTALL_ROCM=${INSTALL_ROCM}
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build essentials
     build-essential \
     gcc \
@@ -26,6 +31,9 @@ RUN apt-get update && apt-get install -y \
     libscalapack-openmpi-dev \
     # NUMA support
     libnuma-dev \
+    # Google Test / gMock for unit tests
+    libgtest-dev \
+    libgmock-dev \
     # Additional tools
     git \
     curl \
@@ -51,34 +59,58 @@ RUN apt-get update && apt-get install -y \
     libxml2-dev \
     libeigen3-dev \
     # Node.js for MCP servers (will be installed via features)
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install CUDA Toolkit
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
+# Build and install GoogleTest libraries (CMake find_package friendly)
+RUN cmake -S /usr/src/googletest -B /tmp/googletest-build \
+    && cmake --build /tmp/googletest-build --target install \
+    && rm -rf /tmp/googletest-build
+
+# Install CUDA 12.9 (conditional)
+RUN if [ "$INSTALL_CUDA" = "true" ]; then \
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O cuda-keyring.deb && \
+    dpkg -i cuda-keyring.deb && \
     apt-get update && \
-    apt-get -y install cuda-toolkit-12-0 cuda-drivers && \
-    rm -f cuda-keyring_1.1-1_all.deb && \
+    apt-get -y install cuda-toolkit-12-9 && \
+    rm cuda-keyring.deb; \
+    else \
+    echo "Skipping CUDA installation"; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
-# Install ROCm and AMD drivers
-RUN wget https://repo.radeon.com/amdgpu-install/7.0.1/ubuntu/jammy/amdgpu-install_7.0.1.70001-1_all.deb && \
-    apt install -y ./amdgpu-install_7.0.1.70001-1_all.deb && \
+# Install ROCm 6.4 (conditional)
+RUN if [ "$INSTALL_ROCM" = "true" ]; then \
+    mkdir -p --mode=0755 /etc/apt/keyrings && \
+    wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+    gpg --dearmor | tee /etc/apt/keyrings/rocm.gpg > /dev/null && \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4.2 noble main" \
+    | tee /etc/apt/sources.list.d/rocm.list && \
+    echo 'Package: *' \
+    | tee /etc/apt/preferences.d/rocm-pin-600 && \
+    echo 'Pin: release o=repo.radeon.com' \
+    | tee -a /etc/apt/preferences.d/rocm-pin-600 && \
+    echo 'Pin-Priority: 600' \
+    | tee -a /etc/apt/preferences.d/rocm-pin-600 && \
     apt-get update && \
-    apt-get install -y python3-setuptools python3-wheel && \
     apt-get install -y rocm && \
-    rm -f amdgpu-install_7.0.1.70001-1_all.deb && \
+    apt-get autoremove -y && \
+    apt-get clean; \
+    else \
+    echo "Skipping ROCm installation"; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
 # Install specific CMake version (latest stable)
 RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null && \
-    echo 'deb https://apt.kitware.com/ubuntu/ jammy main' | tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
+    echo 'deb https://apt.kitware.com/ubuntu/ noble main' | tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
     apt-get update && \
     apt-get install -y cmake && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
-RUN useradd -m -s /bin/bash vscode && \
+RUN groupadd -f render && \
+    groupadd -f video && \
+    useradd -m -s /bin/bash vscode && \
     usermod -aG sudo vscode && \
     usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
@@ -112,7 +144,7 @@ ENV HIP_PATH="${ROCM_HOME}"
 ENV PATH="/home/vscode/.local/bin:$PATH"
 
 # Install Python packages that might be useful
-RUN pip3 install --user \
+RUN pip3 install --user --break-system-packages \
     conan \
     numpy \
     matplotlib \

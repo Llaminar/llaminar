@@ -5,12 +5,16 @@
 #include <cstring>
 #include <numeric>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <sstream>
 #include "graph_compute.h"
 #include <filesystem>
 #include "tensors/simple_tensor.h"
+#include <iostream>
+#include <cstdio>
+#include <cstdint>
 
 #ifndef K_SCALE_SIZE
 #define K_SCALE_SIZE 12
@@ -18,48 +22,50 @@
 
 typedef uint16_t ggml_half;
 
-// Robust IEEE-754 half -> float conversion (avoids UB & NaNs seen with previous bit-hack version)
-static inline float ggml_compute_fp16_to_fp32(uint16_t h)
+// Mirrors ggml's ggml_compute_fp16_to_fp32 to ensure identical behaviour for subnormals.
+static inline float fp32_from_bits(uint32_t w)
 {
-    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    uint32_t exp = (h & 0x7C00u) >> 10;
-    uint32_t mant = (h & 0x03FFu);
-    uint32_t bits;
-    if (exp == 0)
-    {
-        if (mant == 0)
-        {
-            bits = sign; // zero
-        }
-        else
-        {
-            // subnormal -> normalize
-            while ((mant & 0x0400u) == 0)
-            {
-                mant <<= 1;
-                --exp;
-            }
-            ++exp;
-            mant &= 0x03FFu;
-            exp = exp + (127 - 15);
-            bits = sign | (exp << 23) | (mant << 13);
-        }
-    }
-    else if (exp == 0x1Fu)
-    { // Inf/NaN
-        bits = sign | 0x7F800000u | (mant << 13);
-    }
-    else
-    {
-        exp = exp + (127 - 15);
-        bits = sign | (exp << 23) | (mant << 13);
-    }
     union
     {
-        uint32_t u;
-        float f;
-    } u = {bits};
-    return u.f;
+        uint32_t as_bits;
+        float as_value;
+    } fp32;
+    fp32.as_bits = w;
+    return fp32.as_value;
+}
+
+static inline uint32_t fp32_to_bits(float f)
+{
+    union
+    {
+        float as_value;
+        uint32_t as_bits;
+    } fp32;
+    fp32.as_value = f;
+    return fp32.as_bits;
+}
+
+static inline float ggml_compute_fp16_to_fp32(uint16_t h)
+{
+    const uint32_t w = static_cast<uint32_t>(h) << 16;
+    const uint32_t sign = w & UINT32_C(0x80000000);
+    const uint32_t two_w = w + w;
+
+    const uint32_t exp_offset = UINT32_C(0xE0) << 23;
+#if (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || defined(__GNUC__) && !defined(__STRICT_ANSI__)) && (!defined(__cplusplus) || __cplusplus >= 201703L)
+    const float exp_scale = 0x1.0p-112f;
+#else
+    const float exp_scale = fp32_from_bits(UINT32_C(0x7800000));
+#endif
+    const float normalized_value = fp32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
+
+    const uint32_t magic_mask = UINT32_C(126) << 23;
+    const float magic_bias = 0.5f;
+    const float denormalized_value = fp32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
+
+    const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
+    const uint32_t result = sign | (two_w < denormalized_cutoff ? fp32_to_bits(denormalized_value) : fp32_to_bits(normalized_value));
+    return fp32_from_bits(result);
 }
 
 // Constructor
@@ -203,7 +209,7 @@ size_t GGUFTensorInfo::getTypeSize() const
     case GGUFTensorType::Q4_K:
         return 144; // 256 vals
     case GGUFTensorType::Q2_K:
-        return 80; // 256 vals
+        return 84; // 256 vals
     case GGUFTensorType::Q3_K:
         return 110; // 256 vals
     case GGUFTensorType::Q5_K:
@@ -915,7 +921,6 @@ std::vector<float> ModelLoader::dequantizeQ4_0(const uint8_t *data, size_t n_ele
 // Value reconstruction per 64-value segment uses two scale/min pairs.
 std::vector<float> ModelLoader::dequantizeQ4_K(const uint8_t *data, size_t n_elements, GGUFTensorType type, const std::string &tensor_name)
 {
-    constexpr size_t QK_K = 256;
     constexpr size_t SCALES_BYTES = 3 * QK_K / 64;                  // 12
     constexpr size_t QS_BYTES = QK_K / 2;                           // 128
     constexpr size_t BLOCK_BYTES = 2 + 2 + SCALES_BYTES + QS_BYTES; // 144
@@ -1060,61 +1065,38 @@ std::vector<float> ModelLoader::dequantizeQ5_0(const uint8_t *data, const GGUFTe
 std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
     (void)type;
-    constexpr int QK_K = 256;
     size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
     if (n_elements == 0 || !data)
         return {};
-    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    std::vector<float> out(n_blocks * QK_K);
-    auto fp16 = [](const uint8_t *p)
-    {
-        uint16_t h;
-        std::memcpy(&h, p, 2);
-        return ggml_compute_fp16_to_fp32(h);
-    };
 
-    const uint8_t *ptr = data;
-    size_t out_index = 0;
+    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
+    constexpr size_t BLOCK_BYTES = sizeof(block_q2_K);
+    size_t expected_bytes = n_blocks * BLOCK_BYTES;
+    if (info.size_bytes < expected_bytes)
+    {
+        LOG_ERROR("Tensor '" << tensor_name << "' has insufficient data for Q2_K dequantization: expected " << expected_bytes << " bytes, got " << info.size_bytes);
+        return {};
+    }
+    std::vector<float> out(n_blocks * QK_K);
+    const uint8_t *block_ptr = data;
     for (size_t b = 0; b < n_blocks; ++b)
     {
-        const uint8_t *scales = ptr;                // 16 bytes packed scale/min nibbles
-        const uint8_t *qs = scales + QK_K / 16;     // 64 bytes of 2-bit packed quants
-        const float d = fp16(qs + QK_K / 4);        // super-block scale (after quants)
-        const float dmin = fp16(qs + QK_K / 4 + 2); // super-block min scale
-
-        const uint8_t *q = qs;
-        int is = 0;
-        for (int n = 0; n < QK_K; n += 128)
+        block_q2_K blk{};
+        std::memcpy(&blk, block_ptr, sizeof(block_q2_K));
+        float *dst_block = out.data() + b * QK_K;
+        dequantize_row_q2_K(&blk, dst_block, QK_K);
+        if (std::isnan(dst_block[0]))
         {
-            int shift = 0;
-            for (int j = 0; j < 4; ++j)
-            {
-                uint8_t sc = scales[is++];
-                float dl = d * (sc & 0xF);
-                float ml = dmin * (sc >> 4);
-                for (int l = 0; l < 16; ++l)
-                {
-                    uint8_t v = (q[l] >> shift) & 0x3;
-                    out[out_index++] = dl * v - ml;
-                }
-
-                sc = scales[is++];
-                dl = d * (sc & 0xF);
-                ml = dmin * (sc >> 4);
-                for (int l = 0; l < 16; ++l)
-                {
-                    uint8_t v = (q[l + 16] >> shift) & 0x3;
-                    out[out_index++] = dl * v - ml;
-                }
-
-                shift += 2;
-            }
-            q += 32; // advance 32 bytes of packed quants per 128 values
+            const float d = ggml_compute_fp16_to_fp32(blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
+            const float dmin = ggml_compute_fp16_to_fp32(blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin);
+            LOG_ERROR("dequantizeQ2_K block" << b << " produced NaN. d=" << d
+                                             << " dmin=" << dmin
+                                             << " scale0=" << int(blk.scales[0])
+                                             << " scale1=" << int(blk.scales[1])
+                                             << " q0=" << int(blk.qs[0]) << " q1=" << int(blk.qs[1]));
         }
-
-        ptr += (QK_K / 16) + (QK_K / 4) + 4; // consumed scales + quants + (d,dmin)
+        block_ptr += BLOCK_BYTES;
     }
-
     out.resize(n_elements);
     logDequantStats(tensor_name, type, out, 8);
     return out;
@@ -1127,7 +1109,6 @@ std::vector<float> ModelLoader::dequantizeQ3_K(const uint8_t *data, GGUFTensorTy
 {
     (void)type;
     // Mirror ggml::dequantize_row_q3_K logic exactly.
-    constexpr int QK_K = 256;
     constexpr int QS_BYTES = QK_K / 4;    // low 2-bit packed
     constexpr int HMASK_BYTES = QK_K / 8; // high bit mask
     constexpr int SCALES_PACKED = 12;     // packed 6-bit scales
@@ -1204,7 +1185,6 @@ std::vector<float> ModelLoader::dequantizeQ5_K(const uint8_t *data, GGUFTensorTy
     // Manual layout interpretation (avoid dependency on ggml block struct):
     // [0..1]=d (fp16), [2..3]=dmin (fp16), [4..4+K_SCALE_SIZE-1]=scales (6-bit packed scale/min pairs),
     // then qh (QK_K/8 bytes), then qs (QK_K/2 bytes). Total block bytes = 4 + K_SCALE_SIZE + QK_K/8 + QK_K/2.
-    constexpr int QK_K = 256;
     if (!data)
         return {};
     size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
@@ -1287,7 +1267,6 @@ std::vector<float> ModelLoader::dequantizeQ5_K(const uint8_t *data, GGUFTensorTy
 std::vector<float> ModelLoader::dequantizeQ6_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
     (void)type;
-    constexpr int QK_K = 256;
     if (!data)
         return {};
     size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
