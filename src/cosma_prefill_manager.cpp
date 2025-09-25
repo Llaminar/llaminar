@@ -180,7 +180,6 @@ namespace llaminar
             world_size_ = 1;
             rank_ = 0;
         }
-        // Environment initialization
         if (const char *env_t = std::getenv("LLAMINAR_COSMA_PREFILL_THRESHOLD"))
         {
             threshold_ = std::atoi(env_t);
@@ -589,7 +588,7 @@ namespace llaminar
         // avoid allocating COSMA matrix (we'll use original row-major pointers in matmul fast path).
         // For multi-rank elementwise validation we sometimes need to force allocation even for small tensors.
         long long prospective_volume = 1ll * m * k;                                                                                                                  // partial (full volume depends on n, but conservative cheap check)
-        bool skip_cosma = !env.force_distributed_act && ((world_size_ == 1) || (fast_path_threshold_ops_ > 0 && prospective_volume < fast_path_threshold_ops_ / 8)); // heuristic
+        bool skip_cosma = !env.force_distributed_act && !env.force_direct && ((world_size_ == 1) || (fast_path_threshold_ops_ > 0 && prospective_volume < fast_path_threshold_ops_ / 8)); // heuristic
         if (skip_cosma)
         {
             CosmaView v;
@@ -733,8 +732,10 @@ namespace llaminar
 
     CosmaWeightHandle CosmaPrefillManager::load_weight_with_strategy(const WeightDescriptor &desc, const cosma::Strategy &strat)
     {
+        EnvSnapshot env_storage;
+        const auto &env = resolve_env(nullptr, env_storage);
         long long prospective_volume = 1ll * desc.rows * desc.cols;
-        bool skip_cosma = (world_size_ == 1) || (fast_path_threshold_ops_ > 0 && prospective_volume < fast_path_threshold_ops_ / 8);
+        bool skip_cosma = !env.force_direct && ((world_size_ == 1) || (fast_path_threshold_ops_ > 0 && prospective_volume < fast_path_threshold_ops_ / 8));
         if (skip_cosma)
         {
             CosmaView v;
@@ -744,8 +745,6 @@ namespace llaminar
             v.original_row_major = static_cast<const float *>(desc.base_ptr);
             return {v, desc};
         }
-        EnvSnapshot env_storage;
-        const auto &env = resolve_env(nullptr, env_storage);
         size_t w_bytes = (size_t)desc.rows * desc.cols * sizeof(float);
         if (!memory_budget_allows(w_bytes))
         {
@@ -920,15 +919,7 @@ namespace llaminar
                 LOG_ERROR("[CosmaPrefill] Missing original row-major pointers for single-rank fallback");
                 return C;
             }
-            cblas_sgemm(CblasRowMajor,
-                        CblasNoTrans,
-                        transposeW ? CblasTrans : CblasNoTrans,
-                        m, n, k,
-                        alpha,
-                        A_ptr, k,
-                        B_ptr, n,
-                        beta,
-                        C.host_owned->data(), n);
+            run_reference_gemm(A_ptr, B_ptr, C.host_owned->data(), transposeW, m, n, k, alpha, beta, rank_);
             return C;
         }
 
@@ -970,12 +961,11 @@ namespace llaminar
                 for (float v : B_full)
                     sumB += v;
                 LOG_WARN("[CosmaPrefill][debug-force-fallback] sums A=" << sumA << " B=" << sumB);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, transposeW ? CblasTrans : CblasNoTrans,
-                            m, n, k, alpha, A_full.data(), k, B_full.data(), n, beta, C_rep.host_owned->data(), n);
+                run_reference_gemm(A_full.data(), B_full.data(), C_rep.host_owned->data(), transposeW, m, n, k, alpha, beta, rank_);
             }
             safe_bcast(C_rep.host_owned->data(), m * n, MPI_FLOAT, 0);
             if (validate_tile_tokens_ > 0)
-                maybe_validation_tile_gemm(A_full.data(), B_full.data(), C_rep.host_owned->data(), m, k, n);
+                maybe_validation_tile_gemm(A_full.data(), B_full.data(), C_rep.host_owned->data(), m, k, n, transposeW);
             stats_.fast_path_calls++;
             if (rank_ == 0 && should_log(2))
             {
@@ -1005,15 +995,7 @@ namespace llaminar
                 LOG_ERROR("[CosmaPrefill] Missing row-major pointers for fast path");
                 return C;
             }
-            cblas_sgemm(CblasRowMajor,
-                        CblasNoTrans,
-                        transposeW ? CblasTrans : CblasNoTrans,
-                        m, n, k,
-                        alpha,
-                        A_ptr, k,
-                        B_ptr, n,
-                        beta,
-                        C.host_owned->data(), n);
+            run_reference_gemm(A_ptr, B_ptr, C.host_owned->data(), transposeW, m, n, k, alpha, beta, rank_);
             // Replicated inputs => each rank already has identical result; broadcast rank 0's buffer for safety
             if (world_size_ > 1)
             {
@@ -1039,15 +1021,7 @@ namespace llaminar
             C_rep.host_owned = std::make_shared<std::vector<float>>(m * n, 0.f);
             const float *A_ptr = A.original_row_major;
             const float *B_ptr = W.view.original_row_major;
-            cblas_sgemm(CblasRowMajor,
-                        CblasNoTrans,
-                        transposeW ? CblasTrans : CblasNoTrans,
-                        m, n, k,
-                        alpha,
-                        A_ptr, k,
-                        B_ptr, n,
-                        beta,
-                        C_rep.host_owned->data(), n);
+            run_reference_gemm(A_ptr, B_ptr, C_rep.host_owned->data(), transposeW, m, n, k, alpha, beta, rank_);
             MPI_Bcast(C_rep.host_owned->data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
             return C_rep;
         }
@@ -1188,21 +1162,72 @@ namespace llaminar
                 }
             }
 
+            if (transposeW)
+            {
+                if (rank_ == 0)
+                {
+                    std::vector<float> transposed((size_t)n * k, 0.f);
+                    for (int row = 0; row < n; ++row)
+                    {
+                        for (int col = 0; col < k; ++col)
+                        {
+                            transposed[(size_t)row * k + col] = B_full_storage[(size_t)col * n + row];
+                        }
+                    }
+                    B_full_storage.swap(transposed);
+                }
+                if (mpi_is_initialized() && mpi_world_size_safe() > 1)
+                {
+                    safe_bcast(B_full_storage.data(), k * n, MPI_FLOAT, 0);
+                }
+            }
+
             if (rank_ == 0)
             {
                 if (should_log(3))
                 {
-                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] executing cblas_sgemm");
+                    LOG_DEBUG("[CosmaPrefill][fallback-replicated] executing reference GEMM");
                 }
-                cblas_sgemm(CblasRowMajor,
-                            CblasNoTrans,
-                            transposeW ? CblasTrans : CblasNoTrans,
-                            m, n, k,
-                            alpha,
-                            A_full_storage.data(), k,
-                            B_full_storage.data(), n,
-                            beta,
-                            C_rep.host_owned->data(), n);
+                // Define the lambda to take all parameters as arguments
+                auto run_reference_gemm = [](const float *A_ptr, const float *B_ptr, float *C_ptr,
+                                            bool transposeW, int m, int n, int k, float alpha, float beta, int rank_) {
+                    if (!A_ptr || !B_ptr || !C_ptr) return;
+                    if (transposeW) {
+                        if (rank_ == 0) {
+                            LOG_WARN("[run_reference_gemm] transposeW=true: using manual i-j-p loop m=" << m << " n=" << n << " k=" << k);
+                        }
+                        #ifdef _OPENMP
+                        #pragma omp parallel for schedule(static)
+                        #endif
+                        for (int i = 0; i < m; ++i) {
+                            for (int j = 0; j < n; ++j) {
+                                float sum = 0.f;
+                                for (int p = 0; p < k; ++p) {
+                                    sum += A_ptr[(size_t)i * k + p] * B_ptr[(size_t)p * n + j];
+                                }
+                                float prev = beta != 0.f ? C_ptr[(size_t)i * n + j] : 0.f;
+                                C_ptr[(size_t)i * n + j] = alpha * sum + prev;
+                            }
+                        }
+                        return;
+                    }
+                    int lda = k;
+                    int ldb = n;
+                    if (rank_ == 0) {
+                        LOG_WARN("[run_reference_gemm] BLAS path: m=" << m << " n=" << n << " k=" << k << " lda=" << lda << " ldb=" << ldb);
+                    }
+                    cblas_sgemm(CblasRowMajor,
+                                CblasNoTrans,
+                                CblasNoTrans,
+                                m, n, k,
+                                alpha,
+                                A_ptr, lda,
+                                B_ptr, ldb,
+                                beta,
+                                C_ptr, n);
+                };
+                run_reference_gemm(A_full_storage.data(), B_full_storage.data(), C_rep.host_owned->data(),
+                                   transposeW, m, n, k, alpha, beta, rank_);
             }
 
             if (mpi_is_initialized() && mpi_world_size_safe() > 1)
@@ -1230,7 +1255,7 @@ namespace llaminar
             const float *B_validation = (rank_ == 0) ? (B_full_storage.empty() ? nullptr : B_full_storage.data()) : nullptr;
             if (validate_tile_tokens_ > 0)
             {
-                maybe_validation_tile_gemm(A_validation, B_validation, C_rep.host_owned->data(), m, k, n);
+                maybe_validation_tile_gemm(A_validation, B_validation, C_rep.host_owned->data(), m, k, n, transposeW);
             }
             if (rank_ == 0 && should_log(2))
             {
@@ -1290,10 +1315,10 @@ namespace llaminar
         // Earlier we forced a unified strategy (stratC) for A and B, which appears to produce a systematic
         // permutation mismatch (relA≈1, cos≈0.5). Here we revert to per-operand strategies unless explicitly
         // overridden by an env flag (LLAMINAR_COSMA_FORCE_UNIFIED) for regression diagnostics.
-        const auto &sA = strategy_cache_.get(m, k, k, world_size_);
-        const auto &sB = strategy_cache_.get(k, n, k, world_size_);
-        const auto &sC = strategy_cache_.get(m, n, k, world_size_);
-        const bool use_unified_strategy = force_unified_strategy || force_direct;
+    const auto &sA = strategy_cache_.get(m, k, k, world_size_);
+    const auto &sB = strategy_cache_.get(k, n, k, world_size_);
+    const auto &sC = strategy_cache_.get(m, n, k, world_size_);
+    const bool use_unified_strategy = force_unified_strategy;
         const cosma::Strategy &chosenA = use_unified_strategy ? sC : sA;
         const cosma::Strategy &chosenB = use_unified_strategy ? sC : sB;
         const cosma::Strategy &stratC_ref = sC; // result always uses (m,n,k)
@@ -2164,8 +2189,7 @@ namespace llaminar
                 if (A_ptr && B_ptr)
                 {
                     std::vector<float> C_ref((size_t)m * n, 0.f);
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, transposeW ? CblasTrans : CblasNoTrans,
-                                m, n, k, alpha, A_ptr, k, B_ptr, n, beta, C_ref.data(), n);
+                    run_reference_gemm(A_ptr, B_ptr, C_ref.data(), transposeW, m, n, k, alpha, beta, rank_);
                     double num = 0.0, den = 0.0, max_abs = 0.0;
                     for (int i = 0; i < m * n; ++i)
                     {
@@ -2681,7 +2705,7 @@ namespace llaminar
     }
 
     void CosmaPrefillManager::maybe_validation_tile_gemm(const float *A, const float *B, const float *C_full,
-                                                         int m, int k, int n)
+                                                         int m, int k, int n, bool transposeB)
     {
         if (validate_tile_tokens_ <= 0 || world_size_ <= 1 || !mpi_is_initialized())
             return; // Only meaningful multi-rank
@@ -2693,17 +2717,33 @@ namespace llaminar
         if (rank_ != 0)
             return; // Only rank 0 performs comparison & logs
 
-        // Compute reference tile C_ref_tile = A_tile * B (first tile_m rows, first tile_n cols)
+        // Compute reference tile C_ref_tile = A_tile * (B or B^T) (first tile_m rows, first tile_n cols)
         std::vector<float> C_ref(tile_m * tile_n, 0.f);
-        // We only need first tile_m rows of A and all k columns, and first tile_n columns of B.
-        // Row-major GEMM for the tile: naive or cblas
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    tile_m, tile_n, k,
-                    1.0f,
-                    A, k,
-                    B, n,
-                    0.0f,
-                    C_ref.data(), tile_n);
+        if (transposeB)
+        {
+            for (int i = 0; i < tile_m; ++i)
+            {
+                for (int j = 0; j < tile_n; ++j)
+                {
+                    float sum = 0.f;
+                    for (int p = 0; p < k; ++p)
+                    {
+                        sum += A[i * k + p] * B[j * k + p];
+                    }
+                    C_ref[i * tile_n + j] = sum;
+                }
+            }
+        }
+        else
+        {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        tile_m, tile_n, k,
+                        1.0f,
+                        A, k,
+                        B, n,
+                        0.0f,
+                        C_ref.data(), tile_n);
+        }
 
         // Extract corresponding region from C_full (row-major m x n)
         double num = 0.0, den = 0.0, max_abs = 0.0;
