@@ -100,8 +100,8 @@ namespace
             if (rank == 0)
             {
                 LOG_WARN("[run_reference_gemm] transposeW=true: using manual i-j-p loop m=" << m
-                                                                                           << " n=" << n
-                                                                                           << " k=" << k);
+                                                                                            << " n=" << n
+                                                                                            << " k=" << k);
             }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -127,7 +127,7 @@ namespace
         if (rank == 0)
         {
             LOG_WARN("[run_reference_gemm] BLAS path: m=" << m << " n=" << n << " k=" << k << " lda=" << lda
-                                                           << " ldb=" << ldb);
+                                                          << " ldb=" << ldb);
         }
         cblas_sgemm(CblasRowMajor,
                     CblasNoTrans,
@@ -651,7 +651,7 @@ namespace llaminar
         // Fast-path gating: if total matmul volume would fall below fast_path_threshold_ops_,
         // avoid allocating COSMA matrix (we'll use original row-major pointers in matmul fast path).
         // For multi-rank elementwise validation we sometimes need to force allocation even for small tensors.
-        long long prospective_volume = 1ll * m * k;                                                                                                                  // partial (full volume depends on n, but conservative cheap check)
+        long long prospective_volume = 1ll * m * k;                                                                                                                                       // partial (full volume depends on n, but conservative cheap check)
         bool skip_cosma = !env.force_distributed_act && !env.force_direct && ((world_size_ == 1) || (fast_path_threshold_ops_ > 0 && prospective_volume < fast_path_threshold_ops_ / 8)); // heuristic
         if (skip_cosma)
         {
@@ -1349,10 +1349,10 @@ namespace llaminar
         // Earlier we forced a unified strategy (stratC) for A and B, which appears to produce a systematic
         // permutation mismatch (relA≈1, cos≈0.5). Here we revert to per-operand strategies unless explicitly
         // overridden by an env flag (LLAMINAR_COSMA_FORCE_UNIFIED) for regression diagnostics.
-    const auto &sA = strategy_cache_.get(m, k, k, world_size_);
-    const auto &sB = strategy_cache_.get(k, n, k, world_size_);
-    const auto &sC = strategy_cache_.get(m, n, k, world_size_);
-    const bool use_unified_strategy = force_unified_strategy;
+        const auto &sA = strategy_cache_.get(m, k, k, world_size_);
+        const auto &sB = strategy_cache_.get(k, n, k, world_size_);
+        const auto &sC = strategy_cache_.get(m, n, k, world_size_);
+        const bool use_unified_strategy = force_unified_strategy;
         const cosma::Strategy &chosenA = use_unified_strategy ? sC : sA;
         const cosma::Strategy &chosenB = use_unified_strategy ? sC : sB;
         const cosma::Strategy &stratC_ref = sC; // result always uses (m,n,k)
