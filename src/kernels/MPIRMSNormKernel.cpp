@@ -4,6 +4,7 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm>
+#include <limits>
 #include <mpi.h>
 
 namespace llaminar
@@ -268,14 +269,17 @@ namespace llaminar
             LOG_INFO("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
 
-        // Apply normalization to local data (parallel)
+        // Apply RMS normalization locally using the global RMS value
 #pragma omp parallel for collapse(2) schedule(static)
         for (long long i = 0; i < (long long)local_seq_len; ++i)
+        {
             for (long long j = 0; j < (long long)hidden_size; ++j)
             {
-                size_t idx = (size_t)i * hidden_size + (size_t)j;
-                local_output[idx] = (local_input[idx] / rms) * weight[j];
+                size_t idx = static_cast<size_t>(i) * hidden_size + static_cast<size_t>(j);
+                float val = local_input[idx];
+                local_output[idx] = (val / rms) * weight[j];
             }
+        }
 
         // Post-norm local stats to detect zeroing (parallel)
         float out_local_min = std::numeric_limits<float>::infinity();

@@ -189,6 +189,8 @@ namespace llaminar
                           std::shared_ptr<TensorBase> &global_output,
                           size_t seq_len, size_t d_model);
 
+        std::shared_ptr<TensorBase> createLocalSimpleTensor(const std::vector<size_t> &shape) const;
+
         // Configuration parameters
         int n_head_;                    ///< Total number of attention heads
         int n_head_kv_;                 ///< Number of key-value heads (grouped attention)

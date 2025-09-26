@@ -326,6 +326,7 @@ namespace llaminar
         env.overlap_enabled = std::getenv("LLAMINAR_COSMA_OVERLAP_STREAM") != nullptr;
         env.overlap_verbose = std::getenv("LLAMINAR_COSMA_OVERLAP_VERBOSE") != nullptr;
         env.preflight_disable = std::getenv("LLAMINAR_COSMA_PREFLIGHT_DISABLE") != nullptr;
+        env.rmsnorm_validate = std::getenv("LLAMINAR_COSMA_RMSNORM_VALIDATE") != nullptr;
         if (const char *direct_env = std::getenv("LLAMINAR_COSMA_DIRECT_THRESHOLD_OPS"))
         {
             long long parsed = std::atoll(direct_env);
@@ -3063,6 +3064,9 @@ namespace llaminar
     {
         if (!weight || hidden_size <= 0 || seq_len <= 0)
             return false;
+        EnvSnapshot env_storage;
+        const auto &env = resolve_env(nullptr, env_storage);
+
         // Single-rank row-major fallback (no COSMA allocation)
         if (world_size_ == 1 && (!src.mat || !dst.mat) && src.original_row_major && dst.original_row_major)
         {
@@ -3128,24 +3132,84 @@ namespace llaminar
             if ((unsigned)gi < (unsigned)seq_len && (unsigned)gj < (unsigned)hidden_size)
                 row_indices[gi].push_back(static_cast<int>(li));
         }
+
+        std::vector<double> local_sum_sq(seq_len, 0.0);
+        std::vector<int> local_counts(seq_len, 0);
 #pragma omp parallel for schedule(static)
         for (int r = 0; r < seq_len; ++r)
         {
-            auto &idxs = row_indices[r];
-            if (idxs.empty())
-                continue;
-            double sum_sq = 0.0;
+            const auto &idxs = row_indices[r];
+            double accum = 0.0;
             for (int li : idxs)
             {
                 float v = src_local[li];
-                sum_sq += double(v) * double(v);
+                accum += double(v) * double(v);
             }
-            double inv_scale = 1.0 / std::sqrt(sum_sq / std::max(1, (int)idxs.size()) + eps);
+            local_sum_sq[r] = accum;
+            local_counts[r] = static_cast<int>(idxs.size());
+        }
+
+        if (mpi_is_initialized() && mpi_world_size_safe() > 1)
+        {
+            MPI_Allreduce(MPI_IN_PLACE, local_sum_sq.data(), seq_len, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, local_counts.data(), seq_len, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        }
+
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < seq_len; ++r)
+        {
+            const auto &idxs = row_indices[r];
+            if (idxs.empty())
+                continue;
+            double sum_sq = local_sum_sq[r];
+            int count = local_counts[r];
+            int denom_count = count > 0 ? count : hidden_size;
+            if (denom_count <= 0)
+                continue;
+            double inv_scale = 1.0 / std::sqrt(sum_sq / static_cast<double>(std::max(1, denom_count)) + eps);
             for (int li : idxs)
             {
                 int gj = mat_ptr->global_coordinates(li).second;
                 float gamma = (gj >= 0 && gj < hidden_size) ? weight[gj] : 1.f;
                 dst_local[li] = float(src_local[li] * inv_scale * gamma);
+            }
+        }
+
+        if (env.rmsnorm_validate && src.original_row_major)
+        {
+            std::vector<float> dst_row_major((size_t)seq_len * hidden_size, 0.f);
+            reconstruct_matrix(dst, dst_row_major.data(), false);
+            if (rank_ == 0)
+            {
+                std::vector<float> ref((size_t)seq_len * hidden_size, 0.f);
+                for (int r = 0; r < seq_len; ++r)
+                {
+                    const float *row = src.original_row_major + (size_t)r * hidden_size;
+                    double sum = 0.0;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        double v = row[c];
+                        sum += v * v;
+                    }
+                    double inv = 1.0 / std::sqrt(sum / std::max(1, hidden_size) + eps);
+                    float *dst_row = ref.data() + (size_t)r * hidden_size;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        dst_row[c] = float(row[c] * inv * weight[c]);
+                    }
+                }
+                long double num = 0.0L, den = 0.0L, max_abs = 0.0L;
+                size_t total = (size_t)seq_len * hidden_size;
+                for (size_t i = 0; i < total; ++i)
+                {
+                    long double diff = (long double)dst_row_major[i] - (long double)ref[i];
+                    num += diff * diff;
+                    long double refv = (long double)ref[i];
+                    den += refv * refv;
+                    max_abs = std::max(max_abs, fabsl(diff));
+                }
+                double rel = std::sqrt((double)num) / (std::sqrt((double)den) + 1e-30);
+                LOG_INFO("[CosmaPrefill][rmsnorm-validate] rel_l2=" << rel << " max_abs=" << (double)max_abs);
             }
         }
         return true;

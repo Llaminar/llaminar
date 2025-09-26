@@ -2,6 +2,7 @@
 #include "../adaptive_matmul.h"
 #include "../logger.h"
 #include "../performance_timer.h"
+#include "../tensors/tensor_factory.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -51,10 +52,10 @@ namespace llaminar
         size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
 
         // Create local weight tensors for distributed heads
-        auto local_wq = createLocalTensor({d_model, local_head_dim});
-        auto local_wk = createLocalTensor({d_model, local_head_dim});
-        auto local_wv = createLocalTensor({d_model, local_head_dim});
-        auto local_wo = createLocalTensor({local_head_dim, d_model});
+        auto local_wq = createLocalSimpleTensor({d_model, local_head_dim});
+        auto local_wk = createLocalSimpleTensor({d_model, local_head_dim});
+        auto local_wv = createLocalSimpleTensor({d_model, local_head_dim});
+        auto local_wo = createLocalSimpleTensor({local_head_dim, d_model});
 
         // Distribute weights according to head assignment
         {
@@ -62,11 +63,10 @@ namespace llaminar
             distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
                              local_wq, local_wk, local_wv, local_wo, seq_len, d_model);
         }
-
         // Create local projection tensors
-        auto local_q = createLocalTensor({seq_len, local_head_dim});
-        auto local_k = createLocalTensor({seq_len, local_head_dim});
-        auto local_v = createLocalTensor({seq_len, local_head_dim});
+        auto local_q = createLocalSimpleTensor({seq_len, local_head_dim});
+        auto local_k = createLocalSimpleTensor({seq_len, local_head_dim});
+        auto local_v = createLocalSimpleTensor({seq_len, local_head_dim});
 
         // Compute Q, K, V projections for local heads using COSMA
         {
@@ -74,7 +74,6 @@ namespace llaminar
             computeLocalProjections(global_input, local_wq, local_wk, local_wv,
                                     local_q, local_k, local_v, seq_len, d_model);
         }
-
         // Apply RoPE to local Q and K
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::applyLocalRoPE");
@@ -82,7 +81,7 @@ namespace llaminar
         }
 
         // Create local attended output tensor
-        auto local_attended_output = createLocalTensor({seq_len, local_head_dim});
+        auto local_attended_output = createLocalSimpleTensor({seq_len, local_head_dim});
 
         // Compute attention for local heads
         {
@@ -92,7 +91,7 @@ namespace llaminar
         }
 
         // Create local final output tensor
-        auto local_final_output = createLocalTensor({seq_len, d_model});
+        auto local_final_output = createLocalSimpleTensor({seq_len, d_model});
 
         // Compute output projection for local heads using COSMA
         {
@@ -573,6 +572,12 @@ namespace llaminar
         }
 
         LOG_DEBUG("Gathered output: [" << seq_len << ", " << d_model << "] on rank " << getRank());
+    }
+
+    std::shared_ptr<TensorBase> MPIAttentionKernel::createLocalSimpleTensor(const std::vector<size_t> &shape) const
+    {
+        std::vector<int> int_shape(shape.begin(), shape.end());
+        return TensorFactory::create_simple(int_shape);
     }
 
 } // namespace llaminar

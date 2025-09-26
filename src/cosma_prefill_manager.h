@@ -305,6 +305,7 @@ namespace llaminar
             bool overlap_enabled = false;
             bool overlap_verbose = false;
             bool preflight_disable = false;
+            bool rmsnorm_validate = false;
             bool diag_perm_infer_active = false;
             bool diag_samples_active = false;
             bool preflight_safety_override = false;
@@ -338,7 +339,7 @@ namespace llaminar
         void stream_weight_blocks(CosmaView &dst, const WeightDescriptor &desc, const EnvSnapshot &env);
         void stream_weight_blocks_quantized(CosmaView &dst, const WeightDescriptor &desc, const EnvSnapshot &env);
         void maybe_validation_tile_gemm(const float *A, const float *B, const float *C_ref_full,
-                                         int m, int k, int n, bool transposeB);
+                                        int m, int k, int n, bool transposeB);
         bool should_log(int lvl) const { return lvl <= log_level_; }
         bool memory_budget_allows(size_t bytes_needed) const;
         bool preflight_allows(int seq_len, int d_model, int d_ff, int n_proj = 3) const; // attention: Q,K,V by default

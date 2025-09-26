@@ -116,6 +116,8 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/MPIResidualKernel.cpp
     src/kernels/MPIRoPEKernel.cpp
     src/kernels/MPISwiGLUKernel.cpp
+    src/kernels/common/normalization.cpp
+    src/kernels/common/softmax.cpp
     src/mpi_transformer_pipeline.cpp
     src/pipeline_base.cpp
     src/tensors/simple_tensor.cpp

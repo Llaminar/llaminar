@@ -4,6 +4,7 @@
 #include "kernels/MPIRoPEKernel.h"
 #include "kernels/MPIResidualKernel.h"
 #include "kernels/MPIEmbeddingKernel.h"
+#include "kernels/common/normalization.h"
 #include "tensors/tensor_factory.h"
 #include "debug_utils.h"
 #include "performance_timer.h"
@@ -148,16 +149,14 @@ namespace llaminar
                 std::vector<float> tmp(seq_len * config_.d_model, 0.f);
                 auto rmsnorm = [&](std::vector<float> &mat, const float *wn)
                 {
-                    for (int i = 0; i < seq_len; ++i)
-                    {
-                        float sum_sq = 0.f;
-                        float *row = &mat[i * config_.d_model];
-                        for (int j = 0; j < config_.d_model; ++j)
-                            sum_sq += row[j] * row[j];
-                        float inv_rms = 1.f / std::sqrt(sum_sq / config_.d_model + config_.eps);
-                        for (int j = 0; j < config_.d_model; ++j)
-                            row[j] = row[j] * inv_rms * wn[j];
-                    }
+                    kernels::RMSNormArgs args;
+                    args.input = mat.data();
+                    args.output = mat.data();
+                    args.weight = wn;
+                    args.rows = seq_len;
+                    args.cols = config_.d_model;
+                    args.epsilon = config_.eps;
+                    kernels::rmsnorm_row_major(args);
                 };
                 auto matmul = [&](const std::vector<float> &A, const float *B, int k, int n, std::vector<float> &C)
                 {
@@ -710,7 +709,7 @@ namespace llaminar
             }
 
             LOG_DEBUG("Attention head " << head << ": invoking adaptiveMatMul for QK^T (seq_len=" << seq_len
-                                          << ", head_dim=" << head_dim << ") on rank " << rank_);
+                                        << ", head_dim=" << head_dim << ") on rank " << rank_);
             if (!adaptiveMatMul(q_head.data(), k_head.data(), scores.data(),
                                 seq_len, seq_len, head_dim,
                                 true, false, false, true))
@@ -728,14 +727,14 @@ namespace llaminar
             LOG_DEBUG("Attention head " << head << ": converting scores to COSMA layout on rank " << rank_);
             auto scores_view = manager.convert_activation_in_with_strategy(scores.data(), seq_len, seq_len, score_strategy);
             LOG_DEBUG("Attention head " << head << ": scores view mat=" << (scores_view.mat ? 1 : 0)
-                                          << " local_size=" << (scores_view.mat ? scores_view.mat->matrix_size() : 0)
-                                          << " orig_ptr=" << (scores_view.original_row_major ? 1 : 0)
-                                          << " on rank " << rank_);
+                                        << " local_size=" << (scores_view.mat ? scores_view.mat->matrix_size() : 0)
+                                        << " orig_ptr=" << (scores_view.original_row_major ? 1 : 0)
+                                        << " on rank " << rank_);
             auto softmax_view = manager.convert_activation_in_with_strategy(softmax_buf.data(), seq_len, seq_len, score_strategy);
             LOG_DEBUG("Attention head " << head << ": softmax view mat=" << (softmax_view.mat ? 1 : 0)
-                                          << " local_size=" << (softmax_view.mat ? softmax_view.mat->matrix_size() : 0)
-                                          << " orig_ptr=" << (softmax_view.original_row_major ? 1 : 0)
-                                          << " on rank " << rank_);
+                                        << " local_size=" << (softmax_view.mat ? softmax_view.mat->matrix_size() : 0)
+                                        << " orig_ptr=" << (softmax_view.original_row_major ? 1 : 0)
+                                        << " on rank " << rank_);
 
             LOG_DEBUG("Attention head " << head << ": softmax_in_layout start on rank " << rank_);
             if (!manager.softmax_in_layout(scores_view, softmax_view, seq_len, seq_len, 1.0f))
