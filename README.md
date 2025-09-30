@@ -24,6 +24,10 @@ The following environment variables enable additional logging, validation, and i
 | `LLAMINAR_COSMA_LOG_LEVEL` | Verbosity for COSMA prefill instrumentation. | `trace|debug|info|warn|error`; default: `info` | Independent of global logging level. |
 | `OMP_NUM_THREADS` / `OMP_*` | Controls OpenMP threading behavior. | See `run-llaminar.sh` | Script sets optimal defaults (NUMA-aware binding). |
 | `KMP_AFFINITY` / `KMP_BLOCKTIME` | Fine-grain thread affinity & spin-wait tuning. | See script defaults | Only relevant for Intel OpenMP runtime. |
+| `LLAMINAR_EMBED_TRACE` | Enable detailed per-rank embedding buffer diagnostics (min/max, NaN/Inf counts, token & value preview). | Any non-empty (not `0`) enables; default: disabled | Produces TRACE logs labelled `MPIEmbeddingKernel[local_pre_gather|global_post_gather]`. Combine with `LLAMINAR_EMBED_TRACE_TOKENS` / `LLAMINAR_EMBED_TRACE_DIMS`. |
+| `LLAMINAR_EMBED_TRACE_TOKENS` | Limit number of tokens shown in embedding diagnostics. | Positive integer; default: `2` | Ignored unless `LLAMINAR_EMBED_TRACE` enabled. |
+| `LLAMINAR_EMBED_TRACE_DIMS` | Limit number of embedding dims per token shown in diagnostics. | Positive integer; default: `8` | Ignored unless tracing enabled. |
+| `LLAMINAR_EMBED_FAIL_FAST` | Abort immediately if a non-finite (NaN/Inf) value is detected after copying an embedding row. | Any non-empty (not `0`) enables; default: disabled | Provides detailed token/dim context then `abort()`. Without this set a WARN is logged and execution continues. |
 
 ### Quick Usage Examples
 
@@ -37,6 +41,13 @@ export ADAPTIVE_DISABLE_COSMA=1
 
 # Lower threshold to exercise COSMA prefill with small sequences
 export LLAMINAR_COSMA_PREFILL_THRESHOLD=512
+
+# Enable embedding diagnostics
+export LLAMINAR_EMBED_TRACE=1
+export LLAMINAR_EMBED_TRACE_TOKENS=4
+export LLAMINAR_EMBED_TRACE_DIMS=16
+# Fail fast on non-finite embedding values
+export LLAMINAR_EMBED_FAIL_FAST=1
 ```
 
 > Tip: Keep instrumentation disabled for performance benchmarking; some options add measurable overhead (e.g., validation tiles, verbose stats).
@@ -79,6 +90,54 @@ Design principles:
 4. Future distributed layout optimization (COSTA) will replace copy-in/copy-out in COSMA path (TODO)
 
 Implication: For local benchmarking use `mpirun -np 1` instead of reinstating legacy kernels.
+
+### Attention Output Contract (Post-Gather Removal)
+The MPI attention kernel now always emits a per-rank *partial* output (only the contribution from
+that rank's owned heads after the output projection). There is no internal gather or reduction.
+
+Caller / pipeline responsibilities:
+1. Determine reconstruction semantics: for the current row-sharded `Wo` distribution the per-rank
+  outputs are additive and should be summed: `MPI_Allreduce` (SUM) over the full `[seq_len, d_model]` buffer.
+2. Perform the reduction before any consumer treats the tensor as a fully replicated activation
+  (e.g., before residual add or feeding into RMSNorm/MLP expecting full hidden state).
+3. Avoid accidental direct use of the partial result as replicated. An optional safety canary can be
+  enabled with `LLAMINAR_ASSERT_REPLICATED_MISUSE=1`, which injects a microscopic per-rank marker in
+  the final element to aid detection during debugging.
+
+Removed flags: `LLAMINAR_DISABLE_ATTENTION_GATHER` and `LLAMINAR_LEGACY_ATTENTION_GATHER`—they are no
+longer recognized. All documentation or scripts referencing them should be updated accordingly.
+
+Rationale: Eliminating the hidden gather makes communication explicit, prevents double reductions,
+and simplifies extending the sharded pathway (e.g., future head-concat vs additive strategies).
+
+### Supported Quantization Formats (Current)
+
+The loader and dequant pipeline currently support the following GGUF tensor types:
+
+- Q4_0
+- Q5_0
+- Q8_0
+- Q2_K
+- Q3_K
+- Q4_K
+- Q4_K_M (alias layout of Q4_K with fused min variant)
+- Q5_K
+- Q6_K
+- Q8_K
+- F16 / F32 (unquantized)
+
+Deprecated / removed (no longer recognized and will trigger an error if encountered in a model):
+
+- Q4_1 (id 3)
+- Q5_1 (id 7)
+- Q8_1 (id 9)
+
+Reason for removal: These legacy *_1 formats added maintenance complexity (especially Q5_1 with divergent 22 vs 24 byte block variants) without providing clear performance or accuracy wins over the maintained set. Models should be re-converted using any of the supported formats above. The loader now emits a clear diagnostic if a deprecated numeric id is found.
+
+Implications:
+1. Existing GGUF files using Q4_1 / Q5_1 / Q8_1 must be re-exported (e.g., via llama.cpp quantization tools) to one of the supported formats.
+2. Tests referencing the removed formats have been pruned (e.g., Q5_1 layout micro test).
+3. Numeric ids for removed formats are reserved; they will not be repurposed to avoid silent misinterpretation.
 
 ## COSMA Prefill (Phase 1)
 

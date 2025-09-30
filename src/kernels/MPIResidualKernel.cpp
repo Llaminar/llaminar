@@ -1,3 +1,31 @@
+/**
+ * @file MPIResidualKernel.cpp
+ * @brief Performs elementwise residual addition: Y = X + R (optionally in-place) with basic validation.
+ *
+ * @section Contract
+ * Inputs:
+ *  - inputs[0]: Base activation tensor X [seq_len, hidden_dim].
+ *  - inputs[1]: Residual tensor R [seq_len, hidden_dim].
+ * Outputs:
+ *  - outputs[0]: Result tensor Y [seq_len, hidden_dim] (may alias inputs[0] if allowed by graph planner).
+ * Behavior:
+ *  - Pure elementwise addition in float32.
+ *  - Optionally supports accumulation into preallocated buffer (checked via pointer equality by planner, not here).
+ * Error Modes:
+ *  - Shape mismatch or null tensors -> LOG_ERROR + return false.
+ *  - Silent overflow not guarded (IEEE float expected to handle typical ranges).
+ * Distribution:
+ *  - Replicated; each rank performs identical addition.
+ * Threading:
+ *  - Parallel for over total elements; no data races (distinct index writes).
+ * Numerical Expectations:
+ *  - Bit-identical to reference addition for same ordering (single-pass, no reduction).
+ * Future Extensions:
+ *  - Fused residual + RMSNorm variant to reduce memory bandwidth.
+ *  - Optional scaling factor (alpha) for weighted residual merges.
+ * @warning Ensure that upstream kernels have synchronized outputs across ranks before residual addition to avoid divergence amplification.
+ * @author David Sanftenberg
+ */
 #include "MPIResidualKernel.h"
 #include "../debug_utils.h"
 #include "../performance_timer.h"

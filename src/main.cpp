@@ -1,4 +1,4 @@
-// Clean, reconstructed main.cpp after patch corruption cleanup
+// Main application entry & execution pipeline
 
 #include <iostream>
 #include <mpi.h>
@@ -6,35 +6,32 @@
 #include <memory>
 #include <iomanip>
 #include <chrono>
+#include <sstream>
 
-// Llaminar modular components
 #include "argument_parser.h"
 #include "logger.h"
 #include "topology_manager.h"
-#include "graph_compute.h"
 #include "model_loader.h"
 #include "mpi_transformer_pipeline.h"
+#include "graph_compute.h" // contains MatMulNode definition
 #include "performance_timer.h"
-
-// Chat interface components
+#include "utils/debug_env.h"
+#include "tensors/sharded_tensor_registry.h"
+#include "tensors/tensor_factory.h"
 #include "chat/tokenizer_interface.h"
-#include "chat/gguf_tokenizer.h"
-#include "chat/chat_session.h"
 #include "chat/chat_interface.h"
 #include "chat/response_generator.h"
 
 using namespace llaminar;
 
-int main(int argc, char *argv[])
+int main(int argc, char **argv)
 {
-    int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-
-    int rank = 0, size = 0;
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
+    int rank = 0, size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    int exit_code = 0; // unified exit code
+    int exit_code = 0;
 
     auto finalize = [&]()
     {
@@ -98,6 +95,12 @@ int main(int argc, char *argv[])
             LOG_INFO("Llaminar LLM Inference Engine starting...");
             LOG_INFO("MPI initialized with " << size << " processes");
             LOG_DEBUG("Log level set to: " << Logger::getInstance().logLevelToString(params.log_level));
+            // Emit one-time snapshot summary of enabled debug/diagnostic groups
+            auto lines = formatDebugEnvSummary(debugEnv());
+            for (const auto &line : lines)
+            {
+                LOG_INFO(line);
+            }
         }
 
         // 3. Detect system topology
@@ -153,6 +156,45 @@ int main(int argc, char *argv[])
                         model_weights = std::make_unique<MPITransformerPipeline::ModelWeights>(
                             loadModelWeights(*model_loader, config));
                         LOG_INFO("Model weights loaded for transformer pipeline");
+                        if (rank == 0 && params.print_topology)
+                        {
+                            LOG_INFO("-- Sharded Tensor Registry (post model load) --");
+                            auto snap = ShardedTensorRegistry::instance().snapshot();
+                            if (snap.details.empty())
+                            {
+                                LOG_INFO("(no sharded tensors registered)");
+                            }
+                            else
+                            {
+                                int idx = 0;
+                                for (const auto &d : snap.details)
+                                {
+                                    const auto &spec = d.spec;
+                                    std::ostringstream oss;
+                                    oss << "shard[" << idx++ << "] axis=" << spec.axis_name();
+                                    if (!spec.role.empty())
+                                        oss << " role=" << spec.role;
+                                    oss << " world=" << spec.world << " rank=" << spec.rank
+                                        << " global_dim=" << spec.global_dim << " local_offset=" << spec.local_offset
+                                        << " local_dim=" << spec.local_dim << " local_shape=[";
+                                    for (size_t i = 0; i < d.local_shape.size(); ++i)
+                                    {
+                                        if (i)
+                                            oss << 'x';
+                                        oss << d.local_shape[i];
+                                    }
+                                    oss << "] elems_local=" << d.local_elems;
+                                    LOG_INFO(oss.str());
+                                }
+                                LOG_INFO(snap.summary_line());
+                                for (const auto &ax : snap.per_axis)
+                                {
+                                    std::string axis_name = (ax.axis == ShardSpec::Axis::Hidden ? "Hidden" : (ax.axis == ShardSpec::Axis::Heads ? "Heads" : "Unknown"));
+                                    LOG_INFO(axis_name << "-axis shards: count=" << ax.count << " local_elems=" << ax.local_elems << " global_dim=" << ax.global_dim);
+                                }
+                            }
+                            LOG_INFO("-- End Sharded Tensor Registry --");
+                        }
                     }
                     catch (const std::exception &e)
                     {

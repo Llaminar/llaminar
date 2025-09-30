@@ -13,14 +13,51 @@ namespace llaminar
      *
      * This kernel distributes attention heads across MPI processes for parallel computation.
      * Each process handles a subset of attention heads, with global communication for
-     * input distribution and output gathering.
+     * input distribution and (optionally) output gathering.
      *
      * Distribution Strategy:
      * - HEAD_WISE: Each process handles a subset of attention heads
-     * - Input/KV Cache: Replicated across all processes
+     * - Input / KV Cache: Replicated across all processes (future optimization may shard)
      * - Q/K/V Projections: Distributed by heads
-     * - Attention Computation: Parallel across heads
-     * - Output: Gathered from all processes
+     * - Attention Computation: Parallel across local heads only
+     * - Output Projection: Applied to local attended heads; final tensor may be partial or global
+     *
+     * @note Output Contract (Always-Partial):
+     * The kernel always emits ONLY the local partial contribution corresponding to this rank's owned
+     * attention head subset (after local output projection). No implicit MPI gather/reduction occurs
+     * inside the kernel. Reconstruction of a fully replicated hidden state (when required) is the
+     * responsibility of the caller or downstream pipeline stage (e.g., explicit MPI_Allreduce for
+     * additive row-sharded projections or Allgather + reshape for head concatenation). This explicit
+     * contract eliminates hidden synchronization, prevents double reductions, and simplifies reasoning
+     * about distributed correctness. Any previous environment flags that toggled an internal gather
+     * have been removed.
+     *
+     * Rationale:
+     * - Avoids implicit global synchronization hidden inside the kernel.
+     * - Enables downstream kernels (norm / MLP) to operate purely on local shards where possible.
+     * - Makes communication patterns explicit and testable in higher-level pipeline code.
+     *
+     * Caller Responsibilities:
+     * 1. Determine reconstruction semantics: sum (row/feature split) vs concat (head split).
+     * 2. Perform the appropriate collective (e.g. `MPI_Allreduce` for additive partitions).
+     * 3. Avoid accidental reuse of the partial tensor as if it were replicated (enable a future
+     *    guard flag such as `LLAMINAR_ASSERT_REPLICATED_MISUSE` to catch mistakes).
+     *
+     * Example (row-sharded Wo producing additive partials):
+     * @code
+     * // After attention kernel execute with gather disabled
+     * std::vector<float> full(d_model * seq_len);
+     * MPI_Allreduce(local->data(), full.data(), local->size(), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+     * @endcode
+     *
+     * There is no code path that implicitly produces a replicated activation; treating the partial
+     * output as fully replicated without reconstruction is a usage error (a future guard flag may
+     * detect this misuse).
+     *
+     * Misuse Guard (optional):
+     *  - Set `LLAMINAR_ASSERT_REPLICATED_MISUSE=1` to embed a microscopic per-rank canary value in
+     *    the final element of the partial output. A downstream debug pass can inspect divergence in
+     *    that terminal element across ranks before reduction to detect unintended replicated use.
      */
     class MPIAttentionKernel : public MPIKernelBase
     {
@@ -39,9 +76,11 @@ namespace llaminar
          * @param n_head Total number of attention heads
          * @param n_head_kv Number of key-value heads (for grouped attention)
          * @param head_dim Dimension per attention head
+         * @param rope_freq_base Base frequency for rotary embeddings
          * @param strategy Distribution strategy to use
          */
         MPIAttentionKernel(int n_head, int n_head_kv, int head_dim,
+                           float rope_freq_base = 10000.0f,
                            DistributionStrategy strategy = DistributionStrategy::HEAD_WISE);
 
         ~MPIAttentionKernel() = default;
@@ -178,17 +217,6 @@ namespace llaminar
                                           std::shared_ptr<TensorBase> &local_final_output,
                                           size_t seq_len, int local_heads, size_t d_model);
 
-        /**
-         * @brief Gather final outputs from all processes
-         * @param local_output Local output from this process
-         * @param global_output Global output tensor
-         * @param seq_len Sequence length
-         * @param d_model Model dimension
-         */
-        void gatherOutput(const std::shared_ptr<TensorBase> &local_output,
-                          std::shared_ptr<TensorBase> &global_output,
-                          size_t seq_len, size_t d_model);
-
         std::shared_ptr<TensorBase> createLocalSimpleTensor(const std::vector<size_t> &shape) const;
 
         // Configuration parameters
@@ -196,6 +224,7 @@ namespace llaminar
         int n_head_kv_;                 ///< Number of key-value heads (grouped attention)
         int head_dim_;                  ///< Dimension per attention head
         int n_past_;                    ///< Number of past tokens for position embedding
+        float rope_freq_base_;          ///< Base frequency for rotary embeddings
         DistributionStrategy strategy_; ///< Distribution strategy
     };
 

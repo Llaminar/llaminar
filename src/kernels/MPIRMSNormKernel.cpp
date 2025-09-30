@@ -1,15 +1,76 @@
+/**
+ * @file MPIRMSNormKernel.cpp
+ * @brief Root Mean Square Layer Normalization (RMSNorm) applied row-wise to activation matrix.
+ *
+ * @section Contract
+ * Inputs:
+ *  - inputs[0]: Activation tensor X [seq_len, hidden_dim].
+ *  - inputs[1]: Scale (gamma) tensor [hidden_dim].
+ * Outputs:
+ *  - outputs[0]: Normalized tensor Y [seq_len, hidden_dim].
+ * Formula:
+ *  - rms = sqrt( mean( X_i^2 ) + eps ) over hidden_dim
+ *  - Y_i = (X_i / rms) * gamma_i
+ * Numerical Expectations:
+ *  - Deterministic; relative diff vs high precision reference < 1e-7 typical.
+ * Error Modes:
+ *  - Hidden dim mismatch, zero or negative epsilon, null tensors.
+ *  - NaN propagation if input contains NaN (not masked by kernel).
+ * Distribution:
+ *  - Replicated across ranks; each rank processes full sequence (potential future sharding along sequence dimension).
+ * Threading:
+ *  - Parallel over rows; per-row reduction + scale broadcast; uses local temporaries only.
+ * Performance Notes:
+ *  - Compute-bound for large hidden_dim; consider vectorized reduction and reciprocal sqrt improvements.
+ * Future Extensions:
+ *  - FP16/BF16 mixed-precision normalization; fused residual + RMSNorm variant.
+ * @todo Investigate epsilon tuning for quantized activations path.
+ * @author David Sanftenberg
+ */
 #include "MPIRMSNormKernel.h"
 #include "../logger.h"
 #include "../debug_utils.h"
+#include "../utils/debug_env.h"
 #include <cmath>
 #include <chrono>
 #include <algorithm>
 #include <limits>
 #include <vector>
+#include <string>
+#include <sstream>
+#include <cctype>
+#include <cstring>
+#include <cstdlib>
 #include <mpi.h>
 
 namespace llaminar
 {
+
+    namespace
+    {
+        bool env_flag_enabled(const char *value)
+        {
+            if (!value)
+            {
+                return false;
+            }
+            std::string token;
+            token.reserve(std::strlen(value));
+            for (const char *p = value; *p; ++p)
+            {
+                unsigned char ch = static_cast<unsigned char>(*p);
+                if (!std::isspace(ch))
+                {
+                    token.push_back(static_cast<char>(std::tolower(ch)));
+                }
+            }
+            if (token.empty())
+            {
+                return true;
+            }
+            return !(token == "0" || token == "false" || token == "off" || token == "no");
+        }
+    }
 
     MPIRMSNormKernel::MPIRMSNormKernel(DistributionStrategy strategy)
         : strategy_(strategy), epsilon_(1e-6f)
@@ -44,6 +105,18 @@ namespace llaminar
         // Log detailed tensor information
         TensorLogger::logNormalizationOperation(global_input, weight, global_output, "MPIRMSNormKernel");
 
+        std::vector<int> trace_rows;
+        if (!debugEnv().rmsnorm.trace_rows_spec.empty())
+        {
+            trace_rows = parseRowSpecification(debugEnv().rmsnorm.trace_rows_spec.c_str(), static_cast<size_t>(global_input->shape()[0]));
+            LOG_INFO("[MPIRMSNormKernel] trace_rows request='" << debugEnv().rmsnorm.trace_rows_spec << "' parsed_count=" << trace_rows.size());
+        }
+        const bool validate_reference = debugEnv().rmsnorm.validate_ref;
+        if (validate_reference)
+        {
+            LOG_INFO("[MPIRMSNormKernel] reference validation enabled");
+        }
+
         // Additional epsilon logging
         LOG_INFO("[MPIRMSNormKernel] Using epsilon=" << epsilon_);
 
@@ -51,23 +124,201 @@ namespace llaminar
         size_t global_seq_len = static_cast<size_t>(global_input->shape()[0]);
         size_t hidden_size = static_cast<size_t>(global_input->shape()[1]);
 
-        // Calculate local distribution
+        // Shard-aware feature-slice detection (head/hidden sharding along feature dimension)
+        bool feature_sharded = false;
+        size_t feature_local_offset = 0, feature_local_dim = hidden_size;
+        if (auto *ss = dynamic_cast<ShardedSimpleTensor *>(global_input.get()))
+        {
+            const ShardSpec &spec = ss->shard_spec();
+            // If tensor reports sharded along heads/hidden and local_dim < global hidden_size treat as feature slice
+            if (spec.is_sharded() && (spec.axis == ShardSpec::Axis::Heads || spec.axis == ShardSpec::Axis::Hidden))
+            {
+                if ((size_t)spec.local_dim < hidden_size)
+                {
+                    feature_sharded = true;
+                    feature_local_offset = spec.local_offset;
+                    feature_local_dim = spec.local_dim;
+                }
+            }
+        }
+
+        // Calculate local row distribution (sequence-wise) always
         auto [local_seq_len, seq_offset] = getRowDistribution(global_seq_len);
 
-        // Create local tensors
-        auto local_input = createLocalTensor({static_cast<size_t>(local_seq_len), hidden_size});
-        auto local_output = createLocalTensor({static_cast<size_t>(local_seq_len), hidden_size});
+        // Local tensor views / buffers
+        std::shared_ptr<TensorBase> local_input;
+        std::shared_ptr<TensorBase> local_output;
+        if (feature_sharded)
+        {
+            // Already column-sliced; we still need a row slice if strategy is SEQUENCE_WISE
+            if (strategy_ == DistributionStrategy::SEQUENCE_WISE && (local_seq_len != global_seq_len))
+            {
+                // Need to allocate a temporary row-sliced buffer of only our rows but still only local feature slice
+                local_input = createLocalTensor({static_cast<size_t>(local_seq_len), feature_local_dim});
+                local_output = createLocalTensor({static_cast<size_t>(local_seq_len), feature_local_dim});
+                // Copy row subset over feature slice
+                const float *gptr = global_input->data();
+                for (size_t r = 0; r < local_seq_len; ++r)
+                {
+                    size_t gr = seq_offset + r;
+                    const float *src = gptr + gr * feature_local_dim; // sharded tensor stores only local feature columns contiguously
+                    std::memcpy(local_input->data() + r * feature_local_dim, src, sizeof(float) * feature_local_dim);
+                }
+            }
+            else
+            {
+                // Use global_input directly (no row splitting needed)
+                local_input = global_input;
+                local_output = global_output;
+            }
+        }
+        else
+        {
+            // Legacy row distribution path over full hidden size
+            local_input = createLocalTensor({static_cast<size_t>(local_seq_len), hidden_size});
+            local_output = createLocalTensor({static_cast<size_t>(local_seq_len), hidden_size});
+            distributeInput(global_input, local_input, global_seq_len, hidden_size);
+        }
 
-        // Distribute input data
-        distributeInput(global_input, local_input, global_seq_len, hidden_size);
+        // Optional gamma diagnostics / override
+        const bool dump_gamma = debugEnv().rmsnorm.dump_gamma;
+        const bool force_unit_gamma = debugEnv().rmsnorm.force_unit_gamma;
+        const bool track_gamma_checksum = debugEnv().rmsnorm.gamma_checksum;
+        const float *gamma_ptr = weight->data();
+        std::vector<float> unit_gamma;
+        if (force_unit_gamma)
+        {
+            unit_gamma.assign(hidden_size, 1.0f);
+            gamma_ptr = unit_gamma.data();
+            if (getRank() == 0)
+            {
+                LOG_WARN("[MPIRMSNormKernel] FORCING UNIT GAMMA (debug override) hidden_size=" << hidden_size);
+            }
+        }
+        if (dump_gamma && getRank() == 0)
+        {
+            // Dump first handful + min/max/mean for gamma
+            double g_min = std::numeric_limits<double>::infinity();
+            double g_max = -std::numeric_limits<double>::infinity();
+            long double g_sum = 0.0L;
+            for (size_t i = 0; i < hidden_size; ++i)
+            {
+                double v = static_cast<double>(weight->data()[i]);
+                g_min = std::min(g_min, v);
+                g_max = std::max(g_max, v);
+                g_sum += v;
+            }
+            double g_mean = static_cast<double>(g_sum / static_cast<long double>(hidden_size));
+            std::ostringstream goss;
+            goss << "[MPIRMSNormKernel][GammaDump] size=" << hidden_size
+                 << " min=" << g_min << " max=" << g_max << " mean=" << g_mean << " first32=";
+            size_t dump_n = std::min<size_t>(32, hidden_size);
+            for (size_t i = 0; i < dump_n; ++i)
+            {
+                goss << weight->data()[i];
+                if (i + 1 < dump_n)
+                    goss << ',';
+            }
+            LOG_INFO(goss.str());
+        }
 
-        // Compute distributed RMS normalization
-        computeDistributedRMSNorm(local_input->data(), weight->data(),
-                                  local_output->data(), local_seq_len,
-                                  hidden_size, global_seq_len);
+        static uint64_t last_checksum = 0;
+        static bool have_last = false;
+        if (track_gamma_checksum && getRank() == 0)
+        {
+            auto checksum = [](const float *ptr, size_t n) -> uint64_t
+            {
+                const uint64_t FNV_OFFSET = 1469598103934665603ull;
+                const uint64_t FNV_PRIME = 1099511628211ull;
+                uint64_t h = FNV_OFFSET;
+                const uint8_t *bytes = reinterpret_cast<const uint8_t *>(ptr);
+                size_t len_bytes = n * sizeof(float);
+                for (size_t i = 0; i < len_bytes; ++i)
+                {
+                    h ^= bytes[i];
+                    h *= FNV_PRIME;
+                }
+                return h;
+            };
+            uint64_t cs = checksum(weight->data(), hidden_size);
+            if (have_last && cs != last_checksum)
+            {
+                LOG_WARN("[MPIRMSNormKernel][GammaChecksum] CHANGED checksum_old=0x" << std::hex << last_checksum << " checksum_new=0x" << cs << std::dec << " (gamma modified between invocations?)");
+            }
+            else if (!have_last)
+            {
+                LOG_INFO("[MPIRMSNormKernel][GammaChecksum] initial checksum=0x" << std::hex << cs << std::dec);
+                have_last = true;
+            }
+            last_checksum = cs;
+        }
 
-        // Gather results back to global output
-        gatherOutput(local_output, global_output, global_seq_len, hidden_size);
+        // Compute (shard-aware) RMSNorm
+        if (feature_sharded)
+        {
+            // Need per-row global sumsq across feature shards: compute local then Allreduce
+            std::vector<double> local_row_sumsq(local_seq_len, 0.0);
+            size_t feat_dim = feature_local_dim;
+            const float *in_ptr = local_input->data();
+            for (size_t r = 0; r < local_seq_len; ++r)
+            {
+                const float *row = in_ptr + r * feat_dim;
+                double s = 0.0;
+                for (size_t c = 0; c < feat_dim; ++c)
+                {
+                    double v = row[c];
+                    s += v * v;
+                }
+                local_row_sumsq[r] = s;
+            }
+            std::vector<double> global_row_sumsq(local_row_sumsq.size(), 0.0);
+            checkMPIError(MPI_Allreduce(local_row_sumsq.data(), global_row_sumsq.data(), (int)local_row_sumsq.size(), MPI_DOUBLE, MPI_SUM, getComm()), "RMSNorm shard row sumsq");
+            // Determine global hidden size from shard spec (if available)
+            size_t global_hidden = hidden_size;
+            if (auto *ss = dynamic_cast<ShardedSimpleTensor *>(global_input.get()))
+                global_hidden = ss->shard_spec().global_dim;
+            std::vector<float> inv_scale(local_seq_len, 0.f);
+            for (size_t r = 0; r < local_seq_len; ++r)
+            {
+                double denom = (double)global_hidden;
+                double inv = 0.0;
+                if (denom > 0.0)
+                    inv = 1.0 / std::sqrt(global_row_sumsq[r] / denom + (double)epsilon_);
+                inv_scale[r] = (float)inv;
+            }
+            // Apply scaling to local slice
+            float *out_ptr = local_output->data();
+#pragma omp parallel for schedule(static)
+            for (long long r = 0; r < (long long)local_seq_len; ++r)
+            {
+                const float *row_in = in_ptr + r * (long long)feat_dim;
+                float *row_out = out_ptr + r * (long long)feat_dim;
+                float scale = inv_scale[r];
+                for (long long c = 0; c < (long long)feat_dim; ++c)
+                {
+                    row_out[c] = row_in[c] * scale * gamma_ptr[feature_local_offset + c];
+                }
+            }
+            // If we used a temporary row-sliced buffer, need to scatter back into global_output
+            if (local_output != global_output)
+            {
+                float *gout = global_output->data();
+                for (size_t r = 0; r < local_seq_len; ++r)
+                {
+                    size_t gr = seq_offset + r;
+                    float *dst = gout + gr * feat_dim;
+                    const float *src = out_ptr + r * feat_dim;
+                    std::memcpy(dst, src, sizeof(float) * feat_dim);
+                }
+            }
+        }
+        else
+        {
+            computeDistributedRMSNorm(local_input->data(), gamma_ptr,
+                                      local_output->data(), local_seq_len,
+                                      hidden_size, global_seq_len);
+            gatherOutput(local_output, global_output, global_seq_len, hidden_size);
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -77,6 +328,161 @@ namespace llaminar
 
         // Log output tensor statistics
         TensorLogger::logTensorStats(global_output, "RMSNorm final_output", "MPIRMSNormKernel_COMPLETE");
+
+        if (!trace_rows.empty())
+        {
+            logTensorRowPreview(global_input, "RMSNorm input", trace_rows, 8, "RMSNORM_TRACE");
+            logTensorRowPreview(global_output, "RMSNorm output", trace_rows, 8, "RMSNORM_TRACE");
+        }
+
+        if (validate_reference && getRank() == 0)
+        {
+            size_t seq_len = static_cast<size_t>(global_input->shape()[0]);
+            size_t hidden_size = static_cast<size_t>(global_input->shape()[1]);
+            if (seq_len == 0 || hidden_size == 0)
+            {
+                LOG_WARN("[MPIRMSNormKernel][validate] Skipping reference check due to empty dimensions");
+            }
+            else
+            {
+                const float *input_ptr = global_input->data();
+                const float *weight_ptr = weight->data();
+                const float *actual_ptr = global_output->data();
+
+                std::vector<float> reference(seq_len * hidden_size, 0.0f);
+                std::vector<double> row_sum_sq(seq_len, 0.0);
+                std::vector<float> row_inv(seq_len, 0.0f);
+
+                double diff_sq = 0.0;
+                double ref_sq = 0.0;
+                double max_abs = 0.0;
+                size_t worst_index = 0;
+
+                for (size_t row = 0; row < seq_len; ++row)
+                {
+                    size_t base = row * hidden_size;
+                    double sum_sq = 0.0;
+                    for (size_t col = 0; col < hidden_size; ++col)
+                    {
+                        double value = static_cast<double>(input_ptr[base + col]);
+                        sum_sq += value * value;
+                    }
+                    row_sum_sq[row] = sum_sq;
+                    double inv = hidden_size ? 1.0 / std::sqrt(sum_sq / static_cast<double>(hidden_size) + static_cast<double>(epsilon_)) : 0.0;
+                    row_inv[row] = static_cast<float>(inv);
+
+                    for (size_t col = 0; col < hidden_size; ++col)
+                    {
+                        float ref_val = static_cast<float>(static_cast<double>(input_ptr[base + col]) * inv * static_cast<double>(weight_ptr[col]));
+                        reference[base + col] = ref_val;
+                        double diff = static_cast<double>(actual_ptr[base + col]) - static_cast<double>(ref_val);
+                        double abs_diff = std::fabs(diff);
+                        if (abs_diff > max_abs)
+                        {
+                            max_abs = abs_diff;
+                            worst_index = base + col;
+                        }
+                        diff_sq += diff * diff;
+                        ref_sq += static_cast<double>(ref_val) * static_cast<double>(ref_val);
+                    }
+                }
+
+                double rel_l2 = ref_sq > 0.0 ? std::sqrt(diff_sq) / std::sqrt(ref_sq) : 0.0;
+                size_t worst_row = hidden_size ? worst_index / hidden_size : 0;
+                size_t worst_col = hidden_size ? worst_index % hidden_size : 0;
+
+                LOG_INFO("[MPIRMSNormKernel][validate] reference diff max_abs=" << max_abs
+                                                                                << " rel_l2=" << rel_l2
+                                                                                << " worst_row=" << worst_row
+                                                                                << " worst_col=" << worst_col
+                                                                                << " actual=" << actual_ptr[worst_index]
+                                                                                << " ref=" << reference[worst_index]);
+
+                if (hidden_size > 0)
+                {
+                    size_t start_col = (worst_col > 3) ? worst_col - 3 : 0;
+                    size_t end_col = std::min(hidden_size, start_col + static_cast<size_t>(8));
+                    std::ostringstream actual_preview;
+                    std::ostringstream ref_preview;
+                    std::ostringstream diff_preview;
+                    actual_preview << "[";
+                    ref_preview << "[";
+                    diff_preview << "[";
+                    for (size_t col = start_col; col < end_col; ++col)
+                    {
+                        if (col > start_col)
+                        {
+                            actual_preview << ", ";
+                            ref_preview << ", ";
+                            diff_preview << ", ";
+                        }
+                        size_t idx = worst_row * hidden_size + col;
+                        actual_preview << actual_ptr[idx];
+                        ref_preview << reference[idx];
+                        diff_preview << (actual_ptr[idx] - reference[idx]);
+                    }
+                    if (end_col < hidden_size)
+                    {
+                        actual_preview << ", ...";
+                        ref_preview << ", ...";
+                        diff_preview << ", ...";
+                    }
+                    actual_preview << "]";
+                    ref_preview << "]";
+                    diff_preview << "]";
+                    LOG_INFO("[MPIRMSNormKernel][validate] worst_row_preview actual=" << actual_preview.str()
+                                                                                      << " ref=" << ref_preview.str()
+                                                                                      << " diff=" << diff_preview.str());
+                }
+
+                if (!trace_rows.empty())
+                {
+                    for (int row : trace_rows)
+                    {
+                        if (row < 0 || static_cast<size_t>(row) >= seq_len)
+                        {
+                            continue;
+                        }
+                        size_t base = static_cast<size_t>(row) * hidden_size;
+                        size_t cols_to_show = std::min<size_t>(static_cast<size_t>(8), hidden_size);
+                        std::ostringstream actual_preview;
+                        std::ostringstream ref_preview;
+                        std::ostringstream diff_preview;
+                        actual_preview << "[";
+                        ref_preview << "[";
+                        diff_preview << "[";
+                        for (size_t col = 0; col < cols_to_show; ++col)
+                        {
+                            if (col)
+                            {
+                                actual_preview << ", ";
+                                ref_preview << ", ";
+                                diff_preview << ", ";
+                            }
+                            size_t idx = base + col;
+                            actual_preview << actual_ptr[idx];
+                            ref_preview << reference[idx];
+                            diff_preview << (actual_ptr[idx] - reference[idx]);
+                        }
+                        if (cols_to_show < hidden_size)
+                        {
+                            actual_preview << ", ...";
+                            ref_preview << ", ...";
+                            diff_preview << ", ...";
+                        }
+                        actual_preview << "]";
+                        ref_preview << "]";
+                        diff_preview << "]";
+                        LOG_INFO("[RMSNORM_TRACE] row=" << row
+                                                        << " sum_sq=" << row_sum_sq[static_cast<size_t>(row)]
+                                                        << " inv_scale=" << row_inv[static_cast<size_t>(row)]
+                                                        << " actual=" << actual_preview.str()
+                                                        << " ref=" << ref_preview.str()
+                                                        << " diff=" << diff_preview.str());
+                    }
+                }
+            }
+        }
 
         LOG_DEBUG("MPIRMSNormKernel executed successfully on rank " << getRank()
                                                                     << " in " << duration.count() << " microseconds");

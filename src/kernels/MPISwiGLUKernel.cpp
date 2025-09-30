@@ -1,6 +1,37 @@
+/**
+ * @file MPISwiGLUKernel.cpp
+ * @brief Applies SwiGLU feed-forward activation: (X * W1) ⊗ swish(X * W2) * W3 (variant) depending on architecture.
+ *
+ * @section Contract
+ * Inputs (typical 3-projection form after prior linear kernels):
+ *  - inputs[0]: Gate projection tensor G [seq_len, hidden_dim_ff] (pre-activation for swish).
+ *  - inputs[1]: Up projection tensor U [seq_len, hidden_dim_ff] (multiplicative partner).
+ *  - inputs[2] (optional): Down projection tensor D or may be handled by a subsequent linear kernel depending on config.
+ * Outputs:
+ *  - outputs[0]: Activated tensor A [seq_len, hidden_dim_ff] or reduced back to model_dim if fused-down path executed.
+ * Formula (canonical):
+ *  - swish(x) = x * sigmoid(x)
+ *  - y = (swish(G) ⊗ U)  (Hadamard). Some model variants: y = swish(G) * U (elementwise) then linear down-projection outside this kernel.
+ * Numerical Expectations:
+ *  - Stable for |x| < 20; extreme values saturate sigmoid; relative error vs reference < 1e-6 float32.
+ * Error Modes:
+ *  - Shape mismatch between G and U.
+ *  - Null tensors, inconsistent seq_len.
+ * Distribution:
+ *  - Currently replicated; future optimization could partition hidden_dim_ff across ranks with reduce-scatter + allgather.
+ * Threading:
+ *  - Parallel for over rows*columns; no shared mutable state beyond output buffer.
+ * Performance Notes:
+ *  - Memory bandwidth + elementwise compute; vectorization opportunities (FMA + fast sigmoid approx) considered later.
+ * Future Extensions:
+ *  - Quantized input handling, fused down-projection linear, activation checkpointing.
+ * @warning Ensure that upstream linear projections have consistent floating layout to avoid silent divergence.
+ * @author David Sanftenberg
+ */
 #include "MPISwiGLUKernel.h"
 #include "../debug_utils.h"
 #include "../performance_timer.h"
+#include "../utils/debug_env.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -29,8 +60,8 @@ namespace llaminar
             return false;
         }
 
-        auto gate_tensor = inputs[0];
-        auto up_tensor = inputs[1];
+        auto gate_tensor = inputs[0]; // Projection typically named "gate" in model weights
+        auto up_tensor = inputs[1];   // Projection typically named "up" (a.k.a. value) in SwiGLU
         auto output_tensor = outputs[0];
 
         const auto &gate_shape = gate_tensor->shape();
@@ -57,6 +88,33 @@ namespace llaminar
         const float *gate_data = gate_tensor->data();
         const float *up_data = up_tensor->data();
         float *output_data = output_tensor->data();
+
+        // Algorithm selection (default = correct LLaMA style: silu(gate) * up)
+        // Legacy (buggy) ordering previously used: gate * silu(up)
+        //   Enable via: export LLAMINAR_SWIGLU_ALGO=legacy
+        // Validation (compute both & report diff) via: export LLAMINAR_SWIGLU_VALIDATE=1
+        static bool algo_initialized = false;
+        static bool legacy_algo = false; // true => use legacy buggy ordering
+        static bool validation_enabled = false;
+        static int rank_cached = -1;
+        if (!algo_initialized)
+        {
+            if (!debugEnv().swiglu.algo.empty())
+            {
+                std::string v = debugEnv().swiglu.algo;
+                std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+                if (v == "legacy")
+                    legacy_algo = true;
+            }
+            validation_enabled = debugEnv().swiglu.validate;
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank_cached);
+            if (rank_cached == 0)
+            {
+                LOG_INFO("MPISwiGLUKernel SwiGLU algorithm: " << (legacy_algo ? "legacy(gate * silu(up))" : "standard(silu(gate) * up)")
+                                                              << (validation_enabled ? " (validation enabled)" : ""));
+            }
+            algo_initialized = true;
+        }
 
         // === SWIGLU INPUT VALIDATION ===
         ASSERT_TENSOR_VALID(gate_tensor, "SwiGLU gate input");
@@ -249,21 +307,73 @@ namespace llaminar
         // Process assigned sequence positions with OpenMP parallelization
         auto omp_start = std::chrono::high_resolution_clock::now();
 
-#pragma omp parallel for collapse(2) schedule(static)
+        const bool legacy_algo = (!debugEnv().swiglu.algo.empty() && debugEnv().swiglu.algo == "legacy");
+        const bool validate = debugEnv().swiglu.validate;
+        double accum_abs_diff = 0.0;
+        double accum_max_diff = 0.0;
+
+#pragma omp parallel for collapse(2) schedule(static) reduction(+ : accum_abs_diff) reduction(max : accum_max_diff)
         for (size_t pos = start_pos; pos < end_pos; ++pos)
         {
             for (int dim = 0; dim < d_ff; dim += 8)
             { // Process in chunks for better vectorization
                 int end_dim = std::min(dim + 8, d_ff);
 
-#pragma omp simd aligned(gate_data, up_data, output_data : 32)
+#pragma omp simd aligned(gate_data, up_data, output_data : 32) reduction(+ : accum_abs_diff) reduction(max : accum_max_diff)
                 for (int k = dim; k < end_dim; ++k)
                 {
                     size_t idx = pos * d_ff + k;
-                    float up_val = up_data[idx];
-                    float silu_val = computeSiLU(up_val);
-                    output_data[idx] = gate_data[idx] * silu_val;
+                    float gate_v = gate_data[idx];
+                    float up_v = up_data[idx];
+                    float out_val;
+                    if (legacy_algo)
+                    {
+                        // Legacy buggy ordering: gate * silu(up)
+                        out_val = gate_v * computeSiLU(up_v);
+                        if (validate)
+                        {
+                            float correct = computeSiLU(gate_v) * up_v;
+                            float diff = std::fabs(static_cast<double>(out_val) - static_cast<double>(correct));
+                            accum_abs_diff += diff;
+                            if (diff > accum_max_diff)
+                                accum_max_diff = diff;
+                        }
+                    }
+                    else
+                    {
+                        // Correct LLaMA formulation: silu(gate) * up
+                        out_val = computeSiLU(gate_v) * up_v;
+                        if (validate)
+                        {
+                            float legacy = gate_v * computeSiLU(up_v);
+                            float diff = std::fabs(static_cast<double>(out_val) - static_cast<double>(legacy));
+                            accum_abs_diff += diff;
+                            if (diff > accum_max_diff)
+                                accum_max_diff = diff;
+                        }
+                    }
+                    output_data[idx] = out_val;
                 }
+            }
+        }
+
+        if (validate)
+        {
+            int world_rank = 0;
+            MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+            double global_abs = 0.0;
+            double global_max = 0.0;
+            MPI_Allreduce(&accum_abs_diff, &global_abs, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(&accum_max_diff, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            size_t local_elems = (end_pos - start_pos) * static_cast<size_t>(d_ff);
+            size_t global_elems = static_cast<size_t>(seq_len) * static_cast<size_t>(d_ff);
+            double mean_abs = global_abs / static_cast<double>(global_elems);
+            if (world_rank == 0)
+            {
+                LOG_INFO("[SwiGLUValidate] algo=" << (legacy_algo ? "legacy_vs_correct" : "correct_vs_legacy")
+                                                  << " mean_abs_diff=" << mean_abs
+                                                  << " max_diff=" << global_max
+                                                  << " elems=" << global_elems);
             }
         }
 
@@ -296,18 +406,68 @@ namespace llaminar
         // Process assigned features across all sequence positions
         auto omp_start = std::chrono::high_resolution_clock::now();
 
-#pragma omp parallel for schedule(static)
+        const bool legacy_algo = (!debugEnv().swiglu.algo.empty() && debugEnv().swiglu.algo == "legacy");
+        const bool validate = debugEnv().swiglu.validate;
+        double accum_abs_diff = 0.0;
+        double accum_max_diff = 0.0;
+
+#pragma omp parallel for schedule(static) reduction(+ : accum_abs_diff) reduction(max : accum_max_diff)
         for (int pos = 0; pos < seq_len; ++pos)
         {
-            size_t pos_offset = pos * d_ff;
+            size_t pos_offset = static_cast<size_t>(pos) * static_cast<size_t>(d_ff);
 
-#pragma omp simd aligned(gate_data, up_data, output_data : 32)
+#pragma omp simd aligned(gate_data, up_data, output_data : 32) reduction(+ : accum_abs_diff) reduction(max : accum_max_diff)
             for (size_t dim = start_feature; dim < end_feature; ++dim)
             {
                 size_t idx = pos_offset + dim;
-                float up_val = up_data[idx];
-                float silu_val = computeSiLU(up_val);
-                output_data[idx] = gate_data[idx] * silu_val;
+                float gate_v = gate_data[idx];
+                float up_v = up_data[idx];
+                float out_val;
+                if (legacy_algo)
+                {
+                    out_val = gate_v * computeSiLU(up_v);
+                    if (validate)
+                    {
+                        float correct = computeSiLU(gate_v) * up_v;
+                        float diff = std::fabs(static_cast<double>(out_val) - static_cast<double>(correct));
+                        accum_abs_diff += diff;
+                        if (diff > accum_max_diff)
+                            accum_max_diff = diff;
+                    }
+                }
+                else
+                {
+                    out_val = computeSiLU(gate_v) * up_v;
+                    if (validate)
+                    {
+                        float legacy = gate_v * computeSiLU(up_v);
+                        float diff = std::fabs(static_cast<double>(out_val) - static_cast<double>(legacy));
+                        accum_abs_diff += diff;
+                        if (diff > accum_max_diff)
+                            accum_max_diff = diff;
+                    }
+                }
+                output_data[idx] = out_val;
+            }
+        }
+
+        if (validate)
+        {
+            int world_rank = 0;
+            MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+            double global_abs = 0.0;
+            double global_max = 0.0;
+            MPI_Allreduce(&accum_abs_diff, &global_abs, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(&accum_max_diff, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            size_t shard_elems = static_cast<size_t>(seq_len) * (end_feature - start_feature);
+            size_t global_elems = static_cast<size_t>(seq_len) * static_cast<size_t>(d_ff);
+            double mean_abs = global_abs / static_cast<double>(global_elems);
+            if (world_rank == 0)
+            {
+                LOG_INFO("[SwiGLUValidate] algo=" << (legacy_algo ? "legacy_vs_correct" : "correct_vs_legacy")
+                                                  << " mean_abs_diff=" << mean_abs
+                                                  << " max_diff=" << global_max
+                                                  << " elems=" << global_elems);
             }
         }
 

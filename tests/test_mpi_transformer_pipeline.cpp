@@ -3,7 +3,7 @@
 #include "test_timeout_guard.h"
 #include "tensors/tensor_factory.h"
 #include <gtest/gtest.h>
-#include <mpi.h>
+#include "test_mpi_utils.h"
 #include <random>
 #include <algorithm>
 #include <iomanip>
@@ -465,45 +465,4 @@ TEST_F(MPITransformerPipelineTest, LoadBalancingAnalysis)
 }
 
 // Main function for running MPI tests
-int main(int argc, char **argv)
-{
-    // Initialize MPI
-    MPI_Init(&argc, &argv);
-
-    // Initialize logging. If user hasn't specified LLAMINAR_LOG_LEVEL, default tests to DEBUG for better visibility.
-    if (!std::getenv("LLAMINAR_LOG_LEVEL"))
-    {
-        Logger::getInstance().setLogLevel(LogLevel::VERBOSITY_DEBUG);
-    }
-    initializeLogging(); // will apply env override if present
-
-    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
-        {"LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS", "LLAMINAR_TEST_TIMEOUT_MS"},
-        std::chrono::milliseconds(60000));
-    llaminar::test_util::TestTimeoutGuard watchdog("MPITransformerPipelineTest", timeout);
-
-    // Initialize Google Test
-    ::testing::InitGoogleTest(&argc, argv);
-
-    // Get MPI rank and size
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    if (rank == 0)
-    {
-        std::cout << "Running MPITransformerPipeline tests with " << size << " MPI processes" << std::endl;
-    }
-
-    // Run the tests
-    int result = RUN_ALL_TESTS();
-
-    // Synchronize before finalizing
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    watchdog.disarm();
-    // Finalize MPI (ensure all ranks either finished or watchdog aborted earlier)
-    MPI_Finalize();
-
-    return result;
-}
+LLAMINAR_DEFINE_GTEST_MPI_MAIN();

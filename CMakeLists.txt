@@ -121,6 +121,7 @@ set(LLAMINAR_CORE_SOURCES
     src/graph_compute.cpp
     src/mpi_kernel_base.cpp
     src/cosma_prefill_manager.cpp
+    src/utils/debug_env.cpp
     src/kernels/MPILinearKernel.cpp
     src/kernels/MPIRMSNormKernel.cpp
     src/kernels/MPIAttentionKernel.cpp
@@ -129,6 +130,7 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/MPIResidualKernel.cpp
     src/kernels/MPIRoPEKernel.cpp
     src/kernels/MPISwiGLUKernel.cpp
+    src/kernels/common/attention_primitives.cpp
     src/kernels/common/normalization.cpp
     src/kernels/common/softmax.cpp
     src/mpi_transformer_pipeline.cpp
@@ -265,7 +267,7 @@ endfunction()
 
 # Test sources and executables
 add_executable(test_basic tests/test_basic.cpp)
-target_link_libraries(test_basic llaminar_core)
+target_link_libraries(test_basic llaminar_core GTest::gtest GTest::gtest_main)
 add_test(NAME BasicTest COMMAND test_basic)
 
 add_executable(test_numa tests/test_numa.cpp)
@@ -305,6 +307,30 @@ if(GTEST_FOUND)
     endif()
     add_llaminar_mpi_test(MPILinearKernelTest 2 test_mpi_linear_kernel)
 
+    # Linear orientation parity test (naive reference vs MPILinearKernel)
+    add_executable(test_linear_orientation_parity tests/test_linear_orientation_parity.cpp)
+    target_link_libraries(test_linear_orientation_parity llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_linear_orientation_parity GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_linear_orientation_parity PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_linear_orientation_parity ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(LinearOrientationParityTest 2 test_linear_orientation_parity)
+    set_tests_properties(LinearOrientationParityTest PROPERTIES TIMEOUT 30)
+    set_tests_properties(LinearOrientationParityTest PROPERTIES LABELS "linear;parity;kernel")
+
+    # Minimal MPI finalize probe test (diagnostic for finalize hang)
+    add_executable(test_mpi_finalize_probe tests/test_mpi_finalize_probe.cpp)
+    target_link_libraries(test_mpi_finalize_probe llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_finalize_probe GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_mpi_finalize_probe PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_finalize_probe ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(MPIFinalizeProbeTest 2 test_mpi_finalize_probe)
+
     add_executable(test_mpi_rmsnorm_kernel tests/test_mpi_rmsnorm_kernel.cpp)
     target_link_libraries(test_mpi_rmsnorm_kernel llaminar_core)
     if(GTest_FOUND)
@@ -315,15 +341,169 @@ if(GTEST_FOUND)
     endif()
     add_llaminar_mpi_test(MPIRMSNormKernelTest 2 test_mpi_rmsnorm_kernel)
 
+    # Reconfigure test_mpi_attention_kernel as a standalone minimal MPI binary (no GTest) to avoid
+    # pre-main static initialization hang (see tests/AGENTS.md Case Study 11).
     add_executable(test_mpi_attention_kernel tests/test_mpi_attention_kernel.cpp)
-    target_link_libraries(test_mpi_attention_kernel llaminar_core)
+    target_compile_definitions(test_mpi_attention_kernel PRIVATE LLAMINAR_STANDALONE_MPI_ATTENTION_TEST=1)
+    target_link_libraries(test_mpi_attention_kernel PRIVATE llaminar_core MPI::MPI_CXX)
+    # Register as CTest with explicit mpiexec invocation.
+    add_test(NAME MPIAttentionKernelTest COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mpi_attention_kernel>)
+    set_tests_properties(MPIAttentionKernelTest PROPERTIES TIMEOUT 45 LABELS "attention;mpi;kernel" RUN_SERIAL TRUE)
+
+    # Minimal standalone MPI probe (no GTest, used to debug hangs prior to test harness)
+    add_executable(minimal_mpi_probe tests/minimal_mpi_probe.cpp)
+    target_link_libraries(minimal_mpi_probe llaminar_core MPI::MPI_CXX)
+
+    # Parity test wrapper integration: use the standalone binary with parameter variants.
+    # We keep the binary (test_attention_shard_parity) but add several CTest entries.
+    # Variant matrix chosen to exercise small vs medium shapes and uneven head distribution.
+    add_test(NAME AttentionShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_parity> --heads=4 --head-dim=16 --seq-len=5)
+    set_tests_properties(AttentionShardParity_Small PROPERTIES TIMEOUT 30 LABELS "attention;parity;sharding")
+    add_test(NAME AttentionShardParity_Medium COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_parity> --heads=8 --head-dim=8 --seq-len=32)
+    set_tests_properties(AttentionShardParity_Medium PROPERTIES TIMEOUT 30 LABELS "attention;parity;sharding")
+    add_test(NAME AttentionShardParity_Uneven COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_parity> --heads=6 --head-dim=12 --seq-len=9)
+    set_tests_properties(AttentionShardParity_Uneven PROPERTIES TIMEOUT 30 LABELS "attention;parity;sharding")
+    add_test(NAME AttentionShardParity_Stress COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_parity> --heads=12 --head-dim=16 --seq-len=24)
+
+    # --- MLP shard parity tests ---
+    add_executable(test_mlp_shard_parity tests/test_mlp_shard_parity.cpp)
+    target_link_libraries(test_mlp_shard_parity llaminar_core)
+    set_target_properties(test_mlp_shard_parity PROPERTIES OUTPUT_NAME test_mlp_shard_parity)
+
+    # Small (even-ish) partition
+    add_test(NAME MLPShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_parity> --seq-len=5 --d-model=48 --d-ff=64)
+    # Medium uneven d_ff
+    add_test(NAME MLPShardParity_Medium COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_parity> --seq-len=9 --d-model=64 --d-ff=96)
+    # Stress larger dims (still quick)
+    add_test(NAME MLPShardParity_Stress COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_parity> --seq-len=16 --d-model=80 --d-ff=128)
+
+    # --- End-to-End shard parity ---
+    add_executable(test_end2end_shard_parity tests/test_end2end_shard_parity.cpp)
+    target_link_libraries(test_end2end_shard_parity llaminar_core)
+    set_target_properties(test_end2end_shard_parity PROPERTIES OUTPUT_NAME test_end2end_shard_parity)
+    add_test(NAME End2EndShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_end2end_shard_parity> --heads=4 --head-dim=8 --seq-len=6 --d-ff=48)
+    add_test(NAME End2EndShardParity_UnevenHeads COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_end2end_shard_parity> --heads=6 --head-dim=8 --seq-len=5 --d-ff=56)
+    set_tests_properties(AttentionShardParity_Stress PROPERTIES TIMEOUT 60 LABELS "attention;parity;sharding;stress")
+
+    # Diagnostic path test: force loader sharded-mode + shard diagnostics for a tiny config to exercise verification logic.
+    add_test(NAME AttentionShardLoad_Diag
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_parity> --heads=4 --head-dim=8 --seq-len=4)
+    # Environment variables enabling shard-mode and diagnostic logging
+    set_tests_properties(AttentionShardLoad_Diag PROPERTIES
+        TIMEOUT 40
+        LABELS "attention;parity;sharding;diagnostic"
+        ENVIRONMENT "LLAMINAR_SHARD_LOAD_DIAG=1")
+
+    # Uneven head distribution diagnostic (5 heads -> ranks get 3 and 2) to stress offset logic
+    add_test(NAME AttentionShardLoad_Diag_Uneven
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_parity> --heads=5 --head-dim=8 --seq-len=6)
+    set_tests_properties(AttentionShardLoad_Diag_Uneven PROPERTIES
+        TIMEOUT 50
+        LABELS "attention;parity;sharding;diagnostic;uneven"
+        ENVIRONMENT "LLAMINAR_SHARD_LOAD_DIAG=1")
+
+    # --- Role tagging synthetic log capture test (no MPI) ---
+    add_executable(test_role_tagging_logs tests/test_role_tagging_logs.cpp)
+    target_link_libraries(test_role_tagging_logs llaminar_core)
     if(GTest_FOUND)
-        target_link_libraries(test_mpi_attention_kernel GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_mpi_attention_kernel PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_mpi_attention_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+        target_link_libraries(test_role_tagging_logs GTest::gtest GTest::gtest_main)
     endif()
-    add_llaminar_mpi_test(MPIAttentionKernelTest 2 test_mpi_attention_kernel)
+    add_test(NAME RoleTaggingSyntheticTest COMMAND test_role_tagging_logs)
+    set_tests_properties(RoleTaggingSyntheticTest PROPERTIES TIMEOUT 15 LABELS "logging;roles;synthetic")
+
+    # --- Role tagging integration tests (per quant group via GTest discovery) ---
+    add_executable(test_model_load_role_tags tests/test_model_load_role_tags.cpp)
+    target_link_libraries(test_model_load_role_tags llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_model_load_role_tags GTest::gtest GTest::gtest_main)
+        include(GoogleTest)
+        # Discover individual GTest cases (ModelLoadRoleTags.*_Group) so failures isolate the quant type.
+        gtest_discover_tests(test_model_load_role_tags
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES TIMEOUT 120 LABELS "logging;roles;integration" ENVIRONMENT "LLAMINAR_SHARD_LOAD_DIAG=1")
+    else()
+        # Fallback single test registration if GTest not found
+        add_test(NAME RoleTaggingIntegrationTest COMMAND test_model_load_role_tags)
+        set_tests_properties(RoleTaggingIntegrationTest PROPERTIES TIMEOUT 120 LABELS "logging;roles;integration" ENVIRONMENT "LLAMINAR_SHARD_LOAD_DIAG=1")
+    endif()
+
+    # Attention sharding parity harness (transitional). Uses MPI; currently reconstructs legacy sum output.
+    add_executable(test_attention_shard_parity tests/test_attention_shard_parity.cpp)
+    add_executable(test_attention_missing_reduction_negative tests/test_attention_missing_reduction_negative.cpp)
+    target_link_libraries(test_attention_shard_parity llaminar_core)
+    target_link_libraries(test_attention_missing_reduction_negative llaminar_core)
+    # Standalone binary (no GTest) used for debugging; do not register with add_llaminar_mpi_test macro.
+    add_test(NAME AttentionShardParityStandalone 
+             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_attention_shard_parity>)
+    set_tests_properties(AttentionShardParityStandalone PROPERTIES TIMEOUT 30)
+    set_tests_properties(AttentionShardParityStandalone PROPERTIES LABELS "attention;parity;sharding;standalone")
+
+    # Negative misuse test: ensures missing reduction leads to detectable mismatch
+    add_test(NAME AttentionShardMissingReduction_Negative
+        COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_missing_reduction_negative> --heads=4 --head-dim=16 --seq-len=5)
+    set_tests_properties(AttentionShardMissingReduction_Negative PROPERTIES TIMEOUT 30 LABELS "attention;negative;sharding")
+
+    # Attention micro parity test (single small config, scalar reference comparison)
+    add_executable(test_attention_micro tests/test_attention_micro.cpp)
+    target_link_libraries(test_attention_micro llaminar_core)
+    add_executable(test_attention_primitives tests/test_attention_primitives.cpp)
+    target_link_libraries(test_attention_primitives llaminar_core)
+    if (GTest_FOUND)
+        target_link_libraries(test_attention_primitives GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_attention_primitives PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_attention_primitives ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    # Single-rank pure math primitives test (no MPI). Register with CTest explicitly.
+    # Executable may live either in top-level or tests/ depending on generator/output rules.
+    if (EXISTS ${CMAKE_BINARY_DIR}/tests/test_attention_primitives)
+        add_test(NAME AttentionPrimitivesTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_attention_primitives)
+    else()
+        add_test(NAME AttentionPrimitivesTest COMMAND ${CMAKE_BINARY_DIR}/test_attention_primitives)
+    endif()
+    set_tests_properties(AttentionPrimitivesTest PROPERTIES TIMEOUT 5)
+    if(GTest_FOUND)
+        target_link_libraries(test_attention_micro GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_attention_micro PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_attention_micro ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(AttentionMicroTest 2 test_attention_micro)
+    set_tests_properties(AttentionMicroTest PROPERTIES TIMEOUT 30)
+    set_tests_properties(AttentionMicroTest PROPERTIES LABELS "attention;parity;kernel")
+
+    # MPI Embedding kernel comprehensive correctness tests (full vs sharded, transposed vs non-transposed)
+    add_executable(test_mpi_embedding_kernel tests/test_mpi_embedding_kernel.cpp)
+    target_link_libraries(test_mpi_embedding_kernel llaminar_core)
+    # Link only gtest, not gtest_main, since file provides its own main via LLAMINAR_DEFINE_GTEST_MPI_MAIN
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_embedding_kernel GTest::gtest)
+    else()
+        target_include_directories(test_mpi_embedding_kernel PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_embedding_kernel ${GTEST_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(MPIEmbeddingKernelTest 2 test_mpi_embedding_kernel)
+    # Temporary workaround: embedding kernel test hangs in MPI_Finalize; skip finalize to avoid CTRL-C.
+    # Provide only oversubscribe flag; per-test selective finalize skip is handled inside the test now.
+    set_tests_properties(MPIEmbeddingKernelTest PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")
+    # Enforce a hard timeout so the test cannot hang indefinitely (auto-kill after 60s)
+    set_tests_properties(MPIEmbeddingKernelTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(MPIEmbeddingKernelTest PROPERTIES LABELS "embedding;normal")
+
+    # Extended embedding tests (fuzz + precision boundary) in a separate target so they can run under a distinct label.
+    add_executable(test_mpi_embedding_kernel_extended tests/test_mpi_embedding_kernel.cpp)
+    target_link_libraries(test_mpi_embedding_kernel_extended llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_embedding_kernel_extended GTest::gtest)
+    else()
+        target_include_directories(test_mpi_embedding_kernel_extended PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_embedding_kernel_extended ${GTEST_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(MPIEmbeddingKernelExtendedTest 2 test_mpi_embedding_kernel_extended)
+    # Force extended env var so fuzz + precision tests run; still allow user to add others.
+    set_tests_properties(MPIEmbeddingKernelExtendedTest PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1;LLAMINAR_EMBED_EXTENDED=1")
+    set_tests_properties(MPIEmbeddingKernelExtendedTest PROPERTIES TIMEOUT 120)
+    set_tests_properties(MPIEmbeddingKernelExtendedTest PROPERTIES LABELS "embedding;extended")
     
     # MPI Transformer Pipeline test
     add_executable(test_mpi_transformer_pipeline tests/test_mpi_transformer_pipeline.cpp)
@@ -453,6 +633,17 @@ if(GTEST_FOUND)
     add_executable(test_prefill_attention_golden tests/test_prefill_attention_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(PrefillAttentionGoldenTest 2 test_prefill_attention_golden)
+
+    # Embedding orientation diagnostic test (non-MPI critical, rank 0 does work)
+    add_executable(test_embedding_orientation tests/test_embedding_orientation.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_embedding_orientation PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+    target_include_directories(test_embedding_orientation PRIVATE ${CMAKE_SOURCE_DIR}/llama.cpp/src)
+    add_test(NAME EmbeddingOrientationTest COMMAND test_embedding_orientation)
+
+    # Dedicated fused RMSNorm+QKV correctness test (isolates CosmaPrefillManager::fused_rmsnorm_qkv)
+    add_executable(test_cosma_fused_rmsnorm_qkv tests/test_cosma_fused_rmsnorm_qkv.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_cosma_fused_rmsnorm_qkv PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(CosmaFusedRmsnormQkvTest 2 test_cosma_fused_rmsnorm_qkv)
     set_tests_properties(PrefillAttentionGoldenTest PROPERTIES TIMEOUT 180)
 
     # Dequantization tests (Q4_0 correctness + Q4_K placeholder sanity)
@@ -503,6 +694,17 @@ if(GTEST_FOUND)
         target_link_libraries(test_integration_q4k ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
     add_test(NAME IntegrationQ4K COMMAND ${CMAKE_BINARY_DIR}/tests/test_integration_q4k)
+
+    # Golden model loader comparison (float tensors vs llama.cpp reference)
+    add_executable(test_model_loader_golden tests/test_model_loader_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_model_loader_golden PRIVATE llaminar_core llama GTest::gtest_main)
+    # Executable ended up at top-level build dir (not in tests/); reference directly
+    if (EXISTS ${CMAKE_BINARY_DIR}/tests/test_model_loader_golden)
+        add_test(NAME ModelLoaderGoldenTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_model_loader_golden)
+    else()
+        add_test(NAME ModelLoaderGoldenTest COMMAND ${CMAKE_BINARY_DIR}/test_model_loader_golden)
+    endif()
+    set_tests_properties(ModelLoaderGoldenTest PROPERTIES TIMEOUT 60)
     
     # In-layout elementwise (RMSNorm + SwiGLU) single-rank correctness test
     add_executable(test_cosma_in_layout_elementwise tests/test_cosma_in_layout_elementwise.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -520,12 +722,84 @@ if(GTEST_FOUND)
     add_executable(test_cosma_in_layout_elementwise_multi tests/test_cosma_in_layout_elementwise_multi.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_in_layout_elementwise_multi PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(CosmaInLayoutElementwiseMultiTest 2 test_cosma_in_layout_elementwise_multi)
-    set_tests_properties(CosmaInLayoutElementwiseMultiTest PROPERTIES TIMEOUT 60)
+
+    # Quant / Dequant parity tests (single-rank deterministic)
+    add_executable(test_quant_dequant_parity tests/test_quant_dequant_parity.cpp)
+    target_link_libraries(test_quant_dequant_parity llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME QuantDequantParityTest COMMAND test_quant_dequant_parity)
+
+    # Quantized shard regression test (validates column/row shard parity for quant tensors)
+    add_executable(test_model_loader_quant_shard_regression tests/test_model_loader_quant_shard_regression.cpp)
+    target_link_libraries(test_model_loader_quant_shard_regression llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME ModelLoaderQuantShardRegression COMMAND test_model_loader_quant_shard_regression)
+    add_executable(test_quant_shard_cache_stats tests/test_quant_shard_cache_stats.cpp)
+    target_link_libraries(test_quant_shard_cache_stats llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME QuantShardCacheStatsTest COMMAND test_quant_shard_cache_stats)
+    add_executable(test_partial_decode_q4_0 tests/test_partial_decode_q4_0.cpp)
+    target_link_libraries(test_partial_decode_q4_0 llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME PartialDecodeQ4_0Test COMMAND test_partial_decode_q4_0)
+    # Multi-format partial decode parity (legacy formats Q4_1/Q5_1/Q8_1 removed)
+    if (EXISTS ${CMAKE_SOURCE_DIR}/tests/test_partial_decode_multi_formats.cpp)
+        add_executable(test_partial_decode_multi_formats tests/test_partial_decode_multi_formats.cpp)
+        target_link_libraries(test_partial_decode_multi_formats llaminar_core GTest::gtest GTest::gtest_main)
+        add_test(NAME PartialDecodeMultiFormatsTest COMMAND test_partial_decode_multi_formats)
+    endif()
+    # Aggregated parity test iterating present supported formats (Q4_0, Q5_0, Q8_0, K variants)
+    if (EXISTS ${CMAKE_SOURCE_DIR}/tests/test_partial_decode_aggregated.cpp)
+        add_executable(test_partial_decode_aggregated tests/test_partial_decode_aggregated.cpp)
+        target_link_libraries(test_partial_decode_aggregated llaminar_core GTest::gtest GTest::gtest_main)
+        add_test(NAME PartialDecodeAggregatedTest COMMAND test_partial_decode_aggregated)
+    endif()
+    if (EXISTS ${CMAKE_SOURCE_DIR}/tests/test_partial_decode_k_formats.cpp)
+        add_executable(test_partial_decode_k_formats tests/test_partial_decode_k_formats.cpp)
+        target_link_libraries(test_partial_decode_k_formats llaminar_core GTest::gtest GTest::gtest_main)
+        add_test(NAME PartialDecodeKFormatsTest COMMAND test_partial_decode_k_formats)
+    endif()
+
+    # (Removed) Q5_1 layout micro test – deprecated quantization formats are no longer supported.
+    # K-format (Q4_K / Q4_K_M) partial decode parity (added once implementation matures)
+    # Placeholder future extension: we could add a dedicated test when models contain those tensors.
+    set_tests_properties(QuantDequantParityTest PROPERTIES TIMEOUT 10)
+
+    # ------------------------------------------------------------------
+    # Test model download fixture: ensures required Qwen 0.5B GGUF variants
+    # are present before any model-dependent tests run. Downloads are skipped
+    # if files already exist. Users can export LLAMINAR_SKIP_MODEL_DOWNLOAD=1
+    # to bypass network fetch (tests will then skip if models absent).
+    # ------------------------------------------------------------------
+    add_test(NAME FetchTestModels COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/fetch_test_models.sh)
+    set_tests_properties(FetchTestModels PROPERTIES FIXTURES_SETUP TestModels TIMEOUT 420)
+
+    # Helper macro to associate tests with the model fixture.
+    function(mark_requires_models test_name)
+        if (TEST ${test_name})
+            set_tests_properties(${test_name} PROPERTIES FIXTURES_REQUIRED TestModels)
+        endif()
+    endfunction()
+
+    # Explicit tests that rely on presence of GGUF model files.
+    mark_requires_models(RoleTaggingIntegrationTest)
+    mark_requires_models(ModelLoaderGoldenTest)
+    mark_requires_models(ModelLoaderQuantShardRegression)
+    mark_requires_models(IntegrationQ4K)
+    mark_requires_models(PartialDecodeQ4_0Test)
+    mark_requires_models(PartialDecodeAggregatedTest)
+    mark_requires_models(PartialDecodeKFormatsTest)
+
+    # End-to-end / parity tests that may scan models directory.
+    mark_requires_models(End2EndShardParity_Small)
+    mark_requires_models(End2EndShardParity_UnevenHeads)
+
+    # Some GTest-discovered group tests live inside test_model_load_role_tags; we mark the container binary.
+    mark_requires_models(RoleTaggingIntegrationTest)
 
     set(KERNEL_TEST_TARGETS
         test_mpi_linear_kernel
+        test_linear_orientation_parity
         test_mpi_rmsnorm_kernel
         test_mpi_attention_kernel
+    test_attention_micro
+    test_attention_primitives
         test_mpi_transformer_pipeline
         test_adaptive_matmul
         test_cosma_minimal

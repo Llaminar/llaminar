@@ -7,6 +7,9 @@
 #include <chrono>
 #include <iomanip>
 #include <ctime>
+#include <deque>
+#include <mutex>
+#include "utils/debug_env.h"
 
 class Logger
 {
@@ -51,7 +54,14 @@ public:
             location = " [" + filename + ":" + std::to_string(line) + "]";
         }
 
-        std::cout << "[" << timestamp << "] [" << level_str << "]" << location << " " << message << std::endl;
+        std::string full_line = "[" + timestamp + "] [" + level_str + "]" + location + " " + message;
+        {
+            std::lock_guard<std::mutex> lk(buffer_mutex_);
+            recent_.push_back(full_line);
+            if (recent_.size() > max_buffer_)
+                recent_.pop_front();
+        }
+        std::cout << full_line << std::endl;
     }
 
     std::string logLevelToString(LogLevel level) const
@@ -89,8 +99,36 @@ public:
     }
 
 private:
-    Logger() : current_level_(LogLevel::INFO) {}
+    Logger() : current_level_(LogLevel::INFO)
+    {
+        // Allow overriding ring buffer size via environment variable
+        if (const char *env = std::getenv("LLAMINAR_LOG_BUFFER_LINES"))
+        {
+            try
+            {
+                size_t v = static_cast<size_t>(std::stoull(env));
+                if (v > 0 && v < 2000000)
+                { // cap to a reasonable upper bound
+                    max_buffer_ = v;
+                }
+            }
+            catch (...)
+            {
+                // ignore parse errors
+            }
+        }
+    }
     LogLevel current_level_;
+    mutable std::deque<std::string> recent_;
+    mutable size_t max_buffer_ = 2048; // keep last N lines
+    mutable std::mutex buffer_mutex_;
+
+public:
+    std::vector<std::string> recent_lines() const
+    {
+        std::lock_guard<std::mutex> lk(buffer_mutex_);
+        return std::vector<std::string>(recent_.begin(), recent_.end());
+    }
 
     std::string getCurrentTimestamp() const
     {
@@ -160,10 +198,11 @@ private:
 // Initialize logging from environment variable if set
 inline void initializeLogging()
 {
-    const char *log_level_env = std::getenv("LLAMINAR_LOG_LEVEL");
-    if (log_level_env)
+    // Use centralized snapshot; calling debugEnv() here will perform lazy parse once.
+    const auto &snap = ::llaminar::debugEnv();
+    if (snap.logging.log_level_active)
     {
         Logger::getInstance().setLogLevel(
-            Logger::getInstance().stringToLogLevel(log_level_env));
+            Logger::getInstance().stringToLogLevel(snap.logging.log_level.c_str()));
     }
 }

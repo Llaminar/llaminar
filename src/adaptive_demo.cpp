@@ -168,6 +168,7 @@ void demonstrateTokenGeneration()
     config.n_layers = 24;
     config.max_seq_len = 32768;
     config.eps = 1e-6;
+    config.rope_freq_base = 10000.0f;
 
     try
     {

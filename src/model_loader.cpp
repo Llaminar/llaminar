@@ -186,6 +186,8 @@ bool GGUFTensorInfo::isQuantized() const
     case GGUFTensorType::Q4_K:
     case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q6_K:
+    case GGUFTensorType::Q8_K:
+    case GGUFTensorType::Q4_K_M:
         return true;
     default:
         return false;
@@ -201,21 +203,25 @@ size_t GGUFTensorInfo::getTypeSize() const
     case GGUFTensorType::F16:
         return 2;
     case GGUFTensorType::Q4_0:
-        return 2 + 16; // block of 32
+        return 18; // 2 + 16
     case GGUFTensorType::Q5_0:
-        return 2 + 4 + 16; // 32 vals
+        return 22; // 2 + 4 + 16
     case GGUFTensorType::Q8_0:
-        return 2 + 32; // 32 vals
-    case GGUFTensorType::Q4_K:
-        return 144; // 256 vals
+        return 34; // 2 + 32
     case GGUFTensorType::Q2_K:
-        return 84; // 256 vals
+        return 84;
     case GGUFTensorType::Q3_K:
-        return 110; // 256 vals
+        return 110;
+    case GGUFTensorType::Q4_K:
+        return 144;
     case GGUFTensorType::Q5_K:
-        return 176; // 256 vals
+        return 176;
     case GGUFTensorType::Q6_K:
-        return 210; // 256 vals
+        return 210;
+    case GGUFTensorType::Q8_K:
+        return 288; // placeholder, verify if used
+    case GGUFTensorType::Q4_K_M:
+        return 144; // alias
     default:
         return 0;
     }
@@ -234,9 +240,11 @@ size_t GGUFTensorInfo::getBlockSize() const
     case GGUFTensorType::Q4_K:
     case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q6_K:
+    case GGUFTensorType::Q8_K:
+    case GGUFTensorType::Q4_K_M:
         return 256;
     default:
-        return 1; // F16/F32
+        return 0;
     }
 }
 
@@ -591,6 +599,13 @@ bool ModelLoader::parseTensorInfo()
         uint32_t type_val;
         if (!readValue(type_val))
             return false;
+        // Map raw type id -> enum. We have deprecated legacy types (Q4_1=3, Q5_1=7, Q8_1=9)
+        if (type_val == 3 || type_val == 7 || type_val == 9)
+        {
+            LOG_ERROR("parseTensorInfo: Tensor '" << tensor.name << "' uses deprecated quantization type id=" << type_val
+                                                  << " (Q4_1/Q5_1/Q8_1 removed). Please convert the model to a supported format.");
+            return false;
+        }
         tensor.type = static_cast<GGUFTensorType>(type_val);
         LOG_TRACE("parseTensorInfo: Tensor '" << tensor.name << "' raw type_val=" << type_val << ", cast enum value=" << static_cast<int>(tensor.type));
 
@@ -747,13 +762,15 @@ bool ModelLoader::supportsQuantization(GGUFTensorType type) const
     case GGUFTensorType::F32:
     case GGUFTensorType::F16:
     case GGUFTensorType::Q4_0:
-    case GGUFTensorType::Q4_K:
     case GGUFTensorType::Q5_0:
-    case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q8_0:
     case GGUFTensorType::Q2_K:
     case GGUFTensorType::Q3_K:
+    case GGUFTensorType::Q4_K:
+    case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q6_K:
+    case GGUFTensorType::Q8_K:
+    case GGUFTensorType::Q4_K_M:
         return true;
     default:
         return false;
@@ -771,15 +788,17 @@ std::vector<float> ModelLoader::dequantizeTensor(const GGUFTensorInfo &tensor_in
         std::cerr << "[ENUM MAP] GGUFTensorType values: F32=" << static_cast<int>(GGUFTensorType::F32)
                   << " F16=" << static_cast<int>(GGUFTensorType::F16)
                   << " Q4_0=" << static_cast<int>(GGUFTensorType::Q4_0)
-                  << " Q4_1=" << static_cast<int>(GGUFTensorType::Q4_1)
                   << " Q5_0=" << static_cast<int>(GGUFTensorType::Q5_0)
-                  << " Q5_1=" << static_cast<int>(GGUFTensorType::Q5_1)
                   << " Q8_0=" << static_cast<int>(GGUFTensorType::Q8_0)
-                  << " Q8_1=" << static_cast<int>(GGUFTensorType::Q8_1)
                   << " Q2_K=" << static_cast<int>(GGUFTensorType::Q2_K)
                   << " Q3_K=" << static_cast<int>(GGUFTensorType::Q3_K)
                   << " Q4_K=" << static_cast<int>(GGUFTensorType::Q4_K)
+                  << " Q5_K=" << static_cast<int>(GGUFTensorType::Q5_K)
+                  << " Q6_K=" << static_cast<int>(GGUFTensorType::Q6_K)
+                  << " Q8_K=" << static_cast<int>(GGUFTensorType::Q8_K)
+                  << " Q4_K_M=" << static_cast<int>(GGUFTensorType::Q4_K_M)
                   << std::endl;
+        std::cerr << "[ENUM MAP NOTE] Deprecated ids (not shown, do not reuse): Q4_1=3 Q5_1=7 Q8_1=9" << std::endl;
     }
     std::cerr << "[DEQ ENTRY] tensor='" << tensor_name << "' enum=" << static_cast<int>(tensor_info.type)
               << " bytes=" << quantized_data.size() << std::endl;
@@ -914,6 +933,60 @@ std::vector<float> ModelLoader::dequantizeQ4_0(const uint8_t *data, size_t n_ele
     return out;
 }
 
+// ---- Q5_0 Dequant (mirrors ggml dequantize_row_q5_0 logic) ----
+// Block layout (22 bytes, 32 values):
+//   uint16_t d (fp16 scale)
+//   uint8_t  qh[4]  (packed high bits for both halves)
+//   uint8_t  qs[16] (low/high nibbles -> base 4-bit values for 2 values each)
+// Reconstruction for j in [0,15]:
+//   xh_0 = ((qh >> (j + 0)) & 1) << 4  (high bit for value j)
+//   xh_1 = ((qh >> (j + 12)) & 1) << 4 (high bit for value j+16)
+//   q = qs[j]
+//   v0 = ((q & 0x0F) | xh_0) - 16   (signed 5-bit)
+//   v1 = ((q >> 4)   | xh_1) - 16
+//   out[j] = v0 * d; out[j+16] = v1 * d
+std::vector<float> ModelLoader::dequantizeQ5_0(const uint8_t *data, const GGUFTensorInfo &info)
+{
+    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    const size_t QK = 32;
+    const size_t BLOCK_BYTES = 22; // 2 + 4 + 16
+    if (!data || n_elements == 0)
+        return {};
+    size_t n_blocks = (n_elements + QK - 1) / QK;
+    std::vector<float> out(n_blocks * QK, 0.0f);
+    for (size_t b = 0; b < n_blocks; ++b)
+    {
+        const uint8_t *block = data + b * BLOCK_BYTES;
+        float *dst = out.data() + b * QK;
+        size_t remain = std::min<size_t>(QK, n_elements - b * QK);
+        // Fast path: reuse fused helper for full blocks
+        if (remain == QK)
+        {
+            llaminar::dequant_block_q5_0(block, dst, static_cast<int>(remain));
+        }
+        else
+        {
+            // Decode into temp then copy subset
+            float tmp[QK];
+            llaminar::dequant_block_q5_0(block, tmp, QK);
+            std::memcpy(dst, tmp, remain * sizeof(float));
+        }
+        if (b == 0)
+        {
+            uint16_t d_bits;
+            std::memcpy(&d_bits, block, 2);
+            float d = ggml_compute_fp16_to_fp32(d_bits);
+            LOG_TRACE("dequantizeQ5_0: tensor='" << info.name << "' n_elements=" << n_elements
+                                                 << " n_blocks=" << n_blocks << " d_first=" << d
+                                                 << " first8=" << dst[0] << ',' << dst[1] << ',' << dst[2] << ',' << dst[3]
+                                                 << ',' << dst[4] << ',' << dst[5] << ',' << dst[6] << ',' << dst[7]);
+        }
+    }
+    out.resize(n_elements);
+    logDequantStats(info.name, GGUFTensorType::Q5_0, out, 8);
+    return out;
+}
+
 // ---- Q4_K Dequant (spec implementation) ----
 // Follows llama.cpp's ggml-quants.c::dequantize_row_q4_K logic for CPU path.
 // block_q4_K layout per 256 (QK_K) elements:
@@ -1006,55 +1079,199 @@ std::vector<float> ModelLoader::dequantizeQ4_K(const uint8_t *data, size_t n_ele
     return out;
 }
 
-// ---- Q5_0 Dequant ----
-// block_q5_0 layout (32 values per block):
-//   uint16_t d;            // fp16 scale
-//   uint8_t  qh[4];        // high (5th) bit for each of the 32 values (bit i of qh[j])
-//   uint8_t  qs[16];       // 4-bit signed base (nibbles) storing low 4 bits (0..15)
-// Value reconstruction (mirrors llama.cpp):
-//   raw5 = (low_nibble | ( (qh_bit) << 4 )) in range 0..31
-//   signed_val = raw5 - 16  (map to [-16,15])
-//   dequant = signed_val * d
-// Notes: There is no per-block min; zero-point is implicitly centered by subtracting 16.
-std::vector<float> ModelLoader::dequantizeQ5_0(const uint8_t *data, const GGUFTensorInfo &info)
+// (Removed obsolete Q5_0 duplicate & Q5_1 support region)
+
+// ---------------- Quant shard cache & partial load helpers (minimal implementation) ----------------
+const ModelLoader::CachedFullTensor *ModelLoader::getOrCacheFullQuantTensor(const std::string &tensor_name, const GGUFTensorInfo &info)
 {
-    if (!data)
-        return {};
-    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    constexpr int QK = 32; // QK5_0
-    // Mirror ggml's dequantization exactly for bit placement correctness.
-    struct block_q5_0_local
+    // Fast path: lookup
     {
-        uint16_t d;
-        uint8_t qh[4];
-        uint8_t qs[16];
-    };
-    static_assert(sizeof(block_q5_0_local) == 2 + 4 + 16, "Unexpected block_q5_0 size");
-    size_t n_blocks = (n_elements + QK - 1) / QK;
-    const block_q5_0_local *blocks = reinterpret_cast<const block_q5_0_local *>(data);
-    std::vector<float> out(n_blocks * QK);
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        const auto &blk = blocks[b];
-        const float d = ggml_compute_fp16_to_fp32(blk.d);
-        uint32_t qh;
-        std::memcpy(&qh, blk.qh, sizeof(qh));
-        for (int j = 0; j < QK / 2; ++j)
+        std::lock_guard<std::mutex> lock(quant_cache_mutex_);
+        auto it = quant_full_cache_.find(tensor_name);
+        if (it != quant_full_cache_.end())
         {
-            const uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
-            const uint8_t xh_1 = ((qh >> (j + 12))) & 0x10; // note: matches ggml (uses +12)
-            const int32_t x0 = ((blk.qs[j] & 0x0F) | xh_0) - 16;
-            const int32_t x1 = ((blk.qs[j] >> 4) | xh_1) - 16;
-            out[b * QK + j + 0] = x0 * d;
-            out[b * QK + j + QK / 2] = x1 * d;
-        }
-        if (b == 0)
-        {
-            LOG_TRACE("dequantizeQ5_0(aligned) d=" << d << " first4=" << out[0] << "," << out[1] << "," << out[2] << "," << out[3]);
+            it->second.last_access = ++quant_cache_clock_;
+            quant_cache_hits_++;
+            return &it->second;
         }
     }
-    out.resize(n_elements);
-    return out;
+    quant_cache_misses_++;
+    // Simplified: just read declared size; deprecated Q5_1 variant detection removed.
+    size_t logical_read_size = info.size_bytes;
+    const GGUFTensorInfo &adjusted_info = info; // retained for interface uniformity
+
+    // Re-seek and read selected number of bytes
+    file_stream_.seekg(model_.data_offset + info.offset, std::ios::beg);
+    std::vector<uint8_t> raw(logical_read_size);
+    if (!file_stream_.read(reinterpret_cast<char *>(raw.data()), raw.size()))
+    {
+        LOG_ERROR("getOrCacheFullQuantTensor: read failed for tensor '" << tensor_name << "' (requested=" << logical_read_size << ")");
+        return nullptr;
+    }
+    size_t n_elems = 1;
+    for (auto d : info.dimensions)
+        n_elems *= d;
+    std::vector<float> decoded;
+    if (info.isQuantized())
+        decoded = dequantizeTensor(adjusted_info, raw, tensor_name);
+    else
+    {
+        if (info.type == GGUFTensorType::F32)
+        {
+            decoded.resize(n_elems);
+            std::memcpy(decoded.data(), raw.data(), n_elems * sizeof(float));
+        }
+        else if (info.type == GGUFTensorType::F16)
+        {
+            decoded.resize(n_elems);
+            for (size_t i = 0; i < n_elems; ++i)
+            {
+                uint16_t h;
+                std::memcpy(&h, raw.data() + 2 * i, 2);
+                decoded[i] = ggml_compute_fp16_to_fp32(h);
+            }
+        }
+        else
+        {
+            return nullptr;
+        }
+    }
+    auto cache_bytes_limit = quantShardCacheMaxBytes();
+    const size_t new_bytes = decoded.size() * sizeof(float);
+    {
+        std::lock_guard<std::mutex> lock(quant_cache_mutex_);
+        // Simple LRU eviction until space
+        while (cache_bytes_limit > 0 && quant_cache_bytes_ + new_bytes > cache_bytes_limit && !quant_full_cache_.empty())
+        {
+            auto victim_it = std::min_element(quant_full_cache_.begin(), quant_full_cache_.end(), [](auto &a, auto &b)
+                                              { return a.second.last_access < b.second.last_access; });
+            if (victim_it == quant_full_cache_.end())
+                break;
+            quant_cache_bytes_ -= victim_it->second.bytes;
+            quant_full_cache_.erase(victim_it);
+            quant_cache_evictions_++;
+        }
+        auto &entry = quant_full_cache_[tensor_name];
+        entry.data.swap(decoded);
+        entry.shape.clear();
+        for (auto d : info.dimensions)
+            entry.shape.push_back(static_cast<int>(d));
+        entry.bytes = new_bytes;
+        entry.last_access = ++quant_cache_clock_;
+        quant_cache_bytes_ += new_bytes;
+        quant_cache_loads_++;
+        return &entry;
+    }
+}
+
+size_t ModelLoader::quantShardCacheMaxBytes() const
+{
+    const char *env = std::getenv("LLAMINAR_SHARD_CACHE_MAX_MB");
+    size_t mb = env ? std::strtoul(env, nullptr, 10) : 512;
+    if (mb == 0)
+        return 0; // disabled
+    return mb * 1024ULL * 1024ULL;
+}
+
+void ModelLoader::clearQuantShardCache()
+{
+    std::lock_guard<std::mutex> lock(quant_cache_mutex_);
+    quant_full_cache_.clear();
+    quant_cache_bytes_ = 0;
+    quant_cache_loads_ = 0;
+    quant_cache_hits_ = 0;
+    quant_cache_misses_ = 0;
+    quant_cache_evictions_ = 0;
+}
+
+ModelLoader::QuantShardCacheStats ModelLoader::getQuantShardCacheStats() const
+{
+    QuantShardCacheStats s;
+    s.loads = quant_cache_loads_;
+    s.cache_hits = quant_cache_hits_;
+    s.cache_misses = quant_cache_misses_;
+    s.evictions = quant_cache_evictions_;
+    s.bytes_resident = quant_cache_bytes_;
+    return s;
+}
+
+std::vector<std::string> ModelLoader::getTensorNames() const
+{
+    std::vector<std::string> names;
+    names.reserve(model_.tensors.size());
+    for (auto const &t : model_.tensors)
+        names.push_back(t.name);
+    return names;
+}
+
+bool ModelLoader::loadTensorColumnShards(const std::string &tensor_name,
+                                         const std::vector<int> &col_offsets,
+                                         const std::vector<int> &col_counts,
+                                         const std::vector<float *> &dests)
+{
+    if (col_offsets.size() != col_counts.size() || col_offsets.size() != dests.size())
+    {
+        LOG_ERROR("loadTensorColumnShards: mismatched shard vector sizes");
+        return false;
+    }
+    const GGUFTensorInfo *info = model_.findTensor(tensor_name);
+    if (!info)
+    {
+        LOG_ERROR("loadTensorColumnShards: tensor not found '" << tensor_name << "'");
+        return false;
+    }
+    if (info->dimensions.size() != 2)
+    {
+        LOG_WARN("loadTensorColumnShards: only 2D tensors supported; falling back to full");
+    }
+    size_t rows = info->dimensions[0];
+    size_t cols = (info->dimensions.size() > 1) ? info->dimensions[1] : 1;
+    // Fallback: use (cached) full tensor and slice
+    const CachedFullTensor *full = getOrCacheFullQuantTensor(tensor_name, *info);
+    if (!full)
+        return false;
+    const float *src = full->data.data();
+    for (size_t s = 0; s < col_offsets.size(); ++s)
+    {
+        int off = col_offsets[s];
+        int count = col_counts[s];
+        float *dst = dests[s];
+        if (!dst || off < 0 || count <= 0 || static_cast<size_t>(off + count) > cols)
+        {
+            LOG_ERROR("loadTensorColumnShards: invalid shard spec index=" << s);
+            return false;
+        }
+        for (size_t r = 0; r < rows; ++r)
+        {
+            const float *row_src = src + r * cols + off;
+            std::memcpy(dst + r * count, row_src, sizeof(float) * count);
+        }
+    }
+    return true;
+}
+
+bool ModelLoader::loadTensorRowShard(const std::string &tensor_name,
+                                     int row_offset,
+                                     int row_count,
+                                     float *dest)
+{
+    if (row_count <= 0 || row_offset < 0)
+        return false;
+    const GGUFTensorInfo *info = model_.findTensor(tensor_name);
+    if (!info)
+        return false;
+    if (info->dimensions.size() != 2)
+        return false;
+    size_t rows = info->dimensions[0];
+    size_t cols = info->dimensions[1];
+    if (static_cast<size_t>(row_offset + row_count) > rows)
+        return false;
+    const CachedFullTensor *full = getOrCacheFullQuantTensor(tensor_name, *info);
+    if (!full)
+        return false;
+    const float *src = full->data.data() + static_cast<size_t>(row_offset) * cols;
+    std::memcpy(dest, src, sizeof(float) * static_cast<size_t>(row_count) * cols);
+    return true;
 }
 
 // ---- Q2_K Dequant ----

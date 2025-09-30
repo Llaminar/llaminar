@@ -1,3 +1,32 @@
+/**
+ * @file MPIRoPEKernel.cpp
+ * @brief Applies Rotary Positional Embeddings (RoPE) to query/key tensors in a distributed context.
+ *
+ * @section Contract
+ * Inputs:
+ *  - inputs[0]: Query tensor Q [seq_len, n_heads, head_dim] (row-major contiguous; replicated across ranks).
+ *  - inputs[1]: Key tensor K   [seq_len, n_kv_heads, head_dim] (replicated; may be subset of heads for GQA).
+ *  - inputs[2] (optional): Precomputed cos/sin cache tensor [max_rot, head_dim]. If absent, kernel may compute on demand.
+ * Outputs:
+ *  - outputs[0]: In-place or new tensor for rotated Q (same shape as Q).
+ *  - outputs[1]: In-place or new tensor for rotated K (same shape as K).
+ * Behavior:
+ *  - Even-index dims treated as real, odd as imaginary components for complex rotation pairs.
+ *  - Angle index derived from absolute sequence position (supports prefill + decode continuity if provided offset env).
+ * Numerical Properties:
+ *  - Pure elementwise fused sin/cos application; deterministic.
+ *  - Maximum relative error vs reference (double precision build) expected < 2e-7 for float32 inputs.
+ * Error Modes:
+ *  - Dimension mismatch between Q and K head_dim.
+ *  - head_dim must be even (strictly enforced); violation returns false with LOG_ERROR.
+ *  - Null tensor pointers.
+ * Distribution:
+ *  - Currently replicated application; future optimization may shard sequence dimension with identical rotation factors.
+ * Threading:
+ *  - OpenMP parallel for over (seq_len * total_heads) groups; no data races (distinct index ranges).
+ * @note Any caching of sin/cos tables must remain thread-safe (either precomputed or guarded).
+ * @author David Sanftenberg
+ */
 #include "MPIRoPEKernel.h"
 #include "../debug_utils.h"
 #include "../performance_timer.h"

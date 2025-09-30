@@ -1,7 +1,36 @@
+/**
+ * @file MPILinearKernel.cpp
+ * @brief MPI-aware column-partitioned linear projection kernel.
+ *
+ * @section Contract
+ * Inputs:
+ *  - inputs[0]: Activations tensor [seq_len, in_dim] (row-major, replicated on all ranks).
+ *  - inputs[1]: Global weight tensor [in_dim, out_dim] (row-major; will be column-partition distributed).
+ *  - inputs[2] (optional): Global bias [out_dim].
+ * Outputs:
+ *  - outputs[0]: Global output tensor [seq_len, out_dim] (row-major; assembled via Allgatherv over column partitions).
+ * Distribution Strategy:
+ *  - Weight columns are block-distributed across ranks; activations are replicated.
+ *  - Local GEMM: [seq_len, in_dim] * [in_dim, out_dim_local] -> [seq_len, out_dim_local].
+ *  - Optional local bias add then global gather.
+ * Numerical Expectations:
+ *  - Deterministic for identical OpenMP scheduling when OMP_NUM_THREADS=1.
+ *  - Accumulation in float; differences vs single-process reference bounded by floating reduction order on final gather.
+ * Error Modes:
+ *  - Shape mismatches, null tensors, NaN detection trigger logged error and return false.
+ *  - MPI distribution inconsistencies (size mismatch) abort execution.
+ * Threading:
+ *  - OpenMP parallelism inside adaptiveMatMul; environment may cap threads.
+ *  - No concurrent mutation of shared state beyond local temporaries.
+ * MPI:
+ *  - Uses rank/size from MPIKernelBase; collective communications must remain ordered.
+ * @author David Sanftenberg
+ */
 #include "MPILinearKernel.h"
 #include "../logger.h"
 #include "../debug_utils.h"
 #include "../adaptive_matmul.h"
+#include "../utils/debug_env.h"
 #include <algorithm>
 #include <cstring>
 #include <chrono>
@@ -77,6 +106,33 @@ namespace llaminar
         int d_model = static_cast<int>(input_size);
         int d_out = static_cast<int>(local_output_size);
 
+        // Optional detailed diagnostics
+        bool linear_diag = debugEnv().linear.diag; // debugEnv() from llaminar namespace
+        if (linear_diag)
+        {
+            // Dump first few elements of input & a weight column slice for rank 0 (or all ranks if requested later)
+            std::ostringstream pre;
+            pre << "[LinearDiagPre] rank=" << getRank() << " seq_len=" << seq_len_int << " d_model=" << d_model << " d_out_local=" << d_out;
+            int dump_h = std::min(d_model, 8);
+            int dump_seq = std::min(seq_len_int, 2);
+            pre << " input_rows=";
+            for (int r = 0; r < dump_seq; ++r)
+            {
+                pre << "[r=" << r << ":";
+                for (int c = 0; c < dump_h; ++c)
+                    pre << input_data[r * d_model + c] << (c + 1 < dump_h ? "," : "");
+                pre << "]";
+            }
+            // pick a representative local output feature index (0) and dump its weight vector slice
+            if (d_out > 0)
+            {
+                pre << " w_col0=";
+                for (int c = 0; c < dump_h; ++c)
+                    pre << weight_data[c * d_out + 0] << (c + 1 < dump_h ? "," : "");
+            }
+            LOG_INFO(pre.str());
+        }
+
         // Use adaptive matrix multiplication
         auto start = std::chrono::high_resolution_clock::now();
         // We pass distributed_partition=true because weights are column-partitioned across ranks.
@@ -94,6 +150,21 @@ namespace llaminar
 
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
         LOG_DEBUG("MPILinear matmul: " << ms << "ms for " << seq_len_int << "x" << d_model << " * " << d_model << "x" << d_out);
+        if (linear_diag)
+        {
+            std::ostringstream mid;
+            mid << "[LinearDiagPostGEMM] rank=" << getRank();
+            int dump_seq = std::min(seq_len_int, 2);
+            int dump_out = std::min(d_out, 8);
+            for (int r = 0; r < dump_seq; ++r)
+            {
+                mid << " out_row=" << r << "[";
+                for (int c = 0; c < dump_out; ++c)
+                    mid << output_data[r * d_out + c] << (c + 1 < dump_out ? "," : "");
+                mid << "]";
+            }
+            LOG_INFO(mid.str());
+        }
 
         // Add bias if provided
         if (local_bias)
@@ -103,6 +174,22 @@ namespace llaminar
 
         // Gather results from all processes
         gatherOutput(local_output, global_output, seq_len, output_size);
+
+        if (linear_diag)
+        {
+            std::ostringstream post;
+            int dump_seq = std::min<int>(seq_len, 1);
+            int dump_global = std::min<int>(output_size, 8);
+            post << "[LinearDiagGlobal] rank=" << getRank();
+            for (int r = 0; r < dump_seq; ++r)
+            {
+                post << " global_row=" << r << "[";
+                for (int c = 0; c < dump_global; ++c)
+                    post << global_output->data()[r * output_size + c] << (c + 1 < dump_global ? "," : "");
+                post << "]";
+            }
+            LOG_INFO(post.str());
+        }
 
         // === POST-COMPUTATION VALIDATION ===
         ASSERT_TENSOR_NOT_NAN(global_output, "Linear output after computation");

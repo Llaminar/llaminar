@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <string>
+#include <cctype>
 #include <cblas.h>
 #include "tensors/tensor_factory.h"
 #include "logger.h"
@@ -27,6 +29,7 @@
 #include <cosma/strategy.hpp>
 #include <cosma/context.hpp>
 #include "cosma_prefill_manager.h"
+#include "utils/debug_env.h" // Added for centralized debug environment access (debugEnv())
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -46,6 +49,29 @@ namespace llaminar
         // COSMA uses functional interface, no kernel object needed
         bool mpi_initialized_;
         int mpi_rank_, mpi_size_;
+
+        static bool env_flag_enabled(const char *value)
+        {
+            if (!value)
+            {
+                return false;
+            }
+            std::string token;
+            token.reserve(std::strlen(value));
+            for (const char *p = value; *p; ++p)
+            {
+                unsigned char ch = static_cast<unsigned char>(*p);
+                if (!std::isspace(ch))
+                {
+                    token.push_back(static_cast<char>(std::tolower(ch)));
+                }
+            }
+            if (token.empty())
+            {
+                return true;
+            }
+            return !(token == "0" || token == "false" || token == "off" || token == "no");
+        }
 
         // Simplified policy thresholds (empirically derived):
         // COSMA only provides benefit for large PREFILL (context build) operations.
@@ -107,9 +133,18 @@ namespace llaminar
                 return MatMulBackend::OPENBLAS;
             }
 
+            // Access centralized debug environment snapshot
+            const bool adaptive_disabled = debugEnv().adaptive.disable_cosma;
+            const bool cosma_disabled = debugEnv().cosma.disable;
+
+            if (adaptive_disabled || cosma_disabled)
+            {
+                return MatMulBackend::OPENBLAS;
+            }
+
             auto &prefill_mgr = CosmaPrefillManager::instance();
             // Global force knob: override all normal policy except explicit disable env.
-            if (prefill_mgr.force_cosma() && !std::getenv("ADAPTIVE_DISABLE_COSMA"))
+            if (prefill_mgr.force_cosma())
             {
                 return MatMulBackend::COSMA;
             }
@@ -198,10 +233,10 @@ namespace llaminar
                     {
                         LOG_WARN("AdaptiveMatMul COSMA path: transpose not supported yet; falling back");
                         LOG_DEBUG("AdaptiveMatMul transpose fallback -> OpenBLAS start rank=" << mpi_rank_
-                                                    << " m=" << m << " n=" << n << " k=" << k);
+                                                                                              << " m=" << m << " n=" << n << " k=" << k);
                         success = multiply_openblas(A, B, C, m, n, k, transpose_A, transpose_B, alpha, beta);
                         LOG_DEBUG("AdaptiveMatMul transpose fallback -> OpenBLAS complete rank=" << mpi_rank_
-                                                    << " ok=" << success);
+                                                                                                 << " ok=" << success);
                         break;
                     }
                     // IMPORTANT: All COSMA matrices for a single GEMM must share the SAME strategy (m,n,k).
@@ -567,16 +602,7 @@ namespace llaminar
                 // Adaptive threading: allow multi-thread for large standalone ops unless user overrides.
                 // Priority: explicit env > heuristic > 1 (fallback). Heuristic keeps small ops single-threaded.
                 static int env_threads = []()
-                {
-                    // Priority: LLAMINAR_OPENBLAS_THREADS > OPENBLAS_NUM_THREADS
-                    const char *v1 = std::getenv("LLAMINAR_OPENBLAS_THREADS");
-                    const char *v2 = std::getenv("OPENBLAS_NUM_THREADS");
-                    const char *v = v1 ? v1 : v2;
-                    if (!v)
-                        return -1; // no explicit override
-                    int t = std::atoi(v);
-                    return t < 1 ? 1 : t;
-                }();
+                { int t = llaminar::debugEnv().cosma.forced_openblas_threads; return t>0? t : -1; }();
                 int threads = 1;
                 if (env_threads > 0)
                 {

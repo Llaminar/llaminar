@@ -2,7 +2,7 @@
 #include "kernels/MPILinearKernel.h"
 #include "tensors/tensor_factory.h"
 #include <gtest/gtest.h>
-#include <mpi.h>
+#include "test_mpi_utils.h"
 #include <chrono>
 #include <memory>
 #include <random>
@@ -145,24 +145,4 @@ TEST_F(MPILinearKernelTest, ValidationTests)
     // The kernel will handle validation internally during execute()
 }
 
-int main(int argc, char **argv)
-{
-    ::testing::InitGoogleTest(&argc, argv);
-
-    // Initialize MPI for testing
-    int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-
-    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
-        {"LLAMINAR_TEST_TIMEOUT_MS"}, std::chrono::milliseconds(60000));
-    llaminar::test_util::TestTimeoutGuard watchdog("MPILinearKernelTest", timeout);
-
-    int result = RUN_ALL_TESTS();
-
-    watchdog.disarm();
-
-    // Finalize MPI
-    MPI_Finalize();
-
-    return result;
-}
+LLAMINAR_DEFINE_GTEST_MPI_MAIN();

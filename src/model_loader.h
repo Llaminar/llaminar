@@ -8,6 +8,8 @@
 #include <memory>
 #include <unordered_map>
 #include <fstream>
+#include <mutex>
+#include <atomic>
 
 // GGUF metadata value types
 enum class GGUFValueType : uint32_t
@@ -33,17 +35,18 @@ enum class GGUFTensorType : uint32_t
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
-    Q4_1 = 3,
+    // Q4_1 removed
     Q5_0 = 6,
-    Q5_1 = 7,
+    // Q5_1 removed
     Q8_0 = 8,
-    Q8_1 = 9,
+    // Q8_1 removed
     Q2_K = 10,
     Q3_K = 11,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
-    Q8_K = 15
+    Q8_K = 15,
+    Q4_K_M = 20 // medium variant (alias layout to Q4_K for now)
 };
 
 // GGUF metadata value
@@ -80,7 +83,8 @@ struct GGUFModel
     uint32_t version;
     uint64_t tensor_count;
     uint64_t metadata_kv_count;
-    uint64_t data_offset; // Start of tensor data section
+    uint64_t data_offset;    // Start of tensor data section
+    uint32_t alignment = 32; // Alignment for tensor data section (default GGUF alignment)
 
     std::unordered_map<std::string, GGUFValue> metadata;
     std::vector<GGUFTensorInfo> tensors;
@@ -93,6 +97,7 @@ struct GGUFModel
     uint32_t feed_forward_length;
     uint32_t head_count;
     uint32_t head_count_kv;
+    float rope_freq_base = 10000.0f;
     std::vector<std::string> token_list;
 
     // Helper methods
@@ -122,6 +127,23 @@ public:
     std::shared_ptr<llaminar::TensorBase> loadTensor(const std::string &tensor_name);
     std::vector<std::shared_ptr<llaminar::TensorBase>> loadAllTensors();
 
+    // Partial / streaming tensor loading helpers (current limitations: 2D tensors, F32/F16 types).
+    // Column shard streaming: extracts multiple disjoint column ranges for ALL rows of a 2D tensor in one pass.
+    // Each shard i defined by col_offsets[i], col_counts[i], output written to dests[i] as a dense row-major
+    // matrix of shape [rows, col_counts[i]]. Returns true on success. Falls back to false for unsupported types
+    // (caller should use full load + slice path as fallback).
+    bool loadTensorColumnShards(const std::string &tensor_name,
+                                const std::vector<int> &col_offsets,
+                                const std::vector<int> &col_counts,
+                                const std::vector<float *> &dests);
+
+    // Row shard streaming: extracts a contiguous block of rows [row_offset, row_offset+row_count) from a 2D tensor.
+    // Output layout: row-major with original column count. Returns true on success; false if unsupported.
+    bool loadTensorRowShard(const std::string &tensor_name,
+                            int row_offset,
+                            int row_count,
+                            float *dest);
+
     // Model information
     void printModelInfo() const;
     void printTensorInfo() const;
@@ -131,6 +153,7 @@ public:
     // These enable constructing synthetic quantized blocks and verifying decode logic.
     std::vector<float> dequantizeQ4_K(const uint8_t *data, size_t n_elements, GGUFTensorType type, const std::string &tensor_name);
     std::vector<float> dequantizeQ4_0(const uint8_t *data, size_t n_elements);
+    // Removed: dequantizeQ4_1 / Q5_1 / Q8_1 support dropped.
     // Newly added quantization formats (WIP implementations)
     std::vector<float> dequantizeQ5_0(const uint8_t *data, const GGUFTensorInfo &info);                                                      // block_q5_0 (32 vals)
     std::vector<float> dequantizeQ2_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info); // block_q2_K
@@ -146,6 +169,18 @@ public:
 
     // Model configuration extraction
     TransformerLayerConfig createLayerConfig() const;
+
+    // Cache management (testing & diagnostics): clear the quant shard cache.
+    void clearQuantShardCache();
+    struct QuantShardCacheStats
+    {
+        size_t loads = 0;
+        size_t cache_hits = 0;
+        size_t cache_misses = 0;
+        size_t evictions = 0;
+        size_t bytes_resident = 0;
+    };
+    QuantShardCacheStats getQuantShardCacheStats() const;
 
 private:
     bool loaded_;
@@ -196,6 +231,27 @@ private:
 
     // Model-specific parsing
     void extractModelMetadata();
+
+    // ---------------- Quant shard fallback cache (phase 1 optimization) ----------------
+    struct CachedFullTensor
+    {
+        std::vector<float> data;  // full fp32 tensor
+        std::vector<int> shape;   // original shape
+        size_t bytes = 0;         // data.size()*sizeof(float)
+        uint64_t last_access = 0; // monotonic counter for LRU
+    };
+    mutable std::mutex quant_cache_mutex_;
+    mutable std::unordered_map<std::string, CachedFullTensor> quant_full_cache_; // key: tensor name
+    mutable std::atomic<uint64_t> quant_cache_clock_{0};
+    mutable std::atomic<size_t> quant_cache_bytes_{0};
+    mutable std::atomic<size_t> quant_cache_loads_{0}; // times fallback path invoked
+    mutable std::atomic<size_t> quant_cache_hits_{0};
+    mutable std::atomic<size_t> quant_cache_misses_{0};
+    mutable std::atomic<size_t> quant_cache_evictions_{0};
+
+    // Internal helpers
+    const CachedFullTensor *getOrCacheFullQuantTensor(const std::string &tensor_name, const GGUFTensorInfo &info);
+    size_t quantShardCacheMaxBytes() const; // derived from env LLAMINAR_SHARD_CACHE_MAX_MB (default 512MB)
 };
 
 // ---- Static size checks for ggml K-format block structs ----

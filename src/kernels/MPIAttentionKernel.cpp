@@ -1,8 +1,52 @@
+/**
+ * @file MPIAttentionKernel.cpp
+ * @brief Multi-head self-attention (prefill / decode) with optional grouped (GQA) key/value heads in MPI context.
+ *
+ * @section Contract
+ * Inputs:
+ *  - inputs[0]: Query tensor Q [seq_len_q, n_heads, head_dim].
+ *  - inputs[1]: Key tensor K   [seq_len_k, n_kv_heads, head_dim].
+ *  - inputs[2]: Value tensor V [seq_len_k, n_kv_heads, head_dim].
+ *  - inputs[3] (optional): Causal mask or attention bias structure.
+ * Outputs:
+ *  - outputs[0]: Context tensor C [seq_len_q, n_heads, head_dim].
+ * Semantics:
+ *  - Scaled dot-product attention with RoPE already applied upstream.
+ *  - Grouped attention: heads mapped so each query head attends corresponding kv group (n_heads multiple of n_kv_heads).
+ * Scaling & Masking:
+ *  - Score_ij = (Q_i · K_j) / sqrt(head_dim).
+ *  - If causal, j > i positions masked (set to -inf before softmax).
+ * Numerical Expectations:
+ *  - Softmax stability: Max-subtraction per row; overflow-safe for typical head_dim <= 256.
+ *  - Relative error vs reference < 5e-5 (accumulation order dependent) for float32.
+ * Distribution Strategy (current):
+ *  - Replicated computation across ranks (future: sequence or head partition + AllReduce).
+ * Error Modes:
+ *  - Dimension mismatch, invalid head grouping (n_heads % n_kv_heads != 0), null inputs.
+ *  - seq_len_k < seq_len_q under causal mask unsupported.
+ * Threading:
+ *  - Parallelized across (seq_len_q * n_heads) independent softmax+matmul tasks.
+ * Performance Notes:
+ *  - Potential optimization: fuse QK^T + softmax + PV with block tiling and cache-friendly layout.
+ * Future Extensions:
+ *  - Flash-attention style block-sparse kernel, distributed head partition.
+ *  - Mixed precision (FP16/BF16) with accumulation in float32.
+ * Safety:
+ *  - Checks for NaN/Inf after softmax optionally (debug build) could be enabled via env flag (TBD).
+ * @warning Ensure RoPE applied before this kernel for correct positional alignment.
+ * @todo Introduce streaming KV cache update path for decode stage.
+ * @author David Sanftenberg
+ */
 #include "MPIAttentionKernel.h"
+#include "../utils/debug_env.h"
+#include "../utils/debug_sharding.h"
+#include "kernels/common/attention_primitives.h" // for optional validation
 #include "../adaptive_matmul.h"
 #include "../logger.h"
 #include "../performance_timer.h"
 #include "../tensors/tensor_factory.h"
+#include "../tensors/sharded_simple_tensor.h"
+#include "../tensors/shard_spec.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -12,9 +56,10 @@ namespace llaminar
 {
 
     MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim,
+                                           float rope_freq_base,
                                            DistributionStrategy strategy)
         : MPIKernelBase(), n_head_(n_head), n_head_kv_(n_head_kv), head_dim_(head_dim),
-          n_past_(0), strategy_(strategy)
+          n_past_(0), rope_freq_base_(rope_freq_base), strategy_(strategy)
     {
         if (n_head_ % getSize() != 0)
         {
@@ -51,17 +96,62 @@ namespace llaminar
         auto [local_heads, head_offset] = getHeadDistribution();
         size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
 
-        // Create local weight tensors for distributed heads
-        auto local_wq = createLocalSimpleTensor({d_model, local_head_dim});
-        auto local_wk = createLocalSimpleTensor({d_model, local_head_dim});
-        auto local_wv = createLocalSimpleTensor({d_model, local_head_dim});
-        auto local_wo = createLocalSimpleTensor({local_head_dim, d_model});
-
-        // Distribute weights according to head assignment
+        // Detect pre-sharded weights (Head axis) to bypass legacy distributeInputs.
+        auto is_head_sharded = [](const std::shared_ptr<TensorBase> &t) -> bool
         {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
-            distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
-                             local_wq, local_wk, local_wv, local_wo, seq_len, d_model);
+            if (!t)
+                return false;
+            // Dynamic cast to ShardedSimpleTensor if available.
+            if (auto *raw = dynamic_cast<ShardedSimpleTensor *>(t.get()))
+            {
+                const auto &spec = raw->shard_spec();
+                return spec.is_sharded() && spec.axis == ShardSpec::Axis::Heads;
+            }
+            return false;
+        };
+
+        bool pre_sharded = is_head_sharded(global_wq) && is_head_sharded(global_wk) &&
+                           is_head_sharded(global_wv) && is_head_sharded(global_wo);
+
+        std::shared_ptr<TensorBase> local_wq;
+        std::shared_ptr<TensorBase> local_wk;
+        std::shared_ptr<TensorBase> local_wv;
+        std::shared_ptr<TensorBase> local_wo;
+
+        if (pre_sharded)
+        {
+            // Assume each provided weight already holds only this rank's slice.
+            // Validate slice dimensionality matches our expected local_head_dim.
+            size_t wq_cols = static_cast<size_t>(global_wq->shape()[1]);
+            size_t wk_cols = static_cast<size_t>(global_wk->shape()[1]);
+            size_t wv_cols = static_cast<size_t>(global_wv->shape()[1]);
+            size_t wo_rows = static_cast<size_t>(global_wo->shape()[0]);
+            if (wq_cols != local_head_dim || wk_cols != local_head_dim || wv_cols != local_head_dim || wo_rows != local_head_dim)
+            {
+                LOG_ERROR("MPIAttentionKernel: pre-sharded weight dims mismatch local expectation (expected " << local_head_dim << ")");
+                return false;
+            }
+            local_wq = global_wq;
+            local_wk = global_wk;
+            local_wv = global_wv;
+            local_wo = global_wo;
+            if (getRank() == 0)
+            {
+                LOG_DEBUG("MPIAttentionKernel: detected pre-sharded head-axis weights; skipping distributeInputs");
+            }
+        }
+        else
+        {
+            // Legacy path: allocate local slices then copy/distribute.
+            local_wq = createLocalSimpleTensor({d_model, local_head_dim});
+            local_wk = createLocalSimpleTensor({d_model, local_head_dim});
+            local_wv = createLocalSimpleTensor({d_model, local_head_dim});
+            local_wo = createLocalSimpleTensor({local_head_dim, d_model});
+            {
+                PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
+                distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
+                                 local_wq, local_wk, local_wv, local_wo, seq_len, d_model);
+            }
         }
         // Create local projection tensors
         auto local_q = createLocalSimpleTensor({seq_len, local_head_dim});
@@ -100,10 +190,26 @@ namespace llaminar
                                          local_final_output, seq_len, local_heads, d_model);
         }
 
-        // Gather final outputs from all processes
+        // Always emit local partial (per-rank head slice) into global_output.
+        // Global aggregation (sum/concat) is now explicitly the caller's responsibility.
         {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::gatherOutput");
-            gatherOutput(local_final_output, global_output, seq_len, d_model);
+            PERF_SCOPED_TIMER("MPIAttentionKernel::emitLocalPartial");
+            std::copy(local_final_output->data(),
+                      local_final_output->data() + seq_len * d_model,
+                      global_output->data());
+            // Optional misuse guard: when enabled, stamp a lightweight canary into an unlikely location
+            // (final element) so that downstream replicated-assuming code performing a silent in-place
+            // reduction or reuse can be detected in debug diagnostics. Enabled by env var:
+            //   LLAMINAR_ASSERT_REPLICATED_MISUSE=1 will later trigger a check in validate() on next execute.
+            if (getShardingDebugConfig().assert_replicated_misuse)
+            {
+                // Embed rank id scaled marker; harmless numerically (very small) but detectable.
+                global_output->data()[seq_len * d_model - 1] += (float)(1e-30 * (getRank() + 1));
+            }
+            if (getRank() == 0)
+            {
+                LOG_DEBUG("MPIAttentionKernel: emitted local partial head contribution (legacy gather path removed)");
+            }
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -146,35 +252,112 @@ namespace llaminar
         size_t seq_len = static_cast<size_t>(input->shape()[0]);
         size_t d_model = static_cast<size_t>(input->shape()[1]);
         size_t total_head_dim = static_cast<size_t>(n_head_ * head_dim_);
-
-        // Validate weight dimensions
-        if (wq->shape().size() != 2 || static_cast<size_t>(wq->shape()[0]) != d_model ||
-            static_cast<size_t>(wq->shape()[1]) != total_head_dim)
+        bool wq_head_sharded = false, wk_head_sharded = false, wv_head_sharded = false, wo_head_sharded = false;
+        auto chk = [](const std::shared_ptr<TensorBase> &t) -> const ShardSpec *
         {
-            LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch");
-            return false;
+            if(!t) return nullptr; auto *p = dynamic_cast<ShardedSimpleTensor*>(t.get()); return p ? &p->shard_spec() : nullptr; };
+        const ShardSpec *spec_wq = chk(wq);
+        if (spec_wq && spec_wq->axis == ShardSpec::Axis::Heads)
+            wq_head_sharded = spec_wq->is_sharded();
+        const ShardSpec *spec_wk = chk(wk);
+        if (spec_wk && spec_wk->axis == ShardSpec::Axis::Heads)
+            wk_head_sharded = spec_wk->is_sharded();
+        const ShardSpec *spec_wv = chk(wv);
+        if (spec_wv && spec_wv->axis == ShardSpec::Axis::Heads)
+            wv_head_sharded = spec_wv->is_sharded();
+        const ShardSpec *spec_wo = chk(wo);
+        if (spec_wo && spec_wo->axis == ShardSpec::Axis::Heads)
+            wo_head_sharded = spec_wo->is_sharded();
+
+        bool any_sharded = wq_head_sharded || wk_head_sharded || wv_head_sharded || wo_head_sharded;
+        if (any_sharded)
+        {
+            // For head-sharded mode accept local dimensions instead of global aggregate.
+            auto [local_heads, head_offset] = getHeadDistribution();
+            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
+            if (wq_head_sharded)
+            {
+                if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != d_model || (size_t)wq->shape()[1] != local_head_dim)
+                {
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wq shape mismatch");
+                    return false;
+                }
+            }
+            else if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != d_model || (size_t)wq->shape()[1] != total_head_dim)
+            {
+                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch");
+                return false;
+            }
+            if (wk_head_sharded)
+            {
+                if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != d_model || (size_t)wk->shape()[1] != local_head_dim)
+                {
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wk shape mismatch");
+                    return false;
+                }
+            }
+            else if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != d_model || (size_t)wk->shape()[1] != (size_t)(n_head_kv_ * head_dim_))
+            {
+                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch");
+                return false;
+            }
+            if (wv_head_sharded)
+            {
+                if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != d_model || (size_t)wv->shape()[1] != local_head_dim)
+                {
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wv shape mismatch");
+                    return false;
+                }
+            }
+            else if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != d_model || (size_t)wv->shape()[1] != (size_t)(n_head_kv_ * head_dim_))
+            {
+                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch");
+                return false;
+            }
+            if (wo_head_sharded)
+            {
+                if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != local_head_dim || (size_t)wo->shape()[1] != d_model)
+                {
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wo shape mismatch");
+                    return false;
+                }
+            }
+            else if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != total_head_dim || (size_t)wo->shape()[1] != d_model)
+            {
+                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch");
+                return false;
+            }
+        }
+        else
+        {
+            // Original global dimension checks (unchanged)
+            if (wq->shape().size() != 2 || static_cast<size_t>(wq->shape()[0]) != d_model ||
+                static_cast<size_t>(wq->shape()[1]) != total_head_dim)
+            {
+                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch");
+                return false;
+            }
+            if (wk->shape().size() != 2 || static_cast<size_t>(wk->shape()[0]) != d_model ||
+                static_cast<size_t>(wk->shape()[1]) != static_cast<size_t>(n_head_kv_ * head_dim_))
+            {
+                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch");
+                return false;
+            }
+            if (wv->shape().size() != 2 || static_cast<size_t>(wv->shape()[0]) != d_model ||
+                static_cast<size_t>(wv->shape()[1]) != static_cast<size_t>(n_head_kv_ * head_dim_))
+            {
+                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch");
+                return false;
+            }
+            if (wo->shape().size() != 2 || static_cast<size_t>(wo->shape()[0]) != total_head_dim ||
+                static_cast<size_t>(wo->shape()[1]) != d_model)
+            {
+                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch");
+                return false;
+            }
         }
 
-        if (wk->shape().size() != 2 || static_cast<size_t>(wk->shape()[0]) != d_model ||
-            static_cast<size_t>(wk->shape()[1]) != static_cast<size_t>(n_head_kv_ * head_dim_))
-        {
-            LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch");
-            return false;
-        }
-
-        if (wv->shape().size() != 2 || static_cast<size_t>(wv->shape()[0]) != d_model ||
-            static_cast<size_t>(wv->shape()[1]) != static_cast<size_t>(n_head_kv_ * head_dim_))
-        {
-            LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch");
-            return false;
-        }
-
-        if (wo->shape().size() != 2 || static_cast<size_t>(wo->shape()[0]) != total_head_dim ||
-            static_cast<size_t>(wo->shape()[1]) != d_model)
-        {
-            LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch");
-            return false;
-        }
+        // (Removed duplicate global-dimension validation for sharded path.)
 
         // Validate output dimensions
         if (output->shape().size() != 2 || static_cast<size_t>(output->shape()[0]) != seq_len ||
@@ -376,13 +559,61 @@ namespace llaminar
         // Apply attention to values
         applyLocalAttention(scores.get(), local_v, local_output, seq_len, local_heads);
 
+        // Optional debug validation: re-run scalar reference primitives on already RoPE-rotated Q/K
+        // and compare with kernel path. Enabled when LLAMINAR_ATTN_PRIMITIVES_VALIDATE is set.
+        if (debugEnv().attention.validate_primitives)
+        {
+            // We intentionally perform this only on rank 0 to avoid duplicated logs.
+            if (getRank() == 0)
+            {
+                // Primitive layout matches: sequence-major rows, heads contiguous per row.
+                // local_q/k/v layout here is [seq_len, local_heads * head_dim_].
+                // Build a temporary contiguous copy so we can treat as primitives input.
+                size_t frame_elems = seq_len * static_cast<size_t>(local_heads) * head_dim_;
+                std::vector<float> q_copy(frame_elems), k_copy(frame_elems), v_copy(frame_elems);
+                std::memcpy(q_copy.data(), local_q, frame_elems * sizeof(float));
+                std::memcpy(k_copy.data(), local_k, frame_elems * sizeof(float));
+                std::memcpy(v_copy.data(), local_v, frame_elems * sizeof(float));
+
+                // Fused primitive attention (always causal in kernel today)
+                std::vector<float> fused_out(frame_elems, 0.f);
+                llaminar::attn::fused_attention(q_copy.data(), k_copy.data(), v_copy.data(), fused_out.data(),
+                                                static_cast<int>(seq_len), head_dim_, local_heads, /*causal=*/true);
+
+                // Compute simple diff metrics
+                double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
+                for (size_t i = 0; i < frame_elems; ++i)
+                {
+                    double ref = fused_out[i];
+                    double got = local_output[i];
+                    double diff = std::fabs(ref - got);
+                    if (diff > max_abs)
+                        max_abs = diff;
+                    sum_sq_ref += ref * ref;
+                    sum_sq_diff += diff * diff;
+                }
+                double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
+                if (max_abs > 1e-5 || rel_l2 > 1e-5)
+                {
+                    LOG_WARN("MPIAttentionKernel primitives validation divergence max_abs=" << max_abs
+                                                                                            << " rel_l2=" << rel_l2
+                                                                                            << " (seq_len=" << seq_len << ", local_heads=" << local_heads << ")");
+                }
+                else
+                {
+                    LOG_DEBUG("MPIAttentionKernel primitives validation OK max_abs=" << max_abs
+                                                                                     << " rel_l2=" << rel_l2);
+                }
+            }
+        }
+
         LOG_DEBUG("Computed local attention for " << local_heads << " heads on rank " << getRank());
     }
 
     void MPIAttentionKernel::applyLocalRoPE(float *local_q, float *local_k, size_t seq_len, int local_heads)
     {
         // Simplified RoPE implementation - apply rotation to each head
-        float theta_base = 10000.0f;
+        const float theta_base = rope_freq_base_;
 
         for (int head = 0; head < local_heads; ++head)
         {
@@ -531,41 +762,61 @@ namespace llaminar
             return;
         }
 
+        // Optional scalar reference validation for output projection (pre-gather).
+        // Enabled via LLAMINAR_ATTN_OUTPUT_VALIDATE=1 (rank 0 logs divergences >1e-6).
+        if (debugEnv().attention.validate_output)
+        {
+            // Recompute output projection with naive scalar matmul to validate adaptive_matmul path.
+            // local_attended_output: [seq_len, local_head_dim]
+            // local_wo: [local_head_dim, d_model]
+            size_t local_head_dim_e = local_head_dim;
+            std::vector<float> ref(seq_len * d_model, 0.f);
+            const float *A = local_attended_output->data();
+            const float *B = local_wo->data();
+            for (size_t i = 0; i < seq_len; ++i)
+            {
+                const float *a_row = A + i * local_head_dim_e;
+                float *c_row = ref.data() + i * d_model;
+                for (size_t k = 0; k < local_head_dim_e; ++k)
+                {
+                    float aval = a_row[k];
+                    const float *b_col = B + k * d_model;
+                    for (size_t j = 0; j < d_model; ++j)
+                    {
+                        c_row[j] += aval * b_col[j];
+                    }
+                }
+            }
+            double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
+            const float *C = local_final_output->data();
+            for (size_t idx = 0; idx < ref.size(); ++idx)
+            {
+                double r = ref[idx];
+                double g = C[idx];
+                double d = std::fabs(r - g);
+                if (d > max_abs)
+                    max_abs = d;
+                sum_sq_ref += r * r;
+                sum_sq_diff += d * d;
+            }
+            double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
+            if (getRank() == 0)
+            {
+                if (max_abs > 1e-6 || rel_l2 > 1e-6)
+                {
+                    LOG_WARN("MPIAttentionKernel output projection validation divergence max_abs=" << max_abs
+                                                                                                   << " rel_l2=" << rel_l2
+                                                                                                   << " (seq_len=" << seq_len << ", local_heads=" << local_heads << ")");
+                }
+                else
+                {
+                    LOG_DEBUG("MPIAttentionKernel output projection validation OK max_abs=" << max_abs
+                                                                                            << " rel_l2=" << rel_l2);
+                }
+            }
+        }
+
         LOG_DEBUG("Computed output projection using COSMA for " << local_heads << " heads on rank " << getRank());
-    }
-
-    void MPIAttentionKernel::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
-                                          std::shared_ptr<TensorBase> &global_output,
-                                          size_t seq_len, size_t d_model)
-    {
-        // PERFORMANCE WARNING: This MPI_Allreduce is extremely expensive!
-        // For production, this should be replaced with proper tensor sharding
-        // where each process only computes part of the output dimensions
-
-        int rank = getRank();
-        int size = getSize();
-
-        if (size == 1)
-        {
-            PERF_SCOPED_TIMER("gatherOutput::single_process_copy");
-            // Single process case - direct copy
-            std::copy(local_output->data(),
-                      local_output->data() + seq_len * d_model,
-                      global_output->data());
-        }
-        else
-        {
-            PERF_SCOPED_TIMER("gatherOutput::MPI_Allreduce");
-            LOG_WARN("PERFORMANCE: Using expensive MPI_Allreduce for " << (seq_len * d_model) << " elements");
-
-            // Each rank computes partial contributions for its head shard.
-            // Summing across ranks yields the full output; avoid extra averaging.
-            checkMPIError(MPI_Allreduce(local_output->data(), global_output->data(),
-                                        static_cast<int>(seq_len * d_model), MPI_FLOAT, MPI_SUM, getComm()),
-                          "MPI_Allreduce in gatherOutput");
-        }
-
-        LOG_DEBUG("Gathered output: [" << seq_len << ", " << d_model << "] on rank " << getRank());
     }
 
     std::shared_ptr<TensorBase> MPIAttentionKernel::createLocalSimpleTensor(const std::vector<size_t> &shape) const

@@ -2,6 +2,7 @@
 #include "tensor_base.h"
 #include "simple_tensor.h"
 #include "cosma_tensor.h"
+#include "sharded_tensor_registry.h"
 #include "../logger.h"
 #include <mpi.h>
 #include <atomic>
@@ -81,6 +82,69 @@ namespace llaminar
                       ". Falling back to SimpleTensor.");
             return create_simple(shape);
         }
+    }
+
+    std::shared_ptr<llaminar::TensorBase> TensorFactory::create_sharded(const std::vector<int> &shape,
+                                                                        ShardSpec::Axis axis_kind,
+                                                                        int axis_dim_index,
+                                                                        int world,
+                                                                        int rank)
+    {
+        if (axis_dim_index < 0 || axis_dim_index >= (int)shape.size())
+            throw std::runtime_error("create_sharded: axis_dim_index out of range");
+        if (axis_kind == ShardSpec::Axis::None)
+            throw std::runtime_error("create_sharded: axis_kind cannot be None");
+        int global_dim = shape[axis_dim_index];
+        int base = global_dim / world;
+        int rem = global_dim % world;
+        int local = base + (rank < rem ? 1 : 0);
+        int offset = base * rank + (rank < rem ? rank : rem);
+        std::vector<int> local_shape = shape;
+        local_shape[axis_dim_index] = local;
+        ShardSpec spec;
+        spec.type = ShardSpec::Type::Sharded;
+        spec.axis = axis_kind;
+        spec.world = world;
+        spec.rank = rank;
+        spec.global_dim = global_dim;
+        spec.local_dim = local;
+        spec.local_offset = offset;
+        auto t = std::make_shared<ShardedSimpleTensor>(local_shape, spec);
+        ShardedTensorRegistry::instance().register_tensor(std::static_pointer_cast<ShardedSimpleTensor>(t));
+        return t;
+    }
+
+    std::shared_ptr<llaminar::TensorBase> TensorFactory::create_heads_sharded(const std::vector<int> &shape,
+                                                                              int axis_dim_index,
+                                                                              int n_heads,
+                                                                              int head_dim,
+                                                                              int world,
+                                                                              int rank)
+    {
+        if (axis_dim_index < 0 || axis_dim_index >= (int)shape.size())
+            throw std::runtime_error("create_heads_sharded: axis_dim_index out of range");
+        int global_dim = shape[axis_dim_index];
+        if (global_dim != n_heads * head_dim)
+            throw std::runtime_error("create_heads_sharded: global_dim mismatch n_heads*head_dim");
+        int base_heads = n_heads / world;
+        int rem_heads = n_heads % world;
+        int local_heads = base_heads + (rank < rem_heads ? 1 : 0);
+        int head_offset = base_heads * rank + (rank < rem_heads ? rank : rem_heads);
+        int local_dim = local_heads * head_dim;
+        int offset = head_offset * head_dim;
+        std::vector<int> local_shape = shape;
+        local_shape[axis_dim_index] = local_dim;
+        ShardSpec spec;
+        spec.type = ShardSpec::Type::Sharded;
+        spec.axis = ShardSpec::Axis::Heads;
+        spec.world = world;
+        spec.rank = rank;
+        spec.global_dim = global_dim;
+        spec.local_dim = local_dim;
+        spec.local_offset = offset;
+        auto t = std::make_shared<ShardedSimpleTensor>(local_shape, spec);
+        ShardedTensorRegistry::instance().register_tensor(std::static_pointer_cast<ShardedSimpleTensor>(t));
+        return t;
     }
 
     std::shared_ptr<llaminar::TensorBase> TensorFactory::create_auto(const std::vector<int> &shape,
@@ -175,6 +239,20 @@ namespace llaminar
             LOG_WARN("Failed to convert to COSMATensor: " + std::string(e.what()) +
                      ". Returning original tensor.");
             return tensor;
+        }
+    }
+
+    void TensorFactory::for_each_sharded(const std::function<void(const ShardSpec &, const std::vector<int> &)> &fn)
+    {
+        ShardedTensorRegistry::instance().for_each([&](ShardedSimpleTensor &t)
+                                                   { fn(t.shard_spec(), t.shape()); });
+    }
+
+    void TensorFactory::set_last_shard_role(const std::string &role)
+    {
+        if (auto last = ShardedTensorRegistry::instance().last())
+        {
+            last->shard_spec().role = role;
         }
     }
 

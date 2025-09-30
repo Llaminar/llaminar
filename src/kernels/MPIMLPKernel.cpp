@@ -30,7 +30,21 @@ namespace llaminar
 
         size_t seq_len = input->shape()[0];
         size_t d_model = input->shape()[1];
-        size_t local_d_ff = w_gate->shape()[1]; // Local d_ff on this rank
+
+        // Detect sharding of feed-forward dimension (column sharding of gate/up)
+        bool ff_sharded = false;
+        size_t global_d_ff = 0; // only valid if sharded
+        size_t local_d_ff = w_gate->shape()[1];
+        if (auto *ss = dynamic_cast<ShardedSimpleTensor *>(w_gate.get()))
+        {
+            const ShardSpec &spec = ss->shard_spec();
+            if (spec.is_sharded())
+            {
+                ff_sharded = true;
+                global_d_ff = spec.global_dim;
+                local_d_ff = spec.local_dim;
+            }
+        }
 
         LOG_DEBUG("MPIMLPKernel processing: seq_len=" << seq_len
                                                       << ", d_model=" << d_model << ", local_d_ff=" << local_d_ff);
@@ -39,6 +53,7 @@ namespace llaminar
         auto gate_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
         auto up_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
         auto activated = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+        // Down projection always produces the full d_model columns locally (partial over rows of w_down if row sharded)
         auto local_output = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(d_model)});
 
         // Step 1: Compute gate projection using COSMA
@@ -53,8 +68,31 @@ namespace llaminar
         // Step 4: Compute down projection using COSMA
         computeDownProjection(activated, w_down, local_output, seq_len, local_d_ff, d_model);
 
-        // Step 5: Gather final output using MPI_Allreduce
-        gatherFinalOutput(local_output, output, seq_len, d_model);
+        // Step 5: Gather final output using MPI_Allreduce (only if this rank produced partial result)
+        // Heuristic: if down weight is row-sharded (its first dimension < global d_ff) we need Allreduce.
+        bool need_allreduce = true;
+        if (auto *ss_down = dynamic_cast<ShardedSimpleTensor *>(w_down.get()))
+        {
+            const ShardSpec &spec = ss_down->shard_spec();
+            if (spec.is_sharded())
+            {
+                // row sharded feed-forward contributions require summation
+                need_allreduce = true;
+            }
+            else
+            {
+                need_allreduce = true; // replicated path; still Allreduce acts as identity but cheap for small sizes
+            }
+        }
+        if (need_allreduce)
+        {
+            gatherFinalOutput(local_output, output, seq_len, d_model);
+        }
+        else
+        {
+            // Direct copy (should not happen with current strategies but keeps logic explicit)
+            std::memcpy(output->data(), local_output->data(), sizeof(float) * seq_len * d_model);
+        }
 
         return true;
     }
@@ -102,28 +140,31 @@ namespace llaminar
         size_t d_model = input->shape()[1];
 
         // Check weight dimensions for distributed setting
-        if (w_gate->shape().size() != 2 || w_gate->shape()[0] != d_model)
+        // Shard-aware validation: allow gate/up to be column sharded
+        size_t gate_rows = w_gate->shape()[0];
+        size_t gate_cols = w_gate->shape()[1];
+        if (gate_rows != d_model)
         {
-            LOG_ERROR("MPIMLPKernel: Gate weight shape mismatch. Expected ["
-                      << d_model << ", local_d_ff], got ["
-                      << w_gate->shape()[0] << ", " << w_gate->shape()[1] << "]");
+            LOG_ERROR("MPIMLPKernel: Gate weight row mismatch expected d_model=" << d_model << " got " << gate_rows);
             return false;
         }
-
-        size_t local_d_ff = w_gate->shape()[1];
-        if (w_up->shape().size() != 2 || w_up->shape()[0] != d_model || w_up->shape()[1] != local_d_ff)
+        // Up must match gate local columns
+        if (w_up->shape().size() != 2 || w_up->shape()[0] != d_model || w_up->shape()[1] != gate_cols)
         {
-            LOG_ERROR("MPIMLPKernel: Up weight shape mismatch. Expected ["
-                      << d_model << ", " << local_d_ff << "], got ["
-                      << w_up->shape()[0] << ", " << w_up->shape()[1] << "]");
+            LOG_ERROR("MPIMLPKernel: Up weight mismatch; gate local cols=" << gate_cols << " up shape=[" << w_up->shape()[0] << "," << w_up->shape()[1] << "]");
             return false;
         }
-
-        if (w_down->shape().size() != 2 || w_down->shape()[0] != local_d_ff || w_down->shape()[1] != d_model)
+        // Down projection may be row sharded: its first dim must equal gate_cols (local) if sharded or global if replicated
+        size_t down_rows = w_down->shape()[0];
+        if (down_rows != gate_cols)
         {
-            LOG_ERROR("MPIMLPKernel: Down weight shape mismatch. Expected ["
-                      << local_d_ff << ", " << d_model << "], got ["
-                      << w_down->shape()[0] << ", " << w_down->shape()[1] << "]");
+            // If down is sharded, its local rows should still equal gate_cols (local slice) for consistency of local matmul.
+            LOG_ERROR("MPIMLPKernel: Down weight row mismatch expected " << gate_cols << " got " << down_rows);
+            return false;
+        }
+        if (w_down->shape()[1] != d_model)
+        {
+            LOG_ERROR("MPIMLPKernel: Down weight col mismatch expected d_model=" << d_model << " got " << w_down->shape()[1]);
             return false;
         }
 

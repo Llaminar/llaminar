@@ -3,6 +3,9 @@
 #include "tensor_base.h"
 #include "simple_tensor.h"
 #include "cosma_tensor.h"
+#include "sharded_simple_tensor.h"
+#include "shard_spec.h"
+#include <functional>
 #include <memory>
 #include <vector>
 #include <string>
@@ -33,6 +36,30 @@ namespace llaminar
                                                                  bool prefer_distributed = false);
         static std::shared_ptr<llaminar::TensorBase> create_auto(const std::vector<int> &shape,
                                                                  const std::vector<float> &data = {});
+
+        // Iterate currently registered sharded tensors (non-owning). Callback receives const ShardSpec&.
+        static void for_each_sharded(const std::function<void(const ShardSpec &, const std::vector<int> &)> &fn);
+
+        // Assign role metadata to last created sharded tensor (helper for loader/pipeline)
+        static void set_last_shard_role(const std::string &role);
+
+        // Sharded tensor creation (1D partition along given axis index within shape)
+        // axis_kind selects semantic axis (Hidden or Heads); axis_dim_index indicates which dimension in shape is split.
+        static std::shared_ptr<llaminar::TensorBase> create_sharded(const std::vector<int> &shape,
+                                                                    ShardSpec::Axis axis_kind,
+                                                                    int axis_dim_index,
+                                                                    int world,
+                                                                    int rank);
+
+        // Head-aligned sharded creation: ensure partition boundaries align to whole heads (head_dim elements).
+        // global_dim = n_heads * head_dim, axis_dim_index indicates which dimension encodes that product.
+        // Distributes heads with near-even strategy (base + remainder) so some ranks may have +1 head.
+        static std::shared_ptr<llaminar::TensorBase> create_heads_sharded(const std::vector<int> &shape,
+                                                                          int axis_dim_index,
+                                                                          int n_heads,
+                                                                          int head_dim,
+                                                                          int world,
+                                                                          int rank);
 
         // Tensor type conversion
         static std::shared_ptr<llaminar::TensorBase> convert_to_cosma(const std::shared_ptr<llaminar::TensorBase> &tensor,

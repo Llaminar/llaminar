@@ -14,6 +14,7 @@
 // Phase 1b adds: cumulative resident tracking, JSON stats export, env audit helpers.
 // Non-goals (deferred): fused dequant, full in-layout elementwise kernels, stream overlap.
 // --------------------------------------------------------------
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,8 @@ namespace llaminar
         int global_rows = 0;
         int global_cols = 0;
         char label = 'A';
+        const cosma::Strategy *strategy = nullptr; // optional pointer to strategy used when allocated
+        std::string strategy_key;                  // optional cache key / descriptor for diagnostics
         // Single-rank fallback support
         const float *original_row_major = nullptr;      // points to source data (A or B) if available
         std::shared_ptr<std::vector<float>> host_owned; // for outputs or copies when needed
@@ -78,6 +81,53 @@ namespace llaminar
     {
         CosmaView view;
         WeightDescriptor desc;
+    };
+
+    struct MatrixDebugSummary
+    {
+        int rows{0};
+        int cols{0};
+        int sample_rows{0};
+        int sample_cols{0};
+        std::vector<float> sample;           // row-major sample (top-left sample_rows x sample_cols)
+        std::vector<float> reference_sample; // optional reference sample (e.g., OpenBLAS)
+        double rel_l2_vs_original{-1.0};
+        double max_abs_vs_original{0.0};
+        double rel_l2_vs_reference{-1.0};
+        double max_abs_vs_reference{0.0};
+    };
+
+    struct MatmulDebugSnapshot
+    {
+        bool valid{false};
+        int world{1};
+        int rank{0};
+        int m{0};
+        int n{0};
+        int k{0};
+        bool transposeW{false};
+        float alpha{1.f};
+        float beta{0.f};
+        long long volume{0};
+        bool used_cosma{false};
+        bool used_fast_path{false};
+        bool cosma_disabled{false};
+        bool force_direct{false};
+        bool force_replicated{false};
+        bool force_fallback{false};
+        bool compare_replicated{false};
+        bool direct_override{false};
+        long long fast_path_threshold_ops{0};
+        long long direct_threshold_ops{0};
+        std::string path_desc;
+        std::string strategy_A;
+        std::string strategy_B;
+        std::string strategy_C;
+        std::vector<std::string> env_flags;
+        MatrixDebugSummary A_summary;
+        MatrixDebugSummary B_summary;
+        MatrixDebugSummary C_summary;
+        std::string notes;
     };
 
     struct FusedRmsnormQkvResult
@@ -246,6 +296,7 @@ namespace llaminar
             std::atomic<long long> us_softmax{0};
             std::atomic<long long> fused_rmsnorm_qkv_invocations{0};
             std::atomic<long long> us_fused_rmsnorm_qkv{0};
+            std::atomic<long long> mixed_zero_tile_fallbacks{0};
             std::atomic<long long> overlap_stream_invocations{0};
             std::atomic<long long> us_overlap_stream{0};
         } stats_;
@@ -255,8 +306,16 @@ namespace llaminar
         // Phase 1b additions
         void dump_stats_json(const std::string &path) const;          // structured stats export
         void dump_stats_if_requested() const;                         // honour LLAMINAR_COSMA_DUMP_STATS
+        void dump_gemm_snapshots_json(const std::string &path) const; // write captured GEMM snapshots (JSON)
+        void dump_gemm_snapshots_if_requested() const;                // honour LLAMINAR_COSMA_DUMP_GEMM_SNAPSHOTS
         void reset_stats();                                           // test isolation helper
         static const std::vector<std::string> &recognized_env_vars(); // env audit support
+
+        // Debug capture helpers
+        void enable_last_gemm_capture(bool enable, int sample_dim = 8, size_t depth = 16);
+        void set_capture_config(bool enable, int sample_dim, size_t depth);
+        void clear_recent_gemm_snapshots();
+        std::vector<MatmulDebugSnapshot> recent_gemm_snapshots(size_t limit = 0) const;
 
     private:
         CosmaPrefillManager();
@@ -268,6 +327,13 @@ namespace llaminar
         int log_level_ = 2;                                      // 0=error 1=warn 2=info 3=debug 4=trace (mapped from LLAMINAR_COSMA_LOG_LEVEL)
         long long max_resident_mb_ = 2048;                       // LLAMINAR_COSMA_MAX_RESIDENT_MB
         bool force_cosma_ = false;                               // Env: LLAMINAR_COSMA_FORCE (or API set)
+
+        bool capture_last_gemm_{false};
+        int capture_sample_dim_{8};
+        size_t capture_depth_{16};
+        mutable std::mutex debug_mutex_;
+        std::deque<MatmulDebugSnapshot> gemm_debug_ring_;
+        mutable std::atomic<bool> snapshot_dirty_{false};
 
         StrategyCache strategy_cache_;
 
@@ -293,6 +359,7 @@ namespace llaminar
             bool compare_replicated = false;
             bool diag_dump_small = false;
             bool pop_forward_legacy = false;
+            bool force_fallback = false;
             bool force_distributed_act = false;
             bool fast_unverified = false;
             bool disable_fused_dequant = false;
@@ -334,6 +401,7 @@ namespace llaminar
         void recalc_resident();
         EnvSnapshot capture_env_snapshot() const;
         const EnvSnapshot &resolve_env(const EnvSnapshot *override_env, EnvSnapshot &storage) const;
+        bool snapshot_dump_requested(std::string &path) const;
 
         // Internal helpers
         CosmaView allocate_matrix(char label, int m, int n, const cosma::Strategy &strat, bool zero = false);
@@ -351,6 +419,15 @@ namespace llaminar
         void diag_sample_points_impl(const CosmaView &src, const float *original, const char *tag, const EnvSnapshot &env) const;
         void diag_compare_row_major_impl(const float *A, const float *B, int m, int n, const char *tagA, const char *tagB, const EnvSnapshot &env) const;
         void reconstruct_matrix_impl(const CosmaView &src, float *dst, bool normalize, const EnvSnapshot &env) const;
+        void capture_gemm_debug(MatmulDebugSnapshot &snapshot,
+                                const CosmaView &A,
+                                const CosmaView &B,
+                                const WeightDescriptor &w_desc,
+                                const CosmaView &C,
+                                const EnvSnapshot &env) const;
+        void record_snapshot(MatmulDebugSnapshot &&snapshot);
+        std::vector<std::string> active_env_flags(const EnvSnapshot &env) const;
+        static std::string describe_strategy(const cosma::Strategy *strat);
     };
 
 } // namespace llaminar

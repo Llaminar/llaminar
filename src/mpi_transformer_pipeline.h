@@ -149,6 +149,38 @@ namespace llaminar
          */
         static void resetSmallSeqFastPathCount() { small_seq_fast_path_calls_.store(0); }
 
+        /**
+         * @brief Access the last captured pre-LM head hidden state (post-final RMSNorm) if capture was enabled.
+         * Capture is enabled when the environment variable LLAMINAR_PIPELINE_CAPTURE_PRE_LM is set before execute().
+         * @return const reference to internal buffer (empty if not captured or pipeline not yet executed).
+         */
+        static const std::vector<float> &getLastPreLMHidden() { return last_pre_lm_hidden_; }
+
+        /**
+         * @brief Layer activation statistics (post-layer output) recorded when LLAMINAR_PIPELINE_LAYERWISE_STATS=1.
+         */
+        struct LayerActivationStat
+        {
+            double rms;
+            double max_abs;
+            double mean;
+            int layer;
+        };
+
+        /**
+         * @brief Get last recorded layer activation stats sequence.
+         */
+        static const std::vector<LayerActivationStat> &getLastLayerActivationStats() { return last_layer_stats_; }
+
+        /**
+         * @brief Reset captured diagnostic buffers (mainly for tests).
+         */
+        static void resetDiagnostics()
+        {
+            last_pre_lm_hidden_.clear();
+            last_layer_stats_.clear();
+        }
+
     private:
         /**
          * @brief Initialize all kernels for transformer pipeline
@@ -189,6 +221,11 @@ namespace llaminar
         bool executeOutputProjection(std::shared_ptr<TensorBase> &input,
                                      const ModelWeights &weights,
                                      std::shared_ptr<TensorBase> &output);
+
+        void traceFFNShardDiagnostics(const std::string &label,
+                                      const float *data,
+                                      int seq_len,
+                                      int feature_dim);
 
         struct PrefillAttentionTiming
         {
@@ -238,6 +275,10 @@ namespace llaminar
 
         // Instrumentation: replicated small-sequence fast path invocation counter
         static std::atomic<size_t> small_seq_fast_path_calls_;
+
+        // Diagnostics (static so tests can fetch after execute())
+        static std::vector<float> last_pre_lm_hidden_;
+        static std::vector<LayerActivationStat> last_layer_stats_;
     };
 
     /**

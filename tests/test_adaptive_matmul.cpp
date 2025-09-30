@@ -8,7 +8,7 @@
 #include "../src/adaptive_matmul.h"
 #include "../src/adaptive_transformer_pipeline.h"
 #include "../src/transformer_config.h"
-#include <mpi.h>
+#include "test_mpi_utils.h"
 #include <chrono>
 #include <vector>
 #include <random>
@@ -235,6 +235,7 @@ namespace llaminar
         config.n_layers = 24;
         config.max_seq_len = 32768;
         config.eps = 1e-6;
+        config.rope_freq_base = 10000.0f;
 
         // Should not throw during initialization
         EXPECT_NO_THROW({
@@ -294,25 +295,4 @@ namespace llaminar
 } // namespace llaminar
 
 // Main function for running tests
-int main(int argc, char **argv)
-{
-    // Initialize MPI
-    MPI_Init(&argc, &argv);
-
-    auto timeout = llaminar::test_util::TestTimeoutGuard::ResolveTimeout(
-        {"LLAMINAR_TEST_TIMEOUT_MS"}, std::chrono::milliseconds(60000));
-    llaminar::test_util::TestTimeoutGuard watchdog("AdaptiveMatMulTest", timeout);
-
-    // Initialize Google Test
-    ::testing::InitGoogleTest(&argc, argv);
-
-    // Run tests
-    int result = RUN_ALL_TESTS();
-
-    watchdog.disarm();
-
-    // Finalize MPI
-    MPI_Finalize();
-
-    return result;
-}
+LLAMINAR_DEFINE_GTEST_MPI_MAIN();
