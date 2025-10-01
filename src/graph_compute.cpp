@@ -1,6 +1,7 @@
 #include "graph_compute.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
+#include "utils/perf_counters.h" // For PerfMatmulPhaseScope layer index propagation
 #include <iostream>
 #include <algorithm>
 #include <queue>
@@ -468,7 +469,11 @@ bool TransformerBlockNode::execute()
 
     attention_->setInput(attn_input);
     attention_->setOutput(attn_output);
-    attention_->execute();
+    // Establish layer index context for downstream matmuls inside attention
+    {
+        llaminar::PerfMatmulPhaseScope layer_ctx(2, 0, layer_idx_); // layer_type=2 (ATTN), phase=0 (block-level)
+        attention_->execute();
+    }
 
     // Residual connection: input + attention_output
     const float *input_data = input_tensor_->data();
@@ -487,7 +492,10 @@ bool TransformerBlockNode::execute()
 
     mlp_->setInput(attn_input);
     mlp_->setOutput(ffn_output);
-    mlp_->execute();
+    {
+        llaminar::PerfMatmulPhaseScope layer_ctx(1, 0, layer_idx_); // layer_type=1 (MLP), phase=0
+        mlp_->execute();
+    }
 
     // Final residual connection: ffn_input + mlp_output
     const float *mlp_data = ffn_output->data();

@@ -480,8 +480,11 @@ int main(int argc, char **argv)
                 for (size_t i = 0; i < limit; ++i)
                 {
                     const auto &s = snap.samples[i];
+                    const char* layer_name = PerformanceCounters::layerTypeName(s.layer_type);
+                    const char* phase_name = (s.layer_type==1)? PerformanceCounters::mlpPhaseName(s.phase) : (s.layer_type==2? PerformanceCounters::attnPhaseName(s.phase): "-");
                     LOG_DEBUG("MATMUL_SAMPLE i=" << i << " m=" << s.m << " n=" << s.n << " k=" << s.k
-                                                 << " ms=" << s.ms << " gflops=" << s.gflops << " backend=" << s.backend);
+                                                 << " ms=" << s.ms << " gflops=" << s.gflops << " backend=" << s.backend
+                                                 << " layer=" << layer_name << " phase=" << phase_name << " layer_idx=" << s.layer_index);
                 }
                 if (snap.samples.size() > limit)
                 {

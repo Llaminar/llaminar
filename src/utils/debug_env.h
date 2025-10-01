@@ -311,6 +311,9 @@ namespace llaminar
         bool enable = false;          // LLAMINAR_PERF_ENABLE
         bool log_each_matmul = false; // LLAMINAR_PERF_LOG_EACH_MATMUL
         int log_rank = 0;             // LLAMINAR_PERF_LOG_RANK (only rank prints per-op)
+        bool layer_mlp = false;       // LLAMINAR_PERF_LAYER_MLP (emit per-MLP layer timing breakdown)
+        bool layer_verbose = false;   // LLAMINAR_PERF_LAYER_VERBOSE (include gather/parity & extra fields)
+        bool layer_attention = false; // LLAMINAR_PERF_LAYER_ATTENTION (emit per-Attention layer timing)
     };
 
     // ---------------------------------------------------------------------
@@ -430,6 +433,9 @@ namespace llaminar
 
     // Accessor (lazy init, thread-safe via magic statics)
     const DebugEnvSnapshot &debugEnv();
+    // Utility to format a concise multi-line summary of active debug env groups
+    // Implemented in debug_env.cpp
+    std::vector<std::string> formatDebugEnvSummary(const DebugEnvSnapshot &s);
 
     /**
      * @brief Refresh the cached debug environment snapshot.

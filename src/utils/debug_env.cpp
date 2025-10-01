@@ -272,6 +272,9 @@ namespace llaminar
     s.performance.enable = flag(std::getenv("LLAMINAR_PERF_ENABLE"));
     s.performance.log_each_matmul = flag(std::getenv("LLAMINAR_PERF_LOG_EACH_MATMUL"));
     if(const char* pr = std::getenv("LLAMINAR_PERF_LOG_RANK")) { int v=std::atoi(pr); if(v>=0) s.performance.log_rank = v; }
+    s.performance.layer_mlp = flag(std::getenv("LLAMINAR_PERF_LAYER_MLP"));
+    s.performance.layer_verbose = flag(std::getenv("LLAMINAR_PERF_LAYER_VERBOSE"));
+    s.performance.layer_attention = flag(std::getenv("LLAMINAR_PERF_LAYER_ATTENTION"));
     if(const char* fr = std::getenv("LLAMINAR_RMS_FORENSICS_FUSED")) if(*fr) s.rms_fused.forensics = true;
     if(const char* rr2 = std::getenv("LLAMINAR_RMS_FUSED_ROWS")) if(*rr2){ int v=std::atoi(rr2); if(v>0) s.rms_fused.rows_preview = v; }
     if(const char* cc2 = std::getenv("LLAMINAR_RMS_FUSED_COLS")) if(*cc2){ int v=std::atoi(cc2); if(v>0) s.rms_fused.cols_preview = v; }
