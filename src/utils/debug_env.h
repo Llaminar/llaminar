@@ -271,11 +271,11 @@ namespace llaminar
 
     struct MLPTPEnv
     {
-        bool enable = false;      // LLAMINAR_TP_MLP_ENABLE
-        int partitions = 1;       // LLAMINAR_TP_MLP_SIZE
-        bool validate = false;    // LLAMINAR_TP_MLP_VALIDATE (run parity check for small shapes)
-        bool force_column = false;// LLAMINAR_TP_MLP_FORCE_COLUMN (override auto)
-        bool force_row = false;   // LLAMINAR_TP_MLP_FORCE_ROW
+        bool enable = false;       // LLAMINAR_TP_MLP_ENABLE
+        int partitions = 1;        // LLAMINAR_TP_MLP_SIZE
+        bool validate = false;     // LLAMINAR_TP_MLP_VALIDATE (run parity check for small shapes)
+        bool force_column = false; // LLAMINAR_TP_MLP_FORCE_COLUMN (override auto)
+        bool force_row = false;    // LLAMINAR_TP_MLP_FORCE_ROW
     };
 
     // Embedding warnings
@@ -407,7 +407,7 @@ namespace llaminar
         WeightSlicingEnv weight_slicing;    // phase 0: foundational weight slicing flags
         TPPolicyEnv tp_policy;              // tensor parallel policy settings
         LoggerEnv logger;                   // logger ring buffer sizing
-    MLPTPEnv mlp_tp;                    // MLP tensor parallel execution controls
+        MLPTPEnv mlp_tp;                    // MLP tensor parallel execution controls
         struct ThreadingEnv
         {                                 // Global OpenMP / threading policy
             bool use_physical = false;    // LLAMINAR_OMP_USE_PHYSICAL (if set => restrict to physical cores per rank)

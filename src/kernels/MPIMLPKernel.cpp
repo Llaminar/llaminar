@@ -29,13 +29,13 @@ namespace llaminar
         auto input = inputs[0];
         auto w_gate = inputs[1];
         auto w_up = inputs[2];
-    auto w_down = inputs[3];
+        auto w_down = inputs[3];
         auto output = outputs[0];
 
-    size_t seq_len = input->shape()[0];
-    size_t d_model = input->shape()[1];
-    // Capture full (unpartitioned) feed-forward dimension before any TP slicing
-    size_t global_d_ff_full = w_gate->shape()[1];
+        size_t seq_len = input->shape()[0];
+        size_t d_model = input->shape()[1];
+        // Capture full (unpartitioned) feed-forward dimension before any TP slicing
+        size_t global_d_ff_full = w_gate->shape()[1];
 
         // Detect sharding of feed-forward dimension (column sharding of gate/up)
         bool ff_sharded = false;
@@ -56,9 +56,9 @@ namespace llaminar
                                                       << ", d_model=" << d_model << ", local_d_ff=" << local_d_ff);
 
         // Create temporary buffers for intermediate results
-    auto gate_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
-    auto up_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
-    auto activated = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+        auto gate_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+        auto up_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+        auto activated = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
         // Down projection always produces the full d_model columns locally (partial over rows of w_down if row sharded)
         auto local_output = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(d_model)});
 
@@ -130,8 +130,8 @@ namespace llaminar
             if (getRank() == 0)
             {
                 LOG_INFO("MLP_TP_ENABLED partitions=" << tp_parts
-                                                       << " d_model=" << d_model
-                                                       << " global_d_ff(local)=" << local_d_ff);
+                                                      << " d_model=" << d_model
+                                                      << " global_d_ff(local)=" << local_d_ff);
             }
             // Use generic TP GEMM executor abstraction (column split for gate & up)
             size_t global_ff = global_d_ff_full; // full dimension prior to slicing
@@ -151,7 +151,7 @@ namespace llaminar
             // Resize gate_proj/up_proj to local dims and copy results
             if (gate_part.N_local != up_part.N_local)
                 throw std::runtime_error("MLP_TP gate/up local dims mismatch");
-            local_d_ff = gate_part.N_local; // effective local slice width
+            local_d_ff = gate_part.N_local;              // effective local slice width
             tp_ff_offset = gate_part.partB.local_offset; // record slice offset for down projection slice
             // Reallocate intermediates sized to local slice
             gate_proj = TensorFactory::create_simple({(int)seq_len, (int)local_d_ff});
@@ -243,14 +243,20 @@ namespace llaminar
                     LOG_WARN("MLP_TP parity: reference down matmul failed");
                 // Compare with output->data()
                 double diff_sq = 0.0, ref_sq = 0.0, max_abs = 0.0;
-                size_t worst = 0; size_t total = seq_len * d_model;
+                size_t worst = 0;
+                size_t total = seq_len * d_model;
                 const float *cur = output->data();
                 for (size_t i = 0; i < total; ++i)
                 {
                     double d = (double)cur[i] - (double)ref_out[i];
                     double ad = std::fabs(d);
-                    if (ad > max_abs) { max_abs = ad; worst = i; }
-                    diff_sq += d * d; ref_sq += (double)ref_out[i] * (double)ref_out[i];
+                    if (ad > max_abs)
+                    {
+                        max_abs = ad;
+                        worst = i;
+                    }
+                    diff_sq += d * d;
+                    ref_sq += (double)ref_out[i] * (double)ref_out[i];
                 }
                 double rel_l2 = ref_sq > 0.0 ? std::sqrt(diff_sq) / std::sqrt(ref_sq) : 0.0;
                 LOG_INFO("MLP_TP_PARITY rel_l2=" << rel_l2 << " max_abs=" << max_abs << " worst_index=" << worst);

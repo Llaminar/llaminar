@@ -111,23 +111,23 @@ namespace llaminar
         std::shared_ptr<TensorBase> createLocalTensor(const std::vector<size_t> &shape);
 
 #ifdef LLAMINAR_ENABLE_RMSNORM_REFERENCE
-    /**
-     * @brief Perform heavy reference validation comparing kernel output to a scalar reference implementation.
-     *
-     * Builds a high-precision (double accumulation) reference RMSNorm of the full activation on rank 0 and
-     * logs relative L2 error, worst element diagnostics, and optional row previews for traced rows.
-     * Extremely expensive – only compiled when LLAMINAR_ENABLE_RMSNORM_REFERENCE is defined and executed
-     * when runtime flag debugEnv().rmsnorm.validate_ref is true.
-     *
-     * @param global_input  Full (possibly sharded feature-slice) input tensor.
-     * @param weight        Gamma / scale tensor (replicated or sharded slice); reference assumes hidden match.
-     * @param global_output Kernel-computed output to validate.
-     * @param trace_rows    Optional rows requested for detailed diff previews.
-     */
-    void runReferenceValidation(const std::shared_ptr<TensorBase> &global_input,
-                    const std::shared_ptr<TensorBase> &weight,
-                    const std::shared_ptr<TensorBase> &global_output,
-                    const std::vector<int> &trace_rows);
+        /**
+         * @brief Perform heavy reference validation comparing kernel output to a scalar reference implementation.
+         *
+         * Builds a high-precision (double accumulation) reference RMSNorm of the full activation on rank 0 and
+         * logs relative L2 error, worst element diagnostics, and optional row previews for traced rows.
+         * Extremely expensive – only compiled when LLAMINAR_ENABLE_RMSNORM_REFERENCE is defined and executed
+         * when runtime flag debugEnv().rmsnorm.validate_ref is true.
+         *
+         * @param global_input  Full (possibly sharded feature-slice) input tensor.
+         * @param weight        Gamma / scale tensor (replicated or sharded slice); reference assumes hidden match.
+         * @param global_output Kernel-computed output to validate.
+         * @param trace_rows    Optional rows requested for detailed diff previews.
+         */
+        void runReferenceValidation(const std::shared_ptr<TensorBase> &global_input,
+                                    const std::shared_ptr<TensorBase> &weight,
+                                    const std::shared_ptr<TensorBase> &global_output,
+                                    const std::vector<int> &trace_rows);
 #endif // LLAMINAR_ENABLE_RMSNORM_REFERENCE
 
         float epsilon_;                 ///< Small value to prevent division by zero
