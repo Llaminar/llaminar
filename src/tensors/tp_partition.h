@@ -9,6 +9,7 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <cstring>
 
 namespace llaminar
 {
@@ -112,6 +113,70 @@ namespace llaminar
         }
 
     private:
+        MatmulFn fn_;
+    };
+
+    /**
+     * @brief Column-splitting matmul splitter: partitions N dimension of B (and C) across tp_size.
+     * Assumes caller provides full A and full B; this splitter will compute only its column slice into C_local.
+     * Reconstruction (concatenating columns) is left to higher-level orchestration.
+     */
+    class ColumnSplitMatmulSplitter : public MatmulSplitter
+    {
+    public:
+        using MatmulFn = std::function<bool(const float *, const float *, float *, std::size_t, std::size_t, std::size_t)>;
+        ColumnSplitMatmulSplitter(std::size_t global_N, int tp_size, int tp_rank, MatmulFn fn)
+            : specB_(compute_tp_partition(global_N, tp_size, tp_rank, TPPartitionSpec::Axis::Col)), fn_(std::move(fn)) {}
+
+        bool run(const Args &a) override
+        {
+            if (!specB_.active())
+            {
+                return fn_(a.A, a.B, a.C, a.M, a.N, a.K);
+            }
+            // Need to pack the column slice [offset, offset+local_dim) into contiguous K*local_dim buffer
+            // Original B layout: row-major [K,N_full]; element (k,j) at B[k*N_full + j]
+            std::vector<float> packed;
+            packed.resize(a.K * specB_.local_dim);
+            for (std::size_t k = 0; k < a.K; ++k)
+            {
+                const float *row_src = a.B + k * specB_.global_dim + specB_.local_offset; // stride by global N
+                float *row_dst = packed.data() + k * specB_.local_dim;
+                std::memcpy(row_dst, row_src, sizeof(float) * specB_.local_dim);
+            }
+            return fn_(a.A, packed.data(), a.C, a.M, specB_.local_dim, a.K);
+        }
+
+        TPPartitionSpec specA() const override { return TPPartitionSpec{}; }
+        TPPartitionSpec specB() const override { return specB_; }
+
+    private:
+        TPPartitionSpec specB_;
+        MatmulFn fn_;
+    };
+
+    /**
+     * @brief Row-splitting matmul splitter: partitions M dimension of A (and C) across tp_size.
+     * Caller must provide full B; A_local and C_local correspond to local M slice.
+     */
+    class RowSplitMatmulSplitter : public MatmulSplitter
+    {
+    public:
+        using MatmulFn = std::function<bool(const float *, const float *, float *, std::size_t, std::size_t, std::size_t)>;
+        RowSplitMatmulSplitter(std::size_t global_M, int tp_size, int tp_rank, MatmulFn fn)
+            : specA_(compute_tp_partition(global_M, tp_size, tp_rank, TPPartitionSpec::Axis::Row)), fn_(std::move(fn)) {}
+
+        bool run(const Args &a) override
+        {
+            // a.M is expected to be specA_.local_dim (caller supplies local A pointer already).
+            return fn_(a.A, a.B, a.C, specA_.local_dim, a.N, a.K);
+        }
+
+        TPPartitionSpec specA() const override { return specA_; }
+        TPPartitionSpec specB() const override { return TPPartitionSpec{}; }
+
+    private:
+        TPPartitionSpec specA_;
         MatmulFn fn_;
     };
 

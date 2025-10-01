@@ -81,6 +81,77 @@ mpirun -np 2 --bind-to socket --map-by socket \
 
 ## Architecture
 
+### Architecture Overview (ASCII Diagram)
+```
+         +-----------------------------------------+
+         |            Inference Flow               |
+         +-----------------------------------------+
+   Model Load & Init (GGUF parse, quant tensors, topology)      
+         |
+         v
+     +----------------------+    Environment / Heuristic    
+     | Distribution Mode    |<-----------------------------+
+     |  replicated / sharded|   (param count, mem fraction)
+     +----------+-----------+
+          |
+          v
+     +----------------------+      +----------------------+
+     | Shard / TP Metadata  |      |   Debug Env Snapshot |
+     |  ShardSpec (heads/h) |      |  (prefill thresholds) |
+     |  TPPartitionSpec (*) |      |                      |
+     +----------+-----------+      +----------+-----------+
+          |                            |
+          +--------------+-------------+
+                |
+                v
+          +-------------------------------+
+          |      Layer Forward Pass       |
+          +-------------------------------+
+          |  Attention  |   MLP   | Norm  |
+          +------+------+--------+--------+
+           |         |        |
+           v         v        v
+       (Per MatMul) Backend Selection
+           |
+       +---------+------------------+
+       | PrefillBackend (large seq) |
+       | InferenceBackend (decode)  |
+       +---------------+------------+
+              |
+            launch(OpDesc,Ctx)
+              |
+        +--------------+---------------+
+        |  Fallback if Unsupported ->  |
+        |      adaptive_matmul()       |
+        +--------------+---------------+
+              |
+          Heuristic Arbitration
+              |
+       +------------------+------------------+
+       |     OpenBLAS (local)      | COSMA (dist) |
+       +--------------+------------+--------------+
+              |
+            Local/Dist Output
+              |
+        +-----------+------------+
+        | Attention Output Modes |
+        | local | gather_pre     |
+        | gather_post | replicated |
+        +-----------+------------+
+              |
+              Residual
+              |
+            Next Layer → ...
+
+(* planned future TP executor enabling row/col shard execution.)
+
+Rank 0 One-Time Logs:
+  MODEL_DIST ...
+  BACKEND_DECISION_SUMMARY component=Attention ...
+  BACKEND_DECISION_SUMMARY component=MLP ...
+```
+
+
 All execution paths now go through MPI-aware kernels; legacy non-MPI kernels (LinearKernel, AttentionKernel, RMSNormKernel, MatMulKernel) have been removed. Backend selection (OpenBLAS vs COSMA) is centralized in `adaptive_matmul.h`, ensuring a single decision point and preventing divergence between sequential and distributed code paths.
 
 Design principles:
@@ -203,3 +274,18 @@ When enabled, rank 0 recomputes a top-left `(T x T)` GEMM using the original row
 
 ### Reference
 Design details and acceptance criteria are tracked in `.github/instructions/cosma-prefill-plan.instructions.md` (Phase 1).
+
+## Llaminar
+
+High-performance, distributed LLM inference engine.
+
+## Key Documentation
+
+- [Canonical Launch & Runtime Summary](docs/canonical-launch-summary.md)
+- [MPI Barrier Guidelines](docs/mpi_barrier_guidelines.md)
+- [Partial Attention Output Details](docs/attention-partial-output.md)
+- [Tensor Parallel Architecture](docs/tensor_parallel_architecture.md)  <!-- Newly added -->
+
+## Build
+
+See `./run-llaminar.sh -h` for runtime options or consult the development guidelines in `.github/copilot-instructions.md`.

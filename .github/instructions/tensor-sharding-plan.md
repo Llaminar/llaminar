@@ -1,7 +1,196 @@
 # Hybrid Head + Tensor Parallel Sharding Plan
 
-> Status: Rev 2 (supersedes earlier draft focusing only on hidden sharding)
+> Status: Rev 2.1 (adds backend abstraction alignment + replicated vs sharded mode integration)
 > Scope: Introduce a two-level parallel layout: inter-socket (MPI) head sharding + intra-socket tensor parallel (TP) for dense projections (CPU today, GPU-ready). Replace legacy implicit gathers with explicit shard metadata & selectable output modes.
+
+---
+### Quick Reference (Cheat Sheet)
+
+| Domain | Decision | Primary Driver | Env Override(s) | Outcomes |
+|--------|----------|----------------|-----------------|----------|
+| Distribution Mode | Replicated vs Sharded | Param count & mem fraction heuristic | `LLAMINAR_DISTRIBUTION_MODE`, `LLAMINAR_FORCE_{REPLICATED,SHARDED}`, `LLAMINAR_SHARDING_PARAM_THRESHOLD`, `LLAMINAR_MODEL_MEM_FRACTION_MAX` | Replica of all weights OR partitioned weights |
+| Attention Output Assembly | local / gather_pre / gather_post / replicated(alias) | Sequence length vs threshold | `LLAMINAR_ATTN_OUTPUT_MODE`, `LLAMINAR_ATTN_GATHER_THRESHOLD` | Local heads, Pre-gather single WO, Post-projection reduction |
+| Prefill vs Inference Backend | PrefillBackend vs InferenceBackend | `seq_len >= cosma.prefill_threshold` | `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Throughput path vs latency path (matmuls) |
+| Tensor Parallel (intra-socket) | Enable TP executors | Implementation phase & disable flag | `LLAMINAR_ATTN_TP_DISABLE` | Identity (today) or row/col split (future) |
+| COSMA Usage | Distributed vs local BLAS | Matmul size & prefill flag | `ADAPTIVE_DISABLE_COSMA` | COSMA path or OpenBLAS variants |
+
+Key Environment Variables:
+```
+LLAMINAR_DISTRIBUTION_MODE=replicated|sharded
+LLAMINAR_ATTN_OUTPUT_MODE=local|gather_pre|gather_post|replicated
+LLAMINAR_ATTN_GATHER_THRESHOLD=<int seq_len>
+LLAMINAR_COSMA_PREFILL_THRESHOLD=<int seq_len>
+LLAMINAR_ATTN_TP_DISABLE=1   # Force-disable intra-socket TP features
+ADAPTIVE_DISABLE_COSMA=1     # Force OpenBLAS path
+```
+
+Backend Decision Flow (simplified):
+```
+if seq_len >= cosma.prefill_threshold:
+    backend = PrefillBackend (favor large / distributed GEMM)
+else:
+    backend = InferenceBackend (favor low-latency local GEMM)
+if backend.launch(...) != Success:
+    fallback -> adaptive_matmul (OpenBLAS/COSMA arbitration)
+```
+
+Attention Output Mode Selection (high-level):
+```
+if explicit env mode: use it
+else if seq_len >= ATTN_GATHER_THRESHOLD: gather_pre
+else: local (decode default)
+```
+
+One-Time Rank0 Logs:
+```
+MODEL_DIST mode=... params=... reason=...
+BACKEND_DECISION_SUMMARY component=Attention ...
+BACKEND_DECISION_SUMMARY component=MLP ...
+```
+
+Parity / Validation Strategy:
+1. Run replicated single-rank (baseline).
+2. Enable sharded mode; reconstruct tensors via gather in tests.
+3. Compare max_abs / rel_L2 within tolerance.
+
+Fast Sanity Checklist Before Benchmarking:
+```
+grep -R "MPI_Allreduce" src | grep -v stats   # no accidental full activation reductions
+./run-llaminar.sh -v --print-topology         # verify shard summaries (future)
+```
+
+Refer also to: `llaminar-architecture.instructions.md` (Backend Abstraction Layer section) for deeper rationale.
+
+---
+## 0. Deployment Modes (New High-Level Policy)
+
+We standardize Llaminar execution into TWO mutually exclusive model distribution modes, selected primarily by parameter count (and optionally by runtime memory pressure heuristics):
+
+Mode | Target Model Size | Weight Strategy | Parallelism Kind | Collectives in Forward | Primary Goals
+-----|-------------------|-----------------|------------------|------------------------|---------------
+`ReplicatedDataParallel` | < ~32B params (fits in per-device RAM with comfortable headroom) | Full weight replica per rank | Batch / request (data) parallel; optional head slicing for latency | Minimal (possibly final logits / diagnostics only) | Lowest complexity & latency
+`ShardedTensorParallel` | ≥ ~32B params OR memory footprint > X% of device RAM | Partition large weights across ranks (column, row, or hybrid) | Intra-layer weight sharding + (optional) head sharding | Layer-local: AllGather / ReduceScatter / AllReduce as defined | Memory scaling & large prefill throughput
+
+### 0.1 Selection Heuristic (Initial Draft)
+At process start (after model metadata parsed):
+
+```
+let P_total = total parameter count
+let bytes_per_param = (quant_bits / 8) or mixed precision estimate
+let est_model_bytes = P_total * bytes_per_param (including optimizer = N/A in inference)
+let dev_mem = detected usable memory per rank (or user override)
+
+if (env override forces mode) use that.
+else if (P_total < 32B AND est_model_bytes < 0.55 * dev_mem) -> ReplicatedDataParallel
+else -> ShardedTensorParallel
+```
+
+Rationale:
+* 55% cap leaves headroom for KV cache, activation spikes, allocator fragmentation.
+* 32B is a pragmatic inflection based on typical 2× HBM GPU or multi-socket DRAM budgets; adjust as empirical data arrives.
+
+### 0.2 Environment Overrides (Proposed)
+Add to `debug_env` snapshot (names tentative):
+| Variable | Values | Effect |
+|----------|--------|--------|
+| `LLAMINAR_DISTRIBUTION_MODE` | `replicated` / `sharded` / unset | Force specific mode (bypass heuristic) |
+| `LLAMINAR_FORCE_REPLICATED` | any | Shortcut alias forcing replicated (deprecated when mode matures) |
+| `LLAMINAR_FORCE_SHARDED` | any | Shortcut alias forcing sharded |
+| `LLAMINAR_SHARDING_PARAM_THRESHOLD` | integer (billions) | Override 32B switch point |
+| `LLAMINAR_MODEL_MEM_FRACTION_MAX` | float (0.0–0.95) | Replace 0.55 heuristic |
+
+Conflict resolution precedence (highest first):
+1. `LLAMINAR_DISTRIBUTION_MODE`
+2. FORCE flags (`FORCE_SHARDED` / `FORCE_REPLICATED`)
+3. Threshold / fraction overrides
+4. Built-in defaults
+
+### 0.3 Execution Surface Differences
+Aspect | ReplicatedDataParallel | ShardedTensorParallel
+-------|------------------------|----------------------
+Weight Load | Single pass, identical mapping per rank | Partition mapping (slice metadata created) |
+Memory Footprint | O(model) per rank | O(model / world_size) per rank (plus shard metadata) |
+Matmul Kernels | Standard GEMMs | Local shard GEMMs (reduced dimensions) |
+Collectives (Attention) | Optional head gather (if configured) | Defined per projection (gather pre/post or reduce-scatter) |
+RMSNorm | Local stats only | Scalar AllReduce (sumsq) |
+MLP | Fully local | Up/down projections sharded (col/row) |
+Failure Modes | Mostly local | Collective mismatch, shard misalignment |
+Debug Parity Path | Always available (single rank run) | Requires reconstruction harness |
+
+### 0.4 Transition Path
+Phase | Action | Guardrails
+------|--------|-----------
+1 | Implement selector + metadata flag `distribution_mode` | Silent fallback to replicated on any shard init failure
+2 | Weight file loader emits shard slices (contiguous) | Cross-check sum(local_dim) == global_dim
+3 | Enable attention output projection sharding | Parity test vs replicated (max_abs, rel_L2)
+4 | Enable MLP (W1/W2/W3) sharding | Add perf counters (comm vs compute ms)
+5 | Introduce reduce-scatter path for WO | Environment gated
+6 | Autotune gather timing (prefill vs decode) | Logging + diff guard
+
+### 0.5 Rollback / Failsafe
+If any collective times out or parity validation fails under debug flag:
+* Log error with shard descriptors
+* Set a runtime sticky flag `sharding_degraded=true`
+* Reroute remaining layers through replicated fallback (if memory still sufficient)
+
+### 0.6 Testing Additions (Mode-Aware)
+Test | Replicated | Sharded
+-----|------------|--------
+`ModelLoadModeSelectTest` | ✓ | ✓ (assert mode selection) |
+`AttentionWOShardParityTest` | Baseline | Reconstruct vs baseline |
+`MLPShardParityTest` | Baseline | Reconstruct vs baseline |
+`NormScalarAllReduceTest` | Local sums == global | Validate AllReduce correctness |
+
+### 0.7 Telemetry / Logging
+On startup print (rank 0):
+```
+MODEL_DIST mode=sharded params=47.1B quant=4.0b est_model=~23.5GB dev_mem=79GB mem_frac=0.30 reason="exceeds param threshold"
+```
+or
+```
+MODEL_DIST mode=replicated params=7.0B quant=4.0b est_model=~3.5GB dev_mem=63GB mem_frac=0.06 reason="below thresholds"
+```
+
+### 0.8 Open Questions
+| Question | Current Stance |
+|----------|----------------|
+| Should we prefer memory fraction or param count first? | Param count gives coarse early exit; fraction refines borderline cases. |
+| Multiple quant formats (per-layer variance) impact estimate? | Use worst-case (largest bytes/param) until per-layer accounting added. |
+| Dynamic downgrade if fragmentation grows? | Future: periodic allocator watermark check (deferred). |
+
+---
+
+## 0.a Backend Abstraction Alignment (New)
+
+Recent refactors introduced lightweight prefill vs inference backend interfaces (`prefill_backend.*`, `inference_backend.*`) wrapping all projection GEMMs (Q/K/V, WO, Gate/Up/Down). This impacts the sharding plan as follows:
+
+| Concern | Previous State | Current State |
+|---------|----------------|---------------|
+| Kernel call sites | Direct `adaptive_matmul` invocations | Backend `launch()` with fallback to `adaptive_matmul` |
+| Prefill vs Decode heuristic | Scattered size checks | Unified: `seq_len >= debugEnv().cosma.prefill_threshold` |
+| Future GPU enablement | Would require editing every kernel | Drop-in GPU backend implementation; sharding logic unchanged |
+| Logging | Ad-hoc per-matmul | One-time `BACKEND_DECISION_SUMMARY` per component (rank0) |
+| Failure handling | Immediate error | Backend returns `Unsupported/Error` → WARN → fallback |
+
+### Why It Matters for Sharding
+1. Shard-aware dimensions (e.g., reduced K or N) are passed uniformly through descriptors, simplifying future TP executor insertion.
+2. Collective decisions (gather pre vs post) remain orthogonal; backends only see local (shard) shapes.
+3. When weight sharding activates, only the dimensions in the `OpDesc` shrink—no changes to backend selection logic.
+
+### Logging Example
+```
+BACKEND_DECISION_SUMMARY component=Attention seq_len=8192 threshold=4096 path=prefill prefill_backend=cpu_stub inference_backend=cpu_stub phases=QKV+Out fallback=adaptive_matmul
+```
+
+### Relationship to This Plan
+The plan’s intra-layer partition steps (WO / MLP sharding, ReduceScatter, etc.) will feed the backends local shard shapes. No additional abstraction layers are expected; the existing backend interfaces become the stable contract between high-level sharding policy and execution.
+
+### Non-Goals
+* Backends do not perform collective orchestration.
+* Backends do not own sharding metadata (`ShardSpec`/`TPPartitionSpec`).
+* Backends do not re-implement heuristic thresholds (single source: `debugEnv()` + adaptive matmul internals).
+
+---
 
 ---
 ## 1. Motivation
@@ -309,7 +498,8 @@ Benefit: Eliminates dominating term for large H, improves scaling.
 6. (PLANNED) Integrate TP executors into WO + MLP; TP parity tests (row & col).
 7. (PLANNED) Overlap (nonblocking collectives / compute) prototypes.
 8. (PLANNED) ReduceScatter WO experimental path.
-9. (PLANNED) Replicated mode alias + cleanup of legacy debug flags.
+9. (DONE) Replicated mode alias (implemented Rev 2.2) + pending minor legacy flag cleanup.
+10. (DONE) Prefill/Inference backend abstraction wiring (attention + MLP) with fallback & rank0 summary log.
 
 ---
 ## 17. Success Criteria & Sign-off Checklist (Updated)
@@ -378,7 +568,7 @@ bool ShardedAttention::execute(const DistTensor& x, DistTensor& out) {
 ## 23. Immediate Next Actions (Execution Queue – Updated)
 1. (DONE) Replicated mode alias to gather_pre (metadata distinction) + env selection.
 2. Integrate TP executors into WO path (column split baseline) behind `LLAMINAR_ATTN_TP_DISABLE`.
-3. RMSNorm shard stats test (scalar Allreduce parity) preparing hidden sharding.
+3. (DONE) RMSNorm shard stats test (scalar Allreduce parity) preparing hidden sharding (RMSNormShardStats_Parity passing).
 4. Performance instrumentation: gather_pre vs gather_post timing across S={128,2k,8k}; log GFLOPS & comm ms.
 5. TP row & col executor implementations + parity tests M,N not divisible by tp_size.
 6. ReduceScatter WO experimental path.
@@ -401,3 +591,98 @@ grep -R "MPI_Allreduce" -n src | grep -v stats || true
 ---
 ## 25. Conclusion
 We evolve from a single-axis hidden sharding concept to a hierarchical strategy optimized for modern NUMA and multi-GPU topologies. This layered approach allows us to defer inter-socket communication, exploit intra-socket bandwidth with TP, and cleanly extend toward ReduceScatter and vocab sharding. The staged roadmap ensures incremental correctness while laying the groundwork for aggressive performance optimizations.
+
+
+---
+
+# Tensor Parallel Architecture in Llaminar
+
+Author: David Sanftenberg
+
+## Purpose
+Clarify what "tensor parallel" (TP) means in Llaminar so future design and code paths reflect the *intended* scope: **inter-socket / inter-device tensor partitioning**, not intra-socket micro-partitioning.
+
+## Summary Definition
+Tensor Parallel (TP) in Llaminar: A strategy that splits large model weight tensors (e.g. projection matrices) *across distinct compute domains* (CPU sockets or GPUs) so that each domain owns a contiguous shard and participates in collective reconstruction (or avoids it through algorithmic reformulation). TP is **not** about slicing within a single NUMA domain purely to feed more threads; that case is a local threading / BLAS scheduling concern, not architectural TP.
+
+## Why This Clarification Was Needed
+Recent experimental code introduced per-socket column partition logic and splitter abstractions inside a single process with one MPI rank per socket. This blurred boundaries between:
+- Local kernel micro-optimizations (packing, loop tiling, OpenMP)
+- True TP (multi-rank coordinated layout & communication semantics)
+
+Removing the in-process splitter reflects the decision: until we introduce multi-rank head or MLP weight distribution, we stay with a single GEMM per rank.
+
+## Scope of Tensor Parallel in Llaminar
+| Aspect | In-Scope (TP) | Out-of-Scope (Not TP) |
+|--------|---------------|-----------------------|
+| Device boundary | Splitting across MPI ranks mapped to sockets / GPUs | Slicing purely for OpenMP thread balance |
+| Communication | Requires gather / reduce / all-reduce / scatter primitives | No inter-rank collectives required |
+| Partition object | `ShardSpec`, future TP layout metadata | Temporary per-loop spec inside one rank |
+| Performance goal | Reduce per-rank memory & enable scaling larger models | Extract a few % from cache/packing reuse |
+| Failure modes | Collective mismatch, shard misalignment | Minor local scheduling inefficiency |
+
+## Architectural Pillars for TP
+1. **Deterministic Partitioning**: A canonical mapping from global tensor shape to (rank -> slice range). Implemented via `ShardSpec` today; future expansion: richer TP layout registry.
+2. **Collective Semantics**: For each distributed operation, define whether the result is:
+   - Fully materialized on each rank (replicated)
+   - Partially owned (requiring later gather)
+   - Reduced (sum/mean) across ranks
+3. **Latency Hiding / Overlap** (future): Stream shard communication while computing local tiles (esp. for attention prefill & MLP projections).
+4. **Backend Neutrality**: TP should compose with adaptive matmul (OpenBLAS vs COSMA). Distribution policy decides shape; backend executes local shard tile.
+5. **Fallback Grace**: If environment / model size does not justify TP (few ranks, small matrices), remain on single-rank-per-socket replicated path with zero overhead.
+
+## Current State (2025-10-01)
+- Execution model: One MPI rank per CPU socket.
+- Weights: Replicated per rank (no memory pressure at present target model sizes in tests).
+- Output projection (WO): Simplified back to single GEMM (no intra-rank sharding).
+- No true cross-rank TP collectives yet for attention or MLP.
+
+## When TP Becomes Necessary
+Trigger conditions suggesting real TP implementation:
+- Model dimension or parameter count exceeds per-socket memory budget (e.g. > ~40–50 GB resident for targeted hardware).
+- Need to reduce per-rank activation footprint to keep cache pressure manageable.
+- Prefill latency dominated by large projection GEMMs where each rank could own a fractional slice enabling parallel speedup > comm overhead.
+
+## Planned TP Evolution Path
+Stage | Milestone | Key Additions | Risks
+------|-----------|---------------|------
+1 | Spec Formalization | `TPLayout` struct (tensor -> {rank: slice}) | Consistency across kernels
+2 | Read-Only Weight Sharding | Static partition at load (sharded mmap or scatter) | Loader complexity
+3 | Attention WO Shard + AllGather | Local matmul + gather heads before next layer | Gather latency
+4 | MLP FFN Split (Column/Row Hybrid) | Column split W1/W2 + optional reduce-scatter | Overlapping comm
+5 | Overlap & Pipelining | Stream gather while computing next shard | Deadlocks / ordering
+6 | Autotuned Policy | Dynamic decision per layer (size, rank count, seq_len) | Policy thrash
+
+## Non-Goals (for TP layer)
+- Micro kernel autotiling inside a single shard.
+- OpenBLAS thread assignment heuristics (belongs to adaptive backend layer).
+- Replacing COSMA topology logic (orthogonal concern: local vs distributed GEMM backend selection).
+
+## Practical Guidance for Contributors
+DO:
+- Introduce new shard-aware code only behind explicit `ShardSpec` or future `TPLayout` objects.
+- Keep environment toggles centralized (extend `debug_env`).
+- Write tests that assert reconstruction correctness across >1 rank early.
+
+DON'T:
+- Add per-rank intra-socket slicing just for local loops and call it TP.
+- Intermix packing / layout transforms with TP policy logic (separate concerns).
+- Depend on ad-hoc env flags for novel TP states—register them first.
+
+## FAQ
+Q: Why not do intra-socket TP to leverage more cores?
+A: We already exploit cores via OpenMP / BLAS. Slicing tensors purely to reissue more smaller GEMMs usually regresses due to packing & launch overheads versus one well-optimized large GEMM.
+
+Q: Will TP hurt small batch / short sequence latency?
+A: Proper policy gating should disable TP when comm + synchronization overhead outweighs parallel benefit (e.g., short decode steps).
+
+Q: Can COSMA replace TP for large GEMMs?
+A: COSMA distributes a single GEMM but still assumes full operands per rank or well-defined process grids; TP is a *model-graph level* partitioning of weights/activations feeding multiple GEMMs across layers.
+
+## Action Items (Post-Clarification)
+- [ ] Add a lightweight `TPLayout` placeholder (no behavior) to anchor future PRs.
+- [ ] Audit existing code for any residual intra-rank TP artifacts (now removed from attention kernel projection).
+- [ ] Add documentation link reference in `README.md` under Architecture.
+
+---
+This document should be updated once weight sharding or collective-backed TP enters the codebase.

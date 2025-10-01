@@ -117,6 +117,7 @@ namespace llaminar
         bool tp_disable = false;         // LLAMINAR_ATTN_TP_DISABLE
         int tp_partitions = 1;           // LLAMINAR_ATTN_TP_PARTITIONS
         bool tp_auto = false;            // LLAMINAR_ATTN_TP_AUTO
+        bool tp_force_splitter = false;  // LLAMINAR_ATTN_TP_FORCE_SPLITTER
     };
 
     struct EmbeddingEnv
@@ -271,6 +272,15 @@ namespace llaminar
         std::string log_level;
     }; // LLAMINAR_LOG_LEVEL
 
+    struct DistributionEnvConfig
+    {
+        bool force_replicated = false;        // LLAMINAR_FORCE_REPLICATED
+        bool force_sharded = false;           // LLAMINAR_FORCE_SHARDED
+        std::string distribution_mode;        // LLAMINAR_DISTRIBUTION_MODE ("replicated"|"sharded"|"")
+        int param_threshold_billions = 32;    // LLAMINAR_SHARDING_PARAM_THRESHOLD (billions)
+        double model_mem_fraction_max = 0.55; // LLAMINAR_MODEL_MEM_FRACTION_MAX
+    };
+
     struct DebugEnvSnapshot
     {
         ShardingEnv sharding;
@@ -299,6 +309,7 @@ namespace llaminar
         EmbeddingWarnEnv embedding_warn;
         TestHarnessEnv test_harness;
         LoggingEnv logging;
+        DistributionEnvConfig distribution; // new group for high-level mode selection
     };
 
     // Accessor (lazy init, thread-safe via magic statics)

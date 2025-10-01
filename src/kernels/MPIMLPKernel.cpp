@@ -1,5 +1,7 @@
 #include "MPIMLPKernel.h"
 #include "../adaptive_matmul.h"
+#include "../backends/prefill_backend.h"
+#include "../backends/inference_backend.h"
 #include "../logger.h"
 #include <algorithm>
 #include <cmath>
@@ -56,17 +58,65 @@ namespace llaminar
         // Down projection always produces the full d_model columns locally (partial over rows of w_down if row sharded)
         auto local_output = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(d_model)});
 
-        // Step 1: Compute gate projection using COSMA
-        computeGateProjection(input, w_gate, gate_proj, seq_len, d_model, local_d_ff);
+        // Backend selection: treat large seq_len as prefill (use PrefillBackend) else InferenceBackend.
+        bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+        static bool logged_once = false;
+        if (!logged_once && getRank() == 0)
+        {
+            logged_once = true;
+            LOG_INFO("BACKEND_DECISION_SUMMARY component=MLP seq_len=" << seq_len
+                                                                       << " threshold=" << debugEnv().cosma.prefill_threshold
+                                                                       << " path=" << (is_prefill_like ? "prefill" : "inference")
+                                                                       << " prefill_backend=cpu_stub inference_backend=cpu_stub fallback=adaptive_matmul");
+        }
+        auto prefill_backend = PrefillBackendFactory::create();
+        auto infer_backend = InferenceBackendFactory::create();
 
-        // Step 2: Compute up projection using COSMA
-        computeUpProjection(input, w_up, up_proj, seq_len, d_model, local_d_ff);
+        auto run_matmul = [&](const char *tag,
+                              const std::shared_ptr<TensorBase> &A,
+                              const std::shared_ptr<TensorBase> &B,
+                              const std::shared_ptr<TensorBase> &C,
+                              size_t M, size_t N, size_t K)
+        {
+            bool ok = false;
+            if (is_prefill_like)
+            {
+                PrefillOpDesc desc;
+                desc.kind = PrefillOpKind::MatMul;
+                desc.M = (int64_t)M;
+                desc.N = (int64_t)N;
+                desc.K = (int64_t)K;
+                desc.is_prefill = true;
+                PrefillLaunchContext ctx{A->data(), B->data(), C->data()};
+                auto decision = prefill_backend->launch(desc, ctx);
+                if (decision.status == PrefillStatus::Success)
+                    ok = true;
+                else
+                {
+                    LOG_WARN("MLP " << tag << " backend fallback due to status=" << (int)decision.status << " reason=" << decision.reason);
+                }
+            }
+            if (!ok)
+            {
+                if (!adaptive_matmul(A->data(), B->data(), C->data(), (int)M, (int)N, (int)K, is_prefill_like))
+                {
+                    LOG_ERROR("MLP " << tag << " adaptive_matmul failed M=" << M << " N=" << N << " K=" << K);
+                    throw std::runtime_error("MLP matmul failure");
+                }
+            }
+        };
+
+        // Step 1: Gate projection
+        run_matmul("gate", input, w_gate, gate_proj, seq_len, local_d_ff, d_model);
+
+        // Step 2: Up projection
+        run_matmul("up", input, w_up, up_proj, seq_len, local_d_ff, d_model);
 
         // Step 3: Apply SwiGLU activation locally (no MPI communication)
         applySwiGLU(gate_proj, up_proj, activated, seq_len, local_d_ff);
 
-        // Step 4: Compute down projection using COSMA
-        computeDownProjection(activated, w_down, local_output, seq_len, local_d_ff, d_model);
+        // Step 4: Down projection
+        run_matmul("down", activated, w_down, local_output, seq_len, d_model, local_d_ff);
 
         // Step 5: Gather final output using MPI_Allreduce (only if this rank produced partial result)
         // Heuristic: if down weight is row-sharded (its first dimension < global d_ff) we need Allreduce.

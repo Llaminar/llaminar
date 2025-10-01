@@ -42,6 +42,8 @@
 #include "../utils/debug_sharding.h"
 #include "kernels/common/attention_primitives.h" // for optional validation
 #include "../adaptive_matmul.h"
+#include "../backends/prefill_backend.h"
+#include "../backends/inference_backend.h"
 #include "../tp_policy.h"
 #include "../logger.h"
 #include "../performance_timer.h"
@@ -225,9 +227,9 @@ namespace llaminar
 
         // Create local attended output tensor. For GatherHeadsPreProjection optimization we store
         // directly in heads-major layout [local_head_dim, seq_len] to skip a reorder later.
-    // Treat Replicated as an alias of GatherHeadsPreProjection (single global projection path)
-    bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
-             output_mode_ == AttentionOutputMode::Replicated);
+        // Treat Replicated as an alias of GatherHeadsPreProjection (single global projection path)
+        bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
+                         output_mode_ == AttentionOutputMode::Replicated);
         auto local_attended_output = pre_mode
                                          ? createLocalSimpleTensor({local_head_dim, seq_len})
                                          : createLocalSimpleTensor({seq_len, local_head_dim});
@@ -819,11 +821,62 @@ namespace llaminar
             }
             else
             {
-                if (!adaptive_matmul(input->data(), local_wq->data(), local_q->data(),
-                                     seq_len, local_head_dim, d_model, false))
                 {
-                    LOG_ERROR("Q projection failed on rank " << getRank());
-                    return;
+                    static bool logged_once = false;
+                    if (!logged_once && getRank() == 0)
+                    {
+                        logged_once = true;
+                        size_t threshold = static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+                        bool is_prefill_like = seq_len >= threshold;
+                        LOG_INFO("BACKEND_DECISION_SUMMARY component=Attention seq_len=" << seq_len
+                                                                                         << " threshold=" << threshold
+                                                                                         << " path=" << (is_prefill_like ? "prefill" : "inference")
+                                                                                         << " prefill_backend=cpu_stub inference_backend=cpu_stub phases=QKV+Out fallback=adaptive_matmul");
+                    }
+                    // Integrate abstraction (prefill vs inference) with fallback.
+                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+                    if (is_prefill_like)
+                    {
+                        static auto prefill_backend = PrefillBackendFactory::create();
+                        PrefillOpDesc desc;
+                        desc.kind = PrefillOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = local_head_dim;
+                        desc.K = d_model;
+                        desc.is_prefill = true;
+                        PrefillLaunchContext ctx{input->data(), local_wq->data(), local_q->data()};
+                        auto decision = prefill_backend->launch(desc, ctx);
+                        if (decision.status != PrefillStatus::Success)
+                        {
+                            LOG_WARN("Q projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(input->data(), local_wq->data(), local_q->data(), seq_len, local_head_dim, d_model, false))
+                            {
+                                LOG_ERROR("Q projection failed on rank " << getRank());
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        static auto infer_backend = InferenceBackendFactory::create();
+                        InferenceOpDesc desc;
+                        desc.kind = InferenceOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = local_head_dim;
+                        desc.K = d_model;
+                        desc.latency_critical = true;
+                        InferenceLaunchContext ctx{input->data(), local_wq->data(), local_q->data()};
+                        auto decision = infer_backend->launch(desc, ctx);
+                        if (decision.status != InferenceStatus::Success)
+                        {
+                            LOG_WARN("Q projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(input->data(), local_wq->data(), local_q->data(), seq_len, local_head_dim, d_model, false))
+                            {
+                                LOG_ERROR("Q projection failed on rank " << getRank());
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             if (validate_proj || force_scalar)
@@ -845,11 +898,50 @@ namespace llaminar
             }
             else
             {
-                if (!adaptive_matmul(input->data(), local_wk->data(), local_k->data(),
-                                     seq_len, local_head_dim, d_model, false))
                 {
-                    LOG_ERROR("K projection failed on rank " << getRank());
-                    return;
+                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+                    if (is_prefill_like)
+                    {
+                        static auto prefill_backend = PrefillBackendFactory::create();
+                        PrefillOpDesc desc;
+                        desc.kind = PrefillOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = local_head_dim;
+                        desc.K = d_model;
+                        desc.is_prefill = true;
+                        PrefillLaunchContext ctx{input->data(), local_wk->data(), local_k->data()};
+                        auto decision = prefill_backend->launch(desc, ctx);
+                        if (decision.status != PrefillStatus::Success)
+                        {
+                            LOG_WARN("K projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(input->data(), local_wk->data(), local_k->data(), seq_len, local_head_dim, d_model, false))
+                            {
+                                LOG_ERROR("K projection failed on rank " << getRank());
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        static auto infer_backend = InferenceBackendFactory::create();
+                        InferenceOpDesc desc;
+                        desc.kind = InferenceOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = local_head_dim;
+                        desc.K = d_model;
+                        desc.latency_critical = true;
+                        InferenceLaunchContext ctx{input->data(), local_wk->data(), local_k->data()};
+                        auto decision = infer_backend->launch(desc, ctx);
+                        if (decision.status != InferenceStatus::Success)
+                        {
+                            LOG_WARN("K projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(input->data(), local_wk->data(), local_k->data(), seq_len, local_head_dim, d_model, false))
+                            {
+                                LOG_ERROR("K projection failed on rank " << getRank());
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             if (validate_proj || force_scalar)
@@ -871,11 +963,50 @@ namespace llaminar
             }
             else
             {
-                if (!adaptive_matmul(input->data(), local_wv->data(), local_v->data(),
-                                     seq_len, local_head_dim, d_model, false))
                 {
-                    LOG_ERROR("V projection failed on rank " << getRank());
-                    return;
+                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+                    if (is_prefill_like)
+                    {
+                        static auto prefill_backend = PrefillBackendFactory::create();
+                        PrefillOpDesc desc;
+                        desc.kind = PrefillOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = local_head_dim;
+                        desc.K = d_model;
+                        desc.is_prefill = true;
+                        PrefillLaunchContext ctx{input->data(), local_wv->data(), local_v->data()};
+                        auto decision = prefill_backend->launch(desc, ctx);
+                        if (decision.status != PrefillStatus::Success)
+                        {
+                            LOG_WARN("V projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(input->data(), local_wv->data(), local_v->data(), seq_len, local_head_dim, d_model, false))
+                            {
+                                LOG_ERROR("V projection failed on rank " << getRank());
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        static auto infer_backend = InferenceBackendFactory::create();
+                        InferenceOpDesc desc;
+                        desc.kind = InferenceOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = local_head_dim;
+                        desc.K = d_model;
+                        desc.latency_critical = true;
+                        InferenceLaunchContext ctx{input->data(), local_wv->data(), local_v->data()};
+                        auto decision = infer_backend->launch(desc, ctx);
+                        if (decision.status != InferenceStatus::Success)
+                        {
+                            LOG_WARN("V projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(input->data(), local_wv->data(), local_v->data(), seq_len, local_head_dim, d_model, false))
+                            {
+                                LOG_ERROR("V projection failed on rank " << getRank());
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             if (validate_proj || force_scalar)
@@ -1190,131 +1321,74 @@ namespace llaminar
             auto_escalated = false;
         }
         bool use_tp = (tp_parts > 1) && !tp_disable;
-        // TP policy & instrumentation (column partitions only right now)
-        TPPolicyDecision tp_policy; // default
-        if (use_tp)
-        {
-            tp_policy = compute_tp_policy(tp_parts, seq_len, local_head_dim, d_model);
-        }
         if (!use_tp)
         {
-            PERF_SCOPED_TIMER("COSMA::output_projection");
-            if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(),
-                                 seq_len, d_model, local_head_dim, false))
+            PERF_SCOPED_TIMER("OutputProjection::single_gemm");
             {
-                LOG_ERROR("Output projection failed on rank " << getRank());
-                return;
+                bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+                if (is_prefill_like)
+                {
+                    static auto prefill_backend = PrefillBackendFactory::create();
+                    PrefillOpDesc desc;
+                    desc.kind = PrefillOpKind::MatMul;
+                    desc.M = seq_len;
+                    desc.N = d_model;
+                    desc.K = local_head_dim;
+                    desc.is_prefill = true;
+                    PrefillLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
+                    auto decision = prefill_backend->launch(desc, ctx);
+                    if (decision.status != PrefillStatus::Success)
+                    {
+                        LOG_WARN("Output projection prefill fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                        if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                        {
+                            LOG_ERROR("Output projection failed on rank " << getRank());
+                            return;
+                        }
+                    }
+                }
+                else
+                {
+                    static auto infer_backend = InferenceBackendFactory::create();
+                    InferenceOpDesc desc;
+                    desc.kind = InferenceOpKind::MatMul;
+                    desc.M = seq_len;
+                    desc.N = d_model;
+                    desc.K = local_head_dim;
+                    desc.latency_critical = true;
+                    InferenceLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
+                    auto decision = infer_backend->launch(desc, ctx);
+                    if (decision.status != InferenceStatus::Success)
+                    {
+                        LOG_WARN("Output projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                        if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                        {
+                            LOG_ERROR("Output projection failed on rank " << getRank());
+                            return;
+                        }
+                    }
+                }
             }
         }
         else
         {
-            PERF_SCOPED_TIMER("TP::output_projection_column_partition");
-            if (getRank() == 0)
-            {
-                LOG_INFO("[TP] Column-partitioned WO projection parts=" << tp_parts
-                                                                        << " blas_threads=" << tp_policy.blas_threads
-                                                                        << " outer_parallel=" << (tp_policy.outer_parallel ? "1" : "0")
-                                                                        << " d_model=" << d_model
-                                                                        << " seq_len=" << seq_len);
-            }
+            PERF_SCOPED_TIMER("OutputProjection::tp_partition");
             float *C = local_final_output->data();
-            const float *A = local_attended_output->data(); // [seq_len, local_head_dim]
-            const float *B = local_wo->data();              // [local_head_dim, d_model] row-major
-
-            // Temporarily adjust OpenBLAS threading (only once) per policy; restore afterwards when possible.
-            static int remembered_threads = -1; // heuristic baseline
-            int prev_threads = -1;
-#ifdef OPENBLAS_OPENMP
-            // OPENBLAS_OPENMP macro may not exist; we rely on openblas_set_num_threads symbol elsewhere.
-#endif
-            if (tp_policy.blas_threads > 0)
-            {
-                prev_threads = remembered_threads; // may be -1 (unknown)
-                openblas_set_num_threads(tp_policy.blas_threads);
-            }
-
-            auto do_partition = [&](int part)
+            const float *B = local_wo->data();
+            auto do_part = [&](int part)
             {
                 auto spec = compute_tp_partition(d_model, tp_parts, part, TPPartitionSpec::Axis::Col);
-                const int n_sub = static_cast<int>(spec.local_dim);
-                const int col_off = static_cast<int>(spec.local_offset);
-                const float *B_sub = B + col_off; // row-major, row stride d_model
-                float *C_sub = C + col_off;       // row-major, row stride d_model
-                // Timing per partition (adds trace rows when enabled)
-                auto t0 = std::chrono::high_resolution_clock::now();
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            static_cast<int>(seq_len), n_sub, static_cast<int>(local_head_dim),
-                            1.0f,
-                            A, static_cast<int>(local_head_dim),
-                            B_sub, static_cast<int>(d_model),
-                            0.0f,
-                            C_sub, static_cast<int>(d_model));
-                auto t1 = std::chrono::high_resolution_clock::now();
-                if (Logger::getInstance().shouldLog(LogLevel::TRACE))
+                int n_sub = (int)spec.local_dim;
+                int col_off = (int)spec.local_offset;
+                const float *B_sub = B + col_off;
+                float *C_sub = C + col_off;
+                if (!adaptive_matmul(local_attended_output->data(), B_sub, C_sub, seq_len, n_sub, local_head_dim, false))
                 {
-                    double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-                    LOG_TRACE("[TP] part=" << part << "/" << tp_parts << " n_sub=" << n_sub << " time_ms=" << ms);
+                    LOG_ERROR("[TP] partition projection failed part=" << part);
                 }
             };
-
-#ifdef _OPENMP
-            if (tp_policy.outer_parallel)
-            {
-#pragma omp parallel for schedule(static)
-                for (int part = 0; part < tp_parts; ++part)
-                    do_partition(part);
-            }
-            else
-#endif
-            {
-                for (int part = 0; part < tp_parts; ++part)
-                    do_partition(part);
-            }
-            // Restore thread level if we had a remembered baseline and changed it
-            if (tp_policy.blas_threads > 0 && prev_threads > 0)
-            {
-                openblas_set_num_threads(prev_threads);
-            }
-            if (remembered_threads < 0 && tp_policy.blas_threads > 0)
-            {
-                remembered_threads = tp_policy.blas_threads; // adopt as baseline for subsequent restores
-            }
-
-            // Optional lightweight correctness validation (only if enabled and small) using attn validate_proj flag.
-            if (attnEnv3.validate_proj)
-            {
-                size_t elems = seq_len * d_model;
-                if (elems > 0 && elems <= 8192)
-                {
-                    std::vector<float> ref(elems, 0.f);
-                    bool ok = adaptive_matmul(local_attended_output->data(), local_wo->data(), ref.data(),
-                                              seq_len, d_model, local_head_dim, false);
-                    if (ok)
-                    {
-                        const float *tp_out = local_final_output->data();
-                        double max_abs = 0.0, l2_ref = 0.0, l2_diff = 0.0;
-                        for (size_t i = 0; i < elems; ++i)
-                        {
-                            double diff = tp_out[i] - ref[i];
-                            if (std::fabs(diff) > max_abs)
-                                max_abs = std::fabs(diff);
-                            l2_ref += (double)ref[i] * ref[i];
-                            l2_diff += diff * diff;
-                        }
-                        double rel_l2 = (l2_ref > 0) ? std::sqrt(l2_diff) / std::sqrt(l2_ref) : 0.0;
-                        if (getRank() == 0)
-                        {
-                            LOG_INFO("[TP_VALIDATE] seq=" << seq_len << " d_model=" << d_model
-                                                          << " parts=" << tp_parts << " max_abs=" << max_abs
-                                                          << " rel_l2=" << rel_l2);
-                        }
-                    }
-                    else if (getRank() == 0)
-                    {
-                        LOG_WARN("[TP_VALIDATE] reference adaptive_matmul failed – validation skipped");
-                    }
-                }
-            }
+            for (int p = 0; p < tp_parts; ++p)
+                do_part(p);
         }
 
         // Optional scalar reference validation for output projection (pre-gather).
@@ -1372,15 +1446,9 @@ namespace llaminar
         }
 
         if (use_tp)
-        {
-            LOG_DEBUG("Computed output projection (TP col) heads=" << local_heads << " parts=" << tp_parts
-                                                                   << " blas_threads=" << tp_policy.blas_threads << " outer_parallel=" << (tp_policy.outer_parallel ? "1" : "0")
-                                                                   << " rank=" << getRank());
-        }
+            LOG_DEBUG("Computed output projection (TP col) heads=" << local_heads << " parts=" << tp_parts << " rank=" << getRank());
         else
-        {
             LOG_DEBUG("Computed output projection (single GEMM) heads=" << local_heads << " rank=" << getRank());
-        }
     }
 
     std::shared_ptr<TensorBase> MPIAttentionKernel::createLocalSimpleTensor(const std::vector<size_t> &shape) const

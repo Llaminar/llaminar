@@ -112,6 +112,7 @@ namespace llaminar
     s.attention.tp_disable = flag(std::getenv("LLAMINAR_ATTN_TP_DISABLE"));
     if(const char* tpp = std::getenv("LLAMINAR_ATTN_TP_PARTITIONS")) { int v=std::atoi(tpp); if(v>0 && v<1024) s.attention.tp_partitions = v; }
     s.attention.tp_auto = flag(std::getenv("LLAMINAR_ATTN_TP_AUTO"));
+    s.attention.tp_force_splitter = flag(std::getenv("LLAMINAR_ATTN_TP_FORCE_SPLITTER"));
     // Embedding
     s.embedding.trace = flag(std::getenv("LLAMINAR_EMBED_TRACE"));
     s.embedding.fail_fast = flag(std::getenv("LLAMINAR_EMBED_FAIL_FAST"));
@@ -209,6 +210,12 @@ namespace llaminar
 
     // Logging
     if(const char* lvl = std::getenv("LLAMINAR_LOG_LEVEL")) { if(*lvl){ s.logging.log_level_active=true; s.logging.log_level = lvl; } }
+        // Distribution Mode (two-tier policy)
+        if(const char* dm = std::getenv("LLAMINAR_DISTRIBUTION_MODE")) { if(*dm) s.distribution.distribution_mode = dm; }
+        s.distribution.force_replicated = flag(std::getenv("LLAMINAR_FORCE_REPLICATED"));
+        s.distribution.force_sharded    = flag(std::getenv("LLAMINAR_FORCE_SHARDED"));
+        if(const char* pt = std::getenv("LLAMINAR_SHARDING_PARAM_THRESHOLD")) { int v=std::atoi(pt); if(v>0) s.distribution.param_threshold_billions = v; }
+        if(const char* mf = std::getenv("LLAMINAR_MODEL_MEM_FRACTION_MAX")) { try { double d=std::stod(mf); if(d>0.0 && d<0.99) s.distribution.model_mem_fraction_max = d; } catch(...){} }
         return s; }();
         return snap;
     }
@@ -257,6 +264,15 @@ namespace llaminar
                         " force_unit_gamma=" + on(s.rmsnorm.force_unit_gamma) +
                         " gamma_checksum=" + on(s.rmsnorm.gamma_checksum) +
                         (s.rmsnorm.trace_rows_spec.empty() ? "" : " trace_rows=" + s.rmsnorm.trace_rows_spec));
+        // Distribution summary (only if any override active)
+        if (!s.distribution.distribution_mode.empty() || s.distribution.force_replicated || s.distribution.force_sharded)
+        {
+            lines.push_back(std::string("[DebugEnv] distribution: mode=") + (s.distribution.distribution_mode.empty() ? "<auto>" : s.distribution.distribution_mode) +
+                            " force_repl=" + on(s.distribution.force_replicated) +
+                            " force_sharded=" + on(s.distribution.force_sharded) +
+                            " param_thr(B)=" + std::to_string(s.distribution.param_threshold_billions) +
+                            " mem_frac_max=" + std::to_string(s.distribution.model_mem_fraction_max));
+        }
         lines.push_back(std::string("[DebugEnv] ablation: attention=") + on(s.ablation.ablate_attention) +
                         " ffn=" + on(s.ablation.ablate_ffn));
         if (s.layer_capture.capture)

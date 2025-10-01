@@ -141,6 +141,12 @@ set(LLAMINAR_CORE_SOURCES
     src/model_loader.cpp
     src/repacker.cpp
     src/socket_aware_inference.cpp
+    # Backend abstraction (prefill / inference future GPU integration)
+    src/backends/device_kind.h
+    src/backends/prefill_backend.h
+    src/backends/prefill_backend.cpp
+    src/backends/inference_backend.h
+    src/backends/inference_backend.cpp
     # Adaptive architecture components
     src/adaptive_matmul.h
     src/adaptive_transformer_pipeline.h
@@ -212,6 +218,10 @@ target_link_libraries(adaptive_demo llaminar_core)
 # Production adaptive architecture demonstration
 add_executable(production_demo src/production_demo.cpp)
 target_link_libraries(production_demo llaminar_core)
+
+# Tensor-parallel output projection micro-benchmark
+add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
+target_link_libraries(bench_tp_output_projection llaminar_core)
 
 # Add DEBUG flag to main executable when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -437,6 +447,31 @@ if(GTEST_FOUND)
              COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_attention_shard_parity>)
     set_tests_properties(AttentionShardParityStandalone PROPERTIES TIMEOUT 30)
     set_tests_properties(AttentionShardParityStandalone PROPERTIES LABELS "attention;parity;sharding;standalone")
+
+    # RMSNorm shard stats test (validates distributed inverse scale parity vs reference)
+    add_executable(test_rmsnorm_shard_stats tests/test_rmsnorm_shard_stats.cpp)
+    target_link_libraries(test_rmsnorm_shard_stats llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_rmsnorm_shard_stats GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME RMSNormShardStats_Parity
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_rmsnorm_shard_stats>)
+
+    # TP splitters unit tests (pure local, no MPI required)
+    add_executable(test_tp_splitters tests/test_tp_splitters.cpp)
+    target_link_libraries(test_tp_splitters llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_tp_splitters GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME TPSplittersTest COMMAND test_tp_splitters)
+
+    # Attention TP parity test (column split reconstruction)
+    add_executable(test_attention_tp_parity tests/test_attention_tp_parity.cpp)
+    target_link_libraries(test_attention_tp_parity llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_attention_tp_parity GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME AttentionTPParityTest COMMAND test_attention_tp_parity)
 
     # Negative misuse test: ensures missing reduction leads to detectable mismatch
     add_test(NAME AttentionShardMissingReduction_Negative

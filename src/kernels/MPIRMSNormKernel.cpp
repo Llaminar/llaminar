@@ -122,7 +122,8 @@ namespace llaminar
 
         // Extract dimensions
         size_t global_seq_len = static_cast<size_t>(global_input->shape()[0]);
-        size_t hidden_size = static_cast<size_t>(global_input->shape()[1]);
+        size_t hidden_size = static_cast<size_t>(global_input->shape()[1]); // local view (full if not sharded)
+        size_t global_hidden_dim_reported = hidden_size;                    // full hidden size when sharded
 
         // Shard-aware feature-slice detection (head/hidden sharding along feature dimension)
         bool feature_sharded = false;
@@ -130,14 +131,16 @@ namespace llaminar
         if (auto *ss = dynamic_cast<ShardedSimpleTensor *>(global_input.get()))
         {
             const ShardSpec &spec = ss->shard_spec();
-            // If tensor reports sharded along heads/hidden and local_dim < global hidden_size treat as feature slice
+            // Updated detection: rely on spec.global_dim as canonical full hidden size; if local_dim < global_dim treat as sharded slice.
             if (spec.is_sharded() && (spec.axis == ShardSpec::Axis::Heads || spec.axis == ShardSpec::Axis::Hidden))
             {
-                if ((size_t)spec.local_dim < hidden_size)
+                if ((size_t)spec.local_dim < (size_t)spec.global_dim)
                 {
                     feature_sharded = true;
                     feature_local_offset = spec.local_offset;
                     feature_local_dim = spec.local_dim;
+                    // Track full hidden separately; do not overwrite local buffer dimension.
+                    global_hidden_dim_reported = spec.global_dim;
                 }
             }
         }
@@ -150,27 +153,12 @@ namespace llaminar
         std::shared_ptr<TensorBase> local_output;
         if (feature_sharded)
         {
-            // Already column-sliced; we still need a row slice if strategy is SEQUENCE_WISE
-            if (strategy_ == DistributionStrategy::SEQUENCE_WISE && (local_seq_len != global_seq_len))
-            {
-                // Need to allocate a temporary row-sliced buffer of only our rows but still only local feature slice
-                local_input = createLocalTensor({static_cast<size_t>(local_seq_len), feature_local_dim});
-                local_output = createLocalTensor({static_cast<size_t>(local_seq_len), feature_local_dim});
-                // Copy row subset over feature slice
-                const float *gptr = global_input->data();
-                for (size_t r = 0; r < local_seq_len; ++r)
-                {
-                    size_t gr = seq_offset + r;
-                    const float *src = gptr + gr * feature_local_dim; // sharded tensor stores only local feature columns contiguously
-                    std::memcpy(local_input->data() + r * feature_local_dim, src, sizeof(float) * feature_local_dim);
-                }
-            }
-            else
-            {
-                // Use global_input directly (no row splitting needed)
-                local_input = global_input;
-                local_output = global_output;
-            }
+            // For feature-sharded inputs we keep ALL rows locally (each rank owns full sequence rows for its feature slice)
+            // Override any row distribution result.
+            local_seq_len = global_seq_len;
+            seq_offset = 0;
+            local_input = global_input;   // already sized [seq_len, local_feature_dim]
+            local_output = global_output; // same layout for output
         }
         else
         {
@@ -188,11 +176,11 @@ namespace llaminar
         std::vector<float> unit_gamma;
         if (force_unit_gamma)
         {
-            unit_gamma.assign(hidden_size, 1.0f);
+            unit_gamma.assign(global_hidden_dim_reported, 1.0f);
             gamma_ptr = unit_gamma.data();
             if (getRank() == 0)
             {
-                LOG_WARN("[MPIRMSNormKernel] FORCING UNIT GAMMA (debug override) hidden_size=" << hidden_size);
+                LOG_WARN("[MPIRMSNormKernel] FORCING UNIT GAMMA (debug override) hidden_size=" << global_hidden_dim_reported);
             }
         }
         if (dump_gamma && getRank() == 0)
@@ -201,18 +189,18 @@ namespace llaminar
             double g_min = std::numeric_limits<double>::infinity();
             double g_max = -std::numeric_limits<double>::infinity();
             long double g_sum = 0.0L;
-            for (size_t i = 0; i < hidden_size; ++i)
+            for (size_t i = 0; i < global_hidden_dim_reported; ++i)
             {
                 double v = static_cast<double>(weight->data()[i]);
                 g_min = std::min(g_min, v);
                 g_max = std::max(g_max, v);
                 g_sum += v;
             }
-            double g_mean = static_cast<double>(g_sum / static_cast<long double>(hidden_size));
+            double g_mean = static_cast<double>(g_sum / static_cast<long double>(global_hidden_dim_reported));
             std::ostringstream goss;
-            goss << "[MPIRMSNormKernel][GammaDump] size=" << hidden_size
+            goss << "[MPIRMSNormKernel][GammaDump] size=" << global_hidden_dim_reported
                  << " min=" << g_min << " max=" << g_max << " mean=" << g_mean << " first32=";
-            size_t dump_n = std::min<size_t>(32, hidden_size);
+            size_t dump_n = std::min<size_t>(32, global_hidden_dim_reported);
             for (size_t i = 0; i < dump_n; ++i)
             {
                 goss << weight->data()[i];
@@ -285,18 +273,38 @@ namespace llaminar
                 if (denom > 0.0)
                     inv = 1.0 / std::sqrt(global_row_sumsq[r] / denom + (double)epsilon_);
                 inv_scale[r] = (float)inv;
+                if (r == 0 && getRank() == 0 && debugEnv().rmsnorm.validate_ref)
+                {
+                    LOG_INFO("[MPIRMSNormKernel][Diag] r=0 global_row_sumsq=" << global_row_sumsq[r]
+                                                                              << " denom=" << denom << " inv=" << inv);
+                }
             }
             // Apply scaling to local slice
             float *out_ptr = local_output->data();
+            bool weight_sharded = false;
+            if (auto *wss = dynamic_cast<ShardedSimpleTensor *>(weight.get()))
+            {
+                const ShardSpec &wspec = wss->shard_spec();
+                weight_sharded = wspec.is_sharded() && (size_t)wspec.local_dim < (size_t)wspec.global_dim;
+            }
+            // Correct gamma indexing: if weight is replicated, index via global offset; if sharded, direct
 #pragma omp parallel for schedule(static)
             for (long long r = 0; r < (long long)local_seq_len; ++r)
             {
                 const float *row_in = in_ptr + r * (long long)feat_dim;
                 float *row_out = out_ptr + r * (long long)feat_dim;
                 float scale = inv_scale[r];
-                for (long long c = 0; c < (long long)feat_dim; ++c)
+                if (weight_sharded)
                 {
-                    row_out[c] = row_in[c] * scale * gamma_ptr[feature_local_offset + c];
+                    // Weight already corresponds to local slice
+                    for (long long c = 0; c < (long long)feat_dim; ++c)
+                        row_out[c] = row_in[c] * scale * gamma_ptr[c];
+                }
+                else
+                {
+                    // Replicated full gamma vector
+                    for (long long c = 0; c < (long long)feat_dim; ++c)
+                        row_out[c] = row_in[c] * scale * gamma_ptr[feature_local_offset + c];
                 }
             }
             // If we used a temporary row-sliced buffer, need to scatter back into global_output
@@ -535,12 +543,30 @@ namespace llaminar
             return false;
         }
 
-        // Check dimension compatibility
+        // Check dimension compatibility (allow sharded input + replicated weight scenario)
         if (input->shape()[1] != weight->shape()[0])
         {
-            LOG_ERROR("MPIRMSNormKernel: Dimension mismatch between input hidden_size ("
-                      << input->shape()[1] << ") and weight (" << weight->shape()[0] << ")");
-            return false;
+            bool allow_replicated_weight = false;
+            if (auto *sharded_in = dynamic_cast<ShardedSimpleTensor *>(input.get()))
+            {
+                const ShardSpec &spec = sharded_in->shard_spec();
+                if (spec.is_sharded() && (spec.axis == ShardSpec::Axis::Hidden || spec.axis == ShardSpec::Axis::Heads))
+                {
+                    // Local slice dim vs global dim (weight may be replicated full vector)
+                    if ((size_t)spec.local_dim == (size_t)input->shape()[1] && (size_t)spec.global_dim == (size_t)weight->shape()[0])
+                    {
+                        allow_replicated_weight = true;
+                        LOG_DEBUG("MPIRMSNormKernel: Accepting replicated weight (global_hidden=" << spec.global_dim
+                                                                                                  << ") with local feature slice dim=" << spec.local_dim << " on rank " << getRank());
+                    }
+                }
+            }
+            if (!allow_replicated_weight)
+            {
+                LOG_ERROR("MPIRMSNormKernel: Dimension mismatch between input hidden_size ("
+                          << input->shape()[1] << ") and weight (" << weight->shape()[0] << ")");
+                return false;
+            }
         }
 
         // Check input and output have same shape

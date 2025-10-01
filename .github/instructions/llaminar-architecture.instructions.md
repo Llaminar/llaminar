@@ -1,6 +1,6 @@
 # Llaminar LLM Inference Engine - Architecture Documentation
 
-*Last Updated: September 19, 2025*
+*Last Updated: October 1, 2025*
 
 ## Overview
 
@@ -478,3 +478,106 @@ mpirun -np 2 --bind-to socket --map-by socket \
 ```
 
 This architecture provides a solid foundation for high-performance, distributed LLM inference while maintaining modularity, extensibility, and observability throughout the system.
+
+---
+
+## Backend Abstraction Layer (Prefill & Inference)
+
+To prepare for future GPU offload while retaining the current CPU-only implementation, Llaminar now includes lightweight backend abstraction interfaces that wrap all latency / throughput sensitive GEMMs inside attention and MLP kernels.
+
+### Goals
+1. Decouple kernel call sites from concrete matmul implementation details (OpenBLAS vs COSMA vs future GPU libraries)
+2. Preserve existing adaptive CPU heuristics (single-thread / multi-thread / distributed) without duplication
+3. Provide zero-cost indirection today (simple inline / single virtual hop) with fast fallback to existing `adaptive_matmul`
+4. Centralize prefill-vs-inference path decisions for consistent logging and experimentation
+
+### Components
+**Files**: `src/backends/prefill_backend.h/cpp`, `src/backends/inference_backend.h/cpp`, `src/backends/device_kind.h`
+
+| Element | Description |
+|---------|-------------|
+| `DeviceKind` | Enum declaring `CPU`, `GPU` (future) |
+| `PrefillBackendInterface` | Interface for large, throughput-oriented (prompt / prefill) GEMMs |
+| `InferenceBackendInterface` | Interface for small, latency-critical (decode) GEMMs |
+| `CpuPrefillBackend` | Delegates to `adaptive_matmul` honoring COSMA thresholds |
+| `CpuInferenceBackend` | Delegates to `adaptive_matmul` optimized for small/medium ops |
+| `Gpu*BackendStub` | Placeholder implementations returning `Unsupported` status |
+| `PrefillBackendFactory` / `InferenceBackendFactory` | Simple factories (later: pluggable registry) |
+
+### Invocation Pattern (Attention / MLP)
+At each projection (Q, K, V, Out, Gate, Up, Down) the kernel:
+1. Computes `is_prefill_like = seq_len >= debugEnv().cosma.prefill_threshold`
+2. Chooses Prefill vs Inference backend interface
+3. Attempts backend `launch()` with a small descriptor struct (M,N,K + flags)
+4. On non-success (`Unsupported`, `Error`) logs a WARN and falls back to `adaptive_matmul`
+
+All fallbacks preserve the exact previous semantics; there is no behavioral drift.
+
+### Descriptor Structures
+| Prefill | Inference |
+|---------|-----------|
+| `PrefillOpDesc { kind, M,N,K, is_prefill }` | `InferenceOpDesc { kind, M,N,K, latency_critical }` |
+| `PrefillLaunchContext { A,B,C }` | `InferenceLaunchContext { A,B,C }` |
+
+Currently only `MatMul` kind is implemented; future kinds (fused epilogs, attention assembly, quant-dequant fusion) can extend these enums without touching call sites.
+
+### Logging & Observability
+First use per kernel (rank 0 only) emits a single structured line:
+```
+BACKEND_DECISION_SUMMARY component=Attention seq_len=... threshold=... path=prefill prefill_backend=cpu_stub inference_backend=cpu_stub phases=QKV+Out fallback=adaptive_matmul
+```
+This enables quick grep-based validation of which path dominated a run without log spam.
+
+### Relationship to Adaptive MatMul
+`adaptive_matmul` remains the authoritative CPU arbitration layer (single-thread vs multi-thread vs distributed COSMA). Backends **delegate** rather than re-implement heuristics, ensuring a single tuning locus. When GPU support lands, only backend implementations change; kernel code and adaptive CPU logic remain intact.
+
+### Future Extensions (Non-Breaking)
+| Extension | Impact |
+|-----------|--------|
+| GPU BLAS (cuBLAS / rocBLAS) | Implement `GpuPrefillBackend` & `GpuInferenceBackend` with stream / handle caching |
+| Triton / CK kernels | Register specialized fused attention or MLP epilogs via additional `OpKind` values |
+| Auto-tuning | Backends collect lightweight perf stats, feed heuristic refinement engine |
+| JSON decision trace | Optional per-op structured emission for offline analysis |
+
+---
+
+## Distribution Modes & Tensor Parallel Simplification
+
+The legacy intra-rank tensor parallel splitter logic has been removed. Llaminar now treats **Tensor Parallel (TP)** strictly as *inter-socket / inter-process* sharding. Two high-level deployment modes are defined:
+
+| Mode | Default Threshold | Characteristics |
+|------|-------------------|-----------------|
+| `ReplicatedDataParallel` | < ~32B params (configurable) | All weights replicated per rank; simpler, lower latency for small/medium models |
+| `ShardedTensorParallel` | ≥ threshold | Parameter matrices partitioned across ranks; reduces memory footprint |
+
+Runtime selection is driven by environment snapshot fields parsed once in `debug_env` (`DistributionEnvConfig`). This centralization:
+1. Eliminates repeated `getenv()` overhead in hot loops
+2. Provides a discoverable registry of supported knobs
+3. Enables consistent experiment repro (single summary line on startup)
+
+### Rationale for Simplification
+Previous intra-rank column/row splitter heuristics added complexity and branch misprediction overhead for marginal gains on small decode shapes. Inter-rank sharding (true TP) captures the meaningful memory scaling while leaving per-rank math contiguous and cache-friendly.
+
+### Interaction with Backends
+- Prefill path: large prompt → may trigger distributed COSMA via `adaptive_matmul` once thresholds hit
+- Inference path: small decode batches remain local; sharding only affects weight residency & gather/scatter steps external to backend invocation
+
+---
+
+## Environment Snapshot (`debugEnv`) Consolidation
+
+Hot-path code (kernels, backend selection) consumes a pre-parsed immutable snapshot from `debug_env.{h,cpp}` instead of raw `std::getenv` calls.
+
+Benefits:
+1. Reduced libc call overhead on small matmuls
+2. Single source of truth for defaults & validation
+3. Easier documentation & test harness override
+
+Key groups include:
+| Group | Example Fields |
+|-------|----------------|
+| `cosma` | `prefill_threshold`, `max_resident_mb`, validation toggles |
+| `distribution` | Mode overrides, sharding thresholds |
+| `attention` | Trace / micro diagnostics flags |
+
+---
