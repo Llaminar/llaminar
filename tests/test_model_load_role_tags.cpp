@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <limits>
 #include <mpi.h>
+#include <unordered_set>
 
 #include "logger.h"
 #include "model_loader.h"
@@ -118,29 +119,93 @@ namespace
         return L.getModel().findTensor("token_embd.weight");
     }
 
+    // Build a map from quant type -> list of model paths. Originally this keyed only on the
+    // token embedding's quant type which caused K-family tests (Q2_K, Q3_K, etc.) to skip
+    // because many released GGUF variants keep the embedding in a baseline format (e.g. Q4_0/Q8_0)
+    // while attention/FFN weights use the K-block formats. We now index by ANY quant type present
+    // in the model's tensor set (excluding F32/F16 to keep focus on quantized variants). This lets
+    // role tag tests exercise tagging logic across all supported quant families with existing
+    // artifacts. Duplicate model insertions per quant group are avoided.
     static GroupMap &model_groups()
     {
         static GroupMap groups;
         static std::once_flag once;
         std::call_once(once, []()
                        {
-        namespace fs = std::filesystem;
-        if(const char* only = std::getenv("LLAMINAR_ROLE_TAG_MODEL")) {
-            ModelLoader loader; if(loader.loadModel(only)) {
-                if(auto *info = find_token_embd(loader)) groups[info->type].push_back(only);
+            namespace fs = std::filesystem;
+            // Global aggregation structures (model frequency & total tensor frequency per enum)
+            std::unordered_map<GGUFTensorType,int> enum_model_freq;
+            std::unordered_map<GGUFTensorType,long long> enum_tensor_freq;
+            auto index_model = [&](const std::string &path) {
+                ModelLoader loader; if(!loader.loadModel(path)) return;
+                const auto &model = loader.getModel();
+                // Collect distinct quant types (skip F32/F16). We also include the embedding's type
+                // even if it's FP16 (some tests may rely on grouping by its quant type already stored).
+                std::unordered_set<GGUFTensorType> qtypes;
+                std::unordered_map<GGUFTensorType,int> counts; // frequency per quant enum (diagnostic)
+                for (const auto &t : model.tensors) {
+                    switch (t.type) {
+                        case GGUFTensorType::F32:
+                        case GGUFTensorType::F16:
+                        case GGUFTensorType::Q8_1: // unsupported sentinel
+                            continue; // skip pure float & unsupported placeholder
+                        default:
+                            qtypes.insert(t.type);
+                            counts[t.type]++;
+                            break;
+                    }
+                }
+                // Fallback: if nothing collected but we have a token_embd weight, index by its type anyway
+                if(qtypes.empty()) {
+                    if(auto *emb = find_token_embd(loader)) qtypes.insert(emb->type);
+                }
+                for(auto qt : qtypes) {
+                    auto &vec = groups[qt];
+                    if(std::find(vec.begin(), vec.end(), path) == vec.end()) {
+                        vec.push_back(path);
+                    }
+                    enum_model_freq[qt]++; // model-level presence
+                }
+                for (auto &kv : counts) {
+                    enum_tensor_freq[kv.first] += kv.second; // tensor-level frequency
+                }
+                // Emit a one-line diagnostic summary of quant enums discovered for this model to
+                // aid debugging of missing groups (e.g. absence of Q2_K / enum=10). Only rank 0 prints later.
+                std::string diag = "[ROLE-TAG-GROUP-DISCOVERY] model=" + path + " enums=";
+                bool first=true;
+                for (auto &kv : counts) {
+                    if(!first) diag += ","; first=false;
+                    diag += std::to_string(static_cast<int>(kv.first)) + "(n=" + std::to_string(kv.second) + ")";
+                }
+                if(first) diag += "<none-except-float>";
+                LOG_INFO(diag);
+            };
+
+            if(const char* only = std::getenv("LLAMINAR_ROLE_TAG_MODEL")) {
+                index_model(only);
+                return;
             }
-            return;
-        }
-        fs::path dir{"models"};
-        if(!fs::exists(dir)) return;
-        for(auto &p : fs::directory_iterator(dir)) {
-            if(!p.is_regular_file() || p.path().extension() != ".gguf") continue;
-            auto path = p.path().string();
-            ModelLoader loader; if(!loader.loadModel(path)) continue;
-            if(auto *info = find_token_embd(loader)) {
-                groups[info->type].push_back(path);
+
+            fs::path dir{"models"};
+            if(!fs::exists(dir)) return;
+            for(auto &p : fs::directory_iterator(dir)) {
+                if(!p.is_regular_file() || p.path().extension() != ".gguf") continue;
+                index_model(p.path().string());
             }
-        } });
+            // After indexing all models, emit an aggregated summary line for quick inspection.
+            std::string summary = "[ROLE-TAG-GROUP-DISCOVERY-SUMMARY] enums=";
+            if(enum_model_freq.empty()) {
+                summary += "<none>";
+            } else {
+                bool first=true;
+                for (auto &kv : enum_model_freq) {
+                    if(!first) summary += ","; first=false;
+                    auto tensor_it = enum_tensor_freq.find(kv.first);
+                    long long tensor_count = (tensor_it==enum_tensor_freq.end()) ? 0 : tensor_it->second;
+                    summary += std::to_string(static_cast<int>(kv.first)) + "(models=" + std::to_string(kv.second) + ",tensors=" + std::to_string(tensor_count) + ")";
+                }
+            }
+            LOG_INFO(summary); });
         return groups;
     }
 
@@ -166,6 +231,30 @@ namespace
                 fprintf(stderr, "[ROLE-TAG-GROUP enum=%d] %s\n", (int)type, model_path.c_str());
             ModelLoader loader;
             ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load model: " << model_path;
+            if (rank == 0)
+            {
+                // After load, print a condensed set of distinct quant enums actually present to
+                // make skips (like Q2_K) clearly attributable to artifact absence rather than logic.
+                std::unordered_set<int> distinct;
+                for (auto &t : loader.getModel().tensors)
+                {
+                    int e = static_cast<int>(t.type);
+                    if (t.type != GGUFTensorType::F32 && t.type != GGUFTensorType::F16 && t.type != GGUFTensorType::Q8_1)
+                        distinct.insert(e);
+                }
+                std::string summary = "[ROLE-TAG-ENUMS] present=";
+                bool first = true;
+                for (int e : distinct)
+                {
+                    if (!first)
+                        summary += ",";
+                    first = false;
+                    summary += std::to_string(e);
+                }
+                if (first)
+                    summary += "<none>";
+                LOG_INFO(summary);
+            }
             if (const char *req = std::getenv("REQUIRE_KNOWN_TYPES"))
             {
                 bool saw_unsupported = false;

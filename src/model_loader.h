@@ -35,18 +35,29 @@ enum class GGUFTensorType : uint32_t
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
-    // Q4_1 removed
+    Q4_1 = 3,
+    // 4,5 removed upstream (Q4_2/Q4_3)
     Q5_0 = 6,
-    // Q5_1 removed
+    Q5_1 = 7,
     Q8_0 = 8,
-    // Q8_1 removed
+    Q8_1 = 9, // unsupported (we reject on parse but keep id for alignment)
     Q2_K = 10,
     Q3_K = 11,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
-    Q4_K_M = 20 // medium variant (alias layout to Q4_K for now)
+    IQ2_XXS = 16,
+    IQ2_XS = 17,
+    IQ3_XXS = 18,
+    IQ1_S = 19,
+    IQ4_NL = 20,
+    IQ3_S = 21,
+    IQ2_S = 22,
+    IQ4_XS = 23,
+    IQ1_M = 29,
+    // Alias: Q4_K_M uses Q4_K layout
+    Q4_K_M = Q4_K
 };
 
 // GGUF metadata value
@@ -94,7 +105,7 @@ struct GGUFModel
     uint32_t context_length;
     uint32_t embedding_length;
     uint32_t block_count;
-    uint32_t feed_forward_length;
+    uint32_t feed_forward_length = 0; // ensure deterministic default; populated from metadata if present
     uint32_t head_count;
     uint32_t head_count_kv;
     float rope_freq_base = 10000.0f;
@@ -153,7 +164,9 @@ public:
     // These enable constructing synthetic quantized blocks and verifying decode logic.
     std::vector<float> dequantizeQ4_K(const uint8_t *data, size_t n_elements, GGUFTensorType type, const std::string &tensor_name);
     std::vector<float> dequantizeQ4_0(const uint8_t *data, size_t n_elements);
-    // Removed: dequantizeQ4_1 / Q5_1 / Q8_1 support dropped.
+    // Restored legacy formats Q4_1 & Q5_1 (sourced from upstream ggml dequantize_row_* implementations). Q8_1 remains unsupported.
+    std::vector<float> dequantizeQ4_1(const uint8_t *data, const GGUFTensorInfo &info);
+    std::vector<float> dequantizeQ5_1(const uint8_t *data, const GGUFTensorInfo &info);
     // Newly added quantization formats (WIP implementations)
     std::vector<float> dequantizeQ5_0(const uint8_t *data, const GGUFTensorInfo &info);                                                      // block_q5_0 (32 vals)
     std::vector<float> dequantizeQ2_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info); // block_q2_K

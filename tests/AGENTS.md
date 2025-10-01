@@ -281,3 +281,44 @@ After stabilization we added:
 * Environment toggle to disable utilities (`LLAMINAR_NO_TEST_UTILS`) for isolation A/B
 
 Use this case study as a playbook for future unexplained pre-main hangs.
+
+---
+
+### 12. Lesson Learned: Stale Test Binary + Misaligned GGUF Data Region (Float Tensor Parity Regression)
+
+While adding IQ quant formats we hit a dramatic failure in the golden loader test:
+
+* All F32 tensors (layer norms, output norm, biases) showed tiny denormal values (~5–20e-39)
+* Relative L2 errors exploded (1e+36 – 1e+39) vs llama.cpp reference
+* Quantized tensors appeared structurally fine, masking the root cause
+
+#### Root Cause
+Two interacting issues:
+1. The loader previously recorded the raw file position immediately after parsing tensor metadata, without aligning to the GGUF-mandated 32-byte boundary before the tensor data blob. Reads began a few bytes early inside padding / preceding quant payload bytes, so F32 tensors deserialized junk that still formed valid (but meaningless) subnormal floats.
+2. The golden test executable had not been relinked after updating `model_loader.cpp`; incremental build rebuilt `libllaminar_core.a` only. CTest kept executing an older binary lacking the alignment fix, prolonging the investigation.
+
+#### Diagnostic Signals That Solved It
+| Signal | Insight |
+|--------|---------|
+| Added first-10 tensor dump (name, offset, size, type) | Confirmed offset chain looked internally consistent but needed upstream comparison |
+| Upstream gguf comparison block (mismatches=0) | Proved header + tensor metadata parsing was correct (enum realignment OK) |
+| Logging aligned vs raw `data_offset` (raw_pos=... aligned_pos=...) | Showed a 3-byte padding adjustment was required (alignment=32) |
+| Direct test binary run (bypassing CTest) after full rebuild | Passed immediately → stale binary suspicion confirmed |
+
+#### Fix
+* Seek to the next 32-byte boundary after metadata (`(pos + align - 1)/align*align`) and use that as `data_offset` (optionally recompute if first tensor offset is non-zero)
+* Force full rebuild (not just target library) so test executables relink with updated loader
+
+#### Preventive Invariants Added / Recommended
+* Assert (in Debug) that: first tensor offset == 0; each subsequent offset equals previous offset + padded(previous_size)
+* Log alignment decision only when `LLAMINAR_MODEL_LOAD_DEBUG` is set
+* (Planned) Lightweight regression test verifying alignment + offset chain for a small known model
+
+#### Takeaways
+1. Always rebuild dependent test binaries after changing a static library with parsing logic
+2. Add a structural comparison (offsets/types) against a known-good upstream parser early—this isolates logic vs data issues
+3. Denormal floods across all floats usually mean misaligned base pointer or element-size mismatch, not numeric drift
+4. Gate verbose diagnostics behind an env var to allow rapid deep dives without polluting normal test output
+
+Use this pattern for future mysterious “all floats are tiny” failures in loaders or deserializers.
+

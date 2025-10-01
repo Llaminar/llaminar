@@ -62,6 +62,23 @@ namespace llaminar
     class MPIAttentionKernel : public MPIKernelBase
     {
     public:
+        // Output assembly / distribution mode (scaffolding for hybrid head + TP design)
+        enum class AttentionOutputMode
+        {
+            LocalHeads,                ///< Return only local head slice (no gather)
+            GatherHeadsPostProjection, ///< Project locally then gather concatenated hidden (future)
+            GatherHeadsPreProjection,  ///< Gather head contexts before output projection (future)
+            Replicated                 ///< Force fully replicated output (debug / legacy)
+        };
+
+        struct AttentionResultMeta
+        {
+            AttentionOutputMode mode = AttentionOutputMode::LocalHeads;
+            bool concatenated = false; ///< true if full hidden dimension assembled
+            bool replicated = false;   ///< true if buffer identical on all ranks
+            int local_head_offset = 0; ///< starting head index owned by this rank
+            int local_head_count = 0;  ///< number of heads owned by this rank
+        };
         /**
          * @brief Distribution strategies for attention computation
          */
@@ -88,6 +105,11 @@ namespace llaminar
         // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
+
+        // Output mode configuration
+        void setOutputMode(AttentionOutputMode m) { output_mode_ = m; }
+        AttentionOutputMode outputMode() const { return output_mode_; }
+        const AttentionResultMeta &last_result_meta() const { return last_meta_; }
 
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
@@ -220,12 +242,14 @@ namespace llaminar
         std::shared_ptr<TensorBase> createLocalSimpleTensor(const std::vector<size_t> &shape) const;
 
         // Configuration parameters
-        int n_head_;                    ///< Total number of attention heads
-        int n_head_kv_;                 ///< Number of key-value heads (grouped attention)
-        int head_dim_;                  ///< Dimension per attention head
-        int n_past_;                    ///< Number of past tokens for position embedding
-        float rope_freq_base_;          ///< Base frequency for rotary embeddings
-        DistributionStrategy strategy_; ///< Distribution strategy
+        int n_head_;                                                        ///< Total number of attention heads
+        int n_head_kv_;                                                     ///< Number of key-value heads (grouped attention)
+        int head_dim_;                                                      ///< Dimension per attention head
+        int n_past_;                                                        ///< Number of past tokens for position embedding
+        float rope_freq_base_;                                              ///< Base frequency for rotary embeddings
+        DistributionStrategy strategy_;                                     ///< Distribution strategy
+        AttentionOutputMode output_mode_ = AttentionOutputMode::LocalHeads; ///< selected output mode
+        AttentionResultMeta last_meta_{};                                   ///< metadata from last execute
     };
 
 } // namespace llaminar

@@ -106,6 +106,17 @@ namespace llaminar
     {
         bool validate_primitives = false; // LLAMINAR_ATTN_PRIMITIVES_VALIDATE
         bool validate_output = false;     // LLAMINAR_ATTN_OUTPUT_VALIDATE
+        // Newly centralized flags
+        std::string output_mode;         // LLAMINAR_ATTN_OUTPUT_MODE
+        bool output_mode_forced = false; // presence of mode env
+        int gather_threshold = -1;       // LLAMINAR_ATTN_GATHER_THRESHOLD
+        bool force_scalar = false;       // LLAMINAR_ATTN_FORCE_SCALAR
+        bool validate_proj = false;      // LLAMINAR_ATTN_VALIDATE_PROJ
+        bool micro_trace = false;        // LLAMINAR_ATTN_MICRO_TRACE
+        bool dump_attention = false;     // LLAMINAR_ATTN_DUMP_ATTENTION
+        bool tp_disable = false;         // LLAMINAR_ATTN_TP_DISABLE
+        int tp_partitions = 1;           // LLAMINAR_ATTN_TP_PARTITIONS
+        bool tp_auto = false;            // LLAMINAR_ATTN_TP_AUTO
     };
 
     struct EmbeddingEnv
@@ -138,7 +149,11 @@ namespace llaminar
     };
     struct LoaderEnv
     {
-        bool log_eps = false;
+        bool log_eps = false;               // LLAMINAR_LOG_EPS
+        bool model_load_debug = false;      // LLAMINAR_MODEL_LOAD_DEBUG (non-zero => enable)
+        bool model_compare_gguf = false;    // LLAMINAR_MODEL_COMPARE_GGUF
+        bool enum_map_debug = false;        // LLAMINAR_ENUM_MAP_DEBUG
+        long long shard_cache_max_mb = 512; // LLAMINAR_SHARD_CACHE_MAX_MB (0 disables)
     };
 
     // --- Phase 2 additional groups ---

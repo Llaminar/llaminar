@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <unordered_set>
+#include <cmath>
 #include "model_loader.h"
 
 using namespace llaminar;
@@ -131,6 +132,9 @@ namespace
                     const float *b = buffers_ref[s].data() + (size_t)r * cnt;
                     for (int c = 0; c < cnt; ++c)
                     {
+                        // Treat matching NaNs as equal to avoid spurious failures when model contains NaN payloads.
+                        if (std::isnan(a[c]) && std::isnan(b[c]))
+                            continue;
                         ASSERT_FLOAT_EQ(a[c], b[c]) << "Mismatch format=" << fmt_name(target->type) << " shard=" << s << " row=" << r << " col=" << c;
                     }
                 }

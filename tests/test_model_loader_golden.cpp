@@ -429,8 +429,12 @@ TEST(ModelLoaderGolden, CompareQuantizedTensorsWithLlama)
             return "q3_K";
         case GGUFTensorType::Q4_0:
             return "q4_0";
+        case GGUFTensorType::Q4_1:
+            return "q4_1"; // newly reintroduced legacy quant format
         case GGUFTensorType::Q5_0:
             return "q5_0";
+        case GGUFTensorType::Q5_1:
+            return "q5_1"; // newly reintroduced legacy quant format
         case GGUFTensorType::Q8_0:
             return "q8_0";
         case GGUFTensorType::F32:

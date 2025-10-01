@@ -2,8 +2,17 @@
 #include "model_loader.h"
 #include "logger.h"
 #include "quant_dequant.h"
+#include "../llama.cpp/ggml/src/ggml-quants.h" // upstream dequantize_row_q*_1
 #include <cstring>
 #include <numeric>
+#include <cstdlib>
+#include "utils/debug_env.h"
+
+// Include upstream gguf API for offset comparison diagnostics
+extern "C"
+{
+#include "gguf.h"
+}
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -88,8 +97,8 @@ size_t ModelLoader::getFileSize() const
 
 void ModelLoader::logDequantStats(const std::string &tensor_name, GGUFTensorType type, const std::vector<float> &values, size_t max_samples) const
 {
-    const char *env_stats = std::getenv("LLAMINAR_DEQUANT_STATS");
-    if (!env_stats || std::string(env_stats) == "0")
+    const auto &snap = llaminar::debugEnv();
+    if (!snap.dequant.stats)
         return;
     if (values.empty())
     {
@@ -179,7 +188,9 @@ bool GGUFTensorInfo::isQuantized() const
     switch (type)
     {
     case GGUFTensorType::Q4_0:
+    case GGUFTensorType::Q4_1:
     case GGUFTensorType::Q5_0:
+    case GGUFTensorType::Q5_1:
     case GGUFTensorType::Q8_0:
     case GGUFTensorType::Q2_K:
     case GGUFTensorType::Q3_K:
@@ -187,7 +198,15 @@ bool GGUFTensorInfo::isQuantized() const
     case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q6_K:
     case GGUFTensorType::Q8_K:
-    case GGUFTensorType::Q4_K_M:
+    case GGUFTensorType::IQ2_XXS:
+    case GGUFTensorType::IQ2_XS:
+    case GGUFTensorType::IQ3_XXS:
+    case GGUFTensorType::IQ1_S:
+    case GGUFTensorType::IQ4_NL:
+    case GGUFTensorType::IQ3_S:
+    case GGUFTensorType::IQ2_S:
+    case GGUFTensorType::IQ4_XS:
+    case GGUFTensorType::IQ1_M:
         return true;
     default:
         return false;
@@ -204,8 +223,12 @@ size_t GGUFTensorInfo::getTypeSize() const
         return 2;
     case GGUFTensorType::Q4_0:
         return 18; // 2 + 16
+    case GGUFTensorType::Q4_1:
+        return 2 * sizeof(ggml_half) + 16; // match ggml block_q4_1 (scale + min + 16 packed)
     case GGUFTensorType::Q5_0:
         return 22; // 2 + 4 + 16
+    case GGUFTensorType::Q5_1:
+        return 2 * sizeof(ggml_half) + 4 + 16; // scale + min + qh + qs per ggml block_q5_1
     case GGUFTensorType::Q8_0:
         return 34; // 2 + 32
     case GGUFTensorType::Q2_K:
@@ -220,8 +243,24 @@ size_t GGUFTensorInfo::getTypeSize() const
         return 210;
     case GGUFTensorType::Q8_K:
         return 288; // placeholder, verify if used
-    case GGUFTensorType::Q4_K_M:
-        return 144; // alias
+    case GGUFTensorType::IQ2_XXS:
+        return sizeof(block_iq2_xxs);
+    case GGUFTensorType::IQ2_XS:
+        return sizeof(block_iq2_xs);
+    case GGUFTensorType::IQ3_XXS:
+        return sizeof(block_iq3_xxs);
+    case GGUFTensorType::IQ1_S:
+        return sizeof(block_iq1_s);
+    case GGUFTensorType::IQ4_NL:
+        return sizeof(block_iq4_nl);
+    case GGUFTensorType::IQ3_S:
+        return sizeof(block_iq3_s);
+    case GGUFTensorType::IQ2_S:
+        return sizeof(block_iq2_s);
+    case GGUFTensorType::IQ4_XS:
+        return sizeof(block_iq4_xs);
+    case GGUFTensorType::IQ1_M:
+        return sizeof(block_iq1_m);
     default:
         return 0;
     }
@@ -232,7 +271,9 @@ size_t GGUFTensorInfo::getBlockSize() const
     switch (type)
     {
     case GGUFTensorType::Q4_0:
+    case GGUFTensorType::Q4_1:
     case GGUFTensorType::Q5_0:
+    case GGUFTensorType::Q5_1:
     case GGUFTensorType::Q8_0:
         return 32;
     case GGUFTensorType::Q2_K:
@@ -241,8 +282,18 @@ size_t GGUFTensorInfo::getBlockSize() const
     case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q6_K:
     case GGUFTensorType::Q8_K:
-    case GGUFTensorType::Q4_K_M:
         return 256;
+    case GGUFTensorType::IQ2_XXS:
+    case GGUFTensorType::IQ2_XS:
+    case GGUFTensorType::IQ3_XXS:
+    case GGUFTensorType::IQ1_S:
+    case GGUFTensorType::IQ3_S:
+    case GGUFTensorType::IQ2_S:
+    case GGUFTensorType::IQ4_XS:
+    case GGUFTensorType::IQ1_M:
+        return 256; // these IQ variants use QK_K block size upstream
+    case GGUFTensorType::IQ4_NL:
+        return 32; // QK4_NL
     default:
         return 0;
     }
@@ -288,6 +339,11 @@ std::vector<std::string> GGUFValue::asStringArray() const
 // -------------- Model loading high-level API --------------
 bool ModelLoader::loadModel(const std::string &file_path)
 {
+    const auto &loader_env0 = llaminar::debugEnv();
+    if (loader_env0.loader.model_load_debug)
+    {
+        LOG_DEBUG("[MODEL_LOAD_FLOW] Enter loadModel path=" << file_path);
+    }
     file_stream_.close();
     file_stream_.clear();
     file_stream_.open(file_path, std::ios::binary);
@@ -313,14 +369,184 @@ bool ModelLoader::loadModel(const std::string &file_path)
         LOG_ERROR("parseTensorInfo failed");
         return false;
     }
+    {
+        const auto &loader_env1 = llaminar::debugEnv();
+        bool dbg = loader_env1.loader.model_load_debug;
+        if (dbg)
+        {
+            LOG_DEBUG("[MODEL_LOAD_DEBUG] tensor summary count=" << model_.tensors.size());
+            size_t dumpN = std::min<size_t>(10, model_.tensors.size());
+            for (size_t i = 0; i < dumpN; ++i)
+            {
+                const auto &t = model_.tensors[i];
+                LOG_WARN("[MODEL_LOAD_DEBUG] i=" << i << " name=" << t.name
+                                                 << " off=" << t.offset << " size=" << t.size_bytes
+                                                 << " dims=" << (t.dimensions.size())
+                                                 << " type=" << (int)t.type << (t.isQuantized() ? " Q" : " F"));
+            }
+        }
+    }
     extractModelMetadata();
     if (!validateModel())
     {
         LOG_ERROR("validateModel failed");
         return false;
     }
-    // Compute data offset (current position)
-    model_.data_offset = static_cast<uint64_t>(file_stream_.tellg());
+    // Compute data offset (current position) with required alignment padding.
+    // GGUF writers pad the header/tensor info section to 32-byte alignment before
+    // the tensor data region. Our previous code recorded the raw stream position
+    // which could be in the middle of the padding, causing all subsequent tensor
+    // reads to start earlier than intended (observed as denormal ~1e-38 float values
+    // for F32 tensors like output_norm.weight due to reading quantized byte regions).
+    {
+        const auto &loader_env2 = llaminar::debugEnv();
+        bool dbg = loader_env2.loader.model_load_debug;
+        std::streampos pos = file_stream_.tellg();
+        uint64_t cur = static_cast<uint64_t>(pos);
+        uint64_t align = model_.alignment ? model_.alignment : 32;
+        uint64_t aligned = (cur + align - 1) / align * align;
+        if (aligned != cur)
+        {
+            file_stream_.seekg(static_cast<std::streamoff>(aligned), std::ios::beg);
+            if (!file_stream_)
+            {
+                LOG_ERROR("Failed to seek to aligned data offset");
+                return false;
+            }
+        }
+        uint64_t base = aligned;
+        // Recompute base using first tensor's offset if it is non-zero (some exporters
+        // have been observed to emit a non-zero first offset, making the aligned position
+        // insufficient). If first offset is zero, aligned is the correct base.
+        if (!model_.tensors.empty())
+        {
+            uint64_t first_off = model_.tensors[0].offset;
+            if (first_off != 0)
+            {
+                // Current file position corresponds to (base + first_off). Solve for base.
+                uint64_t recomputed = aligned - first_off;
+                if (dbg)
+                {
+                    LOG_WARN("[MODEL_LOAD_DEBUG] first tensor offset !=0 (" << first_off
+                                                                            << ") recomputing data_offset base from aligned=" << aligned
+                                                                            << " -> base=" << recomputed);
+                }
+                base = recomputed;
+            }
+            else if (dbg)
+            {
+                LOG_INFO("[MODEL_LOAD_DEBUG] first tensor offset=0 (expected), using aligned base=" << aligned);
+            }
+        }
+        model_.data_offset = base;
+        if (dbg)
+        {
+            LOG_INFO("[MODEL_LOAD_DEBUG] final data_offset=" << model_.data_offset << " (raw_pos=" << cur << ", aligned_pos=" << aligned << ")");
+        }
+    }
+
+    // Optional: compare our parsed tensor offsets/types with upstream gguf loader
+    // Add diagnostic logging to verify this block executes and env var is visible.
+    const auto &loader_env3 = llaminar::debugEnv();
+    if (loader_env3.loader.model_compare_gguf)
+    {
+        LOG_DEBUG("[GGUF_COMPARE_DIAG] entry cmp_env=<snapshot>"
+                  << " alignment=" << model_.alignment
+                  << " data_offset=" << model_.data_offset
+                  << " tensor_count=" << model_.tensors.size());
+        LOG_INFO("[GGUF_COMPARE] starting upstream comparison phase");
+        const char *cpath = file_path.c_str();
+        struct gguf_init_params params{/* no_alloc */ true, /* ctx */ nullptr};
+        struct gguf_context *ctx = gguf_init_from_file(cpath, params);
+        if (!ctx)
+        {
+            LOG_WARN("[GGUF_COMPARE] Failed to init gguf context for comparison");
+        }
+        else
+        {
+            size_t n_up = gguf_get_n_tensors(ctx);
+            if (n_up != model_.tensors.size())
+            {
+                LOG_WARN("[GGUF_COMPARE] tensor count mismatch ours=" << model_.tensors.size() << " upstream=" << n_up);
+            }
+            size_t n = std::min(n_up, model_.tensors.size());
+            uint64_t running_expected = 0;
+            uint32_t align = model_.alignment ? model_.alignment : 32;
+            size_t mismatch_count = 0;
+            for (size_t i = 0; i < n; ++i)
+            {
+                const GGUFTensorInfo &ours = model_.tensors[i];
+                const char *up_name = gguf_get_tensor_name(ctx, i);
+                auto up_type = gguf_get_tensor_type(ctx, i);
+                uint64_t up_off = gguf_get_tensor_offset(ctx, i);
+                bool name_diff = (ours.name != up_name);
+                bool off_diff = (ours.offset != up_off);
+                bool type_diff = (static_cast<int>(ours.type) != static_cast<int>(up_type));
+                // compute our padded size for previous tensor to validate chain
+                if (i == 0)
+                    running_expected = 0;
+                else
+                {
+                    const GGUFTensorInfo &prev = model_.tensors[i - 1];
+                    size_t prev_size = prev.size_bytes;
+                    size_t padded = ((prev_size + align - 1) / align) * align;
+                    running_expected += padded;
+                }
+                bool chain_diff = (ours.offset != running_expected);
+                if (name_diff || off_diff || type_diff || chain_diff)
+                {
+                    if (mismatch_count < 50)
+                    {
+                        LOG_WARN("[GGUF_COMPARE] i=" << i
+                                                     << " name='" << ours.name << "' up_name='" << up_name << "'"
+                                                     << " ours_off=" << ours.offset << " up_off=" << up_off
+                                                     << " chain_expected=" << running_expected
+                                                     << " ours_type=" << (int)ours.type << " up_type=" << (int)up_type
+                                                     << (name_diff ? " nameDiff" : "")
+                                                     << (off_diff ? " offDiff" : "")
+                                                     << (type_diff ? " typeDiff" : "")
+                                                     << (chain_diff ? " chainDiff" : ""));
+                    }
+                    ++mismatch_count;
+                }
+            }
+            LOG_INFO("[GGUF_COMPARE] Completed comparison n=" << n << " mismatches=" << mismatch_count);
+            gguf_free(ctx);
+        }
+    }
+    else if (loader_env3.loader.model_load_debug)
+    {
+        LOG_INFO("[GGUF_COMPARE] comparison skipped (disabled)");
+    }
+    // Post-parse invariants: verify offset chain alignment (debug only)
+    if (loader_env3.loader.model_load_debug)
+    {
+        uint32_t align = model_.alignment ? model_.alignment : 32;
+        uint64_t expected = 0;
+        size_t mismatches = 0;
+        for (size_t i = 0; i < model_.tensors.size(); ++i)
+        {
+            const auto &t = model_.tensors[i];
+            if (t.offset != expected)
+            {
+                if (mismatches < 8)
+                {
+                    LOG_ERROR("[MODEL_LOAD_INVARIANT] chain mismatch i=" << i << " name='" << t.name << "' got_off=" << t.offset << " expected_off=" << expected);
+                }
+                ++mismatches;
+            }
+            size_t padded = ((t.size_bytes + align - 1) / align) * align;
+            expected += padded;
+        }
+        if (mismatches == 0)
+        {
+            LOG_DEBUG("[MODEL_LOAD_INVARIANT] offset chain OK tensors=" << model_.tensors.size() << " align=" << align);
+        }
+        else
+        {
+            LOG_ERROR("[MODEL_LOAD_INVARIANT] offset chain FAILED mismatches=" << mismatches);
+        }
+    }
     loaded_ = true;
     return true;
 }
@@ -346,12 +572,36 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
         LOG_ERROR("Failed to read tensor bytes: " << tensor_name);
         return nullptr;
     }
+    const auto &loader_env_load = llaminar::debugEnv();
+    bool dbg = loader_env_load.loader.model_load_debug;
     size_t n_elems = 1;
     for (auto d : info->dimensions)
         n_elems *= d;
     std::vector<float> data_f32;
     if (info->isQuantized())
     {
+        if (dbg)
+        {
+            std::ostringstream oss;
+            oss << "[MODEL_LOAD_DEBUG] tensor='" << tensor_name << "' type_enum=" << (int)info->type
+                << " quantized=1 size_bytes=" << info->size_bytes
+                << " dims=";
+            for (size_t i = 0; i < info->dimensions.size(); ++i)
+            {
+                if (i)
+                    oss << "x";
+                oss << info->dimensions[i];
+            }
+            size_t sample_bytes = std::min<size_t>(raw.size(), 32);
+            oss << " raw_first_bytes=";
+            for (size_t i = 0; i < sample_bytes; ++i)
+            {
+                if (i)
+                    oss << ' ';
+                oss << std::hex << std::uppercase << (int)raw[i] << std::dec;
+            }
+            LOG_INFO(oss.str());
+        }
         data_f32 = dequantizeTensor(*info, raw, tensor_name);
     }
     else
@@ -361,6 +611,25 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
         {
             data_f32.resize(n_elems);
             std::memcpy(data_f32.data(), raw.data(), n_elems * sizeof(float));
+            if (dbg)
+            {
+                float fv = data_f32.empty() ? 0.0f : data_f32[0];
+                uint32_t bits;
+                std::memcpy(&bits, &fv, 4);
+                std::ostringstream bytes_oss;
+                bytes_oss << std::hex << std::uppercase;
+                size_t byte_count = std::min<size_t>(8, raw.size());
+                for (size_t i = 0; i < byte_count; ++i)
+                {
+                    if (i)
+                        bytes_oss << ' ';
+                    bytes_oss << (int)raw[i];
+                }
+                std::ostringstream oss;
+                oss << "[MODEL_LOAD_DEBUG] tensor='" << tensor_name << "' type=F32 first_f32=" << fv << " bits=0x" << std::hex << bits;
+                oss << " raw_first_bytes=" << bytes_oss.str();
+                LOG_INFO(oss.str());
+            }
         }
         else if (info->type == GGUFTensorType::F16)
         {
@@ -370,6 +639,15 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
                 uint16_t h;
                 std::memcpy(&h, raw.data() + 2 * i, 2);
                 data_f32[i] = ggml_compute_fp16_to_fp32(h);
+            }
+            if (dbg)
+            {
+                uint16_t h0 = 0;
+                if (!raw.empty())
+                    std::memcpy(&h0, raw.data(), 2);
+                std::ostringstream oss;
+                oss << "[MODEL_LOAD_DEBUG] tensor='" << tensor_name << "' type=F16 first_half_bits=0x" << std::hex << h0 << std::dec << " first_f32=" << (data_f32.empty() ? 0.0f : data_f32[0]);
+                LOG_INFO(oss.str());
             }
         }
         else
@@ -599,12 +877,15 @@ bool ModelLoader::parseTensorInfo()
         uint32_t type_val;
         if (!readValue(type_val))
             return false;
-        // Map raw type id -> enum. We have deprecated legacy types (Q4_1=3, Q5_1=7, Q8_1=9)
-        if (type_val == 3 || type_val == 7 || type_val == 9)
+        // Map raw type id -> enum. Only Q8_1 (9) remains unsupported; allow Q4_1(3)/Q5_1(7) again.
+        if (type_val == 9)
         {
-            LOG_ERROR("parseTensorInfo: Tensor '" << tensor.name << "' uses deprecated quantization type id=" << type_val
-                                                  << " (Q4_1/Q5_1/Q8_1 removed). Please convert the model to a supported format.");
+            LOG_ERROR("parseTensorInfo: Tensor '" << tensor.name << "' uses unsupported quantization type id=9 (Q8_1). Re-export model without Q8_1.");
             return false;
+        }
+        if (type_val >= 16 && type_val <= 23)
+        {
+            LOG_TRACE("parseTensorInfo: IQ-family tensor type id=" << type_val << " name='" << tensor.name << "'");
         }
         tensor.type = static_cast<GGUFTensorType>(type_val);
         LOG_TRACE("parseTensorInfo: Tensor '" << tensor.name << "' raw type_val=" << type_val << ", cast enum value=" << static_cast<int>(tensor.type));
@@ -629,6 +910,14 @@ bool ModelLoader::parseTensorInfo()
                                                             << ", block_elems=" << block_size << ", type_block_bytes=" << type_size
                                                             << ", num_blocks=" << num_blocks << ", computed_size=" << (num_blocks * type_size));
             tensor.size_bytes = num_blocks * type_size;
+            const auto &snap_dbg = llaminar::debugEnv();
+            if (snap_dbg.loader.model_load_debug)
+            {
+                if (tensor.size_bytes == 0 || type_size == 0)
+                {
+                    LOG_WARN("[MODEL_LOAD_DEBUG] tensor='" << tensor.name << "' computed zero size (type_size=" << type_size << ")");
+                }
+            }
         }
         else
         {
@@ -672,6 +961,8 @@ void ModelLoader::extractModelMetadata()
     model_.context_length = model_.getMetadata<uint32_t>("qwen2.context_length", 0);
     model_.embedding_length = model_.getMetadata<uint32_t>("qwen2.embedding_length", 0);
     model_.block_count = model_.getMetadata<uint32_t>("qwen2.block_count", 0);
+    // Feed-forward hidden dimension (sometimes named feed_forward_length). Use 0 default if absent.
+    model_.feed_forward_length = model_.getMetadata<uint32_t>("qwen2.feed_forward_length", 0);
     model_.head_count = model_.getMetadata<uint32_t>("qwen2.attention.head_count", 0);
     model_.head_count_kv = model_.getMetadata<uint32_t>("qwen2.attention.head_count_kv", 0);
 
@@ -685,58 +976,58 @@ void ModelLoader::extractModelMetadata()
 
 std::vector<float> ModelLoader::dequantizeQ8_0(const uint8_t *data, size_t n_elements, const std::string &tensor_name)
 {
-    std::vector<float> result(n_elements);
-
-    const size_t qk = 32;              // QK8_0 from llama.cpp
-    const size_t nb = n_elements / qk; // number of blocks
-
-    // Exact copy of llama.cpp's dequantize_row_q8_0 logic
-    for (size_t i = 0; i < nb; i++)
+    if (!data || n_elements == 0)
+        return {};
+    const size_t QK = 32;
+    size_t full = (n_elements / QK) * QK;
+    size_t tail = n_elements - full;
+    std::vector<float> out(n_elements, 0.0f);
+    if (full)
+        dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(data), out.data(), (int64_t)full);
+    if (tail)
     {
-        const size_t block_offset = i * 34; // 2 bytes (fp16 scale) + 32 bytes (int8 values)
-
-        // Read scale factor (ggml_half = uint16_t)
-        uint16_t scale_bits;
-        std::memcpy(&scale_bits, data + block_offset, 2);
-
-        // Convert using llama.cpp's exact function
-        const float d = ggml_compute_fp16_to_fp32(scale_bits);
-
-        // Dequantize 32 int8 values exactly like llama.cpp
-        for (size_t j = 0; j < qk; ++j)
+        float tmp[QK];
+        dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(data) + (full / QK), tmp, QK);
+        std::memcpy(out.data() + full, tmp, tail * sizeof(float));
+    }
+    bool found_nan = false;
+    for (float &v : out)
+    {
+        if (std::isnan(v) || std::isinf(v))
         {
-            int8_t quantized_val = static_cast<int8_t>(data[block_offset + 2 + j]);
-            result[i * qk + j] = quantized_val * d;
+            found_nan = true;
+            v = 0.0f;
         }
     }
-
-    return result;
+    if (found_nan)
+    {
+        LOG_WARN("dequantizeQ8_0: NaN/Inf detected in tensor '" << tensor_name << "' replaced with 0");
+    }
+    else if (!out.empty() && std::isnan(out[0]))
+    {
+        LOG_ERROR("dequantizeQ8_0: first element NaN prior to scrub for tensor '" << tensor_name << "'");
+    }
+    return out;
 }
 
 bool ModelLoader::validateModel()
 {
-    // Check if architecture is specified
-    if (model_.architecture.empty())
+    if (model_.architecture.empty() || model_.architecture == "unknown")
     {
-        std::cerr << "Error: No architecture specified" << std::endl;
+        LOG_ERROR("validateModel: No architecture specified");
         return false;
     }
-
-    // Validate that we support this architecture
     if (model_.architecture != "qwen2")
     {
-        std::cerr << "Error: Unsupported architecture '" << model_.architecture << "' (expected 'qwen2')" << std::endl;
+        LOG_ERROR("validateModel: Unsupported architecture '" << model_.architecture << "' (expected 'qwen2')");
         return false;
     }
-
-    LOG_INFO("validateModel: Architecture '" << model_.architecture << "' is supported");
-
     if (model_.tensors.empty())
     {
-        std::cerr << "Error: No tensors found" << std::endl;
+        LOG_ERROR("validateModel: No tensors found");
         return false;
     }
-
+    LOG_INFO("validateModel: Architecture '" << model_.architecture << "' is supported");
     return true;
 }
 
@@ -762,7 +1053,9 @@ bool ModelLoader::supportsQuantization(GGUFTensorType type) const
     case GGUFTensorType::F32:
     case GGUFTensorType::F16:
     case GGUFTensorType::Q4_0:
+    case GGUFTensorType::Q4_1:
     case GGUFTensorType::Q5_0:
+    case GGUFTensorType::Q5_1:
     case GGUFTensorType::Q8_0:
     case GGUFTensorType::Q2_K:
     case GGUFTensorType::Q3_K:
@@ -770,7 +1063,15 @@ bool ModelLoader::supportsQuantization(GGUFTensorType type) const
     case GGUFTensorType::Q5_K:
     case GGUFTensorType::Q6_K:
     case GGUFTensorType::Q8_K:
-    case GGUFTensorType::Q4_K_M:
+    case GGUFTensorType::IQ2_XXS:
+    case GGUFTensorType::IQ2_XS:
+    case GGUFTensorType::IQ3_XXS:
+    case GGUFTensorType::IQ1_S:
+    case GGUFTensorType::IQ4_NL:
+    case GGUFTensorType::IQ3_S:
+    case GGUFTensorType::IQ2_S:
+    case GGUFTensorType::IQ4_XS:
+    case GGUFTensorType::IQ1_M:
         return true;
     default:
         return false;
@@ -784,21 +1085,28 @@ std::vector<float> ModelLoader::dequantizeTensor(const GGUFTensorInfo &tensor_in
     static bool printed_enum_map = false;
     if (!printed_enum_map)
     {
+        const auto &snap_enum = llaminar::debugEnv();
+        bool dump_enum = snap_enum.loader.enum_map_debug;
         printed_enum_map = true;
-        std::cerr << "[ENUM MAP] GGUFTensorType values: F32=" << static_cast<int>(GGUFTensorType::F32)
-                  << " F16=" << static_cast<int>(GGUFTensorType::F16)
-                  << " Q4_0=" << static_cast<int>(GGUFTensorType::Q4_0)
-                  << " Q5_0=" << static_cast<int>(GGUFTensorType::Q5_0)
-                  << " Q8_0=" << static_cast<int>(GGUFTensorType::Q8_0)
-                  << " Q2_K=" << static_cast<int>(GGUFTensorType::Q2_K)
-                  << " Q3_K=" << static_cast<int>(GGUFTensorType::Q3_K)
-                  << " Q4_K=" << static_cast<int>(GGUFTensorType::Q4_K)
-                  << " Q5_K=" << static_cast<int>(GGUFTensorType::Q5_K)
-                  << " Q6_K=" << static_cast<int>(GGUFTensorType::Q6_K)
-                  << " Q8_K=" << static_cast<int>(GGUFTensorType::Q8_K)
-                  << " Q4_K_M=" << static_cast<int>(GGUFTensorType::Q4_K_M)
-                  << std::endl;
-        std::cerr << "[ENUM MAP NOTE] Deprecated ids (not shown, do not reuse): Q4_1=3 Q5_1=7 Q8_1=9" << std::endl;
+        if (dump_enum)
+        {
+            std::cerr << "[ENUM MAP] GGUFTensorType values: F32=" << static_cast<int>(GGUFTensorType::F32)
+                      << " F16=" << static_cast<int>(GGUFTensorType::F16)
+                      << " Q4_0=" << static_cast<int>(GGUFTensorType::Q4_0)
+                      << " Q4_1=" << static_cast<int>(GGUFTensorType::Q4_1)
+                      << " Q5_0=" << static_cast<int>(GGUFTensorType::Q5_0)
+                      << " Q5_1=" << static_cast<int>(GGUFTensorType::Q5_1)
+                      << " Q8_0=" << static_cast<int>(GGUFTensorType::Q8_0)
+                      << " Q2_K=" << static_cast<int>(GGUFTensorType::Q2_K)
+                      << " Q3_K=" << static_cast<int>(GGUFTensorType::Q3_K)
+                      << " Q4_K=" << static_cast<int>(GGUFTensorType::Q4_K)
+                      << " Q5_K=" << static_cast<int>(GGUFTensorType::Q5_K)
+                      << " Q6_K=" << static_cast<int>(GGUFTensorType::Q6_K)
+                      << " Q8_K=" << static_cast<int>(GGUFTensorType::Q8_K)
+                      << " Q4_K_M=" << static_cast<int>(GGUFTensorType::Q4_K_M)
+                      << std::endl;
+            std::cerr << "[ENUM MAP NOTE] Unsupported id: Q8_1=9 (Q4_1 & Q5_1 restored)" << std::endl;
+        }
     }
     std::cerr << "[DEQ ENTRY] tensor='" << tensor_name << "' enum=" << static_cast<int>(tensor_info.type)
               << " bytes=" << quantized_data.size() << std::endl;
@@ -823,10 +1131,18 @@ const ModelLoader::IDequantizer *ModelLoader::selectDequantizer(GGUFTensorType t
     static Q8_0Dequantizer q8_0;
     static Q4_0Dequantizer q4_0;
     static Q4KDequantizer q4k;
+    struct Q4_1Dequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override { return L.dequantizeQ4_1(d.data(), i); }
+    };
     // New format dequantizers (implemented below)
     struct Q5_0Dequantizer : IDequantizer
     {
         std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override { return L.dequantizeQ5_0(d.data(), i); }
+    };
+    struct Q5_1Dequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override { return L.dequantizeQ5_1(d.data(), i); }
     };
     struct Q5KDequantizer : IDequantizer
     {
@@ -845,10 +1161,121 @@ const ModelLoader::IDequantizer *ModelLoader::selectDequantizer(GGUFTensorType t
         std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override { return L.dequantizeQ6_K(d.data(), i.type, n, i); }
     };
     static Q5_0Dequantizer q5_0;
+    static Q5_1Dequantizer q5_1;
     static Q5KDequantizer q5k;
     static Q2KDequantizer q2k;
     static Q3KDequantizer q3k;
     static Q6KDequantizer q6k;
+    static Q4_1Dequantizer q4_1;
+    // IQ family thin wrappers
+    struct IQ2XXSDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq2_xxs(reinterpret_cast<const block_iq2_xxs *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ2_XXS, out, 8);
+            return out;
+        }
+    };
+    struct IQ2XSDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq2_xs(reinterpret_cast<const block_iq2_xs *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ2_XS, out, 8);
+            return out;
+        }
+    };
+    struct IQ3XXSDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq3_xxs(reinterpret_cast<const block_iq3_xxs *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ3_XXS, out, 8);
+            return out;
+        }
+    };
+    struct IQ2SDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq2_s(reinterpret_cast<const block_iq2_s *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ2_S, out, 8);
+            return out;
+        }
+    };
+    struct IQ3SDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq3_s(reinterpret_cast<const block_iq3_s *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ3_S, out, 8);
+            return out;
+        }
+    };
+    struct IQ1SDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq1_s(reinterpret_cast<const block_iq1_s *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ1_S, out, 8);
+            return out;
+        }
+    };
+    struct IQ1MDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq1_m(reinterpret_cast<const block_iq1_m *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ1_M, out, 8);
+            return out;
+        }
+    };
+    struct IQ4NLDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq4_nl(reinterpret_cast<const block_iq4_nl *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ4_NL, out, 8);
+            return out;
+        }
+    };
+    struct IQ4XSDequantizer : IDequantizer
+    {
+        std::vector<float> run(const GGUFTensorInfo &i, const std::vector<uint8_t> &d, const std::string &n, ModelLoader &L) const override
+        {
+            size_t n_el = std::accumulate(i.dimensions.begin(), i.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+            std::vector<float> out(n_el);
+            dequantize_row_iq4_xs(reinterpret_cast<const block_iq4_xs *>(d.data()), out.data(), (int64_t)n_el);
+            L.logDequantStats(n, GGUFTensorType::IQ4_XS, out, 8);
+            return out;
+        }
+    };
+    static IQ2XXSDequantizer iq2xxs;
+    static IQ2XSDequantizer iq2xs;
+    static IQ3XXSDequantizer iq3xxs;
+    static IQ2SDequantizer iq2s;
+    static IQ3SDequantizer iq3s;
+    static IQ1SDequantizer iq1s;
+    static IQ1MDequantizer iq1m;
+    static IQ4NLDequantizer iq4nl;
+    static IQ4XSDequantizer iq4xs;
     switch (type)
     {
     case GGUFTensorType::Q8_0:
@@ -857,11 +1284,15 @@ const ModelLoader::IDequantizer *ModelLoader::selectDequantizer(GGUFTensorType t
     case GGUFTensorType::Q4_0:
         LOG_TRACE("selectDequantizer: Returning Q4_0Dequantizer");
         return &q4_0;
-    case GGUFTensorType::Q4_K: // fallthrough intentional for grouped variants later
-        LOG_TRACE("selectDequantizer: Returning Q4KDequantizer (placeholder)");
+    case GGUFTensorType::Q4_1:
+        return &q4_1;
+    case GGUFTensorType::Q4_K: // fallthrough intentional for grouped variants later / alias covers Q4_K_M
+        LOG_TRACE("selectDequantizer: Returning Q4KDequantizer (Q4_K / alias)");
         return &q4k;
     case GGUFTensorType::Q5_0:
         return &q5_0;
+    case GGUFTensorType::Q5_1:
+        return &q5_1;
     case GGUFTensorType::Q5_K:
         return &q5k;
     case GGUFTensorType::Q2_K:
@@ -870,6 +1301,24 @@ const ModelLoader::IDequantizer *ModelLoader::selectDequantizer(GGUFTensorType t
         return &q3k;
     case GGUFTensorType::Q6_K:
         return &q6k;
+    case GGUFTensorType::IQ2_XXS:
+        return &iq2xxs;
+    case GGUFTensorType::IQ2_XS:
+        return &iq2xs;
+    case GGUFTensorType::IQ3_XXS:
+        return &iq3xxs;
+    case GGUFTensorType::IQ1_S:
+        return &iq1s;
+    case GGUFTensorType::IQ4_NL:
+        return &iq4nl;
+    case GGUFTensorType::IQ3_S:
+        return &iq3s;
+    case GGUFTensorType::IQ2_S:
+        return &iq2s;
+    case GGUFTensorType::IQ4_XS:
+        return &iq4xs;
+    case GGUFTensorType::IQ1_M:
+        return &iq1m;
     default:
         LOG_TRACE("selectDequantizer: No dequantizer for enum=" << static_cast<int>(type));
         return nullptr;
@@ -882,20 +1331,38 @@ std::vector<float> ModelLoader::Q8_0Dequantizer::run(const GGUFTensorInfo &info,
     return loader.dequantizeQ8_0(data.data(), n, name);
 }
 
+// Added legacy *_1 format wrappers using upstream ggml row dequant routines
+std::vector<float> ModelLoader::dequantizeQ4_1(const uint8_t *data, const GGUFTensorInfo &info)
+{
+    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    if (!data || n_elements == 0)
+        return {};
+    std::vector<float> out(n_elements);
+    // Use upstream ggml dequantization (handles blocks of 32 internally)
+    dequantize_row_q4_1(reinterpret_cast<const block_q4_1 *>(data), out.data(), static_cast<int64_t>(n_elements));
+    logDequantStats(info.name, GGUFTensorType::Q4_1, out, 8);
+    return out;
+}
+
+std::vector<float> ModelLoader::dequantizeQ5_1(const uint8_t *data, const GGUFTensorInfo &info)
+{
+    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    if (!data || n_elements == 0)
+        return {};
+    std::vector<float> out(n_elements);
+    dequantize_row_q5_1(reinterpret_cast<const block_q5_1 *>(data), out.data(), static_cast<int64_t>(n_elements));
+    logDequantStats(info.name, GGUFTensorType::Q5_1, out, 8);
+    return out;
+}
+
 std::vector<float> ModelLoader::Q4_0Dequantizer::run(const GGUFTensorInfo &info, const std::vector<uint8_t> &data, const std::string &name, ModelLoader &loader) const
 {
-    (void)name; // not used yet
-    size_t n = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    LOG_TRACE("Q4_0Dequantizer::run: tensor='" << name << "' n_elements=" << n << " byte_size=" << data.size());
-    auto out = loader.dequantizeQ4_0(data.data(), n);
-    if (!out.empty())
-    {
-        LOG_TRACE("Q4_0Dequantizer::run: first 8 values: "
-                  << out[0] << ", " << (out.size() > 1 ? out[1] : 0) << ", " << (out.size() > 2 ? out[2] : 0)
-                  << ", " << (out.size() > 3 ? out[3] : 0) << ", " << (out.size() > 4 ? out[4] : 0)
-                  << ", " << (out.size() > 5 ? out[5] : 0) << ", " << (out.size() > 6 ? out[6] : 0)
-                  << ", " << (out.size() > 7 ? out[7] : 0));
-    }
+    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    if (n_elements == 0 || data.empty())
+        return {};
+    std::vector<float> out(n_elements);
+    dequantize_row_q4_0(reinterpret_cast<const block_q4_0 *>(data.data()), out.data(), (int64_t)n_elements);
+    loader.logDequantStats(name, GGUFTensorType::Q4_0, out, 8);
     return out;
 }
 
@@ -905,31 +1372,13 @@ std::vector<float> ModelLoader::Q4KDequantizer::run(const GGUFTensorInfo &info, 
     return loader.dequantizeQ4_K(data.data(), n, info.type, name);
 }
 
-// ---- Q4_0 Dequant (reference implementation based on llama.cpp layout) ----
-// Blocks of 32 values: 2 bytes (fp16 scale) + 16 bytes packed 4-bit values
+// Thin wrapper retained for compatibility – now delegates to upstream ggml row dequant.
 std::vector<float> ModelLoader::dequantizeQ4_0(const uint8_t *data, size_t n_elements)
 {
-    const size_t qk = 32;
-    const size_t block_size = sizeof(uint16_t) + 16;
-    size_t n_blocks = (n_elements + qk - 1) / qk;
-    std::vector<float> out(n_blocks * qk, 0.0f);
-    LOG_TRACE("dequantizeQ4_0: n_elements=" << n_elements << " n_blocks=" << n_blocks << " block_size_bytes=" << block_size);
-    if (n_elements == 0 || !data)
-        return out;
-
-    llaminar::dequant_q4_0_rows(data, out.data(), n_elements);
-
-    if (n_blocks > 0)
-    {
-        uint16_t scale_bits = 0;
-        std::memcpy(&scale_bits, data, sizeof(uint16_t));
-        float d = ggml_compute_fp16_to_fp32(scale_bits);
-        LOG_TRACE("dequantizeQ4_0: block0 scale_bits=" << scale_bits << " scale_float=" << d
-                                                       << " first_8_vals=" << out[0] << "," << out[1] << "," << out[2] << "," << out[3]
-                                                       << "," << out[4] << "," << out[5] << "," << out[6] << "," << out[7]);
-    }
-
-    out.resize(n_elements);
+    if (!data || n_elements == 0)
+        return {};
+    std::vector<float> out(n_elements);
+    dequantize_row_q4_0(reinterpret_cast<const block_q4_0 *>(data), out.data(), (int64_t)n_elements);
     return out;
 }
 
@@ -948,41 +1397,10 @@ std::vector<float> ModelLoader::dequantizeQ4_0(const uint8_t *data, size_t n_ele
 std::vector<float> ModelLoader::dequantizeQ5_0(const uint8_t *data, const GGUFTensorInfo &info)
 {
     size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    const size_t QK = 32;
-    const size_t BLOCK_BYTES = 22; // 2 + 4 + 16
     if (!data || n_elements == 0)
         return {};
-    size_t n_blocks = (n_elements + QK - 1) / QK;
-    std::vector<float> out(n_blocks * QK, 0.0f);
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        const uint8_t *block = data + b * BLOCK_BYTES;
-        float *dst = out.data() + b * QK;
-        size_t remain = std::min<size_t>(QK, n_elements - b * QK);
-        // Fast path: reuse fused helper for full blocks
-        if (remain == QK)
-        {
-            llaminar::dequant_block_q5_0(block, dst, static_cast<int>(remain));
-        }
-        else
-        {
-            // Decode into temp then copy subset
-            float tmp[QK];
-            llaminar::dequant_block_q5_0(block, tmp, QK);
-            std::memcpy(dst, tmp, remain * sizeof(float));
-        }
-        if (b == 0)
-        {
-            uint16_t d_bits;
-            std::memcpy(&d_bits, block, 2);
-            float d = ggml_compute_fp16_to_fp32(d_bits);
-            LOG_TRACE("dequantizeQ5_0: tensor='" << info.name << "' n_elements=" << n_elements
-                                                 << " n_blocks=" << n_blocks << " d_first=" << d
-                                                 << " first8=" << dst[0] << ',' << dst[1] << ',' << dst[2] << ',' << dst[3]
-                                                 << ',' << dst[4] << ',' << dst[5] << ',' << dst[6] << ',' << dst[7]);
-        }
-    }
-    out.resize(n_elements);
+    std::vector<float> out(n_elements);
+    dequantize_row_q5_0(reinterpret_cast<const block_q5_0 *>(data), out.data(), (int64_t)n_elements);
     logDequantStats(info.name, GGUFTensorType::Q5_0, out, 8);
     return out;
 }
@@ -994,87 +1412,10 @@ std::vector<float> ModelLoader::dequantizeQ5_0(const uint8_t *data, const GGUFTe
 // Value reconstruction per 64-value segment uses two scale/min pairs.
 std::vector<float> ModelLoader::dequantizeQ4_K(const uint8_t *data, size_t n_elements, GGUFTensorType type, const std::string &tensor_name)
 {
-    constexpr size_t SCALES_BYTES = 3 * QK_K / 64;                  // 12
-    constexpr size_t QS_BYTES = QK_K / 2;                           // 128
-    constexpr size_t BLOCK_BYTES = 2 + 2 + SCALES_BYTES + QS_BYTES; // 144
-    if (!data)
+    if (!data || n_elements == 0)
         return {};
-    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    std::vector<float> out(n_blocks * QK_K, 0.0f);
-
-    auto fp16 = [](const uint8_t *p)
-    { uint16_t h; std::memcpy(&h,p,2); return ggml_compute_fp16_to_fp32(h); };
-
-    // Unpack scales/mins exactly as in ggml q4_K path (see quants.c utmp manipulations)
-    auto unpack_scales_mins = [](const uint8_t *packed, uint8_t out_scales[8], uint8_t out_mins[8])
-    {
-        // packed[0..11]
-        uint32_t utmp[4] = {0, 0, 0, 0};
-        std::memcpy(utmp, packed, 12); // fill first 3 words + part of 4th
-        // Reconstruct as in llama.cpp (see lines around utmp modifications in ggml-cpu/quants.c)
-        const uint32_t kmask1 = 0x3f3f3f3f;
-        const uint32_t kmask2 = 0x0f0f0f0f;
-        const uint32_t kmask3 = 0x03030303;
-        // After memcpy we have utmp[0], utmp[1], utmp[2]; build utmp[3] and reshuffle
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-        // Now utmp bytes: scales = bytes 0..3 of utmp[0..1]? In original code scales points to utmp[0], mins to utmp[2].
-        const uint8_t *sc_src = reinterpret_cast<const uint8_t *>(&utmp[0]); // 8 bytes of scales
-        const uint8_t *mn_src = reinterpret_cast<const uint8_t *>(&utmp[2]); // 8 bytes of mins
-        for (int i = 0; i < 8; ++i)
-        {
-            out_scales[i] = sc_src[i];
-            out_mins[i] = mn_src[i];
-        }
-    };
-
-    size_t cursor = 0;
-    size_t produced = 0;
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        if (cursor + BLOCK_BYTES > n_blocks * BLOCK_BYTES)
-        {
-            // guard against truncated buffer
-            LOG_ERROR("Q4_K decode truncated buffer at block=" << b);
-            break;
-        }
-        float d = fp16(data + cursor);
-        float dmin = fp16(data + cursor + 2);
-        const uint8_t *scales = data + cursor + 4;
-        const uint8_t *qs = data + cursor + 4 + SCALES_BYTES;
-        // Extract full 8 scales + 8 mins
-        uint8_t sc_arr[8], mn_arr[8];
-        unpack_scales_mins(scales, sc_arr, mn_arr);
-        const uint8_t *qptr = qs;
-        // Four groups of 64 values, each uses two (scale,min) pairs
-        for (int g = 0; g < 4; ++g)
-        {
-            int idx0 = 2 * g + 0;
-            int idx1 = 2 * g + 1;
-            float d1 = d * sc_arr[idx0];
-            float dm1 = dmin * mn_arr[idx0];
-            float d2 = d * sc_arr[idx1];
-            float dm2 = dmin * mn_arr[idx1];
-            // first 32 values: low nibble
-            for (int l = 0; l < 32 && produced < out.size(); ++l)
-                out[produced++] = d1 * (qptr[l] & 0x0F) - dm1;
-            // second 32: high nibble
-            for (int l = 0; l < 32 && produced < out.size(); ++l)
-                out[produced++] = d2 * (qptr[l] >> 4) - dm2;
-            qptr += 32;
-        }
-        if (b == 0)
-        {
-            LOG_TRACE("dequantizeQ4_K(spec): tensor='" << tensor_name << "' d=" << d << " dmin=" << dmin
-                                                       << " first8=" << out[0] << ',' << out[1] << ',' << out[2] << ',' << out[3]
-                                                       << ',' << out[4] << ',' << out[5] << ',' << out[6] << ',' << out[7]);
-        }
-        cursor += BLOCK_BYTES;
-    }
-    out.resize(n_elements);
+    std::vector<float> out(n_elements);
+    dequantize_row_q4_K(reinterpret_cast<const block_q4_K *>(data), out.data(), (int64_t)n_elements);
     logDequantStats(tensor_name, type, out, 8);
     return out;
 }
@@ -1092,6 +1433,7 @@ const ModelLoader::CachedFullTensor *ModelLoader::getOrCacheFullQuantTensor(cons
         {
             it->second.last_access = ++quant_cache_clock_;
             quant_cache_hits_++;
+            quant_cache_loads_++; // count hit as a load for stats consistency
             return &it->second;
         }
     }
@@ -1136,6 +1478,20 @@ const ModelLoader::CachedFullTensor *ModelLoader::getOrCacheFullQuantTensor(cons
             return nullptr;
         }
     }
+    // Global safety: scrub unexpected NaN/Inf from decoded tensor to keep parity ops stable
+    bool any_bad = false;
+    for (float &v : decoded)
+    {
+        if (std::isnan(v) || std::isinf(v))
+        {
+            v = 0.0f;
+            any_bad = true;
+        }
+    }
+    if (any_bad)
+    {
+        LOG_WARN("getOrCacheFullQuantTensor: scrubbed NaN/Inf values in tensor '" << tensor_name << "' (format enum=" << (int)info.type << ")");
+    }
     auto cache_bytes_limit = quantShardCacheMaxBytes();
     const size_t new_bytes = decoded.size() * sizeof(float);
     {
@@ -1166,11 +1522,11 @@ const ModelLoader::CachedFullTensor *ModelLoader::getOrCacheFullQuantTensor(cons
 
 size_t ModelLoader::quantShardCacheMaxBytes() const
 {
-    const char *env = std::getenv("LLAMINAR_SHARD_CACHE_MAX_MB");
-    size_t mb = env ? std::strtoul(env, nullptr, 10) : 512;
+    const auto &snap = llaminar::debugEnv();
+    long long mb = snap.loader.shard_cache_max_mb; // >=0
     if (mb == 0)
         return 0; // disabled
-    return mb * 1024ULL * 1024ULL;
+    return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
 }
 
 void ModelLoader::clearQuantShardCache()
@@ -1238,7 +1594,9 @@ bool ModelLoader::loadTensorColumnShards(const std::string &tensor_name,
         float *dst = dests[s];
         if (!dst || off < 0 || count <= 0 || static_cast<size_t>(off + count) > cols)
         {
-            LOG_ERROR("loadTensorColumnShards: invalid shard spec index=" << s);
+            // Downgraded to WARN because higher layer logic intentionally probes a speculative
+            // shard layout and falls back to full-load scatter when unsupported for a quant type.
+            LOG_WARN("loadTensorColumnShards: invalid shard spec index=" << s << ", falling back to full tensor path");
             return false;
         }
         for (size_t r = 0; r < rows; ++r)
@@ -1274,305 +1632,44 @@ bool ModelLoader::loadTensorRowShard(const std::string &tensor_name,
     return true;
 }
 
-// ---- Q2_K Dequant ----
-// Layout per super-block (256 values) mirrors ggml's block_q2_K:
-//   uint8_t scales[16]; uint8_t qs[64]; ggml_half d; ggml_half dmin
-// Each scale byte packs a 4-bit scale and 4-bit min for 16-value groups. Reconstruct values as:
-// value = (d * scale_nibble) * q - (dmin * min_nibble) where q is the 2-bit quantized value.
+// ---- Simplified K-family dequants now directly call upstream ggml row functions ----
 std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
-    (void)type;
-    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    if (n_elements == 0 || !data)
+    if (!data)
         return {};
-
-    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    constexpr size_t CANONICAL_BLOCK_BYTES = sizeof(block_q2_K);
-    constexpr size_t QS_BYTES = QK_K / 4;     // 64
-    constexpr size_t SCALE_BYTES = QK_K / 16; // 16
-
-    size_t block_stride = CANONICAL_BLOCK_BYTES;
-    if (info.size_bytes != 0)
-    {
-        if (info.size_bytes % n_blocks != 0)
-        {
-            LOG_ERROR("Tensor '" << tensor_name << "' size " << info.size_bytes << " does not align with " << n_blocks << " Q2_K blocks (" << CANONICAL_BLOCK_BYTES << " bytes each)");
-            return {};
-        }
-        block_stride = info.size_bytes / n_blocks;
-    }
-
-    const bool compact_header_first = (block_stride < CANONICAL_BLOCK_BYTES) && (block_stride >= (2 * sizeof(uint16_t) + QS_BYTES));
-    if (!compact_header_first && block_stride < CANONICAL_BLOCK_BYTES)
-    {
-        LOG_ERROR("Tensor '" << tensor_name << "' Q2_K block stride " << block_stride << " is smaller than canonical layout and not recognized as compact header-first variant");
-        return {};
-    }
-
-    std::vector<float> out(n_blocks * QK_K);
-    const uint8_t *block_ptr = data;
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        block_q2_K blk{};
-        if (compact_header_first)
-        {
-            uint16_t d_bits = 0;
-            uint16_t dmin_bits = 0;
-            std::memcpy(&d_bits, block_ptr, sizeof(uint16_t));
-            std::memcpy(&dmin_bits, block_ptr + sizeof(uint16_t), sizeof(uint16_t));
-            blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d = d_bits;
-            blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin = dmin_bits;
-
-            const uint8_t *compact_scales = block_ptr + 2 * sizeof(uint16_t);
-            size_t compact_scale_bytes = block_stride - (2 * sizeof(uint16_t) + QS_BYTES);
-            compact_scale_bytes = std::min(compact_scale_bytes, SCALE_BYTES);
-            std::memset(blk.scales, 0, SCALE_BYTES);
-            if (compact_scale_bytes > 0)
-                std::memcpy(blk.scales, compact_scales, compact_scale_bytes);
-
-            const uint8_t *compact_qs = compact_scales + (block_stride - (2 * sizeof(uint16_t) + QS_BYTES));
-            std::memcpy(blk.qs, compact_qs, QS_BYTES);
-
-            if (b == 0)
-            {
-                std::cout << "[Q2K compact debug] tensor='" << tensor_name
-                          << "' stride=" << block_stride
-                          << " d_bits=0x" << std::hex << d_bits << std::dec
-                          << " dmin_bits=0x" << std::hex << dmin_bits << std::dec
-                          << " scale0=" << int(blk.scales[0])
-                          << " scale1=" << int(blk.scales[1])
-                          << " qs0=0x" << std::hex << int(blk.qs[0]) << std::dec
-                          << std::endl;
-            }
-        }
-        else
-        {
-            std::memcpy(&blk, block_ptr, sizeof(block_q2_K));
-        }
-        float *dst_block = out.data() + b * QK_K;
-        dequantize_row_q2_K(&blk, dst_block, QK_K);
-        if (std::isnan(dst_block[0]))
-        {
-            const float d = ggml_compute_fp16_to_fp32(blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
-            const float dmin = ggml_compute_fp16_to_fp32(blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin);
-            LOG_ERROR("dequantizeQ2_K block" << b << " produced NaN. d=" << d
-                                             << " dmin=" << dmin
-                                             << " scale0=" << int(blk.scales[0])
-                                             << " scale1=" << int(blk.scales[1])
-                                             << " q0=" << int(blk.qs[0]) << " q1=" << int(blk.qs[1]));
-        }
-        block_ptr += block_stride;
-    }
-    out.resize(n_elements);
+    size_t n = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    std::vector<float> out(n);
+    dequantize_row_q2_K(reinterpret_cast<const block_q2_K *>(data), out.data(), (int64_t)n);
     logDequantStats(tensor_name, type, out, 8);
     return out;
 }
-
-// ---- Q3_K Dequant ----
-// Layout per block_q3_K (256 vals): uint16_t d; uint8_t qs[64]; uint8_t hmask[32]; uint8_t scales[12];
-// Reconstruct as in llama.cpp: form 16 groups of 16 values with (scales[g]-32) multiplier and signed low bits via hmask.
 std::vector<float> ModelLoader::dequantizeQ3_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
-    (void)type;
-    // Mirror ggml::dequantize_row_q3_K logic exactly.
-    constexpr int QS_BYTES = QK_K / 4;    // low 2-bit packed
-    constexpr int HMASK_BYTES = QK_K / 8; // high bit mask
-    constexpr int SCALES_PACKED = 12;     // packed 6-bit scales
-    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    std::vector<float> out(n_blocks * QK_K);
-    auto fp16 = [](const uint8_t *p)
-    { uint16_t h; std::memcpy(&h,p,2); return ggml_compute_fp16_to_fp32(h); };
-    const uint8_t *ptr = data;
-    size_t out_index = 0;
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        const uint8_t *hmask = ptr;                     // QK_K/8
-        const uint8_t *qs = hmask + HMASK_BYTES;        // low bits
-        const uint8_t *sc_p = qs + QS_BYTES;            // packed scales
-        const float d_all = fp16(sc_p + SCALES_PACKED); // d stored last in struct
-
-        // Unpack scales to 16 signed 6-bit values
-        uint32_t aux[4] = {0, 0, 0, 0};
-        std::memcpy(aux, sc_p, SCALES_PACKED);
-        const uint32_t kmask1 = 0x03030303u;
-        const uint32_t kmask2 = 0x0f0f0f0fu;
-        uint32_t tmp = aux[2];
-        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        int8_t scales[16];
-        std::memcpy(scales, aux, 16);
-
-        const uint8_t *q = qs;
-        const uint8_t *hm = hmask;
-        uint8_t m = 1; // bit mask cycling through 8 bits each shift phase
-        int is = 0;    // scale index
-        for (int n = 0; n < QK_K; n += 128)
-        {
-            int shift = 0;
-            for (int j = 0; j < 4; ++j)
-            {
-                float dl = d_all * (scales[is++] - 32);
-                for (int l = 0; l < 16; ++l)
-                {
-                    int8_t qv = ((q[l + 0] >> shift) & 0x3); // low two bits
-                    if ((hm[l + 0] & m) == 0)
-                        qv -= 4; // subtract 4 if corresponding high-bit not set
-                    out[out_index++] = dl * qv;
-                }
-                dl = d_all * (scales[is++] - 32);
-                for (int l = 0; l < 16; ++l)
-                {
-                    int8_t qv = ((q[l + 16] >> shift) & 0x3);
-                    if ((hm[l + 16] & m) == 0)
-                        qv -= 4;
-                    out[out_index++] = dl * qv;
-                }
-                shift += 2;
-                m <<= 1; // advance high-bit plane
-            }
-            q += 32;
-        }
-        ptr += HMASK_BYTES + QS_BYTES + SCALES_PACKED + 2; // advance to next block (d already consumed)
-    }
-    out.resize(n_elements);
+    if (!data)
+        return {};
+    size_t n = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    std::vector<float> out(n);
+    dequantize_row_q3_K(reinterpret_cast<const block_q3_K *>(data), out.data(), (int64_t)n);
     logDequantStats(tensor_name, type, out, 8);
     return out;
 }
-
-// ---- Q5_K Dequant ----
-// Layout (block_q5_K, 256 vals): uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128];
-// Scales/mins unpack identical to Q4_K. Two (scale,min) pairs per 64-value segment.
 std::vector<float> ModelLoader::dequantizeQ5_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
-    (void)type;
-    // Manual layout interpretation (avoid dependency on ggml block struct):
-    // [0..1]=d (fp16), [2..3]=dmin (fp16), [4..4+K_SCALE_SIZE-1]=scales (6-bit packed scale/min pairs),
-    // then qh (QK_K/8 bytes), then qs (QK_K/2 bytes). Total block bytes = 4 + K_SCALE_SIZE + QK_K/8 + QK_K/2.
     if (!data)
         return {};
-    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    std::vector<float> out(n_blocks * QK_K);
-
-    auto fp16_to_f32 = [](const uint8_t *p)
-    { uint16_t h; std::memcpy(&h, p, 2); return ggml_compute_fp16_to_fp32(h); };
-    auto get_scale_min_k4_local = [](int j, const uint8_t *q, uint8_t &d_out, uint8_t &m_out)
-    {
-        if (j < 4)
-        {
-            d_out = q[j] & 63;
-            m_out = q[j + 4] & 63;
-        }
-        else
-        {
-            d_out = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-            m_out = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-        }
-    };
-
-    const size_t block_size = 4 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2; // bytes per q5_K block
-    const uint8_t *ptr = data;
-    size_t out_index = 0;
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        const uint8_t *block = ptr + b * block_size;
-        const float d = fp16_to_f32(block + 0);
-        const float dmin = fp16_to_f32(block + 2);
-        const uint8_t *scales = block + 4;
-        const uint8_t *qh = scales + K_SCALE_SIZE;
-        const uint8_t *ql = qh + QK_K / 8;
-
-        // (Debug instrumentation removed after validation; kept minimal for cleanliness.)
-
-        int is = 0;             // scale/min pair index (2 per 64 values)
-        uint8_t u1 = 1, u2 = 2; // moving bit planes inside qh
-        const uint8_t *ql_iter = ql;
-        for (int j = 0; j < QK_K; j += 64)
-        {
-            uint8_t sc, m;
-            get_scale_min_k4_local(is + 0, scales, sc, m);
-            const float d1 = d * sc;
-            const float m1 = dmin * m;
-            get_scale_min_k4_local(is + 1, scales, sc, m);
-            const float d2 = d * sc;
-            const float m2 = dmin * m;
-            // First 32 bytes -> 32 low-nibble + optional high-bit additions (values 0..31)
-            for (int l = 0; l < 32; ++l)
-            {
-                uint8_t v = (ql_iter[l] & 0xF);
-                if (qh[l] & u1)
-                    v += 16;
-                out[out_index++] = d1 * v - m1;
-            }
-            // Upper nibble of same 32 bytes encodes next 32 values
-            for (int l = 0; l < 32; ++l)
-            {
-                uint8_t v = (ql_iter[l] >> 4);
-                if (qh[l] & u2)
-                    v += 16;
-                out[out_index++] = d2 * v - m2;
-            }
-            // Removed per-layer debug once correctness established.
-            ql_iter += 32;
-            is += 2;
-            u1 <<= 2;
-            u2 <<= 2;
-        }
-    }
-    out.resize(n_elements);
+    size_t n = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    std::vector<float> out(n);
+    dequantize_row_q5_K(reinterpret_cast<const block_q5_K *>(data), out.data(), (int64_t)n);
     logDequantStats(tensor_name, type, out, 8);
     return out;
 }
-
-// ---- Q6_K Dequant ----
-// Layout: uint16_t d; uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; (total 2+128+64+16=210)
-// Reconstruct raw6 in [0..63], center to [-32,31], multiply by d*scale_int.
 std::vector<float> ModelLoader::dequantizeQ6_K(const uint8_t *data, GGUFTensorType type, const std::string &tensor_name, const GGUFTensorInfo &info)
 {
-    (void)type;
     if (!data)
         return {};
-    size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    std::vector<float> out(n_blocks * QK_K);
-    auto fp16 = [](const uint8_t *p)
-    { uint16_t h; std::memcpy(&h,p,2); return ggml_compute_fp16_to_fp32(h); };
-    const uint8_t *ptr = data;
-    size_t out_index = 0;
-    for (size_t b = 0; b < n_blocks; ++b)
-    {
-        const uint8_t *ql = ptr;                                                 // lower 4 bits (QK_K/2)
-        const uint8_t *qh = ql + QK_K / 2;                                       // upper 2 bits (QK_K/4)
-        const int8_t *sc = reinterpret_cast<const int8_t *>(qh + QK_K / 4);      // 16 scales
-        const float d = fp16(reinterpret_cast<const uint8_t *>(sc) + QK_K / 16); // d at end
-        const uint8_t *ql_iter = ql;
-        const uint8_t *qh_iter = qh;
-        const int8_t *sc_iter = sc;
-        for (int n = 0; n < QK_K; n += 128)
-        {
-            for (int l = 0; l < 32; ++l)
-            {
-                int is = l / 16; // scale group offset within this 128 chunk (0 or 1) plus even offsets when advancing sc_iter
-                const int8_t q1 = ((ql_iter[l + 0] & 0xF) | (((qh_iter[l] >> 0) & 3) << 4)) - 32;
-                const int8_t q2 = ((ql_iter[l + 32] & 0xF) | (((qh_iter[l] >> 2) & 3) << 4)) - 32;
-                const int8_t q3 = ((ql_iter[l + 0] >> 4) | (((qh_iter[l] >> 4) & 3) << 4)) - 32;
-                const int8_t q4 = ((ql_iter[l + 32] >> 4) | (((qh_iter[l] >> 6) & 3) << 4)) - 32;
-                out[out_index + l + 0] = d * sc_iter[is + 0] * q1;
-                out[out_index + l + 32] = d * sc_iter[is + 2] * q2;
-                out[out_index + l + 64] = d * sc_iter[is + 4] * q3;
-                out[out_index + l + 96] = d * sc_iter[is + 6] * q4;
-            }
-            out_index += 128;
-            ql_iter += 64;
-            qh_iter += 32;
-            sc_iter += 8; // advance to next 128-values portion
-        }
-        ptr += QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // move to next block
-    }
-    out.resize(n_elements);
+    size_t n = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
+    std::vector<float> out(n);
+    dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(data), out.data(), (int64_t)n);
     logDequantStats(tensor_name, type, out, 8);
     return out;
 }

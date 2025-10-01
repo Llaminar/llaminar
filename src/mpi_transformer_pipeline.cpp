@@ -390,6 +390,19 @@ namespace
             throw std::runtime_error(label + " tensor is null");
         }
 
+        // If either expected dimension is zero (unknown from metadata), accept any 2D shape.
+        // This enables late inference of feed-forward dimension without throwing.
+        if (expected_rows == 0 || expected_cols == 0)
+        {
+            const auto &shape_probe = tensor->shape();
+            if (shape_probe.size() == 2)
+            {
+                LOG_WARN(label << ": layout check bypassed (expected dimension 0). Observed shape="
+                               << "[" << shape_probe[0] << ", " << shape_probe[1] << "]");
+                return; // Accept as-is.
+            }
+        }
+
         const auto &shape = tensor->shape();
         if (shape.size() != 2)
         {
@@ -4242,13 +4255,43 @@ namespace llaminar
                 throw std::runtime_error("Failed to load FFN weights");
             }
 
-            enforce_matrix_layout(w_gate, config.d_model, config.d_ff, layer_prefix + "ffn_gate.weight");
-            enforce_matrix_layout(w_up, config.d_model, config.d_ff, layer_prefix + "ffn_up.weight");
-            enforce_matrix_layout(w_down, config.d_ff, config.d_model, layer_prefix + "ffn_down.weight");
+            // If feed-forward dim (d_ff) is zero (metadata absent), attempt to infer from gate weight shape
+            int effective_d_ff = config.d_ff;
+            // Attempt inference before layout enforcement so later matrices use inferred size
+            if (effective_d_ff == 0 && w_gate && w_gate->shape().size() == 2)
+            {
+                auto sh = w_gate->shape();
+                if (sh[0] == config.d_model)
+                {
+                    effective_d_ff = sh[1];
+                    LOG_WARN("[FFN_DIM_INFER] Inferred d_ff=" << effective_d_ff << " from ffn_gate.weight shape[" << sh[0] << ", " << sh[1] << "] (pre-layout)");
+                }
+                else if (sh[1] == config.d_model)
+                {
+                    effective_d_ff = sh[0];
+                    LOG_WARN("[FFN_DIM_INFER] Inferred d_ff=" << effective_d_ff << " from transposed ffn_gate.weight shape[" << sh[0] << ", " << sh[1] << "] (pre-layout)");
+                }
+            }
+
+            // Only enforce if we have inferred or metadata-provided feed-forward dimension
+            if (effective_d_ff > 0)
+            {
+                enforce_matrix_layout(w_gate, config.d_model, effective_d_ff, layer_prefix + "ffn_gate.weight");
+                enforce_matrix_layout(w_up, config.d_model, effective_d_ff, layer_prefix + "ffn_up.weight");
+                enforce_matrix_layout(w_down, effective_d_ff, config.d_model, layer_prefix + "ffn_down.weight");
+            }
 
             weights.w_gate.push_back(w_gate);
             weights.w_up.push_back(w_up);
             weights.w_down.push_back(w_down);
+            if (effective_d_ff == 0)
+            {
+                LOG_WARN("[FFN_DIM_INFER] d_ff remains 0 after attempting inference; proceeding without layout enforcement (layer=" << i << ")");
+            }
+            else
+            {
+                LOG_DEBUG("[FFN_DIM] Using d_ff=" << effective_d_ff << " for layer " << i);
+            }
 
             // Assign semantic roles to FFN matrices for topology diagnostics (local only; replicated tensors)
             // We don't currently re-wrap as sharded, so embed role labels via debug log for now.

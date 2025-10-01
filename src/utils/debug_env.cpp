@@ -103,6 +103,15 @@ namespace llaminar
     // Attention
     s.attention.validate_primitives = flag(std::getenv("LLAMINAR_ATTN_PRIMITIVES_VALIDATE"));
     s.attention.validate_output = flag(std::getenv("LLAMINAR_ATTN_OUTPUT_VALIDATE"));
+    if(const char* om = std::getenv("LLAMINAR_ATTN_OUTPUT_MODE")) { if(*om){ s.attention.output_mode_forced=true; s.attention.output_mode = om; }}
+    if(const char* gt = std::getenv("LLAMINAR_ATTN_GATHER_THRESHOLD")) { s.attention.gather_threshold = std::atoi(gt); }
+    s.attention.force_scalar = flag(std::getenv("LLAMINAR_ATTN_FORCE_SCALAR"));
+    s.attention.validate_proj = flag(std::getenv("LLAMINAR_ATTN_VALIDATE_PROJ"));
+    s.attention.micro_trace = flag(std::getenv("LLAMINAR_ATTN_MICRO_TRACE"));
+    s.attention.dump_attention = flag(std::getenv("LLAMINAR_ATTN_DUMP_ATTENTION"));
+    s.attention.tp_disable = flag(std::getenv("LLAMINAR_ATTN_TP_DISABLE"));
+    if(const char* tpp = std::getenv("LLAMINAR_ATTN_TP_PARTITIONS")) { int v=std::atoi(tpp); if(v>0 && v<1024) s.attention.tp_partitions = v; }
+    s.attention.tp_auto = flag(std::getenv("LLAMINAR_ATTN_TP_AUTO"));
     // Embedding
     s.embedding.trace = flag(std::getenv("LLAMINAR_EMBED_TRACE"));
     s.embedding.fail_fast = flag(std::getenv("LLAMINAR_EMBED_FAIL_FAST"));
@@ -121,7 +130,14 @@ namespace llaminar
     // Linear
     s.linear.diag = flag(std::getenv("LLAMINAR_LINEAR_DIAG"));
     // Loader
-    s.loader.log_eps = flag(std::getenv("LLAMINAR_LOG_EPS"));
+        s.loader.log_eps = flag(std::getenv("LLAMINAR_LOG_EPS"));
+        if(const char* mld = std::getenv("LLAMINAR_MODEL_LOAD_DEBUG")) { if(*mld && std::string(mld) != "0") s.loader.model_load_debug = true; }
+        s.loader.model_compare_gguf = flag(std::getenv("LLAMINAR_MODEL_COMPARE_GGUF"));
+        s.loader.enum_map_debug = flag(std::getenv("LLAMINAR_ENUM_MAP_DEBUG"));
+        if(const char* scm = std::getenv("LLAMINAR_SHARD_CACHE_MAX_MB")) {
+            long long v = std::atoll(scm);
+            if(v >= 0) s.loader.shard_cache_max_mb = v; // keep 0 sentinel (disabled)
+        }
 
         // --- Phase 2 parsing additions ---
         // Ablation

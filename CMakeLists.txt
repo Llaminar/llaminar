@@ -472,6 +472,21 @@ if(GTEST_FOUND)
     set_tests_properties(AttentionMicroTest PROPERTIES TIMEOUT 30)
     set_tests_properties(AttentionMicroTest PROPERTIES LABELS "attention;parity;kernel")
 
+    # TP column-partition WO projection parity (single-rank; ensure partitions vs disabled match)
+    add_test(NAME TPColumnPartitionWOParity
+        COMMAND $<TARGET_FILE:test_attention_micro> --gtest_filter=AttentionMicroTestFixture.TPColumnPartitionWOParity)
+    set_tests_properties(TPColumnPartitionWOParity PROPERTIES TIMEOUT 20 LABELS "attention;parity;tp")
+
+    # GatherHeadsPreProjection multi-rank parity (filtered gtest run)
+    add_test(NAME AttentionGatherPreProjectionParity
+        COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_attention_micro>
+                --gtest_filter=AttentionMicroTestFixture.GatherPreProjectionMultiRankParity)
+    # Ensure the test runs with the intended output mode unless explicitly overridden.
+    set_tests_properties(AttentionGatherPreProjectionParity PROPERTIES
+        ENVIRONMENT "LLAMINAR_ATTN_OUTPUT_MODE=gather_pre;OMPI_MCA_rmaps_base_oversubscribe=1"
+        TIMEOUT 30
+        LABELS "attention;parity;gather_pre")
+
     # MPI Embedding kernel comprehensive correctness tests (full vs sharded, transposed vs non-transposed)
     add_executable(test_mpi_embedding_kernel tests/test_mpi_embedding_kernel.cpp)
     target_link_libraries(test_mpi_embedding_kernel llaminar_core)
@@ -633,6 +648,9 @@ if(GTEST_FOUND)
     add_executable(test_prefill_attention_golden tests/test_prefill_attention_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(PrefillAttentionGoldenTest 2 test_prefill_attention_golden)
+    add_executable(test_tp_partition tests/test_tp_partition.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_tp_partition PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)
 
     # Embedding orientation diagnostic test (non-MPI critical, rank 0 does work)
     add_executable(test_embedding_orientation tests/test_embedding_orientation.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -683,6 +701,22 @@ if(GTEST_FOUND)
         target_link_libraries(test_dequant_golden ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
     add_test(NAME DequantGoldenTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_dequant_golden)
+
+    # Model loader alignment regression test (ensures offset chain + alignment invariants)
+    add_executable(test_model_loader_alignment tests/test_model_loader_alignment.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_include_directories(test_model_loader_alignment PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
+    )
+    target_link_libraries(test_model_loader_alignment llaminar_core llama)
+    if (GTEST_FOUND)
+        target_link_libraries(test_model_loader_alignment GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_model_loader_alignment PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_model_loader_alignment ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME ModelLoaderAlignmentTest COMMAND ${CMAKE_BINARY_DIR}/test_model_loader_alignment)
 
     # Integration test for real Q4_K tensors (statistical sanity)
     add_executable(test_integration_q4k tests/test_integration_q4k.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)

@@ -502,6 +502,36 @@ TEST_CASE("MyNewKernel basic functionality") {
 ```
 
 ### Documentation Standards
+### Centralized Environment Access (debugEnv)
+
+All new or refactored code on hot paths (kernels, matmul selection, attention assembly, tensor partition loops) MUST avoid direct `std::getenv` calls. Instead:
+
+1. Add any new environment flag/knob to the structured snapshot in `debug_env.h` inside the appropriate group (or create one).
+2. Parse it once in `debug_env.cpp` (lazy static initialization already provided) and expose typed fields.
+3. Consume via `const auto &snap = debugEnv();` then reference `snap.<group>.<field>`.
+
+Rationale:
+- Eliminates repeated libc getenv lookups in tight loops (measurable on small decode shapes).
+- Provides a single discoverable registry of supported flags with defaults and validation.
+- Enables future dynamic reconfiguration (e.g., reload snapshot) without editing all call sites.
+
+Migration Guidance:
+- When touching a file that still has raw `std::getenv` for a flag already present in the snapshot, replace it immediately.
+- If a flag is only used in test or one-off tooling code (not perf‑sensitive), direct calls are acceptable but still discouraged.
+- For transient experimental flags, stage them in `debug_env` early; this prevents entropy and drift.
+
+Example (Before → After):
+```cpp
+// BEFORE (hot path)
+if (std::getenv("LLAMINAR_ATTN_MICRO_TRACE") && rank == 0) { ... }
+
+// AFTER
+const auto &env = debugEnv();
+if (env.attention.micro_trace && rank == 0) { ... }
+```
+
+Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `debug_env.h` rather than mixing unrelated flags.
+
 ## Doxygen
 
 All files and functions should be documented with the Doxygen format for readability and easy understanding of their purpose. For @author, use David Sanftenberg.

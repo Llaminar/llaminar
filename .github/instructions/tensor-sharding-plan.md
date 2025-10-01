@@ -1,20 +1,21 @@
-# Tensor Sharding & Distributed Execution Refactor Plan
+# Hybrid Head + Tensor Parallel Sharding Plan
 
-> Status: Draft (Ambitious, green‑field refactor – no transitional compatibility required per request)
-> Scope: End-to-end redesign of model execution to eliminate incorrect `MPI_Allreduce` output aggregation and introduce principled tensor sharding primitives across attention, MLP, and normalization stages.
+> Status: Rev 2 (supersedes earlier draft focusing only on hidden sharding)
+> Scope: Introduce a two-level parallel layout: inter-socket (MPI) head sharding + intra-socket tensor parallel (TP) for dense projections (CPU today, GPU-ready). Replace legacy implicit gathers with explicit shard metadata & selectable output modes.
 
 ---
 ## 1. Motivation
-Current `MPIAttentionKernel` performs an `MPI_Allreduce (SUM)` over the full hidden dimension to fabricate a dense output tensor on every rank. This is:
-- **Semantically incorrect** for head-parallel attention (should concatenate head slices, not sum).
-- **Performance-hostile**: O(world_size * bytes) broadcast-like memory traffic.
-- **Scalability blocker**: Prevents horizontal scaling of hidden dimension; memory duplicated N×.
+The previous design conflated head partitioning and hidden dimension replication, occasionally using `MPI_Allreduce` where concatenation was required. This incurred unnecessary bandwidth and obscured ownership semantics.
 
-We will replace ad‑hoc distribution with a **first-class Distributed Tensor System (DTS)** supporting:
-- Explicit partition metadata.
-- Shard-preserving kernel APIs.
-- Lean collectives (Allgather / ReduceScatter) only when mathematically required.
-- Composable fusion opportunities (e.g. Attention + Output Projection + ReduceScatter).
+We now formalize a Hybrid Parallel Layout:
+* Level 1 (MPI ranks / sockets): Head sharding (independent attention computations, minimal comm during decode).
+* Level 2 (Intra-socket threads or GPUs): Tensor Parallel (split large dense matmuls for output projection and MLP).
+
+Objectives:
+* Eliminate semantically incorrect summations.
+* Provide explicit shard contracts (no silent densification).
+* Allow adaptive choice of gather timing (pre vs post output projection) based on sequence length & cost model.
+* Keep future sequence or vocab sharding pluggable.
 
 ---
 ## 2. High-Level Goals
@@ -22,29 +23,73 @@ We will replace ad‑hoc distribution with a **first-class Distributed Tensor Sy
 |------|-------------|----------------|
 | Correctness | Eliminate semantic misuse of Allreduce; preserve numerics vs single-rank baseline (within FP tolerance). | Max abs diff < 1e-5; rel L2 < 1e-6 on parity tests. |
 | Memory Scaling | Avoid full replica of hidden activations on each rank. | Peak activation memory per rank ≈ (global_hidden / world_size). |
-| Communication Efficiency | Replace full-tensor Allreduce with cheaper collectives. | Comm volume <= (bytes / world_size) for forward pass of attention+MLP (after fusion). |
+| Communication Efficiency | Hierarchical collectives (intra-socket TP, optional inter-socket head gather) only when required. | Inter-socket bytes reduced to O(seq * hidden) at most once per layer (or deferred). |
 | Extensibility | Unified abstraction for future sequence or pipeline parallel expansions. | New kernel integration requires < 200 LOC + no bespoke MPI scatter/gather code. |
 | Instrumentation | Introspect shard ownership easily. | `--print-topology` shows per-tensor sharding summary. |
 
 ---
 ## 3. Partitioning Strategy Overview
-We adopt **model-parallel hidden dimension sharding** (a.k.a. tensor parallelism) initially; sequence & pipeline parallelism are out-of-scope for this phase.
+Two orthogonal axes in this phase:
+1. Head Axis (inter-socket) – each MPI rank owns a contiguous block of heads (may be uneven by +1 head for remainders).
+2. Hidden Axis (intra-socket TP) – dense matmuls split by row or column depending on kernel phase.
 
-Primary partition kinds:
-1. HEAD_SHARD (attention Q/K/V heads & attention output pre-projection)
-2. HIDDEN_OUT_SHARD (post-output-projection / feed-forward hidden shards)
-3. ROW_SHARD (matmul row partition – optional for later throughput tuning)
+### 3.1 Intra-Socket Tensor Parallel Abstraction (NEW)
+We introduce a lightweight, CPU-first tensor parallel specification: `TPPartitionSpec` (see `src/tensors/tp_partition.h`).
 
-### Canonical Mapping
-| Tensor | Partition Axis | Rationale |
-|--------|----------------|-----------|
-| Q, K, V (projected) | Head axis (num_heads) | Independence per head, no cross-head mixes pre-score. |
-| Attention scores | Implicit (local heads only) | No need to materialize global scores. |
-| Context (softmax * V) | Head axis | Still per-head, aligns with Q/K partition. |
-| Output projection weights W_O | Split by input head blocks (columns) | Facilitates fused ReduceScatter across output dim. |
-| Post-projection activation | Hidden dim (ReduceScatter result) | Feeds sharded RMSNorm & MLP. |
-| MLP FFN weights (W1, W3) | Column shard (input dim) | Matches input shard; matmul locally valid. |
-| MLP output weight (W2) | Row shard (output dim) | Enables local partial outputs + Allreduce OR ReduceScatter to logits. |
+Purpose:
+* Decouple logical model parallel decisions from kernel implementation details.
+* Provide a uniform way to describe row (M) or column (N) partitioning of a GEMM without immediately requiring distributed collectives (initially single-process simulation; MPI not required).
+* Allow progressive opt-in: current implementation supplies only a trivial (identity) splitter so existing paths are unaffected.
+
+`TPPartitionSpec` fields:
+```
+struct TPPartitionSpec {
+    enum class Axis { Row, Col } axis; // Partition axis relative to left operand A (Row->split M, Col->split N)
+    int  tp_size;                      // Number of intra-socket partitions
+    int  tp_rank;                      // Partition index [0, tp_size)
+    size_t global_dim;                 // Global extent along axis
+    size_t local_offset;               // Offset slice start
+    size_t local_dim;                  // Local slice length
+};
+```
+
+Helper: `compute_tp_partition(global_dim, tp_size, tp_rank, axis)` implements ceil-balanced block distribution (first `global_dim % tp_size` partitions get +1).
+
+Trivial splitter (`TrivialMatmulSplitter`) contract:
+```
+bool run(A, B, C, M, N, K) // Directly calls provided baseline matmul functor (no slicing yet)
+```
+
+Planned evolution:
+| Stage | Enhancement | Notes |
+|-------|-------------|-------|
+| 1 (DONE) | Spec + trivial splitter | Identity path (no perf impact). |
+| 2 | Row slice executor | Partition M: each partition computes its row block; concat after. |
+| 3 | Column slice executor | Partition N: each partition computes its column block. |
+| 4 | Hybrid row/col (2D) | Enables block-cyclic or 2D tiling later if needed. |
+| 5 | Fused WO partition | Integrate with attention output projection selection. |
+| 6 | MLP integration | Up/Down projection complementary split (e.g., W1/W3 col, W2 row). |
+
+Test strategy additions (see §11): add simulated multi-partition parity tests that reconstruct full C from independently computed slices (currently CPU loops). These prepare for replacing the reconstruction step with in-place writes once real TP executors arrive.
+
+Modes (output assembly choices) (Rev 2.1 semantics):
+* `LocalHeads` – Return only local head slice (row-partitioned WO contribution); no collective.
+* `GatherHeadsPostProjection` – Local output projection with row-partitioned W_O then `MPI_Allreduce` (SUM) to combine additive hidden contributions (earlier draft said Allgather; implementation uses Allreduce).
+* `GatherHeadsPreProjection` – `MPI_Allgatherv` of head contexts (heads-major) followed by single global output projection (avoids redundant per-rank WO matmuls).
+* `Replicated` – Planned alias to `gather_pre` guaranteeing fully replicated hidden (currently falls back to LocalHeads).
+
+### Canonical Mapping (Hybrid)
+| Tensor / Stage | Inter-Socket (MPI) | Intra-Socket TP | Notes |
+|----------------|-------------------|-----------------|-------|
+| Q,K,V proj input | Hidden replicated per head shard OR hidden shard if later phase | Column-split (optional) | Phase 1 keeps replicated hidden inside socket. |
+| Q,K,V outputs | Head shard | Local (no TP) | Each rank only its heads. |
+| Attention scores & softmax | Head shard | Local | No distributed ops. |
+| Context (per-head) | Head shard | Local | |
+| Output projection (WO) | Input heads local | Column or row TP | Mode decides gather timing. |
+| Post-attn hidden | Hidden shard (if TP active) OR replicated per socket | Local TP layout | Sharded only after enabling TP. |
+| RMSNorm | Hidden shard (needs scalar Allreduce) | Local partial + scalar Allreduce | Comm is O(seq). |
+| MLP up / gate (W1,W3) | Hidden shard | Row/Col TP (policy) | |
+| MLP down (W2) | Hidden shard | Complementary split | Possibly ReduceScatter for fusion (later). |
 
 ---
 ## 4. Distributed Tensor Metadata
@@ -75,7 +120,10 @@ public:
 ```
 
 ### Construction Helpers
-`TensorFactory::create_sharded(axis=Axis::Hidden, global_dim, element_type)` → allocates only local portion sized `global_dim / world (+remainder)`.
+Extend factory:
+* `create_head_shard(total_heads, head_dim)`
+* `create_hidden_shard(global_hidden, strategy={even})`
+* `create_tp_partition(kind=Row|Col, global_shape, tp_size)` (Phase 2).
 
 ### Logging / Debug
 `tensor->describe()` ⇒ `ATTN_CTX shard axis=Heads rank=1/4 offset=16 size=16 global=64`.
@@ -90,14 +138,26 @@ struct AttentionInputs {
     DistributedTensorView w_o;    // Sharded columns (input) or rows (output) depending on fusion path
 };
 struct AttentionOutputs {
-    DistributedTensorView context_shard; // [seq, hidden_shard] after output projection + (optional) reduce-scatter
+    DistributedTensorView tensor;  // Local heads or concatenated hidden depending on OutputMode
+    AttentionAssemblyState state;  // LocalPartial / Concatenated / Replicated
+    bool requires_concat_for_dense; // Filled by kernel based on chosen mode
 };
 ```
 All kernels refuse to silently densify; any attempt to pass a sharded tensor where a replicated tensor is required triggers a validation error with remediation hint.
 
 ---
-## 6. Attention Execution Path
-### 6.1 Chosen Baseline Path (Fused Local + ReduceScatter)
+## 6. Attention Execution Path (Output Modes)
+### 6.1 LocalHeads (default for decode)
+Compute attention per head shard, project locally, return partial. No inter-socket comm.
+
+### 6.2 GatherHeadsPostProjection (implemented: Allreduce)
+Local projection using row-partitioned W_O yields additive hidden contributions; reconstruction performed via `MPI_Allreduce` (SUM). If future W_O column-partition is adopted this may switch to Allgather.
+
+### 6.3 GatherHeadsPreProjection (implemented)
+`MPI_Allgatherv` of per-rank head contexts into full heads-major buffer, reorder to standard layout, then single global projection. Sets metadata: concatenated=true, replicated=true.
+
+### 6.4 Replicated
+For legacy consumers or debug; forces full gather irrespective of efficiency.
 1. Local QKV projection (input shard × shard-local weight slice): produces Q_local, K_local, V_local (local heads subset).
 2. Local per-head attention → context_local (still head-sharded).
 3. Output projection W_O:
@@ -105,10 +165,10 @@ All kernels refuse to silently densify; any attempt to pass a sharded tensor whe
 4. If W_O is column-sharded, the result is already *the full hidden dimension subset for this rank* (no need to sum). No inter-rank dependency: **Skip collective**.
 5. Optionally perform **RMSNorm pre-MLP locally** (needs global variance? For RMSNorm over hidden: compute local sum of squares, Allreduce a single scalar per sequence position, finalize scaling).
 
-### 6.2 Alternative (Megatron-like) Path (Optional Future)
-- Use row-sharded W_O, producing partial sums; finish with `ReduceScatter` to obtain final hidden shards directly (amortizing what would be Allgather → slice).
+### 6.5 Future (ReduceScatter Path)
+Row-sharded WO + fused ReduceScatter to produce hidden shards directly; saves gather if subsequent layers remain sharded.
 
-### 6.3 Removed Operations
+### 6.6 Removed Operations
 - No `MPI_Allreduce` over full activation.
 - No staging of concatenated heads unless explicit debug flag: `LLAMINAR_DEBUG_MATERIALIZE_ATTENTION=1` triggers a safeguarded `Allgather`.
 
@@ -135,12 +195,12 @@ Given input shard H_local (size hidden / p):
 Residual add requires matching shard layout; both operands must share identical `ShardSpec`. Enforce at runtime (abort with log if mismatch).
 
 ---
-## 8. Collective Patterns Summary
+## 8. Collective Patterns Summary (Hybrid)
 | Operation | Collective | Frequency | Volume | Notes |
 |-----------|-----------|-----------|--------|-------|
 | RMSNorm stats | Allreduce (SUM) | Per norm | O(seq) | Cheap scalar path. |
 | Attention debug materialize | Allgather (Heads) | Debug only | O(hidden) | Disabled by default. |
-| Logits (final layer) | Allgather or ReduceScatter | 1 / token | Depends on softmax strategy | Might delay until generation step. |
+| Logits (final layer) | Allgather OR vocabulary-partition softmax later | 1 / token | Possibly delayed | Future vocab sharding TBD. |
 | Future gradient (not in scope) | Allreduce / RS | Backprop only | N/A | Placeholder. |
 
 No bulk Allreduce over full hidden activations in forward critical path.
@@ -156,12 +216,14 @@ No bulk Allreduce over full hidden activations in forward critical path.
 Ensure alignment to 64-byte boundaries for vectorization.
 
 ---
-## 10. API & Code Changes Checklist
+## 10. API & Code Changes Checklist (Revised Phasing)
 | Area | Action |
 |------|--------|
 | TensorBase | Add optional `ShardSpec*` or embed struct; add `describe()`. |
 | TensorFactory | New `create_sharded(axis, global_dim, full_shape)` method. |
-| MPIAttentionKernel | Rewrite `execute()` to output shard only; remove `gatherOutput()`. |
+| MPIAttentionKernel | Add OutputMode, emit metadata; implement post-projection gather; remove implicit dense write. |
+| MPIAttentionKernel (Phase 2) | Add pre-projection gather path + heuristic. |
+| MPIAttentionKernel (Phase 3) | Integrate intra-socket TP splits for WO. |
 | distributeInputs() | Becomes weight slicing utility returning shard-aligned local views. |
 | Output projection | Replace identity assumption; provide sliced W_O. |
 | RMSNorm kernel | Accept `ShardSpec`; integrate scalar Allreduce for variance. |
@@ -171,7 +233,11 @@ Ensure alignment to 64-byte boundaries for vectorization.
 | Env flags | Debug materialization & validation toggles (see §14). |
 
 ---
-## 11. Testing Strategy
+## 11. Testing Strategy (Augmented)
+Add tests for each output mode:
+* `AttentionLocalHeadsDecodeTest` – multi-rank decode parity after on-demand gather.
+* `AttentionGatherPreProjectionTest` – sequence-length threshold path.
+* `AttentionTPParityTest` – ensure TP matmul outputs reconstruct single-rank baseline.
 ### 11.1 Unit / Micro
 - `DistributedShardSpecTest`: verify offset math across uneven splits.
 - `AttentionShardParityTest`: construct synthetic small model; gather shards and compare to single-process baseline (QKV + attention).
@@ -196,24 +262,31 @@ Let:
 - B = batch (token) count (assume 1 for decode, large for prefill)
 
 Local compute (QKV): O(S * H * H/p_head_factor) unaffected.
-Comm cost baseline (bad): Allreduce ~ 2 * (p-1)/p * S*H bytes.
-New cost: zero (main path) + optional RMSNorm scalar Allreduce: O(S) bytes.
+Legacy cost: Allreduce ≈ 2 * (p-1)/p * S*H bytes (per layer).
+LocalHeads mode: 0 inter-socket until optional gather → at most one `Allgatherv` of S*H.
+GatherHeadsPreProjection: Same volume but saves (P-1) redundant WO matmuls.
+ReduceScatter future: Potentially lowers final logits or next-layer input volume by factor P when staying sharded.
 Benefit: Eliminates dominating term for large H, improves scaling.
 
 ---
-## 13. Potential Optimizations (Deferred)
+## 13. Potential Optimizations (Deferred / Layered)
 | Optimization | Description | Trigger |
 |--------------|-------------|---------|
 | Fused QKV projection | Single matmul for packed weights | Large S, prefill. |
 | FlashAttention integration | Replace naive softmax loops | S * head_dim large. |
+| Pre vs Post gather auto-switch | Model cost heuristic & env override | Distinguish decode vs prefill. |
 | ReduceScatter W_O path | Row-sharded W_O with fused reduction | p ≥ 4, large H. |
+| TP overlap | Nonblocking collectives hide gather / AllReduce | seq >= 2, multi-layer. |
 | Sharded KV cache | Sequence parallel extension | Long context. |
 
 ---
-## 14. Environment Flags (Debug / Validation)
+## 14. Environment Flags (Expanded)
 | Variable | Effect | Default |
 |----------|--------|---------|
-| `LLAMINAR_DEBUG_MATERIALIZE_ATTENTION` | Forces Allgather of attention output (post W_O) for validation. | Off |
+| `LLAMINAR_ATTN_OUTPUT_MODE` | local | gather_post | gather_pre | replicated | Select attention assembly mode. | default=local decode, gather_pre prefill |
+| `LLAMINAR_DEBUG_MATERIALIZE_ATTENTION` | Forces Allgather regardless of mode (post path). | Off |
+| `LLAMINAR_ATTN_TP_DISABLE` | Force-disable intra-socket TP (debug). | Off |
+| `LLAMINAR_ATTN_GATHER_THRESHOLD` | Sequence length threshold for switching to pre-gather path. | 1024 |
 | `LLAMINAR_DUMP_SHARDS` | Logs first N scalars per shard (N=16). | Off |
 | `LLAMINAR_SHARD_PARITY_CHECK` | After each major kernel, reconstruct global (Allgather) and diff vs rank0 baseline (small configs). | Off |
 | `LLAMINAR_ASSERT_REPLICATED_MISUSE` | Abort if a kernel consumes a replicated tensor where sharded expected or vice versa. | On |
@@ -229,23 +302,26 @@ Benefit: Eliminates dominating term for large H, improves scaling.
 | Accidental re-densification | Memory spike | Track global allocation bytes; warn if > expected. |
 
 ---
-## 16. Implementation Phases
-Even though no transitional deployment required, we execute in controlled phases for safety.
-
-1. **Scaffolding**: Add `ShardSpec`, factory methods, logging; no kernel changes.
-2. **Attention Shard Refactor**: Rewrite attention to output shard only; remove Allreduce; add debug materializer.
-3. **RMSNorm & MLP Shard Enablement**: Update kernels to accept sharded inputs; minimal collectives for norms.
-4. **Parity & Invariants**: Add tests; enforce asserts; run deterministic suite.
-5. **Cleanup & Removal**: Delete legacy gather code paths; remove obsolete env vars. 
-6. **Optimization Hooks**: Introduce optional fused QKV; prepare stubs for ReduceScatter path.
+## 16. Implementation Phases (Hybrid Roadmap – Progress Snapshot)
+1. (DONE) Scaffolding v2: OutputMode enum, AttentionResult metadata, env parsing.
+2. (DONE) GatherHeadsPostProjection path (row-split + Allreduce) integrated.
+3. (DONE) GatherHeadsPreProjection path (Allgatherv + single projection) + multi-rank parity test.
+4. (DONE) Heuristic auto-switch (seq length threshold) LocalHeads ↔ gather_pre.
+5. (DONE) Intra-socket TP abstraction (TPPartitionSpec + trivial splitter + unit tests).
+6. (PLANNED) Integrate TP executors into WO + MLP; TP parity tests (row & col).
+7. (PLANNED) Overlap (nonblocking collectives / compute) prototypes.
+8. (PLANNED) ReduceScatter WO experimental path.
+9. (PLANNED) Replicated mode alias + cleanup of legacy debug flags.
 
 ---
-## 17. Success Criteria & Sign-off Checklist
+## 17. Success Criteria & Sign-off Checklist (Updated)
 - [ ] All existing attention-related tests updated to shard-aware versions.
 - [ ] New shard parity test passes for {H=64, 128, 192} with p=2,3,4.
 - [ ] Micro attention test max_abs < 1e-5 multi-rank vs single-rank.
 - [ ] Memory footprint (RSS) reduced ~1/p for large H (instrumented sample case).
-- [ ] No uses of `MPI_Allreduce` over full `[seq, hidden]` remain (grep gate).
+- [ ] No uses of `MPI_Allreduce` over full `[seq, hidden]` remain (except RMSNorm scalars).
+- [ ] OutputMode switching validated: local ↔ gather_post ↔ gather_pre produce identical concatenated tensor.
+- [ ] TP matmul parity: max_abs < 1e-5 vs single-rank across {row, col} split.
 - [ ] Topology printout lists each tensor with correct offset/size.
 
 ---
@@ -301,18 +377,21 @@ bool ShardedAttention::execute(const DistTensor& x, DistTensor& out) {
 | Integrate with COSMA heuristics? | Provide local shard dims; existing adaptive matmul path should accept reduced K dimension. |
 
 ---
-## 23. Immediate Next Actions
-1. Implement `ShardSpec` & factory.
-2. Refactor attention to remove `gatherOutput` and emit shard only.
-3. Add parity reconstruction test harness.
-4. Update micro test to use concatenated shards instead of reading rank 0 slice.
-5. Remove Allreduce path & related environment hooks.
+## 23. Immediate Next Actions (Execution Queue – Updated)
+1. Replicated mode alias to gather_pre (metadata distinction) + env selection.
+2. Integrate TP executors into WO path (column split baseline) behind `LLAMINAR_ATTN_TP_DISABLE`.
+3. RMSNorm shard stats test (scalar Allreduce parity) preparing hidden sharding.
+4. Performance instrumentation: gather_pre vs gather_post timing across S={128,2k,8k}; log GFLOPS & comm ms.
+5. TP row & col executor implementations + parity tests M,N not divisible by tp_size.
+6. ReduceScatter WO experimental path.
+7. Overlap prototype (nonblocking gather + compute). 
+8. Benchmark harness & reporting integration.
 
 ---
 ## 24. Appendix: Validation Commands (Planned)
 ```bash
 # Run parity tests (multi-rank)
-mpirun -np 4 ./build/test_attention_shard_parity -v
+mpirun -np 4 --oversubscribe ./build/test_attention_shard_parity -v
 
 # Print topology after refactor
 ./run-llaminar.sh -v --print-topology | grep SHARD
@@ -323,4 +402,4 @@ grep -R "MPI_Allreduce" -n src | grep -v stats || true
 
 ---
 ## 25. Conclusion
-This plan replaces an expedient but invalid dense replication model with principled tensor sharding, unlocking scalable multi-rank inference, reducing communication, and clarifying semantics for future optimizations (ReduceScatter fusion, FlashAttention, vocab sharding). The abstractions are intentionally minimal to keep refactor velocity high while establishing a durable foundation.
+We evolve from a single-axis hidden sharding concept to a hierarchical strategy optimized for modern NUMA and multi-GPU topologies. This layered approach allows us to defer inter-socket communication, exploit intra-socket bandwidth with TP, and cleanly extend toward ReduceScatter and vocab sharding. The staged roadmap ensures incremental correctness while laying the groundwork for aggressive performance optimizations.
