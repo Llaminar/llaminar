@@ -126,7 +126,7 @@ ctest --test-dir build --output-on-failure --parallel
 ctest --test-dir build --output-on-failure --verbose --parallel
 
 # Only passing tests (recommended during development)
-ctest --test-dir build --output-on-failure -R "^(BasicTest|NumaTest|GraphTest|LinearKernelTest)$"
+ctest --test-dir build --output-on-failure -R "^(BasicTest|NumaTest)$"
 
 # Test status summary
 ctest --test-dir build --output-on-failure --parallel | tail -20
@@ -140,7 +140,6 @@ mpirun -np 2 ./build/llaminar
 
 # Run specific tests with MPI
 mpirun -np 2 ./build/test_cosma
-mpirun -np 4 ./build/test_graph
 ```
 
 ### Test Categories
@@ -149,7 +148,7 @@ mpirun -np 4 ./build/test_graph
 - **NumaTest**: NUMA topology detection and affinity
 - **CosmaTest**: Matrix multiplication and COSMA integration (currently failing due to precision issues)
 - **GraphTest**: Compute graph construction and execution
-- **LinearKernelTest**: Matrix operations and bias addition
+// (Removed) LinearKernelTest: legacy non-MPI linear kernel test has been retired after full MPI migration.
 
 ## Debugging with GDB
 
@@ -227,6 +226,7 @@ public:
 };
 
 // For simple kernels
+// Historical example (pre-MPI refactor). All production kernels now derive from MPIKernelBase.
 class SimpleKernel : public KernelBase {
     // Similar interface without MPI context
 };

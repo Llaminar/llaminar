@@ -22,7 +22,6 @@ extern "C"
 #ifdef LLAMINAR_HAVE_MPI
 #include <mpi.h>
 #endif
-#include "graph_compute.h"
 #include <filesystem>
 #include "tensors/simple_tensor.h"
 #include <iostream>

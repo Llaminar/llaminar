@@ -1,20 +1,27 @@
 # Llaminar LLM Inference Engine - Architecture Documentation
 
-*Last Updated: October 1, 2025*
+*Last Updated: October 3, 2025*
 
 ## Overview
 
-Llaminar is a high-performance, distributed LLM inference engine built on a modular object-oriented architecture. It features a **hybrid tensor system** that provides zero-copy COSMA optimization while maintaining full backward compatibility. The engine combines COSMA's high-performance matrix multiplication with GGUF model support, MPI distributed computing, and comprehensive system topology detection to create a scalable inference platform.
+Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The original generic compute graph and non‑MPI kernels have been fully retired; all production execution flows through **MPI-aware kernels**, an **Abstract Pipeline** adapter layer, and a centralized **adaptive backend selector** (OpenBLAS vs COSMA) tuned for sequence length and operation size.
 
-## Core Design Principles
+Key pillars:
+- **Abstract Pipeline Adapters**: Model‑family specific orchestration (e.g. Qwen adapter) implementing prefill + decode lifecycle over a fixed semantic stage graph (RMSNorm → Attention primitives → MLP Gate/Up/SwiGLU/Down → Residuals → Output Projection).
+- **Adaptive MatMul**: Single decision point (`adaptive_matmul.h`) governing local vs COSMA distributed matmuls; avoids policy drift.
+- **COSMA Prefill Manager**: High‑throughput large prompt (prefill) GEMMs with fused RMSNorm+QKV path and validation / orientation diagnostics.
+- **Tensor Sharding**: Current column (feature) partition for linear projections & planned evolution to hybrid 1D→2D sharding for future multi‑node scaling (see Roadmap).
+- **Centralized Environment Snapshot**: `debugEnv()` captures all tuning / debug flags once (no repeated `getenv` in hot loops).
+- **Observability**: Structured perf counters, stage timers (norm, attention, linear, activation), optional per-layer token diffs, dequant stats, COSMA tile validation & distributed GEMM forensic logs.
 
-1. **Modular Architecture**: Each component has a single responsibility and clear interfaces
-2. **Hybrid Tensor System**: Zero-copy COSMA optimization with backward compatibility
-3. **Distributed Computing**: Built-in MPI support for multi-node inference
-4. **High Performance**: COSMA integration for optimized matrix operations
-5. **System Awareness**: Comprehensive CPU, NUMA, and GPU topology detection
-6. **Extensibility**: Plugin-based kernel registration system
-7. **Observability**: Multi-level logging and performance profiling
+## Core Design Principles (Current State)
+1. **MPI Everywhere**: All compute kernels derive from `MPIKernelBase`; no legacy single‑process fallbacks remain.
+2. **Semantic Stages Over Generic Graphs**: Explicit transformer stages replace run‑time node scheduling overhead.
+3. **Single Policy Surface**: Backend selection & tuning centralized (predictable & testable).
+4. **Data Locality First**: Column partition weight shards + fused prefill pathways minimize movement.
+5. **Graceful Degradation**: COSMA failures auto‑fallback to OpenBLAS with logged reason.
+6. **Deterministic Debugging**: Environment snapshot + opt‑in reference comparisons (RMSNorm, attention output, FFN) for surgical diagnostics.
+7. **Incremental Evolution**: Design allows swapping in 2D sharding & mixed precision without re‑plumbing pipeline logic.
 
 ## Architecture Components
 
@@ -28,14 +35,15 @@ Llaminar is a high-performance, distributed LLM inference engine built on a modu
   - Exception handling and graceful shutdown
   - Performance measurement and reporting
 
-**Execution Pipeline**:
-1. Command line argument parsing
-2. Logging system initialization  
-3. System topology detection
-4. Kernel manager initialization
-5. Model loading (if specified)
-6. Compute graph execution
-7. Performance reporting and cleanup
+**Execution Flow (Current)**:
+1. Parse CLI → build `LlaminarParams` (includes `--kv-stats`, verbosity, model path).
+2. Initialize logging + environment snapshot (`debugEnv()` lazy init).
+3. Detect topology (NUMA, cores) & optionally print.
+4. Register MPI kernels (attention, linear, rmsnorm, residual, swiglu) & adaptive backend.
+5. Load GGUF model → weight tensors (auto layout decisions) & create model adapter.
+6. Instantiate Abstract Pipeline adapter (Qwen) wrapping legacy MPITransformerPipeline (pending full removal) for parity.
+7. Execute prefill (prompt) then iterative decode until token budget / stop condition.
+8. Emit KV cache summary if requested; output perf counters & adaptive backend stats.
 
 ### 2. Command Line Interface
 
@@ -116,7 +124,7 @@ Node 0: 56 CPUs, 376 GB memory
 Node 1: 56 CPUs, 377 GB memory
 ```
 
-### 6. Hybrid Tensor Architecture
+### 2. Hybrid / Sharded Tensor Architecture
 
 **Files**: `src/tensors/tensor_base.h`, `src/tensors/tensor_factory.cpp`, `src/tensor.h`
 - **Classes**: `TensorBase`, `SimpleTensor`, `COSMATensor`, `TensorFactory`
@@ -137,11 +145,9 @@ public:
 };
 ```
 
-#### SimpleTensor (Legacy Compatibility)
-- **Purpose**: Zero-copy wrapper around existing `Tensor` struct
-- **Data Storage**: Standard `std::vector<float>`
-- **Use Cases**: Small matrices, single-process operations, legacy code
-- **Performance**: No overhead compared to original Tensor
+#### SimpleTensor (Minimal Host Row-Major)
+- Keeps row‑major buffers for small ops & latency‑critical decode.
+- Still used for many activation intermediates (seq_len × hidden_size) to minimize transformation overhead.
 
 #### COSMATensor (COSMA Optimization)
 - **Purpose**: Direct integration with `cosma::CosmaMatrix<float>`
@@ -177,68 +183,163 @@ auto upgraded = TensorFactory::from_tensor(legacy);
 - **Legacy Compatibility**: No performance penalty for existing code
 - **Smart Conversion**: Only copies data when necessary
 
-### 6. Compute Graph Engine
+### 3. Abstract Pipeline Architecture
 
-**Files**: `src/graph_compute.h/cpp`, `src/tensor.h`
-- **Classes**: `ComputeNode`, `MatMulNode`, `ComputeGraph`
-- **Pattern**: Composite pattern with execution engine
-- **Features**:
-  - Node-based computation representation
-  - **Tensor Integration**: Uses legacy `llaminar::Tensor` with hybrid bridge
-  - Dependency tracking and scheduling
-  - Operator overloading for graph construction
-  - Performance measurement per node
+The legacy generic compute graph (ComputeGraph / ComputeNode / MatMulNode) has been removed. It has been replaced by a higher‑level, purpose‑built inference pipeline abstraction that maps directly onto transformer model structure and execution phases.
 
-**Hybrid Tensor Bridge**:
-- `GraphTensorBridge::optimize_for_kernel()`: Converts legacy Tensor to optimal TensorBase
-- `GraphTensorBridge::auto_upgrade()`: Zero-copy promotion for large matrices
-- Seamless integration between graph system and optimized kernels
+**Key Components**:
+- `AbstractPipeline` (interface): Defines lifecycle (prefill / decode), tensor staging, and logits access.
+- Concrete adapter (e.g. `QwenPipelineAdapter`): Specializes AbstractPipeline for specific model families (Qwen2.5 today) translating model config + weights into orchestrated kernel invocations.
+- `MPITransformerPipeline` (**DEPRECATED**): Kept only for parity tests & incremental removal. All new features target adapters.
+- `cosma_prefill_manager`: Orchestrates large prefill GEMMs (possibly distributed) and feeds activations into attention / MLP kernels.
 
-**Node Hierarchy**:
-```cpp
-ComputeNode (abstract base)
-├── MatMulNode (matrix multiplication)
-└── [Future nodes: TransformerBlock, Attention, etc.]
-```
+**Execution Phases**:
+1. **Prefill**: Fused RMSNorm+QKV (COSMA path if threshold & env allow) → attention primitives → MLP (gate/up/down) with adaptive backend per matmul.
+2. **Decode**: Single token; all GEMMs forced OpenBLAS (small shapes) & minimal allocations; KV cache append + attention over growing context.
+3. **Output Projection**: Adaptive matmul (prefill may use COSMA, decode stays OpenBLAS) → logits provided to sampler layer (external / future integration).
 
-**Usage Pattern**:
-```cpp
-auto graph = ComputeGraph();
-auto matmul = std::make_shared<MatMulNode>("benchmark", m, n, k);
-graph.addNode(matmul);
-graph.execute();
-```
+**Design Principles vs Removed Graph**:
+- Eliminates generic node scheduling overhead in favor of fixed semantic stages (clear perf boundaries: attention phases, MLP phases).
+- Centralized environment snapshot (`debug_env`) governs all hot path toggles (no per-node ad‑hoc env checks).
+- Explicit performance counters instrumentation at semantic phases (RMSNorm, Attention QK, Attention Apply, MLP Gate/Up/Down) replaces per-node timing.
+- Simplifies memory lifetime: tensors owned / recycled within pipeline stages instead of heap of generic node objects.
 
-### 7. Matrix Operations
+**Benefits**:
+- Eliminated graph scheduler overhead & dynamic allocations churn.
+- Uniform perf instrumentation surface (matmul counters, stage timers).
+- Consistent environment gating (no latent `getenv` in loops).
+- Simplified feature rollout (add adapter, not node graph rewrites).
 
-**Files**: `src/kernels/MatMulKernel.h/cpp`
-- **Class**: `MatMulKernel`
-- **Integration**: Hybrid tensor system with COSMA optimization
-- **Features**:
-  - **Zero-Copy COSMA Path**: Direct operations on COSMATensor inputs
-  - **Legacy Compatibility**: Automatic tensor conversion for SimpleTensor
-  - High-performance distributed matrix multiplication
-  - Automatic COSMA configuration
-  - MPI-aware execution
-  - Performance monitoring
+**Migration Summary**:
+- Removed files: `src/graph_compute.h`, `src/graph_compute.cpp`, `tests/test_graph.cpp`.
+- Deprecated concepts: generic topology sort, per-node cycle detection, MatMulNode micro-benchmark path.
+- Replacement: direct pipeline invocation inside `main.cpp` (abstract or legacy transformer), with fallback benchmark path removed.
 
-**Hybrid Execution Paths**:
-```cpp
-// Zero-copy COSMA execution (optimal)
-if (canUseZeroCopyCOSMA(inputs, outputs)) {
-    auto cosma_A = std::dynamic_pointer_cast<COSMATensor>(A);
-    success = executeCOSMANative(cosma_A->cosma_matrix(), ...);
-} else {
-    // Legacy path with data copying
-    success = executeCOSMA(*A, *B, *C);
-}
-```
+**Future Extensions**:
+- Plugin registry for model-family adapters.
+- Mixed-precision policy injection (prefill vs decode) at pipeline boundary.
+- Streaming KV cache compaction & eviction policies integrated into pipeline state.
 
-**Performance Optimization**:
-- **Zero-Copy Operations**: COSMATensor → `cosma::multiply()` with no data copying
-- **Automatic Detection**: `canUseZeroCopyCOSMA()` checks for optimal execution path
-- **Fallback Support**: Legacy path maintains compatibility with existing code
-- **COSMA Integration**: Leverages COSMA's optimized PDGEMM implementation
+
+### 4. Adaptive MatMul & Prefill Backend
+
+**File**: `src/adaptive_matmul.h`
+**Concepts**:
+- `AdaptiveMatMulManager` chooses backend per (m,n,k,is_prefill, MPI size, env overrides).
+- Prefill: Potential COSMA offload if seq_len ≥ threshold & world_size>1.
+- Decode: Always OpenBLAS (saves collective overhead > latency).
+- Supports batched Q/K/V path (currently OpenBLAS-loop; future fused COSMA batch candidate).
+
+**File**: `src/cosma_prefill_manager*`
+- Fused RMSNorm + QKV extraction with orientation / validation hooks.
+- Unified COSMA strategy selection to prevent inconsistent tilings across operands.
+- Optional tile verification, reconstruction diagnostics & orientation auto-fix env flags.
+
+**Recent Extensions**:
+- Output projection & all FFN (gate/up/down) matmuls now routed through adaptive backend (COSMA allowed on large prefill only).
+- Performance counters record every GEMM (size, backend, time) for post-run summary.
+
+**Fallback Semantics**:
+1. Attempt COSMA via prefill manager.
+2. On exception or validation failure → log + single-rank OpenBLAS fallback transparently.
+
+### 5. Distributed Linear Projection Kernel
+
+**File**: `src/kernels/MPILinearKernel.cpp`
+**Role**: Column-partitioned dense layer implementation used when adaptive path selects OpenBLAS and we want distributed weight shards.
+**Flow**: Distribute weight slice → local GEMM (OpenBLAS) → Allgatherv assemble full output rows → optional bias.
+**Adaptive Interaction**: Invokes `adaptiveMatMul(... distributed_partition=true)` to ensure COSMA is not (incorrectly) applied to partial matrices.
+
+### 6. Attention Primitives
+- Fused QKV path (prefill COSMA) or kernel-based multi-head attention (decode & small prefill).
+- RoPE applied per head with direct loop (possible future vectorization / LUT sincos reuse).
+- All reductions / softmax executed locally (causal masking enforced row-wise); future: distributed softmax for large multi-rank KV spans.
+
+### 7. KV Cache Management
+**State**: `KVCacheState` tracked in `AbstractPipeline` & CLI flag `--kv-stats` prints usage & capacity.
+**Growth**: Capacity ensured before decode; parity tests validate state after prefill vs incremental decode path.
+**Future**: Segment compaction & eviction policies (LRU / sliding window) pluggable at pipeline layer.
+
+### 8. Environment & Observability
+**Central Snapshot**: `debugEnv()` groups: attention, baseline, cosma, adaptive, pipeline, linear, embedding, layer_capture, prefill_debug, etc.
+**Rules**: No hot path `std::getenv`; all flags registered & typed (bool/int/strings) once.
+**Diagnostics**:
+- Per-stage diff (optional reference recomputation) with rel_l2 & top sample logging.
+- Row capture for RMSNorm & FFN forensic modes.
+- COSMA orientation / reconstruction debug channels.
+- Perf counters + adaptive backend aggregated summary.
+
+### 9. Model Loading & Quantization
+**File**: `src/model_loader.*`
+- Parses GGUF → instantiates weight tensors (Simple/COSMA) based on size & env.
+- Supports quant formats (Q4K / Q6K etc.) with dequant stats & anomaly detection flags.
+**Repacker**: Performs any layout adaptation required by fused prefill manager (e.g., contiguous block ordering for QKV concatenated strategies).
+
+### 10. Testing Infrastructure (Current Representative Set)
+Key test families (non-exhaustive):
+- `test_prefill_attention_golden`, `test_cosma_prefill_*`: Fused COSMA correctness & stats.
+- `test_adaptive_matmul*`: Backend decision correctness & performance constraints.
+- `test_mpi_transformer_pipeline`, `test_abstract_pipeline_parity`: Adapter parity & end-to-end invariants.
+- `test_kv_cache_growth*`: KV capacity correctness across modes.
+- `test_rmsnorm_*`, `test_attention_*`: Primitive parity & edge cases.
+- `test_tp_*`, `test_mlp_tp_parity`: Tensor partition correctness.
+
+Removed tests: `test_graph.cpp`, `LinearKernelTest` (documented as historical in guidelines).
+
+### 11. Performance Strategy Summary
+| Phase | Typical Matmuls | Backend Policy | Rationale |
+|-------|-----------------|----------------|-----------|
+| Prefill (short) | many small/medium | OpenBLAS (single/multi-thread) | COSMA overhead not amortized |
+| Prefill (large ≥4K tokens) | tall skinny (seq_len × hidden) * (hidden × proj) | COSMA | Collective reuse + fused QKV normalization |
+| Decode | 1 × hidden * hidden × proj | OpenBLAS single-thread (often) | Min latency, avoids collectives |
+| FFN large prefill | seq_len × hidden * hidden × d_ff | COSMA candidate | Throughput scaling |
+| LM Head (future) | seq_len × hidden * hidden × vocab | Policy TBD (likely still local) | Avoid huge all-gather unless 2D shard implemented |
+
+### 12. Tensor Sharding Roadmap (Forward Looking)
+Current: 1D column partition for linear weights; activations replicated.
+Planned Phases:
+1. Activation micro-sharding for very large batch prefill (reduce per-rank memory).
+2. 2D block cyclic strategy for extreme vocab or d_ff expansions (align w/ COSMA tiling to eliminate post-gather).
+3. Owner-aware KV cache distribution (shard past sequence to reduce memory duplication) + distributed attention softmax.
+4. Mixed precision (FP16 / BF16) activation buffers with on-the-fly dequant for matmuls.
+
+### 13. Future Enhancements
+- 2D sharded matmul path unifying MPILinearKernel + COSMA strategy (remove gather step where possible).
+- Adaptive decode micro-batching (multiple next-token candidates) with latency guardrails.
+- Runtime reconfiguration: dynamic environment snapshot refresh & remote control channel.
+- Streaming KV compaction & eviction strategies.
+- Quantized fused prefill (direct dequant into COSMA layout without intermediate float buffer).
+
+### 14. Current vs Target End-State Snapshot
+| Aspect | Current | Target |
+|--------|---------|--------|
+| Pipeline | Abstract adapters + legacy MPI pipeline (deprecated) | Pure adapters (legacy removed) |
+| MatMul Policy | Central adaptive manager | Same + 2D shard extension |
+| Attention Prefill | Fused RMSNorm+QKV (COSMA) + local softmax | Fully distributed softmax + partial KV ownership |
+| Linear Sharding | 1D column gather | 1D/2D hybrid (gather-less) |
+| KV Cache | Replicated per rank | Sharded + eviction/compaction |
+| Mixed Precision | Primarily FP32 (with weight quant) | Activation FP16/BF16 + selective FP32 accum |
+| Env Flags | Static snapshot at init | Hot-reloadable snapshot |
+
+---
+**Deprecations**:
+- Compute Graph (removed)
+- Non-MPI kernels (removed)
+- `MPITransformerPipeline` (pending removal – do not extend)
+- Legacy MatMulKernel (replaced by adaptive path + MPILinearKernel + COSMA prefill manager)
+
+**Authoritative Hot Paths**:
+1. `executePrefillAttentionCosma` (fused + distributed GEMMs)
+2. FFN matmuls via adaptive backend (gate/up/down)
+3. Attention decode kernel (MPI primitives + RoPE + softmax)
+4. Output projection adaptiveMatMul
+
+Maintain invariants:
+- No direct `getenv` in hot loops.
+- All distributed collectives bracketed by safe ordering (barriers where needed) to avoid hidden hangs.
+- Fallback to OpenBLAS must never silently change numerical rank agreement; diffs logged if validation toggles enabled.
+
+This document supersedes any earlier graph-centric or non‑MPI kernel guidance.
 
 ### 8. Model Loading System
 
@@ -301,23 +402,25 @@ test_*          # Unit test executables
 4. **Output Generation**: Logits → Sampling → Token generation
 5. **Result Collection**: Distributed gather → Response formatting
 
-### Current State (Matrix Benchmarking)
+### Current State (Abstract Pipeline)
 
-1. **Initialization**: MPI setup → Topology detection → Kernel registration
-2. **Graph Construction**: MatMul nodes → Dependency resolution
-3. **Execution**: COSMA operations → Performance measurement
-4. **Reporting**: Timing collection → GFLOPS calculation
+1. **Initialization**: MPI setup → Topology detection → Environment snapshot
+2. **Model Load**: GGUF parse → Weight tensors (auto Simple/COSMA selection) → Optional adapter wrapping
+3. **Prefill**: Abstract pipeline issues RMSNorm, QKV projection, attention primitives, MLP phases (distributed prefill manager engaged above thresholds)
+4. **Decode Loop** (interactive / generation): Repeated attention + MLP using latency‑optimized local backends
+5. **Output**: Logits retrieval → Sampling / chat interface → Optional validation & perf summary
 
 ## Performance Characteristics
 
 ### Scalability
-- **MPI Distributed**: Multi-node execution with process-based parallelism
-- **NUMA Aware**: Memory locality optimization for large systems
-- **Thread Parallel**: OpenMP integration for shared-memory scaling
+- **MPI Distributed**: Multi-node prefill + optional future distributed decode
+- **NUMA Aware**: Memory locality & process pinning still handled before pipeline creation
+- **Thread Parallel**: OpenMP within each rank; adaptive single vs multi-thread based on op size
 
 ### Memory Management
-- **Hybrid Tensor System**: Zero-copy optimization with backward compatibility
-- **Distributed Tensors**: Automatic sharding across MPI ranks (COSMATensor)
+- **Hybrid Tensor System**: Automatic Simple vs COSMA tensor selection remains intact
+- **Prefill Working Set Control**: Environment-governed memory caps (e.g., `LLAMINAR_COSMA_MAX_RESIDENT_MB`) consulted by prefill manager
+- **KV Cache Growth**: Managed outside generic graph; pipeline directly appends to caches with validation tests ensuring shape parity
 - **Format Optimization**: COSMA layout for optimal cache utilization
 - **Legacy Compatibility**: SimpleTensor maintains existing memory patterns
 - **Smart Allocation**: TensorFactory selects optimal memory layout

@@ -19,6 +19,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cblas.h>
+#include "kernels/common/rmsnorm_core.h"
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -4693,21 +4694,19 @@ namespace llaminar
                 const int Ok = wk.cols;
                 const int Ov = wv.cols;
                 std::shared_ptr<std::vector<float>> norm(new std::vector<float>((size_t)S * H));
-                for (int r = 0; r < S; ++r)
                 {
-                    const float *row = activation_row_major + (size_t)r * H;
-                    long double sum_sq = 0.0L;
-                    for (int c = 0; c < H; ++c)
-                    {
-                        long double v = row[c];
-                        sum_sq += v * v;
-                    }
-                    long double inv = 1.0L / std::sqrt((double)(sum_sq / std::max(1, H)) + (double)eps);
-                    float *dst = norm->data() + (size_t)r * H;
-                    for (int c = 0; c < H; ++c)
-                    {
-                        dst[c] = (float)(row[c] * inv * gamma[c]);
-                    }
+                    // Use core fused RMSNorm for host fallback (replicated gamma)
+                    llaminar::kernels::RMSNormExecOptions ropts; // default
+                    llaminar::kernels::rmsnorm_row_major_fused(
+                        activation_row_major,
+                        gamma,
+                        norm->data(),
+                        (size_t)S,
+                        (size_t)H,
+                        eps,
+                        llaminar::kernels::GammaMode::REPLICATED,
+                        0,
+                        ropts);
                 }
                 auto gemm_host = [&](const float *A, const float *B, int M, int K, int N) -> std::shared_ptr<std::vector<float>>
                 {
@@ -4840,23 +4839,18 @@ namespace llaminar
                 const int Ok = wk.cols;
                 const int Ov = wv.cols;
                 std::shared_ptr<std::vector<float>> norm(new std::vector<float>((size_t)S * H));
-                // RMSNorm
-                for (int r = 0; r < S; ++r)
-                {
-                    const float *row = activation_row_major + (size_t)r * H;
-                    long double sum_sq = 0.0L;
-                    for (int c = 0; c < H; ++c)
-                    {
-                        long double v = row[c];
-                        sum_sq += v * v;
-                    }
-                    long double inv = 1.0L / std::sqrt((double)(sum_sq / std::max(1, H)) + (double)eps);
-                    float *dst = norm->data() + (size_t)r * H;
-                    for (int c = 0; c < H; ++c)
-                    {
-                        dst[c] = (float)(row[c] * inv * gamma[c]);
-                    }
-                }
+                // RMSNorm via core fused helper
+                llaminar::kernels::RMSNormExecOptions ropts2;
+                llaminar::kernels::rmsnorm_row_major_fused(
+                    activation_row_major,
+                    gamma,
+                    norm->data(),
+                    (size_t)S,
+                    (size_t)H,
+                    eps,
+                    llaminar::kernels::GammaMode::REPLICATED,
+                    0,
+                    ropts2);
                 // BLAS GEMM: (S,H) * (H,O) = (S,O) with row-major strides.
                 auto gemm_host = [&](const float *A, const float *B, int M, int K, int N) -> std::shared_ptr<std::vector<float>>
                 {
@@ -4973,21 +4967,18 @@ namespace llaminar
                     return num == 0.0L ? 0.0 : std::numeric_limits<double>::infinity();
                 return static_cast<double>(std::sqrt(num / den));
             };
-            for (int r = 0; r < seq_len; ++r)
             {
-                const float *row = act + (size_t)r * hidden_size;
-                long double sum_sq = 0.0L;
-                for (int c = 0; c < hidden_size; ++c)
-                {
-                    long double v = row[c];
-                    sum_sq += v * v;
-                }
-                long double inv = 1.0L / std::sqrt((double)(sum_sq / std::max(1, hidden_size)) + (double)eps);
-                float *dst = ref.data() + (size_t)r * hidden_size;
-                for (int c = 0; c < hidden_size; ++c)
-                {
-                    dst[c] = static_cast<float>(row[c] * inv * gamma[c]);
-                }
+                llaminar::kernels::RMSNormExecOptions ref_opts;
+                llaminar::kernels::rmsnorm_row_major_fused(
+                    act,
+                    gamma,
+                    ref.data(),
+                    (size_t)seq_len,
+                    (size_t)hidden_size,
+                    eps,
+                    llaminar::kernels::GammaMode::REPLICATED,
+                    0,
+                    ref_opts);
             }
             // Access normalized buffer (host memory) - ensure host_owned prepared (already via rmsnorm_in_layout)
             const float *norm_buf = norm_view.original_row_major;

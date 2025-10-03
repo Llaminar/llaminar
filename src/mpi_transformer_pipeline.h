@@ -107,6 +107,23 @@ namespace llaminar
          */
         void setSequencePosition(int pos) { n_past_ = pos; }
 
+        /**
+         * @brief Explicitly mark upcoming execution as prefill stage.
+         * This avoids relying on implicit (n_past_==0) heuristics so the adapter
+         * can replay full sequences during decode without confusing backend selection.
+         */
+        void setStagePrefill() { is_prefill_stage_ = true; }
+
+        /**
+         * @brief Mark subsequent execution as decode stage.
+         */
+        void setStageDecode() { is_prefill_stage_ = false; }
+
+        /**
+         * @brief Query whether current stage is prefill.
+         */
+        bool isPrefillStage() const { return is_prefill_stage_; }
+
         // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
@@ -137,6 +154,19 @@ namespace llaminar
          * @return Number of output tensors this kernel produces
          */
         size_t getExpectedOutputCount() const override { return 1; } // output_logits
+
+        /**
+         * @brief Attempt incremental single-token decode using KV cache and return logits for that token.
+         * Falls back to false when incremental path is disabled (env flag), KV cache disabled, or any
+         * internal failure occurs. On success, advances internal n_past_ and updates stage to decode.
+         * @param token_id Next token id to decode
+         * @param weights Model weights
+         * @param output_logits Output logits tensor (1 x vocab)
+         * @return true if incremental path executed successfully; false if caller should replay full sequence
+         */
+        bool incrementalDecodeToken(int token_id,
+                                    const ModelWeights &weights,
+                                    std::shared_ptr<TensorBase> &output_logits);
 
         /**
          * @brief Get number of times the replicated small-sequence fast path executed (process-local count).
@@ -172,6 +202,18 @@ namespace llaminar
          */
         static const std::vector<LayerActivationStat> &getLastLayerActivationStats() { return last_layer_stats_; }
 
+        // Layer token diff capture (stores per-layer last-token hidden row when enabled)
+        struct LayerTokenDiffRow
+        {
+            int layer = -1;                 // layer index
+            int seq_len = 0;                // sequence length at time of capture
+            bool incremental = false;       // captured during incrementalDecodeToken path
+            const void *pipeline = nullptr; // originating pipeline instance (this)
+            std::vector<float> values;      // size = d_model
+        };
+        static const std::vector<LayerTokenDiffRow> &getLastLayerTokenRows() { return last_layer_token_rows_; }
+        static void resetLayerTokenRows() { last_layer_token_rows_.clear(); }
+
         /**
          * @brief Reset captured diagnostic buffers (mainly for tests).
          */
@@ -182,6 +224,8 @@ namespace llaminar
         }
 
     private:
+        // Flag set while inside incrementalDecodeToken execution to tag diagnostics.
+        bool in_incremental_pass_ = false;
         /**
          * @brief Initialize all kernels for transformer pipeline
          */
@@ -222,6 +266,21 @@ namespace llaminar
                                      const ModelWeights &weights,
                                      std::shared_ptr<TensorBase> &output);
 
+        /**
+         * @brief Incrementally decode a single next token using existing KV cache without replay.
+         * Falls back to full execute path if KV cache disabled or env flag disables incremental.
+         * @param token_id Next token id
+         * @param weights Model weights
+         * @param output_logits Output logits tensor (1 x vocab)
+         */
+        bool decodeToken(int token_id,
+                         const ModelWeights &weights,
+                         std::shared_ptr<TensorBase> &output_logits);
+
+        // Helper: embed a single token into a 1 x d_model tensor
+        std::shared_ptr<TensorBase> embedSingleToken(int token_id,
+                                                     const std::shared_ptr<TensorBase> &embedding_weight);
+
         void traceFFNShardDiagnostics(const std::string &label,
                                       const float *data,
                                       int seq_len,
@@ -234,6 +293,11 @@ namespace llaminar
             double linear_ms{0.0};
         };
 
+        /**
+         * @deprecated Legacy COSMA prefill decision helper.
+         * Replaced by centralized backend selector (selectAttentionBackend).
+         * TODO(dsanftenberg): Remove once all call sites migrate and tests updated.
+         */
         bool shouldUseCosmaPrefill(int seq_len) const;
         bool executePrefillAttentionCosma(int layer_idx,
                                           std::shared_ptr<TensorBase> &input,
@@ -256,9 +320,34 @@ namespace llaminar
         std::vector<std::shared_ptr<TensorBase>> createIntermediateTensors(int seq_len);
 
     private:
-        LayerConfig config_; ///< Transformer configuration
-        bool use_kv_cache_;  ///< KV cache enabled flag
-        int n_past_;         ///< Current sequence position
+        LayerConfig config_;                ///< Transformer configuration
+        bool use_kv_cache_;                 ///< KV cache enabled flag
+        int n_past_;                        ///< Current sequence position
+        bool is_prefill_stage_{true};       ///< Explicit stage flag (prefill until first decode)
+        bool kv_cache_dynamic_init_{false}; ///< Capture dynamic init intent at construction (stable across env mutations)
+
+        // KV cache state (dynamic capacity management)
+        struct KVCacheState
+        {
+            int capacity_tokens = 0; // total allocated token slots per layer (rows in k/v cache tensors)
+            int used_tokens = 0;     // tokens populated (prefill length + decoded)
+            int growth_events = 0;   // number of reallocations performed
+        } kv_cache_state_;
+
+        // Ensure KV cache has space for at least required_tokens. Returns true on success.
+        bool ensureKVCapacity(int required_tokens);
+
+    public:
+        // Introspection helpers (used in tests / diagnostics)
+        int getKVCacheCapacity() const noexcept { return kv_cache_state_.capacity_tokens; }
+        int getKVCacheUsed() const noexcept { return kv_cache_state_.used_tokens; }
+        int getKVCacheGrowthEvents() const noexcept { return kv_cache_state_.growth_events; }
+        bool isKVDynamicInit() const noexcept { return kv_cache_dynamic_init_; }
+        // Public wrapper for adapter access (maintains encapsulation of growth policy internals)
+        bool ensureKVCapacityPublic(int required_tokens) { return ensureKVCapacity(required_tokens); }
+
+        // Test utility: allocate a local tensor (exposed for lightweight unit tests that need deterministic weight fabrication)
+        std::shared_ptr<TensorBase> allocateTestLocalTensor(const std::vector<int> &shape) { return createLocalTensor(shape); }
 
         // KV cache tensors (if enabled)
         std::vector<std::shared_ptr<TensorBase>> k_cache_; ///< Key cache per layer
@@ -279,6 +368,7 @@ namespace llaminar
         // Diagnostics (static so tests can fetch after execute())
         static std::vector<float> last_pre_lm_hidden_;
         static std::vector<LayerActivationStat> last_layer_stats_;
+        static std::vector<LayerTokenDiffRow> last_layer_token_rows_;
     };
 
     /**

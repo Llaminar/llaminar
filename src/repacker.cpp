@@ -1,5 +1,4 @@
 #include "repacker.h"
-#include "graph_compute.h"
 #include "tensors/tensor_base.h"
 #include "tensors/tensor_factory.h"
 #include <iostream>

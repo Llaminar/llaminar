@@ -16,8 +16,8 @@ Create a lightweight utility module under `src/kernels/common/` holding core rou
 
 ```
 src/kernels/common/
-    normalization.h / .cpp    # RMSNorm core & helpers
-    softmax.h / .cpp          # Softmax core & helpers
+    rmsnorm_core.h / .cpp     # RMSNorm core & helpers (implemented; supersedes legacy normalization.{h,cpp})
+    softmax.h / .cpp          # Softmax core & helpers (pending consolidation)
     mpi_utils.h / .cpp        # Thin wrappers for shared MPI reductions (existing bits we can reuse)
 ```
 
@@ -129,8 +129,8 @@ Adapters:
 
 ## Next Steps
 
-1. Implement `src/kernels/common/normalization.{h,cpp}` and `softmax.{h,cpp}` with row-major versions plus MPI-aware reducers.
-2. Refactor `MPIRMSNormKernel` to use the shared helper (includes unit tests for regression).
-3. Wire COSMA `rmsnorm_in_layout` to the shared helper without breaking existing statistics.
-4. Repeat for softmax.
-5. Start scaffolding the llama.cpp golden test harness once core behavior is identical.
+1. (DONE) Implement `src/kernels/common/rmsnorm_core.{h,cpp}` with row-major + distributed helpers (legacy normalization removed).
+2. (DONE) Refactor `MPIRMSNormKernel` to use shared `rmsnorm_core` (parity test added: `RMSNormCoreParity`).
+3. (DONE) Wire COSMA fused & small-seq paths to `rmsnorm_core` helpers (instrumentation preserved).
+4. (PENDING) Implement `softmax.{h,cpp}` unification and migrate attention kernels.
+5. (PENDING) Start scaffolding the llama.cpp golden test harness once softmax path unified.

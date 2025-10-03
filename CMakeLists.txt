@@ -133,7 +133,6 @@ set(LLAMINAR_CORE_SOURCES
     src/common.cpp
     src/argument_parser.cpp
     src/topology_manager.cpp
-    src/graph_compute.cpp
     src/mpi_kernel_base.cpp
     src/cosma_prefill_manager.cpp
     src/utils/debug_env.cpp
@@ -146,10 +145,13 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/MPIRoPEKernel.cpp
     src/kernels/MPISwiGLUKernel.cpp
     src/kernels/common/attention_primitives.cpp
-    src/kernels/common/normalization.cpp
-    src/kernels/common/softmax.cpp
+    src/kernels/common/rmsnorm_core.cpp
+    src/kernels/common/softmax_core.cpp
     src/mpi_transformer_pipeline.cpp
     src/pipeline_base.cpp
+    src/backend_selector.cpp
+    src/abstract_pipeline.cpp
+    src/qwen_pipeline_adapter.cpp
     src/tensors/simple_tensor.cpp
     src/tensors/cosma_tensor.cpp
     src/tensors/tensor_factory.cpp
@@ -190,6 +192,14 @@ target_link_libraries(llaminar_core
     ggml
     ${BLAS_LIBRARIES}
 )
+
+# Optional GNU libmvec (vector math) for accelerated transcendentals (e.g., RoPE sin/cos)
+find_library(MVEC_LIB mvec)
+if(MVEC_LIB)
+    message(STATUS "Found libmvec: ${MVEC_LIB}")
+    target_link_libraries(llaminar_core PUBLIC ${MVEC_LIB})
+    target_compile_definitions(llaminar_core PUBLIC LLAMINAR_HAVE_LIBMVEC=1)
+endif()
 
 # Add NUMA if available
 if(NUMA_FOUND)
@@ -243,6 +253,26 @@ target_link_libraries(production_demo llaminar_core)
 add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
 target_link_libraries(bench_tp_output_projection llaminar_core)
 
+# RMSNorm micro-benchmark harness
+add_executable(bench_rmsnorm bench_rmsnorm.cpp)
+target_link_libraries(bench_rmsnorm llaminar_core)
+
+# Attention primitives benchmark (primitives vs legacy path)
+add_executable(bench_attention bench_attention.cpp)
+target_link_libraries(bench_attention llaminar_core)
+
+# Softmax micro-benchmark harness
+add_executable(bench_softmax bench_softmax.cpp)
+target_link_libraries(bench_softmax llaminar_core)
+
+# Distributed softmax benchmark (MPI required)
+add_executable(bench_softmax_distributed bench_softmax_distributed.cpp)
+target_link_libraries(bench_softmax_distributed llaminar_core)
+
+# RoPE micro-benchmark harness
+add_executable(bench_rope bench_rope.cpp)
+target_link_libraries(bench_rope llaminar_core)
+
 # Add DEBUG flag to main executable when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(llaminar PRIVATE DEBUG)
@@ -267,6 +297,32 @@ if(GTEST_FOUND)
         GTest::gtest_main
     )
     add_test(NAME WeightRoleClassification COMMAND test_weight_role_classification)
+endif()
+
+# RMSNorm core parity regression test
+if(GTEST_FOUND)
+    add_executable(test_rmsnorm_core_parity
+        tests/test_rmsnorm_core_parity.cpp
+        src/utils/debug_env.cpp
+    )
+    target_link_libraries(test_rmsnorm_core_parity
+        PRIVATE
+            llaminar_core
+            GTest::gtest
+            GTest::gtest_main
+    )
+    add_test(NAME RMSNormCoreParity COMMAND test_rmsnorm_core_parity)
+
+    add_executable(test_softmax_core_parity
+        tests/test_softmax_core_parity.cpp
+    )
+    target_link_libraries(test_softmax_core_parity
+        PRIVATE
+            llaminar_core
+            GTest::gtest
+            GTest::gtest_main
+    )
+    add_test(NAME SoftmaxCoreParity COMMAND test_softmax_core_parity)
 endif()
 
 
@@ -341,9 +397,6 @@ add_executable(test_cosma tests/test_cosma.cpp)
 target_link_libraries(test_cosma llaminar_core)
 add_test(NAME CosmaTest COMMAND test_cosma)
 
-add_executable(test_graph tests/test_graph.cpp)
-target_link_libraries(test_graph llaminar_core)
-add_test(NAME GraphTest COMMAND test_graph)
 
 # Kernel unit tests (if Google Test is available)
 if(GTEST_FOUND)
@@ -403,6 +456,16 @@ if(GTEST_FOUND)
         target_link_libraries(test_mpi_rmsnorm_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
     add_llaminar_mpi_test(MPIRMSNormKernelTest 2 test_mpi_rmsnorm_kernel)
+    # Distributed softmax parity test (2 ranks)
+    add_executable(test_mpi_softmax_parity tests/test_mpi_softmax_parity.cpp)
+    target_link_libraries(test_mpi_softmax_parity llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_softmax_parity GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_mpi_softmax_parity PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_softmax_parity ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(MPISoftmaxParityTest 2 test_mpi_softmax_parity)
 
     # Reconfigure test_mpi_attention_kernel as a standalone minimal MPI binary (no GTest) to avoid
     # pre-main static initialization hang (see tests/AGENTS.md Case Study 11).
@@ -494,6 +557,72 @@ if(GTEST_FOUND)
     add_test(NAME MLPTPParity_Matrix
              COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_mlp_tp_parity_matrix.sh)
     set_tests_properties(MLPTPParity_Matrix PROPERTIES TIMEOUT 300 LABELS "mlp;tp;parity;matrix")
+
+    # Unified TP GEMM parity matrix driver (row + col executor cases)
+    add_test(NAME TPGemmParity_Matrix
+             COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_tp_gemm_parity_matrix.sh)
+    set_tests_properties(TPGemmParity_Matrix PROPERTIES TIMEOUT 240 LABELS "tp;gemm;parity;matrix")
+
+    # ---------------------------------------------------------------------------
+    # Generic TP GEMM executor parity tests (row & column partition)
+    # ---------------------------------------------------------------------------
+    add_executable(test_tp_gemm_parity tests/test_tp_gemm_parity.cpp)
+    target_link_libraries(test_tp_gemm_parity PRIVATE llaminar_core GTest::gtest_main)
+
+    # Column mode tests
+    add_test(NAME TPGemmParity_ColEven_2way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.ColumnEvenSplit_2way)
+    set_tests_properties(TPGemmParity_ColEven_2way PROPERTIES TIMEOUT 40 LABELS "tp;gemm;parity;col;tp2")
+    add_test(NAME TPGemmParity_ColRagged_3way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.ColumnRaggedPrime_3way)
+    set_tests_properties(TPGemmParity_ColRagged_3way PROPERTIES TIMEOUT 50 LABELS "tp;gemm;parity;col;ragged;tp3")
+    add_test(NAME TPGemmParity_ColEven_4way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.ColumnEven_4way)
+    set_tests_properties(TPGemmParity_ColEven_4way PROPERTIES TIMEOUT 60 LABELS "tp;gemm;parity;col;tp4")
+
+    # Row mode tests
+    add_test(NAME TPGemmParity_RowEven_2way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.RowEvenSplit_2way)
+    set_tests_properties(TPGemmParity_RowEven_2way PROPERTIES TIMEOUT 40 LABELS "tp;gemm;parity;row;tp2")
+    add_test(NAME TPGemmParity_RowRagged_3way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.RowRaggedPrime_3way)
+    set_tests_properties(TPGemmParity_RowRagged_3way PROPERTIES TIMEOUT 50 LABELS "tp;gemm;parity;row;ragged;tp3")
+    add_test(NAME TPGemmParity_RowEven_4way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.RowEven_4way)
+    set_tests_properties(TPGemmParity_RowEven_4way PROPERTIES TIMEOUT 60 LABELS "tp;gemm;parity;row;tp4")
+
+    # Degenerate single-rank path
+    add_test(NAME TPGemmParity_DegenerateSingle
+             COMMAND $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.DegenerateSingle)
+    set_tests_properties(TPGemmParity_DegenerateSingle PROPERTIES TIMEOUT 20 LABELS "tp;gemm;parity;degenerate")
+
+    # Additional shape coverage (wider, taller, moderate, larger ragged)
+    add_test(NAME TPGemmParity_ColWide_4way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.ColumnWide_4way)
+    set_tests_properties(TPGemmParity_ColWide_4way PROPERTIES TIMEOUT 70 LABELS "tp;gemm;parity;col;tp4;extra")
+    add_test(NAME TPGemmParity_RowTall_4way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.RowTall_4way)
+    set_tests_properties(TPGemmParity_RowTall_4way PROPERTIES TIMEOUT 70 LABELS "tp;gemm;parity;row;tp4;extra")
+    add_test(NAME TPGemmParity_ColModerate_2way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.ColumnModerate_2way)
+    set_tests_properties(TPGemmParity_ColModerate_2way PROPERTIES TIMEOUT 50 LABELS "tp;gemm;parity;col;tp2;extra")
+    add_test(NAME TPGemmParity_RowModerate_2way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.RowModerate_2way)
+    set_tests_properties(TPGemmParity_RowModerate_2way PROPERTIES TIMEOUT 50 LABELS "tp;gemm;parity;row;tp2;extra")
+    add_test(NAME TPGemmParity_ColRaggedLarge_3way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.ColumnRaggedLarge_3way)
+    set_tests_properties(TPGemmParity_ColRaggedLarge_3way PROPERTIES TIMEOUT 60 LABELS "tp;gemm;parity;col;tp3;ragged;extra")
+    add_test(NAME TPGemmParity_RowRaggedLarge_3way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.RowRaggedLarge_3way)
+    set_tests_properties(TPGemmParity_RowRaggedLarge_3way PROPERTIES TIMEOUT 60 LABELS "tp;gemm;parity;row;tp3;ragged;extra")
+
+    # Batched GEMM parity (multiple independent GEMMs)
+    add_test(NAME TPGemmParity_BatchRowEven_2way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.BatchRowEvenSplit_2way)
+    set_tests_properties(TPGemmParity_BatchRowEven_2way PROPERTIES TIMEOUT 70 LABELS "tp;gemm;parity;row;tp2;batch")
+    add_test(NAME TPGemmParity_BatchColEven_2way
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_parity> --gtest_filter=TPGemmParity.BatchColEvenSplit_2way)
+    set_tests_properties(TPGemmParity_BatchColEven_2way PROPERTIES TIMEOUT 70 LABELS "tp;gemm;parity;col;tp2;batch")
 
     # Small (even-ish) partition
     add_test(NAME MLPShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_parity> --seq-len=5 --d-model=48 --d-ff=64)
@@ -643,11 +772,8 @@ if(GTEST_FOUND)
     endif()
     # Single-rank pure math primitives test (no MPI). Register with CTest explicitly.
     # Executable may live either in top-level or tests/ depending on generator/output rules.
-    if (EXISTS ${CMAKE_BINARY_DIR}/tests/test_attention_primitives)
-        add_test(NAME AttentionPrimitivesTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_attention_primitives)
-    else()
-        add_test(NAME AttentionPrimitivesTest COMMAND ${CMAKE_BINARY_DIR}/test_attention_primitives)
-    endif()
+    # Use generator expression for reliable path regardless of multi-config or output dir layout
+    add_test(NAME AttentionPrimitivesTest COMMAND $<TARGET_FILE:test_attention_primitives>)
     set_tests_properties(AttentionPrimitivesTest PROPERTIES TIMEOUT 5)
     if(GTest_FOUND)
         target_link_libraries(test_attention_micro GTest::gtest GTest::gtest_main)
@@ -658,6 +784,18 @@ if(GTEST_FOUND)
     add_llaminar_mpi_test(AttentionMicroTest 2 test_attention_micro)
     set_tests_properties(AttentionMicroTest PROPERTIES TIMEOUT 30)
     set_tests_properties(AttentionMicroTest PROPERTIES LABELS "attention;parity;kernel")
+
+    # RoPE recurrence parity test (single-rank; validates recurrence vs legacy bitwise/tolerance parity)
+    add_executable(test_rope_recurrence_parity tests/test_rope_recurrence_parity.cpp)
+    target_link_libraries(test_rope_recurrence_parity llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_rope_recurrence_parity GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_rope_recurrence_parity PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_rope_recurrence_parity ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME RoPERecurrenceParityTest COMMAND $<TARGET_FILE:test_rope_recurrence_parity>)
+    set_tests_properties(RoPERecurrenceParityTest PROPERTIES TIMEOUT 10 LABELS "rope;parity;attention")
 
     # TP column-partition WO projection parity (single-rank; ensure partitions vs disabled match)
     add_test(NAME TPColumnPartitionWOParity
@@ -813,7 +951,7 @@ if(GTEST_FOUND)
     # TP output projection executor (simulation) test
     add_executable(test_tp_output_projection_executor tests/test_tp_output_projection_executor.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_tp_output_projection_executor llaminar_core)
-    add_test(NAME TPOutputProjectionExecutorTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_tp_output_projection_executor)
+    add_test(NAME TPOutputProjectionExecutorTest COMMAND $<TARGET_FILE:test_tp_output_projection_executor>)
 
     add_executable(test_cosma_prefill_manager_stats_dump tests/test_cosma_prefill_manager_stats_dump.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_stats_dump llaminar_core)
@@ -836,6 +974,22 @@ if(GTEST_FOUND)
     target_link_libraries(test_cosma_prefill_population_perf PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(CosmaPrefillManagerPopulationPerfTest 2 test_cosma_prefill_population_perf)
     set_tests_properties(CosmaPrefillManagerPopulationPerfTest PROPERTIES TIMEOUT 120)
+
+    # Abstract pipeline parity test (legacy vs adapter incremental decode)
+    add_executable(test_abstract_pipeline_parity tests/test_abstract_pipeline_parity.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_abstract_pipeline_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(AbstractPipelineParityTest 2 test_abstract_pipeline_parity)
+    set_tests_properties(AbstractPipelineParityTest PROPERTIES TIMEOUT 60)
+    # KV cache growth dynamic capacity test
+    add_executable(test_kv_cache_growth tests/test_kv_cache_growth.cpp)
+    target_link_libraries(test_kv_cache_growth PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(KVCacheGrowthTest 2 test_kv_cache_growth)
+
+    # KV cache growth parity test (incremental vs replay logits parity across growth)
+    add_executable(test_kv_cache_growth_parity tests/test_kv_cache_growth_parity.cpp)
+    target_link_libraries(test_kv_cache_growth_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(KVCacheGrowthParityTest 2 test_kv_cache_growth_parity)
+    set_tests_properties(KVCacheGrowthTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_prefill_attention_golden tests/test_prefill_attention_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
@@ -1054,7 +1208,7 @@ set_target_properties(llaminar adaptive_demo
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-set_target_properties(test_basic test_numa test_cosma test_graph ${KERNEL_TEST_TARGETS}
+set_target_properties(test_basic test_numa test_cosma ${KERNEL_TEST_TARGETS}
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
@@ -1062,14 +1216,14 @@ set_target_properties(test_basic test_numa test_cosma test_graph ${KERNEL_TEST_T
 # Custom test target to run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_basic test_numa test_cosma test_graph ${KERNEL_TEST_TARGETS}
+    DEPENDS test_basic test_numa test_cosma ${KERNEL_TEST_TARGETS}
     COMMENT "Running all tests"
 )
 
 # Add DEBUG flag to all test targets when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     # List of all test targets
-    set(TEST_TARGETS test_basic test_numa test_cosma test_graph)
+    set(TEST_TARGETS test_basic test_numa test_cosma)
     
     # Add any kernel test targets if they exist
     if(GTEST_FOUND)

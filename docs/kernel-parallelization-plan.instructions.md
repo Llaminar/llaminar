@@ -32,7 +32,7 @@
 ### **Phase 1B: Matrix Operations (Todos 2-3)**
 **Objective**: Parallelize core matrix and normalization operations
 
-**LinearKernel (Todo 2)**:
+**LinearKernel (Todo 2)**: (Historical) The standalone non-MPI LinearKernel has been removed; MPILinearKernel plus adaptiveMatMul now cover all projection paths.
 ```cpp
 // Row-wise distribution pattern:
 // Input:  [seq_len, d_model] → distribute by seq_len
@@ -123,7 +123,7 @@
 ### **Phase 2B: Matrix Operation Replacement (Todos 8-10)**
 **Objective**: Replace all matrix multiplications with COSMA
 
-**LinearKernel (Todo 8)**:
+**LinearKernel (Todo 8)**: (Historical) Skipped — legacy kernel retired after MPI unification.
 ```cpp
 // Replace: computeLinear() triple loop
 // With: cosma::multiply() call

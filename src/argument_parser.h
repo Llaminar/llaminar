@@ -46,6 +46,7 @@ struct LlaminarParams
     // Performance parameters
     bool profile_kernels = false;
     bool validate_results = false;
+    bool kv_cache_stats = false; // --kv-stats : print KV cache capacity/usage summary at end
 
     // Help/version
     bool show_help = false;

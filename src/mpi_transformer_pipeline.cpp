@@ -4,13 +4,16 @@
 #include "kernels/MPIRoPEKernel.h"
 #include "kernels/MPIResidualKernel.h"
 #include "kernels/MPIEmbeddingKernel.h"
-#include "kernels/common/normalization.h"
+#include "kernels/common/rmsnorm_core.h"
 #include "tensors/tensor_factory.h"
 #include "tensors/simple_tensor.h"
 #include "debug_utils.h"
 #include "performance_timer.h"
 #include "cosma_prefill_manager.h"
 #include "adaptive_matmul.h"
+#include "backend_selector.h"
+using llaminar::BackendContext;
+using llaminar::BackendDecision;
 #include <chrono>
 #include <iomanip>
 #include <cmath>
@@ -608,6 +611,7 @@ namespace llaminar
     std::atomic<size_t> MPITransformerPipeline::small_seq_fast_path_calls_{0};
     std::vector<float> MPITransformerPipeline::last_pre_lm_hidden_;
     std::vector<MPITransformerPipeline::LayerActivationStat> MPITransformerPipeline::last_layer_stats_;
+    std::vector<MPITransformerPipeline::LayerTokenDiffRow> MPITransformerPipeline::last_layer_token_rows_;
 
     MPITransformerPipeline::MPITransformerPipeline(const LayerConfig &config)
         : PipelineBase(), config_(config), use_kv_cache_(true), n_past_(0),
@@ -618,9 +622,27 @@ namespace llaminar
         initializeKernels();
 
         // Initialize KV cache if enabled
+        kv_cache_dynamic_init_ = debugEnv().kv_cache.dynamic_init; // snapshot per-instance
+        if (getRank() == 0)
+        {
+            LOG_INFO("[KVCacheInitMode] constructing pipeline this=" << (const void *)this
+                                                                     << " dynamic_init=" << (kv_cache_dynamic_init_ ? "on" : "off"));
+        }
         if (use_kv_cache_)
         {
-            initializeKVCache(config_.max_seq_len);
+            int initial_capacity = config_.max_seq_len;
+            if (kv_cache_dynamic_init_)
+            {
+                // Defer exact sizing until first execute() call where we know prefill length.
+                // Allocate minimal (1) placeholder so vectors are non-empty; will be resized on first execute.
+                initial_capacity = 1;
+            }
+            initializeKVCache(initial_capacity);
+            if (getRank() == 0)
+            {
+                LOG_INFO("[KVCacheInitMode] post-initial-capacity this=" << (const void *)this
+                                                                         << " capacity_tokens=" << kv_cache_state_.capacity_tokens);
+            }
         }
 
         LOG_INFO("MPITransformerPipeline initialized on rank " << getRank() << "/" << getSize()
@@ -862,6 +884,19 @@ namespace llaminar
             return false;
         }
 
+        // Dynamic KV cache initial sizing if requested (placeholder capacity expanded to prefill length)
+        if (use_kv_cache_ && kv_cache_dynamic_init_)
+        {
+            if (kv_cache_state_.capacity_tokens < seq_len)
+            {
+                if (getRank() == 0)
+                {
+                    LOG_INFO("[KVCacheInit] dynamic prefill resize trigger old_cap=" << kv_cache_state_.capacity_tokens
+                                                                                     << " seq_len=" << seq_len);
+                }
+                initializeKVCache(std::min(seq_len, config_.max_seq_len));
+            }
+        }
         // Replicated small-sequence fast path (avoid distributed partition producing zero-length shards).
         // Trigger when global sequence length is smaller than number of ranks.
         int world_size = getSize();
@@ -887,14 +922,17 @@ namespace llaminar
                 std::vector<float> tmp(seq_len * config_.d_model, 0.f);
                 auto rmsnorm = [&](std::vector<float> &mat, const float *wn)
                 {
-                    kernels::RMSNormArgs args;
-                    args.input = mat.data();
-                    args.output = mat.data();
-                    args.weight = wn;
-                    args.rows = seq_len;
-                    args.cols = config_.d_model;
-                    args.epsilon = config_.eps;
-                    kernels::rmsnorm_row_major(args);
+                    kernels::RMSNormExecOptions opts; // default heuristics
+                    kernels::rmsnorm_row_major_fused(
+                        mat.data(),
+                        wn,
+                        mat.data(),
+                        (size_t)seq_len,
+                        (size_t)config_.d_model,
+                        config_.eps,
+                        kernels::GammaMode::REPLICATED,
+                        0,
+                        opts);
                 };
                 auto matmul = [&](const std::vector<float> &A, const float *B, int k, int n, std::vector<float> &C)
                 {
@@ -1035,6 +1073,11 @@ namespace llaminar
                 PrefillBaselineRegistry::instance().clear();
                 LOG_DEBUG("[PrefillBaseline] cleared registry after comparison run (small seq path)");
             }
+            if (use_kv_cache_)
+            {
+                kv_cache_state_.used_tokens = seq_len;
+                n_past_ = seq_len;
+            }
             return true;
         }
 
@@ -1151,7 +1194,39 @@ namespace llaminar
             PrefillBaselineRegistry::instance().clear();
             LOG_DEBUG("[PrefillBaseline] cleared registry after comparison run");
         }
-
+        // Sanity: ensure prefill sequence length fits within allocated KV cache capacity.
+        // Rare edge: some test harness env mutation ordering caused dynamic_init path to miss the early
+        // resize (capacity still placeholder=1 here). Provide a last-chance re-init if dynamic_init enabled
+        // and no tokens have been written yet (used_tokens==0) to avoid a spurious failure.
+        if (use_kv_cache_ && seq_len > kv_cache_state_.capacity_tokens)
+        {
+            if (kv_cache_dynamic_init_ && kv_cache_state_.used_tokens == 0)
+            {
+                if (getRank() == 0)
+                    LOG_WARN("[KVCache] late dynamic resize fallback triggering (cap=" << kv_cache_state_.capacity_tokens
+                                                                                       << " -> " << seq_len << ")");
+                initializeKVCache(std::min(seq_len, config_.max_seq_len));
+            }
+            if (seq_len > kv_cache_state_.capacity_tokens)
+            {
+                LOG_ERROR("[KVCache] seq_len=" << seq_len << " exceeds capacity_tokens=" << kv_cache_state_.capacity_tokens
+                                               << " after prefill; this indicates initialization logic failure");
+                return false;
+            }
+        }
+        // KV cache bookkeeping (standard prefill path). The small-seq fast path and
+        // some early-return ablation paths already update these counters, but the
+        // main path previously forgot to set them, leaving used_tokens at 0 which
+        // breaks incremental decode + growth logic expectations.
+        if (use_kv_cache_)
+        {
+            n_past_ = seq_len;
+            kv_cache_state_.used_tokens = seq_len;
+            if (getRank() == 0)
+                LOG_INFO("[KVCacheSummary] post_prefill used_tokens=" << kv_cache_state_.used_tokens
+                                                                      << " capacity=" << kv_cache_state_.capacity_tokens
+                                                                      << " growth_events=" << kv_cache_state_.growth_events);
+        }
         return true;
     }
 
@@ -1243,6 +1318,21 @@ namespace llaminar
     {
         PERF_SCOPED_TIMER("MPITransformerPipeline::executeTransformerLayer");
         int seq_len = input->shape()[0];
+
+        // Early one-shot diagnostic for layer token diff capture flags (before any potential early returns)
+        {
+            static bool printed_early_token_diff = false;
+            if (!printed_early_token_diff && getRank() == 0)
+            {
+                printed_early_token_diff = true;
+                const char *raw_env = std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF");
+                const char *raw_env_verbose = std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF_VERBOSE");
+                LOG_INFO(std::string("[LayerTokenDiffEarly] snapshot.layer_token_diff=") + (debugEnv().pipeline.layer_token_diff ? "1" : "0") +
+                         " snapshot.layer_token_diff_verbose=" + (debugEnv().pipeline.layer_token_diff_verbose ? "1" : "0") +
+                         " raw_env=" + (raw_env ? raw_env : "<unset>") +
+                         " raw_env_verbose=" + (raw_env_verbose ? raw_env_verbose : "<unset>"));
+            }
+        }
 
         // Create temporary tensors for layer computation
         auto attn_norm_out = createLocalTensor({seq_len, config_.d_model});
@@ -1595,7 +1685,14 @@ namespace llaminar
         PrefillAttentionTiming cosma_timing;
         if (!abl.ablate_attention)
         {
-            if (shouldUseCosmaPrefill(seq_len))
+            BackendContext bctx;
+            bctx.is_prefill = is_prefill_stage_; // explicit stage flag set by adapter / external caller
+            bctx.seq_len = seq_len;
+            bctx.d_model = config_.d_model;
+            bctx.n_layers = config_.n_layers;
+            bctx.world = getSize();
+            BackendDecision backend_dec = selectAttentionBackend(bctx);
+            if (backend_dec.use_cosma())
             {
                 if (!executePrefillAttentionCosma(layer_idx, input, weights, attn_norm_out, attn_out, cosma_timing))
                 {
@@ -1605,9 +1702,11 @@ namespace llaminar
                 total_norm_time_ += cosma_timing.norm_ms;
                 total_attention_time_ += cosma_timing.attention_ms;
                 total_linear_time_ += cosma_timing.linear_ms;
+                LOG_DEBUG("[backend] attention layer=" << layer_idx << " backend=COSMA stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << backend_dec.reason);
             }
             else
             {
+                LOG_DEBUG("[backend] attention layer=" << layer_idx << " backend=OpenBLAS stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << backend_dec.reason);
                 auto norm_start = std::chrono::high_resolution_clock::now();
 
                 // Attention pre-norm using registered RMSNorm kernel
@@ -1800,6 +1899,11 @@ namespace llaminar
                 LOG_WARN("[Ablation] Layer " << layer_idx << " FFN skipped (LLAMINAR_ABLATE_FFN)");
             capture_rows("layer_output", output);
             LOG_DEBUG("Layer " << layer_idx << " completed (FFN ablated) on rank " << getRank());
+            if (use_kv_cache_)
+            {
+                kv_cache_state_.used_tokens = seq_len;
+                n_past_ = seq_len;
+            }
             return true;
         }
         auto norm_start = std::chrono::high_resolution_clock::now();
@@ -1939,14 +2043,46 @@ namespace llaminar
         auto gate_out = createLocalTensor({seq_len, config_.d_ff});
         auto up_out = createLocalTensor({seq_len, config_.d_ff});
 
-        // Gate projection using registered linear kernel
-        std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_out, weights.w_gate[layer_idx]};
-        std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate_out};
-
-        if (!executeKernel("linear", gate_inputs, gate_outputs))
+        // Gate projection with adaptive backend (COSMA for large prefill else linear kernel / OpenBLAS)
         {
-            LOG_ERROR("Layer " << layer_idx << " gate projection failed");
-            return false;
+            BackendContext bctx;
+            bctx.is_prefill = is_prefill_stage_;
+            bctx.seq_len = seq_len;
+            bctx.d_model = config_.d_model;
+            bctx.n_layers = config_.n_layers;
+            bctx.world = getSize();
+            auto dec = selectAttentionBackend(bctx); // Reuse attention heuristic for FFN for now
+            if (dec.use_cosma())
+            {
+                LOG_DEBUG("[backend] ffn_gate layer=" << layer_idx << " backend=COSMA stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << dec.reason);
+                if (!adaptiveMatMul(ffn_norm_out->data(),
+                                    weights.w_gate[layer_idx]->data(),
+                                    gate_out->data(),
+                                    seq_len,     /*m*/
+                                    d_ff,        /*n*/
+                                    hidden_size, /*k*/
+                                    is_prefill_stage_,
+                                    /*distributed_partition*/ false,
+                                    /*transpose_A*/ false,
+                                    /*transpose_B*/ false,
+                                    /*alpha*/ 1.0f,
+                                    /*beta*/ 0.0f))
+                {
+                    LOG_ERROR("Layer " << layer_idx << " gate projection COSMA path failed");
+                    return false;
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[backend] ffn_gate layer=" << layer_idx << " backend=OpenBLAS(linear-kernel) stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << dec.reason);
+                std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_out, weights.w_gate[layer_idx]};
+                std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate_out};
+                if (!executeKernel("linear", gate_inputs, gate_outputs))
+                {
+                    LOG_ERROR("Layer " << layer_idx << " gate projection failed");
+                    return false;
+                }
+            }
         }
 
         ASSERT_TENSOR_NOT_NAN(gate_out, "FFN gate output has NaN in layer " + std::to_string(layer_idx));
@@ -1963,14 +2099,46 @@ namespace llaminar
         logFFNRowPreviewIfEnabled("layer_" + std::to_string(layer_idx) + "_ffn_gate", gate_out);
         capture_rows("ffn_gate", gate_out);
 
-        // Up projection using registered linear kernel
-        std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_out, weights.w_up[layer_idx]};
-        std::vector<std::shared_ptr<TensorBase>> up_outputs = {up_out};
-
-        if (!executeKernel("linear", up_inputs, up_outputs))
+        // Up projection adaptive path
         {
-            LOG_ERROR("Layer " << layer_idx << " up projection failed");
-            return false;
+            BackendContext bctx;
+            bctx.is_prefill = is_prefill_stage_;
+            bctx.seq_len = seq_len;
+            bctx.d_model = config_.d_model;
+            bctx.n_layers = config_.n_layers;
+            bctx.world = getSize();
+            auto dec = selectAttentionBackend(bctx);
+            if (dec.use_cosma())
+            {
+                LOG_DEBUG("[backend] ffn_up layer=" << layer_idx << " backend=COSMA stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << dec.reason);
+                if (!adaptiveMatMul(ffn_norm_out->data(),
+                                    weights.w_up[layer_idx]->data(),
+                                    up_out->data(),
+                                    seq_len,
+                                    d_ff,
+                                    hidden_size,
+                                    is_prefill_stage_,
+                                    false,
+                                    false,
+                                    false,
+                                    1.0f,
+                                    0.0f))
+                {
+                    LOG_ERROR("Layer " << layer_idx << " up projection COSMA path failed");
+                    return false;
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[backend] ffn_up layer=" << layer_idx << " backend=OpenBLAS(linear-kernel) stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << dec.reason);
+                std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_out, weights.w_up[layer_idx]};
+                std::vector<std::shared_ptr<TensorBase>> up_outputs = {up_out};
+                if (!executeKernel("linear", up_inputs, up_outputs))
+                {
+                    LOG_ERROR("Layer " << layer_idx << " up projection failed");
+                    return false;
+                }
+            }
         }
 
         ASSERT_TENSOR_NOT_NAN(up_out, "FFN up output has NaN in layer " + std::to_string(layer_idx));
@@ -2073,14 +2241,46 @@ namespace llaminar
             log_stage_diff(swiglu_label, swiglu_out->data(), swiglu_ref_storage.data(), elems, d_ff, 1e-3);
         }
 
-        // Down projection using registered linear kernel
-        std::vector<std::shared_ptr<TensorBase>> down_inputs = {swiglu_out, weights.w_down[layer_idx]};
-        std::vector<std::shared_ptr<TensorBase>> down_outputs = {ffn_out};
-
-        if (!executeKernel("linear", down_inputs, down_outputs))
+        // Down projection adaptive path
         {
-            LOG_ERROR("Layer " << layer_idx << " down projection failed");
-            return false;
+            BackendContext bctx;
+            bctx.is_prefill = is_prefill_stage_;
+            bctx.seq_len = seq_len;
+            bctx.d_model = config_.d_model;
+            bctx.n_layers = config_.n_layers;
+            bctx.world = getSize();
+            auto dec = selectAttentionBackend(bctx);
+            if (dec.use_cosma())
+            {
+                LOG_DEBUG("[backend] ffn_down layer=" << layer_idx << " backend=COSMA stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << dec.reason);
+                if (!adaptiveMatMul(swiglu_out->data(),
+                                    weights.w_down[layer_idx]->data(),
+                                    ffn_out->data(),
+                                    seq_len,
+                                    hidden_size, /* n (output) */
+                                    d_ff,        /* k */
+                                    is_prefill_stage_,
+                                    false,
+                                    false,
+                                    false,
+                                    1.0f,
+                                    0.0f))
+                {
+                    LOG_ERROR("Layer " << layer_idx << " down projection COSMA path failed");
+                    return false;
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[backend] ffn_down layer=" << layer_idx << " backend=OpenBLAS(linear-kernel) stage=" << (is_prefill_stage_ ? "prefill" : "decode") << " reason=" << dec.reason);
+                std::vector<std::shared_ptr<TensorBase>> down_inputs = {swiglu_out, weights.w_down[layer_idx]};
+                std::vector<std::shared_ptr<TensorBase>> down_outputs = {ffn_out};
+                if (!executeKernel("linear", down_inputs, down_outputs))
+                {
+                    LOG_ERROR("Layer " << layer_idx << " down projection failed");
+                    return false;
+                }
+            }
         }
 
         ASSERT_TENSOR_NOT_NAN(ffn_out, "FFN output has NaN in layer " + std::to_string(layer_idx));
@@ -2174,11 +2374,48 @@ namespace llaminar
             LayerActivationStat stat{rms, max_abs, mean, layer_idx};
             last_layer_stats_.push_back(stat);
         }
+        // Capture last token row for diff diagnostics (only rank 0 to reduce memory)
+        // Diagnostics: one-time snapshot of flag state to understand missing capture
+        {
+            static bool printed_flag_diag = false;
+            if (!printed_flag_diag && getRank() == 0)
+            {
+                printed_flag_diag = true;
+                const char *raw_env = std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF");
+                const char *raw_env_verbose = std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF_VERBOSE");
+                LOG_INFO(std::string("[LayerTokenDiffDiag] snapshot.layer_token_diff=") + (debugEnv().pipeline.layer_token_diff ? "1" : "0") +
+                         " snapshot.layer_token_diff_verbose=" + (debugEnv().pipeline.layer_token_diff_verbose ? "1" : "0") +
+                         " raw_env=" + (raw_env ? raw_env : "<unset>") +
+                         " raw_env_verbose=" + (raw_env_verbose ? raw_env_verbose : "<unset>") +
+                         " n_rows_current=" + std::to_string(last_layer_token_rows_.size()));
+            }
+        }
+        if (debugEnv().pipeline.layer_token_diff && getRank() == 0 && output && output->data())
+        {
+            int rows = output->shape().size() > 0 ? output->shape()[0] : 0;
+            int hidden = output->shape().size() > 1 ? output->shape()[1] : 0;
+            if (rows > 0 && hidden > 0)
+            {
+                LayerTokenDiffRow row;
+                row.layer = layer_idx;
+                row.seq_len = rows;
+                row.incremental = in_incremental_pass_;
+                row.pipeline = this;
+                row.values.assign(output->data() + (size_t)(rows - 1) * hidden, output->data() + (size_t)rows * hidden);
+                last_layer_token_rows_.push_back(std::move(row));
+                if (debugEnv().pipeline.layer_token_diff_verbose)
+                {
+                    LOG_INFO("[LayerTokenCapture] pipe=" << this << " incr=" << (in_incremental_pass_ ? 1 : 0) << " layer=" << layer_idx << " seq_len=" << rows << " hidden=" << hidden << " total_rows=" << last_layer_token_rows_.size());
+                }
+            }
+        }
         return true;
     }
 
     bool MPITransformerPipeline::shouldUseCosmaPrefill(int seq_len) const
     {
+        // DEPRECATED: Retained temporarily for any external callers; internal logic now
+        // uses BackendSelector with explicit stage context. Mirrors former heuristic.
         if (seq_len <= 0)
             return false;
         if (n_past_ != 0)
@@ -2187,6 +2424,163 @@ namespace llaminar
             return false;
         auto &prefill_mgr = CosmaPrefillManager::instance();
         return prefill_mgr.enabled_for(seq_len);
+    }
+
+    std::shared_ptr<TensorBase> MPITransformerPipeline::embedSingleToken(int token_id,
+                                                                         const std::shared_ptr<TensorBase> &embedding_weight)
+    {
+        if (!embedding_weight || embedding_weight->shape().size() != 2)
+        {
+            LOG_ERROR("embedSingleToken: invalid embedding weight");
+            return nullptr;
+        }
+        int vocab = embedding_weight->shape()[0];
+        int dim = embedding_weight->shape()[1];
+        if (token_id < 0 || token_id >= vocab)
+        {
+            LOG_ERROR("embedSingleToken: token id out of range: " << token_id << "/" << vocab);
+            return nullptr;
+        }
+        auto out = createLocalTensor({1, dim});
+        const float *src = embedding_weight->data() + (size_t)token_id * dim;
+        float *dst = out->data();
+        std::memcpy(dst, src, sizeof(float) * dim);
+        if (debugEnv().embedding.trace && getRank() == 0)
+        {
+            int show = std::min(dim, debugEnv().embedding.trace_dims);
+            std::ostringstream oss;
+            oss << "[EmbedTrace] token=" << token_id << " dims=" << dim << " preview=";
+            for (int i = 0; i < show; ++i)
+            {
+                oss << dst[i];
+                if (i + 1 < show)
+                    oss << ",";
+            }
+            LOG_INFO(oss.str());
+        }
+        return out;
+    }
+
+    bool MPITransformerPipeline::decodeToken(int token_id,
+                                             const ModelWeights &weights,
+                                             std::shared_ptr<TensorBase> &output_logits)
+    {
+        const auto &env = debugEnv();
+        if (env.pipeline.disable_incremental_decode)
+        {
+            if (getRank() == 0)
+                LOG_DEBUG("[decode] incremental disabled via env; fallback to replay");
+            return false; // signal caller to fallback
+        }
+        if (!use_kv_cache_)
+        {
+            if (getRank() == 0)
+                LOG_DEBUG("[decode] KV cache disabled; fallback to replay");
+            return false;
+        }
+        // Basic KV cache readiness guard (capacity check) — if caches were never initialized or too small, fallback
+        if (k_cache_.empty() || v_cache_.empty())
+        {
+            if (getRank() == 0)
+                LOG_DEBUG("[decode] KV cache not initialized; fallback to replay");
+            return false;
+        }
+        if ((int)k_cache_.size() != config_.n_layers || (int)v_cache_.size() != config_.n_layers)
+        {
+            LOG_WARN("[decode] KV cache layer count mismatch (" << k_cache_.size() << "/" << v_cache_.size() << " vs " << config_.n_layers << ") fallback to replay");
+            return false;
+        }
+        if (!weights.token_embedding)
+        {
+            LOG_ERROR("decodeToken: missing token embedding");
+            return false;
+        }
+        // Embed single token (1 x d_model)
+        auto current = embedSingleToken(token_id, weights.token_embedding);
+        if (!current)
+            return false;
+
+        // Capacity check / growth before populating new K/V slice
+        if (use_kv_cache_)
+        {
+            int required = n_past_ + 1; // token to be written at index n_past_
+            if (!ensureKVCapacity(required))
+            {
+                if (getRank() == 0)
+                    LOG_WARN("[decode] ensureKVCapacity failed (required=" << required << ") fallback to replay");
+                return false;
+            }
+        }
+
+        // Stage & sequence context
+        setStageDecode();
+        // n_past_ holds number of previously processed tokens (prefill length + prior decodes)
+        int position = n_past_;
+        setSequencePosition(position);
+
+        // Explicit minimal intermediate allocation for seq_len=1 incremental path.
+        // We allocate only what's actually required by executeTransformerLayer + output projection.
+        const int seq_len = 1;
+        // Current tensor already represents the layer input; we'll create a reusable output buffer.
+        auto layer_output = createLocalTensor({seq_len, config_.d_model});
+        if (!layer_output)
+        {
+            LOG_ERROR("decodeToken: failed to allocate layer_output tensor");
+            return false;
+        }
+        // Final logits buffer (1 x vocab)
+        auto logits = createLocalTensor({seq_len, config_.vocab_size});
+        if (!logits)
+        {
+            LOG_ERROR("decodeToken: failed to allocate logits tensor");
+            return false;
+        }
+
+        for (int layer = 0; layer < config_.n_layers; ++layer)
+        {
+            if (!executeTransformerLayer(layer, current, weights, layer_output))
+            {
+                LOG_ERROR("decodeToken: layer " << layer << " failed");
+                return false;
+            }
+            current = layer_output; // reuse buffer across layers
+        }
+
+        // Final output projection (norm + lm head) into logits
+        if (!executeOutputProjection(current, weights, logits))
+        {
+            LOG_ERROR("decodeToken: output projection failed");
+            return false;
+        }
+
+        output_logits = logits;
+        n_past_ += 1; // advance position
+        if (use_kv_cache_)
+        {
+            kv_cache_state_.used_tokens = n_past_;
+        }
+        if (getRank() == 0)
+            LOG_DEBUG("[decode] incremental token=" << token_id << " pos=" << position);
+        return true;
+    }
+
+    bool MPITransformerPipeline::incrementalDecodeToken(int token_id,
+                                                        const ModelWeights &weights,
+                                                        std::shared_ptr<TensorBase> &output_logits)
+    {
+        // Tag diagnostic context so layer capture knows this is incremental
+        struct Scope
+        {
+            MPITransformerPipeline *p;
+            ~Scope()
+            {
+                if (p)
+                    p->in_incremental_pass_ = false;
+            }
+        };
+        in_incremental_pass_ = true;
+        Scope scope{this};
+        return decodeToken(token_id, weights, output_logits);
     }
 
     bool MPITransformerPipeline::executePrefillAttentionCosma(int layer_idx,
@@ -2738,16 +3132,27 @@ namespace llaminar
         timing.attention_ms = std::chrono::duration<double, std::milli>(attention_end - attention_start).count();
 
         auto proj_start = std::chrono::high_resolution_clock::now();
-        // TODO(Phase2): once the COSMA matmul path for the output projection is validated,
-        // restore a distributed implementation. For now we rely on local OpenBLAS to guarantee
-        // correctness for the attention output projection.
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    seq_len, hidden_size, total_head_dim,
-                    1.0f,
-                    context_concat.data(), total_head_dim,
-                    weights.wo[layer_idx]->data(), hidden_size,
-                    0.0f,
-                    attn_out->data(), hidden_size);
+        {
+            // Adaptive backend for attention output projection (context * Wo)
+            // Use COSMA only for large prefill (same heuristic reused via adaptiveMatMul).
+            bool ok = adaptiveMatMul(context_concat.data(),
+                                     weights.wo[layer_idx]->data(),
+                                     attn_out->data(),
+                                     seq_len,        // m
+                                     hidden_size,    // n
+                                     total_head_dim, // k
+                                     /*is_prefill*/ true,
+                                     /*distributed_partition*/ false,
+                                     /*transpose_A*/ false,
+                                     /*transpose_B*/ false,
+                                     /*alpha*/ 1.0f,
+                                     /*beta*/ 0.0f);
+            if (!ok)
+            {
+                LOG_ERROR("Attention output projection adaptiveMatMul failed; aborting layer " << layer_idx);
+                return false;
+            }
+        }
         auto proj_end = std::chrono::high_resolution_clock::now();
         timing.linear_ms = std::chrono::duration<double, std::milli>(proj_end - proj_start).count();
 
@@ -2987,6 +3392,38 @@ namespace llaminar
 
         output = createLocalTensor({seq_len, vocab_size});
 
+        // Instrumentation: snapshot last norm_out row prior to LM head to detect any mutation
+        // or mismatch with captured last_pre_lm_hidden_ used by external tests.
+        std::vector<float> pre_linear_last_row_snapshot; // empty unless instrumentation enabled
+        int last_token_row = seq_len > 0 ? (seq_len - 1) : 0;
+        bool enable_pre_lm_row_diff = debugEnv().pipeline.capture_pre_lm && debugEnv().pipeline.pre_lm_row_diff;
+        if (enable_pre_lm_row_diff && getRank() == 0 && norm_out && norm_out->data() && hidden_size > 0 && seq_len > 0)
+        {
+            const float *row_ptr = norm_out->data() + static_cast<size_t>(last_token_row) * hidden_size;
+            pre_linear_last_row_snapshot.assign(row_ptr, row_ptr + hidden_size);
+            // Also compute immediate diff vs the copy we stored in last_pre_lm_hidden_ (captured full buffer)
+            if (last_pre_lm_hidden_.size() >= static_cast<size_t>(seq_len) * hidden_size)
+            {
+                const float *captured_row = last_pre_lm_hidden_.data() + static_cast<size_t>(last_token_row) * hidden_size;
+                double sum_sq = 0.0, ref_sq = 0.0, max_abs = 0.0;
+                for (int i = 0; i < hidden_size; ++i)
+                {
+                    double diff = static_cast<double>(captured_row[i]) - static_cast<double>(row_ptr[i]);
+                    sum_sq += diff * diff;
+                    ref_sq += static_cast<double>(row_ptr[i]) * static_cast<double>(row_ptr[i]);
+                    double a = std::fabs(diff);
+                    if (a > max_abs)
+                        max_abs = a;
+                }
+                double rel_l2 = (ref_sq > 0.0) ? std::sqrt(sum_sq / ref_sq) : 0.0;
+                LOG_INFO("[PreLMRowDiff] stage=pre_linear type=capture_vs_live rel_l2=" << rel_l2 << " max_abs=" << max_abs << " row=" << last_token_row << " hidden_size=" << hidden_size);
+            }
+            else
+            {
+                LOG_INFO("[PreLMRowDiff] stage=pre_linear capture buffer too small for comparison");
+            }
+        }
+
         std::vector<std::shared_ptr<TensorBase>> lm_inputs = {norm_out, weights.lm_head};
         std::vector<std::shared_ptr<TensorBase>> lm_outputs = {output};
 
@@ -2995,6 +3432,42 @@ namespace llaminar
         {
             LOG_ERROR("LM head projection failed");
             return false;
+        }
+
+        // Post-linear comparison: check whether norm_out last row mutated during the linear kernel
+        if (enable_pre_lm_row_diff && !pre_linear_last_row_snapshot.empty() && getRank() == 0 && norm_out && norm_out->data())
+        {
+            const float *post_row_ptr = norm_out->data() + static_cast<size_t>(last_token_row) * hidden_size;
+            double sum_sq = 0.0, ref_sq = 0.0, max_abs = 0.0;
+            for (int i = 0; i < hidden_size; ++i)
+            {
+                double diff = static_cast<double>(post_row_ptr[i]) - static_cast<double>(pre_linear_last_row_snapshot[i]);
+                sum_sq += diff * diff;
+                ref_sq += static_cast<double>(pre_linear_last_row_snapshot[i]) * static_cast<double>(pre_linear_last_row_snapshot[i]);
+                double a = std::fabs(diff);
+                if (a > max_abs)
+                    max_abs = a;
+            }
+            double rel_l2 = (ref_sq > 0.0) ? std::sqrt(sum_sq / ref_sq) : 0.0;
+            LOG_INFO("[PreLMRowDiff] stage=post_linear type=live_mutation rel_l2=" << rel_l2 << " max_abs=" << max_abs << " row=" << last_token_row << " hidden_size=" << hidden_size);
+
+            // Also compare the captured buffer again vs post-linear live row
+            if (last_pre_lm_hidden_.size() >= static_cast<size_t>(seq_len) * hidden_size)
+            {
+                const float *captured_row = last_pre_lm_hidden_.data() + static_cast<size_t>(last_token_row) * hidden_size;
+                double sum_sq2 = 0.0, ref_sq2 = 0.0, max_abs2 = 0.0;
+                for (int i = 0; i < hidden_size; ++i)
+                {
+                    double diff = static_cast<double>(captured_row[i]) - static_cast<double>(post_row_ptr[i]);
+                    sum_sq2 += diff * diff;
+                    ref_sq2 += static_cast<double>(post_row_ptr[i]) * static_cast<double>(post_row_ptr[i]);
+                    double a = std::fabs(diff);
+                    if (a > max_abs2)
+                        max_abs2 = a;
+                }
+                double rel_l22 = (ref_sq2 > 0.0) ? std::sqrt(sum_sq2 / ref_sq2) : 0.0;
+                LOG_INFO("[PreLMRowDiff] stage=post_linear type=capture_vs_live rel_l2=" << rel_l22 << " max_abs=" << max_abs2 << " row=" << last_token_row << " hidden_size=" << hidden_size);
+            }
         }
 
         ASSERT_TENSOR_NOT_NAN(output, "LM head output has NaN - final pipeline output contaminated!");
@@ -3501,6 +3974,8 @@ namespace llaminar
 
     void MPITransformerPipeline::initializeKVCache(int seq_len)
     {
+        if (getRank() == 0)
+            LOG_INFO("[KVCacheInit] this=" << (const void *)this << " resizing to seq_len=" << seq_len);
         k_cache_.clear();
         v_cache_.clear();
 
@@ -3514,9 +3989,80 @@ namespace llaminar
             k_cache_[i]->zero();
             v_cache_[i]->zero();
         }
+        kv_cache_state_.capacity_tokens = seq_len;
+        if (kv_cache_state_.used_tokens > kv_cache_state_.capacity_tokens)
+            kv_cache_state_.used_tokens = kv_cache_state_.capacity_tokens; // clamp safety
+        if (getRank() == 0)
+            LOG_INFO("[KVCacheInit] completed capacity=" << seq_len << " this=" << (const void *)this);
+    }
 
-        LOG_DEBUG("Initialized KV cache for " << config_.n_layers << " layers, "
-                                              << seq_len << " max sequence length on rank " << getRank());
+    bool MPITransformerPipeline::ensureKVCapacity(int required_tokens)
+    {
+        if (!use_kv_cache_)
+            return false;
+        if (required_tokens <= kv_cache_state_.capacity_tokens)
+            return true; // already sufficient
+        int max_allowed = config_.max_seq_len;
+        if (required_tokens > max_allowed)
+        {
+            if (getRank() == 0)
+                LOG_ERROR("[KVCache] required_tokens=" << required_tokens << " exceeds max_seq_len=" << max_allowed);
+            return false;
+        }
+        // Growth policy
+        int growth_factor = std::max(1, std::min(16, debugEnv().kv_cache.growth_factor));
+        int new_capacity = kv_cache_state_.capacity_tokens > 0 ? kv_cache_state_.capacity_tokens : 1;
+        while (new_capacity < required_tokens)
+        {
+            long long cand = (long long)new_capacity * growth_factor;
+            if (cand > max_allowed)
+            {
+                new_capacity = max_allowed;
+                break;
+            }
+            new_capacity = (int)cand;
+        }
+        if (new_capacity > max_allowed)
+            new_capacity = max_allowed;
+        // Allocate new caches and copy existing data
+        if (getRank() == 0)
+            LOG_INFO("[KVCacheGrowth] old_cap=" << kv_cache_state_.capacity_tokens << " new_cap=" << new_capacity
+                                                << " required=" << required_tokens << " factor=" << growth_factor);
+        std::vector<std::shared_ptr<TensorBase>> new_k;
+        std::vector<std::shared_ptr<TensorBase>> new_v;
+        new_k.reserve(config_.n_layers);
+        new_v.reserve(config_.n_layers);
+        for (int i = 0; i < config_.n_layers; ++i)
+        {
+            int kv_dim = config_.n_head_kv * config_.head_dim;
+            auto nk = createLocalTensor({new_capacity, kv_dim});
+            auto nv = createLocalTensor({new_capacity, kv_dim});
+            // zero initialize new region
+            nk->zero();
+            nv->zero();
+            // copy old rows if any
+            if (i < (int)k_cache_.size() && k_cache_[i] && v_cache_[i])
+            {
+                int rows_copy = std::min(kv_cache_state_.used_tokens, kv_cache_state_.capacity_tokens);
+                if (rows_copy > 0)
+                {
+                    size_t bytes = (size_t)rows_copy * kv_dim * sizeof(float);
+                    std::memcpy(nk->data(), k_cache_[i]->data(), bytes);
+                    std::memcpy(nv->data(), v_cache_[i]->data(), bytes);
+                }
+            }
+            new_k.push_back(nk);
+            new_v.push_back(nv);
+        }
+        k_cache_.swap(new_k);
+        v_cache_.swap(new_v);
+        kv_cache_state_.capacity_tokens = new_capacity;
+        kv_cache_state_.growth_events += 1;
+        if (getRank() == 0)
+            LOG_INFO("[KVCacheSummary] growth_event=" << kv_cache_state_.growth_events
+                                                      << " used_tokens=" << kv_cache_state_.used_tokens
+                                                      << " capacity=" << kv_cache_state_.capacity_tokens);
+        return true;
     }
 
     // Factory function
@@ -3526,1014 +4072,133 @@ namespace llaminar
         return std::make_unique<MPITransformerPipeline>(config);
     }
 
-    // Utility function for loading weights
-    MPITransformerPipeline::ModelWeights loadModelWeights(
-        const std::string &model_path,
-        const MPITransformerPipeline::LayerConfig &config)
-    {
-        MPITransformerPipeline::ModelWeights weights;
+    // Forward declaration of unified helper (defined below)
+    static MPITransformerPipeline::ModelWeights loadModelWeightsExistingLoaderImpl(
+        ModelLoader &loader,
+        const MPITransformerPipeline::LayerConfig &config);
 
-        // Create and load model
-        ModelLoader loader;
-        if (!loader.loadModel(model_path))
-        {
-            LOG_ERROR("Failed to load model from: " << model_path);
-            throw std::runtime_error("Failed to load model");
-        }
-
-        LOG_INFO("Loading model weights from: " << model_path);
-
-        // Load token embedding
-        weights.token_embedding = loader.loadTensor("token_embd.weight");
-        if (!weights.token_embedding)
-        {
-            LOG_ERROR("Failed to load token embedding");
-            throw std::runtime_error("Failed to load token embedding");
-        }
-        // Allow late-setting of LLAMINAR_SHARD_LOAD_DIAG inside tests by also checking getenv
-        bool shard_diag = debugEnv().sharding.shard_load_diag; // snapshot authoritative (tests can call debugEnvRefresh after setenv)
-        if (shard_diag)
-        {
-            int rank = 0;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (rank == 0)
-                LOG_INFO("[RoleTag] token_embd.weight -> Embedding (vocab_size x d_model)");
-        }
-
-        // Debug: Print token embedding shape
-        auto token_emb_shape = weights.token_embedding->shape();
-        LOG_INFO("Token embedding shape: [" << token_emb_shape[0] << ", " << token_emb_shape[1] << "]");
-        LOG_INFO("Expected vocab_size: " << config.vocab_size << ", d_model: " << config.d_model);
-
-        // Debug: Validate token embedding data for NaN/inf values
-        auto *token_emb_data = static_cast<const float *>(weights.token_embedding->data());
-        size_t total_elements = token_emb_shape[0] * token_emb_shape[1];
-        size_t nan_count = 0;
-        size_t inf_count = 0;
-        for (size_t i = 0; i < std::min(total_elements, size_t(1000)); ++i)
-        {
-            if (std::isnan(token_emb_data[i]))
-                nan_count++;
-            if (std::isinf(token_emb_data[i]))
-                inf_count++;
-        }
-        LOG_INFO("Token embedding validation (first 1000 elements): " << nan_count << " NaN, " << inf_count << " inf values");
-
-        // Show first few values for verification
-        LOG_INFO("First 10 token embedding values:");
-        for (int i = 0; i < 10 && i < total_elements; ++i)
-        {
-            LOG_INFO("  [" << i << "] = " << token_emb_data[i]);
-        }
-
-        LOG_INFO("Loading output norm weights...");
-        // Load output layer weights (Qwen2.5 uses tied embeddings - no separate lm_head)
-        weights.output_norm_weight = loader.loadTensor("output_norm.weight");
-        if (!weights.output_norm_weight)
-        {
-            LOG_ERROR("Failed to load output norm weights");
-            throw std::runtime_error("Failed to load output norm weights");
-        }
-
-        // Debug: Check for NaN in output norm weight
-        DEBUG_ASSERT(weights.output_norm_weight, "Output norm weight is null");
-        const float *output_norm_data = weights.output_norm_weight->data();
-        int output_norm_size = weights.output_norm_weight->size();
-        LOG_INFO("Loaded output_norm.weight with size " << output_norm_size);
-
-        // Check for NaN in loaded weights
-        for (int j = 0; j < std::min(output_norm_size, 10); ++j)
-        {
-            if (std::isnan(output_norm_data[j]))
-            {
-                LOG_ERROR("NaN detected in output_norm.weight at index " << j << " immediately after loading!");
-                abort();
-            }
-        }
-        LOG_DEBUG("Output norm weight loaded successfully - first 5 values: "
-                  << output_norm_data[0] << " " << output_norm_data[1] << " " << output_norm_data[2] << " "
-                  << output_norm_data[3] << " " << output_norm_data[4]);
-
-        // --- Added instrumentation: checksum + extended preview for gamma integrity ---
-        {
-            auto compute_checksum = [](const float *ptr, int n) -> uint64_t
-            {
-                // FNV-1a 64-bit
-                const uint64_t FNV_OFFSET = 1469598103934665603ull;
-                const uint64_t FNV_PRIME = 1099511628211ull;
-                uint64_t hash = FNV_OFFSET;
-                const uint8_t *bytes = reinterpret_cast<const uint8_t *>(ptr);
-                size_t len_bytes = static_cast<size_t>(n) * sizeof(float);
-                for (size_t i = 0; i < len_bytes; ++i)
-                {
-                    hash ^= bytes[i];
-                    hash *= FNV_PRIME;
-                }
-                return hash;
-            };
-            uint64_t cs = compute_checksum(output_norm_data, output_norm_size);
-            // Basic stats
-            double gmin = std::numeric_limits<double>::infinity();
-            double gmax = -std::numeric_limits<double>::infinity();
-            long double gsum = 0.0L;
-            for (int i = 0; i < output_norm_size; ++i)
-            {
-                double v = static_cast<double>(output_norm_data[i]);
-                gmin = std::min(gmin, v);
-                gmax = std::max(gmax, v);
-                gsum += v;
-            }
-            double gmean = static_cast<double>(gsum / (long double)output_norm_size);
-            std::ostringstream oss_ext;
-            oss_ext << "[OutputNormIntegrity] size=" << output_norm_size
-                    << " checksum=0x" << std::hex << cs << std::dec
-                    << " min=" << gmin << " max=" << gmax << " mean=" << gmean
-                    << " first32=";
-            int dump_n = std::min(32, output_norm_size);
-            for (int i = 0; i < dump_n; ++i)
-            {
-                oss_ext << output_norm_data[i];
-                if (i + 1 < dump_n)
-                    oss_ext << ',';
-            }
-            LOG_INFO(oss_ext.str());
-            if (debugEnv().rmsnorm.gamma_checksum)
-            {
-                if (gmax > 4.0 || gmin < -1.0 || gmean > 2.0)
-                {
-                    LOG_WARN("[OutputNormIntegrity] gamma statistics outside expected range (Qwen2.5 typical ~[0,2])");
-                }
-            }
-        }
-
-        LOG_INFO("Output norm weights loaded successfully");
-
-        // Validate size matches hidden dimension
-        if (output_norm_size != config.d_model)
-        {
-            LOG_ERROR("output_norm.weight size " << output_norm_size << " does not match d_model=" << config.d_model
-                                                 << ". This is unexpected and may cause severe logits divergence.");
-        }
-
-        // Optional environment-based overrides for experimentation / diagnostics
-        bool applied_override = false;
-        if (debugEnv().output_norm.force_unit || debugEnv().output_norm.force_unit_all)
-        {
-            for (int i = 0; i < output_norm_size; ++i)
-            {
-                const_cast<float *>(output_norm_data)[i] = 1.0f; // safe: tensor is mutable model weight
-            }
-            applied_override = true;
-            LOG_WARN(std::string("[OutputNormIntegrity] Forcing output_norm.weight to all 1.0 (unit gamma) due to ") +
-                     (debugEnv().output_norm.force_unit ? "LLAMINAR_OUTPUT_NORM_FORCE_UNIT" : "LLAMINAR_ALL_RMSNORM_FORCE_UNIT") + "=1");
-        }
-        else if (debugEnv().output_norm.clamp)
-        {
-            // Clamp excessively large/small gamma values into a conservative range
-            float clamp_lo = 0.0f;
-            float clamp_hi = 4.0f; // generous upper bound for RMSNorm gamma in Qwen family
-            int clamp_count = 0;
-            for (int i = 0; i < output_norm_size; ++i)
-            {
-                float v = output_norm_data[i];
-                float nv = std::min(std::max(v, clamp_lo), clamp_hi);
-                if (nv != v)
-                    ++clamp_count;
-                const_cast<float *>(output_norm_data)[i] = nv;
-            }
-            applied_override = true;
-            LOG_WARN("[OutputNormIntegrity] Clamped " << clamp_count << " gamma entries to [" << clamp_lo << ", " << clamp_hi
-                                                      << "] due to LLAMINAR_OUTPUT_NORM_CLAMP=1");
-        }
-
-        if (applied_override)
-        {
-            // Recompute and log updated stats after override
-            double gmin2 = std::numeric_limits<double>::infinity();
-            double gmax2 = -std::numeric_limits<double>::infinity();
-            long double gsum2 = 0.0L;
-            for (int i = 0; i < output_norm_size; ++i)
-            {
-                double v = static_cast<double>(output_norm_data[i]);
-                gmin2 = std::min(gmin2, v);
-                gmax2 = std::max(gmax2, v);
-                gsum2 += v;
-            }
-            double gmean2 = static_cast<double>(gsum2 / (long double)output_norm_size);
-            LOG_INFO("[OutputNormIntegrity] Post-override stats: min=" << gmin2 << " max=" << gmax2 << " mean=" << gmean2);
-        }
-
-        // Prefer dedicated output projection weights when available
-        std::shared_ptr<TensorBase> lm_head = nullptr;
-        try
-        {
-            lm_head = loader.loadTensor("output.weight");
-        }
-        catch (const std::exception &e)
-        {
-            LOG_WARN("Exception while loading output.weight: " << e.what());
-        }
-
-        if (lm_head)
-        {
-            try
-            {
-                // LM head orientation toggle: if LLAMINAR_LM_HEAD_RAW_ORIENTATION is set, skip transpose enforcement.
-                bool raw_orientation = debugEnv().lm_head.raw_orientation;
-                const auto original_shape = lm_head->shape();
-                if (!raw_orientation)
-                {
-                    enforce_matrix_layout(lm_head, config.d_model, config.vocab_size, "output.weight");
-                }
-                else
-                {
-                    LOG_WARN("[LMHeadOrientation] Skipping layout enforcement for output.weight due to LLAMINAR_LM_HEAD_RAW_ORIENTATION=1; using raw shape [" << original_shape[0] << ", " << original_shape[1] << "]");
-                }
-                weights.lm_head = lm_head;
-                LOG_INFO("Loaded lm_head from output.weight tensor (final shape " << weights.lm_head->shape()[0] << "x" << weights.lm_head->shape()[1] << ")");
-
-                // Cosine similarity diagnostics (optional)
-                if (debugEnv().lm_head.cosine_diag)
-                {
-                    const float *wptr = weights.lm_head->data();
-                    const auto &sh = weights.lm_head->shape();
-                    if (sh.size() == 2)
-                    {
-                        int R = sh[0];
-                        int C = sh[1];
-                        auto cosine = [](const float *a, const float *b, int n) -> double
-                        {
-                            long double dot = 0.0L, na = 0.0L, nb = 0.0L;
-                            for (int i = 0; i < n; ++i)
-                            {
-                                long double va = a[i];
-                                long double vb = b[i];
-                                dot += va * vb;
-                                na += va * va;
-                                nb += vb * vb;
-                            }
-                            if (na <= 0.0L || nb <= 0.0L)
-                                return 0.0;
-                            return static_cast<double>(dot / (std::sqrt(static_cast<double>(na)) * std::sqrt(static_cast<double>(nb))));
-                        };
-                        // Strategy: treat matrix as [in_dim, out_dim]; compare a few adjacent output vectors (columns).
-                        int samples = std::min(8, C - 1);
-                        if (samples > 0)
-                        {
-                            std::vector<double> sims;
-                            sims.reserve(samples);
-                            for (int j = 0; j < samples; ++j)
-                            {
-                                const float *colA = wptr + j;       // column j start (row-major access stride C)
-                                const float *colB = wptr + (j + 1); // column j+1
-                                // Gather contiguous column vectors into temp buffers for stable cosine (since stored row-major)
-                                std::vector<float> bufA(R), bufB(R);
-                                for (int r = 0; r < R; ++r)
-                                {
-                                    bufA[r] = colA[r * C];
-                                    bufB[r] = colB[r * C];
-                                }
-                                sims.push_back(cosine(bufA.data(), bufB.data(), R));
-                            }
-                            double smin = 1e9;
-                            double smax = -1e9;
-                            long double ssum = 0.0L;
-                            for (double v : sims)
-                            {
-                                smin = std::min(smin, v);
-                                smax = std::max(smax, v);
-                                ssum += v;
-                            }
-                            double smean = sims.empty() ? 0.0 : static_cast<double>(ssum / sims.size());
-                            std::ostringstream oss;
-                            oss << "[LMHeadCosineDiag] orientation=" << (raw_orientation ? "raw" : "enforced")
-                                << " shape=" << R << "x" << C
-                                << " adj_column_cosine min=" << smin << " max=" << smax << " mean=" << smean
-                                << " samples=" << sims.size();
-                            LOG_INFO(oss.str());
-                        }
-                    }
-                }
-                // LM head diagnostics: log first row slice and pseudo column slice to detect orientation issues
-                if (weights.lm_head && weights.lm_head->data())
-                {
-                    const auto &lm_shape = weights.lm_head->shape();
-                    if (lm_shape.size() == 2)
-                    {
-                        int rows = lm_shape[0];
-                        int cols = lm_shape[1];
-                        const float *wptr = weights.lm_head->data();
-                        int log_elems = std::min(cols, 8); // first row slice
-                        std::ostringstream row_oss;
-                        row_oss << "[LMHeadDiag] first_row[0: " << log_elems << "]:";
-                        for (int j = 0; j < log_elems; ++j)
-                        {
-                            row_oss << ' ' << wptr[j];
-                        }
-                        // Approximate a first column slice (values at [r,0])
-                        int col_elems = std::min(rows, 8);
-                        std::ostringstream col_oss;
-                        col_oss << "[LMHeadDiag] first_col[0: " << col_elems << "]:";
-                        for (int r = 0; r < col_elems; ++r)
-                        {
-                            col_oss << ' ' << wptr[r * cols];
-                        }
-                        // Norms for sanity
-                        double row_sum_sq = 0.0;
-                        for (int j = 0; j < cols; ++j)
-                        {
-                            double v = wptr[j];
-                            row_sum_sq += v * v;
-                        }
-                        double col0_sum_sq = 0.0;
-                        for (int r = 0; r < rows; ++r)
-                        {
-                            double v = wptr[r * cols];
-                            col0_sum_sq += v * v;
-                        }
-                        LOG_INFO("[LMHeadDiag] shape=" << rows << "x" << cols
-                                                       << " row0_l2=" << std::sqrt(row_sum_sq)
-                                                       << " col0_l2=" << std::sqrt(col0_sum_sq));
-                        LOG_DEBUG(row_oss.str());
-                        LOG_DEBUG(col_oss.str());
-                    }
-                }
-            }
-            catch (const std::exception &e)
-            {
-                LOG_WARN("output.weight shape unexpected (" << e.what() << "); falling back to tied embeddings");
-                weights.lm_head = weights.token_embedding;
-            }
-        }
-        else
-        {
-            LOG_WARN("output.weight tensor unavailable; falling back to tied token embeddings for LM head");
-            weights.lm_head = weights.token_embedding;
-        }
-
-        LOG_INFO("Starting per-layer weight loading for " << config.n_layers << " layers...");
-        for (int i = 0; i < config.n_layers; ++i)
-        {
-            std::string layer_prefix = "blk." + std::to_string(i) + ".";
-
-            // Attention normalization
-            std::string attn_norm_name = layer_prefix + "attn_norm.weight";
-            auto attn_norm = loader.loadTensor(attn_norm_name);
-            if (!attn_norm)
-            {
-                LOG_ERROR("Failed to load " << attn_norm_name);
-                throw std::runtime_error("Failed to load attention norm weight");
-            }
-
-            // Debug: Check for NaN in the loaded weight immediately
-            DEBUG_ASSERT(attn_norm, "Attention norm weight is null for layer " + std::to_string(i));
-            const float *attn_norm_data = attn_norm->data();
-            int attn_norm_size = attn_norm->size();
-            LOG_INFO("Loaded " << attn_norm_name << " with size " << attn_norm_size);
-
-            // Check for NaN in loaded weights
-            for (int j = 0; j < std::min(attn_norm_size, 10); ++j)
-            {
-                if (std::isnan(attn_norm_data[j]))
-                {
-                    LOG_ERROR("NaN detected in " << attn_norm_name << " at index " << j << " immediately after loading!");
-                    abort();
-                }
-            }
-            LOG_DEBUG("Attention norm weight for layer " << i << " loaded successfully - first 5 values: "
-                                                         << attn_norm_data[0] << " " << attn_norm_data[1] << " " << attn_norm_data[2] << " "
-                                                         << attn_norm_data[3] << " " << attn_norm_data[4]);
-
-            weights.attn_norm_weight.push_back(attn_norm);
-
-            // Global override: force all RMSNorm gammas (including per-layer attn_norm) to 1.0
-            if (debugEnv().output_norm.force_unit_all)
-            {
-                float *mutable_attn = const_cast<float *>(attn_norm_data);
-                for (int j = 0; j < attn_norm_size; ++j)
-                    mutable_attn[j] = 1.0f;
-                LOG_WARN("[RMSNormGlobalOverride] Forced attn_norm.weight layer " << i << " to unit gamma due to LLAMINAR_ALL_RMSNORM_FORCE_UNIT=1");
-            }
-
-            // Attention projection weights (sharded loading path)
-            // Legacy gather path removed: always load sharded head slices and row-sharded Wo.
-            bool shard_mode = true;
-
-            auto load_full = [&](const std::string &tensor_name)
-            {
-                auto t = loader.loadTensor(tensor_name);
-                if (!t)
-                {
-                    LOG_ERROR("Failed to load " << tensor_name);
-                    throw std::runtime_error("Failed to load attention weight " + tensor_name);
-                }
-                return t;
-            };
-
-            std::shared_ptr<TensorBase> wq, wk, wv, wo;
-            if (!shard_mode)
-            { /* unreachable after legacy removal */
-            }
-            else
-            {
-                // Root-only load & scatter of head shards so non-root ranks never materialize full weights.
-                int world = 1, rank = 0;
-                MPI_Comm_size(MPI_COMM_WORLD, &world);
-                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-                int total_heads = config.n_head;
-                int head_dim = config.head_dim;
-                int total_q_cols = total_heads * head_dim; // projection dim for q/k/v
-                int d_model = config.d_model;
-
-                // Head distribution (must match attention kernel logic)
-                auto head_dist = [&](int r)
-                {
-                    int base = total_heads / world; int rem = total_heads % world; int h = base + (r < rem ? 1 : 0); return h; };
-                auto head_offset_fn = [&](int r)
-                {
-                    int base = total_heads / world; int rem = total_heads % world; return base * r + (r < rem ? r : rem); };
-                int local_heads = head_dist(rank);
-                int head_offset = head_offset_fn(rank);
-                int local_head_dim = local_heads * head_dim;
-
-                // Allocate destination sharded tensors on all ranks
-                wq = TensorFactory::create_heads_sharded({d_model, total_q_cols}, 1, total_heads, head_dim, world, rank);
-                TensorFactory::set_last_shard_role("W_Q");
-                wk = TensorFactory::create_heads_sharded({d_model, total_q_cols}, 1, total_heads, head_dim, world, rank);
-                TensorFactory::set_last_shard_role("W_K");
-                wv = TensorFactory::create_heads_sharded({d_model, total_q_cols}, 1, total_heads, head_dim, world, rank);
-                TensorFactory::set_last_shard_role("W_V");
-                wo = TensorFactory::create_heads_sharded({total_q_cols, d_model}, 0, total_heads, head_dim, world, rank);
-                TensorFactory::set_last_shard_role("W_O"); // rows sharded
-
-                const int TAG_WQ = 9101, TAG_WK = 9102, TAG_WV = 9103, TAG_WO = 9104;
-
-                if (rank == 0)
-                {
-                    // Build vectors of column shard definitions for every rank for q/k/v
-                    std::vector<int> col_offsets;
-                    col_offsets.reserve(world);
-                    std::vector<int> col_counts;
-                    col_counts.reserve(world);
-                    for (int r = 0; r < world; ++r)
-                    {
-                        int r_heads = head_dist(r);
-                        int r_offset = head_offset_fn(r);
-                        int r_head_dim = r_heads * head_dim;
-                        col_offsets.push_back(r_offset * head_dim);
-                        col_counts.push_back(r_head_dim);
-                    }
-                    // Temporary buffers for all ranks (root extracts all shards in one pass per tensor)
-                    std::vector<std::vector<float>> qkv_buffers_q(world), qkv_buffers_k(world), qkv_buffers_v(world);
-                    std::vector<float *> ptrs_q(world), ptrs_k(world), ptrs_v(world);
-                    for (int r = 0; r < world; ++r)
-                    {
-                        int elems = d_model * col_counts[r];
-                        qkv_buffers_q[r].resize(elems);
-                        qkv_buffers_k[r].resize(elems);
-                        qkv_buffers_v[r].resize(elems);
-                        ptrs_q[r] = qkv_buffers_q[r].data();
-                        ptrs_k[r] = qkv_buffers_k[r].data();
-                        ptrs_v[r] = qkv_buffers_v[r].data();
-                    }
-                    bool ok_q = loader.loadTensorColumnShards(layer_prefix + "attn_q.weight", col_offsets, col_counts, ptrs_q);
-                    bool ok_k = loader.loadTensorColumnShards(layer_prefix + "attn_k.weight", col_offsets, col_counts, ptrs_k);
-                    bool ok_v = loader.loadTensorColumnShards(layer_prefix + "attn_v.weight", col_offsets, col_counts, ptrs_v);
-                    if (!(ok_q && ok_k && ok_v))
-                    {
-                        LOG_WARN("Partial column shard load failed (quantized? unsupported). Falling back to full-load scatter");
-                        // Fallback: load full then reuse earlier logic (rare path; not re-implemented here to keep patch small)
-                        auto fb_wq = load_full(layer_prefix + "attn_q.weight");
-                        auto fb_wk = load_full(layer_prefix + "attn_k.weight");
-                        auto fb_wv = load_full(layer_prefix + "attn_v.weight");
-                        const float *src_wq = fb_wq->data();
-                        const float *src_wk = fb_wk->data();
-                        const float *src_wv = fb_wv->data();
-                        for (int r = 0; r < world; ++r)
-                        {
-                            int off = col_offsets[r];
-                            int cnt = col_counts[r];
-                            int r_elems = d_model * cnt;
-                            if (r == 0)
-                            {
-                                for (int row = 0; row < d_model; ++row)
-                                {
-                                    std::memcpy(wq->data() + row * local_head_dim, src_wq + row * total_q_cols + off, sizeof(float) * cnt);
-                                    std::memcpy(wk->data() + row * local_head_dim, src_wk + row * total_q_cols + off, sizeof(float) * cnt);
-                                    std::memcpy(wv->data() + row * local_head_dim, src_wv + row * total_q_cols + off, sizeof(float) * cnt);
-                                }
-                            }
-                            else
-                            {
-                                std::vector<float> tmp_q(r_elems), tmp_k(r_elems), tmp_v(r_elems);
-                                for (int row = 0; row < d_model; ++row)
-                                {
-                                    std::memcpy(tmp_q.data() + row * cnt, src_wq + row * total_q_cols + off, sizeof(float) * cnt);
-                                    std::memcpy(tmp_k.data() + row * cnt, src_wk + row * total_q_cols + off, sizeof(float) * cnt);
-                                    std::memcpy(tmp_v.data() + row * cnt, src_wv + row * total_q_cols + off, sizeof(float) * cnt);
-                                }
-                                MPI_Send(tmp_q.data(), r_elems, MPI_FLOAT, r, TAG_WQ, MPI_COMM_WORLD);
-                                MPI_Send(tmp_k.data(), r_elems, MPI_FLOAT, r, TAG_WK, MPI_COMM_WORLD);
-                                MPI_Send(tmp_v.data(), r_elems, MPI_FLOAT, r, TAG_WV, MPI_COMM_WORLD);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Distribute q/k/v shards
-                        for (int r = 0; r < world; ++r)
-                        {
-                            int cnt = col_counts[r];
-                            int elems = d_model * cnt;
-                            if (r == 0)
-                            {
-                                std::memcpy(wq->data(), ptrs_q[r], sizeof(float) * elems);
-                                std::memcpy(wk->data(), ptrs_k[r], sizeof(float) * elems);
-                                std::memcpy(wv->data(), ptrs_v[r], sizeof(float) * elems);
-                            }
-                            else
-                            {
-                                MPI_Send(ptrs_q[r], elems, MPI_FLOAT, r, TAG_WQ, MPI_COMM_WORLD);
-                                MPI_Send(ptrs_k[r], elems, MPI_FLOAT, r, TAG_WK, MPI_COMM_WORLD);
-                                MPI_Send(ptrs_v[r], elems, MPI_FLOAT, r, TAG_WV, MPI_COMM_WORLD);
-                            }
-                        }
-                    }
-                    // Wo: row shard per rank (rows = head_dim * heads_per_rank, cols = d_model)
-                    // Use row shard loader; each rank gets contiguous row block starting at (offset*head_dim)
-                    std::vector<int> row_offsets(world), row_counts(world);
-                    for (int r = 0; r < world; ++r)
-                    {
-                        int r_heads = head_dist(r);
-                        int r_offset = head_offset_fn(r);
-                        int r_head_dim = r_heads * head_dim;
-                        row_offsets[r] = r_offset * head_dim;
-                        row_counts[r] = r_head_dim;
-                    }
-                    // Root loads each needed row shard sequentially (could be optimized to batched extraction)
-                    for (int r = 0; r < world; ++r)
-                    {
-                        int rows_needed = row_counts[r];
-                        int row_off = row_offsets[r];
-                        size_t elems = (size_t)rows_needed * d_model;
-                        if (r == 0)
-                        {
-                            if (!loader.loadTensorRowShard(layer_prefix + "attn_output.weight", row_off, rows_needed, wo->data()))
-                            {
-                                LOG_ERROR("Row shard load failed for Wo on root");
-                                // fallback full load
-                                auto fb_wo = load_full(layer_prefix + "attn_output.weight");
-                                const float *src_wo = fb_wo->data();
-                                std::memcpy(wo->data(), src_wo + row_off * d_model, sizeof(float) * elems);
-                            }
-                        }
-                        else
-                        {
-                            std::vector<float> tmp(elems);
-                            if (!loader.loadTensorRowShard(layer_prefix + "attn_output.weight", row_off, rows_needed, tmp.data()))
-                            {
-                                auto fb_wo = load_full(layer_prefix + "attn_output.weight");
-                                const float *src_wo = fb_wo->data();
-                                std::memcpy(tmp.data(), src_wo + row_off * d_model, sizeof(float) * elems);
-                            }
-                            MPI_Send(tmp.data(), (int)elems, MPI_FLOAT, r, TAG_WO, MPI_COMM_WORLD);
-                        }
-                    }
-                    LOG_INFO("Root rank streamed and distributed sharded attention weights layer=" << i);
-                }
-                else
-                {
-                    // Receive q/k/v shards
-                    size_t shard_elems_qkv = (size_t)d_model * local_head_dim;
-                    MPI_Recv(wq->data(), (int)shard_elems_qkv, MPI_FLOAT, 0, TAG_WQ, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    MPI_Recv(wk->data(), (int)shard_elems_qkv, MPI_FLOAT, 0, TAG_WK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    MPI_Recv(wv->data(), (int)shard_elems_qkv, MPI_FLOAT, 0, TAG_WV, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    // Receive Wo shard (rows subset)
-                    size_t shard_elems_wo = (size_t)local_head_dim * d_model;
-                    MPI_Recv(wo->data(), (int)shard_elems_wo, MPI_FLOAT, 0, TAG_WO, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    LOG_INFO("Rank " << rank << " received streamed sharded attention weights layer=" << i << " local_heads=" << local_heads << " head_offset=" << head_offset);
-                }
-            }
-
-            weights.wq.push_back(wq);
-            weights.wk.push_back(wk);
-            weights.wv.push_back(wv);
-            weights.wo.push_back(wo);
-
-            // Sharded load verification & diagnostics (optional)
-            if (shard_mode)
-            {
-                bool diag = debugEnv().sharding.shard_load_diag;
-                auto chk_sharded = [&](const char *name, const std::shared_ptr<TensorBase> &t, bool expect_head_axis, bool expect_rows_head_dim)
-                {
-                    auto *ss = dynamic_cast<ShardedSimpleTensor *>(t.get());
-                    if (!ss)
-                    {
-                        LOG_ERROR("ShardLoadVerify: tensor '" << name << "' is not ShardedSimpleTensor under shard_mode");
-                        throw std::runtime_error("ShardLoadVerify: missing sharded tensor");
-                    }
-                    const ShardSpec &spec = ss->shard_spec();
-                    if (!spec.is_sharded())
-                    {
-                        LOG_ERROR("ShardLoadVerify: tensor '" << name << "' spec not marked sharded");
-                        throw std::runtime_error("ShardLoadVerify: spec not sharded");
-                    }
-                    if (expect_head_axis && spec.axis != ShardSpec::Axis::Heads)
-                    {
-                        LOG_ERROR("ShardLoadVerify: tensor '" << name << "' axis mismatch (expected Heads)");
-                        throw std::runtime_error("ShardLoadVerify: axis mismatch");
-                    }
-                    if (diag)
-                    {
-                        size_t elems = (size_t)ss->size();
-                        double bytes = elems * sizeof(float);
-                        LOG_INFO("[ShardDiag] layer=" << i << " tensor=" << name << " local_shape=" << ss->shape()[0] << "x" << ss->shape()[1]
-                                                      << " spec={" << spec.to_string() << "} elems=" << elems << " bytes=" << (size_t)bytes);
-                    }
-                    // Shape consistency checks vs config
-                    if (std::string(name) == "wq" || std::string(name) == "wk" || std::string(name) == "wv")
-                    {
-                        // Expect shape: [d_model, local_heads*head_dim]
-                        if ((int)ss->shape()[0] != config.d_model)
-                        {
-                            LOG_ERROR("ShardLoadVerify: tensor '" << name << "' row dim mismatch d_model");
-                            throw std::runtime_error("ShardLoadVerify: row mismatch");
-                        }
-                        int local_heads_calc = (int)spec.local_dim / config.head_dim;
-                        if (local_heads_calc * config.head_dim != (int)spec.local_dim)
-                        {
-                            LOG_ERROR("ShardLoadVerify: tensor '" << name << "' local_dim not multiple of head_dim");
-                            throw std::runtime_error("ShardLoadVerify: head multiple");
-                        }
-                    }
-                    else if (std::string(name) == "wo")
-                    {
-                        // Expect shape: [local_heads*head_dim, d_model]
-                        if (expect_rows_head_dim)
-                        {
-                            if ((int)ss->shape()[1] != config.d_model)
-                            {
-                                LOG_ERROR("ShardLoadVerify: tensor 'wo' col dim mismatch d_model");
-                                throw std::runtime_error("ShardLoadVerify: wo col mismatch");
-                            }
-                        }
-                    }
-                };
-
-                try
-                {
-                    chk_sharded("wq", wq, true, false);
-                    chk_sharded("wk", wk, true, false);
-                    chk_sharded("wv", wv, true, false);
-                    chk_sharded("wo", wo, true, true);
-                }
-                catch (const std::exception &ex)
-                {
-                    LOG_ERROR("ShardLoadVerify failure layer=" << i << " : " << ex.what());
-                    throw; // rethrow to abort load early
-                }
-
-                // Optional global consistency: sum local dims across ranks and compare to global
-                int world = 1, rank = 0;
-                MPI_Comm_size(MPI_COMM_WORLD, &world);
-                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-                size_t local_q_cols = (size_t)wq->shape()[1];
-                size_t global_q_cols = 0;
-                MPI_Allreduce(&local_q_cols, &global_q_cols, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-                if (rank == 0 && global_q_cols != (size_t)config.n_head * config.head_dim)
-                {
-                    LOG_ERROR("ShardLoadVerify: aggregated q cols=" << global_q_cols << " expected=" << ((size_t)config.n_head * config.head_dim));
-                    throw std::runtime_error("ShardLoadVerify: aggregated mismatch");
-                }
-            }
-
-            // Feed-forward normalization
-            auto ffn_norm = loader.loadTensor(layer_prefix + "ffn_norm.weight");
-            if (!ffn_norm)
-            {
-                LOG_ERROR("Failed to load FFN norm for layer " << i);
-                throw std::runtime_error("Failed to load FFN norm weight");
-            }
-
-            // Debug: Check for NaN in FFN norm weight
-            DEBUG_ASSERT(ffn_norm, "FFN norm weight is null for layer " + std::to_string(i));
-            const float *ffn_norm_data = ffn_norm->data();
-            int ffn_norm_size = ffn_norm->size();
-            LOG_INFO("Loaded FFN norm for layer " << i << " with size " << ffn_norm_size);
-
-            // Check for NaN in loaded weights
-            for (int j = 0; j < std::min(ffn_norm_size, 10); ++j)
-            {
-                if (std::isnan(ffn_norm_data[j]))
-                {
-                    LOG_ERROR("NaN detected in FFN norm weight for layer " << i << " at index " << j << " immediately after loading!");
-                    abort();
-                }
-            }
-            LOG_DEBUG("FFN norm weight for layer " << i << " loaded successfully - first 5 values: "
-                                                   << ffn_norm_data[0] << " " << ffn_norm_data[1] << " " << ffn_norm_data[2] << " "
-                                                   << ffn_norm_data[3] << " " << ffn_norm_data[4]);
-
-            weights.ffn_norm_weight.push_back(ffn_norm);
-
-            if (debugEnv().output_norm.force_unit_all)
-            {
-                float *mutable_ffn = const_cast<float *>(ffn_norm_data);
-                for (int j = 0; j < ffn_norm_size; ++j)
-                    mutable_ffn[j] = 1.0f;
-                LOG_WARN("[RMSNormGlobalOverride] Forced ffn_norm.weight layer " << i << " to unit gamma due to LLAMINAR_ALL_RMSNORM_FORCE_UNIT=1");
-            }
-
-            // Feed-forward weights (SwiGLU style: gate (W1), up (W3), down (W2))
-            auto w_gate = loader.loadTensor(layer_prefix + "ffn_gate.weight");
-            auto w_up = loader.loadTensor(layer_prefix + "ffn_up.weight");
-            auto w_down = loader.loadTensor(layer_prefix + "ffn_down.weight");
-
-            if (!w_gate || !w_up || !w_down)
-            {
-                LOG_ERROR("Failed to load FFN weights for layer " << i);
-                throw std::runtime_error("Failed to load FFN weights");
-            }
-
-            // If feed-forward dim (d_ff) is zero (metadata absent), attempt to infer from gate weight shape
-            int effective_d_ff = config.d_ff;
-            // Attempt inference before layout enforcement so later matrices use inferred size
-            if (effective_d_ff == 0 && w_gate && w_gate->shape().size() == 2)
-            {
-                auto sh = w_gate->shape();
-                if (sh[0] == config.d_model)
-                {
-                    effective_d_ff = sh[1];
-                    LOG_WARN("[FFN_DIM_INFER] Inferred d_ff=" << effective_d_ff << " from ffn_gate.weight shape[" << sh[0] << ", " << sh[1] << "] (pre-layout)");
-                }
-                else if (sh[1] == config.d_model)
-                {
-                    effective_d_ff = sh[0];
-                    LOG_WARN("[FFN_DIM_INFER] Inferred d_ff=" << effective_d_ff << " from transposed ffn_gate.weight shape[" << sh[0] << ", " << sh[1] << "] (pre-layout)");
-                }
-            }
-
-            // Only enforce if we have inferred or metadata-provided feed-forward dimension
-            if (effective_d_ff > 0)
-            {
-                enforce_matrix_layout(w_gate, config.d_model, effective_d_ff, layer_prefix + "ffn_gate.weight");
-                enforce_matrix_layout(w_up, config.d_model, effective_d_ff, layer_prefix + "ffn_up.weight");
-                enforce_matrix_layout(w_down, effective_d_ff, config.d_model, layer_prefix + "ffn_down.weight");
-            }
-
-            weights.w_gate.push_back(w_gate);
-            weights.w_up.push_back(w_up);
-            weights.w_down.push_back(w_down);
-            if (effective_d_ff == 0)
-            {
-                LOG_WARN("[FFN_DIM_INFER] d_ff remains 0 after attempting inference; proceeding without layout enforcement (layer=" << i << ")");
-            }
-            else
-            {
-                LOG_DEBUG("[FFN_DIM] Using d_ff=" << effective_d_ff << " for layer " << i);
-            }
-
-            // Assign semantic roles to FFN matrices for topology diagnostics (local only; replicated tensors)
-            // We don't currently re-wrap as sharded, so embed role labels via debug log for now.
-            if (debugEnv().sharding.shard_load_diag)
-            {
-                int rank = 0;
-                int world_tmp = 1;
-                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-                MPI_Comm_size(MPI_COMM_WORLD, &world_tmp);
-                if (rank == 0)
-                {
-                    LOG_INFO("[RoleTag] layer=" << i << " ffn_gate -> W1  (d_model x d_ff)");
-                    LOG_INFO("[RoleTag] layer=" << i << " ffn_up   -> W3  (d_model x d_ff)");
-                    LOG_INFO("[RoleTag] layer=" << i << " ffn_down -> W2  (d_ff x d_model)");
-                }
-            }
-        }
-
-        // Re-emit embedding role tag late so tests that check recent_lines (with finite ring buffer)
-        // still observe it even after many per-layer logs pushed older entries out.
-        if (shard_diag)
-        {
-            int rank = 0;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (rank == 0)
-                LOG_INFO("[RoleTag][Late] token_embd.weight -> Embedding (vocab_size x d_model)");
-        }
-        if (shard_diag)
-        {
-            int rank = 0;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (rank == 0)
-                LOG_INFO("[RoleTag][Late] token_embd.weight -> Embedding (vocab_size x d_model)");
-        }
-        LOG_INFO("Successfully loaded all model weights: " << config.n_layers << " layers");
-        // Emit sharded tensor registry summary (subset of main.cpp) so tests not using main still see topology
-        if (shard_diag)
-        {
-            int rank = 0;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (rank == 0)
-            {
-                LOG_INFO("-- Sharded Tensor Registry (post model load) --");
-                size_t total_local_bytes = 0;
-                size_t total_local_elems = 0;
-                bool any = false;
-                size_t hidden_local_elems = 0, heads_local_elems = 0;
-                size_t hidden_global_dim = 0, heads_global_dim = 0;
-                TensorFactory::for_each_sharded([&](const ShardSpec &spec, const std::vector<int> &local_shape)
-                                                {
-                    any=true; size_t elems=1; for(int d: local_shape) elems*= (size_t)d; total_local_elems += elems; total_local_bytes += elems * sizeof(float);
-                    if(spec.axis == ShardSpec::Axis::Hidden){ hidden_local_elems += elems; hidden_global_dim = spec.global_dim; }
-                    else if(spec.axis == ShardSpec::Axis::Heads){ heads_local_elems += elems; heads_global_dim = spec.global_dim; } });
-                double mb = total_local_bytes / (1024.0 * 1024.0);
-                if (!any)
-                {
-                    LOG_INFO("(no sharded tensors registered)");
-                }
-                LOG_INFO("Aggregate shard footprint: local_bytes=" << total_local_bytes << " (" << mb << " MB) local_elems=" << total_local_elems);
-                if (hidden_local_elems)
-                {
-                    LOG_INFO("Hidden-axis shards: local_elems=" << hidden_local_elems << " global_dim=" << hidden_global_dim);
-                }
-                if (heads_local_elems)
-                {
-                    LOG_INFO("Heads-axis shards: local_elems=" << heads_local_elems << " global_dim=" << heads_global_dim);
-                }
-                size_t est_global_elems = 0;
-                TensorFactory::for_each_sharded([&](const ShardSpec &spec, const std::vector<int> &local_shape)
-                                                { size_t elems=1; for(int d: local_shape) elems*= (size_t)d; if(spec.local_dim>0){ double expand = (double)spec.global_dim / (double)spec.local_dim; est_global_elems += (size_t)(elems * expand + 0.5);} else { est_global_elems += elems; } });
-                double est_global_mb = (est_global_elems * sizeof(float)) / (1024.0 * 1024.0);
-                LOG_INFO("Estimated global (logical) elements represented by shards: " << est_global_elems << " (~" << est_global_mb << " MB as fp32)");
-                LOG_INFO("-- End Sharded Tensor Registry --");
-            }
-        }
-        return weights;
-    }
-
-    // Overloaded utility function for loading weights using existing ModelLoader
-    MPITransformerPipeline::ModelWeights loadModelWeights(
+    // Internal helper extracted from the second overload (unified rich diagnostics)
+    static MPITransformerPipeline::ModelWeights loadModelWeightsExistingLoaderImpl(
         ModelLoader &loader,
         const MPITransformerPipeline::LayerConfig &config)
     {
         MPITransformerPipeline::ModelWeights weights;
-
         LOG_INFO("Loading model weights using existing ModelLoader");
-
-        // Load token embedding
+        // Token embedding load + diagnostics
         weights.token_embedding = loader.loadTensor("token_embd.weight");
         if (!weights.token_embedding)
-        {
-            LOG_ERROR("Failed to load token embedding");
             throw std::runtime_error("Failed to load token embedding");
-        }
-        bool shard_diag2 = debugEnv().sharding.shard_load_diag;
-        if (shard_diag2)
+        if (debugEnv().sharding.shard_load_diag)
         {
             int rank = 0;
             MPI_Comm_rank(MPI_COMM_WORLD, &rank);
             if (rank == 0)
                 LOG_INFO("[RoleTag] token_embd.weight -> Embedding (vocab_size x d_model)");
         }
-
-        // Debug: Print token embedding shape
-        auto token_emb_shape = weights.token_embedding->shape();
-        LOG_INFO("Token embedding shape: [" << token_emb_shape[0] << ", " << token_emb_shape[1] << "]");
-        LOG_INFO("Expected vocab_size: " << config.vocab_size << ", d_model: " << config.d_model);
-
-        LOG_INFO("Loading output norm weights...");
-        // Load output layer weights (Qwen2.5 uses tied embeddings - no separate lm_head)
-        weights.output_norm_weight = loader.loadTensor("output_norm.weight");
-        if (!weights.output_norm_weight)
+        const auto emb_shape = weights.token_embedding->shape();
+        LOG_INFO("Token embedding shape: [" << emb_shape[0] << ", " << emb_shape[1] << "] expected vocab=" << config.vocab_size << " d_model=" << config.d_model);
         {
-            LOG_ERROR("Failed to load output norm weights");
-            throw std::runtime_error("Failed to load output norm weights");
-        }
-
-        // Debug: Check for NaN in output norm weight
-        DEBUG_ASSERT(weights.output_norm_weight, "Output norm weight is null");
-        const float *output_norm_data = weights.output_norm_weight->data();
-        int output_norm_size = weights.output_norm_weight->size();
-        LOG_INFO("Loaded output_norm.weight with size " << output_norm_size);
-
-        // Check for NaN in loaded weights
-        for (int j = 0; j < std::min(output_norm_size, 10); ++j)
-        {
-            if (std::isnan(output_norm_data[j]))
+            const float *ptr = weights.token_embedding->data();
+            size_t total = (size_t)emb_shape[0] * emb_shape[1];
+            size_t sample = std::min<size_t>(total, 1000);
+            size_t nan_ct = 0, inf_ct = 0;
+            for (size_t i = 0; i < sample; ++i)
             {
-                LOG_ERROR("NaN detected in output_norm.weight at index " << j);
-                throw std::runtime_error("NaN detected in output norm weights");
+                float v = ptr[i];
+                if (std::isnan(v))
+                    ++nan_ct;
+                if (std::isinf(v))
+                    ++inf_ct;
+            }
+            LOG_INFO("Token embedding validation (first " << sample << "): " << nan_ct << " NaN, " << inf_ct << " inf");
+            int first_n = std::min<int>(10, (int)total);
+            if (first_n > 0)
+            {
+                std::ostringstream oss;
+                oss << "First 10 token embedding values:";
+                for (int i = 0; i < first_n; ++i)
+                    oss << " [" << i << "]=" << ptr[i];
+                LOG_DEBUG(oss.str());
             }
         }
-        LOG_DEBUG("Output norm weight loaded successfully - first 5 values: "
-                  << output_norm_data[0] << " " << output_norm_data[1] << " " << output_norm_data[2] << " "
-                  << output_norm_data[3] << " " << output_norm_data[4]);
-
-        // --- Added instrumentation: checksum + extended preview for gamma integrity (duplicate loader path) ---
+        // Output norm
+        weights.output_norm_weight = loader.loadTensor("output_norm.weight");
+        if (!weights.output_norm_weight)
+            throw std::runtime_error("Failed to load output norm weights");
+        const float *out_gamma = weights.output_norm_weight->data();
+        int gamma_n = weights.output_norm_weight->size();
+        LOG_INFO("Loaded output_norm.weight size=" << gamma_n);
+        for (int j = 0; j < std::min(gamma_n, 10); ++j)
+            if (std::isnan(out_gamma[j]))
+                throw std::runtime_error("NaN in output_norm.weight");
         {
-            auto compute_checksum = [](const float *ptr, int n) -> uint64_t
-            {
-                const uint64_t FNV_OFFSET = 1469598103934665603ull;
-                const uint64_t FNV_PRIME = 1099511628211ull;
-                uint64_t hash = FNV_OFFSET;
-                const uint8_t *bytes = reinterpret_cast<const uint8_t *>(ptr);
-                size_t len_bytes = static_cast<size_t>(n) * sizeof(float);
-                for (size_t i = 0; i < len_bytes; ++i)
-                {
-                    hash ^= bytes[i];
-                    hash *= FNV_PRIME;
-                }
-                return hash;
-            };
-            uint64_t cs = compute_checksum(output_norm_data, output_norm_size);
-            double gmin = std::numeric_limits<double>::infinity();
-            double gmax = -std::numeric_limits<double>::infinity();
+            auto checksum = [](const float *p, int n)
+            { const uint64_t OFF=1469598103934665603ull,PR=1099511628211ull; uint64_t h=OFF; const uint8_t *b=reinterpret_cast<const uint8_t*>(p); size_t L=(size_t)n*sizeof(float); for(size_t i=0;i<L;++i){ h^=b[i]; h*=PR;} return h; };
+            uint64_t cs = checksum(out_gamma, gamma_n);
+            double gmin = std::numeric_limits<double>::infinity(), gmax = -gmin;
             long double gsum = 0.0L;
-            for (int i = 0; i < output_norm_size; ++i)
+            for (int i = 0; i < gamma_n; ++i)
             {
-                double v = static_cast<double>(output_norm_data[i]);
+                double v = out_gamma[i];
                 gmin = std::min(gmin, v);
                 gmax = std::max(gmax, v);
                 gsum += v;
             }
-            double gmean = static_cast<double>(gsum / (long double)output_norm_size);
-            std::ostringstream oss_ext;
-            oss_ext << "[OutputNormIntegrity] (2nd path) size=" << output_norm_size
-                    << " checksum=0x" << std::hex << cs << std::dec
-                    << " min=" << gmin << " max=" << gmax << " mean=" << gmean
-                    << " first32=";
-            int dump_n = std::min(32, output_norm_size);
-            for (int i = 0; i < dump_n; ++i)
+            double gmean = (double)(gsum / (long double)gamma_n);
+            std::ostringstream oss;
+            oss << "[OutputNormIntegrity] size=" << gamma_n << " checksum=0x" << std::hex << cs << std::dec << " min=" << gmin << " max=" << gmax << " mean=" << gmean << " first32=";
+            int dump = std::min(32, gamma_n);
+            for (int i = 0; i < dump; ++i)
             {
-                oss_ext << output_norm_data[i];
-                if (i + 1 < dump_n)
-                    oss_ext << ',';
+                oss << out_gamma[i];
+                if (i + 1 < dump)
+                    oss << ',';
             }
-            LOG_INFO(oss_ext.str());
-            if (debugEnv().rmsnorm.gamma_checksum)
-            {
-                if (gmax > 4.0 || gmin < -1.0 || gmean > 2.0)
-                {
-                    LOG_WARN("[OutputNormIntegrity] (2nd path) gamma statistics outside expected range (Qwen2.5 typical ~[0,2])");
-                }
-            }
+            LOG_INFO(oss.str());
+            if (debugEnv().rmsnorm.gamma_checksum && (gmax > 4.0 || gmin < -1.0 || gmean > 2.0))
+                LOG_WARN("[OutputNormIntegrity] gamma statistics outside expected range (Qwen2.5 typical ~[0,2])");
         }
-
-        // Size validation
-        if (output_norm_size != config.d_model)
-        {
-            LOG_ERROR("output_norm.weight size (2nd path) " << output_norm_size << " != d_model=" << config.d_model
-                                                            << ". Potential source of logits divergence.");
-        }
-
-        // Diagnostic overrides (duplicate path) — unit or clamp
-        bool applied_override = false;
+        if (gamma_n != config.d_model)
+            LOG_ERROR("output_norm.weight size " << gamma_n << " != d_model=" << config.d_model);
+        bool override_applied = false;
         if (debugEnv().output_norm.force_unit || debugEnv().output_norm.force_unit_all)
         {
-            for (int i = 0; i < output_norm_size; ++i)
-            {
-                const_cast<float *>(output_norm_data)[i] = 1.0f;
-            }
-            applied_override = true;
-            LOG_WARN(std::string("[OutputNormIntegrity] (2nd path) Forcing output_norm.weight to all 1.0 due to ") +
-                     (debugEnv().output_norm.force_unit ? "LLAMINAR_OUTPUT_NORM_FORCE_UNIT" : "LLAMINAR_ALL_RMSNORM_FORCE_UNIT") + "=1");
+            for (int i = 0; i < gamma_n; ++i)
+                const_cast<float *>(out_gamma)[i] = 1.0f;
+            override_applied = true;
+            LOG_WARN("[OutputNormIntegrity] Forcing output_norm.weight to all 1.0");
         }
         else if (debugEnv().output_norm.clamp)
         {
-            float clamp_lo = 0.0f;
-            float clamp_hi = 4.0f;
-            int clamp_count = 0;
-            for (int i = 0; i < output_norm_size; ++i)
+            float lo = 0.f, hi = 4.f;
+            int clamp_ct = 0;
+            for (int i = 0; i < gamma_n; ++i)
             {
-                float v = output_norm_data[i];
-                float nv = std::min(std::max(v, clamp_lo), clamp_hi);
+                float v = out_gamma[i];
+                float nv = std::clamp(v, lo, hi);
                 if (nv != v)
-                    ++clamp_count;
-                const_cast<float *>(output_norm_data)[i] = nv;
+                    ++clamp_ct;
+                const_cast<float *>(out_gamma)[i] = nv;
             }
-            applied_override = true;
-            LOG_WARN("[OutputNormIntegrity] (2nd path) Clamped " << clamp_count << " gamma entries to [" << clamp_lo << ", " << clamp_hi
-                                                                 << "] due to LLAMINAR_OUTPUT_NORM_CLAMP=1");
+            override_applied = true;
+            LOG_WARN("[OutputNormIntegrity] Clamped gamma due to LLAMINAR_OUTPUT_NORM_CLAMP=1");
         }
-        if (applied_override)
+        if (override_applied)
         {
-            double gmin2 = std::numeric_limits<double>::infinity();
-            double gmax2 = -std::numeric_limits<double>::infinity();
-            long double gsum2 = 0.0L;
-            for (int i = 0; i < output_norm_size; ++i)
+            double gmin = 1e9, gmax = -1e9;
+            long double gsum = 0.0L;
+            for (int i = 0; i < gamma_n; ++i)
             {
-                double v = static_cast<double>(output_norm_data[i]);
-                gmin2 = std::min(gmin2, v);
-                gmax2 = std::max(gmax2, v);
-                gsum2 += v;
+                double v = out_gamma[i];
+                gmin = std::min(gmin, v);
+                gmax = std::max(gmax, v);
+                gsum += v;
             }
-            double gmean2 = static_cast<double>(gsum2 / (long double)output_norm_size);
-            LOG_INFO("[OutputNormIntegrity] (2nd path) Post-override stats: min=" << gmin2 << " max=" << gmax2 << " mean=" << gmean2);
+            double gmean = (double)(gsum / (long double)gamma_n);
+            LOG_INFO("[OutputNormIntegrity] Post-override stats: min=" << gmin << " max=" << gmax << " mean=" << gmean);
         }
-
-        weights.output_norm_weight = weights.output_norm_weight;
-        LOG_INFO("Output norm weights loaded successfully");
-
-        std::shared_ptr<TensorBase> lm_head = nullptr;
+        // LM head
+        std::shared_ptr<TensorBase> lm_head;
         try
         {
             lm_head = loader.loadTensor("output.weight");
@@ -4542,24 +4207,22 @@ namespace llaminar
         {
             LOG_WARN("Exception while loading output.weight: " << e.what());
         }
-
         if (lm_head)
         {
             try
             {
-                bool raw_orientation = debugEnv().lm_head.raw_orientation;
-                const auto original_shape = lm_head->shape();
-                if (!raw_orientation)
+                bool raw = debugEnv().lm_head.raw_orientation;
+                auto orig = lm_head->shape();
+                if (!raw)
                 {
                     enforce_matrix_layout(lm_head, config.d_model, config.vocab_size, "output.weight");
                 }
                 else
                 {
-                    LOG_WARN("[LMHeadOrientation] (2nd path) Skipping layout enforcement for output.weight due to LLAMINAR_LM_HEAD_RAW_ORIENTATION=1; using raw shape [" << original_shape[0] << ", " << original_shape[1] << "]");
+                    LOG_WARN("[LMHeadOrientation] Skipping layout enforcement for output.weight; raw shape [" << orig[0] << "," << orig[1] << "]");
                 }
                 weights.lm_head = lm_head;
                 LOG_INFO("Loaded lm_head from output.weight tensor (final shape " << weights.lm_head->shape()[0] << "x" << weights.lm_head->shape()[1] << ")");
-
                 if (debugEnv().lm_head.cosine_diag)
                 {
                     const float *wptr = weights.lm_head->data();
@@ -4568,20 +4231,19 @@ namespace llaminar
                     {
                         int R = sh[0];
                         int C = sh[1];
-                        auto cosine = [](const float *a, const float *b, int n) -> double
+                        auto cosine = [](const float *a, const float *b, int n)
                         {
-                            long double dot = 0.0L, na = 0.0L, nb = 0.0L;
+                            long double dot = 0, na = 0, nb = 0;
                             for (int i = 0; i < n; ++i)
                             {
-                                long double va = a[i];
-                                long double vb = b[i];
+                                long double va = a[i], vb = b[i];
                                 dot += va * vb;
                                 na += va * va;
                                 nb += vb * vb;
                             }
-                            if (na <= 0.0L || nb <= 0.0L)
+                            if (na <= 0 || nb <= 0)
                                 return 0.0;
-                            return static_cast<double>(dot / (std::sqrt(static_cast<double>(na)) * std::sqrt(static_cast<double>(nb))));
+                            return (double)(dot / (std::sqrt((double)na) * std::sqrt((double)nb)));
                         };
                         int samples = std::min(8, C - 1);
                         if (samples > 0)
@@ -4600,23 +4262,44 @@ namespace llaminar
                                 }
                                 sims.push_back(cosine(bufA.data(), bufB.data(), R));
                             }
-                            double smin = 1e9;
-                            double smax = -1e9;
-                            long double ssum = 0.0L;
+                            double smin = 1e9, smax = -1e9;
+                            long double ssum = 0;
                             for (double v : sims)
                             {
                                 smin = std::min(smin, v);
                                 smax = std::max(smax, v);
                                 ssum += v;
                             }
-                            double smean = sims.empty() ? 0.0 : static_cast<double>(ssum / sims.size());
+                            double smean = sims.empty() ? 0.0 : (double)(ssum / sims.size());
                             std::ostringstream oss;
-                            oss << "[LMHeadCosineDiag] (2nd path) orientation=" << (raw_orientation ? "raw" : "enforced")
+                            oss << "[LMHeadCosineDiag] orientation=" << (raw ? "raw" : "enforced")
                                 << " shape=" << R << "x" << C
                                 << " adj_column_cosine min=" << smin << " max=" << smax << " mean=" << smean
                                 << " samples=" << sims.size();
                             LOG_INFO(oss.str());
                         }
+                    }
+                }
+                // Additional row/col norm diag
+                if (weights.lm_head && weights.lm_head->data())
+                {
+                    const auto &sh2 = weights.lm_head->shape();
+                    if (sh2.size() == 2)
+                    {
+                        int rows = sh2[0], cols = sh2[1];
+                        const float *p = weights.lm_head->data();
+                        double row0 = 0, col0 = 0;
+                        for (int c = 0; c < cols; ++c)
+                        {
+                            double v = p[c];
+                            row0 += v * v;
+                        }
+                        for (int r = 0; r < rows; ++r)
+                        {
+                            double v = p[r * cols];
+                            col0 += v * v;
+                        }
+                        LOG_DEBUG("[LMHeadDiag] shape=" << rows << "x" << cols << " row0_l2=" << std::sqrt(row0) << " col0_l2=" << std::sqrt(col0));
                     }
                 }
             }
@@ -4631,144 +4314,141 @@ namespace llaminar
             LOG_WARN("output.weight tensor unavailable; falling back to tied token embeddings for LM head");
             weights.lm_head = weights.token_embedding;
         }
-
+        // Per-layer weights
         LOG_INFO("Starting per-layer weight loading for " << config.n_layers << " layers...");
-
-        // Load per-layer weights
-        for (int i = 0; i < config.n_layers; ++i)
+        for (int layer = 0; layer < config.n_layers; ++layer)
         {
-            std::string layer_prefix = "blk." + std::to_string(i) + ".";
-
-            // Attention norm
-            auto attn_norm = loader.loadTensor(layer_prefix + "attn_norm.weight");
+            std::string prefix = "blk." + std::to_string(layer) + ".";
+            auto attn_norm = loader.loadTensor(prefix + "attn_norm.weight");
             if (!attn_norm)
-            {
-                LOG_ERROR("Failed to load attention norm for layer " << i);
                 throw std::runtime_error("Failed to load attention norm weight");
-            }
-
-            // Debug: Check for NaN in attention norm weight
-            const float *attn_norm_data = attn_norm->data();
-            int attn_norm_size = attn_norm->size();
-            for (int j = 0; j < attn_norm_size; ++j)
-            {
-                if (std::isnan(attn_norm_data[j]))
-                {
-                    LOG_ERROR("NaN detected in attn_norm.weight for layer " << i << " at index " << j);
-                    throw std::runtime_error("NaN detected in attention norm weights");
-                }
-            }
-
-            LOG_DEBUG("Attention norm weight for layer " << i << " loaded successfully - first 5 values: "
-                                                         << attn_norm_data[0] << " " << attn_norm_data[1] << " " << attn_norm_data[2] << " "
-                                                         << attn_norm_data[3] << " " << attn_norm_data[4]);
-
+            const float *attn_ptr = attn_norm->data();
+            int attn_sz = attn_norm->size();
+            for (int j = 0; j < attn_sz; ++j)
+                if (std::isnan(attn_ptr[j]))
+                    throw std::runtime_error("NaN in attn_norm.weight");
             weights.attn_norm_weight.push_back(attn_norm);
-
-            // Attention projection weights
-            auto wq = loader.loadTensor(layer_prefix + "attn_q.weight");
-            auto wk = loader.loadTensor(layer_prefix + "attn_k.weight");
-            auto wv = loader.loadTensor(layer_prefix + "attn_v.weight");
-            auto wo = loader.loadTensor(layer_prefix + "attn_output.weight");
-
-            if (!wq || !wk || !wv || !wo)
+            if (debugEnv().output_norm.force_unit_all)
             {
-                LOG_ERROR("Failed to load attention weights for layer " << i);
-                throw std::runtime_error("Failed to load attention weights");
+                float *m = const_cast<float *>(attn_ptr);
+                for (int j = 0; j < attn_sz; ++j)
+                    m[j] = 1.0f;
+                LOG_WARN("[RMSNormGlobalOverride] Forced attn_norm.weight layer " << layer);
             }
-
+            auto wq = loader.loadTensor(prefix + "attn_q.weight");
+            auto wk = loader.loadTensor(prefix + "attn_k.weight");
+            auto wv = loader.loadTensor(prefix + "attn_v.weight");
+            auto wo = loader.loadTensor(prefix + "attn_output.weight");
+            if (!wq || !wk || !wv || !wo)
+                throw std::runtime_error("Failed to load attention weights");
             weights.wq.push_back(wq);
             weights.wk.push_back(wk);
             weights.wv.push_back(wv);
             weights.wo.push_back(wo);
-
-            // Feed-forward normalization
-            auto ffn_norm = loader.loadTensor(layer_prefix + "ffn_norm.weight");
+            auto ffn_norm = loader.loadTensor(prefix + "ffn_norm.weight");
             if (!ffn_norm)
-            {
-                LOG_ERROR("Failed to load FFN norm for layer " << i);
                 throw std::runtime_error("Failed to load FFN norm weight");
-            }
-
-            // Debug: Check for NaN in FFN norm weight
-            const float *ffn_norm_data = ffn_norm->data();
-            int ffn_norm_size = ffn_norm->size();
-            for (int j = 0; j < ffn_norm_size; ++j)
+            const float *ffn_ptr = ffn_norm->data();
+            int ffn_sz = ffn_norm->size();
+            for (int j = 0; j < ffn_sz; ++j)
+                if (std::isnan(ffn_ptr[j]))
+                    throw std::runtime_error("NaN in ffn_norm.weight");
+            weights.ffn_norm_weight.push_back(ffn_norm);
+            if (debugEnv().output_norm.force_unit_all)
             {
-                if (std::isnan(ffn_norm_data[j]))
+                float *m = const_cast<float *>(ffn_ptr);
+                for (int j = 0; j < ffn_sz; ++j)
+                    m[j] = 1.0f;
+                LOG_WARN("[RMSNormGlobalOverride] Forced ffn_norm.weight layer " << layer);
+            }
+            auto w_gate = loader.loadTensor(prefix + "ffn_gate.weight");
+            auto w_up = loader.loadTensor(prefix + "ffn_up.weight");
+            auto w_down = loader.loadTensor(prefix + "ffn_down.weight");
+            if (!w_gate || !w_up || !w_down)
+                throw std::runtime_error("Failed to load FFN weights");
+            int effective_d_ff = config.d_ff;
+            if (effective_d_ff == 0 && w_gate && w_gate->shape().size() == 2)
+            {
+                auto sh = w_gate->shape();
+                if (sh[0] == config.d_model)
                 {
-                    LOG_ERROR("NaN detected in ffn_norm.weight for layer " << i << " at index " << j);
-                    throw std::runtime_error("NaN detected in FFN norm weights");
+                    effective_d_ff = sh[1];
+                    LOG_WARN("[FFN_DIM_INFER] Inferred d_ff=" << effective_d_ff << " from ffn_gate.weight");
+                }
+                else if (sh[1] == config.d_model)
+                {
+                    effective_d_ff = sh[0];
+                    LOG_WARN("[FFN_DIM_INFER] Inferred d_ff=" << effective_d_ff << " from transposed ffn_gate.weight");
                 }
             }
-
-            LOG_DEBUG("FFN norm weight for layer " << i << " loaded successfully - first 5 values: "
-                                                   << ffn_norm_data[0] << " " << ffn_norm_data[1] << " " << ffn_norm_data[2] << " "
-                                                   << ffn_norm_data[3] << " " << ffn_norm_data[4]);
-
-            weights.ffn_norm_weight.push_back(ffn_norm);
-
-            // Feed-forward weights
-            auto w_gate = loader.loadTensor(layer_prefix + "ffn_gate.weight");
-            auto w_up = loader.loadTensor(layer_prefix + "ffn_up.weight");
-            auto w_down = loader.loadTensor(layer_prefix + "ffn_down.weight");
-
-            if (!w_gate || !w_up || !w_down)
+            if (effective_d_ff > 0)
             {
-                LOG_ERROR("Failed to load FFN weights for layer " << i);
-                throw std::runtime_error("Failed to load FFN weights");
+                enforce_matrix_layout(w_gate, config.d_model, effective_d_ff, prefix + "ffn_gate.weight");
+                enforce_matrix_layout(w_up, config.d_model, effective_d_ff, prefix + "ffn_up.weight");
+                enforce_matrix_layout(w_down, effective_d_ff, config.d_model, prefix + "ffn_down.weight");
+                LOG_DEBUG("[FFN_DIM] Using d_ff=" << effective_d_ff << " layer=" << layer);
             }
-
-            enforce_matrix_layout(w_gate, config.d_model, config.d_ff, layer_prefix + "ffn_gate.weight");
-            enforce_matrix_layout(w_up, config.d_model, config.d_ff, layer_prefix + "ffn_up.weight");
-            enforce_matrix_layout(w_down, config.d_ff, config.d_model, layer_prefix + "ffn_down.weight");
-
+            else
+            {
+                LOG_WARN("[FFN_DIM_INFER] d_ff unresolved (0); skipping layout enforcement layer=" << layer);
+            }
             weights.w_gate.push_back(w_gate);
             weights.w_up.push_back(w_up);
             weights.w_down.push_back(w_down);
         }
-
         LOG_INFO("Successfully loaded all model weights: " << config.n_layers << " layers");
-        if (shard_diag2)
+        if (debugEnv().sharding.shard_load_diag)
         {
             int rank = 0;
             MPI_Comm_rank(MPI_COMM_WORLD, &rank);
             if (rank == 0)
             {
                 LOG_INFO("-- Sharded Tensor Registry (post model load) --");
-                size_t total_local_bytes = 0;
-                size_t total_local_elems = 0;
+                size_t total_local_bytes = 0, total_local_elems = 0;
                 bool any = false;
-                size_t hidden_local_elems = 0, heads_local_elems = 0;
-                size_t hidden_global_dim = 0, heads_global_dim = 0;
-                TensorFactory::for_each_sharded([&](const ShardSpec &spec, const std::vector<int> &local_shape)
-                                                {
-                    any=true; size_t elems=1; for(int d: local_shape) elems*= (size_t)d; total_local_elems += elems; total_local_bytes += elems * sizeof(float);
-                    if(spec.axis == ShardSpec::Axis::Hidden){ hidden_local_elems += elems; hidden_global_dim = spec.global_dim; }
-                    else if(spec.axis == ShardSpec::Axis::Heads){ heads_local_elems += elems; heads_global_dim = spec.global_dim; } });
+                size_t hidden_local = 0, heads_local = 0;
+                size_t hidden_global = 0, heads_global = 0;
+                TensorFactory::for_each_sharded([&](const ShardSpec &spec, const std::vector<int> &local)
+                                                { any=true; size_t elems=1; for(int d:local) elems*=(size_t)d; total_local_elems+=elems; total_local_bytes+=elems*sizeof(float); if(spec.axis==ShardSpec::Axis::Hidden){ hidden_local+=elems; hidden_global=spec.global_dim;} else if(spec.axis==ShardSpec::Axis::Heads){ heads_local+=elems; heads_global=spec.global_dim;} });
                 double mb = total_local_bytes / (1024.0 * 1024.0);
                 if (!any)
-                {
                     LOG_INFO("(no sharded tensors registered)");
-                }
                 LOG_INFO("Aggregate shard footprint: local_bytes=" << total_local_bytes << " (" << mb << " MB) local_elems=" << total_local_elems);
-                if (hidden_local_elems)
-                {
-                    LOG_INFO("Hidden-axis shards: local_elems=" << hidden_local_elems << " global_dim=" << hidden_global_dim);
-                }
-                if (heads_local_elems)
-                {
-                    LOG_INFO("Heads-axis shards: local_elems=" << heads_local_elems << " global_dim=" << heads_global_dim);
-                }
-                size_t est_global_elems = 0;
-                TensorFactory::for_each_sharded([&](const ShardSpec &spec, const std::vector<int> &local_shape)
-                                                { size_t elems=1; for(int d: local_shape) elems*= (size_t)d; if(spec.local_dim>0){ double expand = (double)spec.global_dim / (double)spec.local_dim; est_global_elems += (size_t)(elems * expand + 0.5);} else { est_global_elems += elems; } });
-                double est_global_mb = (est_global_elems * sizeof(float)) / (1024.0 * 1024.0);
-                LOG_INFO("Estimated global (logical) elements represented by shards: " << est_global_elems << " (~" << est_global_mb << " MB as fp32)");
+                if (hidden_local)
+                    LOG_INFO("Hidden-axis shards: local_elems=" << hidden_local << " global_dim=" << hidden_global);
+                if (heads_local)
+                    LOG_INFO("Heads-axis shards: local_elems=" << heads_local << " global_dim=" << heads_global);
+                size_t est_global = 0;
+                TensorFactory::for_each_sharded([&](const ShardSpec &spec, const std::vector<int> &local)
+                                                { size_t elems=1; for(int d:local) elems*=(size_t)d; if(spec.local_dim>0){ double expand=(double)spec.global_dim/(double)spec.local_dim; est_global += (size_t)(elems*expand + 0.5);} else est_global += elems; });
+                double est_mb = (est_global * sizeof(float)) / (1024.0 * 1024.0);
+                LOG_INFO("Estimated global (logical) elements represented by shards: " << est_global << " (~" << est_mb << " MB as fp32)");
                 LOG_INFO("-- End Sharded Tensor Registry --");
             }
         }
         return weights;
+    }
+
+    // Public path-based overload now delegates to unified helper
+    MPITransformerPipeline::ModelWeights loadModelWeights(
+        const std::string &model_path,
+        const MPITransformerPipeline::LayerConfig &config)
+    {
+        ModelLoader loader;
+        if (!loader.loadModel(model_path))
+        {
+            LOG_ERROR("Failed to load model from: " << model_path);
+            throw std::runtime_error("Failed to load model");
+        }
+        LOG_INFO("Loading model weights from: " << model_path);
+        return loadModelWeightsExistingLoaderImpl(loader, config);
+    }
+    // Overloaded utility function for loading weights using existing ModelLoader (now delegates to internal helper)
+    MPITransformerPipeline::ModelWeights loadModelWeights(
+        ModelLoader &loader,
+        const MPITransformerPipeline::LayerConfig &config)
+    {
+        return loadModelWeightsExistingLoaderImpl(loader, config);
     }
 
 } // namespace llaminar

@@ -80,18 +80,19 @@ namespace llaminar
             return;
         uint16_t scale_bits = 0;
         std::memcpy(&scale_bits, block, sizeof(uint16_t));
-        const float d = qd_fp16_to_fp32(scale_bits);
+        // Use upstream macro GGML_FP16_TO_FP32 for exact parity with ggml's dequantize_row_q4_0
+        const float d = ggml_fp16_to_fp32(scale_bits);
         const uint8_t *qs = block + sizeof(uint16_t);
-        const int max_pairs = QK / 2;
-        for (int j = 0; j < max_pairs && (2 * j) < values; ++j)
+        const int half = QK / 2;
+        for (int j = 0; j < half; ++j)
         {
             const uint8_t packed = qs[j];
-            const int dst_idx0 = 2 * j;
-            const int dst_idx1 = dst_idx0 + 1;
-            if (dst_idx0 < values)
-                dst[dst_idx0] = (float)((packed & 0x0F) - 8) * d;
-            if (dst_idx1 < values)
-                dst[dst_idx1] = (float)((packed >> 4) - 8) * d;
+            const int x0i = j;        // first half position
+            const int x1i = j + half; // second half position
+            if (x0i < values)
+                dst[x0i] = (float)((packed & 0x0F) - 8) * d;
+            if (x1i < values)
+                dst[x1i] = (float)((packed >> 4) - 8) * d;
         }
     }
 

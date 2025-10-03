@@ -10,8 +10,9 @@ This document outlines the comprehensive plan for implementing prompt processing
 
 ### Existing Infrastructure ✅
 - Command-line argument parsing with prompt parameter support (`ArgumentParser`)
-- GGUF model loading with vocabulary extraction (`ModelLoader`) 
-- MPI distributed inference pipeline (`MPITransformerPipeline`)
+- GGUF model loading with vocabulary extraction (`ModelLoader`)
+- Abstract inference pipeline adapter (`AbstractPipeline` + concrete Qwen adapter)  
+    - NOTE: Legacy `MPITransformerPipeline` is deprecated and only retained for temporary parity tests.
 - Logging system and error handling
 - System topology detection and COSMA integration
 
@@ -34,7 +35,7 @@ This document outlines the comprehensive plan for implementing prompt processing
            │                          │                           │
            │                          ▼                           │
            │              ┌──────────────────────┐                │
-           │              │ MPITransformerPipeline │               │
+           │              │  AbstractPipeline(Qwen) │              │
            │              │  (Distributed Inference)│              │
            │              └──────────────────────┘                │
            │                          │                           │

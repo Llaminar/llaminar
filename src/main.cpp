@@ -4,6 +4,7 @@
 #include <mpi.h>
 #include <string>
 #include <memory>
+// Removed unused headers from legacy graph system; keep iostream, mpi, string, memory, chrono, iomanip, sstream if needed.
 #include <iomanip>
 #include <chrono>
 #include <sstream>
@@ -13,12 +14,13 @@
 #include "topology_manager.h"
 #include "model_loader.h"
 #include "mpi_transformer_pipeline.h"
-#include "graph_compute.h" // contains MatMulNode definition
+#include "abstract_pipeline.h"
+#include "qwen_pipeline_adapter.h"
 #include "performance_timer.h"
 #include "utils/debug_env.h"
 #include "utils/perf_counters.h"
-#include "tensors/sharded_tensor_registry.h"
 #include "tensors/tensor_factory.h"
+#include "tensors/sharded_tensor_registry.h" // required for ShardedTensorRegistry snapshot logging
 #include "chat/tokenizer_interface.h"
 #include "chat/chat_interface.h"
 #include "chat/response_generator.h"
@@ -138,8 +140,10 @@ int main(int argc, char **argv)
 
         // 5. Model loading
         std::unique_ptr<ModelLoader> model_loader;
-        std::unique_ptr<MPITransformerPipeline> transformer_pipeline;
-        std::unique_ptr<MPITransformerPipeline::ModelWeights> model_weights;
+        std::unique_ptr<MPITransformerPipeline> transformer_pipeline;        // legacy path
+        std::unique_ptr<MPITransformerPipeline::ModelWeights> model_weights; // legacy weights
+        std::unique_ptr<AbstractPipeline> abstract_pipeline;                 // new abstract pipeline (feature flag)
+        std::unique_ptr<QwenModelWeights> abstract_weights;                  // adapter weights container
         if (!params.model_file.empty())
         {
             LOG_INFO("Loading model from: " << params.model_file);
@@ -154,13 +158,36 @@ int main(int argc, char **argv)
                                                         << config.n_head << " heads, " << config.d_model << " dimensions");
                     LOG_INFO("Model config details: vocab_size=" << config.vocab_size
                                                                  << ", max_seq_len=" << config.max_seq_len << ", d_ff=" << config.d_ff);
-                    transformer_pipeline = std::make_unique<MPITransformerPipeline>(config);
-                    LOG_INFO("Transformer pipeline initialized successfully");
+                    bool use_abstract = debugEnv().pipeline.enable_abstract_pipeline;
+                    if (use_abstract)
+                    {
+                        registerQwenPipeline();
+                        abstract_pipeline = PipelineFactory::instance().create("qwen", config);
+                        if (!abstract_pipeline)
+                        {
+                            RETURN_FAIL(1, "Failed to create abstract pipeline instance");
+                        }
+                        LOG_INFO("Abstract pipeline initialized: " << abstract_pipeline->name());
+                    }
+                    else
+                    {
+                        transformer_pipeline = std::make_unique<MPITransformerPipeline>(config);
+                        LOG_INFO("Transformer pipeline initialized successfully");
+                    }
                     try
                     {
-                        model_weights = std::make_unique<MPITransformerPipeline::ModelWeights>(
-                            loadModelWeights(*model_loader, config));
-                        LOG_INFO("Model weights loaded for transformer pipeline");
+                        auto loaded = loadModelWeights(*model_loader, config);
+                        if (abstract_pipeline)
+                        {
+                            abstract_weights = std::make_unique<QwenModelWeights>();
+                            abstract_weights->inner = std::move(loaded);
+                            LOG_INFO("Model weights loaded (abstract adapter)");
+                        }
+                        else
+                        {
+                            model_weights = std::make_unique<MPITransformerPipeline::ModelWeights>(std::move(loaded));
+                            LOG_INFO("Model weights loaded for transformer pipeline");
+                        }
                         if (rank == 0 && params.print_topology)
                         {
                             LOG_INFO("-- Sharded Tensor Registry (post model load) --");
@@ -218,7 +245,7 @@ int main(int argc, char **argv)
         }
 
         // 6. Chat interface mode
-        if (params.interactive && transformer_pipeline)
+        if (params.interactive && (transformer_pipeline || abstract_pipeline))
         {
             if (rank == 0)
             {
@@ -230,8 +257,10 @@ int main(int argc, char **argv)
                 auto tokenizer_shared = std::shared_ptr<chat::TokenizerInterface>(tokenizer.release());
                 auto tokenizer_copy = chat::createTokenizer(*model_loader);
                 auto session = std::make_unique<chat::ChatSession>(std::move(tokenizer_copy), params);
-                auto shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
-                auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, *model_weights);
+                std::shared_ptr<MPITransformerPipeline> shared_pipeline;
+                if (transformer_pipeline)
+                    shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
+                auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, transformer_pipeline ? *model_weights : abstract_weights->inner);
                 chat::ChatInterface chat_ui(std::move(session), shared_pipeline, std::move(generator), params);
                 chat_ui.run();
                 int done = 1;
@@ -253,7 +282,7 @@ int main(int argc, char **argv)
         }
 
         // 7. Non-interactive prompt / eval path
-        if (transformer_pipeline && (!params.prompt.empty() || params.eval_only))
+        if ((transformer_pipeline || abstract_pipeline) && (!params.prompt.empty() || params.eval_only))
         {
             std::shared_ptr<chat::TokenizerInterface> tokenizer_shared;
             std::vector<int32_t> prompt_tokens;
@@ -301,8 +330,10 @@ int main(int argc, char **argv)
             if (rank != 0)
                 prompt_tokens.resize(token_count);
             MPI_Bcast(prompt_tokens.data(), token_count, MPI_INT, 0, MPI_COMM_WORLD);
-            auto shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
-            auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, *model_weights);
+            std::shared_ptr<MPITransformerPipeline> shared_pipeline;
+            if (transformer_pipeline)
+                shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
+            auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, transformer_pipeline ? *model_weights : abstract_weights->inner);
             try
             {
                 std::string response = generator->generateResponse(prompt_tokens);
@@ -318,88 +349,17 @@ int main(int argc, char **argv)
         }
 
         // 8. Standard inference path
-        ComputeGraph graph;
-        if (transformer_pipeline && model_weights)
-        {
-            LOG_INFO("Setting up transformer inference pipeline...");
-            std::vector<int> input_tokens = {1, 2, 3, 4, 5};
-            LOG_INFO("Running inference on " << input_tokens.size() << " tokens");
-            try
-            {
-                std::shared_ptr<TensorBase> output;
-                auto t0 = std::chrono::high_resolution_clock::now();
-                bool ok = transformer_pipeline->execute(input_tokens, *model_weights, output);
-                auto t1 = std::chrono::high_resolution_clock::now();
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-                if (ok && rank == 0)
-                {
-                    LOG_INFO("Inference completed successfully!");
-                    LOG_INFO("Single token generation took: " << ms << " ms");
-                    LOG_INFO("Output shape: [" << output->shape()[0] << ", " << output->shape()[1] << "]");
-                    const float *out = output->data();
-                    LOG_INFO("First 10 output values:");
-                    for (int i = 0; i < std::min(10, (int)output->shape()[1]); ++i)
-                        LOG_INFO("  [" << i << "] = " << out[i]);
-                    std::cout << "\n"
-                              << std::string(60, '=') << "\nPERFORMANCE TIMING REPORT\n";
-                    std::cout << "Single token generation: " << ms << " ms\n"
-                              << std::string(60, '=') << std::endl;
-                    PerformanceTimer::getInstance().printReport();
-                    std::cout << std::string(60, '=') << std::endl;
-                }
-                else if (!ok)
-                {
-                    RETURN_FAIL(1, "Transformer pipeline execution failed");
-                }
-            }
-            catch (const std::exception &e)
-            {
-                RETURN_FAIL(1, std::string("Exception during inference: ") + e.what());
-            }
-        }
         else if (model_loader)
         {
-            LOG_INFO("Model loaded but transformer pipeline not initialized - running matmul demo");
-            int matrix_size = params.m;
-            auto node = std::make_shared<MatMulNode>("model_matmul_demo", matrix_size, matrix_size, matrix_size);
-            graph.addNode(node);
+            LOG_INFO("Model loaded but no transformer pipeline initialized (graph system removed) - skipping legacy matmul demo");
         }
         else
         {
-            auto node = std::make_shared<MatMulNode>("cosma_benchmark", params.m, params.n, params.k);
-            graph.addNode(node);
+            LOG_INFO("No model or pipeline initialized; graph system removed so benchmark path is disabled.");
         }
 
-        // 9. Execute compute graph if applicable
-        if (!transformer_pipeline || !model_weights)
-        {
-            LOG_INFO("Executing compute graph...");
-            auto start = std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < params.num_repeat; ++i)
-            {
-                bool ok = graph.execute();
-                if (!ok)
-                    RETURN_FAIL(1, "Compute graph execution failed on iteration " + std::to_string(i));
-                if (rank == 0 && params.log_level >= LogLevel::VERBOSITY_DEBUG)
-                {
-                    LOG_DEBUG("Completed iteration " << (i + 1) << "/" << params.num_repeat);
-                }
-            }
-            auto end = std::chrono::high_resolution_clock::now();
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-            if (rank == 0)
-            {
-                LOG_INFO("=== Performance Results ===");
-                LOG_INFO("Total execution time: " << ms.count() << " ms");
-                LOG_INFO("Average time per iteration: " << (ms.count() / params.num_repeat) << " ms");
-                if (!model_loader)
-                {
-                    long long ops = 2LL * params.m * params.n * params.k * params.num_repeat;
-                    double gflops = (double)ops / (ms.count() * 1e6);
-                    LOG_INFO("Achieved performance: " << std::fixed << std::setprecision(3) << gflops << " GFLOPS");
-                }
-            }
-        }
+        // 9. (Legacy placeholder) Graph system removed; no execution here.
+        LOG_INFO("Graph system removed; skipping legacy graph execution phase.");
 
         // 10. Validation
         if (params.validate_results && rank == 0)
@@ -409,6 +369,29 @@ int main(int argc, char **argv)
         }
 
         LOG_INFO("Llaminar execution completed successfully");
+        if (params.kv_cache_stats && (transformer_pipeline || abstract_pipeline) && rank == 0)
+        {
+            LOG_INFO("-- KV Cache Summary --");
+            if (abstract_pipeline)
+            {
+                if (auto *state = abstract_pipeline->kvCacheState())
+                {
+                    LOG_INFO("KV capacity=" << state->capacity_tokens
+                                            << " used=" << state->used_tokens
+                                            << " growth_events=" << state->growth_events);
+                }
+                else
+                {
+                    LOG_INFO("(abstract pipeline reports no KV cache state)");
+                }
+            }
+            else if (transformer_pipeline)
+            {
+                LOG_INFO("KV capacity=" << transformer_pipeline->getKVCacheCapacity()
+                                        << " used=" << transformer_pipeline->getKVCacheUsed()
+                                        << " growth_events=" << transformer_pipeline->getKVCacheGrowthEvents());
+            }
+        }
         // Performance counters summary (only if enabled and rank matches)
         const auto &perf_env = debugEnv().performance;
         if (perf_env.enable && rank == perf_env.log_rank)

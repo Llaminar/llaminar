@@ -49,7 +49,6 @@ struct BenchmarkResult
 };
 
 // Forward declarations
-class ComputeGraph;
 class KernelManager;
 class ModelLoader;
 class TensorRepacker;

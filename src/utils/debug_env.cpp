@@ -164,6 +164,17 @@ namespace llaminar
         // Pipeline
         s.pipeline.capture_pre_lm = flag(std::getenv("LLAMINAR_PIPELINE_CAPTURE_PRE_LM"));
         s.pipeline.layerwise_stats = flag(std::getenv("LLAMINAR_PIPELINE_LAYERWISE_STATS"));
+    s.pipeline.enable_abstract_pipeline = flag(std::getenv("LLAMINAR_ENABLE_ABSTRACT_PIPELINE"));
+    s.pipeline.disable_incremental_decode = flag(std::getenv("LLAMINAR_DISABLE_INCREMENTAL_DECODE"));
+    s.pipeline.layer_token_diff = flag(std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF"));
+    s.pipeline.layer_token_diff_verbose = flag(std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF_VERBOSE"));
+    s.pipeline.attn_ref_compare = flag(std::getenv("LLAMINAR_DEBUG_ATTENTION_REF"));
+    s.pipeline.layer_replay_compare = flag(std::getenv("LLAMINAR_DEBUG_LAYER_REPLAY_COMPARE"));
+    // Pre-LM row diff instrumentation (explicit opt-in; unset or "0" keeps it off)
+    s.pipeline.pre_lm_row_diff = flag(std::getenv("LLAMINAR_PIPELINE_PRE_LM_ROW_DIFF"));
+    // KV cache
+    s.kv_cache.dynamic_init = flag(std::getenv("LLAMINAR_KV_DYNAMIC_INIT"));
+    if(const char* gfac = std::getenv("LLAMINAR_KV_GROWTH_FACTOR")) { int v=std::atoi(gfac); if(v>=1 && v<=16) s.kv_cache.growth_factor = v; }
         // Dequant
         s.dequant.stats = flag(std::getenv("LLAMINAR_DEQUANT_STATS"));
         s.dequant.anomalies = flag(std::getenv("LLAMINAR_DEQUANT_ANOMALIES"));
@@ -172,6 +183,10 @@ namespace llaminar
     // Attention
     s.attention.validate_primitives = flag(std::getenv("LLAMINAR_ATTN_PRIMITIVES_VALIDATE"));
     s.attention.validate_output = flag(std::getenv("LLAMINAR_ATTN_OUTPUT_VALIDATE"));
+    if(const char* up = std::getenv("LLAMINAR_ATTN_USE_PRIMITIVES")) {
+        // empty string => treat as true; explicit 0 disables
+        if(*up == '0') s.attention.use_primitives = false; else s.attention.use_primitives = true;
+    }
     if(const char* om = std::getenv("LLAMINAR_ATTN_OUTPUT_MODE")) { if(*om){ s.attention.output_mode_forced=true; s.attention.output_mode = om; }}
     if(const char* gt = std::getenv("LLAMINAR_ATTN_GATHER_THRESHOLD")) { s.attention.gather_threshold = std::atoi(gt); }
     s.attention.force_scalar = flag(std::getenv("LLAMINAR_ATTN_FORCE_SCALAR"));
@@ -182,6 +197,25 @@ namespace llaminar
     if(const char* tpp = std::getenv("LLAMINAR_ATTN_TP_PARTITIONS")) { int v=std::atoi(tpp); if(v>0 && v<1024) s.attention.tp_partitions = v; }
     s.attention.tp_auto = flag(std::getenv("LLAMINAR_ATTN_TP_AUTO"));
     s.attention.tp_force_splitter = flag(std::getenv("LLAMINAR_ATTN_TP_FORCE_SPLITTER"));
+    // Attention primitive optimization flags
+    if(const char* ppe = std::getenv("LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS")) { int v=std::atoi(ppe); if(v>0) s.attention.prim_parallel_elems_threshold = v; }
+    s.attention.prim_force_scalar = flag(std::getenv("LLAMINAR_ATTN_PRIM_FORCE_SCALAR"));
+    if(const char* frt = std::getenv("LLAMINAR_ATTN_PRIM_FUSED_RECOMPUTE_THRESHOLD")) { int v=std::atoi(frt); if(v>0) s.attention.prim_fused_recompute_threshold = v; }
+    s.attention.prim_force_fused = flag(std::getenv("LLAMINAR_ATTN_PRIM_FORCE_FUSED"));
+    s.attention.prim_disable_fused = flag(std::getenv("LLAMINAR_ATTN_PRIM_DISABLE_FUSED"));
+    {
+        const char* rv = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_VECTORIZE");
+        if(rv && *rv=='0') s.attention.prim_rope_vectorize = false; // default true
+    }
+    {
+        const char* rfs = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_FUSED_SINCOS");
+        if(rfs && *rfs=='0') s.attention.prim_rope_fused_sincos = false; // default true
+    }
+    {
+        if(const char* rt = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD")) { int v=std::atoi(rt); if(v>0) s.attention.prim_rope_recurrence_threshold = v; }
+        if(flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE"))) s.attention.prim_rope_disable_recurrence = true;
+        s.attention.prim_rope_trace = flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_TRACE"));
+    }
     // Embedding
     s.embedding.trace = flag(std::getenv("LLAMINAR_EMBED_TRACE"));
     s.embedding.fail_fast = flag(std::getenv("LLAMINAR_EMBED_FAIL_FAST"));
@@ -195,6 +229,31 @@ namespace llaminar
     s.rmsnorm.gamma_checksum = flag(std::getenv("LLAMINAR_RMSNORM_GAMMA_CHECKSUM"));
     if(const char* rr = std::getenv("LLAMINAR_RMSNORM_TRACE_ROWS")){ if(*rr) s.rmsnorm.trace_rows_spec = rr; }
     s.rmsnorm.verbose = flag(std::getenv("LLAMINAR_RMSNORM_VERBOSE"));
+    s.rmsnorm.force_scalar = flag(std::getenv("LLAMINAR_RMSNORM_FORCE_SCALAR"));
+    s.rmsnorm.disable_tls_scratch = flag(std::getenv("LLAMINAR_RMSNORM_DISABLE_TLS_SCRATCH"));
+    if(const char* sp = std::getenv("LLAMINAR_RMSNORM_SCRATCH_PREALLOC_ROWS")) { int v=std::atoi(sp); if(v>0 && v<1000000) s.rmsnorm.scratch_prealloc_rows = v; }
+    s.rmsnorm.false_sharing_probe = flag(std::getenv("LLAMINAR_RMSNORM_FALSE_SHARING_PROBE"));
+    s.rmsnorm.fast_accumulate = flag(std::getenv("LLAMINAR_RMSNORM_FAST_ACC"));
+    if(const char* rvi = std::getenv("LLAMINAR_RMSNORM_VEC_IMPL")) { int v=std::atoi(rvi); if(v>=0 && v<=3) s.rmsnorm.vec_impl = v; }
+
+        // Softmax core
+        s.softmax.force_scalar = flag(std::getenv("LLAMINAR_SOFTMAX_FORCE_SCALAR"));
+        s.softmax.validate = flag(std::getenv("LLAMINAR_SOFTMAX_VALIDATE"));
+        s.softmax.parallel_row_threshold = to_int(std::getenv("LLAMINAR_SOFTMAX_PARALLEL_ROW_THRESHOLD"), 0);
+        s.softmax.parallel_elems_threshold = to_int(std::getenv("LLAMINAR_SOFTMAX_PARALLEL_ELEMS"), 32768);
+        s.softmax.validate_scalar_row_threshold = to_int(std::getenv("LLAMINAR_SOFTMAX_VALIDATE_SCALAR_ROW_THRESHOLD"), 256);
+        {
+            const char* cf = std::getenv("LLAMINAR_SOFTMAX_CAUSAL_FUSE");
+            if(cf && *cf == '0') s.softmax.causal_fuse = false; // default true
+        }
+        s.softmax.fast_exp = flag(std::getenv("LLAMINAR_SOFTMAX_FAST_EXP"));
+        if(const char* fem = std::getenv("LLAMINAR_SOFTMAX_FAST_EXP_MODE")) { int v=std::atoi(fem); if(v>=0 && v<=4) s.softmax.fast_exp_mode = v; }
+        s.softmax.dist_recompute = flag(std::getenv("LLAMINAR_SOFTMAX_DIST_RECOMPUTE"));
+    if(const char* drt = std::getenv("LLAMINAR_SOFTMAX_DIST_RECOMPUTE_THRESHOLD")) { int v=std::atoi(drt); if(v>0) s.softmax.dist_recompute_threshold = v; }
+        if(const char* vsr = std::getenv("LLAMINAR_SOFTMAX_VALIDATE_SAMPLE_ROWS")) { int v=std::atoi(vsr); s.softmax.validate_sample_rows = v; }
+        if(const char* vrl = std::getenv("LLAMINAR_SOFTMAX_VALIDATE_REL_L2")) { try { s.softmax.validate_rel_l2_tol = std::stod(vrl);} catch(...){} }
+        if(const char* vma = std::getenv("LLAMINAR_SOFTMAX_VALIDATE_MAX_ABS")) { try { s.softmax.validate_max_abs_tol = std::stod(vma);} catch(...){} }
+        s.softmax.validate_abort = flag(std::getenv("LLAMINAR_SOFTMAX_VALIDATE_ABORT"));
     // SwiGLU
     s.swiglu.validate = flag(std::getenv("LLAMINAR_SWIGLU_VALIDATE"));
     if(const char* algo = std::getenv("LLAMINAR_SWIGLU_ALGO")) s.swiglu.algo = algo;
@@ -295,6 +354,9 @@ namespace llaminar
     if(std::getenv("LLAMINAR_TP_DISABLE_OUTER_PAR")) s.tp_policy.disable_outer_par = true;
     // Logger buffer override
     if(const char* lbl = std::getenv("LLAMINAR_LOG_BUFFER_LINES")) { try { long long v = std::stoll(lbl); if(v>0 && v < 2000000) s.logger.buffer_lines_override = (size_t)v; } catch(...){} }
+        // KV cache (refresh)
+        s.kv_cache.dynamic_init = flag(std::getenv("LLAMINAR_KV_DYNAMIC_INIT"));
+        if(const char* gfac2 = std::getenv("LLAMINAR_KV_GROWTH_FACTOR")) { int v=std::atoi(gfac2); if(v>=1 && v<=16) s.kv_cache.growth_factor = v; }
         // Distribution Mode (two-tier policy)
         if(const char* dm = std::getenv("LLAMINAR_DISTRIBUTION_MODE")) { if(*dm) s.distribution.distribution_mode = dm; }
         s.distribution.force_replicated = flag(std::getenv("LLAMINAR_FORCE_REPLICATED"));
@@ -352,6 +414,12 @@ namespace llaminar
                 s.sharding.shard_parity_check = flag(std::getenv("LLAMINAR_SHARD_PARITY_CHECK"));
                 s.sharding.assert_replicated_misuse = flag(std::getenv("LLAMINAR_ASSERT_REPLICATED_MISUSE"));
                 s.sharding.shard_load_diag = flag(std::getenv("LLAMINAR_SHARD_LOAD_DIAG"));
+                // Pipeline (new flags must be kept in sync with initial static snapshot parse)
+                s.pipeline.layer_token_diff = flag(std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF"));
+                s.pipeline.layer_token_diff_verbose = flag(std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF_VERBOSE"));
+                s.pipeline.attn_ref_compare = flag(std::getenv("LLAMINAR_DEBUG_ATTENTION_REF"));
+                s.pipeline.layer_replay_compare = flag(std::getenv("LLAMINAR_DEBUG_LAYER_REPLAY_COMPARE"));
+                s.pipeline.capture_pre_lm = flag(std::getenv("LLAMINAR_PIPELINE_CAPTURE_PRE_LM"));
                 // COSMA subset
                 s.cosma.prefill_threshold = to_int(std::getenv("LLAMINAR_COSMA_PREFILL_THRESHOLD"), 4096);
                 s.cosma.fast_path_threshold = to_int(std::getenv("LLAMINAR_COSMA_FAST_PATH_THRESHOLD"), -1);
@@ -361,6 +429,20 @@ namespace llaminar
                 s.cosma.disable = flag(std::getenv("LLAMINAR_COSMA_DISABLE"));
                 s.cosma.force = flag(std::getenv("LLAMINAR_COSMA_FORCE"));
                 // Distribution
+                // Softmax (refresh subset)
+                s.softmax.force_scalar = flag(std::getenv("LLAMINAR_SOFTMAX_FORCE_SCALAR"));
+                s.softmax.validate = flag(std::getenv("LLAMINAR_SOFTMAX_VALIDATE"));
+                s.softmax.parallel_row_threshold = to_int(std::getenv("LLAMINAR_SOFTMAX_PARALLEL_ROW_THRESHOLD"), 0);
+                s.softmax.parallel_elems_threshold = to_int(std::getenv("LLAMINAR_SOFTMAX_PARALLEL_ELEMS"), 32768);
+                { const char* cf = std::getenv("LLAMINAR_SOFTMAX_CAUSAL_FUSE"); if(cf && *cf=='0') s.softmax.causal_fuse=false; else if(cf && *cf) s.softmax.causal_fuse=true; }
+                s.softmax.fast_exp = flag(std::getenv("LLAMINAR_SOFTMAX_FAST_EXP"));
+                if(const char* fem = std::getenv("LLAMINAR_SOFTMAX_FAST_EXP_MODE")) { int v=std::atoi(fem); if(v>=0 && v<=4) s.softmax.fast_exp_mode = v; }
+                s.softmax.dist_recompute = flag(std::getenv("LLAMINAR_SOFTMAX_DIST_RECOMPUTE"));
+                if(const char* drt = std::getenv("LLAMINAR_SOFTMAX_DIST_RECOMPUTE_THRESHOLD")) { int v=std::atoi(drt); if(v>0) s.softmax.dist_recompute_threshold = v; }
+                if(const char* vsr = std::getenv("LLAMINAR_SOFTMAX_VALIDATE_SAMPLE_ROWS")) { int v=std::atoi(vsr); s.softmax.validate_sample_rows = v; }
+                if(const char* vrl = std::getenv("LLAMINAR_SOFTMAX_VALIDATE_REL_L2")) { try { s.softmax.validate_rel_l2_tol = std::stod(vrl);} catch(...){} }
+                if(const char* vma = std::getenv("LLAMINAR_SOFTMAX_VALIDATE_MAX_ABS")) { try { s.softmax.validate_max_abs_tol = std::stod(vma);} catch(...){} }
+                s.softmax.validate_abort = flag(std::getenv("LLAMINAR_SOFTMAX_VALIDATE_ABORT"));
                 if(const char* dm = std::getenv("LLAMINAR_DISTRIBUTION_MODE")) if(*dm) s.distribution.distribution_mode = dm;
                 s.distribution.force_replicated = flag(std::getenv("LLAMINAR_FORCE_REPLICATED"));
                 s.distribution.force_sharded    = flag(std::getenv("LLAMINAR_FORCE_SHARDED"));
@@ -396,6 +478,13 @@ namespace llaminar
                 if(std::getenv("LLAMINAR_TP_MLP_VALIDATE")) s.mlp_tp.validate = true;
                 if(std::getenv("LLAMINAR_TP_MLP_FORCE_COLUMN")) s.mlp_tp.force_column = true;
                 if(std::getenv("LLAMINAR_TP_MLP_FORCE_ROW")) s.mlp_tp.force_row = true;
+                // RMSNorm tuning flags (subset needed for dynamic test reconfiguration)
+                s.rmsnorm.force_scalar = flag(std::getenv("LLAMINAR_RMSNORM_FORCE_SCALAR"));
+                s.rmsnorm.disable_tls_scratch = flag(std::getenv("LLAMINAR_RMSNORM_DISABLE_TLS_SCRATCH"));
+                if(const char* sp2 = std::getenv("LLAMINAR_RMSNORM_SCRATCH_PREALLOC_ROWS")) { int v=std::atoi(sp2); if(v>0 && v<1000000) s.rmsnorm.scratch_prealloc_rows = v; }
+                s.rmsnorm.false_sharing_probe = flag(std::getenv("LLAMINAR_RMSNORM_FALSE_SHARING_PROBE"));
+                s.rmsnorm.fast_accumulate = flag(std::getenv("LLAMINAR_RMSNORM_FAST_ACC"));
+                if(const char* rvi2 = std::getenv("LLAMINAR_RMSNORM_VEC_IMPL")) { int v=std::atoi(rvi2); if(v>=0 && v<=3) s.rmsnorm.vec_impl = v; }
                 // TP policy refresh
                 if(const char* fbt = std::getenv("LLAMINAR_TP_FORCE_BLAS_THREADS")) { int v=std::atoi(fbt); if(v>0) s.tp_policy.force_blas_threads = v; }
                 if(const char* mbt = std::getenv("LLAMINAR_TP_MAX_BLAS_THREADS")) { int v=std::atoi(mbt); if(v>0) s.tp_policy.max_blas_threads = v; }
@@ -606,7 +695,17 @@ namespace llaminar
             }
         }
         lines.push_back(std::string("[DebugEnv] pipeline: capture_pre_lm=") + on(s.pipeline.capture_pre_lm) +
-                        " layerwise_stats=" + on(s.pipeline.layerwise_stats));
+                        " layerwise_stats=" + on(s.pipeline.layerwise_stats) +
+                        " abstract_base=" + on(s.pipeline.enable_abstract_pipeline) +
+                        " incr_decode=" + on(!s.pipeline.disable_incremental_decode) +
+                        " layer_token_diff=" + on(s.pipeline.layer_token_diff) +
+                        " pre_lm_row_diff=" + on(s.pipeline.pre_lm_row_diff));
+        // KV cache (print only if non-default policies active to limit noise)
+        if (s.kv_cache.dynamic_init || s.kv_cache.growth_factor != 2)
+        {
+            lines.push_back(std::string("[DebugEnv] kv_cache: dynamic_init=") + on(s.kv_cache.dynamic_init) +
+                            " growth_factor=" + std::to_string(s.kv_cache.growth_factor));
+        }
         lines.push_back(std::string("[DebugEnv] embedding: trace=") + on(s.embedding.trace) +
                         " fail_fast=" + on(s.embedding.fail_fast) +
                         " trace_tokens=" + std::to_string(s.embedding.trace_tokens) +
@@ -616,7 +715,12 @@ namespace llaminar
                         " dump_gamma=" + on(s.rmsnorm.dump_gamma) +
                         " force_unit_gamma=" + on(s.rmsnorm.force_unit_gamma) +
                         " gamma_checksum=" + on(s.rmsnorm.gamma_checksum) +
-                        (s.rmsnorm.trace_rows_spec.empty() ? "" : " trace_rows=" + s.rmsnorm.trace_rows_spec));
+                        (s.rmsnorm.trace_rows_spec.empty() ? "" : " trace_rows=" + s.rmsnorm.trace_rows_spec) +
+                        (s.rmsnorm.force_scalar ? " force_scalar=on" : "") +
+                        (s.rmsnorm.disable_tls_scratch ? " tls_scratch=off" : "") +
+                        (s.rmsnorm.scratch_prealloc_rows > 0 ? (" prealloc_rows=" + std::to_string(s.rmsnorm.scratch_prealloc_rows)) : "") +
+                        (s.rmsnorm.fast_accumulate ? " fast_acc=on" : "") +
+                        (s.rmsnorm.vec_impl ? (" vec_impl=" + std::to_string(s.rmsnorm.vec_impl)) : ""));
         // Distribution summary (only if any override active)
         if (!s.distribution.distribution_mode.empty() || s.distribution.force_replicated || s.distribution.force_sharded)
         {

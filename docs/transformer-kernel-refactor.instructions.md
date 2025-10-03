@@ -1,5 +1,7 @@
 # Transformer Kernel Refactoring Plan
 
+> Deprecation Context (2025-10): The refactoring direction outlined here has since been superseded by the implemented Abstract Pipeline architecture. The `MPITransformerPipeline` mentioned below is deprecated. Kernel modularization proceeded via dedicated attention primitives, RMSNorm, and adaptive matmul selection surfaced through pipeline orchestration rather than a standalone `PipelineBase` + generic kernel registry exactly as sketched. This document remains as historical rationale; do not revive the legacy pipeline—extend the current `AbstractPipeline` adapters instead.
+
 ## Overview
 
 This document outlines the architectural refactoring of the Llaminar transformer pipeline to achieve proper separation of concerns through modular kernel composition. The current implementation violates architectural principles by embedding kernel logic directly in the pipeline, preventing reusability and proper MPI distribution.
@@ -121,8 +123,9 @@ public:
 };
 ```
 
-#### 3. Refactored MPITransformerPipeline
+#### 3. (Historical) Refactored MPITransformerPipeline (Deprecated)
 ```cpp
+// DEPRECATED: Example retained only for historical context.
 class MPITransformerPipeline : public PipelineBase {
 private:
     LayerConfig config_;
@@ -277,6 +280,8 @@ for (int i = start_row; i < end_row; ++i) {
 ```
 
 ### Phase 5: Cleanup Non-MPI Components
+
+> [STATUS UPDATE - COMPLETED] All non-MPI kernels and pipelines referenced in this phase (LinearKernel, AttentionKernel, RMSNormKernel, MatMulKernel, legacy non-distributed pipelines) have been removed. Remaining references here are historical planning notes. New development must target MPIKernelBase-derived implementations only; add any new linear/attention variants as MPI-aware from inception.
 
 #### Files to Remove
 1. **Non-MPI Kernels**: All kernels not inheriting from MPIKernelBase

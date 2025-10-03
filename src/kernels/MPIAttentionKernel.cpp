@@ -41,7 +41,7 @@
 #include "../utils/perf_counters.h"
 #include "../utils/debug_env.h"
 #include "../utils/debug_sharding.h"
-#include "kernels/common/attention_primitives.h" // for optional validation
+#include "kernels/common/attention_primitives.h" // shared fast paths (RoPE, QK scores, scores@V)
 #include "../adaptive_matmul.h"
 #include "../backends/prefill_backend.h"
 #include "../backends/inference_backend.h"
@@ -64,50 +64,34 @@
 namespace llaminar
 {
 
-    MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim,
-                                           float rope_freq_base,
-                                           DistributionStrategy strategy)
-        : MPIKernelBase(), n_head_(n_head), n_head_kv_(n_head_kv), head_dim_(head_dim),
-          n_past_(0), rope_freq_base_(rope_freq_base), strategy_(strategy)
+    MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim, float rope_freq_base, DistributionStrategy strategy)
+        : n_head_(n_head), n_head_kv_(n_head_kv), head_dim_(head_dim), rope_freq_base_(rope_freq_base), strategy_(strategy)
     {
-        if (n_head_ % getSize() != 0)
+        if (head_dim_ <= 0 || n_head_ <= 0 || n_head_kv_ <= 0)
         {
-            LOG_WARN("Number of heads (" << n_head_ << ") not evenly divisible by MPI size ("
-                                         << getSize() << "). Load balancing may be suboptimal.");
+            throw std::invalid_argument("MPIAttentionKernel: invalid constructor parameters");
         }
-
-        // Centralized attention env config
-        const auto &attnEnv = debugEnv().attention;
-        if (attnEnv.output_mode_forced)
+        if (n_head_kv_ > n_head_)
         {
-            std::string mode = attnEnv.output_mode;
-            if (mode == "local")
-                output_mode_ = AttentionOutputMode::LocalHeads;
-            else if (mode == "gather_post")
-                output_mode_ = AttentionOutputMode::GatherHeadsPostProjection;
-            else if (mode == "gather_pre")
-                output_mode_ = AttentionOutputMode::GatherHeadsPreProjection;
-            else if (mode == "replicated")
-                output_mode_ = AttentionOutputMode::Replicated;
-            else if (getRank() == 0)
-                LOG_WARN("LLAMINAR_ATTN_OUTPUT_MODE unknown value: '" << mode << "' (using default)");
-            if (getRank() == 0)
-                LOG_INFO("MPIAttentionKernel configured output mode from env: " << mode);
+            throw std::invalid_argument("MPIAttentionKernel: n_head_kv cannot exceed n_head");
         }
     }
 
     bool MPIAttentionKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                      std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        PERF_SCOPED_TIMER("MPIAttentionKernel::execute");
+        // Execution timing scaffolding (per-phase breakdown)
         auto t_exec_start = std::chrono::high_resolution_clock::now();
-        // Layer timing accumulators (wall ms). Only filled if perf flag enabled.
-        double t_distribute_ms = 0.0, t_proj_ms = 0.0, t_rope_ms = 0.0, t_attn_ms = 0.0,
-               t_gather_pre_ms = 0.0, t_reconstruct_wo_ms = 0.0, t_output_proj_ms = 0.0,
-               t_gather_post_ms = 0.0, t_emit_ms = 0.0;
+        double t_distribute_ms = 0.0, t_proj_ms = 0.0, t_rope_ms = 0.0, t_attn_ms = 0.0;
+        double t_reconstruct_wo_ms = 0.0, t_output_proj_ms = 0.0, t_gather_pre_ms = 0.0, t_gather_post_ms = 0.0, t_emit_ms = 0.0;
         const auto &perf_env = debugEnv().performance;
         auto time_block = [](auto &&fn)
-        { auto t0=std::chrono::high_resolution_clock::now(); fn(); auto t1=std::chrono::high_resolution_clock::now(); return std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count()/1000.0; };
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            fn();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+        };
 
         if (!validate(inputs, outputs))
         {
@@ -237,17 +221,199 @@ namespace llaminar
                                    { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads); });
         }
 
+        // Prefill KV cache population (only once at sequence start). We currently support only the
+        // common case n_head_kv == n_head (no grouped attention) for cache population. Grouped KV
+        // requires merging multiple query heads; defer until needed.
+        if (n_past_ == 0 && seq_len > 1)
+        {
+            if (n_head_kv_ != n_head_)
+            {
+                if (getRank() == 0)
+                    LOG_WARN("MPIAttentionKernel prefill KV population skipped (grouped KV heads unsupported in cache path)");
+            }
+            else
+            {
+                float *k_cache_ptr = k_cache->data();
+                float *v_cache_ptr = v_cache->data();
+                size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
+                const float *local_k_ptr = local_k->data();
+                const float *local_v_ptr = local_v->data();
+                for (size_t t = 0; t < seq_len; ++t)
+                {
+                    const float *k_row_local = local_k_ptr + t * local_head_dim;
+                    const float *v_row_local = local_v_ptr + t * local_head_dim;
+                    // Copy each local head slice into global cache row
+                    for (int lh = 0; lh < local_heads; ++lh)
+                    {
+                        size_t global_head = head_offset + lh;
+                        float *k_dest = k_cache_ptr + t * kv_dim + global_head * head_dim_;
+                        float *v_dest = v_cache_ptr + t * kv_dim + global_head * head_dim_;
+                        const float *k_src = k_row_local + lh * head_dim_;
+                        const float *v_src = v_row_local + lh * head_dim_;
+                        std::memcpy(k_dest, k_src, head_dim_ * sizeof(float));
+                        std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
+                    }
+                }
+                if (getRank() == 0)
+                    LOG_DEBUG("MPIAttentionKernel: populated KV cache for prefill seq_len=" << seq_len);
+            }
+        }
+
         // Create local attended output tensor. For GatherHeadsPreProjection optimization we store
         // directly in heads-major layout [local_head_dim, seq_len] to skip a reorder later.
         // Treat Replicated as an alias of GatherHeadsPreProjection (single global projection path)
         bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
                          output_mode_ == AttentionOutputMode::Replicated);
+        bool incremental_single = (seq_len == 1 && n_past_ > 0); // single-token decode with history
         auto local_attended_output = pre_mode
                                          ? createLocalSimpleTensor({local_head_dim, seq_len})
                                          : createLocalSimpleTensor({seq_len, local_head_dim});
 
-        // Compute attention for local heads
+        // Incremental decode specialized path: use KV cache (inputs[5], inputs[6]) to attend over all past tokens + current
+        if (incremental_single)
         {
+            PERF_SCOPED_TIMER("MPIAttentionKernel::incrementalAttention");
+            t_attn_ms = time_block([&]
+                                   {
+                // If grouped KV heads present, fallback to legacy single-token attention (no history)
+                if (n_head_kv_ != n_head_)
+                {
+                    if (getRank() == 0)
+                        LOG_WARN("MPIAttentionKernel incremental path: grouped KV heads unsupported for cache usage; falling back to per-token attention only");
+                    // Behave like standard path (seq_len==1) - compute attention only over current token
+                    if (pre_mode)
+                    {
+                        auto tmp_std = createLocalSimpleTensor({seq_len, local_head_dim});
+                        computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
+                                              tmp_std->data(), seq_len, local_heads);
+                        const float *srcA = tmp_std->data();
+                        float *dstA = local_attended_output->data();
+                        for (size_t h = 0; h < local_head_dim; ++h)
+                            dstA[h * seq_len + 0] = srcA[h];
+                    }
+                    else
+                    {
+                        computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
+                                              local_attended_output->data(), seq_len, local_heads);
+                    }
+                    return; // skip cache path
+                }
+
+                size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
+                // Safety check on cache shapes (optional)
+                if ((size_t)k_cache->shape()[1] != kv_dim || (size_t)v_cache->shape()[1] != kv_dim)
+                {
+                    LOG_ERROR("MPIAttentionKernel: KV cache dim mismatch for incremental path");
+                    throw std::runtime_error("KV cache dimension mismatch");
+                }
+
+                float *k_cache_ptr = k_cache->data();
+                float *v_cache_ptr = v_cache->data();
+                const float *q_cur = local_q->data(); // [1, local_head_dim]
+                const float *k_cur = local_k->data();
+                const float *v_cur = local_v->data();
+
+                // 1. Write current K/V into cache row n_past_ at our head slice
+                size_t row_offset_bytes = (size_t)n_past_ * kv_dim * sizeof(float);
+                size_t head_slice_offset = (size_t)head_offset * head_dim_ * sizeof(float);
+                float *k_dest = reinterpret_cast<float *>(reinterpret_cast<char *>(k_cache_ptr) + row_offset_bytes + head_slice_offset);
+                float *v_dest = reinterpret_cast<float *>(reinterpret_cast<char *>(v_cache_ptr) + row_offset_bytes + head_slice_offset);
+                std::memcpy(k_dest, k_cur, local_head_dim * sizeof(float));
+                std::memcpy(v_dest, v_cur, local_head_dim * sizeof(float));
+
+                size_t T = (size_t)n_past_ + 1; // total tokens including current
+                // For each local head compute attention over past + current
+                float *out_row; // where to write final attended vector (row-major or heads-major)
+                if (pre_mode)
+                {
+                    // We'll first compute into a temporary row-major buffer then transpose to heads-major layout
+                    auto tmp_std = createLocalSimpleTensor({seq_len, local_head_dim}); // seq_len == 1
+                    out_row = tmp_std->data();
+                    // Compute per-head context into out_row
+                    for (int lh = 0; lh < local_heads; ++lh)
+                    {
+                        int global_head = head_offset + lh;
+                        const float *q_head = q_cur + lh * head_dim_;
+                        std::vector<float> scores(T);
+                        float max_score = -1e30f;
+                        for (size_t t = 0; t < T; ++t)
+                        {
+                            const float *k_row_head = k_cache_ptr + t * kv_dim + global_head * head_dim_;
+                            float dot = 0.f;
+                            for (int d = 0; d < head_dim_; ++d)
+                                dot += q_head[d] * k_row_head[d];
+                            dot /= std::sqrt((float)head_dim_);
+                            scores[t] = dot;
+                            if (dot > max_score)
+                                max_score = dot;
+                        }
+                        // softmax
+                        float sum_exp = 0.f;
+                        for (size_t t = 0; t < T; ++t)
+                        {
+                            float e = std::exp(scores[t] - max_score);
+                            scores[t] = e;
+                            sum_exp += e;
+                        }
+                        // weighted sum of values
+                        float *out_head = out_row + lh * head_dim_;
+                        std::fill(out_head, out_head + head_dim_, 0.f);
+                        for (size_t t = 0; t < T; ++t)
+                        {
+                            float w = scores[t] / sum_exp;
+                            const float *v_row_head = v_cache_ptr + t * kv_dim + global_head * head_dim_;
+                            for (int d = 0; d < head_dim_; ++d)
+                                out_head[d] += w * v_row_head[d];
+                        }
+                    }
+                    // transpose to heads-major [local_head_dim, 1]
+                    const float *srcA = out_row; // length local_head_dim
+                    float *dstA = local_attended_output->data();
+                    for (size_t h = 0; h < local_head_dim; ++h)
+                        dstA[h * seq_len + 0] = srcA[h];
+                }
+                else
+                {
+                    out_row = local_attended_output->data(); // shape [1, local_head_dim]
+                    for (int lh = 0; lh < local_heads; ++lh)
+                    {
+                        int global_head = head_offset + lh;
+                        const float *q_head = q_cur + lh * head_dim_;
+                        std::vector<float> scores(T);
+                        float max_score = -1e30f;
+                        for (size_t t = 0; t < T; ++t)
+                        {
+                            const float *k_row_head = k_cache_ptr + t * kv_dim + global_head * head_dim_;
+                            float dot = 0.f;
+                            for (int d = 0; d < head_dim_; ++d)
+                                dot += q_head[d] * k_row_head[d];
+                            dot /= std::sqrt((float)head_dim_);
+                            scores[t] = dot;
+                            if (dot > max_score)
+                                max_score = dot;
+                        }
+                        float sum_exp = 0.f;
+                        for (size_t t = 0; t < T; ++t)
+                        {
+                            float e = std::exp(scores[t] - max_score);
+                            scores[t] = e;
+                            sum_exp += e;
+                        }
+                        float *out_head = out_row + lh * head_dim_;
+                        std::fill(out_head, out_head + head_dim_, 0.f);
+                        for (size_t t = 0; t < T; ++t)
+                        {
+                            float w = scores[t] / sum_exp;
+                            const float *v_row_head = v_cache_ptr + t * kv_dim + global_head * head_dim_;
+                            for (int d = 0; d < head_dim_; ++d)
+                                out_head[d] += w * v_row_head[d];
+                        }
+                    }
+                } });
+        }
+        else
+        {
+            // Standard (prefill or trivial single-token) attention over provided seq_len window
             PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalAttention");
             t_attn_ms = time_block([&]
                                    {
@@ -367,15 +533,11 @@ namespace llaminar
                                           {
                 PerfMatmulPhaseScope phase(2,4); // Attention output projection (gather-pre path)
                 if (!adaptive_matmul(full_attended->data(), full_wo->data(), global_output->data(),
-                                 seq_len, d_model, total_head_dim, false))
+                                     seq_len, d_model, total_head_dim, false))
                 {
                     LOG_ERROR("MPIAttentionKernel: pre-projection gathered output projection failed");
                     throw std::runtime_error("Attention output projection failed");
                 } });
-            {
-                LOG_ERROR("MPIAttentionKernel: pre-projection gathered output projection failed");
-                return false;
-            }
 
             // Populate metadata early and return.
             // Preserve the originally requested mode (Replicated remains distinguishable in metadata)
@@ -824,14 +986,11 @@ namespace llaminar
                                                      std::shared_ptr<TensorBase> &local_v,
                                                      size_t seq_len, size_t d_model)
     {
-        const auto &attnEnv2 = debugEnv().attention;
-        bool force_scalar = attnEnv2.force_scalar;
-        bool validate_proj = attnEnv2.validate_proj;
-
-        auto scalar_matmul = [](const float *A, const float *B, float *C,
-                                size_t M, size_t N, size_t K)
+        const auto &attnEnv = debugEnv().attention;
+        bool force_scalar = attnEnv.force_scalar;
+        bool validate_proj = attnEnv.validate_proj;
+        auto scalar_matmul = [](const float *A, const float *B, float *C, size_t M, size_t N, size_t K)
         {
-            // Row-major: A[M,K] @ B[K,N] -> C[M,N]
             for (size_t i = 0; i < M; ++i)
             {
                 const float *a_row = A + i * K;
@@ -840,257 +999,107 @@ namespace llaminar
                     c_row[j] = 0.f;
                 for (size_t k = 0; k < K; ++k)
                 {
-                    float aval = a_row[k];
-                    const float *b_row = B + k * N; // B row-major, row k length N
+                    float a = a_row[k];
+                    const float *b_col = B + k * N;
                     for (size_t j = 0; j < N; ++j)
-                    {
-                        c_row[j] += aval * b_row[j];
-                    }
+                        c_row[j] += a * b_col[j];
                 }
             }
         };
 
-        auto diff_and_maybe_copy = [&](const char *tag, const float *ref, float *got,
-                                       size_t M, size_t N)
+        auto do_projection = [&](const char *tag, const std::shared_ptr<TensorBase> &W, std::shared_ptr<TensorBase> &OUT, int phase_id)
         {
-            double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
-            size_t elems = M * N;
-            for (size_t i = 0; i < elems; ++i)
+            auto [lh, _ho] = getHeadDistribution();
+            size_t local_head_dim = static_cast<size_t>(lh * head_dim_);
+            if (force_scalar)
             {
-                double r = ref[i];
-                double g = got[i];
-                double d = std::fabs(r - g);
-                if (d > max_abs)
-                    max_abs = d;
-                sum_sq_ref += r * r;
-                sum_sq_diff += d * d;
-            }
-            double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
-            if (max_abs > 1e-5 || rel_l2 > 1e-5)
-            {
-                LOG_WARN("MPIAttentionKernel projection validation divergence (" << tag << ") max_abs=" << max_abs << " rel_l2=" << rel_l2
-                                                                                 << " M=" << M << " N=" << N);
-                // Copy reference over to stabilize downstream correctness so tests can proceed.
-                std::memcpy(got, ref, elems * sizeof(float));
+                scalar_matmul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model);
             }
             else
             {
-                LOG_DEBUG("MPIAttentionKernel projection validation OK (" << tag << ") max_abs=" << max_abs << " rel_l2=" << rel_l2);
+                PerfMatmulPhaseScope phase(2, phase_id);
+                bool prefill_like = seq_len >= (size_t)debugEnv().cosma.prefill_threshold;
+                if (prefill_like)
+                {
+                    static auto prefill_backend = PrefillBackendFactory::create();
+                    PrefillOpDesc desc;
+                    desc.kind = PrefillOpKind::MatMul;
+                    desc.M = seq_len;
+                    desc.N = local_head_dim;
+                    desc.K = d_model;
+                    desc.is_prefill = true;
+                    PrefillLaunchContext ctx{input->data(), W->data(), OUT->data()};
+                    auto decision = prefill_backend->launch(desc, ctx);
+                    if (decision.status != PrefillStatus::Success)
+                    {
+                        LOG_WARN(tag << " projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                        if (!adaptive_matmul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false))
+                        {
+                            LOG_ERROR(tag << " projection failed on rank " << getRank());
+                            return false;
+                        }
+                    }
+                }
+                else
+                {
+                    static auto infer_backend = InferenceBackendFactory::create();
+                    InferenceOpDesc desc;
+                    desc.kind = InferenceOpKind::MatMul;
+                    desc.M = seq_len;
+                    desc.N = local_head_dim;
+                    desc.K = d_model;
+                    desc.latency_critical = true;
+                    InferenceLaunchContext ctx{input->data(), W->data(), OUT->data()};
+                    auto decision = infer_backend->launch(desc, ctx);
+                    if (decision.status != InferenceStatus::Success)
+                    {
+                        LOG_WARN(tag << " projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                        if (!adaptive_matmul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false))
+                        {
+                            LOG_ERROR(tag << " projection failed on rank " << getRank());
+                            return false;
+                        }
+                    }
+                }
             }
+            if (validate_proj || force_scalar)
+            {
+                auto [lh2, _] = getHeadDistribution();
+                size_t lhd2 = (size_t)lh2 * head_dim_;
+                std::vector<float> ref(seq_len * lhd2);
+                scalar_matmul(input->data(), W->data(), ref.data(), seq_len, lhd2, d_model);
+                // Lightweight diff metrics (log only)
+                double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
+                const float *dst = OUT->data();
+                for (size_t i = 0; i < ref.size(); ++i)
+                {
+                    double r = ref[i];
+                    double g = dst[i];
+                    double d = std::fabs(r - g);
+                    if (d > max_abs)
+                        max_abs = d;
+                    sum_sq_ref += r * r;
+                    sum_sq_diff += d * d;
+                }
+                double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
+                if (max_abs > 1e-5 || rel_l2 > 1e-5)
+                {
+                    if (getRank() == 0)
+                        LOG_WARN("Projection validation diverged tag=" << tag << " max_abs=" << max_abs << " rel_l2=" << rel_l2);
+                }
+            }
+            return true;
         };
 
-        // Compute Q = input @ local_wq using adaptive matrix multiplication
-        {
-            PERF_SCOPED_TIMER("COSMA::Q_projection");
-            auto [local_heads, head_offset] = getHeadDistribution();
-            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-            if (force_scalar)
-            {
-                scalar_matmul(input->data(), local_wq->data(), local_q->data(), seq_len, local_head_dim, d_model);
-            }
-            else
-            {
-                {
-                    PerfMatmulPhaseScope phase(2, 1); // Attention Q projection
-                    static bool logged_once = false;
-                    if (!logged_once && getRank() == 0)
-                    {
-                        logged_once = true;
-                        size_t threshold = static_cast<size_t>(debugEnv().cosma.prefill_threshold);
-                        bool is_prefill_like = seq_len >= threshold;
-                        LOG_INFO("BACKEND_DECISION_SUMMARY component=Attention seq_len=" << seq_len
-                                                                                         << " threshold=" << threshold
-                                                                                         << " path=" << (is_prefill_like ? "prefill" : "inference")
-                                                                                         << " prefill_backend=cpu_stub inference_backend=cpu_stub phases=QKV+Out fallback=adaptive_matmul");
-                    }
-                    // Integrate abstraction (prefill vs inference) with fallback.
-                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
-                    if (is_prefill_like)
-                    {
-                        static auto prefill_backend = PrefillBackendFactory::create();
-                        PrefillOpDesc desc;
-                        desc.kind = PrefillOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = local_head_dim;
-                        desc.K = d_model;
-                        desc.is_prefill = true;
-                        PrefillLaunchContext ctx{input->data(), local_wq->data(), local_q->data()};
-                        auto decision = prefill_backend->launch(desc, ctx);
-                        if (decision.status != PrefillStatus::Success)
-                        {
-                            LOG_WARN("Q projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(input->data(), local_wq->data(), local_q->data(), seq_len, local_head_dim, d_model, false))
-                            {
-                                LOG_ERROR("Q projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        static auto infer_backend = InferenceBackendFactory::create();
-                        InferenceOpDesc desc;
-                        desc.kind = InferenceOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = local_head_dim;
-                        desc.K = d_model;
-                        desc.latency_critical = true;
-                        InferenceLaunchContext ctx{input->data(), local_wq->data(), local_q->data()};
-                        auto decision = infer_backend->launch(desc, ctx);
-                        if (decision.status != InferenceStatus::Success)
-                        {
-                            LOG_WARN("Q projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(input->data(), local_wq->data(), local_q->data(), seq_len, local_head_dim, d_model, false))
-                            {
-                                LOG_ERROR("Q projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            if (validate_proj || force_scalar)
-            {
-                std::vector<float> ref(seq_len * local_head_dim);
-                scalar_matmul(input->data(), local_wq->data(), ref.data(), seq_len, local_head_dim, d_model);
-                diff_and_maybe_copy("Q", ref.data(), local_q->data(), seq_len, local_head_dim);
-            }
-        }
-
-        // Compute K = input @ local_wk using adaptive matrix multiplication
-        {
-            PERF_SCOPED_TIMER("COSMA::K_projection");
-            auto [local_heads, head_offset] = getHeadDistribution();
-            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-            if (force_scalar)
-            {
-                scalar_matmul(input->data(), local_wk->data(), local_k->data(), seq_len, local_head_dim, d_model);
-            }
-            else
-            {
-                {
-                    PerfMatmulPhaseScope phase(2, 2); // Attention K projection
-                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
-                    if (is_prefill_like)
-                    {
-                        static auto prefill_backend = PrefillBackendFactory::create();
-                        PrefillOpDesc desc;
-                        desc.kind = PrefillOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = local_head_dim;
-                        desc.K = d_model;
-                        desc.is_prefill = true;
-                        PrefillLaunchContext ctx{input->data(), local_wk->data(), local_k->data()};
-                        auto decision = prefill_backend->launch(desc, ctx);
-                        if (decision.status != PrefillStatus::Success)
-                        {
-                            LOG_WARN("K projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(input->data(), local_wk->data(), local_k->data(), seq_len, local_head_dim, d_model, false))
-                            {
-                                LOG_ERROR("K projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        static auto infer_backend = InferenceBackendFactory::create();
-                        InferenceOpDesc desc;
-                        desc.kind = InferenceOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = local_head_dim;
-                        desc.K = d_model;
-                        desc.latency_critical = true;
-                        InferenceLaunchContext ctx{input->data(), local_wk->data(), local_k->data()};
-                        auto decision = infer_backend->launch(desc, ctx);
-                        if (decision.status != InferenceStatus::Success)
-                        {
-                            LOG_WARN("K projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(input->data(), local_wk->data(), local_k->data(), seq_len, local_head_dim, d_model, false))
-                            {
-                                LOG_ERROR("K projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            if (validate_proj || force_scalar)
-            {
-                std::vector<float> ref(seq_len * local_head_dim);
-                scalar_matmul(input->data(), local_wk->data(), ref.data(), seq_len, local_head_dim, d_model);
-                diff_and_maybe_copy("K", ref.data(), local_k->data(), seq_len, local_head_dim);
-            }
-        }
-
-        // Compute V = input @ local_wv using adaptive matrix multiplication
-        {
-            PERF_SCOPED_TIMER("COSMA::V_projection");
-            auto [local_heads, head_offset] = getHeadDistribution();
-            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-            if (force_scalar)
-            {
-                scalar_matmul(input->data(), local_wv->data(), local_v->data(), seq_len, local_head_dim, d_model);
-            }
-            else
-            {
-                {
-                    PerfMatmulPhaseScope phase(2, 3); // Attention V projection
-                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
-                    if (is_prefill_like)
-                    {
-                        static auto prefill_backend = PrefillBackendFactory::create();
-                        PrefillOpDesc desc;
-                        desc.kind = PrefillOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = local_head_dim;
-                        desc.K = d_model;
-                        desc.is_prefill = true;
-                        PrefillLaunchContext ctx{input->data(), local_wv->data(), local_v->data()};
-                        auto decision = prefill_backend->launch(desc, ctx);
-                        if (decision.status != PrefillStatus::Success)
-                        {
-                            LOG_WARN("V projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(input->data(), local_wv->data(), local_v->data(), seq_len, local_head_dim, d_model, false))
-                            {
-                                LOG_ERROR("V projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        static auto infer_backend = InferenceBackendFactory::create();
-                        InferenceOpDesc desc;
-                        desc.kind = InferenceOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = local_head_dim;
-                        desc.K = d_model;
-                        desc.latency_critical = true;
-                        InferenceLaunchContext ctx{input->data(), local_wv->data(), local_v->data()};
-                        auto decision = infer_backend->launch(desc, ctx);
-                        if (decision.status != InferenceStatus::Success)
-                        {
-                            LOG_WARN("V projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(input->data(), local_wv->data(), local_v->data(), seq_len, local_head_dim, d_model, false))
-                            {
-                                LOG_ERROR("V projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            if (validate_proj || force_scalar)
-            {
-                std::vector<float> ref(seq_len * local_head_dim);
-                scalar_matmul(input->data(), local_wv->data(), ref.data(), seq_len, local_head_dim, d_model);
-                diff_and_maybe_copy("V", ref.data(), local_v->data(), seq_len, local_head_dim);
-            }
-        }
-
-        auto [local_heads, head_offset] = getHeadDistribution();
-        LOG_DEBUG("Computed local projections using COSMA for " << local_heads << " heads on rank " << getRank());
+        // Q, K, V
+        if (!do_projection("Q", local_wq, local_q, 1))
+            return;
+        if (!do_projection("K", local_wk, local_k, 2))
+            return;
+        if (!do_projection("V", local_wv, local_v, 3))
+            return;
+        auto [lh_final, _off] = getHeadDistribution();
+        LOG_DEBUG("Computed local projections using COSMA/adaptive for " << lh_final << " heads on rank " << getRank());
     }
 
     void MPIAttentionKernel::computeLocalAttention(const float *local_q, const float *local_k, const float *local_v,
@@ -1159,215 +1168,31 @@ namespace llaminar
 
     void MPIAttentionKernel::applyLocalRoPE(float *local_q, float *local_k, size_t seq_len, int local_heads)
     {
-        // Simplified RoPE implementation - apply rotation to each head
-        const float theta_base = rope_freq_base_;
-
-        for (int head = 0; head < local_heads; ++head)
-        {
-            for (size_t seq = 0; seq < seq_len; ++seq)
-            {
-                float *q_head = local_q + seq * local_heads * head_dim_ + head * head_dim_;
-                float *k_head = local_k + seq * local_heads * head_dim_ + head * head_dim_;
-
-                for (int dim_pair = 0; dim_pair < head_dim_ / 2; ++dim_pair)
-                {
-                    float theta = 1.0f / std::pow(theta_base, (2.0f * dim_pair) / head_dim_);
-                    float cos_theta = std::cos((n_past_ + static_cast<float>(seq)) * theta);
-                    float sin_theta = std::sin((n_past_ + static_cast<float>(seq)) * theta);
-
-                    // Apply rotation to Q
-                    float q0 = q_head[2 * dim_pair];
-                    float q1 = q_head[2 * dim_pair + 1];
-                    q_head[2 * dim_pair] = q0 * cos_theta - q1 * sin_theta;
-                    q_head[2 * dim_pair + 1] = q0 * sin_theta + q1 * cos_theta;
-
-                    // Apply rotation to K
-                    float k0 = k_head[2 * dim_pair];
-                    float k1 = k_head[2 * dim_pair + 1];
-                    k_head[2 * dim_pair] = k0 * cos_theta - k1 * sin_theta;
-                    k_head[2 * dim_pair + 1] = k0 * sin_theta + k1 * cos_theta;
-                }
-            }
-        }
-
-        LOG_DEBUG("Applied RoPE to " << local_heads << " local heads on rank " << getRank());
+        // Primitive applies in-place RoPE to Q/K (causal offset n_past_)
+        llaminar::attn::apply_rope(local_q, local_k, (int)seq_len, head_dim_, local_heads, (int)n_past_, rope_freq_base_);
+        LOG_DEBUG("Applied RoPE for " << local_heads << " heads on rank " << getRank());
     }
 
     void MPIAttentionKernel::computeLocalAttentionScores(const float *local_q, const float *local_k, float *scores,
                                                          size_t seq_len, int local_heads)
     {
-        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-
-        for (int head = 0; head < local_heads; ++head)
-        {
-            // Compute Q @ K^T for this head
-            for (size_t i = 0; i < seq_len; ++i)
-            {
-                const float *q_row = local_q + i * local_heads * head_dim_ + head * head_dim_;
-
-                for (size_t j = 0; j < seq_len; ++j)
-                {
-                    const float *k_row = local_k + j * local_heads * head_dim_ + head * head_dim_;
-
-                    float score = 0.0f;
-                    for (int d = 0; d < head_dim_; ++d)
-                    {
-                        score += q_row[d] * k_row[d];
-                    }
-
-                    scores[head * seq_len * seq_len + i * seq_len + j] = score * scale;
-                }
-            }
-
-            // Apply causal mask and softmax for this head
-            for (size_t i = 0; i < seq_len; ++i)
-            {
-                float *score_row = scores + head * seq_len * seq_len + i * seq_len;
-
-                // Apply causal mask
-                for (size_t j = i + 1; j < seq_len; ++j)
-                {
-                    score_row[j] = -INFINITY;
-                }
-
-                // Compute softmax
-                float max_score = -INFINITY;
-                for (size_t j = 0; j <= i; ++j)
-                {
-                    max_score = std::max(max_score, score_row[j]);
-                }
-
-                float sum_exp = 0.0f;
-                for (size_t j = 0; j <= i; ++j)
-                {
-                    score_row[j] = std::exp(score_row[j] - max_score);
-                    sum_exp += score_row[j];
-                }
-
-                for (size_t j = 0; j <= i; ++j)
-                {
-                    score_row[j] /= sum_exp;
-                }
-
-                // Set masked positions to 0
-                for (size_t j = i + 1; j < seq_len; ++j)
-                {
-                    score_row[j] = 0.0f;
-                }
-            }
-        }
-
-        LOG_DEBUG("Computed attention scores for " << local_heads << " heads on rank " << getRank());
-
-        // Optional micro trace for debugging tiny seq/head cases.
-        if (debugEnv().attention.micro_trace && getRank() == 0 && seq_len <= 4 && local_heads <= 2)
-        {
-            std::cerr << "[AttnMicroProbe] seq_len=" << seq_len << " heads=" << local_heads << " head_dim=" << head_dim_ << " scale=" << scale << "\n";
-            for (int head = 0; head < local_heads; ++head)
-            {
-                std::cerr << " head=" << head << "\n";
-                // Dump Q/K rows post-RoPE
-                for (size_t i = 0; i < seq_len; ++i)
-                {
-                    const float *q_row = local_q + i * local_heads * head_dim_ + head * head_dim_;
-                    const float *k_row = local_k + i * local_heads * head_dim_ + head * head_dim_;
-                    std::cerr << "  q[" << i << "]:";
-                    for (int d = 0; d < head_dim_; ++d)
-                        std::cerr << ' ' << q_row[d];
-                    std::cerr << '\n';
-                    std::cerr << "  k[" << i << "]:";
-                    for (int d = 0; d < head_dim_; ++d)
-                        std::cerr << ' ' << k_row[d];
-                    std::cerr << '\n';
-                }
-                // Dump raw dot products (reconstruct) and stored probabilities
-                for (size_t i = 0; i < seq_len; ++i)
-                {
-                    const float *score_row = scores + head * seq_len * seq_len + i * seq_len;
-                    std::cerr << "  probs[" << i << "]:";
-                    for (size_t j = 0; j < seq_len; ++j)
-                        std::cerr << ' ' << score_row[j];
-                    std::cerr << " | sum=";
-                    float s = 0.f;
-                    for (size_t j = 0; j <= i; ++j)
-                        s += score_row[j];
-                    std::cerr << s << '\n';
-                    if (i > 0)
-                    {
-                        // Manual recompute of dot products vs position 0..i-1 to see relative magnitudes
-                        const float *q_row = local_q + i * local_heads * head_dim_ + head * head_dim_;
-                        std::cerr << "    dots[i=" << i << "]:";
-                        for (size_t j = 0; j <= i; ++j)
-                        {
-                            const float *k_row = local_k + j * local_heads * head_dim_ + head * head_dim_;
-                            float dot = 0.f;
-                            for (int d = 0; d < head_dim_; ++d)
-                                dot += q_row[d] * k_row[d];
-                            std::cerr << ' ' << dot;
-                        }
-                        std::cerr << '\n';
-                    }
-                }
-            }
-        }
+        llaminar::attn::compute_qk_scores(local_q, local_k, scores, (int)seq_len, head_dim_, local_heads, /*causal=*/true, /*apply_softmax=*/true);
+        LOG_DEBUG("Computed local attention scores for " << local_heads << " heads on rank " << getRank());
     }
 
     void MPIAttentionKernel::applyLocalAttention(const float *scores, const float *local_v, float *local_attended_output,
                                                  size_t seq_len, int local_heads)
     {
-        // Compute attention @ values for each head
-        bool dump = debugEnv().attention.dump_attention;
-        for (int head = 0; head < local_heads; ++head)
+        const auto &env = debugEnv();
+        llaminar::attn::apply_scores_to_v(scores, local_v, local_attended_output, (int)seq_len, head_dim_, local_heads);
+        if (env.attention.dump_attention && getRank() == 0 && seq_len <= 4 && local_heads <= 2)
         {
-            for (size_t i = 0; i < seq_len; ++i)
-            {
-                const float *score_row = scores + head * seq_len * seq_len + i * seq_len;
-                float *output_row = local_attended_output + i * local_heads * head_dim_ + head * head_dim_;
-
-                // Initialize output row to zero
-                for (int d = 0; d < head_dim_; ++d)
-                {
-                    output_row[d] = 0.0f;
-                }
-
-                // Compute weighted sum of values
-                for (size_t j = 0; j < seq_len; ++j)
-                {
-                    const float *v_row = local_v + j * local_heads * head_dim_ + head * head_dim_;
-                    float weight = score_row[j];
-
-                    for (int d = 0; d < head_dim_; ++d)
-                    {
-                        output_row[d] += weight * v_row[d];
-                    }
-                }
-
-                if (dump && getRank() == 0 && seq_len <= 4 && local_heads <= 2)
-                {
-                    std::cerr << "[AttnApplyDump] head=" << head << " row=" << i << " scores:";
-                    for (size_t j = 0; j < seq_len; ++j)
-                        std::cerr << ' ' << score_row[j];
-                    std::cerr << " | output:";
-                    for (int d = 0; d < head_dim_; ++d)
-                        std::cerr << ' ' << output_row[d];
-                    if (i > 0)
-                    {
-                        // Show first two v rows that should contribute
-                        const float *v_prev = local_v + (i - 1) * local_heads * head_dim_ + head * head_dim_;
-                        const float *v_cur = local_v + i * local_heads * head_dim_ + head * head_dim_;
-                        std::cerr << " | v[i-1]:";
-                        for (int d = 0; d < head_dim_; ++d)
-                            std::cerr << ' ' << v_prev[d];
-                        std::cerr << " | v[i]:";
-                        for (int d = 0; d < head_dim_; ++d)
-                            std::cerr << ' ' << v_cur[d];
-                    }
-                    std::cerr << '\n';
-                }
-            }
+            std::cerr << "[AttnApplyDump] head0 row0:";
+            for (size_t j = 0; j < std::min(seq_len, (size_t)8); ++j)
+                std::cerr << ' ' << scores[j];
+            std::cerr << '\n';
         }
-
-        LOG_DEBUG("Applied attention to values for " << local_heads << " heads on rank " << getRank());
+        LOG_DEBUG("Applied attention for " << local_heads << " heads on rank " << getRank());
     }
 
     void MPIAttentionKernel::computeLocalOutputProjection(const std::shared_ptr<TensorBase> &local_attended_output,

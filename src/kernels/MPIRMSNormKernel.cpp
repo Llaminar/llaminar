@@ -31,6 +31,7 @@
 #include "../logger.h"
 #include "../debug_utils.h"
 #include "../utils/debug_env.h"
+#include "common/rmsnorm_core.h" // centralized RMSNorm primitives
 #include <cmath>
 #include <chrono>
 #include <algorithm>
@@ -250,19 +251,10 @@ namespace llaminar
             std::vector<double> local_row_sumsq(local_seq_len, 0.0);
             size_t feat_dim = feature_local_dim;
             const float *in_ptr = local_input->data();
-// Parallelize over rows; SIMD over columns for faster sumsq when hidden dim large.
-#pragma omp parallel for schedule(static) if (feat_dim >= 128 && local_seq_len > 1)
-            for (long long r = 0; r < (long long)local_seq_len; ++r)
+            // Use core primitive for per-row sumsq
             {
-                const float *row = in_ptr + r * (long long)feat_dim;
-                double s = 0.0;
-#pragma omp simd reduction(+ : s)
-                for (long long c = 0; c < (long long)feat_dim; ++c)
-                {
-                    double v = (double)row[c];
-                    s += v * v;
-                }
-                local_row_sumsq[(size_t)r] = s;
+                kernels::RMSNormExecOptions opts; // default heuristics
+                kernels::rmsnorm_compute_row_sumsq(in_ptr, local_seq_len, feat_dim, local_row_sumsq.data(), opts);
             }
             std::vector<double> global_row_sumsq(local_row_sumsq.size(), 0.0);
             checkMPIError(PerfAllreduce(local_row_sumsq.data(), global_row_sumsq.data(), (int)local_row_sumsq.size(), MPI_DOUBLE, MPI_SUM, getComm()), "RMSNorm shard row sumsq");
@@ -292,25 +284,11 @@ namespace llaminar
                 const ShardSpec &wspec = wss->shard_spec();
                 weight_sharded = wspec.is_sharded() && (size_t)wspec.local_dim < (size_t)wspec.global_dim;
             }
-            // Correct gamma indexing: if weight is replicated, index via global offset; if sharded, direct
-#pragma omp parallel for schedule(static)
-            for (long long r = 0; r < (long long)local_seq_len; ++r)
+            // Use core apply primitive with appropriate GammaMode semantics
             {
-                const float *row_in = in_ptr + r * (long long)feat_dim;
-                float *row_out = out_ptr + r * (long long)feat_dim;
-                float scale = inv_scale[r];
-                if (weight_sharded)
-                {
-                    // Weight already corresponds to local slice
-                    for (long long c = 0; c < (long long)feat_dim; ++c)
-                        row_out[c] = row_in[c] * scale * gamma_ptr[c];
-                }
-                else
-                {
-                    // Replicated full gamma vector
-                    for (long long c = 0; c < (long long)feat_dim; ++c)
-                        row_out[c] = row_in[c] * scale * gamma_ptr[feature_local_offset + c];
-                }
+                kernels::RMSNormExecOptions opts; // default heuristics
+                kernels::GammaMode mode = weight_sharded ? kernels::GammaMode::SHARDED : kernels::GammaMode::REPLICATED;
+                kernels::rmsnorm_apply(in_ptr, gamma_ptr, inv_scale.data(), local_seq_len, feat_dim, out_ptr, mode, feature_local_offset, opts);
             }
             // If we used a temporary row-sliced buffer, need to scatter back into global_output
             if (local_output != global_output)
@@ -519,31 +497,18 @@ namespace llaminar
         }
         double local_mean = local_count ? (local_sum / local_count) : 0.0;
 
-        // Compute per-row RMS (RMSNorm is applied independently per sequence position)
+        // Compute per-row RMS using core helpers
+        std::vector<double> row_sumsq(local_seq_len, 0.0);
         std::vector<float> row_inv_rms(local_seq_len, 0.f);
-        double local_sum_sq_total = 0.0;
-        size_t denom = hidden_size > 0 ? hidden_size : 1;
-
-#pragma omp parallel for reduction(+ : local_sum_sq_total) schedule(static) if (hidden_size >= 128 && local_seq_len > 1)
-        for (long long row = 0; row < (long long)local_seq_len; ++row)
         {
-            const float *row_ptr = local_input + row * (long long)hidden_size;
-            double row_sum_sq = 0.0;
-#pragma omp simd reduction(+ : row_sum_sq)
-            for (long long col = 0; col < (long long)hidden_size; ++col)
-            {
-                double v = (double)row_ptr[col];
-                row_sum_sq += v * v;
-            }
-            local_sum_sq_total += row_sum_sq;
-            double denom_safe = static_cast<double>(denom);
-            double inv = 0.0;
-            if (denom_safe > 0.0)
-            {
-                inv = 1.0 / std::sqrt(row_sum_sq / denom_safe + static_cast<double>(epsilon_));
-            }
-            row_inv_rms[(size_t)row] = (float)inv;
+            kernels::RMSNormExecOptions opts; // default heuristics
+            kernels::rmsnorm_compute_row_sumsq(local_input, local_seq_len, hidden_size, row_sumsq.data(), opts);
+            kernels::rmsnorm_compute_inv(row_sumsq.data(), local_seq_len, hidden_size, epsilon_, row_inv_rms.data());
         }
+        double local_sum_sq_total = 0.0;
+        for (size_t r = 0; r < local_seq_len; ++r)
+            local_sum_sq_total += row_sumsq[r];
+        size_t denom = hidden_size > 0 ? hidden_size : 1;
 
         // Aggregate statistics for logging (global averages are informational only)
         double global_sum_sq = 0.0;
@@ -590,23 +555,8 @@ namespace llaminar
             LOG_INFO("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
 
-        // Apply RMS normalization locally using per-row normalization factors
-#pragma omp parallel for schedule(static)
-        for (long long row = 0; row < (long long)local_seq_len; ++row)
-        {
-            float scale = row_inv_rms[static_cast<size_t>(row)];
-            const float *row_in = local_input + row * (long long)hidden_size;
-            float *row_out = local_output + row * (long long)hidden_size;
-            if (scale == 0.0f)
-            {
-                std::fill(row_out, row_out + hidden_size, 0.0f);
-                continue;
-            }
-            for (long long col = 0; col < (long long)hidden_size; ++col)
-            {
-                row_out[col] = row_in[col] * scale * weight[col];
-            }
-        }
+        // Apply via core primitive (replicated gamma semantics)
+        kernels::rmsnorm_apply(local_input, weight, row_inv_rms.data(), local_seq_len, hidden_size, local_output, kernels::GammaMode::REPLICATED, 0, kernels::RMSNormExecOptions{});
 
         // Post-norm local stats to detect zeroing (parallel)
         float out_local_min = std::numeric_limits<float>::infinity();

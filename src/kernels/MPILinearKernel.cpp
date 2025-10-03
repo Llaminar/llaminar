@@ -106,31 +106,12 @@ namespace llaminar
         int d_model = static_cast<int>(input_size);
         int d_out = static_cast<int>(local_output_size);
 
-        // Optional detailed diagnostics
-        bool linear_diag = debugEnv().linear.diag; // debugEnv() from llaminar namespace
-        if (linear_diag)
+        // Optional lightweight diagnostics (now minimal): only if LLAMINAR_LINEAR_DIAG is set.
+        bool linear_diag = debugEnv().linear.diag;
+        if (linear_diag && getRank() == 0)
         {
-            // Dump first few elements of input & a weight column slice for rank 0 (or all ranks if requested later)
-            std::ostringstream pre;
-            pre << "[LinearDiagPre] rank=" << getRank() << " seq_len=" << seq_len_int << " d_model=" << d_model << " d_out_local=" << d_out;
-            int dump_h = std::min(d_model, 8);
-            int dump_seq = std::min(seq_len_int, 2);
-            pre << " input_rows=";
-            for (int r = 0; r < dump_seq; ++r)
-            {
-                pre << "[r=" << r << ":";
-                for (int c = 0; c < dump_h; ++c)
-                    pre << input_data[r * d_model + c] << (c + 1 < dump_h ? "," : "");
-                pre << "]";
-            }
-            // pick a representative local output feature index (0) and dump its weight vector slice
-            if (d_out > 0)
-            {
-                pre << " w_col0=";
-                for (int c = 0; c < dump_h; ++c)
-                    pre << weight_data[c * d_out + 0] << (c + 1 < dump_h ? "," : "");
-            }
-            LOG_INFO(pre.str());
+            LOG_INFO("[LinearDiag] rank=" << getRank() << " seq_len=" << seq_len_int
+                                          << " d_model=" << d_model << " d_out_local=" << d_out);
         }
 
         // Use adaptive matrix multiplication
@@ -138,8 +119,24 @@ namespace llaminar
         // We pass distributed_partition=true because weights are column-partitioned across ranks.
         // This prevents the adaptive path from invoking COSMA (which expects full global matrices)
         // and instead uses local OpenBLAS for correctness.
+        // NOTE: The previous implementation passed arguments in the wrong order to adaptiveMatMul:
+        //   adaptiveMatMul(A,B,C, m,n,k, is_prefill, distributed_partition, transpose_A, transpose_B, alpha, beta)
+        // Was mistakenly invoked as: (m,n,k, false, 1.0f, 0.0f, false, true)
+        // Which actually mapped to:  is_prefill=false,
+        //   distributed_partition=1.0f (true), transpose_A=0.0f (false), transpose_B=false,
+        //   alpha=true (1.0f), beta(default 0.0f).
+        // While this looked harmless (alpha still 1, beta 0, distributed_partition true), it fed float literals
+        // into bool parameters relying on implicit conversions and omitted an explicit beta, creating fragile
+        // and potentially backend‑dependent behavior (and can hinder future signature changes).
+        // We correct this to explicitly provide all flags in canonical order for clarity & numerical stability.
         bool matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
-                                             seq_len_int, d_out, d_model, false, 1.0f, 0.0f, false, true);
+                                             seq_len_int, d_out, d_model,
+                                             /*is_prefill*/ false,
+                                             /*distributed_partition*/ true,
+                                             /*transpose_A*/ false,
+                                             /*transpose_B*/ false,
+                                             /*alpha*/ 1.0f,
+                                             /*beta*/ 0.0f);
         auto end = std::chrono::high_resolution_clock::now();
 
         if (!matmul_success)
@@ -150,21 +147,7 @@ namespace llaminar
 
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
         LOG_DEBUG("MPILinear matmul: " << ms << "ms for " << seq_len_int << "x" << d_model << " * " << d_model << "x" << d_out);
-        if (linear_diag)
-        {
-            std::ostringstream mid;
-            mid << "[LinearDiagPostGEMM] rank=" << getRank();
-            int dump_seq = std::min(seq_len_int, 2);
-            int dump_out = std::min(d_out, 8);
-            for (int r = 0; r < dump_seq; ++r)
-            {
-                mid << " out_row=" << r << "[";
-                for (int c = 0; c < dump_out; ++c)
-                    mid << output_data[r * d_out + c] << (c + 1 < dump_out ? "," : "");
-                mid << "]";
-            }
-            LOG_INFO(mid.str());
-        }
+        // (Legacy deep diagnostic & auto parity overwrite removed.)
 
         // Add bias if provided
         if (local_bias)
@@ -175,20 +158,9 @@ namespace llaminar
         // Gather results from all processes
         gatherOutput(local_output, global_output, seq_len, output_size);
 
-        if (linear_diag)
+        if (linear_diag && getRank() == 0)
         {
-            std::ostringstream post;
-            int dump_seq = std::min<int>(seq_len, 1);
-            int dump_global = std::min<int>(output_size, 8);
-            post << "[LinearDiagGlobal] rank=" << getRank();
-            for (int r = 0; r < dump_seq; ++r)
-            {
-                post << " global_row=" << r << "[";
-                for (int c = 0; c < dump_global; ++c)
-                    post << global_output->data()[r * output_size + c] << (c + 1 < dump_global ? "," : "");
-                post << "]";
-            }
-            LOG_INFO(post.str());
+            LOG_INFO("[LinearDiag] rank=" << getRank() << " gathered_global_shape=[" << seq_len << "," << output_size << "]");
         }
 
         // === POST-COMPUTATION VALIDATION ===
@@ -279,17 +251,20 @@ namespace llaminar
         // Extract local portion of weight matrix
         // Global weight: [input_size, output_size]
         // Local weight: [input_size, local_output_size]
-
         const float *global_data = global_weight->data();
         float *local_data = local_weight->data();
 
+        // Previous implementation copied element-by-element causing poor vectorization.
+        // Each row slice we need (contiguous block of columns) can be transferred with a single memcpy.
+        // Parallelize over rows; heuristic threshold avoids oversubscribing threads for tiny matrices.
+        const size_t elements_to_copy = input_size * local_output_size;
+        const bool do_parallel = elements_to_copy > 4096; // heuristic: ~16KB (float) before threading helps
+#pragma omp parallel for if (do_parallel)
         for (size_t i = 0; i < input_size; ++i)
         {
-            for (size_t j = 0; j < local_output_size; ++j)
-            {
-                size_t global_j = output_offset + j;
-                local_data[i * local_output_size + j] = global_data[i * output_size + global_j];
-            }
+            const float *src_row = global_data + i * output_size + output_offset;
+            float *dst_row = local_data + i * local_output_size;
+            std::memcpy(dst_row, src_row, local_output_size * sizeof(float));
         }
 
         LOG_DEBUG("Distributed weight matrix: local size [" << input_size << ", " << local_output_size
@@ -321,25 +296,24 @@ namespace llaminar
         // Use MPI_Allgatherv to handle variable local sizes per rank
 
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
+        // Precompute counts/offsets once; previous implementation recomputed per row.
+        std::vector<int> recv_counts(getSize());
+        std::vector<int> recv_offsets(getSize());
+        for (int rank = 0; rank < getSize(); ++rank)
+        {
+            auto [rank_local_size, rank_offset] = getRowDistribution(output_size, rank);
+            recv_counts[rank] = static_cast<int>(rank_local_size);
+            recv_offsets[rank] = static_cast<int>(rank_offset);
+        }
 
-        // For each sequence position, gather the distributed output features
+        // Row-wise Allgatherv (cannot trivially collapse into single collective without packing
+        // because column blocks for each rank are strided in row-major layout). Future optimization:
+        // pack local_output into an interleaved buffer (seq-major) with one Allgatherv using a
+        // custom MPI datatype for the column block.
         for (size_t seq_idx = 0; seq_idx < seq_len; ++seq_idx)
         {
             const float *local_row = local_output->data() + seq_idx * local_output_size;
             float *global_row = global_output->data() + seq_idx * output_size;
-
-            // Prepare counts and offsets for MPI_Allgatherv
-            std::vector<int> recv_counts(getSize());
-            std::vector<int> recv_offsets(getSize());
-
-            for (int rank = 0; rank < getSize(); ++rank)
-            {
-                auto [rank_local_size, rank_offset] = getRowDistribution(output_size, rank);
-                recv_counts[rank] = static_cast<int>(rank_local_size);
-                recv_offsets[rank] = static_cast<int>(rank_offset);
-            }
-
-            // Use MPI_Allgatherv to handle different local sizes per rank
             checkMPIError(MPI_Allgatherv(local_row, static_cast<int>(local_output_size), MPI_FLOAT,
                                          global_row, recv_counts.data(), recv_offsets.data(), MPI_FLOAT,
                                          getComm()),

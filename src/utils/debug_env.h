@@ -87,8 +87,22 @@ namespace llaminar
 
     struct PipelineEnv
     {
-        bool capture_pre_lm = false;  // LLAMINAR_PIPELINE_CAPTURE_PRE_LM
-        bool layerwise_stats = false; // LLAMINAR_PIPELINE_LAYERWISE_STATS
+        bool capture_pre_lm = false;             // LLAMINAR_PIPELINE_CAPTURE_PRE_LM
+        bool layerwise_stats = false;            // LLAMINAR_PIPELINE_LAYERWISE_STATS
+        bool enable_abstract_pipeline = false;   // LLAMINAR_ENABLE_ABSTRACT_PIPELINE (feature flag for new AbstractPipeline scaffolding)
+        bool disable_incremental_decode = false; // LLAMINAR_DISABLE_INCREMENTAL_DECODE (forces replay decode path)
+        bool layer_token_diff = false;           // LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF (capture last-token row per layer for diff diagnostics)
+        bool layer_token_diff_verbose = false;   // LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF_VERBOSE (log each capture row)
+        bool attn_ref_compare = false;           // LLAMINAR_DEBUG_ATTENTION_REF (run reference full attention for incremental token)
+        bool layer_replay_compare = false;       // LLAMINAR_DEBUG_LAYER_REPLAY_COMPARE (per-layer immediate replay compare during incremental decode)
+        bool pre_lm_row_diff = false;            // LLAMINAR_PIPELINE_PRE_LM_ROW_DIFF (emit per-call pre/post LM head last-row diff logs)
+    };
+
+    // KV cache policy (dynamic capacity management for incremental decode)
+    struct KVCacheEnv
+    {
+        bool dynamic_init = false; // LLAMINAR_KV_DYNAMIC_INIT (allocate exactly prefill length instead of max_seq_len)
+        int growth_factor = 2;     // LLAMINAR_KV_GROWTH_FACTOR (capacity *= factor when expansion required)
     };
 
     struct DequantEnv
@@ -106,6 +120,7 @@ namespace llaminar
     {
         bool validate_primitives = false; // LLAMINAR_ATTN_PRIMITIVES_VALIDATE
         bool validate_output = false;     // LLAMINAR_ATTN_OUTPUT_VALIDATE
+        bool use_primitives = true;       // LLAMINAR_ATTN_USE_PRIMITIVES (toggle new centralized primitive path)
         // Newly centralized flags
         std::string output_mode;         // LLAMINAR_ATTN_OUTPUT_MODE
         bool output_mode_forced = false; // presence of mode env
@@ -118,6 +133,17 @@ namespace llaminar
         int tp_partitions = 1;           // LLAMINAR_ATTN_TP_PARTITIONS
         bool tp_auto = false;            // LLAMINAR_ATTN_TP_AUTO
         bool tp_force_splitter = false;  // LLAMINAR_ATTN_TP_FORCE_SPLITTER
+        // Primitive optimization knobs
+        int prim_parallel_elems_threshold = 32768;   // LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS (heads*seq_len*seq_len or heads*seq_len*D)
+        bool prim_force_scalar = false;              // LLAMINAR_ATTN_PRIM_FORCE_SCALAR
+        int prim_fused_recompute_threshold = 0;      // LLAMINAR_ATTN_PRIM_FUSED_RECOMPUTE_THRESHOLD (seq_len threshold to use fused two-pass path)
+        bool prim_force_fused = false;               // LLAMINAR_ATTN_PRIM_FORCE_FUSED
+        bool prim_disable_fused = false;             // LLAMINAR_ATTN_PRIM_DISABLE_FUSED
+        bool prim_rope_vectorize = true;             // LLAMINAR_ATTN_PRIM_ROPE_VECTORIZE (disable for debugging)
+        bool prim_rope_fused_sincos = true;          // LLAMINAR_ATTN_PRIM_ROPE_FUSED_SINCOS (gate libmvec sincosf usage)
+        int prim_rope_recurrence_threshold = 300000; // LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD (elements = heads*seq_len*head_dim). Tuned from empirical sweep: recurrence under-performs below ~300k elems, wins at 640x8x64 (327,680) but is noisy at 896.
+        bool prim_rope_disable_recurrence = false;   // LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE (force old per-pos trig path)
+        bool prim_rope_trace = false;                // LLAMINAR_ATTN_PRIM_ROPE_TRACE (emit instrumentation for RoPE path selection)
     };
 
     struct EmbeddingEnv
@@ -131,12 +157,37 @@ namespace llaminar
 
     struct RMSNormEnv
     {
-        bool validate_ref = false;     // LLAMINAR_RMSNORM_VALIDATE_REF
-        bool dump_gamma = false;       // LLAMINAR_RMSNORM_DUMP_GAMMA
-        bool force_unit_gamma = false; // LLAMINAR_RMSNORM_FORCE_UNIT_GAMMA
-        bool gamma_checksum = false;   // LLAMINAR_RMSNORM_GAMMA_CHECKSUM (kernel)
-        std::string trace_rows_spec;   // LLAMINAR_RMSNORM_TRACE_ROWS
-        bool verbose = false;          // LLAMINAR_RMSNORM_VERBOSE (extra row-sum and stats logging)
+        bool validate_ref = false;        // LLAMINAR_RMSNORM_VALIDATE_REF
+        bool dump_gamma = false;          // LLAMINAR_RMSNORM_DUMP_GAMMA
+        bool force_unit_gamma = false;    // LLAMINAR_RMSNORM_FORCE_UNIT_GAMMA
+        bool gamma_checksum = false;      // LLAMINAR_RMSNORM_GAMMA_CHECKSUM (kernel)
+        std::string trace_rows_spec;      // LLAMINAR_RMSNORM_TRACE_ROWS
+        bool verbose = false;             // LLAMINAR_RMSNORM_VERBOSE (extra row-sum and stats logging)
+        bool force_scalar = false;        // LLAMINAR_RMSNORM_FORCE_SCALAR (override parallel heuristics)
+        bool disable_tls_scratch = false; // LLAMINAR_RMSNORM_DISABLE_TLS_SCRATCH (revert to per-call allocs for A/B)
+        int scratch_prealloc_rows = 0;    // LLAMINAR_RMSNORM_SCRATCH_PREALLOC_ROWS (>0 pre-reserves TLS scratch capacity)
+        bool false_sharing_probe = false; // LLAMINAR_RMSNORM_FALSE_SHARING_PROBE (bench harness extra test)
+        bool fast_accumulate = false;     // LLAMINAR_RMSNORM_FAST_ACC (accumulate in float then widen)
+        int vec_impl = 0;                 // LLAMINAR_RMSNORM_VEC_IMPL (0=auto,1=scalar,2=avx2,3=avx512)
+    };
+
+    struct SoftmaxEnv
+    {
+        bool force_scalar = false;               // LLAMINAR_SOFTMAX_FORCE_SCALAR (disable OpenMP and SIMD hints)
+        bool validate = false;                   // LLAMINAR_SOFTMAX_VALIDATE (optional reference compare hooks)
+        int parallel_row_threshold = 0;          // LLAMINAR_SOFTMAX_PARALLEL_ROW_THRESHOLD (min rows to parallelize)
+        int parallel_elems_threshold = 32768;    // LLAMINAR_SOFTMAX_PARALLEL_ELEMS (rows*cols threshold)
+        int validate_scalar_row_threshold = 256; // LLAMINAR_SOFTMAX_VALIDATE_SCALAR_ROW_THRESHOLD (rows below this use scalar validation)
+        bool causal_fuse = true;                 // LLAMINAR_SOFTMAX_CAUSAL_FUSE (allow masking during max/sum passes)
+        bool fast_exp = false;                   // LLAMINAR_SOFTMAX_FAST_EXP (enable polynomial / approx exp)
+        int fast_exp_mode = 0;                   // LLAMINAR_SOFTMAX_FAST_EXP_MODE (reserved for future variants)
+        bool dist_recompute = false;             // LLAMINAR_SOFTMAX_DIST_RECOMPUTE (recompute exp in normalize pass to save memory traffic)
+        int dist_recompute_threshold = 0;        // LLAMINAR_SOFTMAX_DIST_RECOMPUTE_THRESHOLD (auto-enable recompute if rows*cols >= this and dist_recompute not set)
+        // Validation extended controls (active only if validate && fast_exp)
+        int validate_sample_rows = 4;       // LLAMINAR_SOFTMAX_VALIDATE_SAMPLE_ROWS (<=0 => all rows)
+        double validate_rel_l2_tol = 2e-5;  // LLAMINAR_SOFTMAX_VALIDATE_REL_L2
+        double validate_max_abs_tol = 1e-6; // LLAMINAR_SOFTMAX_VALIDATE_MAX_ABS
+        bool validate_abort = false;        // LLAMINAR_SOFTMAX_VALIDATE_ABORT (abort/fail if tolerance exceeded)
     };
 
     struct SwiGLUEnv
@@ -411,6 +462,8 @@ namespace llaminar
         TPPolicyEnv tp_policy;              // tensor parallel policy settings
         LoggerEnv logger;                   // logger ring buffer sizing
         MLPTPEnv mlp_tp;                    // MLP tensor parallel execution controls
+        KVCacheEnv kv_cache;                // KV cache dynamic capacity controls
+        SoftmaxEnv softmax;                 // softmax core execution tuning
         struct ThreadingEnv
         {                                 // Global OpenMP / threading policy
             bool use_physical = false;    // LLAMINAR_OMP_USE_PHYSICAL (if set => restrict to physical cores per rank)

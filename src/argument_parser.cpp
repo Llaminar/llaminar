@@ -175,6 +175,10 @@ bool ArgumentParser::parse(LlaminarParams &params)
         {
             params.validate_results = true;
         }
+        else if (arg == "--kv-stats")
+        {
+            params.kv_cache_stats = true;
+        }
         // Help and version
         else if (arg == "--help" || arg == "-h")
         {
@@ -258,6 +262,7 @@ void ArgumentParser::printUsage() const
     std::cout << "\nPerformance Options:" << std::endl;
     std::cout << "  --profile                Enable kernel profiling" << std::endl;
     std::cout << "  --validate               Enable result validation" << std::endl;
+    std::cout << "  --kv-stats               Print KV cache capacity/usage summary at exit" << std::endl;
     std::cout << "\nInformation:" << std::endl;
     std::cout << "  --help, -h               Show this help message" << std::endl;
     std::cout << "  --version                Show version information" << std::endl;

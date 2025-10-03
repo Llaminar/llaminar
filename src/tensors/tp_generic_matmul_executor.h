@@ -16,6 +16,8 @@
 #pragma once
 
 #include "tp_partition.h"
+#include "../logger.h" // for LOG_DEBUG
+#include <chrono>
 #include <functional>
 #include <vector>
 #include <stdexcept>
@@ -71,6 +73,7 @@ namespace llaminar
             TPGemmLocalResult r;
             r.partA = specA_;
             r.partB = specB_;
+            auto t_start = std::chrono::high_resolution_clock::now();
             if (cfg_.tp_size <= 1)
             {
                 r.M_local = M_;
@@ -78,6 +81,11 @@ namespace llaminar
                 r.buffer.resize(M_ * N_);
                 if (!fn_(A, B, r.buffer.data(), M_, N_, K_))
                     throw std::runtime_error("TPGemmExecutor single-partition matmul failed");
+                auto t_end = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count() / 1000.0;
+                LOG_DEBUG("TP_GEMM_PART time_ms=" << ms << " mode=" << (cfg_.mode == TPGemmExecConfig::Mode::Row ? "row" : "col")
+                                                  << " tp_size=" << cfg_.tp_size << " rank=" << cfg_.tp_rank
+                                                  << " M=" << M_ << " N=" << N_ << " K=" << K_ << " local_M=" << r.M_local << " local_N=" << r.N_local);
                 return r;
             }
             if (cfg_.mode == TPGemmExecConfig::Mode::Row)
@@ -105,6 +113,12 @@ namespace llaminar
                 if (!fn_(A, B_packed.data(), r.buffer.data(), r.M_local, r.N_local, K_))
                     throw std::runtime_error("Column-split local gemm failed");
             }
+            auto t_end = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count() / 1000.0;
+            LOG_DEBUG("TP_GEMM_PART time_ms=" << ms << " mode=" << (cfg_.mode == TPGemmExecConfig::Mode::Row ? "row" : "col")
+                                              << " tp_size=" << cfg_.tp_size << " rank=" << cfg_.tp_rank
+                                              << " M=" << M_ << " N=" << N_ << " K=" << K_ << " local_M=" << r.M_local << " local_N=" << r.N_local
+                                              << " offset_M=" << specA_.local_offset << " offset_N=" << specB_.local_offset);
             return r;
         }
 

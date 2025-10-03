@@ -747,63 +747,13 @@ public:
 
 COSMA's strategy system and layout transformations can be adapted for inference compute graphs:
 
+> Historical Note: A prototype "CosmaComputeGraph" abstraction previously explored representing transformer execution as a generic node graph for COSMA strategy optimization. This approach has been removed in favor of the simpler, higher‑level Abstract Pipeline + prefill manager design. The following snippet has been retired (do not reintroduce):
+
 ```cpp
-// compute_graph_adapter.hpp
-#pragma once
-
-#include <cosma/strategy.hpp>
-#include <cosma/layout.hpp>
-#include <memory>
-#include <vector>
-#include <unordered_map>
-#include <functional>
-
-namespace llaminar {
-
-// Represents a node in the inference compute graph
-struct ComputeNode {
-    enum Type { MATMUL, ATTENTION, FFN, NORM, ACTIVATION, EMBEDDING };
-    
-    Type type;
-    std::string name;
-    std::vector<int> input_tensor_ids;
-    std::vector<int> output_tensor_ids;
-    std::unordered_map<std::string, float> params;  // layer-specific parameters
-    
-    // COSMA-specific optimization hints
-    cosma::Strategy preferred_strategy;
-    bool can_overlap_with_next = false;
-    bool requires_global_sync = false;
+// (DEPRECATED – illustrative only, no longer in repository)
+struct DeprecatedCosmaComputeGraphExample {
+    // Placeholder to avoid encouraging new graph-style implementations.
 };
-
-// Inference compute graph optimized for COSMA
-class CosmaComputeGraph {
-private:
-    std::vector<ComputeNode> nodes_;
-    std::vector<cosma::Strategy> optimal_strategies_;
-    std::unordered_map<int, std::pair<int, int>> tensor_shapes_;  // tensor_id -> (rows, cols)
-    int num_processes_;
-    long long memory_limit_;
-    
-public:
-    CosmaComputeGraph(int num_processes, long long memory_limit)
-        : num_processes_(num_processes), memory_limit_(memory_limit) {}
-    
-    // Add nodes for transformer layers
-    void add_transformer_layer(int layer_id, int seq_len, int hidden_dim, 
-                              int num_heads, int intermediate_dim);
-    
-    // Optimize the entire compute graph for COSMA execution
-    void optimize_graph();
-    
-    // Execute the optimized compute graph
-    template<typename T>
-    void execute(const std::vector<T*>& input_tensors,
-                std::vector<T*>& output_tensors,
-                MPI_Comm comm);
-};
-
-} // namespace llaminar
 ```
 
 ## Multi-NUMA Xeon Deployment
@@ -1014,7 +964,7 @@ class QwenInferenceEngine {
 private:
     std::unique_ptr<NumaAwareDeployment> numa_deployment_;
     std::unique_ptr<CustomKernelScheduler> kernel_scheduler_;
-    std::unique_ptr<CosmaComputeGraph> compute_graph_;
+    // (Removed) std::unique_ptr<CosmaComputeGraph> compute_graph_; // replaced by pipeline + prefill manager orchestration
     
     // Model weights (quantized)
     std::vector<ggml_tensor*> layer_weights_;
@@ -1043,10 +993,7 @@ public:
             strategy, numa_deployment_->get_numa_comm()
         );
         
-        compute_graph_ = std::make_unique<CosmaComputeGraph>(
-            numa_deployment_->get_numa_process_count(),
-            numa_deployment_->get_numa_memory_size() / 4
-        );
+        // (Removed) Graph construction. COSMA large-op planning now handled by prefill manager + adaptive backend.
         
         initialize_model();
     }
