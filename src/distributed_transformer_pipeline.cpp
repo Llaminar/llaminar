@@ -1,6 +1,24 @@
 // Canonical implementation translation unit for DistributedTransformerPipeline.
 // Formerly implemented in mpi_transformer_pipeline.cpp (now a deprecation shim).
 // NOTE: Original history remains in that file; future refactors will operate here.
+//
+// Parity Replay Design (Option A):
+//   Full prefix replay (all prior tokens plus current) is used for incremental vs replay
+//   parity diagnostics. Earlier minimal single-token replay (n_past=0) produced large RoPE
+//   divergences because the incremental path rotated the token at its true absolute position
+//   while the replay path treated it as position 0. Reconstructing the entire prefix ensures
+//   (1) identical positional indices for RoPE, (2) authentic accumulated K/V context, and
+//   (3) elimination of synthetic self-pair logic that previously masked missing replay rows.
+//
+//   Mechanics:
+//     * Build replay_seq of size n_past_ (after increment) = prior committed tokens + new token.
+//     * Execute a fresh pipeline instance with layer_token_diff enabled to capture rows.
+//     * Filter replay rows to seq_len == replay_seq.size() so only the final token's rows remain.
+//     * Pair incremental token rows directly with filtered replay rows (stage + layer match).
+//     * Record first divergence (rel_l2 > threshold) in a global atomic for regression tests.
+//
+//   Trade-offs: Increased diagnostic cost (O(prefix_length)) accepted because this path is
+//   gated behind debug flags. Production incremental decode remains unchanged.
 
 #include "distributed_transformer_pipeline.h"
 #include "model_loader.h"
@@ -126,6 +144,14 @@ namespace
         return summary;
     }
 }
+
+// (parity sentinel accessors defined later after the atomic is declared)
+namespace
+{
+    static std::atomic<bool> g_replay_first_exceed{false};
+}
+bool getReplayFirstExceedFlag() { return g_replay_first_exceed.load(); }
+void resetReplayFirstExceedFlag() { g_replay_first_exceed.store(false); }
 
 // === Section 1: Factory registration, statics, constructor, kernel registration, FFN shard diagnostics ===
 namespace llaminar
@@ -598,6 +624,7 @@ namespace llaminar
     std::vector<float> DistributedTransformerPipeline::last_pre_lm_hidden_;
     std::vector<DistributedTransformerPipeline::LayerActivationStat> DistributedTransformerPipeline::last_layer_stats_;
     std::vector<DistributedTransformerPipeline::LayerTokenDiffRow> DistributedTransformerPipeline::last_layer_token_rows_;
+    // (parity sentinel atomic declared globally below outside namespace for accessor simplicity)
 
     DistributedTransformerPipeline::DistributedTransformerPipeline(const LayerConfig &config)
         : PipelineBase(), config_(config), use_kv_cache_(true), n_past_(0),
@@ -610,6 +637,9 @@ namespace llaminar
         {
             LOG_INFO("[KVCacheInitMode] constructing pipeline this=" << (const void *)this << " dynamic_init=" << (kv_cache_dynamic_init_ ? "on" : "off"));
         }
+
+        // (accessor implementations defined at TU end)
+
         if (use_kv_cache_)
         {
             int initial_capacity = config_.max_seq_len;
@@ -1838,6 +1868,7 @@ namespace llaminar
                     const double rel_l2_warn = 1e-5;
                     bool exceed = false; // legacy flag preserved (not used for early break now)
                     bool first_exceed_recorded = false;
+                    g_replay_first_exceed.store(false);
                     DiffSummary first_exceed_ds{};
                     int first_exceed_layer = 0;
                     std::string first_exceed_stage;
@@ -1983,6 +2014,7 @@ namespace llaminar
                                 first_exceed_ds = ds;
                                 first_exceed_layer = layer;
                                 first_exceed_stage = sp.inc->stage;
+                                g_replay_first_exceed.store(true);
                                 if (getRank() == 0)
                                     LOG_WARN("[LayerReplayIsoFirstExceed] token_pos=" << (replay_seq.size() - 1)
                                                                                       << " layer=" << layer

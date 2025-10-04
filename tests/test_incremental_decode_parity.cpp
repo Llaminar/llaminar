@@ -116,6 +116,12 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
     EXPECT_LT(relL2(base_logits, inc_prefill_last), 1e-5f);
 
     // Generate next tokens deterministically (choose token id = (i*7)%vocab)
+    // If layer token diff + replay compare instrumentation flags are enabled externally,
+    // we also assert that no stage exceeded the rel_l2 warning threshold (via global sentinel).
+    const bool layer_diff_enabled = (std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF") && std::string(std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF")) == "1");
+    const bool replay_compare_enabled = (std::getenv("LLAMINAR_PIPELINE_LAYER_REPLAY_COMPARE") && std::string(std::getenv("LLAMINAR_PIPELINE_LAYER_REPLAY_COMPARE")) == "1");
+    if (layer_diff_enabled && replay_compare_enabled)
+        resetReplayFirstExceedFlag();
     std::vector<int> generated;
     int steps = 5;
     for (int i = 0; i < steps; ++i)
@@ -156,6 +162,13 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
                     ++inc_count;
             (void)inc_count; // silence unused if assertions compiled out
         }
+        if (layer_diff_enabled && replay_compare_enabled)
+        {
+            // Assert no internal stage divergence beyond tolerance for this token decode
+            EXPECT_FALSE(getReplayFirstExceedFlag()) << "Unexpected internal stage rel_l2 exceed at step=" << i;
+            // Prepare for next iteration (sentinel is per-token)
+            resetReplayFirstExceedFlag();
+        }
         generated.push_back(next);
     }
 }
@@ -169,6 +182,8 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalMultiRank)
     {
         GTEST_SKIP() << "Requires mpirun -np >=2";
     }
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     TransformerLayerConfig cfg;
     cfg.n_layers = 2;
     cfg.n_head = 2;
@@ -188,6 +203,10 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalMultiRank)
     ASSERT_TRUE(pipe->execute(prompt, weights, prefill_logits));
     // Perform incremental decode and replay check for 3 steps
     std::vector<int> generated;
+    const bool layer_diff_enabled = (std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF") && std::string(std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF")) == "1");
+    const bool replay_compare_enabled = (std::getenv("LLAMINAR_PIPELINE_LAYER_REPLAY_COMPARE") && std::string(std::getenv("LLAMINAR_PIPELINE_LAYER_REPLAY_COMPARE")) == "1");
+    if (rank == 0 && layer_diff_enabled && replay_compare_enabled)
+        resetReplayFirstExceedFlag();
     for (int step = 0; step < 3; ++step)
     {
         int next = (step * 5) % cfg.vocab_size; // Replay
@@ -203,6 +222,11 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalMultiRank)
         std::memcpy(inc_last.data(), inc_logits_row->data(), sizeof(float) * cfg.vocab_size);
         float diff = relL2(replay_last, inc_last);
         EXPECT_LT(diff, 1e-4f) << "multi-rank step=" << step;
+        if (rank == 0 && layer_diff_enabled && replay_compare_enabled)
+        {
+            EXPECT_FALSE(getReplayFirstExceedFlag()) << "Unexpected internal stage rel_l2 exceed at multi-rank step=" << step;
+            resetReplayFirstExceedFlag();
+        }
         generated.push_back(next);
     }
 }

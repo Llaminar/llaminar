@@ -140,6 +140,13 @@ namespace llaminar
         {
             int layer = -1;
             int seq_len = 0;
+            // token_pos: 0-based position of the token row within the captured window.
+            // For current instrumentation we approximate token_pos = seq_len - 1 (the "last" token
+            // in the window) because we only capture final-row projections (and internal attention
+            // stages) for the active pass. Full prefix replay (Option A) filters to the final token
+            // anyway, so this provides stable tagging for future multi-token analysis without
+            // requiring historical accumulation.
+            int token_pos = -1;
             bool incremental = false;
             const void *pipeline = nullptr;
             // Stage label within the layer lifecycle. For backward compatibility existing
@@ -152,6 +159,9 @@ namespace llaminar
         static const std::vector<LayerTokenDiffRow> &getLastLayerTokenRows() { return last_layer_token_rows_; }
         static void resetLayerTokenRows() { last_layer_token_rows_.clear(); }
         static void appendLayerTokenDiffRow(LayerTokenDiffRow row) { last_layer_token_rows_.push_back(std::move(row)); }
+        // Accessors for replay parity exceed sentinel
+        friend bool getReplayFirstExceedFlag();
+        friend void resetReplayFirstExceedFlag();
         // Centralized internal attention capture helper: ensures pipeline pointer + verbose logging
         static void appendInternalAttnRow(DistributedTransformerPipeline *pipeline,
                                           int layer,
@@ -173,6 +183,7 @@ namespace llaminar
             LayerTokenDiffRow row;
             row.layer = layer;
             row.seq_len = seq_len;
+            row.token_pos = seq_len > 0 ? (seq_len - 1) : -1;
             row.incremental = incremental;
             row.pipeline = pipeline;
             row.stage = stage;
