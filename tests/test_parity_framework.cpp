@@ -314,8 +314,8 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     }
 
     const int vocab = config.vocab_size;
-    const int64_t total_logits = static_cast<int64_t>(test_seq_len) * static_cast<int64_t>(vocab);
-    std::vector<float> llama_logits(total_logits, 0.0f);
+    const int64_t total_logit_elements = static_cast<int64_t>(test_seq_len) * static_cast<int64_t>(vocab);
+    std::vector<float> llama_logits(total_logit_elements, 0.0f);
 
     // ========== Run llama.cpp for reference ==========
     if (rank == 0)
