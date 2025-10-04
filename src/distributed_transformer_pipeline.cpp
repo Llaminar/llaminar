@@ -1,24 +1,57 @@
-// Canonical implementation translation unit for DistributedTransformerPipeline.
-// Formerly implemented in mpi_transformer_pipeline.cpp (now a deprecation shim).
-// NOTE: Original history remains in that file; future refactors will operate here.
-//
-// Parity Replay Design (Option A):
-//   Full prefix replay (all prior tokens plus current) is used for incremental vs replay
-//   parity diagnostics. Earlier minimal single-token replay (n_past=0) produced large RoPE
-//   divergences because the incremental path rotated the token at its true absolute position
-//   while the replay path treated it as position 0. Reconstructing the entire prefix ensures
-//   (1) identical positional indices for RoPE, (2) authentic accumulated K/V context, and
-//   (3) elimination of synthetic self-pair logic that previously masked missing replay rows.
-//
-//   Mechanics:
-//     * Build replay_seq of size n_past_ (after increment) = prior committed tokens + new token.
-//     * Execute a fresh pipeline instance with layer_token_diff enabled to capture rows.
-//     * Filter replay rows to seq_len == replay_seq.size() so only the final token's rows remain.
-//     * Pair incremental token rows directly with filtered replay rows (stage + layer match).
-//     * Record first divergence (rel_l2 > threshold) in a global atomic for regression tests.
-//
-//   Trade-offs: Increased diagnostic cost (O(prefix_length)) accepted because this path is
-//   gated behind debug flags. Production incremental decode remains unchanged.
+/**
+ * @file distributed_transformer_pipeline.cpp
+ * @brief Canonical implementation of the DistributedTransformerPipeline class.
+ * @author David Sanftenberg
+ *
+ * This is the primary implementation translation unit for the distributed transformer pipeline.
+ * It was migrated from the legacy mpi_transformer_pipeline.cpp (now a deprecation shim).
+ * Historical implementation details remain in the legacy file for reference.
+ *
+ * @section architecture Architecture Overview
+ *
+ * The DistributedTransformerPipeline implements a multi-stage transformer inference engine
+ * with support for:
+ * - Multi-node MPI-based distribution
+ * - NUMA-aware tensor placement
+ * - Hybrid execution backends (OpenBLAS, COSMA)
+ * - KV cache management with dynamic growth
+ * - Incremental decode with optional parity validation
+ *
+ * @section parity_replay Parity Replay Design (Option A)
+ *
+ * The incremental decode path supports optional parity diagnostics through full prefix replay.
+ * This design choice was made to address RoPE position encoding divergence issues.
+ *
+ * @subsection problem Problem Statement
+ * Earlier implementations used minimal single-token replay (n_past=0), which produced large
+ * RoPE divergences. The incremental path correctly rotated tokens at their absolute positions,
+ * but the replay path incorrectly treated each token as position 0.
+ *
+ * @subsection solution Solution
+ * Full prefix reconstruction ensures:
+ * 1. **Identical RoPE positions** - Both paths see the same absolute token indices
+ * 2. **Authentic KV context** - Accumulated key/value history matches exactly
+ * 3. **Simplified validation** - No synthetic self-pairing logic needed for missing rows
+ *
+ * @subsection mechanics Implementation Mechanics
+ *
+ * The replay comparison proceeds as follows:
+ * 1. Build `replay_seq` of size `n_past_` containing all prior tokens plus the new token
+ * 2. Execute a fresh pipeline instance with `layer_token_diff` enabled to capture stage outputs
+ * 3. Filter replay rows where `seq_len == replay_seq.size()` to isolate final token stages
+ * 4. Pair incremental token rows with filtered replay rows (matched by stage + layer)
+ * 5. Record first divergence exceeding threshold (rel_l2 > 1e-5) in global atomic flag
+ *
+ * @subsection tradeoffs Trade-offs
+ *
+ * **Cost**: O(prefix_length) computational overhead for each incremental token
+ *
+ * **Benefit**: Precise parity validation for regression testing and debugging
+ *
+ * **Mitigation**: This diagnostic path is gated behind debug environment flags
+ * (`LLAMINAR_LAYER_TOKEN_DIFF` and `LLAMINAR_LAYER_REPLAY_COMPARE`).
+ * Production incremental decode remains unchanged and incurs no overhead.
+ */
 
 #include "distributed_transformer_pipeline.h"
 #include "model_loader.h"
@@ -27,6 +60,7 @@
 #include "kernels/MPIResidualKernel.h"
 #include "kernels/MPIEmbeddingKernel.h"
 #include "kernels/common/rmsnorm_core.h"
+#include "kernels/common/attention_primitives.h"
 #include "tensors/tensor_factory.h"
 #include "tensors/simple_tensor.h"
 #include "debug_utils.h"
@@ -67,33 +101,55 @@ namespace
         double stddev = 0.0;
     };
 
+    /**
+     * @brief Compute comprehensive statistics for a float buffer.
+     *
+     * @param data Pointer to float array
+     * @param size Number of elements
+     * @return BufferStats containing min, max, mean, RMS, L2 norm, and standard deviation
+     */
     BufferStats computeBufferStats(const float *data, size_t size)
     {
         BufferStats stats;
+
+        // Guard against invalid input
         if (!data || size == 0)
             return stats;
+
+        // Initialize accumulators and extrema
         double sum = 0.0;
         double sumsq = 0.0;
         double min_v = static_cast<double>(data[0]);
         double max_v = static_cast<double>(data[0]);
+
+        // Single-pass accumulation of statistics
         for (size_t i = 0; i < size; ++i)
         {
             double v = static_cast<double>(data[i]);
+
+            // Accumulate moments
             sum += v;
             sumsq += v * v;
+
+            // Track extrema
             if (v < min_v)
                 min_v = v;
             if (v > max_v)
                 max_v = v;
         }
+
+        // Compute derived statistics
         double mean = sum / static_cast<double>(size);
         double variance = std::max(0.0, sumsq / static_cast<double>(size) - mean * mean);
+
+        // Populate result structure
         stats.min = min_v;
         stats.max = max_v;
         stats.mean = mean;
         stats.rms = std::sqrt(sumsq / static_cast<double>(size));
         stats.l2 = std::sqrt(sumsq);
         stats.stddev = std::sqrt(variance);
+
         return stats;
     }
 
@@ -107,26 +163,54 @@ namespace
         float value_b = 0.0f;
     };
 
+    /**
+     * @brief Compute difference statistics between two float buffers.
+     *
+     * Calculates max absolute error, mean absolute error, relative L2 norm,
+     * and identifies the worst-case element for debugging.
+     *
+     * @param a First buffer (e.g., incremental result)
+     * @param b Second buffer (e.g., reference/replay result)
+     * @param size Number of elements in each buffer
+     * @return DiffSummary containing error metrics and worst-case location
+     */
     DiffSummary computeDiffSummary(const float *a, const float *b, size_t size)
     {
         DiffSummary summary;
+
+        // Guard against invalid input
         if (!a || !b || size == 0)
             return summary;
+
+        // Initialize tracking variables for worst-case element
         double max_abs = 0.0;
         size_t worst = 0;
         float worst_a = 0.0f;
         float worst_b = 0.0f;
+
+        // Initialize accumulators for aggregate metrics
         double sum_abs = 0.0;
         long double sum_sq = 0.0L;
         long double denom_sq = 0.0L;
+
+        // Single-pass computation of all diff metrics
         for (size_t i = 0; i < size; ++i)
         {
+            // Compute element-wise difference
             double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
             double abs_diff = std::fabs(diff);
+
+            // Accumulate absolute error
             sum_abs += abs_diff;
+
+            // Accumulate squared error for L2 norm
             sum_sq += diff * diff;
+
+            // Accumulate denominator for relative L2
             double base = static_cast<double>(b[i]);
             denom_sq += base * base;
+
+            // Track worst-case element
             if (abs_diff > max_abs)
             {
                 max_abs = abs_diff;
@@ -135,12 +219,17 @@ namespace
                 worst_b = b[i];
             }
         }
+
+        // Compute final metrics
         summary.max_abs = max_abs;
         summary.mean_abs = sum_abs / static_cast<double>(size);
         summary.rel_l2 = std::sqrt(static_cast<double>(sum_sq)) / (std::sqrt(static_cast<double>(denom_sq)) + 1e-30);
+
+        // Record worst-case element details for debugging
         summary.worst_index = worst;
         summary.value_a = worst_a;
         summary.value_b = worst_b;
+
         return summary;
     }
 }
@@ -691,22 +780,56 @@ namespace llaminar
         LOG_DEBUG("DistributedTransformerPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
     }
 
-    void DistributedTransformerPipeline::traceFFNShardDiagnostics(const std::string &label, const float *data, int seq_len, int feature_dim)
+    /**
+     * @brief Trace diagnostics for an FFN shard buffer (stats + optional samples + baseline compare).
+     *
+     * Readability refactor: expanded spacing, explicit braces, grouped logical blocks.
+     *
+     * Flow:
+     *  1. Guard conditions (env enabled, data valid, dims > 0, label allow‑list)
+     *  2. Compute stats for current shard
+     *  3. (Rank 0) Optional baseline fetch & diff stats
+     *  4. Emit summary header line
+     *  5. Optionally emit sampled rows (bounded by cfg.limit)
+     */
+    void DistributedTransformerPipeline::traceFFNShardDiagnostics(const std::string &label,
+                                                                  const float *data,
+                                                                  int seq_len,
+                                                                  int feature_dim)
     {
+        // --- Stage 1: Guards ---
         const auto &cfg = debugEnv().ffn_shard_trace;
-        if (!cfg.enabled || !data || seq_len <= 0 || feature_dim <= 0)
+
+        if (!cfg.enabled || !data)
+        {
             return;
+        }
+
+        if (seq_len <= 0 || feature_dim <= 0)
+        {
+            return;
+        }
+
         if (!isFFNShardTracingEnabledFor(label))
+        {
             return;
-        const int sample_limit = cfg.limit > 0 ? cfg.limit : 1;
+        }
+
+        // --- Stage 2: Basic stats ---
+        const int sample_limit = (cfg.limit > 0) ? cfg.limit : 1;
+
         int rank = 0;
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
         const size_t total_elements = static_cast<size_t>(seq_len) * static_cast<size_t>(feature_dim);
         auto stats = computeBufferStats(data, total_elements);
-        const bool baseline_enabled = llaminar::debugEnv().baseline.compare;
+
+        // --- Stage 3: Baseline diff (rank 0 only) ---
+        const bool baseline_enabled = debugEnv().baseline.compare;
         std::vector<float> baseline_buffer;
         const float *baseline_ptr = nullptr;
-        BufferStats baseline_stats{};
+        BufferStats baseline_stats{}; // (optional – retained for future extended diff logging)
+
         if (rank == 0 && baseline_enabled)
         {
             auto &registry = PrefillBaselineRegistry::instance();
@@ -720,30 +843,53 @@ namespace llaminar
                 LOG_DEBUG("[PrefillFFNTrace] baseline unavailable for shard '" << label << "'");
             }
         }
+
+        // --- Stage 4: Summary header ---
         std::ostringstream header;
-        header << "[PrefillFFNTrace] rank=" << rank << " shard=" << label
+        header << "[PrefillFFNTrace] rank=" << rank
+               << " shard=" << label
                << " shape=(" << seq_len << "," << feature_dim << ")"
-               << " min=" << stats.min << " max=" << stats.max
-               << " mean=" << stats.mean << " rms=" << stats.rms
+               << " min=" << stats.min
+               << " max=" << stats.max
+               << " mean=" << stats.mean
+               << " rms=" << stats.rms
                << " stddev=" << stats.stddev;
+
         if (baseline_ptr)
         {
             auto diff = computeDiffSummary(data, baseline_ptr, total_elements);
-            header << " rel_l2=" << diff.rel_l2 << " mean_abs=" << diff.mean_abs << " max_abs=" << diff.max_abs;
+            header << " rel_l2=" << diff.rel_l2
+                   << " mean_abs=" << diff.mean_abs
+                   << " max_abs=" << diff.max_abs;
         }
+
         if (rank == 0)
+        {
             LOG_INFO(header.str());
+        }
+
+        // --- Stage 5: Sample rows (rank 0 only) ---
         if (cfg.limit > 0 && rank == 0)
-        { // using limit as proxy for sample request (legacy field sample_prefix not yet migrated)
-            int rows = std::min(seq_len, sample_limit);
-            int cols = std::min(feature_dim, sample_limit);
+        { // legacy: using limit as sample trigger
+            const int rows = std::min(seq_len, sample_limit);
+            const int cols = std::min(feature_dim, sample_limit);
+
             for (int r = 0; r < rows; ++r)
             {
                 std::ostringstream row_ss;
-                row_ss << "[PrefillFFNSample] shard=" << label << " row=" << r << " vals=";
-                const float *row_ptr = data + r * feature_dim;
+                row_ss << "[PrefillFFNSample] shard=" << label
+                       << " row=" << r
+                       << " vals=";
+
+                const float *row_ptr = data + (size_t)r * feature_dim;
                 for (int c = 0; c < cols; ++c)
-                    row_ss << row_ptr[c] << (c + 1 < cols ? ',' : '\0');
+                {
+                    row_ss << row_ptr[c];
+                    if (c + 1 < cols)
+                    {
+                        row_ss << ',';
+                    }
+                }
                 LOG_INFO(row_ss.str());
             }
         }
@@ -760,19 +906,24 @@ namespace llaminar
         DistributedTransformerPipeline::ModelWeights weights;
         LOG_INFO("[WeightLoad] begin vocab=" << config.vocab_size << " d_model=" << config.d_model << " layers=" << config.n_layers);
 
-        // Token embedding
+        // === Token Embedding ===
+        // Load vocabulary embedding matrix (vocab_size x d_model)
         weights.token_embedding = loader.loadTensor("token_embd.weight");
-        // (Removed stray incremental decode guard accidentally injected during patch)
+
+        // Log embedding shape for verification
         const auto emb_shape = weights.token_embedding->shape();
         if (emb_shape.size() == 2)
         {
             LOG_INFO("[WeightLoad] token_embd.weight shape=" << emb_shape[0] << "x" << emb_shape[1]);
         }
-        // Sample stats (lightweight)
+
+        // Lightweight anomaly detection on sample of embedding values
         {
             const float *ptr = weights.token_embedding->data();
             size_t total = (size_t)weights.token_embedding->size();
             size_t sample = std::min<size_t>(total, (size_t)512);
+
+            // Count NaN and Inf values in sample
             size_t nan_ct = 0, inf_ct = 0;
             for (size_t i = 0; i < sample; ++i)
             {
@@ -782,18 +933,26 @@ namespace llaminar
                 if (std::isinf(v))
                     ++inf_ct;
             }
+
+            // Warn if anomalies detected
             if (nan_ct || inf_ct)
                 LOG_WARN("[WeightLoad] token_embd anomalies nan=" << nan_ct << " inf=" << inf_ct);
         }
 
-        // Output norm
+        // === Output Normalization Weight ===
+        // Load final RMSNorm gamma parameters
         weights.output_norm_weight = loader.loadTensor("output_norm.weight");
         if (!weights.output_norm_weight)
             throw std::runtime_error("Failed to load output_norm.weight");
+
+        // Validate dimensions
         if (weights.output_norm_weight->size() != config.d_model)
         {
-            LOG_WARN("[WeightLoad] output_norm.weight size=" << weights.output_norm_weight->size() << " != d_model=" << config.d_model);
+            LOG_WARN("[WeightLoad] output_norm.weight size=" << weights.output_norm_weight->size()
+                                                             << " != d_model=" << config.d_model);
         }
+
+        // Debug override: force unit gamma (disable normalization scaling)
         if (debugEnv().output_norm.force_unit || debugEnv().output_norm.force_unit_all)
         {
             float *g = const_cast<float *>(weights.output_norm_weight->data());
@@ -801,6 +960,7 @@ namespace llaminar
                 g[i] = 1.0f;
             LOG_WARN("[WeightLoad] Forced output_norm to unit gamma");
         }
+        // Debug override: clamp gamma to reasonable range
         else if (debugEnv().output_norm.clamp)
         {
             float *g = const_cast<float *>(weights.output_norm_weight->data());
@@ -809,7 +969,8 @@ namespace llaminar
             LOG_WARN("[WeightLoad] Clamped output_norm gamma range [0,4]");
         }
 
-        // LM head (optional)
+        // === LM Head (Language Model Output Projection) ===
+        // Attempt to load dedicated output projection weight
         std::shared_ptr<TensorBase> lm_head;
         try
         {
@@ -819,28 +980,38 @@ namespace llaminar
         {
             LOG_WARN("[WeightLoad] output.weight load exc: " << e.what());
         }
+
         if (lm_head)
         {
+            // Successfully loaded dedicated LM head
             try
             {
+                // Check if debug override bypasses orientation enforcement
                 bool raw = debugEnv().lm_head.raw_orientation;
+
+                // Enforce expected layout (d_model x vocab_size) unless raw mode
                 if (!raw)
                     enforce_matrix_layout_compat(lm_head, config.d_model, config.vocab_size, "output.weight");
+
                 weights.lm_head = lm_head;
             }
             catch (const std::exception &e)
             {
-                LOG_WARN("[WeightLoad] lm_head orientation issue: " << e.what() << " using tied embedding");
+                // Orientation correction failed, fall back to tied embeddings
+                LOG_WARN("[WeightLoad] lm_head orientation issue: " << e.what()
+                                                                    << " using tied embedding");
                 weights.lm_head = weights.token_embedding;
             }
         }
         else
         {
+            // No dedicated LM head found, use weight tying (common in many models)
             LOG_WARN("[WeightLoad] output.weight missing; using tied embeddings as LM head");
             weights.lm_head = weights.token_embedding;
         }
 
-        // Reserve vectors
+        // === Per-Layer Weight Vectors ===
+        // Pre-allocate storage for all layer weights to avoid reallocation
         weights.attn_norm_weight.reserve(config.n_layers);
         weights.wq.reserve(config.n_layers);
         weights.wk.reserve(config.n_layers);
@@ -854,10 +1025,16 @@ namespace llaminar
         LOG_INFO("[WeightLoad] per-layer loading start layers=" << config.n_layers);
         for (int layer = 0; layer < config.n_layers; ++layer)
         {
+            // Construct tensor name prefix for this layer
             std::string prefix = "blk." + std::to_string(layer) + ".";
+
+            // --- Attention Normalization ---
+            // Load pre-attention RMSNorm gamma
             auto attn_norm = loader.loadTensor(prefix + "attn_norm.weight");
             if (!attn_norm)
                 throw std::runtime_error("Failed to load " + prefix + "attn_norm.weight");
+
+            // Debug override: force unit gamma if requested
             if (debugEnv().output_norm.force_unit_all)
             {
                 float *g = const_cast<float *>(attn_norm->data());
@@ -866,20 +1043,30 @@ namespace llaminar
             }
             weights.attn_norm_weight.push_back(attn_norm);
 
-            auto wq = loader.loadTensor(prefix + "attn_q.weight");
-            auto wk = loader.loadTensor(prefix + "attn_k.weight");
-            auto wv = loader.loadTensor(prefix + "attn_v.weight");
-            auto wo = loader.loadTensor(prefix + "attn_output.weight");
+            // --- Attention Projection Matrices ---
+            // Load Q, K, V, and output projection weights
+            auto wq = loader.loadTensor(prefix + "attn_q.weight");      // Query projection
+            auto wk = loader.loadTensor(prefix + "attn_k.weight");      // Key projection
+            auto wv = loader.loadTensor(prefix + "attn_v.weight");      // Value projection
+            auto wo = loader.loadTensor(prefix + "attn_output.weight"); // Output projection
+
+            // Validate all attention weights loaded successfully
             if (!wq || !wk || !wv || !wo)
                 throw std::runtime_error("Failed to load attention weights for layer " + std::to_string(layer));
+
+            // Store attention weights for this layer
             weights.wq.push_back(wq);
             weights.wk.push_back(wk);
             weights.wv.push_back(wv);
             weights.wo.push_back(wo);
 
+            // --- FFN Normalization ---
+            // Load pre-FFN RMSNorm gamma
             auto ffn_norm = loader.loadTensor(prefix + "ffn_norm.weight");
             if (!ffn_norm)
                 throw std::runtime_error("Failed to load " + prefix + "ffn_norm.weight");
+
+            // Debug override: force unit gamma if requested
             if (debugEnv().output_norm.force_unit_all)
             {
                 float *g = const_cast<float *>(ffn_norm->data());
@@ -888,11 +1075,17 @@ namespace llaminar
             }
             weights.ffn_norm_weight.push_back(ffn_norm);
 
-            auto w_gate = loader.loadTensor(prefix + "ffn_gate.weight");
-            auto w_up = loader.loadTensor(prefix + "ffn_up.weight");
-            auto w_down = loader.loadTensor(prefix + "ffn_down.weight");
+            // --- FFN Projection Matrices (SwiGLU) ---
+            // Load gate, up, and down projection weights for SwiGLU activation
+            auto w_gate = loader.loadTensor(prefix + "ffn_gate.weight"); // Gate projection
+            auto w_up = loader.loadTensor(prefix + "ffn_up.weight");     // Up projection
+            auto w_down = loader.loadTensor(prefix + "ffn_down.weight"); // Down projection
+
+            // Validate all FFN weights loaded successfully
             if (!w_gate || !w_up || !w_down)
                 throw std::runtime_error("Failed to load FFN weights for layer " + std::to_string(layer));
+
+            // Store FFN weights for this layer
             weights.w_gate.push_back(w_gate);
             weights.w_up.push_back(w_up);
             weights.w_down.push_back(w_down);
@@ -1077,13 +1270,33 @@ namespace llaminar
 
     bool DistributedTransformerPipeline::validate(const ModelWeights &w) const
     {
-        auto check_vec = [&](const std::vector<std::shared_ptr<TensorBase>> &v, const char *name)
-        { if((int)v.size()!=config_.n_layers){ LOG_ERROR("Weights vector size mismatch for "<<name); return false;} for(size_t i=0;i<v.size();++i) if(!v[i]) { LOG_ERROR("Null weight in "<<name<<" index="<<i); return false; } return true; };
+        // Helper: validate a vector of per-layer tensors
+        auto check_vec = [&](const std::vector<std::shared_ptr<TensorBase>> &v, const char *name) -> bool
+        {
+            if ((int)v.size() != config_.n_layers)
+            {
+                LOG_ERROR("Weights vector size mismatch for " << name << " expected=" << config_.n_layers << " got=" << v.size());
+                return false;
+            }
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                if (!v[i])
+                {
+                    LOG_ERROR("Null weight in " << name << " index=" << i);
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // Core singleton tensors
         if (!w.token_embedding || !w.output_norm_weight || !w.lm_head)
         {
             LOG_ERROR("Missing core weights (embedding/output_norm/lm_head)");
             return false;
         }
+
+        // Per-layer collections
         if (!check_vec(w.attn_norm_weight, "attn_norm_weight"))
             return false;
         if (!check_vec(w.wq, "wq"))
@@ -1102,6 +1315,7 @@ namespace llaminar
             return false;
         if (!check_vec(w.w_down, "w_down"))
             return false;
+
         return true;
     }
 
@@ -1189,42 +1403,113 @@ namespace llaminar
         int world_size = getSize();
         if (seq_len < world_size && !force_full_layer_capture)
         {
+            // Increment fast path counter for diagnostics
             small_seq_fast_path_calls_.fetch_add(1, std::memory_order_relaxed);
+
+            // Only rank 0 executes the replicated forward pass
             if (getRank() == 0)
             {
+                // Log diagnostic bypass if needed
                 if (force_full_layer_capture)
                 {
                     LOG_INFO("[LayerTokenDiffDiag] bypass small_seq_fast_path due to replay_compare instrumentation");
                 }
+
+                // Allocate output tensor if needed
                 if (!output || output->shape().size() != 2 || output->shape()[0] != seq_len || output->shape()[1] != config_.vocab_size)
                     output = createLocalTensor({seq_len, config_.vocab_size});
-                // Naive local forward (embedding + simplified transformer) from legacy path (trimmed diagnostics)
+
+                // === Naive local forward pass (legacy simplified path) ===
+
+                // Get embedding table pointer
                 auto embed_data = weights.token_embedding->data();
-                std::vector<float> hidden(seq_len * config_.d_model, 0.f), tmp(seq_len * config_.d_model, 0.f);
+
+                // Allocate working buffers for hidden states
+                std::vector<float> hidden(seq_len * config_.d_model, 0.f);
+                std::vector<float> tmp(seq_len * config_.d_model, 0.f);
+
+                // Define inline helper lambdas for basic operations
+
+                // RMSNorm: normalize rows and scale by gamma
                 auto rmsnorm = [&](std::vector<float> &mat, const float *wn)
-                { kernels::RMSNormExecOptions opts; kernels::rmsnorm_row_major_fused(mat.data(), wn, mat.data(), (size_t)seq_len, (size_t)config_.d_model, config_.eps, kernels::GammaMode::REPLICATED, 0, opts); };
+                {
+                    kernels::RMSNormExecOptions opts;
+                    kernels::rmsnorm_row_major_fused(mat.data(), wn, mat.data(),
+                                                     (size_t)seq_len, (size_t)config_.d_model,
+                                                     config_.eps, kernels::GammaMode::REPLICATED, 0, opts);
+                };
+
+                // Matrix multiplication: C = A * B (naive implementation)
                 auto matmul = [&](const std::vector<float> &A, const float *B, int k, int n, std::vector<float> &C)
-                { C.assign(seq_len*n,0.f); for(int i=0;i<seq_len;++i){ const float *a=&A[i*k]; float *crow=&C[i*n]; for(int kk=0;kk<k;++kk){ float aval=a[kk]; const float *bcol=&B[kk*n]; for(int j=0;j<n;++j) crow[j]+=aval*bcol[j]; } } };
+                {
+                    C.assign(seq_len * n, 0.f);
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        const float *a = &A[i * k];
+                        float *crow = &C[i * n];
+                        for (int kk = 0; kk < k; ++kk)
+                        {
+                            float aval = a[kk];
+                            const float *bcol = &B[kk * n];
+                            for (int j = 0; j < n; ++j)
+                                crow[j] += aval * bcol[j];
+                        }
+                    }
+                };
+
+                // Element-wise addition: A += B
                 auto elementwise_add = [&](std::vector<float> &A, const std::vector<float> &B)
-                { for(size_t i=0;i<A.size();++i) A[i]+=B[i]; };
+                {
+                    for (size_t i = 0; i < A.size(); ++i)
+                        A[i] += B[i];
+                };
+
+                // Sigmoid activation
                 auto sigmoid = [](float x)
-                { return 1.f / (1.f + std::exp(-x)); };
+                {
+                    return 1.f / (1.f + std::exp(-x));
+                };
+
+                // SwiGLU activation: out = up * sigmoid(gate)
                 auto swiglu = [&](const std::vector<float> &up, const std::vector<float> &gate, std::vector<float> &out)
-                { out.resize(up.size()); for(size_t i=0;i<up.size();++i) out[i]=up[i]*sigmoid(gate[i]); };
+                {
+                    out.resize(up.size());
+                    for (size_t i = 0; i < up.size(); ++i)
+                        out[i] = up[i] * sigmoid(gate[i]);
+                };
+
+                // --- Embedding lookup ---
+                // Copy token embeddings into hidden state buffer
                 for (int t = 0; t < seq_len; ++t)
                 {
                     int tok = token_ids[t];
-                    std::memcpy(&hidden[t * config_.d_model], &embed_data[tok * config_.d_model], sizeof(float) * config_.d_model);
+                    std::memcpy(&hidden[t * config_.d_model],
+                                &embed_data[tok * config_.d_model],
+                                sizeof(float) * config_.d_model);
                 }
+                // --- Per-layer transformer blocks ---
                 for (int layer = 0; layer < config_.n_layers; ++layer)
                 {
+                    // === Attention Block ===
+
+                    // Pre-attention normalization
                     rmsnorm(hidden, weights.attn_norm_weight[layer]->data());
+
+                    // Project to Q, V (simplified: no K, using Q approximation)
                     std::vector<float> Q, V, context;
-                    matmul(hidden, weights.wq[layer]->data(), config_.d_model, config_.n_head * config_.head_dim, tmp);
+                    matmul(hidden, weights.wq[layer]->data(), config_.d_model,
+                           config_.n_head * config_.head_dim, tmp);
                     Q = tmp;
-                    matmul(hidden, weights.wv[layer]->data(), config_.d_model, config_.n_head_kv * config_.head_dim, tmp);
+
+                    // Project to V (value)
+                    matmul(hidden, weights.wv[layer]->data(), config_.d_model,
+                           config_.n_head_kv * config_.head_dim, tmp);
                     V = tmp;
+
+                    // Simplified attention: use Q as initial context
                     context = Q;
+
+                    // Compute mean pooling of V across sequence
                     int ctx_dim = config_.n_head * config_.head_dim;
                     std::vector<float> v_mean(ctx_dim, 0.f);
                     for (int i = 0; i < seq_len; ++i)
@@ -1235,45 +1520,86 @@ namespace llaminar
                     }
                     for (int j = 0; j < ctx_dim; ++j)
                         v_mean[j] /= std::max(1, seq_len);
+
+                    // Blend context with V mean (simplified attention)
                     for (int i = 0; i < seq_len; ++i)
                     {
                         float *crow = &context[i * ctx_dim];
                         for (int j = 0; j < ctx_dim; ++j)
                             crow[j] = 0.5f * (crow[j] + v_mean[j]);
                     }
+
+                    // Output projection
                     matmul(context, weights.wo[layer]->data(), ctx_dim, config_.d_model, tmp);
+
+                    // Residual connection
                     elementwise_add(tmp, hidden);
                     hidden = tmp;
+
+                    // === FFN Block ===
+
+                    // Pre-FFN normalization
                     rmsnorm(hidden, weights.ffn_norm_weight[layer]->data());
+
+                    // Gate projection
                     std::vector<float> gate, up, swiglu_out;
                     matmul(hidden, weights.w_gate[layer]->data(), config_.d_model, config_.d_ff, gate);
+
+                    // Up projection
                     matmul(hidden, weights.w_up[layer]->data(), config_.d_model, config_.d_ff, up);
+
+                    // SwiGLU activation
                     swiglu(up, gate, swiglu_out);
+
+                    // Down projection
                     matmul(swiglu_out, weights.w_down[layer]->data(), config_.d_ff, config_.d_model, tmp);
+
+                    // Residual connection
                     elementwise_add(tmp, hidden);
                     hidden = tmp;
                 }
+                // --- Final Output ---
+
+                // Final normalization before LM head
                 rmsnorm(hidden, weights.output_norm_weight->data());
+
+                // Project to vocabulary logits
                 std::vector<float> logits;
                 matmul(hidden, weights.lm_head->data(), config_.d_model, config_.vocab_size, logits);
-                std::memcpy(const_cast<float *>(output->data()), logits.data(), sizeof(float) * logits.size());
+
+                // Copy logits to output tensor
+                std::memcpy(const_cast<float *>(output->data()), logits.data(),
+                            sizeof(float) * logits.size());
+
+                // Clean up baseline registry if comparison was enabled
                 if (compare_baseline)
                 {
                     PrefillBaselineRegistry::instance().clear();
                 }
+
+                // Update KV cache state (though not used in fast path)
                 if (use_kv_cache_)
                 {
                     kv_cache_state_.used_tokens = seq_len;
                     n_past_ = seq_len;
                 }
             }
-            // Broadcast output to all ranks
+            // --- Broadcast output to all ranks ---
+            // Other ranks need to allocate output buffer to receive broadcast
             if (getRank() != 0)
             {
-                if (!output || output->shape().size() != 2 || output->shape()[0] != seq_len || output->shape()[1] != config_.vocab_size)
+                if (!output || output->shape().size() != 2 ||
+                    output->shape()[0] != seq_len || output->shape()[1] != config_.vocab_size)
+                {
                     output = createLocalTensor({seq_len, config_.vocab_size});
+                }
             }
-            checkMPIError(MPI_Bcast(const_cast<float *>(output->data()), seq_len * config_.vocab_size, MPI_FLOAT, 0, getComm()), "MPI_Bcast small-seq output");
+
+            // Broadcast result from rank 0 to all other ranks
+            checkMPIError(MPI_Bcast(const_cast<float *>(output->data()),
+                                    seq_len * config_.vocab_size, MPI_FLOAT, 0, getComm()),
+                          "MPI_Bcast small-seq output");
+
             return true;
         }
 
@@ -1451,11 +1777,31 @@ namespace llaminar
         return true;
     }
 
+    /**
+     * @brief Incrementally decode a single token using the existing KV cache (fast path).
+     *
+     * High-level stages:
+     *  1. Environment + guard checks (disable flags, kv cache availability, capacity growth)
+     *  2. Single-token embedding allocation (shape 1 x d_model)
+     *  3. Per-layer forward (attention + FFN) with stage capture for diagnostics
+     *  4. Output projection -> logits (1 x vocab)
+     *  5. Optional incremental hidden / cache tracing
+     *  6. Optional replay parity comparison (rebuild full prefix and diff captured stages)
+     *
+     * Replay Parity Mode (layer_replay_compare):
+     *  When enabled, after producing incremental rows for the new token we reconstruct a full
+     *  prefix sequence (all previous tokens + new token) in a fresh pipeline instance and capture
+     *  only the final token's stages. We then diff stage-by-stage to identify the first divergence.
+     *
+     * Return semantics:
+     *  true  -> incremental path executed (logits written to output_logits, parity check optional)
+     *  false -> caller should fall back to full prefill+decode (e.g. guards, capacity failure)
+     */
     bool DistributedTransformerPipeline::incrementalDecodeToken(int token_id,
                                                                 const ModelWeights &weights,
                                                                 std::shared_ptr<TensorBase> &output_logits)
     {
-        // Incremental decode ported from legacy pipeline (single-token fast path)
+        // === Stage 1: Environment + guard checks ===
         const auto &env = debugEnv();
         if (getRank() == 0)
         {
@@ -1472,14 +1818,10 @@ namespace llaminar
             LOG_INFO("[IncrEarlyReturn] rank=" << getRank() << " reason=disabled_incremental");
             return false;
         }
-        // Diagnostic override: ensure attention/ffn not ablated when doing layer replay compare, so we can capture full stage set.
-        bool diag_force_full_layers = env.pipeline.layer_token_diff && env.pipeline.layer_replay_compare;
-        bool saved_ablate_attention = false, saved_ablate_ffn = false;
-        if (diag_force_full_layers)
-        {
-            // We cannot mutate global snapshot; instead we branch locally by guarding ablation checks later.
-            // We'll signal via a local flag used below where ablation is checked.
-        }
+        // If doing layer replay compare we must still run full layers (ablation ignored locally)
+        const bool diag_force_full_layers = env.pipeline.layer_token_diff && env.pipeline.layer_replay_compare;
+        (void)diag_force_full_layers; // (currently only informational; ablation checks occur in executeTransformerLayer)
+
         if (!use_kv_cache_)
         {
             LOG_INFO("[IncrEarlyReturn] rank=" << getRank() << " reason=kv_cache_disabled");
@@ -1495,25 +1837,27 @@ namespace llaminar
             LOG_ERROR("incrementalDecodeToken: missing token embedding");
             return false;
         }
-        // Ensure capacity for new token write (position = n_past_)
+        // Capacity (position == n_past_)
         if (!ensureKVCapacity(n_past_ + 1))
         {
             LOG_WARN("[IncrEarlyReturn] rank=" << getRank() << " reason=ensureKVCapacity_failed requested=" << (n_past_ + 1));
             return false;
         }
-        // Embed single token (1 x d_model)
+
+        // === Stage 2: Single-token embedding ===
         auto current = embedSingleToken(token_id, weights.token_embedding);
         if (!current)
             return false;
-        // Record starting offset for layer token diff rows (so we can isolate incremental rows for this token)
         size_t layer_rows_offset_before = last_layer_token_rows_.size();
         if (env.pipeline.incr_trace && getRank() == 0)
         {
             LOG_INFO("[IncrTrace] start token=" << token_id << " n_past=" << n_past_ << " use_kv=1");
         }
         setStageDecode();
-        int position = n_past_;
+        const int position = n_past_;
         setSequencePosition(position);
+
+        // === Stage 3: Layer forward (seq_len == 1) ===
         const int seq_len = 1;
         auto layer_output = createLocalTensor({seq_len, config_.d_model});
         if (!layer_output)
@@ -1529,12 +1873,11 @@ namespace llaminar
         }
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
-            // Force per-layer attention kernel sequence position and expected window (prefill len + decoded count)
+            // Update attention kernel context (expected window = committed + 1)
             if (auto attn = dynamic_cast<MPIAttentionKernel *>(getKernel("attention")))
             {
                 attn->setSequencePosition(n_past_);
                 attn->setLayerIndex(layer);
-                // expected window = current committed tokens (n_past_) + 1 (this token)
                 attn->setExpectedTotalWindow((size_t)n_past_ + 1);
             }
             if (!executeTransformerLayer(layer, current, weights, layer_output))
@@ -1545,10 +1888,10 @@ namespace llaminar
             current = layer_output;
             if (env.pipeline.incr_cache_trace && getRank() == 0 && use_kv_cache_)
             {
-                // Minimal KV preview (first 4 floats of first head) assuming contiguous per-token layout
+                // Minimal KV preview (first 4 values of first head at this position)
                 if (layer < (int)k_cache_.size() && k_cache_[layer])
                 {
-                    int head_dim = config_.head_dim;
+                    const int head_dim = config_.head_dim;
                     size_t base = (size_t)position * head_dim;
                     float k_prev[4] = {0}, v_prev[4] = {0};
                     auto &K = k_cache_[layer];
@@ -1558,15 +1901,20 @@ namespace llaminar
                         k_prev[i] = K->data()[base + i];
                         v_prev[i] = V->data()[base + i];
                     }
-                    LOG_INFO("[IncrCacheTrace] layer=" << layer << " pos=" << position << " k0=[" << k_prev[0] << "," << k_prev[1] << "," << k_prev[2] << "," << k_prev[3] << "] v0=[" << v_prev[0] << "," << v_prev[1] << "," << v_prev[2] << "," << v_prev[3] << "]");
+                    LOG_INFO("[IncrCacheTrace] layer=" << layer << " pos=" << position << " k0=[" << k_prev[0] << "," << k_prev[1] << "," << k_prev[2] << "," << k_prev[3]
+                                                       << "] v0=[" << v_prev[0] << "," << v_prev[1] << "," << v_prev[2] << "," << v_prev[3] << "]");
                 }
             }
         }
+
+        // === Stage 4: Output projection ===
         if (!executeOutputProjection(current, weights, logits))
         {
             LOG_ERROR("incrementalDecodeToken: output projection failed");
             return false;
         }
+
+        // === Stage 5: Optional hidden preview ===
         if (env.pipeline.incr_hidden_trace && getRank() == 0)
         {
             int d = config_.d_model;
@@ -1587,532 +1935,177 @@ namespace llaminar
         if (use_kv_cache_)
             kv_cache_state_.used_tokens = n_past_;
 
-        // Optional replay compare: run full replay for sequence (previous tokens + new token) and diff per-layer last-row.
-        // Isolation model: copy incremental rows, clear global vector, run replay to capture only replay rows,
-        // then restore incremental rows before diffing.
+        // === Stage 6: Optional replay parity comparison ===
         const auto &penv = debugEnv().pipeline;
         if (penv.layer_token_diff && penv.layer_replay_compare)
         {
-            // Symmetry enforcement: all ranks must be here; verify via Allreduce.
+            // Symmetry: ensure all ranks participate
             int local_flag = 1;
             int global_sum = 0;
             MPI_Allreduce(&local_flag, &global_sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-            int world_size = getSize();
-            if (global_sum != world_size)
+            if (global_sum != getSize())
             {
                 if (getRank() == 0)
-                    LOG_WARN("[LayerReplayIsoSkip] not all ranks in incremental path (global_sum=" << global_sum << " world=" << world_size << ") skipping isolation token_pos=" << n_past_);
+                    LOG_WARN("[LayerReplayIsoSkip] rank quorum mismatch global_sum=" << global_sum << " world=" << getSize());
             }
             else
             {
                 if (getRank() == 0)
-                {
-                    LOG_INFO("[LayerReplayIsoEnter] triggering isolation replay compare token_pos=" << n_past_ << " rows_size=" << last_layer_token_rows_.size());
-                }
+                    LOG_INFO("[LayerReplayIsoEnter] token_pos=" << n_past_ << " rows_size=" << last_layer_token_rows_.size());
                 try
                 {
-                    // Full prefix reconstruction (Option A): rebuild all prior tokens plus this new token.
-                    // At this point n_past_ was just incremented above (now equals total committed tokens).
-                    // current_tokens_ has NOT yet been updated with token_id (push_back happens later only if incremental path succeeded).
-                    // So we build a replay sequence consisting of: prior committed tokens (n_past_-1) + this new token.
+                    // Build replay prefix: prior tokens + new token (n_past_ total length)
                     std::vector<int> replay_seq;
                     replay_seq.reserve((size_t)n_past_);
-                    if ((int)current_tokens_.size() != n_past_ - 1 && getRank() == 0)
-                        LOG_WARN("[LayerReplayIsoGuard] current_tokens_.size()=" << current_tokens_.size() << " expected=" << (n_past_ - 1));
-                    // Copy prior tokens
                     int prior_count = std::min((int)current_tokens_.size(), n_past_ - 1);
                     for (int i = 0; i < prior_count; ++i)
                         replay_seq.push_back(current_tokens_[i]);
-                    // Append the new token we are decoding now
                     replay_seq.push_back(token_id);
                     if ((int)replay_seq.size() != n_past_ && getRank() == 0)
-                        LOG_WARN("[LayerReplayIsoGuard] replay_seq.size()=" << replay_seq.size() << " n_past_=" << n_past_);
-                    if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoTrace] full_replay_prefix len=" << replay_seq.size());
-                    // Collect incremental rows for THIS token & pipeline (rank 0 for decision)
+                        LOG_WARN("[LayerReplayIsoGuard] replay_seq.size()=" << replay_seq.size() << " expected=" << n_past_);
+
+                    // Collect incremental rows for THIS token
                     std::vector<LayerTokenDiffRow> inc_rows;
-                    inc_rows.reserve(16);
                     if (getRank() == 0)
                     {
-                        LOG_INFO("[LayerReplayIsoTrace] collecting_inc_rows start offset=" << layer_rows_offset_before << " total_rows=" << last_layer_token_rows_.size());
                         for (size_t i = layer_rows_offset_before; i < last_layer_token_rows_.size(); ++i)
                         {
                             const auto &r = last_layer_token_rows_[i];
                             if (!r.pipeline || r.pipeline == this)
                                 inc_rows.push_back(r);
                         }
-                        // Retro scan: include any internal attention rows for current token (seq_len==replay_seq.size())
-                        // that may have been captured before offset (defensive; should normally be none, but adds robustness).
-                        int retro_added = 0;
+                        // Retro add internal attention rows earlier than offset with matching seq_len
                         for (size_t i = 0; i < layer_rows_offset_before; ++i)
                         {
                             const auto &r = last_layer_token_rows_[i];
-                            if (!(r.stage.rfind("attn_int_", 0) == 0))
-                                continue;
-                            if (!r.incremental)
-                                continue;
-                            if (r.seq_len != (int)replay_seq.size())
-                                continue;
-                            bool exists = false;
-                            for (auto &e : inc_rows)
-                                if (&e == &r)
-                                {
-                                    exists = true;
-                                    break;
-                                }
-                            if (exists)
-                                continue;
-                            inc_rows.push_back(r);
-                            ++retro_added;
+                            if (r.incremental && r.seq_len == (int)replay_seq.size() && r.stage.rfind("attn_int_", 0) == 0)
+                                inc_rows.push_back(r);
                         }
-                        if (retro_added > 0)
-                            LOG_INFO("[LayerReplayIsoTrace] retro_added_internal_rows=" << retro_added);
-                        // List stages gathered
-                        if (penv.layer_token_diff_verbose)
-                        {
-                            std::ostringstream oss;
-                            oss << "[LayerReplayIsoTrace] inc_rows_list=";
-                            for (size_t i = 0; i < inc_rows.size(); ++i)
-                            {
-                                oss << inc_rows[i].stage;
-                                if (i + 1 < inc_rows.size())
-                                    oss << ",";
-                            }
-                            LOG_INFO(oss.str());
-                        }
-                        LOG_INFO("[LayerReplayIsoTrace] collected_inc_rows count=" << inc_rows.size());
                     }
-                    bool run_replay = true; // Force replay; we want rep rows regardless of inc row capture
                     if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoDecision] forced run_replay=1 inc_rows=" << inc_rows.size());
+                        last_layer_token_rows_.clear(); // prepare for replay capture
 
-                    if (penv.layer_token_diff_verbose && getRank() == 0)
-                    {
-                        LOG_INFO("[LayerReplayIsoDiag] inc_rows=" << inc_rows.size() << " total_rows_before=" << last_layer_token_rows_.size());
-                    }
-                    // Only rank 0 manipulates diagnostic row buffer; others just execute replay
-                    if (getRank() == 0)
-                        last_layer_token_rows_.clear();
-                    if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoExecPrep] creating replay pipeline token_pos=" << (replay_seq.size() - 1));
+                    // Execute replay in fresh pipeline
                     auto replay_pipe = createDistributedTransformerPipeline(config_);
-                    if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoExecPrep] created replay pipeline ptr=" << (void *)replay_pipe.get());
                     auto replay_logits = TensorFactory::create_simple({(int)replay_seq.size(), config_.vocab_size});
-                    if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoExecCall] about to execute replay pipeline seq_len=" << replay_seq.size());
                     bool replay_ok = replay_pipe && replay_pipe->execute(replay_seq, weights, replay_logits);
-                    if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoExecCall] returned from replay pipeline");
                     std::vector<LayerTokenDiffRow> rep_rows;
                     if (getRank() == 0)
                     {
-                        LOG_INFO("[LayerReplayIsoExec] replay_ok=" << (replay_ok ? 1 : 0) << " rep_rows_after_execute=" << last_layer_token_rows_.size());
-                        // Filter replay rows to only the LAST token (absolute pos = n_past_-1) by selecting rows whose seq_len == replay_seq.size()
-                        // Assumption: internal capture sets seq_len to total sequence length seen by kernel at capture time.
                         for (auto &r_all : last_layer_token_rows_)
-                        {
                             if (r_all.seq_len == (int)replay_seq.size())
                                 rep_rows.push_back(r_all);
-                        }
                         if (rep_rows.empty())
-                            LOG_WARN("[LayerReplayIsoFilter] no final-token replay rows found (expected seq_len=" << replay_seq.size() << ") using unfiltered set");
-                        if (rep_rows.empty())
-                            rep_rows = last_layer_token_rows_; // fallback to prior behavior
-                        // Restore incremental rows for future tokens (preserve only inc_rows)
+                            rep_rows = last_layer_token_rows_; // fallback
+                        // Restore only incremental rows for future tokens
                         last_layer_token_rows_.clear();
                         last_layer_token_rows_.insert(last_layer_token_rows_.end(), inc_rows.begin(), inc_rows.end());
-                    }
-                    // No barrier here; rely on mirrored execution order.
-                    if (!replay_ok)
-                    {
-                        if (getRank() == 0)
+                        if (!replay_ok)
                             LOG_WARN("[LayerReplayIso] replay execute failed");
                     }
-                    else if (getRank() == 0 && rep_rows.empty())
+
+                    // Pairing + diff (rank 0)
+                    if (getRank() == 0 && !rep_rows.empty())
                     {
-                        LOG_WARN("[LayerReplayIso] replay produced no rows");
-                    }
-                    // (Removed duplicate second incremental collection block)
-                    // Build maps layer->stage rows
-                    auto order = [](const std::string &v)
-                    {
-							// Fine-grained internal attention stages inserted between qkv_in and attn_out
-							if(v=="attn_qkv_in") return 0;
-							if(v=="attn_int_q_proj") return 1;
-							if(v=="attn_int_k_proj") return 2;
-							if(v=="attn_int_q_rope") return 3;
-							if(v=="attn_int_k_rope") return 4;
-							if(v=="attn_int_context") return 5;
-							if(v=="attn_int_context_full") return 6; // incremental reconstructed window
-							if(v=="attn_int_out_partial") return 7;
-							if(v=="attn_out") return 8;
-							if(v=="attn_residual") return 9;
-							if(v=="ffn_norm") return 10;
-							if(v=="ffn_out") return 11;
-							if(v=="layer_output") return 12;
-							// Legacy / unused placeholder retained for compatibility
-							if(v=="attn_norm") return 100;
-							return 500; };
-                    struct StagePair
-                    {
-                        const LayerTokenDiffRow *inc;
-                        const LayerTokenDiffRow *rep;
-                    };
-                    std::map<int, std::vector<StagePair>> layer_pairs;
-                    if (getRank() == 0)
-                        LOG_INFO("[LayerReplayIsoSentinel2] layer_pairs_container_initialized layers_inc=" << inc_rows.size());
-                    for (auto &ir : inc_rows)
-                        layer_pairs[ir.layer];
-                    // DEBUG: count internal incremental rows before pairing
-                    if (penv.layer_token_diff_verbose && getRank() == 0)
-                    {
-                        int inc_int_ct = 0;
+                        auto order = [](const std::string &v)
+                        {
+                            if (v == "attn_qkv_in") return 0;
+                            if (v == "attn_int_q_proj") return 1;
+                            if (v == "attn_int_k_proj") return 2;
+                            if (v == "attn_int_q_rope") return 3;
+                            if (v == "attn_int_k_rope") return 4;
+                            if (v == "attn_int_context") return 5;
+                            if (v == "attn_int_context_full") return 6;
+                            if (v == "attn_int_out_partial") return 7;
+                            if (v == "attn_out") return 8;
+                            if (v == "attn_residual") return 9;
+                            if (v == "ffn_norm") return 10;
+                            if (v == "ffn_out") return 11;
+                            if (v == "layer_output") return 12;
+                            if (v == "attn_norm") return 100; // legacy
+                            return 500; };
+                        struct StagePair
+                        {
+                            const LayerTokenDiffRow *inc;
+                            const LayerTokenDiffRow *rep;
+                        };
+                        std::map<int, std::vector<StagePair>> layer_pairs;
                         for (auto &ir : inc_rows)
-                            if (ir.stage.rfind("attn_int_", 0) == 0)
-                                ++inc_int_ct;
-                        LOG_INFO("[LayerReplayIsoPrePairDiag] inc_internal_rows=" << inc_int_ct);
-                    }
-                    for (auto &ir : inc_rows)
-                    {
-                        if (getRank() == 0 && (&ir == &inc_rows.front()))
+                            layer_pairs[ir.layer];
+                        for (auto &ir : inc_rows)
                         {
-                            LOG_INFO("[LayerReplayIsoSentinel3] first_inc_row stage=" << ir.stage << " layer=" << ir.layer);
-                        }
-                        const LayerTokenDiffRow *rep_match = nullptr;
-                        // With filtered rep_rows containing only last token captures, we just need direct match.
-                        for (auto &rr : rep_rows)
-                        {
-                            if (rr.layer == ir.layer && rr.stage == ir.stage)
-                            {
-                                rep_match = &rr;
-                                break;
-                            }
-                        }
-                        if (!rep_match)
-                        {
-                            // Stage-only fallback
+                            const LayerTokenDiffRow *rep_match = nullptr;
                             for (auto &rr : rep_rows)
-                                if (rr.stage == ir.stage)
+                                if (rr.layer == ir.layer && rr.stage == ir.stage)
                                 {
                                     rep_match = &rr;
                                     break;
                                 }
-                        }
-                        layer_pairs[ir.layer].push_back(StagePair{&ir, rep_match});
-                    }
-                    // Diagnostic: enumerate unmatched stages (verbose mode only)
-                    if (penv.layer_token_diff_verbose && getRank() == 0)
-                    {
-                        for (auto &kv_diag : layer_pairs)
-                        {
-                            int layer = kv_diag.first;
-                            auto &pairs = kv_diag.second;
-                            std::vector<std::string> inc_only;
-                            std::vector<std::string> rep_only;
-                            // Build rep stage set for quick lookup
-                            std::vector<std::string> rep_stages;
-                            rep_stages.reserve(rep_rows.size());
-                            for (auto &rr : rep_rows)
-                                if (rr.layer == layer)
-                                    rep_stages.push_back(rr.stage);
-                            auto has_rep = [&](const std::string &s)
-                            { return std::find(rep_stages.begin(), rep_stages.end(), s) != rep_stages.end(); };
-                            for (auto &p : pairs)
-                            {
-                                if (!p.rep)
-                                    inc_only.push_back(p.inc->stage);
-                            }
-                            // Find rep-only (stages captured in replay but not in incremental set)
-                            for (auto &rr : rep_rows)
-                                if (rr.layer == layer)
-                                {
-                                    bool found = false;
-                                    for (auto &p : pairs)
-                                        if (p.inc->stage == rr.stage)
-                                        {
-                                            found = true;
-                                            break;
-                                        }
-                                    if (!found)
-                                        rep_only.push_back(rr.stage);
-                                }
-                            if (!inc_only.empty() || !rep_only.empty())
-                            {
-                                std::ostringstream oss;
-                                oss << "[LayerReplayIsoStageDiag] layer=" << layer;
-                                if (!inc_only.empty())
-                                {
-                                    oss << " inc_only=";
-                                    for (size_t i = 0; i < inc_only.size(); ++i)
+                            if (!rep_match)
+                                for (auto &rr : rep_rows)
+                                    if (rr.stage == ir.stage)
                                     {
-                                        oss << inc_only[i];
-                                        if (i + 1 < inc_only.size())
-                                            oss << ",";
+                                        rep_match = &rr;
+                                        break;
                                     }
-                                }
-                                if (!rep_only.empty())
-                                {
-                                    oss << " rep_only=";
-                                    for (size_t i = 0; i < rep_only.size(); ++i)
-                                    {
-                                        oss << rep_only[i];
-                                        if (i + 1 < rep_only.size())
-                                            oss << ",";
-                                    }
-                                }
-                                LOG_INFO(oss.str());
-                            }
+                            layer_pairs[ir.layer].push_back(StagePair{&ir, rep_match});
                         }
-                    }
-                    const double rel_l2_warn = 1e-5;
-                    bool exceed = false; // legacy flag preserved (not used for early break now)
-                    bool first_exceed_recorded = false;
-                    g_replay_first_exceed.store(false);
-                    DiffSummary first_exceed_ds{};
-                    int first_exceed_layer = 0;
-                    std::string first_exceed_stage;
-                    // Synthetic pairing pass: attach replay rows to internal incremental rows with layer=-1
-                    // that lack a rep match but have a stage starting with attn_int_. This enables diff logging
-                    // for kernel-level captures executed outside a fully indexed pipeline layer context.
-                    auto synth_pair_internal = [&]()
-                    {
-                        auto it = layer_pairs.find(-1);
-                        if (it == layer_pairs.end())
-                            return; // no synthetic bucket
-                        for (auto &sp : it->second)
+                        const double rel_l2_warn = 1e-5;
+                        bool first_exceed_recorded = false;
+                        g_replay_first_exceed.store(false);
+                        DiffSummary first_exceed_ds{};
+                        int first_exceed_layer = 0;
+                        std::string first_exceed_stage;
+                        for (auto &kv : layer_pairs)
                         {
-                            if (sp.rep)
-                                continue; // already matched (unlikely for layer -1)
-                            if (!sp.inc || sp.inc->stage.rfind("attn_int_", 0) != 0)
-                                continue;
-                            // find first replay row with same stage (any layer)
-                            for (auto &rr : rep_rows)
+                            int layer = kv.first;
+                            auto &pairs = kv.second;
+                            std::stable_sort(pairs.begin(), pairs.end(), [&](const StagePair &a, const StagePair &b)
+                                             { return order(a.inc->stage) < order(b.inc->stage); });
+                            for (auto &sp : pairs)
                             {
-                                if (rr.stage == sp.inc->stage)
-                                {
-                                    sp.rep = &rr;
-                                    break;
-                                }
-                            }
-                        }
-                    };
-                    synth_pair_internal();
-                    for (auto &kv : layer_pairs)
-                    {
-                        int layer = kv.first;
-                        auto &pairs = kv.second;
-                        std::stable_sort(pairs.begin(), pairs.end(), [&](const StagePair &a, const StagePair &b)
-                                         { return order(a.inc->stage) < order(b.inc->stage); });
-                        for (auto &sp : pairs)
-                        {
-                            if (penv.layer_token_diff_verbose && getRank() == 0 && sp.inc)
-                            {
-                                // Iteration diagnostic before any filtering logic; helps identify ordering, missing reps, or size mismatches
-                                int ord = order(sp.inc->stage);
-                                size_t rep_sz = sp.rep ? sp.rep->values.size() : 0;
-                                LOG_INFO("[LayerReplayIsoStageIterDiag] layer=" << layer
-                                                                                << " stage=" << sp.inc->stage
-                                                                                << " order=" << ord
-                                                                                << " has_rep=" << (sp.rep ? 1 : 0)
-                                                                                << " inc_size=" << sp.inc->values.size()
-                                                                                << " rep_size=" << rep_sz);
-                            }
-                            bool synth_self_pair = false;
-                            if (!sp.rep)
-                            {
-                                // Now that we filter to last token, missing rep indicates genuine capture mismatch; skip.
-                                if (penv.layer_token_diff_verbose && getRank() == 0 && sp.inc)
-                                    LOG_WARN("[LayerReplayIsoStageSkip] layer=" << layer << " stage=" << sp.inc->stage << " reason=no_final_replay_row");
-                                continue;
-                            }
-                            if (sp.inc->values.empty())
-                            {
-                                if (penv.layer_token_diff_verbose && getRank() == 0)
-                                {
-                                    LOG_INFO("[LayerReplayIsoSizeMismatch] layer=" << layer << " stage=" << sp.inc->stage << " reason=empty_inc_values");
-                                }
-                                continue;
-                            }
-                            if (!synth_self_pair && sp.rep && sp.inc->values.size() != sp.rep->values.size())
-                            {
-                                if (penv.layer_token_diff_verbose && getRank() == 0)
-                                {
-                                    LOG_INFO("[LayerReplayIsoSizeMismatch] layer=" << layer
-                                                                                   << " stage=" << sp.inc->stage
-                                                                                   << " inc_size=" << sp.inc->values.size()
-                                                                                   << " rep_size=" << (sp.rep ? sp.rep->values.size() : 0));
-                                }
-                                continue;
-                            }
-                            DiffSummary ds{};
-                            // Normal diff (no more synthetic self-pairs for internal stages once full prefix replay is used)
-                            ds = computeDiffSummary(sp.inc->values.data(), sp.rep->values.data(), sp.inc->values.size());
-                            // Always log internal stages and attn_out for layer 0; previously only attn_qkv_in was forced.
-                            if (getRank() == 0)
-                            {
-                                // New policy: Always emit all internal attention stages (attn_int_*) for every layer
-                                // plus the macro attention boundary stages (attn_qkv_in, attn_out) so we can localize
-                                // the first divergence regardless of layer index. Original behavior restricted most
-                                // stages to layer==0 which hid per-layer internal drift.
+                                if (!sp.rep)
+                                    continue; // missing replay stage
+                                if (sp.inc->values.empty() || sp.inc->values.size() != sp.rep->values.size())
+                                    continue;
+                                DiffSummary ds = computeDiffSummary(sp.inc->values.data(), sp.rep->values.data(), sp.inc->values.size());
+                                // Log policy: internal attention + boundaries always; layer0 any attn_*; others only forced types
                                 bool force_log = false;
-                                const bool is_internal_attn = (sp.inc->stage.rfind("attn_int_", 0) == 0);
-                                const bool is_attn_boundary = (sp.inc->stage == "attn_qkv_in" || sp.inc->stage == "attn_out");
-                                if (is_internal_attn || is_attn_boundary)
+                                bool internal_attn = (sp.inc->stage.rfind("attn_int_", 0) == 0);
+                                bool attn_boundary = (sp.inc->stage == "attn_qkv_in" || sp.inc->stage == "attn_out");
+                                if (internal_attn || attn_boundary)
                                     force_log = true;
-                                // Preserve previous special cases (synthetic bucket layer -1 or self-pair)
-                                if (layer == -1 && is_internal_attn)
-                                    force_log = true;
-                                if (synth_self_pair && is_internal_attn)
-                                    force_log = true;
-                                // Backward compatibility: still log any other attention-prefixed stage for layer 0
                                 if (!force_log && layer == 0 && sp.inc->stage.rfind("attn_", 0) == 0)
                                     force_log = true;
                                 if (force_log)
+                                    LOG_INFO("[LayerReplayIsoStage] token_pos=" << (replay_seq.size() - 1) << " layer=" << layer << " stage=" << sp.inc->stage << " rel_l2=" << ds.rel_l2 << " max_abs=" << ds.max_abs << " mean_abs=" << ds.mean_abs);
+                                if (ds.rel_l2 > rel_l2_warn && !first_exceed_recorded)
                                 {
-                                    LOG_INFO("[LayerReplayIsoStage] token_pos=" << (replay_seq.size() - 1)
-                                                                                << " layer=" << layer
-                                                                                << " stage=" << sp.inc->stage
-                                                                                << " rel_l2=" << ds.rel_l2
-                                                                                << " max_abs=" << ds.max_abs
-                                                                                << " mean_abs=" << ds.mean_abs);
-                                }
-                            }
-                            // Optional detailed per-stage diff logging (verbose mode)
-                            if (getRank() == 0 && penv.layer_token_diff_verbose)
-                            {
-                                // Compute simple checksum diagnostics to distinguish scale vs orientation drift
-                                long double sum_inc = 0.0L, sum_rep = 0.0L, sumsq_inc = 0.0L, sumsq_rep = 0.0L;
-                                for (size_t ci = 0; ci < sp.inc->values.size(); ++ci)
-                                {
-                                    long double ai = sp.inc->values[ci];
-                                    long double bi = sp.rep->values[ci];
-                                    sum_inc += ai;
-                                    sum_rep += bi;
-                                    sumsq_inc += ai * ai;
-                                    sumsq_rep += bi * bi;
-                                }
-                                long double l2_inc = std::sqrt((double)sumsq_inc);
-                                long double l2_rep = std::sqrt((double)sumsq_rep);
-                                LOG_INFO("[LayerReplayIsoStageVerbose] token_pos=" << (replay_seq.size() - 1)
-                                                                                   << " layer=" << layer
-                                                                                   << " stage=" << sp.inc->stage
-                                                                                   << " rel_l2=" << ds.rel_l2
-                                                                                   << " max_abs=" << ds.max_abs
-                                                                                   << " mean_abs=" << ds.mean_abs
-                                                                                   << " size=" << sp.inc->values.size()
-                                                                                   << " sum_inc=" << (double)sum_inc
-                                                                                   << " sum_rep=" << (double)sum_rep
-                                                                                   << " l2_inc=" << (double)l2_inc
-                                                                                   << " l2_rep=" << (double)l2_rep
-                                                                                   << " sum_diff=" << (double)(sum_inc - sum_rep)
-                                                                                   << " l2_ratio=" << ((l2_rep > 0) ? (double)(l2_inc / l2_rep) : 0.0));
-                            }
-                            if (ds.rel_l2 > rel_l2_warn && !first_exceed_recorded)
-                            {
-                                first_exceed_recorded = true;
-                                first_exceed_ds = ds;
-                                first_exceed_layer = layer;
-                                first_exceed_stage = sp.inc->stage;
-                                g_replay_first_exceed.store(true);
-                                if (getRank() == 0)
-                                    LOG_WARN("[LayerReplayIsoFirstExceed] token_pos=" << (replay_seq.size() - 1)
-                                                                                      << " layer=" << layer
-                                                                                      << " stage=" << sp.inc->stage
-                                                                                      << " rel_l2=" << ds.rel_l2
-                                                                                      << " max_abs=" << ds.max_abs
-                                                                                      << " worst_index=" << ds.worst_index);
-                                if (getRank() == 0 && layer == 0 && sp.inc->stage == "attn_out")
-                                {
-                                    const LayerTokenDiffRow *inc_qkv = nullptr;
-                                    const LayerTokenDiffRow *rep_qkv = nullptr;
-                                    for (auto &sp2 : pairs)
-                                        if (sp2.rep && sp2.inc->stage == "attn_qkv_in")
-                                        {
-                                            inc_qkv = sp2.inc;
-                                            rep_qkv = sp2.rep;
-                                            break;
-                                        }
-                                    if (inc_qkv && rep_qkv && layer < (int)weights.wq.size() && weights.wq[layer])
-                                    {
-                                        auto wqT = weights.wq[layer];
-                                        const auto &wshape = wqT->shape();
-                                        if (wshape.size() == 2)
-                                        {
-                                            int R = wshape[0], C = wshape[1];
-                                            int d_model = config_.d_model;
-                                            const float *wptr = wqT->data();
-                                            std::vector<float> q_inc, q_rep;
-                                            if (R == d_model)
-                                            {
-                                                q_inc.assign(C, 0.f);
-                                                q_rep.assign(C, 0.f);
-                                                for (int i = 0; i < d_model; ++i)
-                                                {
-                                                    float vi = inc_qkv->values[i];
-                                                    float vr = rep_qkv->values[i];
-                                                    const float *wrow = wptr + (size_t)i * C;
-                                                    for (int j = 0; j < C; ++j)
-                                                    {
-                                                        q_inc[j] += vi * wrow[j];
-                                                        q_rep[j] += vr * wrow[j];
-                                                    }
-                                                }
-                                            }
-                                            else if (C == d_model)
-                                            {
-                                                int proj = R;
-                                                q_inc.assign(proj, 0.f);
-                                                q_rep.assign(proj, 0.f);
-                                                for (int j = 0; j < proj; ++j)
-                                                {
-                                                    const float *wrow = wptr + (size_t)j * C;
-                                                    float ai = 0.f, ar = 0.f;
-                                                    for (int c = 0; c < C; ++c)
-                                                    {
-                                                        ai += inc_qkv->values[c] * wrow[c];
-                                                        ar += rep_qkv->values[c] * wrow[c];
-                                                    }
-                                                    q_inc[j] = ai;
-                                                    q_rep[j] = ar;
-                                                }
-                                            }
-                                            if (!q_inc.empty() && q_inc.size() == q_rep.size())
-                                            {
-                                                DiffSummary qds = computeDiffSummary(q_inc.data(), q_rep.data(), q_inc.size());
-                                                if (getRank() == 0)
-                                                    LOG_WARN("[LayerReplayIsoQProj] token_pos=" << (replay_seq.size() - 1) << " layer=0 rel_l2=" << qds.rel_l2 << " max_abs=" << qds.max_abs << " mean_abs=" << qds.mean_abs << " size=" << q_inc.size());
-                                            }
-                                        }
-                                    }
+                                    first_exceed_recorded = true;
+                                    first_exceed_ds = ds;
+                                    first_exceed_layer = layer;
+                                    first_exceed_stage = sp.inc->stage;
+                                    g_replay_first_exceed.store(true);
+                                    LOG_WARN("[LayerReplayIsoFirstExceed] token_pos=" << (replay_seq.size() - 1) << " layer=" << layer << " stage=" << sp.inc->stage << " rel_l2=" << ds.rel_l2 << " max_abs=" << ds.max_abs << " worst_index=" << ds.worst_index);
                                 }
                             }
                         }
+                        if (first_exceed_recorded)
+                        {
+                            LOG_WARN("[LayerReplayIso] token_pos=" << (replay_seq.size() - 1) << " first_exceed_layer=" << first_exceed_layer << " stage=" << first_exceed_stage << " rel_l2=" << first_exceed_ds.rel_l2 << " max_abs=" << first_exceed_ds.max_abs << " worst_index=" << first_exceed_ds.worst_index << " inc=" << first_exceed_ds.value_a << " rep=" << first_exceed_ds.value_b);
+                        }
+                        else
+                        {
+                            LOG_INFO("[LayerReplayIso] token_pos=" << (replay_seq.size() - 1) << " all_layers_all_stages_rel_l2<=1e-5");
+                        }
                     }
-                    if (first_exceed_recorded && getRank() == 0)
-                    {
-                        LOG_WARN("[LayerReplayIso] token_pos=" << (replay_seq.size() - 1)
-                                                               << " first_exceed_layer=" << first_exceed_layer
-                                                               << " stage=" << first_exceed_stage
-                                                               << " rel_l2=" << first_exceed_ds.rel_l2
-                                                               << " max_abs=" << first_exceed_ds.max_abs
-                                                               << " worst_index=" << first_exceed_ds.worst_index
-                                                               << " inc=" << first_exceed_ds.value_a
-                                                               << " rep=" << first_exceed_ds.value_b);
-                    }
-                    if (!first_exceed_recorded && getRank() == 0)
-                    {
-                        LOG_INFO("[LayerReplayIso] token_pos=" << (replay_seq.size() - 1)
-                                                               << " all_layers_all_stages_rel_l2<=" << rel_l2_warn);
-                    }
-                    // No final barrier: avoid interference with outer harness collectives.
                 }
                 catch (const std::exception &e)
                 {
                     if (getRank() == 0)
                         LOG_ERROR("[LayerReplayIso] exception: " << e.what());
                 }
-            } // end symmetry else
+            }
         }
         return true;
     }
@@ -2122,6 +2115,19 @@ namespace llaminar
 // === Section 5: COSMA fused prefill attention implementation (standalone) ===
 namespace llaminar
 {
+    /**
+     * @brief Execute fused RMSNorm + QKV + scaled masked attention using COSMA backend for prefill.
+     *
+     * Stages:
+     *  1. Descriptor setup & fused rmsnorm+qkv generation (CosmaPrefillManager)
+     *  2. Materialize normalized + Q/K/V into row-major temporary buffers
+     *  3. Apply RoPE and compute attention using optimized primitives (attention_primitives.h)
+     *  4. Output projection via adaptiveMatMul (may dispatch COSMA/local backend internally)
+     *  5. Timing capture for norm/attention/linear phases
+     *
+     * This implementation uses the optimized attention primitives from attention_primitives.cpp
+     * which provide vectorized RoPE, efficient QK score computation, and numerically stable softmax.
+     */
     bool DistributedTransformerPipeline::executePrefillAttentionCosma(int layer_idx,
                                                                       std::shared_ptr<TensorBase> &input,
                                                                       const ModelWeights &weights,
@@ -2138,6 +2144,7 @@ namespace llaminar
         const int n_kv_heads = config_.n_head_kv;
         const int total_head_dim = n_heads * head_dim;
         const int kv_head_dim = n_kv_heads * head_dim;
+        // --- Stage 1: weight descriptors for fused op ---
         auto make_desc = [&](const std::shared_ptr<TensorBase> &tensor, const std::string &id) -> WeightDescriptor
         {
             const auto &shape = tensor->shape();
@@ -2158,100 +2165,94 @@ namespace llaminar
             LOG_ERROR("COSMA fused_rmsnorm_qkv incomplete for layer " << layer_idx);
             return false;
         }
+        // --- Stage 2: materialize row-major normalized + Q K V ---
         std::vector<float> norm_buf((size_t)seq_len * hidden_size, 0.f);
         manager.to_row_major(fused.normalized, norm_buf.data());
-        std::memcpy(attn_norm_out->data(), norm_buf.data(), norm_buf.size() * sizeof(float));
-        std::vector<float> q_buf((size_t)seq_len * total_head_dim, 0.f), k_buf((size_t)seq_len * kv_head_dim, 0.f), v_buf((size_t)seq_len * kv_head_dim, 0.f);
+        std::memcpy(attn_norm_out->data(), norm_buf.data(), norm_buf.size() * sizeof(float)); // output rmsnorm
+        std::vector<float> q_buf((size_t)seq_len * total_head_dim, 0.f),
+            k_buf((size_t)seq_len * kv_head_dim, 0.f),
+            v_buf((size_t)seq_len * kv_head_dim, 0.f);
         manager.to_row_major(fused.q, q_buf.data(), true);
         manager.to_row_major(fused.k, k_buf.data(), true);
         manager.to_row_major(fused.v, v_buf.data(), true);
         timing.norm_ms = std::chrono::duration<double, std::milli>(fused_end - fused_start).count();
-        std::vector<float> context_concat((size_t)seq_len * total_head_dim, 0.f);
-        std::vector<float> q_head((size_t)seq_len * head_dim, 0.f), k_head((size_t)seq_len * head_dim, 0.f), v_head((size_t)seq_len * head_dim, 0.f);
-        std::vector<float> scores((size_t)seq_len * seq_len, 0.f), context_head((size_t)seq_len * head_dim, 0.f);
-        constexpr float theta_base = 10000.0f;
+
+        // --- Stage 3: Apply RoPE and compute attention using optimized primitives ---
         auto attention_start = std::chrono::high_resolution_clock::now();
-        for (int head = 0; head < n_heads; ++head)
+
+        // Output buffer for multi-head attention context
+        std::vector<float> context_concat((size_t)seq_len * total_head_dim, 0.f);
+
+        // Handle GQA (Grouped Query Attention) by replicating K/V heads if needed
+        if (n_kv_heads != n_heads)
         {
-            int kv_head = head % n_kv_heads;
+            // Expand K and V to match number of query heads
+            std::vector<float> k_expanded((size_t)seq_len * total_head_dim, 0.f);
+            std::vector<float> v_expanded((size_t)seq_len * total_head_dim, 0.f);
+
             for (int row = 0; row < seq_len; ++row)
             {
-                const float *q_src = q_buf.data() + (size_t)row * total_head_dim + head * head_dim;
-                const float *k_src = k_buf.data() + (size_t)row * kv_head_dim + kv_head * head_dim;
-                const float *v_src = v_buf.data() + (size_t)row * kv_head_dim + kv_head * head_dim;
-                std::memcpy(q_head.data() + (size_t)row * head_dim, q_src, head_dim * sizeof(float));
-                std::memcpy(k_head.data() + (size_t)row * head_dim, k_src, head_dim * sizeof(float));
-                std::memcpy(v_head.data() + (size_t)row * head_dim, v_src, head_dim * sizeof(float));
-            }
-            for (int row = 0; row < seq_len; ++row)
-            {
-                float *q_row = q_head.data() + (size_t)row * head_dim;
-                float *k_row = k_head.data() + (size_t)row * head_dim;
-                float position = (float)(n_past_ + row);
-                for (int dpair = 0; dpair < head_dim / 2; ++dpair)
+                for (int h = 0; h < n_heads; ++h)
                 {
-                    float theta = 1.0f / std::pow(theta_base, (2.0f * (float)dpair) / (float)head_dim);
-                    float c = std::cos(position * theta);
-                    float s = std::sin(position * theta);
-                    float q0 = q_row[2 * dpair], q1 = q_row[2 * dpair + 1];
-                    q_row[2 * dpair] = q0 * c - q1 * s;
-                    q_row[2 * dpair + 1] = q0 * s + q1 * c;
-                    float k0 = k_row[2 * dpair], k1 = k_row[2 * dpair + 1];
-                    k_row[2 * dpair] = k0 * c - k1 * s;
-                    k_row[2 * dpair + 1] = k0 * s + k1 * c;
+                    int kv_h = h % n_kv_heads; // Map query head to KV head
+
+                    // Copy this KV head's data to the expanded buffer
+                    const float *k_src = k_buf.data() + (size_t)row * kv_head_dim + kv_h * head_dim;
+                    const float *v_src = v_buf.data() + (size_t)row * kv_head_dim + kv_h * head_dim;
+
+                    float *k_dst = k_expanded.data() + (size_t)row * total_head_dim + h * head_dim;
+                    float *v_dst = v_expanded.data() + (size_t)row * total_head_dim + h * head_dim;
+
+                    std::memcpy(k_dst, k_src, head_dim * sizeof(float));
+                    std::memcpy(v_dst, v_src, head_dim * sizeof(float));
                 }
             }
-            for (int row = 0; row < seq_len; ++row)
-            {
-                const float *q_row = q_head.data() + (size_t)row * head_dim;
-                float *score_row = scores.data() + (size_t)row * seq_len;
-                float row_max = -std::numeric_limits<float>::infinity();
-                for (int col = 0; col <= row; ++col)
-                {
-                    const float *k_row = k_head.data() + (size_t)col * head_dim;
-                    float dot = 0.f;
-                    for (int d = 0; d < head_dim; ++d)
-                        dot += q_row[d] * k_row[d];
-                    float scaled = dot * scale;
-                    score_row[col] = scaled;
-                    if (scaled > row_max)
-                        row_max = scaled;
-                }
-                for (int col = row + 1; col < seq_len; ++col)
-                    score_row[col] = -std::numeric_limits<float>::infinity();
-                double denom = 0.0;
-                for (int col = 0; col <= row; ++col)
-                {
-                    float v = std::exp(score_row[col] - row_max);
-                    score_row[col] = v;
-                    denom += v;
-                }
-                float inv = denom > 0.0 ? (float)(1.0 / denom) : 1.0f;
-                for (int col = 0; col <= row; ++col)
-                    score_row[col] *= inv;
-                for (int col = row + 1; col < seq_len; ++col)
-                    score_row[col] = 0.f;
-                float *ctx_row = context_head.data() + (size_t)row * head_dim;
-                std::fill(ctx_row, ctx_row + head_dim, 0.f);
-                for (int col = 0; col <= row; ++col)
-                {
-                    const float *v_row = v_head.data() + (size_t)col * head_dim;
-                    float w = scores[(size_t)row * seq_len + col];
-                    for (int d = 0; d < head_dim; ++d)
-                        ctx_row[d] += w * v_row[d];
-                }
-            }
-            for (int row = 0; row < seq_len; ++row)
-            {
-                float *dst = context_concat.data() + (size_t)row * total_head_dim + head * head_dim;
-                const float *src = context_head.data() + (size_t)row * head_dim;
-                std::memcpy(dst, src, head_dim * sizeof(float));
-            }
+
+            // Use the attention primitives with expanded K/V
+            llaminar::attn::apply_rope(q_buf.data(), k_expanded.data(), seq_len, head_dim, n_heads,
+                                       n_past_, config_.rope_freq_base);
+            llaminar::attn::fused_attention(q_buf.data(), k_expanded.data(), v_expanded.data(),
+                                            context_concat.data(), seq_len, head_dim, n_heads,
+                                            /*causal=*/true);
         }
+        else
+        {
+            // Standard MHA: same number of query and KV heads
+            // Note: primitives expect Q/K/V with layout [seq_len, n_heads * head_dim]
+            // but our buffers have different sizes, so we need temporary expanded buffers
+            std::vector<float> k_expanded((size_t)seq_len * total_head_dim, 0.f);
+            std::vector<float> v_expanded((size_t)seq_len * total_head_dim, 0.f);
+
+            // Copy K/V to match Q layout (this is a no-op when n_kv_heads == n_heads)
+            for (int row = 0; row < seq_len; ++row)
+            {
+                std::memcpy(k_expanded.data() + (size_t)row * total_head_dim,
+                            k_buf.data() + (size_t)row * kv_head_dim,
+                            kv_head_dim * sizeof(float));
+                std::memcpy(v_expanded.data() + (size_t)row * total_head_dim,
+                            v_buf.data() + (size_t)row * kv_head_dim,
+                            kv_head_dim * sizeof(float));
+            }
+
+            // Apply RoPE to Q and K in-place
+            llaminar::attn::apply_rope(q_buf.data(), k_expanded.data(), seq_len, head_dim, n_heads,
+                                       n_past_, config_.rope_freq_base);
+
+            // Compute full attention: QK^T scores + softmax + apply to V
+            llaminar::attn::fused_attention(q_buf.data(), k_expanded.data(), v_expanded.data(),
+                                            context_concat.data(), seq_len, head_dim, n_heads,
+                                            /*causal=*/true);
+        }
+
         auto attention_end = std::chrono::high_resolution_clock::now();
         timing.attention_ms = std::chrono::duration<double, std::milli>(attention_end - attention_start).count();
+
+        // --- Stage 4: output projection ---
         auto proj_start = std::chrono::high_resolution_clock::now();
-        bool ok = adaptiveMatMul(context_concat.data(), weights.wo[layer_idx]->data(), attn_out->data(), seq_len, hidden_size, total_head_dim, true, false, false, false, 1.0f, 0.0f);
+        bool ok = adaptiveMatMul(context_concat.data(), weights.wo[layer_idx]->data(), attn_out->data(),
+                                 seq_len, hidden_size, total_head_dim, /*is_prefill=*/true,
+                                 /*is_decode=*/false, /*transposed_a=*/false, /*transposed_b=*/false,
+                                 1.0f, 0.0f);
         if (!ok)
         {
             LOG_ERROR("COSMA attention output projection failed layer=" << layer_idx);
