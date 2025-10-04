@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h" // Provides DistributedTransformerPipeline definition
 #include "adaptive_matmul.h"
 #include "logger.h"
 #include <memory>
@@ -22,7 +22,7 @@
 namespace llaminar
 {
 
-    class AdaptiveTransformerPipeline : public MPITransformerPipeline
+    class AdaptiveTransformerPipeline : public DistributedTransformerPipeline
     {
     private:
         std::unique_ptr<AdaptiveMatMulManager> matmul_manager_;
@@ -30,7 +30,7 @@ namespace llaminar
 
     public:
         AdaptiveTransformerPipeline(const TransformerLayerConfig &config, bool enable_logging = true)
-            : MPITransformerPipeline(config), enable_performance_logging_(enable_logging)
+            : DistributedTransformerPipeline(config), enable_performance_logging_(enable_logging)
         {
             matmul_manager_ = std::make_unique<AdaptiveMatMulManager>();
 

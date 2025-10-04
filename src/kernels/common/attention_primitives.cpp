@@ -10,6 +10,9 @@
 #include <cstring>
 #include <unordered_map>
 #include <chrono>
+#include <array>
+#include <sstream>
+#include <iomanip>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -17,6 +20,7 @@
 #include "utils/debug_env.h"
 #include "kernels/common/attention_primitives.h"
 #include "kernels/common/softmax_core.h"
+#include "logger.h"
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -41,11 +45,34 @@ namespace llaminar::attn
 
     void apply_rope(float *q, float *k, int seq_len, int head_dim, int heads, int n_past, float freq_base)
     {
+        // Unconditional lightweight trace (first few invocations) to verify this path executes in parity tests.
+        static int rope_call_count = 0;
+        if (rope_call_count < 8)
+        {
+            LOG_WARN("[RoPETraceCall] idx=" << rope_call_count << " seq_len=" << seq_len << " heads=" << heads << " head_dim=" << head_dim << " n_past=" << n_past << " freq_base=" << freq_base);
+        }
+        ++rope_call_count;
         const auto &env = llaminar::debugEnv().attention;
         const int pairs = head_dim / 2;
         std::vector<float> theta(pairs);
         for (int p = 0; p < pairs; ++p)
             theta[p] = 1.f / std::pow(freq_base, (2.f * p) / head_dim);
+
+        bool diag = llaminar::debugEnv().attention.internal_diff && llaminar::debugEnv().pipeline.layer_token_diff;
+        int preview = std::min(head_dim * heads, 8);
+        std::array<float, 8> q_before{};
+        std::array<float, 8> k_before{};
+        q_before.fill(0.f);
+        k_before.fill(0.f);
+        if (diag && seq_len > 0 && preview > 0)
+        {
+            size_t row_offset = (size_t)(seq_len - 1) * heads * head_dim; // last token row
+            for (int i = 0; i < preview; ++i)
+            {
+                q_before[i] = q[row_offset + i];
+                k_before[i] = k[row_offset + i];
+            }
+        }
 
         const size_t total_elems = (size_t)heads * seq_len * head_dim;
         // Auto-tune cache: decide best path per (heads, head_dim, seq_len) once per process.
@@ -573,6 +600,152 @@ namespace llaminar::attn
                     kh[i0] = k0 * cs - k1 * sn;
                     kh[i1] = k0 * sn + k1 * cs;
                 }
+            }
+        }
+        if (diag && seq_len > 0 && preview > 0)
+        {
+            size_t row_offset = (size_t)(seq_len - 1) * heads * head_dim;
+            std::array<float, 8> q_after{};
+            std::array<float, 8> k_after{};
+            q_after.fill(0.f);
+            k_after.fill(0.f);
+            for (int i = 0; i < preview; ++i)
+            {
+                q_after[i] = q[row_offset + i];
+                k_after[i] = k[row_offset + i];
+            }
+            long double l2b = 0, l2d = 0;
+            for (int i = 0; i < preview; ++i)
+            {
+                long double b = q_before[i];
+                long double d = q_after[i] - b;
+                l2b += b * b;
+                l2d += d * d;
+            }
+            double rel_move = (l2b > 0) ? std::sqrt((double)l2d / (double)l2b) : 0.0;
+            int pos_last = n_past + seq_len - 1;
+            float theta0 = (pairs > 0) ? theta[0] : 0.f;
+            float angle0 = theta0 * pos_last;
+            float cs = std::cos(angle0), sn = std::sin(angle0);
+
+            // Rotation correctness classification (only emit once per mode to reduce noise)
+            bool is_prefill = (n_past == 0 && seq_len > 1);
+            bool is_incremental = (n_past > 0 && seq_len == 1);
+            static bool emitted_prefill = false;
+            static bool emitted_incremental = false;
+            std::string classification = "skipped";
+            double best_rel_err = 0.0;
+            if ((is_prefill && !emitted_prefill) || (is_incremental && !emitted_incremental))
+            {
+                // Use first complex pair (indices 0,1) if available.
+                if (head_dim >= 2)
+                {
+                    float qb0 = q_before[0], qb1 = q_before[1];
+                    // Expected single rotation
+                    float exp_q0 = qb0 * cs - qb1 * sn;
+                    float exp_q1 = qb0 * sn + qb1 * cs;
+                    float qa0 = q_after[0], qa1 = q_after[1];
+                    auto rel_err = [&](float a0, float a1)
+                    {
+                        double nb0 = (double)exp_q0; double nb1=(double)exp_q1; double da0=a0-nb0; double da1=a1-nb1; double denom = nb0*nb0+nb1*nb1; if(denom==0.0) denom=1.0; return std::sqrt( (da0*da0+da1*da1)/denom ); };
+                    double err_expected = rel_err(qa0, qa1);
+                    // Off-by-one angle checks
+                    float angle_plus = theta0 * (pos_last + 1);
+                    float csp = std::cos(angle_plus), snp = std::sin(angle_plus);
+                    float exp_p0 = qb0 * csp - qb1 * snp;
+                    float exp_p1 = qb0 * snp + qb1 * csp;
+                    double err_plus = 0.0;
+                    {
+                        double nb0 = (double)exp_p0;
+                        double nb1 = (double)exp_p1;
+                        double da0 = qa0 - nb0;
+                        double da1 = qa1 - nb1;
+                        double denom = nb0 * nb0 + nb1 * nb1;
+                        if (denom == 0.0)
+                            denom = 1.0;
+                        err_plus = std::sqrt((da0 * da0 + da1 * da1) / denom);
+                    }
+                    float angle_minus = theta0 * (pos_last - 1);
+                    float csm = std::cos(angle_minus), snm = std::sin(angle_minus);
+                    float exp_m0 = qb0 * csm - qb1 * snm;
+                    float exp_m1 = qb0 * snm + qb1 * csm;
+                    double err_minus = 0.0;
+                    {
+                        double nb0 = (double)exp_m0;
+                        double nb1 = (double)exp_m1;
+                        double da0 = qa0 - nb0;
+                        double da1 = qa1 - nb1;
+                        double denom = nb0 * nb0 + nb1 * nb1;
+                        if (denom == 0.0)
+                            denom = 1.0;
+                        err_minus = std::sqrt((da0 * da0 + da1 * da1) / denom);
+                    }
+                    // Double rotation (angle *2)
+                    float angle2 = angle0 * 2.f;
+                    float cs2 = std::cos(angle2), sn2 = std::sin(angle2);
+                    float exp2_q0 = qb0 * cs2 - qb1 * sn2;
+                    float exp2_q1 = qb0 * sn2 + qb1 * cs2;
+                    double err_double = 0.0;
+                    {
+                        double nb0 = (double)exp2_q0;
+                        double nb1 = (double)exp2_q1;
+                        double da0 = qa0 - nb0;
+                        double da1 = qa1 - nb1;
+                        double denom = nb0 * nb0 + nb1 * nb1;
+                        if (denom == 0.0)
+                            denom = 1.0;
+                        err_double = std::sqrt((da0 * da0 + da1 * da1) / denom);
+                    }
+                    // Select classification by smallest error
+                    best_rel_err = err_expected;
+                    classification = "expected";
+                    double best = err_expected;
+                    auto consider = [&](double err, const char *tag)
+                    { if(err < best*0.8 && err < best){ best=err; best_rel_err=err; classification=tag; } };
+                    consider(err_double, "double_rotation");
+                    consider(err_plus, "off_by_one_plus");
+                    consider(err_minus, "off_by_one_minus");
+                }
+                if (is_prefill)
+                    emitted_prefill = true;
+                if (is_incremental)
+                    emitted_incremental = true;
+            }
+
+            // Stream directly to logger (previous string log appeared empty in some builds)
+            LOG_INFO("[RoPEDiagPrim] seq_len=" << seq_len << " heads=" << heads << " head_dim=" << head_dim
+                                               << " n_past=" << n_past << " pos_last=" << pos_last << " theta0=" << std::setprecision(6) << theta0
+                                               << " angle0=" << angle0 << " cos0=" << cs << " sin0=" << sn
+                                               << " rel_move_q=" << rel_move << " classification=" << classification << " class_rel_err=" << best_rel_err);
+            if (head_dim >= 2)
+            {
+                // Emit per-hypothesis relative errors for first complex pair (Q)
+                float qb0 = q_before[0], qb1 = q_before[1];
+                float qa0 = q_after[0], qa1 = q_after[1];
+                auto rel_err_pair = [&](float e0, float e1)
+                { double nb0=e0, nb1=e1; double da0=qa0-nb0; double da1=qa1-nb1; double denom=nb0*nb0+nb1*nb1; if(denom==0.0) denom=1.0; return std::sqrt((da0*da0+da1*da1)/denom); };
+                float angle_plus = theta0 * (pos_last + 1);
+                float angle_minus = theta0 * (pos_last - 1);
+                float angle2 = angle0 * 2.f;
+                float cs_plus = std::cos(angle_plus), sn_plus = std::sin(angle_plus);
+                float cs_minus = std::cos(angle_minus), sn_minus = std::sin(angle_minus);
+                float cs2 = std::cos(angle2), sn2 = std::sin(angle2);
+                float exp_q0 = qb0 * cs - qb1 * sn;
+                float exp_q1 = qb0 * sn + qb1 * cs;
+                float exp_p0 = qb0 * cs_plus - qb1 * sn_plus;
+                float exp_p1 = qb0 * sn_plus + qb1 * cs_plus;
+                float exp_m0 = qb0 * cs_minus - qb1 * sn_minus;
+                float exp_m1 = qb0 * sn_minus + qb1 * cs_minus;
+                float exp2_q0 = qb0 * cs2 - qb1 * sn2;
+                float exp2_q1 = qb0 * sn2 + qb1 * cs2;
+                double err_exp = rel_err_pair(exp_q0, exp_q1);
+                double err_plus = rel_err_pair(exp_p0, exp_p1);
+                double err_minus = rel_err_pair(exp_m0, exp_m1);
+                double err_double = rel_err_pair(exp2_q0, exp2_q1);
+                LOG_INFO("[RoPEDiagPrimDetail] pair=q classification=" << classification
+                                                                       << " err_expected=" << err_exp << " err_double=" << err_double
+                                                                       << " err_plus=" << err_plus << " err_minus=" << err_minus
+                                                                       << " q_before_pair=" << qb0 << "," << qb1 << " q_after_pair=" << qa0 << "," << qa1);
             }
         }
     }

@@ -1,4 +1,4 @@
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h"
 #include "cosma_prefill_manager.h"
 #include "tensors/tensor_factory.h"
 #include "model_loader.h"
@@ -437,7 +437,7 @@ TEST(PrefillAttentionGolden, PipelineMatchesLlamaBaseline)
         }
 
         auto weights = loadModelWeights(loader, config);
-        MPITransformerPipeline pipeline(config);
+        DistributedTransformerPipeline pipeline(config);
         const int vocab = config.vocab_size;
 
         for (const auto &pattern : token_patterns)
@@ -583,7 +583,7 @@ TEST(PrefillAttentionGolden, PipelineMatchesLlamaBaseline)
             // Fetch layerwise stats for spike detection (must be after execute)
             if (layerwise_scan && rank == 0)
             {
-                const auto &stats = MPITransformerPipeline::getLastLayerActivationStats();
+                const auto &stats = DistributedTransformerPipeline::getLastLayerActivationStats();
                 // Simple heuristic: compute per-layer deltas vs previous layer
                 for (size_t i = 1; i < stats.size(); ++i)
                 {
@@ -611,7 +611,7 @@ TEST(PrefillAttentionGolden, PipelineMatchesLlamaBaseline)
             // True elementwise pre-LM hidden comparison (post final norm, before LM head) rank 0 only
             if (compare_pre_lm && rank == 0)
             {
-                const auto &pre_hidden = MPITransformerPipeline::getLastPreLMHidden();
+                const auto &pre_hidden = DistributedTransformerPipeline::getLastPreLMHidden();
                 if (pre_hidden.empty())
                 {
                     std::cout << "[PRE_LM_HIDDEN] capture empty; skipping diff" << std::endl;

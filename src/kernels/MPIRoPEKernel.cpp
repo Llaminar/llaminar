@@ -100,6 +100,37 @@ namespace llaminar
         const float *position_ids_data = position_ids_tensor->data();
         float *output_data = output_tensor->data();
 
+        // --- Diagnostics: capture pre-rotation slice for last position if enabled ---
+        const auto &env = debugEnv();
+        bool diag = env.attention.internal_diff && getRank() == 0;
+        if (getRank() == 0)
+        {
+            static int gate_prints = 0;
+            if (gate_prints < 4)
+            {
+                LOG_INFO("[RoPEKernelGate] internal_diff=" << env.attention.internal_diff << " layer_token_diff=" << env.pipeline.layer_token_diff << " replay_compare=" << env.pipeline.layer_replay_compare << " seq_len=" << seq_len);
+                ++gate_prints;
+            }
+        }
+        // Determine whether this is an incremental single-token decode (seq_len==1 with prior history encoded in position_ids)
+        bool incr = (seq_len == 1 && position_ids_data[0] > 0);
+        int preview = std::min(head_dim_ * n_heads, 8);
+        std::array<float, 8> before{};
+        before.fill(0.f);
+        int last_pos_index = seq_len - 1;
+        if (diag && preview > 0)
+        {
+            size_t row_offset = static_cast<size_t>(last_pos_index) * n_heads * head_dim_;
+            for (int i = 0; i < preview; ++i)
+                before[i] = input_data[row_offset + i];
+            static int gate_notes = 0;
+            if (!env.pipeline.layer_replay_compare && gate_notes < 1)
+            {
+                LOG_INFO("[RoPEDiag] note=rope_kernel_replay_compare_flag_off");
+                ++gate_notes;
+            }
+        }
+
         // Convert position_ids to int array for efficiency
         std::vector<int> position_ids(seq_len);
         for (int i = 0; i < seq_len; ++i)
@@ -135,6 +166,60 @@ namespace llaminar
         {
             LOG_ERROR("MPIRoPEKernel: Execution failed: " << e.what());
             return false;
+        }
+
+        if (diag && preview > 0)
+        {
+            std::array<float, 8> after{};
+            after.fill(0.f);
+            size_t row_offset = static_cast<size_t>(last_pos_index) * n_heads * head_dim_;
+            for (int i = 0; i < preview; ++i)
+                after[i] = output_data[row_offset + i];
+            // compute relative movement
+            long double l2_b = 0, l2_a = 0, l2_delta = 0;
+            for (int i = 0; i < preview; ++i)
+            {
+                long double b = before[i], a = after[i];
+                l2_b += b * b;
+                l2_a += a * a;
+                long double d = a - b;
+                l2_delta += d * d;
+            }
+            double rel_move = (l2_b > 0) ? std::sqrt((double)l2_delta / (double)l2_b) : 0.0;
+            // derive first angle used
+            int pos_last = static_cast<int>(position_ids_data[last_pos_index]);
+            int pairs = head_dim_ / 2;
+            float theta0 = (pairs > 0) ? (1.f / std::pow(theta_, (2.f * 0) / head_dim_)) : 0.f;
+            float angle0 = theta0 * pos_last;
+            float cs = std::cos(angle0), sn = std::sin(angle0);
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed);
+            oss << std::setprecision(6);
+            oss << "[RoPEDiagKernel] mode=" << (incr ? "INC" : "REPLAY")
+                << " seq_len=" << seq_len
+                << " pos_last=" << pos_last
+                << " n_heads=" << n_heads
+                << " head_dim=" << head_dim_
+                << " theta=" << theta_
+                << " theta0=" << theta0
+                << " angle0=" << angle0
+                << " cos0=" << cs << " sin0=" << sn
+                << " before=";
+            for (int i = 0; i < preview; ++i)
+            {
+                oss << before[i];
+                if (i + 1 < preview)
+                    oss << ",";
+            }
+            oss << " after=";
+            for (int i = 0; i < preview; ++i)
+            {
+                oss << after[i];
+                if (i + 1 < preview)
+                    oss << ",";
+            }
+            oss << " rel_move=" << rel_move;
+            LOG_INFO(oss.str());
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();

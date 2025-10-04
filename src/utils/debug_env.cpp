@@ -132,6 +132,10 @@ namespace llaminar
         s.cosma.overlap_enabled = flag(std::getenv("LLAMINAR_COSMA_OVERLAP_STREAM"));
         s.cosma.overlap_verbose = flag(std::getenv("LLAMINAR_COSMA_OVERLAP_VERBOSE"));
         s.cosma.preflight_disable = flag(std::getenv("LLAMINAR_COSMA_PREFLIGHT_DISABLE"));
+    // Attention decode instrumentation (initial snapshot parse)
+    s.attention_decode.decode_diag = flag(std::getenv("LLAMINAR_ATTENTION_DECODE_DIAG"));
+    s.attention_decode.dump_full_qkv = flag(std::getenv("LLAMINAR_ATTENTION_DECODE_DUMP_QKV"));
+    if(const char* dl0 = std::getenv("LLAMINAR_ATTENTION_DECODE_DUMP_LIMIT")) { int v=std::atoi(dl0); if(v>0 && v<=4096) s.attention_decode.dump_limit = v; }
         s.cosma.rmsnorm_validate = flag(std::getenv("LLAMINAR_COSMA_RMSNORM_VALIDATE"));
         s.cosma.rmsnorm_trace = flag(std::getenv("LLAMINAR_COSMA_RMSNORM_TRACE"));
         if(const char* pts = std::getenv("LLAMINAR_COSMA_RMSNORM_TRACE_POINTS")){
@@ -172,6 +176,10 @@ namespace llaminar
     s.pipeline.layer_replay_compare = flag(std::getenv("LLAMINAR_DEBUG_LAYER_REPLAY_COMPARE"));
     // Pre-LM row diff instrumentation (explicit opt-in; unset or "0" keeps it off)
     s.pipeline.pre_lm_row_diff = flag(std::getenv("LLAMINAR_PIPELINE_PRE_LM_ROW_DIFF"));
+    // Incremental decode instrumentation controls
+    s.pipeline.incr_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_TRACE"));
+    s.pipeline.incr_cache_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_CACHE_TRACE"));
+    s.pipeline.incr_hidden_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE"));
     // KV cache
     s.kv_cache.dynamic_init = flag(std::getenv("LLAMINAR_KV_DYNAMIC_INIT"));
     if(const char* gfac = std::getenv("LLAMINAR_KV_GROWTH_FACTOR")) { int v=std::atoi(gfac); if(v>=1 && v<=16) s.kv_cache.growth_factor = v; }
@@ -197,6 +205,7 @@ namespace llaminar
     if(const char* tpp = std::getenv("LLAMINAR_ATTN_TP_PARTITIONS")) { int v=std::atoi(tpp); if(v>0 && v<1024) s.attention.tp_partitions = v; }
     s.attention.tp_auto = flag(std::getenv("LLAMINAR_ATTN_TP_AUTO"));
     s.attention.tp_force_splitter = flag(std::getenv("LLAMINAR_ATTN_TP_FORCE_SPLITTER"));
+    s.attention.internal_diff = flag(std::getenv("LLAMINAR_ATTN_INTERNAL_DIFF"));
     // Attention primitive optimization flags
     if(const char* ppe = std::getenv("LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS")) { int v=std::atoi(ppe); if(v>0) s.attention.prim_parallel_elems_threshold = v; }
     s.attention.prim_force_scalar = flag(std::getenv("LLAMINAR_ATTN_PRIM_FORCE_SCALAR"));
@@ -235,6 +244,13 @@ namespace llaminar
     s.rmsnorm.false_sharing_probe = flag(std::getenv("LLAMINAR_RMSNORM_FALSE_SHARING_PROBE"));
     s.rmsnorm.fast_accumulate = flag(std::getenv("LLAMINAR_RMSNORM_FAST_ACC"));
     if(const char* rvi = std::getenv("LLAMINAR_RMSNORM_VEC_IMPL")) { int v=std::atoi(rvi); if(v>=0 && v<=3) s.rmsnorm.vec_impl = v; }
+    {
+        const char* lg = std::getenv("LLAMINAR_RMSNORM_LEGACY_GLOBAL_STATS");
+        if(lg){
+            // default true; explicit 0/false/off disables legacy global sequence-length dependent stats aggregation
+            if(*lg=='0') s.rmsnorm.legacy_global_stats = false; else s.rmsnorm.legacy_global_stats = true;
+        }
+    }
 
         // Softmax core
         s.softmax.force_scalar = flag(std::getenv("LLAMINAR_SOFTMAX_FORCE_SCALAR"));
@@ -478,6 +494,10 @@ namespace llaminar
                 if(std::getenv("LLAMINAR_TP_MLP_VALIDATE")) s.mlp_tp.validate = true;
                 if(std::getenv("LLAMINAR_TP_MLP_FORCE_COLUMN")) s.mlp_tp.force_column = true;
                 if(std::getenv("LLAMINAR_TP_MLP_FORCE_ROW")) s.mlp_tp.force_row = true;
+                // Attention decode instrumentation (refresh subset)
+                if(std::getenv("LLAMINAR_ATTENTION_DECODE_DIAG")) s.attention_decode.decode_diag = true;
+                if(std::getenv("LLAMINAR_ATTENTION_DECODE_DUMP_QKV")) s.attention_decode.dump_full_qkv = true;
+                if(const char* dl = std::getenv("LLAMINAR_ATTENTION_DECODE_DUMP_LIMIT")) { int v=std::atoi(dl); if(v>0 && v<=4096) s.attention_decode.dump_limit = v; }
                 // RMSNorm tuning flags (subset needed for dynamic test reconfiguration)
                 s.rmsnorm.force_scalar = flag(std::getenv("LLAMINAR_RMSNORM_FORCE_SCALAR"));
                 s.rmsnorm.disable_tls_scratch = flag(std::getenv("LLAMINAR_RMSNORM_DISABLE_TLS_SCRATCH"));

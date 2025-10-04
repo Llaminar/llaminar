@@ -1,6 +1,6 @@
 # MPI Transformer Pipeline vs llama.cpp (Qwen2.5 0.5B) Deep Dive
 
-> Historical Analysis Notice: This comparison references the legacy `MPITransformerPipeline`, now deprecated in favor of the Abstract Pipeline + attention primitives architecture. While the execution ordering and tensor shape discussions remain useful for parity investigations, new divergence analyses should be framed against the active `AbstractPipeline` adapter (Qwen) rather than the deprecated class.
+> Historical Analysis Notice: This comparison references the former `MPITransformerPipeline` (now `DistributedTransformerPipeline`). Execution ordering and tensor shape discussions still apply; adapter indirection has since been removed.
 
 > Purpose: Document precise dataflow, tensor shapes, and operation ordering to localize causes of golden test divergence between our `MPITransformerPipeline` and the llama.cpp reference implementation.
 

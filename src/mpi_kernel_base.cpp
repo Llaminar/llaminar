@@ -52,6 +52,21 @@ namespace llaminar
             // Finalize MPI if we initialized it
             if (mpi_initialized_)
             {
+                // In test environments we sometimes need MPI to persist across multiple
+                // test cases even after individual kernels (that performed the initial
+                // MPI_Init_thread) are destroyed. A test harness can set the environment
+                // variable LLAMINAR_TEST_MPI_NO_FINALIZE=1 (or any non-empty value) to
+                // delegate responsibility for MPI_Finalize() to a higher-level fixture.
+                // This avoids scenarios where the first test's kernel destructors call
+                // MPI_Finalize(), leaving subsequent tests attempting MPI calls after
+                // finalization (triggering MPI standard violations).
+                const char *no_finalize = std::getenv("LLAMINAR_TEST_MPI_NO_FINALIZE");
+                if (no_finalize)
+                {
+                    // Skip finalization here; a global test environment will finalize
+                    // once all tests (and their kernels) have completed.
+                    return;
+                }
                 int mpi_finalized;
                 MPI_Finalized(&mpi_finalized);
                 if (!mpi_finalized)

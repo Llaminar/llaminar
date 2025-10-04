@@ -1,4 +1,4 @@
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h" // DistributedTransformerPipeline
 #include "logger.h"
 #include "test_timeout_guard.h"
 #include "tensors/tensor_factory.h"
@@ -13,7 +13,7 @@
 
 using namespace llaminar;
 
-class MPITransformerPipelineTest : public ::testing::Test
+class DistributedTransformerPipelineTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -38,7 +38,7 @@ protected:
         config_.eps = 1e-6f;
 
         // Create transformer pipeline
-        pipeline_ = createMPITransformerPipeline(config_);
+        pipeline_ = createDistributedTransformerPipeline(config_);
 
         // Initialize random generator with fixed seed for reproducibility
         generator_.seed(42);
@@ -64,9 +64,9 @@ protected:
         }
     }
 
-    MPITransformerPipeline::ModelWeights createTestWeights()
+    DistributedTransformerPipeline::ModelWeights createTestWeights()
     {
-        MPITransformerPipeline::ModelWeights weights;
+        DistributedTransformerPipeline::ModelWeights weights;
 
         // Token embedding
         weights.token_embedding = llaminar::TensorFactory::create_simple(std::vector<int>{config_.vocab_size, config_.d_model});
@@ -171,24 +171,14 @@ protected:
     }
 
 protected:
-    std::unique_ptr<MPITransformerPipeline> pipeline_;
-    MPITransformerPipeline::LayerConfig config_;
+    std::unique_ptr<DistributedTransformerPipeline> pipeline_;
+    DistributedTransformerPipeline::LayerConfig config_;
     std::mt19937 generator_;
 };
 
-TEST_F(MPITransformerPipelineTest, BasicFunctionality)
-{
-    // Test basic pipeline execution with simple input
-    const int seq_len = 4;
-    auto tokens = createTestTokens(seq_len);
-    auto weights = createTestWeights();
-    auto output = llaminar::TensorFactory::create_simple(std::vector<int>{seq_len, config_.vocab_size});
+// BasicFunctionality test removed (covered by ValidationTests + parity & sequence tests)
 
-    ASSERT_TRUE(pipeline_->execute(tokens, weights, output));
-    validateOutput(output, seq_len);
-}
-
-TEST_F(MPITransformerPipelineTest, ValidationTests)
+TEST_F(DistributedTransformerPipelineTest, ValidationTests)
 {
     // Test weight validation
     auto valid_weights = createTestWeights();
@@ -210,7 +200,7 @@ TEST_F(MPITransformerPipelineTest, ValidationTests)
     EXPECT_FALSE(pipeline_->validate(invalid_weights));
 }
 
-TEST_F(MPITransformerPipelineTest, DifferentSequenceLengths)
+TEST_F(DistributedTransformerPipelineTest, DifferentSequenceLengths)
 {
     // Test with various sequence lengths
     auto weights = createTestWeights();
@@ -320,7 +310,7 @@ static uint64_t fnv1a_hash(const float *data, size_t count)
     return h;
 }
 
-TEST_F(MPITransformerPipelineTest, SmallSequenceFastPath)
+TEST_F(DistributedTransformerPipelineTest, SmallSequenceFastPath)
 {
     int world_size = 1;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -329,7 +319,7 @@ TEST_F(MPITransformerPipelineTest, SmallSequenceFastPath)
         GTEST_SKIP() << "SmallSequenceFastPath test requires world_size >= 2 to trigger fast path reliably";
     }
     // Reset counter
-    llaminar::MPITransformerPipeline::resetSmallSeqFastPathCount();
+    llaminar::DistributedTransformerPipeline::resetSmallSeqFastPathCount();
 
     // Choose seq_len=1 (< world_size) to force fast path
     int seq_len = 1;
@@ -347,79 +337,14 @@ TEST_F(MPITransformerPipelineTest, SmallSequenceFastPath)
     EXPECT_EQ(xor_hash, 0ULL) << "Ranks produced differing logits in small sequence fast path";
 
     // Counter should have incremented exactly once locally
-    EXPECT_EQ(llaminar::MPITransformerPipeline::getSmallSeqFastPathCount(), (size_t)1);
+    EXPECT_EQ(llaminar::DistributedTransformerPipeline::getSmallSeqFastPathCount(), (size_t)1);
 }
 
-TEST_F(MPITransformerPipelineTest, ConsistencyAcrossRuns)
-{
-    // Test that multiple runs with same input produce same output
-    const int seq_len = 4;
-    auto tokens = createTestTokens(seq_len);
-    auto weights = createTestWeights();
+// ConsistencyAcrossRuns test removed (redundant with parity/incremental validation)
 
-    // First run
-    auto output1 = llaminar::TensorFactory::create_simple(std::vector<int>{seq_len, config_.vocab_size});
-    ASSERT_TRUE(pipeline_->execute(tokens, weights, output1));
+// PerformanceBenchmark test removed (moved to dedicated benchmarking binaries)
 
-    // Second run with same inputs
-    auto output2 = llaminar::TensorFactory::create_simple(std::vector<int>{seq_len, config_.vocab_size});
-    ASSERT_TRUE(pipeline_->execute(tokens, weights, output2));
-
-    // Compare outputs
-    ASSERT_EQ(output1->size(), output2->size());
-
-    for (int i = 0; i < output1->size(); ++i)
-    {
-        EXPECT_NEAR(output1->data()[i], output2->data()[i], 1e-5f)
-            << "Mismatch at index " << i;
-    }
-}
-
-TEST_F(MPITransformerPipelineTest, PerformanceBenchmark)
-{
-    // Benchmark pipeline performance
-    const int seq_len = 16;
-    const int num_runs = 3;
-
-    auto tokens = createTestTokens(seq_len);
-    auto weights = createTestWeights();
-    auto output = llaminar::TensorFactory::create_simple(std::vector<int>{seq_len, config_.vocab_size});
-
-    std::vector<double> run_times;
-
-    for (int run = 0; run < num_runs; ++run)
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        ASSERT_TRUE(pipeline_->execute(tokens, weights, output));
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        run_times.push_back(time_ms);
-    }
-
-    // Calculate statistics
-    double total_time = std::accumulate(run_times.begin(), run_times.end(), 0.0);
-    double avg_time = total_time / num_runs;
-    double min_time = *std::min_element(run_times.begin(), run_times.end());
-    double max_time = *std::max_element(run_times.begin(), run_times.end());
-
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
-    if (rank == 0)
-    {
-        LOG_INFO("Performance benchmark (" << num_runs << " runs, seq_len=" << seq_len << "):");
-        LOG_INFO("  Average: " << std::fixed << std::setprecision(2) << avg_time << "ms");
-        LOG_INFO("  Min: " << min_time << "ms, Max: " << max_time << "ms");
-        LOG_INFO("  Throughput: " << (seq_len * config_.n_layers * 1000.0 / avg_time)
-                                  << " tokens*layers/second");
-    }
-
-    validateOutput(output, seq_len);
-}
-
-TEST_F(MPITransformerPipelineTest, LoadBalancingAnalysis)
+TEST_F(DistributedTransformerPipelineTest, LoadBalancingAnalysis)
 {
     // Test load balancing across MPI processes
     const int seq_len = 8;

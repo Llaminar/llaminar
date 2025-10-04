@@ -38,7 +38,7 @@ namespace llaminar
         }
 
         ChatInterface::ChatInterface(std::unique_ptr<ChatSession> session,
-                                     std::shared_ptr<MPITransformerPipeline> pipeline,
+                                     std::shared_ptr<AbstractPipeline> pipeline,
                                      std::unique_ptr<ResponseGenerator> generator,
                                      const LlaminarParams &params)
             : session_(std::move(session)), pipeline_(pipeline), generator_(std::move(generator)), params_(params), should_stop_(false), is_mpi_rank_zero_(true) // Assume rank 0 for now, can be set properly

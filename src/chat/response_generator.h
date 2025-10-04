@@ -2,7 +2,8 @@
 
 #include "tokenizer_interface.h"
 #include "../argument_parser.h"
-#include "../mpi_transformer_pipeline.h"
+#include "../abstract_pipeline.h"
+#include "../distributed_transformer_pipeline.h" // for QwenModelWeights definition (inherits IModelWeights)
 #include <memory>
 #include <vector>
 #include <string>
@@ -18,14 +19,16 @@ namespace llaminar
         class ResponseGenerator
         {
         public:
+            // Construct with pipeline + load weights internally from params.model_file
             ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
-                              std::shared_ptr<MPITransformerPipeline> pipeline,
+                              std::shared_ptr<AbstractPipeline> pipeline,
                               const LlaminarParams &params);
 
+            // Construct with pre-loaded weights (wrapped)
             ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
-                              std::shared_ptr<MPITransformerPipeline> pipeline,
+                              std::shared_ptr<AbstractPipeline> pipeline,
                               const LlaminarParams &params,
-                              const MPITransformerPipeline::ModelWeights &weights);
+                              const QwenModelWeights &weights);
 
             ~ResponseGenerator() = default;
 
@@ -43,9 +46,12 @@ namespace llaminar
 
         private:
             std::shared_ptr<TokenizerInterface> tokenizer_;
-            std::shared_ptr<MPITransformerPipeline> pipeline_;
+            std::shared_ptr<AbstractPipeline> pipeline_;
             const LlaminarParams &params_;
-            MPITransformerPipeline::ModelWeights weights_;
+            QwenModelWeights weights_; // wrapper holding inner ModelWeights
+            bool have_weights_ = false;
+            bool prefilled_ = false;
+            StageContext stage_ctx_{}; // tracks prefill/decode progress
 
             float temperature_;
             int32_t top_k_;
@@ -64,6 +70,8 @@ namespace llaminar
             void applyTopP(std::vector<float> &logits, float p);
             std::vector<float> softmax(const std::vector<float> &logits);
             int32_t sampleFromProbs(const std::vector<float> &probs);
+            bool ensureWeights();
+            std::vector<float> fetchLastLogitsRow(const std::shared_ptr<TensorBase> &logits_tensor) const;
         };
 
     } // namespace chat

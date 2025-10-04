@@ -1376,17 +1376,17 @@ Integrate the adaptive backend into the transformer pipeline:
 #pragma once
 
 #include "adaptive_matmul.hpp"
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h"
 
 namespace llaminar {
 
-class AdaptiveTransformerPipeline : public MPITransformerPipeline {
+class AdaptiveTransformerPipeline : public DistributedTransformerPipeline {
 private:
     std::unique_ptr<AdaptiveMatMulManager> matmul_manager_;
     
 public:
     AdaptiveTransformerPipeline(const TransformerLayerConfig& config) 
-        : MPITransformerPipeline(config) {
+    : DistributedTransformerPipeline(config) {
         matmul_manager_ = std::make_unique<AdaptiveMatMulManager>();
     }
     

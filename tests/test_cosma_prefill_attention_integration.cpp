@@ -1,4 +1,4 @@
-#include "../src/mpi_transformer_pipeline.h"
+#include "../src/distributed_transformer_pipeline.h"
 #include "../src/cosma_prefill_manager.h"
 #include "../src/tensors/tensor_factory.h"
 #include <gtest/gtest.h>
@@ -91,10 +91,10 @@ TEST(CosmaPrefillAttentionIntegration, PrefillPathMatchesBaseline)
     config.n_layers = 2;
     config.eps = 1e-5f;
 
-    MPITransformerPipeline pipeline(config);
+    DistributedTransformerPipeline pipeline(config);
 
     std::mt19937 rng(42);
-    MPITransformerPipeline::ModelWeights weights;
+    DistributedTransformerPipeline::ModelWeights weights;
     weights.token_embedding = makeTensor({config.vocab_size, config.d_model}, rng);
     weights.output_norm_weight = makeTensor({config.d_model}, rng);
     weights.lm_head = makeTensor({config.d_model, config.vocab_size}, rng);

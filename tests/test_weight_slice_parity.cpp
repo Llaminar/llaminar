@@ -10,12 +10,12 @@
 
 #include "logger.h"
 #include "model_loader.h"
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h"
 
 // Forward declaration (existing in namespace)
 namespace llaminar
 {
-    MPITransformerPipeline::ModelWeights loadModelWeights(const std::string &model_path, const MPITransformerPipeline::LayerConfig &config);
+    DistributedTransformerPipeline::ModelWeights loadModelWeights(const std::string &model_path, const DistributedTransformerPipeline::LayerConfig &config);
 }
 
 namespace
@@ -155,7 +155,7 @@ TEST(WeightSliceParity, AttentionProjectionColumns)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load model: " << model_path;
     auto config = loader.createLayerConfig();
-    auto pipeline = std::make_unique<llaminar::MPITransformerPipeline>(config);
+    auto pipeline = std::make_unique<llaminar::DistributedTransformerPipeline>(config);
     // Avoid double full-model load by using overload that reuses existing ModelLoader
     auto weights = llaminar::loadModelWeights(loader, config);
     (void)weights;

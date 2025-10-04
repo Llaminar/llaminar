@@ -41,7 +41,7 @@ Key pillars:
 3. Detect topology (NUMA, cores) & optionally print.
 4. Register MPI kernels (attention, linear, rmsnorm, residual, swiglu) & adaptive backend.
 5. Load GGUF model → weight tensors (auto layout decisions) & create model adapter.
-6. Instantiate Abstract Pipeline adapter (Qwen) wrapping legacy MPITransformerPipeline (pending full removal) for parity.
+6. Instantiate distributed Qwen pipeline (formerly MPITransformerPipeline + adapter) – adapter layer removed; factory now returns DistributedTransformerPipeline directly.
 7. Execute prefill (prompt) then iterative decode until token budget / stop condition.
 8. Emit KV cache summary if requested; output perf counters & adaptive backend stats.
 
@@ -190,7 +190,7 @@ The legacy generic compute graph (ComputeGraph / ComputeNode / MatMulNode) has b
 **Key Components**:
 - `AbstractPipeline` (interface): Defines lifecycle (prefill / decode), tensor staging, and logits access.
 - Concrete adapter (e.g. `QwenPipelineAdapter`): Specializes AbstractPipeline for specific model families (Qwen2.5 today) translating model config + weights into orchestrated kernel invocations.
-- `MPITransformerPipeline` (**DEPRECATED**): Kept only for parity tests & incremental removal. All new features target adapters.
+- `DistributedTransformerPipeline` (formerly `MPITransformerPipeline`): Unified distributed transformer implementation (adapters removed).
 - `cosma_prefill_manager`: Orchestrates large prefill GEMMs (possibly distributed) and feeds activations into attention / MLP kernels.
 
 **Execution Phases**:
@@ -325,7 +325,7 @@ Planned Phases:
 **Deprecations**:
 - Compute Graph (removed)
 - Non-MPI kernels (removed)
-- `MPITransformerPipeline` (pending removal – do not extend)
+- `DistributedTransformerPipeline` (successor to deprecated `MPITransformerPipeline`; extend this for distributed transformer behavior)
 - Legacy MatMulKernel (replaced by adaptive path + MPILinearKernel + COSMA prefill manager)
 
 **Authoritative Hot Paths**:

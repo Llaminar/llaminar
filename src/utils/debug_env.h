@@ -96,6 +96,9 @@ namespace llaminar
         bool attn_ref_compare = false;           // LLAMINAR_DEBUG_ATTENTION_REF (run reference full attention for incremental token)
         bool layer_replay_compare = false;       // LLAMINAR_DEBUG_LAYER_REPLAY_COMPARE (per-layer immediate replay compare during incremental decode)
         bool pre_lm_row_diff = false;            // LLAMINAR_PIPELINE_PRE_LM_ROW_DIFF (emit per-call pre/post LM head last-row diff logs)
+        bool incr_trace = false;                 // LLAMINAR_PIPELINE_INCR_TRACE (basic incremental decode trace: n_past, pos, seq_len)
+        bool incr_cache_trace = false;           // LLAMINAR_PIPELINE_INCR_CACHE_TRACE (log K/V slice stats around incremental writes)
+        bool incr_hidden_trace = false;          // LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE (dump final hidden row prior to LM head)
     };
 
     // KV cache policy (dynamic capacity management for incremental decode)
@@ -133,6 +136,7 @@ namespace llaminar
         int tp_partitions = 1;           // LLAMINAR_ATTN_TP_PARTITIONS
         bool tp_auto = false;            // LLAMINAR_ATTN_TP_AUTO
         bool tp_force_splitter = false;  // LLAMINAR_ATTN_TP_FORCE_SPLITTER
+        bool internal_diff = false;      // LLAMINAR_ATTN_INTERNAL_DIFF (capture internal per-stage last-token rows for parity forensics)
         // Primitive optimization knobs
         int prim_parallel_elems_threshold = 32768;   // LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS (heads*seq_len*seq_len or heads*seq_len*D)
         bool prim_force_scalar = false;              // LLAMINAR_ATTN_PRIM_FORCE_SCALAR
@@ -169,6 +173,7 @@ namespace llaminar
         bool false_sharing_probe = false; // LLAMINAR_RMSNORM_FALSE_SHARING_PROBE (bench harness extra test)
         bool fast_accumulate = false;     // LLAMINAR_RMSNORM_FAST_ACC (accumulate in float then widen)
         int vec_impl = 0;                 // LLAMINAR_RMSNORM_VEC_IMPL (0=auto,1=scalar,2=avx2,3=avx512)
+        bool legacy_global_stats = true;  // LLAMINAR_RMSNORM_LEGACY_GLOBAL_STATS (if true, log/aggregate legacy global sum_sq; if false, suppress sequence-length dependent global avg in stats to aid incremental parity)
     };
 
     struct SoftmaxEnv
@@ -436,6 +441,12 @@ namespace llaminar
         DequantEnv dequant;
         AdaptiveEnv adaptive;
         AttentionEnv attention;
+        struct AttentionDecodeDiagEnv
+        {
+            bool decode_diag = false;   // LLAMINAR_ATTENTION_DECODE_DIAG : log incremental attention window sizes & indices
+            bool dump_full_qkv = false; // LLAMINAR_ATTENTION_DECODE_DUMP_QKV : dump small tensors (guarded by size)
+            int dump_limit = 16;        // LLAMINAR_ATTENTION_DECODE_DUMP_LIMIT : number of floats to preview per tensor row
+        } attention_decode;
         EmbeddingEnv embedding;
         RMSNormEnv rmsnorm;
         SwiGLUEnv swiglu;

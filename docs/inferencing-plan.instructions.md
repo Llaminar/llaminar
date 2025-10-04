@@ -12,7 +12,7 @@ This document outlines the comprehensive plan for implementing prompt processing
 - Command-line argument parsing with prompt parameter support (`ArgumentParser`)
 - GGUF model loading with vocabulary extraction (`ModelLoader`)
 - Abstract inference pipeline adapter (`AbstractPipeline` + concrete Qwen adapter)  
-    - NOTE: Legacy `MPITransformerPipeline` is deprecated and only retained for temporary parity tests.
+    - NOTE: `DistributedTransformerPipeline` (renamed from legacy `MPITransformerPipeline`) is the canonical implementation; adapter parity layer has been removed.
 - Logging system and error handling
 - System topology detection and COSMA integration
 
@@ -168,7 +168,7 @@ public:
 
 ### Phase 5: MPI Integration (Todo 5)
 **Files to Modify:**
-- `src/mpi_transformer_pipeline.h/cpp` - Add chat support
+- `src/distributed_transformer_pipeline.h/cpp` (was `mpi_transformer_pipeline`) - Add chat support
 - `src/main.cpp` - Add interactive mode
 
 **Key Features:**

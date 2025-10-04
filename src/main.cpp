@@ -13,9 +13,8 @@
 #include "logger.h"
 #include "topology_manager.h"
 #include "model_loader.h"
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h" // DistributedTransformerPipeline (implements AbstractPipeline)
 #include "abstract_pipeline.h"
-#include "qwen_pipeline_adapter.h"
 #include "performance_timer.h"
 #include "utils/debug_env.h"
 #include "utils/perf_counters.h"
@@ -138,12 +137,10 @@ int main(int argc, char **argv)
             LOG_INFO("Running COSMA benchmark mode");
         }
 
-        // 5. Model loading
+        // 5. Model loading & pipeline creation (single unified path)
         std::unique_ptr<ModelLoader> model_loader;
-        std::unique_ptr<MPITransformerPipeline> transformer_pipeline;        // legacy path
-        std::unique_ptr<MPITransformerPipeline::ModelWeights> model_weights; // legacy weights
-        std::unique_ptr<AbstractPipeline> abstract_pipeline;                 // new abstract pipeline (feature flag)
-        std::unique_ptr<QwenModelWeights> abstract_weights;                  // adapter weights container
+        std::unique_ptr<AbstractPipeline> pipeline;        // unified distributed pipeline
+        std::unique_ptr<QwenModelWeights> wrapped_weights; // weights wrapper (ModelWeights retained for architectural clarity)
         if (!params.model_file.empty())
         {
             LOG_INFO("Loading model from: " << params.model_file);
@@ -158,36 +155,17 @@ int main(int argc, char **argv)
                                                         << config.n_head << " heads, " << config.d_model << " dimensions");
                     LOG_INFO("Model config details: vocab_size=" << config.vocab_size
                                                                  << ", max_seq_len=" << config.max_seq_len << ", d_ff=" << config.d_ff);
-                    bool use_abstract = debugEnv().pipeline.enable_abstract_pipeline;
-                    if (use_abstract)
-                    {
-                        registerQwenPipeline();
-                        abstract_pipeline = PipelineFactory::instance().create("qwen", config);
-                        if (!abstract_pipeline)
-                        {
-                            RETURN_FAIL(1, "Failed to create abstract pipeline instance");
-                        }
-                        LOG_INFO("Abstract pipeline initialized: " << abstract_pipeline->name());
-                    }
-                    else
-                    {
-                        transformer_pipeline = std::make_unique<MPITransformerPipeline>(config);
-                        LOG_INFO("Transformer pipeline initialized successfully");
-                    }
+                    registerQwenPipeline();
+                    pipeline = PipelineFactory::instance().create("qwen", config);
+                    if (!pipeline)
+                        RETURN_FAIL(1, "Failed to create pipeline instance for architecture 'qwen'");
+                    LOG_INFO("Pipeline initialized: " << pipeline->name());
                     try
                     {
                         auto loaded = loadModelWeights(*model_loader, config);
-                        if (abstract_pipeline)
-                        {
-                            abstract_weights = std::make_unique<QwenModelWeights>();
-                            abstract_weights->inner = std::move(loaded);
-                            LOG_INFO("Model weights loaded (abstract adapter)");
-                        }
-                        else
-                        {
-                            model_weights = std::make_unique<MPITransformerPipeline::ModelWeights>(std::move(loaded));
-                            LOG_INFO("Model weights loaded for transformer pipeline");
-                        }
+                        wrapped_weights = std::make_unique<QwenModelWeights>();
+                        wrapped_weights->inner = std::move(loaded);
+                        LOG_INFO("Model weights loaded");
                         if (rank == 0 && params.print_topology)
                         {
                             LOG_INFO("-- Sharded Tensor Registry (post model load) --");
@@ -244,8 +222,8 @@ int main(int argc, char **argv)
             }
         }
 
-        // 6. Chat interface mode
-        if (params.interactive && (transformer_pipeline || abstract_pipeline))
+        // 6. Chat interface mode (interactive path executed only on rank 0 for I/O)
+        if (params.interactive && pipeline && wrapped_weights)
         {
             if (rank == 0)
             {
@@ -257,10 +235,10 @@ int main(int argc, char **argv)
                 auto tokenizer_shared = std::shared_ptr<chat::TokenizerInterface>(tokenizer.release());
                 auto tokenizer_copy = chat::createTokenizer(*model_loader);
                 auto session = std::make_unique<chat::ChatSession>(std::move(tokenizer_copy), params);
-                std::shared_ptr<MPITransformerPipeline> shared_pipeline;
-                if (transformer_pipeline)
-                    shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
-                auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, transformer_pipeline ? *model_weights : abstract_weights->inner);
+                // Share the existing pipeline with chat components
+                auto shared_pipeline = std::shared_ptr<AbstractPipeline>(pipeline.release());
+                pipeline.reset(); // transferred ownership
+                auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, *wrapped_weights);
                 chat::ChatInterface chat_ui(std::move(session), shared_pipeline, std::move(generator), params);
                 chat_ui.run();
                 int done = 1;
@@ -282,7 +260,7 @@ int main(int argc, char **argv)
         }
 
         // 7. Non-interactive prompt / eval path
-        if ((transformer_pipeline || abstract_pipeline) && (!params.prompt.empty() || params.eval_only))
+        if (pipeline && wrapped_weights && (!params.prompt.empty() || params.eval_only))
         {
             std::shared_ptr<chat::TokenizerInterface> tokenizer_shared;
             std::vector<int32_t> prompt_tokens;
@@ -330,10 +308,9 @@ int main(int argc, char **argv)
             if (rank != 0)
                 prompt_tokens.resize(token_count);
             MPI_Bcast(prompt_tokens.data(), token_count, MPI_INT, 0, MPI_COMM_WORLD);
-            std::shared_ptr<MPITransformerPipeline> shared_pipeline;
-            if (transformer_pipeline)
-                shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
-            auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, transformer_pipeline ? *model_weights : abstract_weights->inner);
+            auto shared_pipeline = std::shared_ptr<AbstractPipeline>(pipeline.release());
+            pipeline.reset();
+            auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, *wrapped_weights);
             try
             {
                 std::string response = generator->generateResponse(prompt_tokens);
@@ -348,20 +325,17 @@ int main(int argc, char **argv)
             return exit_code;
         }
 
-        // 8. Standard inference path
+        // 8. Standard inference path (no prompt / chat provided)
         else if (model_loader)
         {
-            LOG_INFO("Model loaded but no transformer pipeline initialized (graph system removed) - skipping legacy matmul demo");
+            LOG_INFO("Model loaded but no execution mode selected (supply --interactive or --prompt). Nothing executed.");
         }
         else
         {
-            LOG_INFO("No model or pipeline initialized; graph system removed so benchmark path is disabled.");
+            LOG_INFO("No model loaded; exiting.");
         }
 
-        // 9. (Legacy placeholder) Graph system removed; no execution here.
-        LOG_INFO("Graph system removed; skipping legacy graph execution phase.");
-
-        // 10. Validation
+        // 9. Optional validation (stub)
         if (params.validate_results && rank == 0)
         {
             LOG_INFO("Running result validation (stub)...");
@@ -369,27 +343,18 @@ int main(int argc, char **argv)
         }
 
         LOG_INFO("Llaminar execution completed successfully");
-        if (params.kv_cache_stats && (transformer_pipeline || abstract_pipeline) && rank == 0)
+        if (params.kv_cache_stats && pipeline && rank == 0)
         {
             LOG_INFO("-- KV Cache Summary --");
-            if (abstract_pipeline)
+            if (auto *state = pipeline->kvCacheState())
             {
-                if (auto *state = abstract_pipeline->kvCacheState())
-                {
-                    LOG_INFO("KV capacity=" << state->capacity_tokens
-                                            << " used=" << state->used_tokens
-                                            << " growth_events=" << state->growth_events);
-                }
-                else
-                {
-                    LOG_INFO("(abstract pipeline reports no KV cache state)");
-                }
+                LOG_INFO("KV capacity=" << state->capacity_tokens
+                                        << " used=" << state->used_tokens
+                                        << " growth_events=" << state->growth_events);
             }
-            else if (transformer_pipeline)
+            else
             {
-                LOG_INFO("KV capacity=" << transformer_pipeline->getKVCacheCapacity()
-                                        << " used=" << transformer_pipeline->getKVCacheUsed()
-                                        << " growth_events=" << transformer_pipeline->getKVCacheGrowthEvents());
+                LOG_INFO("(pipeline reports no KV cache state)");
             }
         }
         // Performance counters summary (only if enabled and rank matches)

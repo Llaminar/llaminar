@@ -5,7 +5,7 @@
 #pragma once
 
 #include "abstract_pipeline.h"
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h"
 #include <memory>
 
 namespace llaminar

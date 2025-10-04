@@ -1,619 +1,556 @@
-#include "mpi_transformer_pipeline.h"
-#include "model_loader.h"
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIRoPEKernel.h"
-#include "kernels/MPIResidualKernel.h"
-#include "kernels/MPIEmbeddingKernel.h"
-#include "kernels/common/rmsnorm_core.h"
-#include "tensors/tensor_factory.h"
-#include "tensors/simple_tensor.h"
-#include "debug_utils.h"
-#include "performance_timer.h"
-#include "cosma_prefill_manager.h"
-#include "adaptive_matmul.h"
-#include "backend_selector.h"
-using llaminar::BackendContext;
-using llaminar::BackendDecision;
-#include <chrono>
-#include <iomanip>
-#include <cmath>
-#include <cstring>
-#include <cstdlib>
-#include <limits>
-#include <numeric>
-#include <algorithm>
-#include "utils/debug_env.h"
-#include <cblas.h>
-#include <omp.h>
-#include <sstream>
-#include <filesystem>
-#include <tuple>
-#include <mutex>
-#include <unordered_map>
-#include <unordered_set>
-
-namespace
+// Deprecated translation unit. All implementation moved to distributed_transformer_pipeline.cpp
+// This file intentionally causes a compile error if directly built to prevent divergence.
+#error "mpi_transformer_pipeline.cpp deprecated: use distributed_transformer_pipeline.cpp"
+struct DiffSummary
 {
-    struct BufferStats
-    {
-        double min = 0.0;
-        double max = 0.0;
-        double mean = 0.0;
-        double l2 = 0.0;
-        double rms = 0.0;
-        double stddev = 0.0;
-    };
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double rel_l2 = 0.0;
+    size_t worst_index = 0;
+    float value_a = 0.0f;
+    float value_b = 0.0f;
+};
 
-    BufferStats computeBufferStats(const float *data, size_t size)
+DiffSummary computeDiffSummary(const float *a, const float *b, size_t size)
+{
+    DiffSummary summary;
+    if (!a || !b || size == 0)
     {
-        BufferStats stats;
-        if (!data || size == 0)
-        {
-            return stats;
-        }
-
-        double sum = 0.0;
-        double sumsq = 0.0;
-        double min_v = static_cast<double>(data[0]);
-        double max_v = static_cast<double>(data[0]);
-        for (size_t i = 0; i < size; ++i)
-        {
-            double v = static_cast<double>(data[i]);
-            sum += v;
-            sumsq += v * v;
-            if (v < min_v)
-                min_v = v;
-            if (v > max_v)
-                max_v = v;
-        }
-        double mean = sum / static_cast<double>(size);
-        double variance = std::max(0.0, sumsq / static_cast<double>(size) - mean * mean);
-        stats.min = min_v;
-        stats.max = max_v;
-        stats.mean = mean;
-        stats.rms = std::sqrt(sumsq / static_cast<double>(size));
-        stats.l2 = std::sqrt(sumsq);
-        stats.stddev = std::sqrt(variance);
-        return stats;
-    }
-
-    struct DiffSummary
-    {
-        double max_abs = 0.0;
-        double mean_abs = 0.0;
-        double rel_l2 = 0.0;
-        size_t worst_index = 0;
-        float value_a = 0.0f;
-        float value_b = 0.0f;
-    };
-
-    DiffSummary computeDiffSummary(const float *a, const float *b, size_t size)
-    {
-        DiffSummary summary;
-        if (!a || !b || size == 0)
-        {
-            return summary;
-        }
-        double max_abs = 0.0;
-        size_t worst = 0;
-        float worst_a = 0.0f;
-        float worst_b = 0.0f;
-        double sum_abs = 0.0;
-        long double sum_sq = 0.0L;
-        long double denom_sq = 0.0L;
-        for (size_t i = 0; i < size; ++i)
-        {
-            double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
-            double abs_diff = std::fabs(diff);
-            sum_abs += abs_diff;
-            sum_sq += diff * diff;
-            double base = static_cast<double>(b[i]);
-            denom_sq += base * base;
-            if (abs_diff > max_abs)
-            {
-                max_abs = abs_diff;
-                worst = i;
-                worst_a = a[i];
-                worst_b = b[i];
-            }
-        }
-        summary.max_abs = max_abs;
-        summary.mean_abs = sum_abs / static_cast<double>(size);
-        summary.rel_l2 = std::sqrt(static_cast<double>(sum_sq)) / (std::sqrt(static_cast<double>(denom_sq)) + 1e-30);
-        summary.worst_index = worst;
-        summary.value_a = worst_a;
-        summary.value_b = worst_b;
         return summary;
     }
-
-    std::vector<std::tuple<size_t, float, float, double>> collectTopDiffSamples(const float *a,
-                                                                                const float *b,
-                                                                                size_t size,
-                                                                                size_t top_n)
+    double max_abs = 0.0;
+    size_t worst = 0;
+    float worst_a = 0.0f;
+    float worst_b = 0.0f;
+    double sum_abs = 0.0;
+    long double sum_sq = 0.0L;
+    long double denom_sq = 0.0L;
+    for (size_t i = 0; i < size; ++i)
     {
-        std::vector<std::tuple<size_t, float, float, double>> samples;
-        if (!a || !b || size == 0 || top_n == 0)
+        double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+        double abs_diff = std::fabs(diff);
+        sum_abs += abs_diff;
+        sum_sq += diff * diff;
+        double base = static_cast<double>(b[i]);
+        denom_sq += base * base;
+        if (abs_diff > max_abs)
         {
-            return samples;
+            max_abs = abs_diff;
+            worst = i;
+            worst_a = a[i];
+            worst_b = b[i];
         }
-        samples.reserve(std::min(size, top_n));
-        for (size_t i = 0; i < size; ++i)
-        {
-            double diff = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
-            if (diff <= 0.0)
-            {
-                continue;
-            }
-            if (samples.size() < top_n)
-            {
-                samples.emplace_back(i, a[i], b[i], diff);
-            }
-            else
-            {
-                auto min_it = std::min_element(samples.begin(), samples.end(),
-                                               [](const auto &lhs, const auto &rhs)
-                                               { return std::get<3>(lhs) < std::get<3>(rhs); });
-                if (diff > std::get<3>(*min_it))
-                {
-                    *min_it = std::make_tuple(i, a[i], b[i], diff);
-                }
-            }
-        }
-        std::sort(samples.begin(), samples.end(),
-                  [](const auto &lhs, const auto &rhs)
-                  { return std::get<3>(lhs) > std::get<3>(rhs); });
+    }
+    summary.max_abs = max_abs;
+    summary.mean_abs = sum_abs / static_cast<double>(size);
+    summary.rel_l2 = std::sqrt(static_cast<double>(sum_sq)) / (std::sqrt(static_cast<double>(denom_sq)) + 1e-30);
+    summary.worst_index = worst;
+    summary.value_a = worst_a;
+    summary.value_b = worst_b;
+    return summary;
+}
+
+std::vector<std::tuple<size_t, float, float, double>> collectTopDiffSamples(const float *a,
+                                                                            const float *b,
+                                                                            size_t size,
+                                                                            size_t top_n)
+{
+    std::vector<std::tuple<size_t, float, float, double>> samples;
+    if (!a || !b || size == 0 || top_n == 0)
+    {
         return samples;
     }
-
-    std::string trimWhitespace(const std::string &input)
+    samples.reserve(std::min(size, top_n));
+    for (size_t i = 0; i < size; ++i)
     {
-        const auto begin = input.find_first_not_of(" \t\n\r");
-        if (begin == std::string::npos)
+        double diff = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+        if (diff <= 0.0)
         {
-            return {};
+            continue;
         }
-        const auto end = input.find_last_not_of(" \t\n\r");
-        return input.substr(begin, end - begin + 1);
-    }
-
-    std::vector<int> parseIndexList(const char *env_value)
-    {
-        std::vector<int> indices;
-        if (!env_value || *env_value == '\0')
+        if (samples.size() < top_n)
         {
-            return indices;
-        }
-
-        std::stringstream ss(env_value);
-        std::string token;
-        while (std::getline(ss, token, ','))
-        {
-            auto trimmed = trimWhitespace(token);
-            if (trimmed.empty())
-            {
-                continue;
-            }
-            try
-            {
-                int value = std::stoi(trimmed);
-                if (value >= 0)
-                {
-                    indices.push_back(value);
-                }
-            }
-            catch (const std::exception &)
-            {
-                // Ignore malformed entries silently; diagnostics will indicate actual selections later.
-            }
-        }
-        return indices;
-    }
-
-    // Legacy PrefillFFNTraceConfig and related kTrace* env constants removed;
-    // tracing now driven entirely by debugEnv().ffn_shard_trace snapshot.
-
-    void logWorstDiffRowPreview(const char *tag,
-                                const std::string &stage,
-                                const float *actual,
-                                const float *baseline,
-                                size_t count,
-                                int cols,
-                                size_t worst_index,
-                                size_t preview_cols = 16)
-    {
-        if (!actual || !baseline || count == 0 || cols <= 0)
-        {
-            return;
-        }
-        size_t cols_sz = static_cast<size_t>(cols);
-        if (cols_sz == 0)
-        {
-            return;
-        }
-        size_t rows = count / cols_sz;
-        if (rows == 0)
-        {
-            return;
-        }
-        size_t row = worst_index / cols_sz;
-        size_t col = worst_index % cols_sz;
-        if (row >= rows)
-        {
-            return;
-        }
-
-        size_t offset = row * cols_sz;
-        size_t preview = std::min(preview_cols, cols_sz);
-
-        std::ostringstream actual_stream;
-        std::ostringstream baseline_stream;
-        std::ostringstream delta_stream;
-        actual_stream << "[";
-        baseline_stream << "[";
-        delta_stream << "[";
-        for (size_t i = 0; i < preview; ++i)
-        {
-            size_t idx = offset + i;
-            float a_val = actual[idx];
-            float b_val = baseline[idx];
-            float d_val = a_val - b_val;
-            if (i > 0)
-            {
-                actual_stream << ", ";
-                baseline_stream << ", ";
-                delta_stream << ", ";
-            }
-            actual_stream << a_val;
-            baseline_stream << b_val;
-            delta_stream << d_val;
-        }
-        if (cols_sz > preview)
-        {
-            actual_stream << ", ...";
-            baseline_stream << ", ...";
-            delta_stream << ", ...";
-        }
-        actual_stream << "]";
-        baseline_stream << "]";
-        delta_stream << "]";
-
-        LOG_WARN(tag << " " << stage << " worst_row=" << row
-                     << " worst_col=" << col
-                     << " actual=" << actual_stream.str()
-                     << " baseline=" << baseline_stream.str()
-                     << " delta=" << delta_stream.str());
-    }
-
-    std::vector<int> resolveFFNTraceIndices(const std::vector<int> &requested, int upper_bound, int limit)
-    {
-        std::vector<int> indices;
-        if (upper_bound <= 0)
-        {
-            return indices;
-        }
-
-        auto clamp_push = [&](int value)
-        {
-            if (value >= 0 && value < upper_bound)
-            {
-                indices.push_back(value);
-            }
-        };
-
-        if (!requested.empty())
-        {
-            indices.reserve(std::min<int>(requested.size(), std::max(limit, 1)));
-            std::unordered_set<int> seen;
-            for (int value : requested)
-            {
-                if (value >= 0 && value < upper_bound && seen.insert(value).second)
-                {
-                    indices.push_back(value);
-                }
-            }
+            samples.emplace_back(i, a[i], b[i], diff);
         }
         else
         {
-            int fill_count = limit > 0 ? std::min(upper_bound, limit) : std::min(upper_bound, 1);
-            indices.reserve(fill_count);
-            for (int i = 0; i < fill_count; ++i)
+            auto min_it = std::min_element(samples.begin(), samples.end(),
+                                           [](const auto &lhs, const auto &rhs)
+                                           { return std::get<3>(lhs) < std::get<3>(rhs); });
+            if (diff > std::get<3>(*min_it))
             {
-                clamp_push(i);
+                *min_it = std::make_tuple(i, a[i], b[i], diff);
             }
         }
+    }
+    std::sort(samples.begin(), samples.end(),
+              [](const auto &lhs, const auto &rhs)
+              { return std::get<3>(lhs) > std::get<3>(rhs); });
+    return samples;
+}
 
-        if (limit > 0 && static_cast<int>(indices.size()) > limit)
-        {
-            indices.resize(limit);
-        }
+std::string trimWhitespace(const std::string &input)
+{
+    const auto begin = input.find_first_not_of(" \t\n\r");
+    if (begin == std::string::npos)
+    {
+        return {};
+    }
+    const auto end = input.find_last_not_of(" \t\n\r");
+    return input.substr(begin, end - begin + 1);
+}
 
+std::vector<int> parseIndexList(const char *env_value)
+{
+    std::vector<int> indices;
+    if (!env_value || *env_value == '\0')
+    {
         return indices;
     }
 
-    bool isFFNShardTracingEnabledFor(const std::string &label)
+    std::stringstream ss(env_value);
+    std::string token;
+    while (std::getline(ss, token, ','))
     {
-        const auto &cfg = llaminar::debugEnv().ffn_shard_trace;
-        if (!cfg.enabled)
-            return false;
-        if (cfg.match_all)
-            return true;
-        if (cfg.shards_spec.empty())
-            return true; // implicit enable
-        // simple comma list semantics already stored as original spec; parse on demand for label membership
-        if (cfg.match_all)
-            return true;
-        std::stringstream ss(cfg.shards_spec);
-        std::string tok;
-        while (std::getline(ss, tok, ','))
+        auto trimmed = trimWhitespace(token);
+        if (trimmed.empty())
         {
-            if (trimWhitespace(tok) == label)
-                return true;
+            continue;
         }
+        try
+        {
+            int value = std::stoi(trimmed);
+            if (value >= 0)
+            {
+                indices.push_back(value);
+            }
+        }
+        catch (const std::exception &)
+        {
+            // Ignore malformed entries silently; diagnostics will indicate actual selections later.
+        }
+    }
+    return indices;
+}
+
+// Legacy PrefillFFNTraceConfig and related kTrace* env constants removed;
+// tracing now driven entirely by debugEnv().ffn_shard_trace snapshot.
+
+void logWorstDiffRowPreview(const char *tag,
+                            const std::string &stage,
+                            const float *actual,
+                            const float *baseline,
+                            size_t count,
+                            int cols,
+                            size_t worst_index,
+                            size_t preview_cols = 16)
+{
+    if (!actual || !baseline || count == 0 || cols <= 0)
+    {
+        return;
+    }
+    size_t cols_sz = static_cast<size_t>(cols);
+    if (cols_sz == 0)
+    {
+        return;
+    }
+    size_t rows = count / cols_sz;
+    if (rows == 0)
+    {
+        return;
+    }
+    size_t row = worst_index / cols_sz;
+    size_t col = worst_index % cols_sz;
+    if (row >= rows)
+    {
+        return;
+    }
+
+    size_t offset = row * cols_sz;
+    size_t preview = std::min(preview_cols, cols_sz);
+
+    std::ostringstream actual_stream;
+    std::ostringstream baseline_stream;
+    std::ostringstream delta_stream;
+    actual_stream << "[";
+    baseline_stream << "[";
+    delta_stream << "[";
+    for (size_t i = 0; i < preview; ++i)
+    {
+        size_t idx = offset + i;
+        float a_val = actual[idx];
+        float b_val = baseline[idx];
+        float d_val = a_val - b_val;
+        if (i > 0)
+        {
+            actual_stream << ", ";
+            baseline_stream << ", ";
+            delta_stream << ", ";
+        }
+        actual_stream << a_val;
+        baseline_stream << b_val;
+        delta_stream << d_val;
+    }
+    if (cols_sz > preview)
+    {
+        actual_stream << ", ...";
+        baseline_stream << ", ...";
+        delta_stream << ", ...";
+    }
+    actual_stream << "]";
+    baseline_stream << "]";
+    delta_stream << "]";
+
+    LOG_WARN(tag << " " << stage << " worst_row=" << row
+                 << " worst_col=" << col
+                 << " actual=" << actual_stream.str()
+                 << " baseline=" << baseline_stream.str()
+                 << " delta=" << delta_stream.str());
+}
+
+std::vector<int> resolveFFNTraceIndices(const std::vector<int> &requested, int upper_bound, int limit)
+{
+    std::vector<int> indices;
+    if (upper_bound <= 0)
+    {
+        return indices;
+    }
+
+    auto clamp_push = [&](int value)
+    {
+        if (value >= 0 && value < upper_bound)
+        {
+            indices.push_back(value);
+        }
+    };
+
+    if (!requested.empty())
+    {
+        indices.reserve(std::min<int>(requested.size(), std::max(limit, 1)));
+        std::unordered_set<int> seen;
+        for (int value : requested)
+        {
+            if (value >= 0 && value < upper_bound && seen.insert(value).second)
+            {
+                indices.push_back(value);
+            }
+        }
+    }
+    else
+    {
+        int fill_count = limit > 0 ? std::min(upper_bound, limit) : std::min(upper_bound, 1);
+        indices.reserve(fill_count);
+        for (int i = 0; i < fill_count; ++i)
+        {
+            clamp_push(i);
+        }
+    }
+
+    if (limit > 0 && static_cast<int>(indices.size()) > limit)
+    {
+        indices.resize(limit);
+    }
+
+    return indices;
+}
+
+bool isFFNShardTracingEnabledFor(const std::string &label)
+{
+    const auto &cfg = llaminar::debugEnv().ffn_shard_trace;
+    if (!cfg.enabled)
         return false;
+    if (cfg.match_all)
+        return true;
+    if (cfg.shards_spec.empty())
+        return true; // implicit enable
+    // simple comma list semantics already stored as original spec; parse on demand for label membership
+    if (cfg.match_all)
+        return true;
+    std::stringstream ss(cfg.shards_spec);
+    std::string tok;
+    while (std::getline(ss, tok, ','))
+    {
+        if (trimWhitespace(tok) == label)
+            return true;
+    }
+    return false;
+}
+
+std::string formatDiffSamples(const std::vector<std::tuple<size_t, float, float, double>> &samples,
+                              int cols)
+{
+    if (samples.empty())
+    {
+        return std::string("<none>");
+    }
+    std::ostringstream oss;
+    for (size_t i = 0; i < samples.size(); ++i)
+    {
+        size_t idx = std::get<0>(samples[i]);
+        oss << "[idx=" << idx;
+        if (cols > 0)
+        {
+            int row = static_cast<int>(idx / static_cast<size_t>(cols));
+            int col = static_cast<int>(idx % static_cast<size_t>(cols));
+            oss << " r=" << row << " c=" << col;
+        }
+        oss << " cosma=" << std::get<1>(samples[i])
+            << " ref=" << std::get<2>(samples[i])
+            << " diff=" << std::get<3>(samples[i]) << "]";
+        if (i + 1 < samples.size())
+        {
+            oss << ' ';
+        }
+    }
+    return oss.str();
+}
+
+// Baseline capture / compare now sourced from debugEnv().baseline
+
+void enforce_matrix_layout(std::shared_ptr<llaminar::TensorBase> &tensor,
+                           int expected_rows,
+                           int expected_cols,
+                           const std::string &label)
+{
+    if (!tensor)
+    {
+        throw std::runtime_error(label + " tensor is null");
     }
 
-    std::string formatDiffSamples(const std::vector<std::tuple<size_t, float, float, double>> &samples,
-                                  int cols)
+    // If either expected dimension is zero (unknown from metadata), accept any 2D shape.
+    // This enables late inference of feed-forward dimension without throwing.
+    if (expected_rows == 0 || expected_cols == 0)
     {
-        if (samples.empty())
+        const auto &shape_probe = tensor->shape();
+        if (shape_probe.size() == 2)
         {
-            return std::string("<none>");
+            LOG_WARN(label << ": layout check bypassed (expected dimension 0). Observed shape="
+                           << "[" << shape_probe[0] << ", " << shape_probe[1] << "]");
+            return; // Accept as-is.
         }
-        std::ostringstream oss;
-        for (size_t i = 0; i < samples.size(); ++i)
-        {
-            size_t idx = std::get<0>(samples[i]);
-            oss << "[idx=" << idx;
-            if (cols > 0)
-            {
-                int row = static_cast<int>(idx / static_cast<size_t>(cols));
-                int col = static_cast<int>(idx % static_cast<size_t>(cols));
-                oss << " r=" << row << " c=" << col;
-            }
-            oss << " cosma=" << std::get<1>(samples[i])
-                << " ref=" << std::get<2>(samples[i])
-                << " diff=" << std::get<3>(samples[i]) << "]";
-            if (i + 1 < samples.size())
-            {
-                oss << ' ';
-            }
-        }
-        return oss.str();
     }
 
-    // Baseline capture / compare now sourced from debugEnv().baseline
-
-    void enforce_matrix_layout(std::shared_ptr<llaminar::TensorBase> &tensor,
-                               int expected_rows,
-                               int expected_cols,
-                               const std::string &label)
+    const auto &shape = tensor->shape();
+    if (shape.size() != 2)
     {
-        if (!tensor)
-        {
-            throw std::runtime_error(label + " tensor is null");
-        }
-
-        // If either expected dimension is zero (unknown from metadata), accept any 2D shape.
-        // This enables late inference of feed-forward dimension without throwing.
-        if (expected_rows == 0 || expected_cols == 0)
-        {
-            const auto &shape_probe = tensor->shape();
-            if (shape_probe.size() == 2)
-            {
-                LOG_WARN(label << ": layout check bypassed (expected dimension 0). Observed shape="
-                               << "[" << shape_probe[0] << ", " << shape_probe[1] << "]");
-                return; // Accept as-is.
-            }
-        }
-
-        const auto &shape = tensor->shape();
-        if (shape.size() != 2)
-        {
-            std::ostringstream oss;
-            oss << label << " has " << shape.size() << " dimensions, expected 2";
-            LOG_ERROR(oss.str());
-            throw std::runtime_error(oss.str());
-        }
-
-        if (shape[0] == expected_rows && shape[1] == expected_cols)
-        {
-            return; // Already in desired layout
-        }
-
-        if (shape[0] == expected_cols && shape[1] == expected_rows)
-        {
-            const float *src = tensor->data();
-            std::vector<float> transposed(static_cast<size_t>(expected_rows) * expected_cols, 0.0f);
-            for (int r = 0; r < expected_rows; ++r)
-            {
-                for (int c = 0; c < expected_cols; ++c)
-                {
-                    transposed[static_cast<size_t>(r) * expected_cols + c] =
-                        src[static_cast<size_t>(c) * expected_rows + r];
-                }
-            }
-
-            tensor = std::make_shared<llaminar::SimpleTensor>(std::vector<int>{expected_rows, expected_cols}, transposed);
-            LOG_INFO(label << " loaded as [" << shape[0] << ", " << shape[1]
-                           << "]; transposed to [" << expected_rows << ", " << expected_cols << "] for pipeline layout alignment");
-            return;
-        }
-
         std::ostringstream oss;
-        oss << label << " has unsupported shape [" << shape[0] << ", " << shape[1]
-            << "], expected either [" << expected_rows << ", " << expected_cols
-            << "] or its transpose";
+        oss << label << " has " << shape.size() << " dimensions, expected 2";
         LOG_ERROR(oss.str());
         throw std::runtime_error(oss.str());
     }
 
-    class PrefillBaselineRegistry
+    if (shape[0] == expected_rows && shape[1] == expected_cols)
     {
-    public:
-        static PrefillBaselineRegistry &instance()
-        {
-            static PrefillBaselineRegistry inst;
-            return inst;
-        }
+        return; // Already in desired layout
+    }
 
-        void clear()
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            storage_.clear();
-        }
-
-        void store(const std::string &name, const float *data, size_t count)
-        {
-            if (!data || count == 0)
-            {
-                return;
-            }
-            std::lock_guard<std::mutex> guard(mutex_);
-            storage_[name] = std::vector<float>(data, data + count);
-        }
-        bool ensure(const std::string &name, const float *data, size_t count)
-        {
-            if (!data || count == 0)
-            {
-                return false;
-            }
-            std::lock_guard<std::mutex> guard(mutex_);
-            auto it = storage_.find(name);
-            if (it == storage_.end() || it->second.size() != count)
-            {
-                storage_[name] = std::vector<float>(data, data + count);
-                return true;
-            }
-            return false;
-        }
-
-        bool fetch(const std::string &name, std::vector<float> &out) const
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            auto it = storage_.find(name);
-            if (it == storage_.end())
-            {
-                return false;
-            }
-            out = it->second;
-            return true;
-        }
-
-    private:
-        PrefillBaselineRegistry() = default;
-        PrefillBaselineRegistry(const PrefillBaselineRegistry &) = delete;
-        PrefillBaselineRegistry &operator=(const PrefillBaselineRegistry &) = delete;
-
-        mutable std::mutex mutex_;
-        std::unordered_map<std::string, std::vector<float>> storage_;
-    };
-
-    void handle_prefill_stage_snapshot(int rank,
-                                       const std::string &name,
-                                       const float *data,
-                                       size_t count,
-                                       int cols,
-                                       double warn_threshold,
-                                       bool capture_enabled,
-                                       bool compare_enabled)
+    if (shape[0] == expected_cols && shape[1] == expected_rows)
     {
-        if ((!capture_enabled && !compare_enabled) || !data || count == 0)
+        const float *src = tensor->data();
+        std::vector<float> transposed(static_cast<size_t>(expected_rows) * expected_cols, 0.0f);
+        for (int r = 0; r < expected_rows; ++r)
+        {
+            for (int c = 0; c < expected_cols; ++c)
+            {
+                transposed[static_cast<size_t>(r) * expected_cols + c] =
+                    src[static_cast<size_t>(c) * expected_rows + r];
+            }
+        }
+
+        tensor = std::make_shared<llaminar::SimpleTensor>(std::vector<int>{expected_rows, expected_cols}, transposed);
+        LOG_INFO(label << " loaded as [" << shape[0] << ", " << shape[1]
+                       << "]; transposed to [" << expected_rows << ", " << expected_cols << "] for pipeline layout alignment");
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << label << " has unsupported shape [" << shape[0] << ", " << shape[1]
+        << "], expected either [" << expected_rows << ", " << expected_cols
+        << "] or its transpose";
+    LOG_ERROR(oss.str());
+    throw std::runtime_error(oss.str());
+}
+
+class PrefillBaselineRegistry
+{
+public:
+    static PrefillBaselineRegistry &instance()
+    {
+        static PrefillBaselineRegistry inst;
+        return inst;
+    }
+
+    void clear()
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        storage_.clear();
+    }
+
+    void store(const std::string &name, const float *data, size_t count)
+    {
+        if (!data || count == 0)
         {
             return;
         }
-
-        constexpr const char *tag = "[PrefillBaseline]";
-        auto &registry = PrefillBaselineRegistry::instance();
-
-        if (capture_enabled && rank == 0)
-        {
-            bool stored = registry.ensure(name, data, count);
-            if (stored)
-            {
-                LOG_DEBUG(tag << " captured stage '" << name << "' elements=" << count);
-            }
-            else
-            {
-                LOG_TRACE(tag << " baseline for stage '" << name << "' already present; skipping overwrite");
-            }
-        }
-
-        if (compare_enabled && rank == 0)
-        {
-            std::vector<float> baseline;
-            if (!registry.fetch(name, baseline))
-            {
-                LOG_WARN(tag << " missing baseline for stage '" << name << "'");
-                return;
-            }
-            if (baseline.size() != count)
-            {
-                LOG_WARN(tag << " size mismatch for stage '" << name << "' baseline=" << baseline.size()
-                             << " current=" << count);
-                return;
-            }
-
-            auto diff = computeDiffSummary(data, baseline.data(), count);
-            auto samples = collectTopDiffSamples(data, baseline.data(), count, 8);
-            if (diff.rel_l2 > warn_threshold)
-            {
-                LOG_WARN(tag << " " << name << " diff rel_l2=" << diff.rel_l2
-                             << " max_abs=" << diff.max_abs
-                             << " mean_abs=" << diff.mean_abs
-                             << " worst_index=" << diff.worst_index
-                             << " cosma=" << diff.value_a
-                             << " baseline=" << diff.value_b);
-                logWorstDiffRowPreview(tag,
-                                       name,
-                                       data,
-                                       baseline.data(),
-                                       count,
-                                       cols,
-                                       diff.worst_index,
-                                       16);
-            }
-            else
-            {
-                LOG_INFO(tag << " " << name << " diff rel_l2=" << diff.rel_l2
-                             << " max_abs=" << diff.max_abs
-                             << " mean_abs=" << diff.mean_abs
-                             << " worst_index=" << diff.worst_index
-                             << " cosma=" << diff.value_a
-                             << " baseline=" << diff.value_b);
-            }
-            LOG_INFO(tag << " " << name << " diff samples: " << formatDiffSamples(samples, cols));
-        }
+        std::lock_guard<std::mutex> guard(mutex_);
+        storage_[name] = std::vector<float>(data, data + count);
     }
-
-    bool findFirstNonFinite(const float *data, size_t size, size_t &index, float &value)
+    bool ensure(const std::string &name, const float *data, size_t count)
     {
-        if (!data)
+        if (!data || count == 0)
         {
             return false;
         }
-        for (size_t i = 0; i < size; ++i)
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = storage_.find(name);
+        if (it == storage_.end() || it->second.size() != count)
         {
-            if (!std::isfinite(data[i]))
-            {
-                index = i;
-                value = data[i];
-                return true;
-            }
+            storage_[name] = std::vector<float>(data, data + count);
+            return true;
         }
         return false;
     }
+
+    bool fetch(const std::string &name, std::vector<float> &out) const
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = storage_.find(name);
+        if (it == storage_.end())
+        {
+            return false;
+        }
+        out = it->second;
+        return true;
+    }
+
+private:
+    PrefillBaselineRegistry() = default;
+    PrefillBaselineRegistry(const PrefillBaselineRegistry &) = delete;
+    PrefillBaselineRegistry &operator=(const PrefillBaselineRegistry &) = delete;
+
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, std::vector<float>> storage_;
+};
+
+void handle_prefill_stage_snapshot(int rank,
+                                   const std::string &name,
+                                   const float *data,
+                                   size_t count,
+                                   int cols,
+                                   double warn_threshold,
+                                   bool capture_enabled,
+                                   bool compare_enabled)
+{
+    if ((!capture_enabled && !compare_enabled) || !data || count == 0)
+    {
+        return;
+    }
+
+    constexpr const char *tag = "[PrefillBaseline]";
+    auto &registry = PrefillBaselineRegistry::instance();
+
+    if (capture_enabled && rank == 0)
+    {
+        bool stored = registry.ensure(name, data, count);
+        if (stored)
+        {
+            LOG_DEBUG(tag << " captured stage '" << name << "' elements=" << count);
+        }
+        else
+        {
+            LOG_TRACE(tag << " baseline for stage '" << name << "' already present; skipping overwrite");
+        }
+    }
+
+    if (compare_enabled && rank == 0)
+    {
+        std::vector<float> baseline;
+        if (!registry.fetch(name, baseline))
+        {
+            LOG_WARN(tag << " missing baseline for stage '" << name << "'");
+            return;
+        }
+        if (baseline.size() != count)
+        {
+            LOG_WARN(tag << " size mismatch for stage '" << name << "' baseline=" << baseline.size()
+                         << " current=" << count);
+            return;
+        }
+
+        auto diff = computeDiffSummary(data, baseline.data(), count);
+        auto samples = collectTopDiffSamples(data, baseline.data(), count, 8);
+        if (diff.rel_l2 > warn_threshold)
+        {
+            LOG_WARN(tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                         << " max_abs=" << diff.max_abs
+                         << " mean_abs=" << diff.mean_abs
+                         << " worst_index=" << diff.worst_index
+                         << " cosma=" << diff.value_a
+                         << " baseline=" << diff.value_b);
+            logWorstDiffRowPreview(tag,
+                                   name,
+                                   data,
+                                   baseline.data(),
+                                   count,
+                                   cols,
+                                   diff.worst_index,
+                                   16);
+        }
+        else
+        {
+            LOG_INFO(tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                         << " max_abs=" << diff.max_abs
+                         << " mean_abs=" << diff.mean_abs
+                         << " worst_index=" << diff.worst_index
+                         << " cosma=" << diff.value_a
+                         << " baseline=" << diff.value_b);
+        }
+        LOG_INFO(tag << " " << name << " diff samples: " << formatDiffSamples(samples, cols));
+    }
+}
+
+bool findFirstNonFinite(const float *data, size_t size, size_t &index, float &value)
+{
+    if (!data)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < size; ++i)
+    {
+        if (!std::isfinite(data[i]))
+        {
+            index = i;
+            value = data[i];
+            return true;
+        }
+    }
+    return false;
+}
 } // namespace
 
 namespace llaminar
 {
+    // Factory registration for AbstractPipeline usage (architecture key: "qwen")
+    static std::once_flag qwen_register_flag;
+    void registerQwenPipeline()
+    {
+        std::call_once(qwen_register_flag, []()
+                       { PipelineFactory::instance().registerCreator("qwen", [](const TransformerLayerConfig &cfg) -> std::unique_ptr<AbstractPipeline>
+                                                                     {
+                auto impl = std::make_unique<DistributedTransformerPipeline>(cfg);
+                return std::unique_ptr<AbstractPipeline>(impl.release()); }); });
+    }
 
     // Static member definition
-    std::atomic<size_t> MPITransformerPipeline::small_seq_fast_path_calls_{0};
-    std::vector<float> MPITransformerPipeline::last_pre_lm_hidden_;
-    std::vector<MPITransformerPipeline::LayerActivationStat> MPITransformerPipeline::last_layer_stats_;
-    std::vector<MPITransformerPipeline::LayerTokenDiffRow> MPITransformerPipeline::last_layer_token_rows_;
+    // Legacy static definitions disabled to avoid ODR duplication with unified implementation in
+    // distributed_transformer_pipeline.cpp. If this file is linked, these would create separate
+    // storage causing replay pipeline writes to go to a different vector instance.
+    // std::atomic<size_t> DistributedTransformerPipeline::small_seq_fast_path_calls_{0};
+    // std::vector<float> DistributedTransformerPipeline::last_pre_lm_hidden_;
+    // std::vector<DistributedTransformerPipeline::LayerActivationStat> DistributedTransformerPipeline::last_layer_stats_;
+    // std::vector<DistributedTransformerPipeline::LayerTokenDiffRow> DistributedTransformerPipeline::last_layer_token_rows_;
 
-    MPITransformerPipeline::MPITransformerPipeline(const LayerConfig &config)
+    DistributedTransformerPipeline::DistributedTransformerPipeline(const LayerConfig &config)
         : PipelineBase(), config_(config), use_kv_cache_(true), n_past_(0),
           total_embedding_time_(0.0), total_attention_time_(0.0),
           total_linear_time_(0.0), total_norm_time_(0.0), total_activation_time_(0.0), total_communication_time_(0.0)
@@ -645,14 +582,14 @@ namespace llaminar
             }
         }
 
-        LOG_INFO("MPITransformerPipeline initialized on rank " << getRank() << "/" << getSize()
-                                                               << " with " << config_.n_layers << " layers, " << config_.n_head << " heads");
+        LOG_INFO("DistributedTransformerPipeline initialized on rank " << getRank() << "/" << getSize()
+                                                                       << " with " << config_.n_layers << " layers, " << config_.n_head << " heads");
     }
 
     // Explicit out-of-line destructor to anchor vtable emission
-    MPITransformerPipeline::~MPITransformerPipeline() = default;
+    DistributedTransformerPipeline::~DistributedTransformerPipeline() = default;
 
-    void MPITransformerPipeline::initializeKernels()
+    void DistributedTransformerPipeline::initializeKernels()
     {
         // Register Embedding kernel (supports sharded or full embedding table)
         {
@@ -711,13 +648,13 @@ namespace llaminar
 
         // Embedding previously handled directly; now executed via registered kernel for consistency
 
-        LOG_DEBUG("MPITransformerPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
+        LOG_DEBUG("DistributedTransformerPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
     }
 
-    void MPITransformerPipeline::traceFFNShardDiagnostics(const std::string &label,
-                                                          const float *data,
-                                                          int seq_len,
-                                                          int feature_dim)
+    void DistributedTransformerPipeline::traceFFNShardDiagnostics(const std::string &label,
+                                                                  const float *data,
+                                                                  int seq_len,
+                                                                  int feature_dim)
     {
         const auto &cfg = debugEnv().ffn_shard_trace;
         if (!cfg.enabled || !data || seq_len <= 0 || feature_dim <= 0)
@@ -857,16 +794,16 @@ namespace llaminar
         logTensorRowPreview(tensor, label, rows, preview_cols, "PrefillFFNPreview");
     }
 
-    bool MPITransformerPipeline::execute(const std::vector<int> &token_ids,
-                                         const ModelWeights &weights,
-                                         std::shared_ptr<TensorBase> &output)
+    bool DistributedTransformerPipeline::execute(const std::vector<int> &token_ids,
+                                                 const ModelWeights &weights,
+                                                 std::shared_ptr<TensorBase> &output)
     {
-        PERF_SCOPED_TIMER("MPITransformerPipeline::execute");
+        PERF_SCOPED_TIMER("DistributedTransformerPipeline::execute");
         start_time_ = std::chrono::high_resolution_clock::now();
 
         if (!validate(weights))
         {
-            LOG_ERROR("MPITransformerPipeline: Weight validation failed");
+            LOG_ERROR("DistributedTransformerPipeline: Weight validation failed");
             return false;
         }
 
@@ -880,7 +817,7 @@ namespace llaminar
         }
         if (seq_len <= 0 || seq_len > config_.max_seq_len)
         {
-            LOG_ERROR("MPITransformerPipeline: Invalid sequence length " << seq_len);
+            LOG_ERROR("DistributedTransformerPipeline: Invalid sequence length " << seq_len);
             return false;
         }
 
@@ -1090,7 +1027,7 @@ namespace llaminar
         auto embedding_start = std::chrono::high_resolution_clock::now();
         if (!executeEmbedding(token_ids, weights.token_embedding, current_input))
         {
-            LOG_ERROR("MPITransformerPipeline: Embedding execution failed");
+            LOG_ERROR("DistributedTransformerPipeline: Embedding execution failed");
             return false;
         }
         auto embedding_end = std::chrono::high_resolution_clock::now();
@@ -1160,7 +1097,7 @@ namespace llaminar
         {
             if (!executeTransformerLayer(layer_idx, current_input, weights, layer_output))
             {
-                LOG_ERROR("MPITransformerPipeline: Layer " << layer_idx << " execution failed");
+                LOG_ERROR("DistributedTransformerPipeline: Layer " << layer_idx << " execution failed");
                 return false;
             }
 
@@ -1171,7 +1108,7 @@ namespace llaminar
         // 3. Final output projection
         if (!executeOutputProjection(current_input, weights, output))
         {
-            LOG_ERROR("MPITransformerPipeline: Output projection failed");
+            LOG_ERROR("DistributedTransformerPipeline: Output projection failed");
             return false;
         }
 
@@ -1180,9 +1117,9 @@ namespace llaminar
 
         if (getRank() == 0)
         {
-            LOG_INFO("MPITransformerPipeline completed: " << seq_len << " tokens, "
-                                                          << config_.n_layers << " layers in " << std::fixed << std::setprecision(2)
-                                                          << total_time << "ms");
+            LOG_INFO("DistributedTransformerPipeline completed: " << seq_len << " tokens, "
+                                                                  << config_.n_layers << " layers in " << std::fixed << std::setprecision(2)
+                                                                  << total_time << "ms");
             LOG_DEBUG("Breakdown - Embedding: " << total_embedding_time_ << "ms, "
                                                 << "Attention: " << total_attention_time_ << "ms, "
                                                 << "Linear: " << total_linear_time_ << "ms, "
@@ -1230,9 +1167,9 @@ namespace llaminar
         return true;
     }
 
-    bool MPITransformerPipeline::executeEmbedding(const std::vector<int> &token_ids,
-                                                  const std::shared_ptr<TensorBase> &embedding_weight,
-                                                  std::shared_ptr<TensorBase> &embedded_output)
+    bool DistributedTransformerPipeline::executeEmbedding(const std::vector<int> &token_ids,
+                                                          const std::shared_ptr<TensorBase> &embedding_weight,
+                                                          std::shared_ptr<TensorBase> &embedded_output)
     {
         int seq_len = token_ids.size();
 
@@ -1311,12 +1248,12 @@ namespace llaminar
         return true;
     }
 
-    bool MPITransformerPipeline::executeTransformerLayer(int layer_idx,
-                                                         std::shared_ptr<TensorBase> &input,
-                                                         const ModelWeights &weights,
-                                                         std::shared_ptr<TensorBase> &output)
+    bool DistributedTransformerPipeline::executeTransformerLayer(int layer_idx,
+                                                                 std::shared_ptr<TensorBase> &input,
+                                                                 const ModelWeights &weights,
+                                                                 std::shared_ptr<TensorBase> &output)
     {
-        PERF_SCOPED_TIMER("MPITransformerPipeline::executeTransformerLayer");
+        PERF_SCOPED_TIMER("DistributedTransformerPipeline::executeTransformerLayer");
         int seq_len = input->shape()[0];
 
         // Early one-shot diagnostic for layer token diff capture flags (before any potential early returns)
@@ -2412,7 +2349,7 @@ namespace llaminar
         return true;
     }
 
-    bool MPITransformerPipeline::shouldUseCosmaPrefill(int seq_len) const
+    bool DistributedTransformerPipeline::shouldUseCosmaPrefill(int seq_len) const
     {
         // DEPRECATED: Retained temporarily for any external callers; internal logic now
         // uses BackendSelector with explicit stage context. Mirrors former heuristic.
@@ -2426,8 +2363,8 @@ namespace llaminar
         return prefill_mgr.enabled_for(seq_len);
     }
 
-    std::shared_ptr<TensorBase> MPITransformerPipeline::embedSingleToken(int token_id,
-                                                                         const std::shared_ptr<TensorBase> &embedding_weight)
+    std::shared_ptr<TensorBase> DistributedTransformerPipeline::embedSingleToken(int token_id,
+                                                                                 const std::shared_ptr<TensorBase> &embedding_weight)
     {
         if (!embedding_weight || embedding_weight->shape().size() != 2)
         {
@@ -2461,9 +2398,9 @@ namespace llaminar
         return out;
     }
 
-    bool MPITransformerPipeline::decodeToken(int token_id,
-                                             const ModelWeights &weights,
-                                             std::shared_ptr<TensorBase> &output_logits)
+    bool DistributedTransformerPipeline::decodeToken(int token_id,
+                                                     const ModelWeights &weights,
+                                                     std::shared_ptr<TensorBase> &output_logits)
     {
         const auto &env = debugEnv();
         if (env.pipeline.disable_incremental_decode)
@@ -2499,6 +2436,14 @@ namespace llaminar
         auto current = embedSingleToken(token_id, weights.token_embedding);
         if (!current)
             return false;
+
+        if (env.pipeline.incr_trace && getRank() == 0)
+        {
+            LOG_INFO("[IncrTrace] start token=" << token_id
+                                                << " n_past=" << n_past_
+                                                << " use_kv=" << (use_kv_cache_ ? 1 : 0)
+                                                << " cache_init=" << (!k_cache_.empty() ? 1 : 0));
+        }
 
         // Capacity check / growth before populating new K/V slice
         if (use_kv_cache_)
@@ -2544,6 +2489,34 @@ namespace llaminar
                 return false;
             }
             current = layer_output; // reuse buffer across layers
+
+            if (env.pipeline.incr_cache_trace && use_kv_cache_ && getRank() == 0)
+            {
+                // Log brief K/V slice preview for this layer at the just-written position
+                int pos = n_past_;
+                if (layer < (int)k_cache_.size() && k_cache_[layer] && v_cache_[layer])
+                {
+                    auto &K = k_cache_[layer];
+                    auto &V = v_cache_[layer];
+                    int kv_heads = config_.n_head_kv;
+                    int head_dim = config_.head_dim;
+                    size_t stride = (size_t)config_.max_seq_len * head_dim; // layout assumption (layer-major, head-contiguous) – adjust if different
+                    if (pos < config_.max_seq_len)
+                    {
+                        // Sample first 4 floats of first KV head at this position
+                        size_t base = (size_t)pos * head_dim; // simplified: single-head contiguous assumption
+                        float k_preview[4] = {0}, v_preview[4] = {0};
+                        for (int i = 0; i < 4 && i < head_dim; ++i)
+                        {
+                            k_preview[i] = K->data()[base + i];
+                            v_preview[i] = V->data()[base + i];
+                        }
+                        LOG_INFO("[IncrCacheTrace] layer=" << layer << " pos=" << pos
+                                                           << " k0=[" << k_preview[0] << "," << k_preview[1] << "," << k_preview[2] << "," << k_preview[3]
+                                                           << "] v0=[" << v_preview[0] << "," << v_preview[1] << "," << v_preview[2] << "," << v_preview[3] << "]");
+                    }
+                }
+            }
         }
 
         // Final output projection (norm + lm head) into logits
@@ -2553,6 +2526,23 @@ namespace llaminar
             return false;
         }
 
+        if (env.pipeline.incr_hidden_trace && getRank() == 0)
+        {
+            // Dump last hidden row prior to LM head for post-mortem comparison
+            int d = config_.d_model;
+            int dump = std::min(d, 16); // first 16 dims preview
+            std::ostringstream oss;
+            oss << "[IncrHiddenTrace] pos=" << n_past_ << " dims=" << d << " preview=";
+            const float *row = current->data(); // seq_len=1
+            for (int i = 0; i < dump; ++i)
+            {
+                oss << row[i];
+                if (i + 1 < dump)
+                    oss << ',';
+            }
+            LOG_INFO(oss.str());
+        }
+
         output_logits = logits;
         n_past_ += 1; // advance position
         if (use_kv_cache_)
@@ -2560,18 +2550,27 @@ namespace llaminar
             kv_cache_state_.used_tokens = n_past_;
         }
         if (getRank() == 0)
-            LOG_DEBUG("[decode] incremental token=" << token_id << " pos=" << position);
+        {
+            if (env.pipeline.incr_trace)
+            {
+                LOG_INFO("[IncrTrace] done token=" << token_id << " pos=" << position << " n_past(new)=" << n_past_ << " logits_shape=1x" << config_.vocab_size);
+            }
+            else
+            {
+                LOG_DEBUG("[decode] incremental token=" << token_id << " pos=" << position);
+            }
+        }
         return true;
     }
 
-    bool MPITransformerPipeline::incrementalDecodeToken(int token_id,
-                                                        const ModelWeights &weights,
-                                                        std::shared_ptr<TensorBase> &output_logits)
+    bool DistributedTransformerPipeline::incrementalDecodeToken(int token_id,
+                                                                const ModelWeights &weights,
+                                                                std::shared_ptr<TensorBase> &output_logits)
     {
         // Tag diagnostic context so layer capture knows this is incremental
         struct Scope
         {
-            MPITransformerPipeline *p;
+            DistributedTransformerPipeline *p;
             ~Scope()
             {
                 if (p)
@@ -2583,12 +2582,12 @@ namespace llaminar
         return decodeToken(token_id, weights, output_logits);
     }
 
-    bool MPITransformerPipeline::executePrefillAttentionCosma(int layer_idx,
-                                                              std::shared_ptr<TensorBase> &input,
-                                                              const ModelWeights &weights,
-                                                              std::shared_ptr<TensorBase> &attn_norm_out,
-                                                              std::shared_ptr<TensorBase> &attn_out,
-                                                              PrefillAttentionTiming &timing)
+    bool DistributedTransformerPipeline::executePrefillAttentionCosma(int layer_idx,
+                                                                      std::shared_ptr<TensorBase> &input,
+                                                                      const ModelWeights &weights,
+                                                                      std::shared_ptr<TensorBase> &attn_norm_out,
+                                                                      std::shared_ptr<TensorBase> &attn_out,
+                                                                      PrefillAttentionTiming &timing)
     {
         auto fused_start = std::chrono::high_resolution_clock::now();
         CosmaPrefillManager &manager = CosmaPrefillManager::instance();
@@ -3178,9 +3177,9 @@ namespace llaminar
         return true;
     }
 
-    bool MPITransformerPipeline::executeOutputProjection(std::shared_ptr<TensorBase> &input,
-                                                         const ModelWeights &weights,
-                                                         std::shared_ptr<TensorBase> &output)
+    bool DistributedTransformerPipeline::executeOutputProjection(std::shared_ptr<TensorBase> &input,
+                                                                 const ModelWeights &weights,
+                                                                 std::shared_ptr<TensorBase> &output)
     {
         DEBUG_ASSERT(input, "Input tensor null before final normalization");
         int seq_len = input->shape()[0];
@@ -3768,7 +3767,7 @@ namespace llaminar
         return true;
     }
 
-    bool MPITransformerPipeline::validate(const ModelWeights &weights) const
+    bool DistributedTransformerPipeline::validate(const ModelWeights &weights) const
     {
         // Validate embedding weights
         if (!weights.token_embedding)
@@ -3944,15 +3943,15 @@ namespace llaminar
     }
 
     // Implement abstract interface from PipelineBase (not used in main execution path)
-    bool MPITransformerPipeline::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                         std::vector<std::shared_ptr<TensorBase>> &outputs)
+    bool DistributedTransformerPipeline::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                                 std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        LOG_ERROR("MPITransformerPipeline::execute(vector) not supported; use execute(token_ids, weights, output) overload");
+        LOG_ERROR("DistributedTransformerPipeline::execute(vector) not supported; use execute(token_ids, weights, output) overload");
         return false;
     }
 
-    bool MPITransformerPipeline::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                          const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+    bool DistributedTransformerPipeline::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                                  const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Minimal shape checks; pipeline primary API differs.
         if (inputs.empty() || outputs.empty())
@@ -3960,7 +3959,7 @@ namespace llaminar
         return true;
     }
 
-    std::vector<std::shared_ptr<TensorBase>> MPITransformerPipeline::createIntermediateTensors(int seq_len)
+    std::vector<std::shared_ptr<TensorBase>> DistributedTransformerPipeline::createIntermediateTensors(int seq_len)
     {
         std::vector<std::shared_ptr<TensorBase>> tensors;
 
@@ -3972,7 +3971,101 @@ namespace llaminar
         return tensors;
     }
 
-    void MPITransformerPipeline::initializeKVCache(int seq_len)
+    // ================= AbstractPipeline interface implementation =================
+    bool DistributedTransformerPipeline::prefill(const std::vector<int> &tokens,
+                                                 const IModelWeights &weights_iface,
+                                                 StageContext &ctx)
+    {
+        setStagePrefill();
+        current_tokens_ = tokens;
+        const auto *w = dynamic_cast<const QwenModelWeights *>(&weights_iface);
+        if (!w)
+        {
+            LOG_ERROR("prefill: Invalid weights type for Qwen pipeline");
+            return false;
+        }
+        auto output = TensorFactory::create_simple({(int)tokens.size(), config_.vocab_size});
+        if (!execute(tokens, w->inner, output))
+            return false;
+        last_logits_ = output;
+        kv_snapshot_.capacity_tokens = getKVCacheCapacity();
+        kv_snapshot_.used_tokens = getKVCacheUsed();
+        kv_snapshot_.growth_events = getKVCacheGrowthEvents();
+        ctx.stage = InferenceStage::Prefill;
+        ctx.seq_len = (int)tokens.size();
+        ctx.generated = 0;
+        ctx.kv_capacity = kv_snapshot_.capacity_tokens;
+        ctx.kv_used = kv_snapshot_.used_tokens;
+        return true;
+    }
+
+    bool DistributedTransformerPipeline::decode(int next_token,
+                                                const IModelWeights &weights_iface,
+                                                StageContext &ctx)
+    {
+        const auto *w = dynamic_cast<const QwenModelWeights *>(&weights_iface);
+        if (!w)
+        {
+            LOG_ERROR("decode: Invalid weights type for Qwen pipeline");
+            return false;
+        }
+        setStageDecode();
+        std::shared_ptr<TensorBase> one_logits;
+        bool used_incremental = incrementalDecodeToken(next_token, w->inner, one_logits);
+        if (!used_incremental)
+        {
+            current_tokens_.push_back(next_token);
+            auto replay = TensorFactory::create_simple({(int)current_tokens_.size(), config_.vocab_size});
+            if (!execute(current_tokens_, w->inner, replay))
+                return false;
+            last_logits_ = replay;
+        }
+        else
+        {
+            current_tokens_.push_back(next_token);
+            if (!last_logits_)
+            {
+                last_logits_ = one_logits;
+            }
+            else
+            {
+                int prev_rows = last_logits_->shape()[0];
+                int vocab = last_logits_->shape()[1];
+                auto combined = TensorFactory::create_simple({prev_rows + 1, vocab});
+                float *dst = const_cast<float *>(combined->data());
+                std::memcpy(dst, last_logits_->data(), sizeof(float) * prev_rows * vocab);
+                std::memcpy(dst + prev_rows * vocab, one_logits->data(), sizeof(float) * vocab);
+                last_logits_ = combined;
+            }
+        }
+        kv_snapshot_.capacity_tokens = getKVCacheCapacity();
+        kv_snapshot_.used_tokens = getKVCacheUsed();
+        kv_snapshot_.growth_events = getKVCacheGrowthEvents();
+        ctx.stage = InferenceStage::Decode;
+        ctx.seq_len = (int)current_tokens_.size();
+        ctx.generated += 1;
+        ctx.kv_capacity = kv_snapshot_.capacity_tokens;
+        ctx.kv_used = kv_snapshot_.used_tokens;
+        return true;
+    }
+
+    bool DistributedTransformerPipeline::logits(std::shared_ptr<TensorBase> &out_logits)
+    {
+        out_logits = last_logits_;
+        return (bool)last_logits_;
+    }
+
+    const KVCacheState *DistributedTransformerPipeline::kvCacheState() const
+    {
+        return &kv_snapshot_;
+    }
+
+    bool DistributedTransformerPipeline::ensureKVCapacity(int required_tokens)
+    {
+        return ensureKVCapacityPublic(required_tokens);
+    }
+
+    void DistributedTransformerPipeline::initializeKVCache(int seq_len)
     {
         if (getRank() == 0)
             LOG_INFO("[KVCacheInit] this=" << (const void *)this << " resizing to seq_len=" << seq_len);
@@ -3996,7 +4089,7 @@ namespace llaminar
             LOG_INFO("[KVCacheInit] completed capacity=" << seq_len << " this=" << (const void *)this);
     }
 
-    bool MPITransformerPipeline::ensureKVCapacity(int required_tokens)
+    bool DistributedTransformerPipeline::ensureKVCapacityInternal(int required_tokens)
     {
         if (!use_kv_cache_)
             return false;
@@ -4065,24 +4158,26 @@ namespace llaminar
         return true;
     }
 
-    // Factory function
-    std::unique_ptr<MPITransformerPipeline> createMPITransformerPipeline(
-        const MPITransformerPipeline::LayerConfig &config)
+    // Legacy createDistributedTransformerPipeline moved to distributed_transformer_pipeline.cpp
+    // (stub kept to avoid accidental use if this TU is ever re-enabled)
+    std::unique_ptr<DistributedTransformerPipeline> createDistributedTransformerPipeline(
+        const DistributedTransformerPipeline::LayerConfig &config)
     {
-        return std::make_unique<MPITransformerPipeline>(config);
+        LOG_ERROR("Legacy mpi_transformer_pipeline.cpp factory invoked unexpectedly");
+        return std::make_unique<DistributedTransformerPipeline>(config);
     }
 
     // Forward declaration of unified helper (defined below)
-    static MPITransformerPipeline::ModelWeights loadModelWeightsExistingLoaderImpl(
+    static DistributedTransformerPipeline::ModelWeights loadModelWeightsExistingLoaderImpl(
         ModelLoader &loader,
-        const MPITransformerPipeline::LayerConfig &config);
+        const DistributedTransformerPipeline::LayerConfig &config);
 
     // Internal helper extracted from the second overload (unified rich diagnostics)
-    static MPITransformerPipeline::ModelWeights loadModelWeightsExistingLoaderImpl(
+    static DistributedTransformerPipeline::ModelWeights loadModelWeightsExistingLoaderImpl(
         ModelLoader &loader,
-        const MPITransformerPipeline::LayerConfig &config)
+        const DistributedTransformerPipeline::LayerConfig &config)
     {
-        MPITransformerPipeline::ModelWeights weights;
+        DistributedTransformerPipeline::ModelWeights weights;
         LOG_INFO("Loading model weights using existing ModelLoader");
         // Token embedding load + diagnostics
         weights.token_embedding = loader.loadTensor("token_embd.weight");
@@ -4429,25 +4524,22 @@ namespace llaminar
         return weights;
     }
 
-    // Public path-based overload now delegates to unified helper
-    MPITransformerPipeline::ModelWeights loadModelWeights(
+    // Legacy loadModelWeights now lives in distributed_transformer_pipeline.cpp; keep shim wrappers
+    DistributedTransformerPipeline::ModelWeights loadModelWeights(
         const std::string &model_path,
-        const MPITransformerPipeline::LayerConfig &config)
+        const DistributedTransformerPipeline::LayerConfig &config)
     {
+        LOG_ERROR("Legacy mpi_transformer_pipeline.cpp loadModelWeights(path) invoked unexpectedly");
         ModelLoader loader;
         if (!loader.loadModel(model_path))
-        {
-            LOG_ERROR("Failed to load model from: " << model_path);
-            throw std::runtime_error("Failed to load model");
-        }
-        LOG_INFO("Loading model weights from: " << model_path);
+            throw std::runtime_error("Failed legacy load");
         return loadModelWeightsExistingLoaderImpl(loader, config);
     }
-    // Overloaded utility function for loading weights using existing ModelLoader (now delegates to internal helper)
-    MPITransformerPipeline::ModelWeights loadModelWeights(
+    DistributedTransformerPipeline::ModelWeights loadModelWeights(
         ModelLoader &loader,
-        const MPITransformerPipeline::LayerConfig &config)
+        const DistributedTransformerPipeline::LayerConfig &config)
     {
+        LOG_ERROR("Legacy mpi_transformer_pipeline.cpp loadModelWeights(loader) invoked unexpectedly");
         return loadModelWeightsExistingLoaderImpl(loader, config);
     }
 

@@ -147,11 +147,10 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/common/attention_primitives.cpp
     src/kernels/common/rmsnorm_core.cpp
     src/kernels/common/softmax_core.cpp
-    src/mpi_transformer_pipeline.cpp
+    src/distributed_transformer_pipeline.cpp
     src/pipeline_base.cpp
     src/backend_selector.cpp
     src/abstract_pipeline.cpp
-    src/qwen_pipeline_adapter.cpp
     src/tensors/simple_tensor.cpp
     src/tensors/cosma_tensor.cpp
     src/tensors/tensor_factory.cpp
@@ -854,9 +853,10 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_transformer_pipeline PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_transformer_pipeline ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    add_llaminar_mpi_test(MPITransformerPipelineTest 2 test_mpi_transformer_pipeline)
+    # Renamed to reflect DistributedTransformerPipeline implementation (was MPITransformerPipelineTest)
+    add_llaminar_mpi_test(DistributedTransformerPipelineTest 2 test_mpi_transformer_pipeline)
     # Ensure this long-running MPI test cannot hang indefinitely; internal watchdog < 60s, external timeout at 60s
-    set_tests_properties(MPITransformerPipelineTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(DistributedTransformerPipelineTest PROPERTIES TIMEOUT 60)
     
     # Adaptive Matrix Multiplication test
     # Shared logging bootstrap (object library) to unify test logging levels
@@ -975,20 +975,27 @@ if(GTEST_FOUND)
     add_llaminar_mpi_test(CosmaPrefillManagerPopulationPerfTest 2 test_cosma_prefill_population_perf)
     set_tests_properties(CosmaPrefillManagerPopulationPerfTest PROPERTIES TIMEOUT 120)
 
-    # Abstract pipeline parity test (legacy vs adapter incremental decode)
-    add_executable(test_abstract_pipeline_parity tests/test_abstract_pipeline_parity.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_abstract_pipeline_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_llaminar_mpi_test(AbstractPipelineParityTest 2 test_abstract_pipeline_parity)
-    set_tests_properties(AbstractPipelineParityTest PROPERTIES TIMEOUT 60)
+    # (Removed) test_abstract_pipeline_parity: disabled due to untrusted baseline; source retained for manual runs.
     # KV cache growth dynamic capacity test
     add_executable(test_kv_cache_growth tests/test_kv_cache_growth.cpp)
+    add_executable(test_incremental_generation tests/test_incremental_generation.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_kv_cache_growth PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    target_link_libraries(test_incremental_generation PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(KVCacheGrowthTest 2 test_kv_cache_growth)
+    add_llaminar_mpi_test(IncrementalGenerationTest 1 test_incremental_generation)
+    add_executable(test_incremental_generation_multi tests/test_incremental_generation_multi.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_incremental_generation_multi PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(IncrementalGenerationMultiRankTest 2 test_incremental_generation_multi)
 
-    # KV cache growth parity test (incremental vs replay logits parity across growth)
-    add_executable(test_kv_cache_growth_parity tests/test_kv_cache_growth_parity.cpp)
-    target_link_libraries(test_kv_cache_growth_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_llaminar_mpi_test(KVCacheGrowthParityTest 2 test_kv_cache_growth_parity)
+    # Incremental decode replay vs incremental parity tests
+    add_executable(test_incremental_decode_parity tests/test_incremental_decode_parity.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_incremental_decode_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+    # Single-rank invocation (multi-rank test section will internally GTEST_SKIP multi-rank portion)
+    add_llaminar_mpi_test(IncrementalDecodeParitySingle 1 test_incremental_decode_parity)
+    # Two-rank invocation exercises distributed parity path
+    add_llaminar_mpi_test(IncrementalDecodeParityMulti 2 test_incremental_decode_parity)
+
+    # (Removed) test_kv_cache_growth_parity: superseded by functional KVCacheGrowthTest + decode instrumentation.
     set_tests_properties(KVCacheGrowthTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_prefill_attention_golden tests/test_prefill_attention_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)

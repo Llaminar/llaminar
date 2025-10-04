@@ -13,67 +13,45 @@ namespace llaminar
     {
 
         ResponseGenerator::ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
-                                             std::shared_ptr<MPITransformerPipeline> pipeline,
+                                             std::shared_ptr<AbstractPipeline> pipeline,
                                              const LlaminarParams &params)
-            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
+            : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), params_(params), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
         {
             if (!pipeline_)
             {
-                throw std::invalid_argument("Pipeline cannot be null");
+                throw std::invalid_argument("ResponseGenerator: pipeline cannot be null");
             }
-
-            // Load model weights
-            LOG_INFO("Loading model weights from: " << params_.model_file);
-            weights_ = loadModelWeights(params_.model_file, pipeline_->getConfig());
-            LOG_INFO("Model weights loaded successfully");
-
-            // Initialize default stop tokens
+            if (params_.model_file.empty())
+            {
+                throw std::invalid_argument("ResponseGenerator: model_file must be set when not providing pre-loaded weights");
+            }
+            LOG_INFO("ResponseGenerator will lazily load weights on first generation from: " << params_.model_file);
+            // Stop tokens / sequences
             if (tokenizer_)
             {
-                int32_t eos_token = tokenizer_->getSpecialToken("eos");
-                if (eos_token != -1)
-                {
-                    stop_tokens_.push_back(eos_token);
-                }
+                int32_t eos = tokenizer_->getSpecialToken("eos");
+                if (eos != -1)
+                    stop_tokens_.push_back(eos);
             }
-
-            // Default stop sequences
             stop_sequences_ = {"<|im_end|>", "</s>", "<|endoftext|>"};
-
-            LOG_INFO("ResponseGenerator initialized - temp: " << temperature_
-                                                              << ", top_k: " << top_k_ << ", top_p: " << top_p_
-                                                              << ", max_tokens: " << max_tokens_);
         }
 
         ResponseGenerator::ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
-                                             std::shared_ptr<MPITransformerPipeline> pipeline,
+                                             std::shared_ptr<AbstractPipeline> pipeline,
                                              const LlaminarParams &params,
-                                             const MPITransformerPipeline::ModelWeights &weights)
-            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), weights_(weights), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
+                                             const QwenModelWeights &weights)
+            : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), params_(params), weights_(weights), have_weights_(true), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
         {
             if (!pipeline_)
-            {
-                throw std::invalid_argument("Pipeline cannot be null");
-            }
-
-            LOG_INFO("Using pre-loaded model weights");
-
-            // Initialize default stop tokens
+                throw std::invalid_argument("ResponseGenerator: pipeline cannot be null");
             if (tokenizer_)
             {
-                int32_t eos_token = tokenizer_->getSpecialToken("eos");
-                if (eos_token != -1)
-                {
-                    stop_tokens_.push_back(eos_token);
-                }
+                int32_t eos = tokenizer_->getSpecialToken("eos");
+                if (eos != -1)
+                    stop_tokens_.push_back(eos);
             }
-
-            // Default stop sequences
             stop_sequences_ = {"<|im_end|>", "</s>", "<|endoftext|>"};
-
-            LOG_INFO("ResponseGenerator initialized with pre-loaded weights - temp: " << temperature_
-                                                                                      << ", top_k: " << top_k_ << ", top_p: " << top_p_
-                                                                                      << ", max_tokens: " << max_tokens_);
+            LOG_INFO("ResponseGenerator initialized with pre-loaded weights");
         }
 
         std::string ResponseGenerator::generateResponse(const std::vector<int32_t> &prompt_tokens,
@@ -89,78 +67,32 @@ namespace llaminar
 
             try
             {
-                std::vector<int32_t> generated_tokens;
+                std::vector<int32_t> generated_tokens; // tokens generated (excluding prompt)
                 std::string response_text;
-
-                // Current token sequence includes prompt + generated tokens
                 std::vector<int32_t> current_sequence = prompt_tokens;
+
+                if (!prefilled_)
+                {
+                    if (!ensureWeights())
+                        return ""; // error logged in ensureWeights
+                    if (!pipeline_->prefill(prompt_tokens, weights_, stage_ctx_))
+                    {
+                        LOG_ERROR("Prefill failed");
+                        return "";
+                    }
+                    prefilled_ = true;
+                }
 
                 for (int32_t step = 0; step < max_tokens_; ++step)
                 {
-                    // Create output tensor with appropriate shape [seq_len, vocab_size]
-                    size_t seq_len = current_sequence.size();
-                    size_t vocab_size = pipeline_->getConfig().vocab_size;
-                    auto output = TensorFactory::create_auto({static_cast<int>(seq_len), static_cast<int>(vocab_size)},
-                                                             false /* prefer_distributed */);
-
-                    // CRITICAL: Zero the output tensor to prevent NaN logits from uninitialized memory
-                    output->zero();
-
-                    // Debug: Verify tensor is zeroed
-                    const float *test_data = output->data();
-                    LOG_INFO("Post-zero check - First 5 values: " << test_data[0] << " " << test_data[1] << " " << test_data[2] << " " << test_data[3] << " " << test_data[4]);
-
-                    // Run inference to get next token probabilities
-                    bool success = pipeline_->execute(current_sequence, weights_, output);
-
-                    if (!success || !output)
+                    // Fetch logits produced by prefill (step 0) or previous decode (step>0)
+                    std::shared_ptr<TensorBase> latest_logits;
+                    if (!pipeline_->logits(latest_logits) || !latest_logits)
                     {
-                        LOG_ERROR("Pipeline execution failed at step " << step);
+                        LOG_ERROR("Failed to fetch logits prior to sampling at step " << step);
                         break;
                     }
-
-                    // Debug: Check tensor values immediately after pipeline execution
-                    const float *post_pipeline_data = output->data();
-                    LOG_INFO("Post-pipeline check - First 5 values: " << post_pipeline_data[0] << " " << post_pipeline_data[1] << " " << post_pipeline_data[2] << " " << post_pipeline_data[3] << " " << post_pipeline_data[4]);
-
-                    // Extract logits for next token prediction
-                    // The output should be [seq_len, vocab_size], we want the last position
-                    const float *output_data = output->data();
-                    const auto &shape = output->shape();
-
-                    if (shape.size() != 2)
-                    {
-                        LOG_ERROR("Unexpected output shape from pipeline");
-                        break;
-                    }
-
-                    // Use shape directly instead of declaring new variables
-                    size_t actual_seq_len = shape[0];
-                    size_t actual_vocab_size = shape[1];
-
-                    // Debug tensor data after pipeline execution
-                    LOG_INFO("Output tensor shape: [" << actual_seq_len << ", " << actual_vocab_size << "]");
-                    LOG_INFO("First 10 raw output values: ");
-                    for (size_t i = 0; i < std::min(size_t(10), actual_vocab_size); ++i)
-                    {
-                        std::cout << output_data[i] << " ";
-                    }
-                    std::cout << std::endl;
-
-                    // Check for NaN/inf in first 100 values
-                    int nan_count = 0, inf_count = 0;
-                    for (size_t i = 0; i < std::min(size_t(100), actual_seq_len * actual_vocab_size); ++i)
-                    {
-                        if (std::isnan(output_data[i]))
-                            nan_count++;
-                        if (std::isinf(output_data[i]))
-                            inf_count++;
-                    }
-                    LOG_INFO("NaN count in first 100 values: " << nan_count << ", Inf count: " << inf_count);
-
-                    // Get logits for the last token position
-                    std::vector<float> logits(output_data + (actual_seq_len - 1) * actual_vocab_size,
-                                              output_data + actual_seq_len * actual_vocab_size);
+                    std::vector<float> logits = fetchLastLogitsRow(latest_logits);
 
                     // Sample next token
                     int32_t next_token = sampleToken(logits);
@@ -181,6 +113,16 @@ namespace llaminar
 
                     generated_tokens.push_back(next_token);
                     current_sequence.push_back(next_token);
+
+                    // Prepare logits for next iteration (unless stopping this iteration)
+                    if (!shouldStop(current_sequence, response_text))
+                    {
+                        if (!pipeline_->decode(next_token, weights_, stage_ctx_))
+                        {
+                            LOG_ERROR("Pipeline incremental decode failed after sampling token at step " << step);
+                            break;
+                        }
+                    }
 
                     // Convert token to text if we have a tokenizer
                     std::string token_text;
@@ -429,6 +371,48 @@ namespace llaminar
             {
                 logits[indices[i]] = -std::numeric_limits<float>::infinity();
             }
+        }
+
+        bool ResponseGenerator::ensureWeights()
+        {
+            if (have_weights_)
+                return true;
+            try
+            {
+                // We need DistributedTransformerPipeline to load weights for now; dynamic cast ok
+                auto *dist = dynamic_cast<DistributedTransformerPipeline *>(pipeline_.get());
+                if (!dist)
+                {
+                    LOG_ERROR("ensureWeights: underlying pipeline is not DistributedTransformerPipeline; external weight loading not implemented");
+                    return false;
+                }
+                auto loaded = loadModelWeights(params_.model_file, dist->getConfig());
+                weights_.inner = std::move(loaded);
+                have_weights_ = true;
+                LOG_INFO("Weights loaded lazily in ensureWeights()");
+                return true;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("ensureWeights failed: " << e.what());
+                return false;
+            }
+        }
+
+        std::vector<float> ResponseGenerator::fetchLastLogitsRow(const std::shared_ptr<TensorBase> &logits_tensor) const
+        {
+            std::vector<float> row;
+            if (!logits_tensor)
+                return row;
+            const auto &sh = logits_tensor->shape();
+            if (sh.size() != 2)
+                return row;
+            int rows = sh[0];
+            int cols = sh[1];
+            row.resize(cols);
+            const float *base = logits_tensor->data();
+            std::memcpy(row.data(), base + (rows - 1) * cols, sizeof(float) * cols);
+            return row;
         }
 
         std::vector<float> ResponseGenerator::softmax(const std::vector<float> &logits)

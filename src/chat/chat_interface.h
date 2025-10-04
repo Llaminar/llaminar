@@ -3,7 +3,7 @@
 #include "chat_session.h"
 #include "response_generator.h"
 #include "../argument_parser.h"
-#include "../mpi_transformer_pipeline.h"
+#include "../abstract_pipeline.h"
 #include <memory>
 #include <string>
 #include <atomic>
@@ -28,7 +28,7 @@ namespace llaminar
              * @param params Configuration parameters
              */
             ChatInterface(std::unique_ptr<ChatSession> session,
-                          std::shared_ptr<MPITransformerPipeline> pipeline,
+                          std::shared_ptr<AbstractPipeline> pipeline,
                           std::unique_ptr<ResponseGenerator> generator,
                           const LlaminarParams &params);
 
@@ -57,7 +57,7 @@ namespace llaminar
 
         private:
             std::unique_ptr<ChatSession> session_;
-            std::shared_ptr<MPITransformerPipeline> pipeline_;
+            std::shared_ptr<AbstractPipeline> pipeline_;
             std::unique_ptr<ResponseGenerator> generator_;
             const LlaminarParams &params_;
             std::atomic<bool> should_stop_;

@@ -60,6 +60,7 @@
 #include <sstream>
 #include <mpi.h>
 #include "tensors/tp_partition.h"
+#include "../distributed_transformer_pipeline.h" // for LayerTokenDiffRow instrumentation
 
 namespace llaminar
 {
@@ -166,6 +167,31 @@ namespace llaminar
         std::shared_ptr<TensorBase> local_wv;
         std::shared_ptr<TensorBase> local_wo;
 
+        if (local_heads == 0)
+        {
+            // No heads assigned to this rank (imbalanced head/world configuration). Allocate minimal tensors and skip work.
+            local_wq = createLocalSimpleTensor({d_model, 0});
+            local_wk = createLocalSimpleTensor({d_model, 0});
+            local_wv = createLocalSimpleTensor({d_model, 0});
+            local_wo = createLocalSimpleTensor({0, d_model});
+            // Still need empty Q/K/V to satisfy downstream shapes
+            auto local_q = createLocalSimpleTensor({seq_len, 0});
+            auto local_k = createLocalSimpleTensor({seq_len, 0});
+            auto local_v = createLocalSimpleTensor({seq_len, 0});
+            // Produce a zeroed attention output (residual path will just add zero)
+            if (!outputs.empty() && outputs[0])
+            {
+                auto &attn_out_zero = outputs[0];
+                if (attn_out_zero->shape().size() == 2 && attn_out_zero->shape()[0] == (int)seq_len && attn_out_zero->shape()[1] == d_model)
+                {
+                    memset(attn_out_zero->data(), 0, seq_len * d_model * sizeof(float));
+                }
+            }
+            if (getRank() == 0)
+                LOG_WARN("MPIAttentionKernel: rank has zero local heads; producing zero contribution");
+            return true;
+        }
+
         if (pre_sharded)
         {
             // Assume each provided weight already holds only this rank's slice.
@@ -214,49 +240,72 @@ namespace llaminar
                                    { computeLocalProjections(global_input, local_wq, local_wk, local_wv,
                                                              local_q, local_k, local_v, seq_len, d_model); });
         }
+        if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
+        {
+            size_t slice = (size_t)local_heads * head_dim_;
+            size_t offset = (seq_len - 1) * slice;
+            bool incr = (seq_len == 1 && n_past_ > 0);
+            int capture_seq_len_meta = incr ? (n_past_ + 1) : (int)seq_len;
+            DistributedTransformerPipeline::appendInternalAttnRow(nullptr,
+                                                                  layer_index_, capture_seq_len_meta, incr,
+                                                                  "attn_int_q_proj", local_q->data() + offset, slice);
+            DistributedTransformerPipeline::appendInternalAttnRow(nullptr,
+                                                                  layer_index_, capture_seq_len_meta, incr,
+                                                                  "attn_int_k_proj", local_k->data() + offset, slice);
+        }
         // Apply RoPE to local Q and K
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::applyLocalRoPE");
             t_rope_ms = time_block([&]
                                    { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads); });
         }
+        if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
+        {
+            size_t slice = (size_t)local_heads * head_dim_;
+            size_t offset = (seq_len - 1) * slice;
+            bool incr = (seq_len == 1 && n_past_ > 0);
+            int capture_seq_len_meta = incr ? (n_past_ + 1) : (int)seq_len;
+            DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_q_rope", local_q->data() + offset, slice);
+            DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_k_rope", local_k->data() + offset, slice);
+        }
 
-        // Prefill KV cache population (only once at sequence start). We currently support only the
-        // common case n_head_kv == n_head (no grouped attention) for cache population. Grouped KV
-        // requires merging multiple query heads; defer until needed.
+        // Prefill KV cache population (only once at sequence start). Support both full and grouped KV heads.
+        // For grouped KV (multi-query) we map each query head to its KV head via (q_head % n_head_kv_). We may
+        // write duplicate KV slices when multiple query heads map to the same KV head; duplicates are identical
+        // and therefore harmless for correctness in this diagnostic path.
         if (n_past_ == 0 && seq_len > 1)
         {
-            if (n_head_kv_ != n_head_)
+            float *k_cache_ptr = k_cache->data();
+            float *v_cache_ptr = v_cache->data();
+            size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
+            const float *local_k_ptr = local_k->data();
+            const float *local_v_ptr = local_v->data();
+            int group_size = (n_head_kv_ == 0) ? 1 : (n_head_ / n_head_kv_);
+            for (size_t t = 0; t < seq_len; ++t)
             {
-                if (getRank() == 0)
-                    LOG_WARN("MPIAttentionKernel prefill KV population skipped (grouped KV heads unsupported in cache path)");
-            }
-            else
-            {
-                float *k_cache_ptr = k_cache->data();
-                float *v_cache_ptr = v_cache->data();
-                size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
-                const float *local_k_ptr = local_k->data();
-                const float *local_v_ptr = local_v->data();
-                for (size_t t = 0; t < seq_len; ++t)
+                const float *k_row_local = local_k_ptr + t * local_head_dim;
+                const float *v_row_local = local_v_ptr + t * local_head_dim;
+                for (int lh = 0; lh < local_heads; ++lh)
                 {
-                    const float *k_row_local = local_k_ptr + t * local_head_dim;
-                    const float *v_row_local = local_v_ptr + t * local_head_dim;
-                    // Copy each local head slice into global cache row
-                    for (int lh = 0; lh < local_heads; ++lh)
+                    size_t global_q_head = head_offset + lh;
+                    size_t kv_head = static_cast<size_t>(global_q_head % n_head_kv_);
+                    // For grouped KV ensure only canonical query head (lowest in group) writes to cache to avoid
+                    // clobbering with potentially different numeric projections across ranks.
+                    if (n_head_kv_ != n_head_)
                     {
-                        size_t global_head = head_offset + lh;
-                        float *k_dest = k_cache_ptr + t * kv_dim + global_head * head_dim_;
-                        float *v_dest = v_cache_ptr + t * kv_dim + global_head * head_dim_;
-                        const float *k_src = k_row_local + lh * head_dim_;
-                        const float *v_src = v_row_local + lh * head_dim_;
-                        std::memcpy(k_dest, k_src, head_dim_ * sizeof(float));
-                        std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
+                        if ((global_q_head % group_size) != 0)
+                            continue; // skip non-canonical heads
                     }
+                    float *k_dest = k_cache_ptr + t * kv_dim + kv_head * head_dim_;
+                    float *v_dest = v_cache_ptr + t * kv_dim + kv_head * head_dim_;
+                    const float *k_src = k_row_local + lh * head_dim_;
+                    const float *v_src = v_row_local + lh * head_dim_;
+                    std::memcpy(k_dest, k_src, head_dim_ * sizeof(float));
+                    std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
                 }
-                if (getRank() == 0)
-                    LOG_DEBUG("MPIAttentionKernel: populated KV cache for prefill seq_len=" << seq_len);
             }
+            if (getRank() == 0)
+                LOG_DEBUG("MPIAttentionKernel: populated KV cache for prefill seq_len=" << seq_len << (n_head_kv_ == n_head_ ? "" : " (grouped)"));
         }
 
         // Create local attended output tensor. For GatherHeadsPreProjection optimization we store
@@ -265,6 +314,7 @@ namespace llaminar
         bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
                          output_mode_ == AttentionOutputMode::Replicated);
         bool incremental_single = (seq_len == 1 && n_past_ > 0); // single-token decode with history
+        int capture_seq_len_meta = incremental_single ? (n_past_ + 1) : (int)seq_len;
         auto local_attended_output = pre_mode
                                          ? createLocalSimpleTensor({local_head_dim, seq_len})
                                          : createLocalSimpleTensor({seq_len, local_head_dim});
@@ -275,29 +325,9 @@ namespace llaminar
             PERF_SCOPED_TIMER("MPIAttentionKernel::incrementalAttention");
             t_attn_ms = time_block([&]
                                    {
-                // If grouped KV heads present, fallback to legacy single-token attention (no history)
-                if (n_head_kv_ != n_head_)
-                {
-                    if (getRank() == 0)
-                        LOG_WARN("MPIAttentionKernel incremental path: grouped KV heads unsupported for cache usage; falling back to per-token attention only");
-                    // Behave like standard path (seq_len==1) - compute attention only over current token
-                    if (pre_mode)
-                    {
-                        auto tmp_std = createLocalSimpleTensor({seq_len, local_head_dim});
-                        computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
-                                              tmp_std->data(), seq_len, local_heads);
-                        const float *srcA = tmp_std->data();
-                        float *dstA = local_attended_output->data();
-                        for (size_t h = 0; h < local_head_dim; ++h)
-                            dstA[h * seq_len + 0] = srcA[h];
-                    }
-                    else
-                    {
-                        computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
-                                              local_attended_output->data(), seq_len, local_heads);
-                    }
-                    return; // skip cache path
-                }
+                // Support grouped KV incremental decode (n_head_kv_ <= n_head_). When grouped, all query heads map
+                // to a (possibly smaller) set of KV heads. We re-use the populated KV cache and perform attention
+                // over all past tokens + current.
 
                 size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
                 // Safety check on cache shapes (optional)
@@ -312,104 +342,201 @@ namespace llaminar
                 const float *q_cur = local_q->data(); // [1, local_head_dim]
                 const float *k_cur = local_k->data();
                 const float *v_cur = local_v->data();
+                // Write current token K/V into cache for each (possibly grouped) KV head mapping.
+                // Duplicate writes for grouped heads are harmless (identical data) and keep logic simple.
+                int group_size = (n_head_kv_ == 0) ? 1 : (n_head_ / n_head_kv_);
+                for (int lh = 0; lh < local_heads; ++lh)
+                {
+                    size_t global_q_head = head_offset + lh;
+                    size_t kv_head = static_cast<size_t>(global_q_head % n_head_kv_);
+                    if (n_head_kv_ != n_head_)
+                    {
+                        if ((global_q_head % group_size) != 0)
+                            continue; // only canonical query head writes
+                    }
+                    float *k_dest = k_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
+                    float *v_dest = v_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
+                    const float *k_src = k_cur + lh * head_dim_;
+                    const float *v_src = v_cur + lh * head_dim_;
+                    std::memcpy(k_dest, k_src, head_dim_ * sizeof(float));
+                    std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
+                }
 
-                // 1. Write current K/V into cache row n_past_ at our head slice
-                size_t row_offset_bytes = (size_t)n_past_ * kv_dim * sizeof(float);
-                size_t head_slice_offset = (size_t)head_offset * head_dim_ * sizeof(float);
-                float *k_dest = reinterpret_cast<float *>(reinterpret_cast<char *>(k_cache_ptr) + row_offset_bytes + head_slice_offset);
-                float *v_dest = reinterpret_cast<float *>(reinterpret_cast<char *>(v_cache_ptr) + row_offset_bytes + head_slice_offset);
-                std::memcpy(k_dest, k_cur, local_head_dim * sizeof(float));
-                std::memcpy(v_dest, v_cur, local_head_dim * sizeof(float));
+                // For each local query head, compute attention over tokens [0, n_past_] using its mapped KV head.
+                const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+                for (int lh = 0; lh < local_heads; ++lh)
+                {
+                    size_t global_q_head = head_offset + lh;
+                    size_t kv_head = static_cast<size_t>(global_q_head % n_head_kv_);
+                    const float *q_vec = q_cur + lh * head_dim_;
+                    // Temporary score buffer (stack) limited by max seq len (assumed small in tests)
+                    std::vector<float> scores(n_past_ + 1);
+                    float max_score = -std::numeric_limits<float>::infinity();
+                    for (int t = 0; t < n_past_; ++t)
+                    {
+                        const float *k_vec = k_cache_ptr + t * kv_dim + kv_head * head_dim_;
+                        float dot = 0.f;
+                        for (int d = 0; d < head_dim_; ++d)
+                            dot += q_vec[d] * k_vec[d];
+                        dot *= scale;
+                        scores[t] = dot;
+                        if (dot > max_score)
+                            max_score = dot;
+                    }
+                    // Current token score
+                    {
+                        const float *k_vec = k_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
+                        float dot = 0.f;
+                        for (int d = 0; d < head_dim_; ++d)
+                            dot += q_vec[d] * k_vec[d];
+                        dot *= scale;
+                        scores[n_past_] = dot;
+                        if (dot > max_score)
+                            max_score = dot;
+                    }
+                    // Softmax
+                    float sum_exp = 0.f;
+                    for (float &s : scores)
+                    {
+                        s = std::exp(s - max_score);
+                        sum_exp += s;
+                    }
+                    float inv_sum = 1.f / (sum_exp + 1e-9f);
+                    for (float &s : scores)
+                        s *= inv_sum;
+                    // Weighted value accumulation
+                    float *out_base = pre_mode ? (local_attended_output->data() + lh * head_dim_ * seq_len) : local_attended_output->data();
+                    float *out_vec = pre_mode ? (out_base) : (out_base + lh * head_dim_); // seq_len==1 in incremental
+                    std::fill(out_vec, out_vec + head_dim_, 0.f);
+                    for (int t = 0; t < n_past_; ++t)
+                    {
+                        const float *v_vec = v_cache_ptr + t * kv_dim + kv_head * head_dim_;
+                        float w = scores[t];
+                        for (int d = 0; d < head_dim_; ++d)
+                            out_vec[d] += w * v_vec[d];
+                    }
+                    // Current token contribution
+                    {
+                        const float *v_vec = v_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
+                        float w = scores[n_past_];
+                        for (int d = 0; d < head_dim_; ++d)
+                            out_vec[d] += w * v_vec[d];
+                    }
+                }
+
+                // NOTE: We already wrote current token K/V for (canonical) heads above.
+                // The previous implementation redundantly attempted to memcpy a contiguous
+                // block for all local heads assuming a per-query-head cache layout. That
+                // layout is only valid when n_head_kv_ == n_head_. For grouped KV (GQA)
+                // it caused out-of-bounds writes (global_head >= n_head_kv_) and numerical
+                // drift. We remove it and rely solely on the canonical per-kv-head writes.
 
                 size_t T = (size_t)n_past_ + 1; // total tokens including current
-                // For each local head compute attention over past + current
-                float *out_row; // where to write final attended vector (row-major or heads-major)
-                if (pre_mode)
+                size_t expected_T = expected_total_window_ ? expected_total_window_ : T;
+                const auto &ade = debugEnv().attention_decode;
+                if(ade.decode_diag && getRank()==0) {
+                    int cache_rows = k_cache ? k_cache->shape()[0] : -1;
+                    if(cache_rows >=0 && (size_t)cache_rows < T) {
+                        LOG_WARN("[DecodeAttnDiag] cache underrun: layer="<<layer_index_<<" token_pos="<<n_past_
+                                 <<" cache_rows="<<cache_rows<<" expected>="<<T);
+                    }
+                    LOG_WARN("[DecodeAttnDiag] layer="<<layer_index_<<" token_pos="<<n_past_
+                             <<" local_heads="<<local_heads<<" head_offset="<<head_offset
+                             <<" T="<<T<<" expected_T="<<expected_T<<" head_dim="<<head_dim_<<" cache_rows="<<cache_rows);
+                    if(expected_total_window_ && T != expected_T) {
+                        LOG_WARN("[DecodeAttnDiag] WINDOW_MISMATCH layer="<<layer_index_<<" token_pos="<<n_past_
+                                 <<" actual_T="<<T<<" expected_T="<<expected_T);
+                    }
+                }
+                // Per-instance monotonic check (resets on new decode stream when expected_T==1)
+                if(expected_T == 1) {
+                    last_seen_decode_T_ = 0; // new stream (first token)
+                }
+                if(ade.decode_diag && T < last_seen_decode_T_ && getRank()==0) {
+                    LOG_WARN("[DecodeAttnDiag] NON_MONOTONIC_INSTANCE_T previous="<<last_seen_decode_T_<<" current="<<T
+                             <<" layer="<<layer_index_<<" token_pos="<<n_past_);
+                }
+                if(T > last_seen_decode_T_) last_seen_decode_T_ = T;
+                if(ade.decode_diag && k_cache && getRank()==0) {
+                    int cache_rows = k_cache->shape()[0];
+                    if((int)T > cache_rows) {
+                        LOG_WARN("[DecodeAttnDiag] T exceeds cache_rows: T="<<T<<" cache_rows="<<cache_rows<<" layer="<<layer_index_);
+                    }
+                }
+                // Build contiguous Q/K/V blocks representing the full causal window [0..T-1]
+                // so we can invoke the standard computeLocalAttention path for numerical parity.
+                size_t local_head_dim_sz = local_head_dim;
+                auto full_q = createLocalSimpleTensor({T, local_head_dim_sz});
+                auto full_k = createLocalSimpleTensor({T, local_head_dim_sz});
+                auto full_v = createLocalSimpleTensor({T, local_head_dim_sz});
+                float *fq = full_q->data();
+                float *fk = full_k->data();
+                float *fv = full_v->data();
+                // Populate K/V from cache for past tokens (0..T-1)
+                for (size_t t = 0; t < T; ++t)
                 {
-                    // We'll first compute into a temporary row-major buffer then transpose to heads-major layout
-                    auto tmp_std = createLocalSimpleTensor({seq_len, local_head_dim}); // seq_len == 1
-                    out_row = tmp_std->data();
-                    // Compute per-head context into out_row
                     for (int lh = 0; lh < local_heads; ++lh)
                     {
                         int global_head = head_offset + lh;
-                        const float *q_head = q_cur + lh * head_dim_;
-                        std::vector<float> scores(T);
-                        float max_score = -1e30f;
-                        for (size_t t = 0; t < T; ++t)
-                        {
-                            const float *k_row_head = k_cache_ptr + t * kv_dim + global_head * head_dim_;
-                            float dot = 0.f;
-                            for (int d = 0; d < head_dim_; ++d)
-                                dot += q_head[d] * k_row_head[d];
-                            dot /= std::sqrt((float)head_dim_);
-                            scores[t] = dot;
-                            if (dot > max_score)
-                                max_score = dot;
-                        }
-                        // softmax
-                        float sum_exp = 0.f;
-                        for (size_t t = 0; t < T; ++t)
-                        {
-                            float e = std::exp(scores[t] - max_score);
-                            scores[t] = e;
-                            sum_exp += e;
-                        }
-                        // weighted sum of values
-                        float *out_head = out_row + lh * head_dim_;
-                        std::fill(out_head, out_head + head_dim_, 0.f);
-                        for (size_t t = 0; t < T; ++t)
-                        {
-                            float w = scores[t] / sum_exp;
-                            const float *v_row_head = v_cache_ptr + t * kv_dim + global_head * head_dim_;
-                            for (int d = 0; d < head_dim_; ++d)
-                                out_head[d] += w * v_row_head[d];
-                        }
+                        int kv_head = (n_head_kv_ == n_head_) ? global_head : (global_head % n_head_kv_);
+                        const float *k_src = k_cache_ptr + t * kv_dim + kv_head * head_dim_;
+                        const float *v_src = v_cache_ptr + t * kv_dim + kv_head * head_dim_;
+                        float *k_dst = fk + t * local_head_dim_sz + lh * head_dim_;
+                        float *v_dst = fv + t * local_head_dim_sz + lh * head_dim_;
+                        std::memcpy(k_dst, k_src, head_dim_ * sizeof(float));
+                        std::memcpy(v_dst, v_src, head_dim_ * sizeof(float));
                     }
-                    // transpose to heads-major [local_head_dim, 1]
-                    const float *srcA = out_row; // length local_head_dim
-                    float *dstA = local_attended_output->data();
-                    for (size_t h = 0; h < local_head_dim; ++h)
-                        dstA[h * seq_len + 0] = srcA[h];
+                }
+                // Populate Q: only last row (T-1) has real query; earlier rows unused for our output row.
+                std::memset(fq, 0, T * local_head_dim_sz * sizeof(float));
+                std::memcpy(fq + (T - 1) * local_head_dim_sz, q_cur, local_head_dim_sz * sizeof(float));
+
+                // Compute attention across window using existing numerically stable path.
+                auto full_out = createLocalSimpleTensor({T, local_head_dim_sz});
+                computeLocalAttention(fq, fk, fv, full_out->data(), T, local_heads);
+                // Internal diff capture: full window context (reconstructed incremental path)
+                if(debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank()==0) {
+                    size_t slice = (size_t)local_heads * head_dim_;
+                    const float *last_row_full = full_out->data() + (T - 1) * slice;
+                    DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, (int)T, true, "attn_int_context_full", last_row_full, slice);
+                }
+                if(ade.decode_diag && ade.dump_full_qkv && getRank()==0 && (int)local_head_dim_sz <= ade.dump_limit) {
+                    auto dump_vec = [&](const char* tag, const float* ptr){ std::ostringstream oss; oss<<"[DecodeAttnDump] "<<tag<<":"; for(size_t i=0;i<local_head_dim_sz;++i){ oss<<ptr[i]; if(i+1<local_head_dim_sz) oss<<","; } LOG_WARN(oss.str()); };
+                    dump_vec("q_last", fq + (T-1)*local_head_dim_sz);
+                    if(T>1) dump_vec("k_prev", fk + (T-2)*local_head_dim_sz);
+                    dump_vec("k_last", fk + (T-1)*local_head_dim_sz);
+                }
+
+                // Extract last row into expected output layout.
+                const float *last_row = full_out->data() + (T - 1) * local_head_dim_sz;
+                if (pre_mode)
+                {
+                    float *dstA = local_attended_output->data(); // heads-major [local_head_dim, 1]
+                    for (size_t h = 0; h < local_head_dim_sz; ++h)
+                        dstA[h * seq_len + 0] = last_row[h];
                 }
                 else
                 {
-                    out_row = local_attended_output->data(); // shape [1, local_head_dim]
-                    for (int lh = 0; lh < local_heads; ++lh)
-                    {
-                        int global_head = head_offset + lh;
-                        const float *q_head = q_cur + lh * head_dim_;
-                        std::vector<float> scores(T);
-                        float max_score = -1e30f;
-                        for (size_t t = 0; t < T; ++t)
-                        {
-                            const float *k_row_head = k_cache_ptr + t * kv_dim + global_head * head_dim_;
-                            float dot = 0.f;
-                            for (int d = 0; d < head_dim_; ++d)
-                                dot += q_head[d] * k_row_head[d];
-                            dot /= std::sqrt((float)head_dim_);
-                            scores[t] = dot;
-                            if (dot > max_score)
-                                max_score = dot;
-                        }
-                        float sum_exp = 0.f;
-                        for (size_t t = 0; t < T; ++t)
-                        {
-                            float e = std::exp(scores[t] - max_score);
-                            scores[t] = e;
-                            sum_exp += e;
-                        }
-                        float *out_head = out_row + lh * head_dim_;
-                        std::fill(out_head, out_head + head_dim_, 0.f);
-                        for (size_t t = 0; t < T; ++t)
-                        {
-                            float w = scores[t] / sum_exp;
-                            const float *v_row_head = v_cache_ptr + t * kv_dim + global_head * head_dim_;
-                            for (int d = 0; d < head_dim_; ++d)
-                                out_head[d] += w * v_row_head[d];
-                        }
-                    }
+                    float *dst = local_attended_output->data(); // [1, local_head_dim]
+                    std::memcpy(dst, last_row, local_head_dim_sz * sizeof(float));
                 } });
+            // Internal diff capture: incremental context after mapping to local_attended_output layout
+            if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0)
+            {
+                size_t slice = (size_t)local_heads * head_dim_;
+                std::vector<float> tmp(slice);
+                const float *src_base = local_attended_output->data();
+                if (pre_mode)
+                {
+                    for (size_t h = 0; h < slice; ++h)
+                        tmp[h] = src_base[h * seq_len + 0];
+                }
+                else
+                {
+                    std::memcpy(tmp.data(), src_base, slice * sizeof(float));
+                }
+                DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, true, "attn_int_context", tmp.data(), slice);
+            }
         }
         else
         {
@@ -436,6 +563,25 @@ namespace llaminar
                     computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
                                           local_attended_output->data(), seq_len, local_heads);
                 } });
+            // Internal diff capture: prefill / standard context last token row
+            if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
+            {
+                size_t slice = (size_t)local_heads * head_dim_;
+                std::vector<float> tmp(slice);
+                if (pre_mode)
+                {
+                    const float *src = local_attended_output->data();
+                    size_t last_idx = (size_t)(seq_len - 1);
+                    for (size_t h = 0; h < slice; ++h)
+                        tmp[h] = src[h * seq_len + last_idx];
+                }
+                else
+                {
+                    const float *src = local_attended_output->data() + (seq_len - 1) * slice;
+                    std::memcpy(tmp.data(), src, slice * sizeof(float));
+                }
+                DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_context", tmp.data(), slice);
+            }
         }
 
         // Pre-projection gather path: gather head contexts BEFORE output projection so we do the
@@ -593,6 +739,11 @@ namespace llaminar
             t_output_proj_ms = time_block([&]
                                           { PerfMatmulPhaseScope phase(2,4); computeLocalOutputProjection(local_attended_output, local_wo,
                                          local_final_output, seq_len, local_heads, d_model); });
+        }
+        if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
+        {
+            const float *src = local_final_output->data() + (seq_len - 1) * d_model;
+            DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_out_partial", src, (size_t)d_model);
         }
 
         bool performed_collective = false;
@@ -1169,7 +1320,149 @@ namespace llaminar
     void MPIAttentionKernel::applyLocalRoPE(float *local_q, float *local_k, size_t seq_len, int local_heads)
     {
         // Primitive applies in-place RoPE to Q/K (causal offset n_past_)
+        const auto &env = debugEnv();
+        if (getRank() == 0)
+        {
+            static int gate_count = 0;
+            if (gate_count < 8)
+            {
+                LOG_WARN("[RoPEDiagGate] internal_diff=" << env.attention.internal_diff
+                                                         << " layer_token_diff=" << env.pipeline.layer_token_diff
+                                                         << " layer_replay_compare=" << env.pipeline.layer_replay_compare
+                                                         << " seq_len=" << seq_len << " n_past=" << n_past_ << " local_heads=" << local_heads);
+                ++gate_count;
+            }
+        }
+        // We want diagnostics even if replay compare snapshot not yet set when called from replay pipeline.
+        bool diag = env.attention.internal_diff && getRank() == 0;
+        if (diag)
+        {
+            static int invoke_count = 0;
+            ++invoke_count;
+            if (invoke_count <= 12)
+            {
+                LOG_INFO("[RoPEDiagInvoke] call=" << invoke_count << " seq_len=" << seq_len << " n_past=" << n_past_ << " local_heads=" << local_heads << " head_dim=" << head_dim_ << " layer_replay_compare=" << (env.pipeline.layer_replay_compare ? 1 : 0));
+            }
+        }
+        if (!env.pipeline.layer_replay_compare && diag)
+        {
+            // Lightweight marker to confirm gating condition; only emits once per run per rank due to static.
+            static bool warned = false;
+            if (!warned)
+            {
+                LOG_INFO("[RoPEDiag] note=replay_compare_flag_off but collecting due to internal_diff");
+                warned = true;
+            }
+        }
+        // Determine whether this invocation is incremental single-token (seq_len==1 with history)
+        bool incr = (seq_len == 1 && n_past_ > 0);
+        int head_dim = head_dim_;
+        int preview = std::min(head_dim * local_heads, 8); // first few floats across first head slice
+        // Capture BEFORE snapshot for first head last token only (the token whose rotation parity we care about)
+        std::array<float, 8> q_before{};
+        std::array<float, 8> k_before{};
+        q_before.fill(0.f);
+        k_before.fill(0.f);
+        if (diag && seq_len > 0 && preview > 0)
+        {
+            // Layout: contiguous [seq_len, local_heads*head_dim]
+            size_t row_offset = (seq_len - 1) * (size_t)local_heads * head_dim; // last token row inside local_q/k
+            const float *q_row = local_q + row_offset;
+            const float *k_row = local_k + row_offset;
+            for (int i = 0; i < preview; ++i)
+            {
+                q_before[i] = q_row[i];
+                k_before[i] = k_row[i];
+            }
+        }
+
         llaminar::attn::apply_rope(local_q, local_k, (int)seq_len, head_dim_, local_heads, (int)n_past_, rope_freq_base_);
+
+        if (diag && seq_len > 0)
+        {
+            if (preview == 0)
+            {
+                LOG_INFO("[RoPEDiag] mode=" << (incr ? "INC" : "REPLAY")
+                                            << " n_past=" << n_past_ << " seq_len=" << seq_len
+                                            << " heads_local=" << local_heads << " head_dim=" << head_dim
+                                            << " note=preview_zero_unexpected");
+            }
+            else
+            {
+                std::array<float, 8> q_after{};
+                std::array<float, 8> k_after{};
+                q_after.fill(0.f);
+                k_after.fill(0.f);
+                size_t row_offset = (seq_len - 1) * (size_t)local_heads * head_dim; // last token row
+                const float *q_row_after = local_q + row_offset;
+                const float *k_row_after = local_k + row_offset;
+                long double l2_q_b = 0, l2_q_a = 0, l2_k_b = 0, l2_k_a = 0, l2_q_delta = 0, l2_k_delta = 0;
+                for (int i = 0; i < preview; ++i)
+                {
+                    q_after[i] = q_row_after[i];
+                    k_after[i] = k_row_after[i];
+                    long double qb = q_before[i], qa = q_after[i];
+                    long double kb = k_before[i], ka = k_after[i];
+                    l2_q_b += qb * qb;
+                    l2_q_a += qa * qa;
+                    l2_k_b += kb * kb;
+                    l2_k_a += ka * ka;
+                    long double dq = qa - qb;
+                    long double dk = ka - kb;
+                    l2_q_delta += dq * dq;
+                    l2_k_delta += dk * dk;
+                }
+                double rel_move_q = (l2_q_b > 0) ? std::sqrt((double)l2_q_delta / (double)l2_q_b) : 0.0;
+                double rel_move_k = (l2_k_b > 0) ? std::sqrt((double)l2_k_delta / (double)l2_k_b) : 0.0;
+                int pos_last = (int)n_past_ + (int)seq_len - 1; // semantic position of this final token
+                // Recompute first two angles used (pair 0) for transparency
+                int pairs = head_dim / 2;
+                float theta0 = (pairs > 0) ? (1.f / std::pow(rope_freq_base_, (2.f * 0) / head_dim)) : 0.f;
+                float angle_pos = theta0 * pos_last;
+                float cs = std::cos(angle_pos), sn = std::sin(angle_pos);
+                std::ostringstream oss;
+                oss << "[RoPEDiag] mode=" << (incr ? "INC" : "REPLAY")
+                    << " n_past=" << n_past_ << " seq_len=" << seq_len
+                    << " pos_last=" << pos_last
+                    << " heads_local=" << local_heads
+                    << " head_dim=" << head_dim
+                    << " freq_base=" << rope_freq_base_
+                    << " theta0=" << theta0
+                    << " angle0=" << angle_pos
+                    << " cos0=" << cs << " sin0=" << sn
+                    << " q_before=";
+                for (int i = 0; i < preview; ++i)
+                {
+                    oss << q_before[i];
+                    if (i + 1 < preview)
+                        oss << ",";
+                }
+                oss << " q_after=";
+                for (int i = 0; i < preview; ++i)
+                {
+                    oss << q_after[i];
+                    if (i + 1 < preview)
+                        oss << ",";
+                }
+                oss << " rel_move_q=" << rel_move_q
+                    << " k_before=";
+                for (int i = 0; i < preview; ++i)
+                {
+                    oss << k_before[i];
+                    if (i + 1 < preview)
+                        oss << ",";
+                }
+                oss << " k_after=";
+                for (int i = 0; i < preview; ++i)
+                {
+                    oss << k_after[i];
+                    if (i + 1 < preview)
+                        oss << ",";
+                }
+                oss << " rel_move_k=" << rel_move_k;
+                LOG_INFO(oss.str());
+            }
+        }
         LOG_DEBUG("Applied RoPE for " << local_heads << " heads on rank " << getRank());
     }
 

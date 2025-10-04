@@ -1,6 +1,6 @@
 # Transformer Kernel Refactoring Plan
 
-> Deprecation Context (2025-10): The refactoring direction outlined here has since been superseded by the implemented Abstract Pipeline architecture. The `MPITransformerPipeline` mentioned below is deprecated. Kernel modularization proceeded via dedicated attention primitives, RMSNorm, and adaptive matmul selection surfaced through pipeline orchestration rather than a standalone `PipelineBase` + generic kernel registry exactly as sketched. This document remains as historical rationale; do not revive the legacy pipeline—extend the current `AbstractPipeline` adapters instead.
+> Deprecation Context (2025-10): This historical plan predates consolidation under `DistributedTransformerPipeline` (formerly `MPITransformerPipeline`). Modern work should target `DistributedTransformerPipeline` directly; adapter layers referenced here were removed.
 
 ## Overview
 
@@ -9,7 +9,7 @@ This document outlines the architectural refactoring of the Llaminar transformer
 ## Current Architecture Problems
 
 ### Identified Issues
-1. **Embedded Kernel Logic**: SwiGLU, RoPE, and other operations are hardcoded in `MPITransformerPipeline` instead of being composable kernels
+1. **Embedded Kernel Logic**: (Historical) SwiGLU, RoPE, and other operations were hardcoded in `MPITransformerPipeline` (now `DistributedTransformerPipeline`) instead of being composable kernels
 2. **Architectural Violations**: Pipeline implements operations rather than orchestrating them
 3. **Code Duplication**: Activation functions and math operations scattered throughout codebase
 4. **Limited Reusability**: Cannot reuse operations outside transformer context

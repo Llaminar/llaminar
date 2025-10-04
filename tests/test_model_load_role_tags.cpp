@@ -9,12 +9,12 @@
 
 #include "logger.h"
 #include "model_loader.h"
-#include "mpi_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h"
 
 // Forward declaration of helper (inside llaminar namespace)
 namespace llaminar
 {
-    MPITransformerPipeline::ModelWeights loadModelWeights(const std::string &model_path, const MPITransformerPipeline::LayerConfig &config);
+    DistributedTransformerPipeline::ModelWeights loadModelWeights(const std::string &model_path, const DistributedTransformerPipeline::LayerConfig &config);
 }
 
 namespace
@@ -267,7 +267,7 @@ namespace
                 EXPECT_FALSE(saw_unsupported) << "Unsupported tensor encountered under REQUIRE_KNOWN_TYPES in model " << model_path;
             }
             auto config = loader.createLayerConfig();
-            auto pipeline = std::make_unique<llaminar::MPITransformerPipeline>(config);
+            auto pipeline = std::make_unique<llaminar::DistributedTransformerPipeline>(config);
             auto weights = llaminar::loadModelWeights(model_path, config);
             (void)weights;
             (void)pipeline;

@@ -121,6 +121,12 @@ namespace llaminar
         // Configuration methods
         void setHeadDimensions(int n_head, int n_head_kv, int head_dim);
         void setSequencePosition(int n_past) { n_past_ = n_past; }
+        void setLayerIndex(int idx) { layer_index_ = idx; }
+        int getSequencePosition() const { return n_past_; }
+        // Set externally computed expected total window length (prefill_len + decoded_tokens)
+        void setExpectedTotalWindow(size_t expected) { expected_total_window_ = expected; }
+        size_t getExpectedTotalWindow() const { return expected_total_window_; }
+        void resetDecodeWindowTracking() { last_seen_decode_T_ = 0; }
         void setDistributionStrategy(DistributionStrategy strategy) { strategy_ = strategy; }
 
         /**
@@ -261,6 +267,9 @@ namespace llaminar
         int n_head_kv_;                                                     ///< Number of key-value heads (grouped attention)
         int head_dim_;                                                      ///< Dimension per attention head
         int n_past_;                                                        ///< Number of past tokens for position embedding
+        int layer_index_ = -1;                                              ///< Layer index for diagnostics
+        size_t expected_total_window_ = 0;                                  ///< Expected causal window (external assertion)
+        size_t last_seen_decode_T_ = 0;                                     ///< Per-instance last seen T for monotonic check
         float rope_freq_base_;                                              ///< Base frequency for rotary embeddings
         DistributionStrategy strategy_;                                     ///< Distribution strategy
         AttentionOutputMode output_mode_ = AttentionOutputMode::LocalHeads; ///< selected output mode
