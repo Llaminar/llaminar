@@ -1001,6 +1001,15 @@ if(GTEST_FOUND)
     add_executable(test_prefill_attention_golden tests/test_prefill_attention_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(PrefillAttentionGoldenTest 2 test_prefill_attention_golden)
+    
+    # Parity test framework for comparing Llaminar with llama.cpp at intermediate stages
+    add_executable(test_parity_framework 
+        tests/test_parity_framework.cpp 
+        tests/parity_test_framework.cpp 
+        $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_parity_framework PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(ParityFrameworkTest 2 test_parity_framework)
+    
     add_executable(test_tp_partition tests/test_tp_partition.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_tp_partition PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
     add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)
