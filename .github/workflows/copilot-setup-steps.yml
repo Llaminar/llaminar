@@ -1,0 +1,118 @@
+name: "Copilot Setup Steps"
+
+# Automatically run the setup steps when they are changed to allow for easy validation, and
+# allow manual testing through the repository's "Actions" tab
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  # The job MUST be called `copilot-setup-steps` or it will not be picked up by Copilot.
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+
+    # Set the permissions to the lowest permissions possible needed for your steps.
+    # Copilot will be given its own token for its operations.
+    permissions:
+      # If you want to clone the repository as part of your setup steps, for example to install dependencies, you'll need the `contents: read` permission. If you don't clone the repository in your setup steps, Copilot will do this for you automatically after the steps complete.
+      contents: read
+
+    # You can define any steps you want, and they will run before the agent starts.
+    # If you do not check out your code, Copilot will do this for you.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            gcc \
+            g++ \
+            gdb \
+            cmake \
+            make \
+            ninja-build \
+            pkg-config \
+            bsdmainutils \
+            strace \
+            openmpi-bin \
+            openmpi-common \
+            libopenmpi-dev \
+            libopenblas-dev \
+            libscalapack-openmpi-dev \
+            libnuma-dev \
+            libgtest-dev \
+            libgmock-dev \
+            git \
+            curl \
+            wget \
+            sudo \
+            vim \
+            nano \
+            tree \
+            htop \
+            unzip \
+            zip \
+            ca-certificates \
+            gnupg \
+            lsb-release \
+            python3 \
+            python3-pip \
+            python3-dev \
+            libssl-dev \
+            libcurl4-openssl-dev \
+            libjson-c-dev \
+            libxml2-dev \
+            libeigen3-dev
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Build and install GoogleTest libraries
+        run: |
+          sudo cmake -S /usr/src/googletest -B /tmp/googletest-build
+          sudo cmake --build /tmp/googletest-build --target install
+          sudo rm -rf /tmp/googletest-build
+
+      - name: Install latest CMake from Kitware
+        run: |
+          wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | sudo tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
+          echo "deb https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y cmake
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Install Python packages
+        run: |
+          pip3 install --user --break-system-packages \
+            conan \
+            numpy \
+            matplotlib \
+            pytest
+
+      - name: Verify installations
+        run: |
+          echo "=== CMake Version ==="
+          cmake --version
+          echo ""
+          echo "=== GCC Version ==="
+          gcc --version
+          echo ""
+          echo "=== G++ Version ==="
+          g++ --version
+          echo ""
+          echo "=== MPI Version ==="
+          mpirun --version
+          echo ""
+          echo "=== Python Version ==="
+          python3 --version
+          echo ""
+          echo "=== Ninja Version ==="
+          ninja --version
