@@ -1,8 +1,12 @@
 #include "gtest/gtest.h"
-#include "distributed_transformer_pipeline.h"
+#include "distributed_transformer_pipeline.h" // provides getReplayFirstExceedFlag/resetReplayFirstExceedFlag friend access
 #include "model_loader.h"
 #include "utils/debug_env.h"
 #include <mpi.h>
+
+// Forward declarations for parity sentinel helpers (friends in pipeline implementation)
+bool getReplayFirstExceedFlag();
+void resetReplayFirstExceedFlag();
 
 using namespace llaminar;
 
