@@ -2,12 +2,12 @@
  * @file parity_test_framework.h
  * @brief Extensible parity test framework for comparing Llaminar pipeline stages with llama.cpp
  * @author David Sanftenberg
- * 
+ *
  * This framework provides infrastructure for capturing and comparing intermediate tensor states
  * at various stages of the transformer pipeline between Llaminar and llama.cpp implementations.
- * 
+ *
  * Key features:
- * - Stage-based snapshot capture
+ * - Stage-based snapshot capture (uses core PipelineStage enum from src/pipeline_stages.h)
  * - Configurable comparison metrics (max_abs, rel_l2, mean_abs)
  * - Extensible to new model architectures
  * - MPI-aware for distributed execution
@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "pipeline_stages.h" // Core PipelineStage enum from src/
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -27,30 +28,8 @@ namespace llaminar
 {
     namespace parity
     {
-        /**
-         * @brief Stages of the transformer pipeline where snapshots can be captured
-         */
-        enum class PipelineStage
-        {
-            EMBEDDING,           // Token embedding lookup
-            ATTENTION_NORM,      // RMSNorm before attention
-            QKV_PROJECTION,      // Q, K, V linear projections
-            ROPE_APPLICATION,    // Rotary position embeddings
-            ATTENTION_SCORES,    // Q @ K^T scores
-            ATTENTION_SOFTMAX,   // Softmax over attention scores
-            ATTENTION_CONTEXT,   // Attention weights @ V
-            ATTENTION_OUTPUT,    // Output projection W_o
-            ATTENTION_RESIDUAL,  // After attention residual connection
-            FFN_NORM,           // RMSNorm before FFN
-            FFN_GATE,           // Gate projection
-            FFN_UP,             // Up projection
-            FFN_SWIGLU,         // SwiGLU activation
-            FFN_DOWN,           // Down projection
-            FFN_RESIDUAL,       // After FFN residual connection
-            FINAL_NORM,         // Final RMSNorm
-            LM_HEAD,            // Language model head output (logits)
-            CUSTOM              // Custom stage for extensions
-        };
+        // Use core PipelineStage enum from llaminar::PipelineStage
+        // (No duplicate definition - we import from src/pipeline_stages.h)
 
         /**
          * @brief Metadata for a captured tensor snapshot
@@ -59,12 +38,12 @@ namespace llaminar
         {
             std::string stage_name;
             PipelineStage stage;
-            int layer_index;        // -1 for non-layer stages (embedding, final norm, etc.)
+            int layer_index; // -1 for non-layer stages (embedding, final norm, etc.)
             int seq_len;
-            int feature_dim;        // Hidden size, vocab size, etc.
+            int feature_dim; // Hidden size, vocab size, etc.
             int64_t total_elements;
-            std::string source;     // "llaminar" or "llama.cpp"
-            
+            std::string source; // "llaminar" or "llama.cpp"
+
             SnapshotMetadata()
                 : stage_name(""), stage(PipelineStage::CUSTOM), layer_index(-1),
                   seq_len(0), feature_dim(0), total_elements(0), source("") {}
@@ -79,8 +58,8 @@ namespace llaminar
             std::vector<float> data;
 
             TensorSnapshot() = default;
-            
-            TensorSnapshot(const SnapshotMetadata& meta, const float* data_ptr, size_t count)
+
+            TensorSnapshot(const SnapshotMetadata &meta, const float *data_ptr, size_t count)
                 : metadata(meta), data(data_ptr, data_ptr + count)
             {
                 metadata.total_elements = static_cast<int64_t>(count);
@@ -112,7 +91,7 @@ namespace llaminar
         {
             float max_abs;
             double rel_l2;
-            
+
             ComparisonTolerance(float abs_tol = 1e-3f, double l2_tol = 1e-4)
                 : max_abs(abs_tol), rel_l2(l2_tol) {}
         };
@@ -137,21 +116,21 @@ namespace llaminar
         class SnapshotRegistry
         {
         public:
-            static SnapshotRegistry& instance();
+            static SnapshotRegistry &instance();
 
             void clear();
-            
-            void register_snapshot(const std::string& key, const TensorSnapshot& snapshot);
-            
-            bool has_snapshot(const std::string& key) const;
-            
-            bool get_snapshot(const std::string& key, TensorSnapshot& out_snapshot) const;
-            
+
+            void register_snapshot(const std::string &key, const TensorSnapshot &snapshot);
+
+            bool has_snapshot(const std::string &key) const;
+
+            bool get_snapshot(const std::string &key, TensorSnapshot &out_snapshot) const;
+
             std::vector<std::string> list_keys() const;
 
             // Convenience methods for common key patterns
-            std::string make_key(const std::string& source, PipelineStage stage, int layer = -1) const;
-            std::string make_key(const std::string& source, const std::string& stage_name, int layer = -1) const;
+            std::string make_key(const std::string &source, PipelineStage stage, int layer = -1) const;
+            std::string make_key(const std::string &source, const std::string &stage_name, int layer = -1) const;
 
         private:
             SnapshotRegistry() = default;
@@ -172,26 +151,26 @@ namespace llaminar
              * @return Comparison result with metrics
              */
             static ComparisonResult compare(
-                const TensorSnapshot& expected,
-                const TensorSnapshot& actual,
-                const ComparisonTolerance& tolerance = ComparisonTolerance());
+                const TensorSnapshot &expected,
+                const TensorSnapshot &actual,
+                const ComparisonTolerance &tolerance = ComparisonTolerance());
 
             /**
              * @brief Compute comparison metrics between two tensors
              */
             static ComparisonMetrics compute_metrics(
-                const std::vector<float>& expected,
-                const std::vector<float>& actual);
+                const std::vector<float> &expected,
+                const std::vector<float> &actual);
 
             /**
              * @brief Log top-k differences for debugging
              */
             static void log_top_differences(
-                const std::vector<float>& expected,
-                const std::vector<float>& actual,
+                const std::vector<float> &expected,
+                const std::vector<float> &actual,
                 int cols,
                 int top_k,
-                const std::string& label);
+                const std::string &label);
         };
 
         /**
@@ -211,7 +190,7 @@ namespace llaminar
             static void capture(
                 PipelineStage stage,
                 int layer_index,
-                const float* data,
+                const float *data,
                 int seq_len,
                 int feature_dim);
 
@@ -219,9 +198,9 @@ namespace llaminar
              * @brief Capture with custom stage name
              */
             static void capture(
-                const std::string& stage_name,
+                const std::string &stage_name,
                 int layer_index,
-                const float* data,
+                const float *data,
                 int seq_len,
                 int feature_dim);
 
@@ -229,22 +208,15 @@ namespace llaminar
              * @brief Enable/disable snapshot capture
              */
             static void set_enabled(bool enabled);
-            
+
             static bool is_enabled();
 
         private:
             static bool enabled_;
         };
 
-        /**
-         * @brief Utility to convert stage enum to string
-         */
-        std::string stage_to_string(PipelineStage stage);
-
-        /**
-         * @brief Utility to convert string to stage enum
-         */
-        PipelineStage string_to_stage(const std::string& str);
+        // Note: stage_to_string() and string_to_stage() utilities are provided
+        // by the core pipeline_stages.h header (inline functions in llaminar namespace)
 
     } // namespace parity
 } // namespace llaminar

@@ -237,6 +237,8 @@ namespace llaminar
                 }
                 // Stage capture: post-attention norm (QKV input)
                 capture_stage(attn_norm_out, "attn_qkv_in");
+                // Parity capture: attention norm output (input to QKV)
+                captureIfEnabled(PipelineStage::ATTENTION_NORM, layer_idx, attn_norm_out);
                 // Attention kernel
                 auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
                 if (attention_kernel)
@@ -259,6 +261,8 @@ namespace llaminar
             }
             // Stage capture: attention output
             capture_stage(attn_out, "attn_out");
+            // Parity capture: attention output
+            captureIfEnabled(PipelineStage::ATTENTION_OUTPUT, layer_idx, attn_out);
             // Residual add
             std::vector<std::shared_ptr<TensorBase>> residual_inputs = {input, attn_out};
             std::vector<std::shared_ptr<TensorBase>> residual_outputs = {residual_tmp};
@@ -269,6 +273,8 @@ namespace llaminar
             }
             // Stage capture: post-attention residual
             capture_stage(residual_tmp, "attn_residual");
+            // Parity capture: post-attention residual
+            captureIfEnabled(PipelineStage::ATTENTION_RESIDUAL, layer_idx, residual_tmp);
         }
         else
         {
@@ -298,6 +304,8 @@ namespace llaminar
         }
         // Stage capture: FFN norm output
         capture_stage(ffn_norm_out, "ffn_norm");
+        // Parity capture: FFN norm output
+        captureIfEnabled(PipelineStage::FFN_NORM, layer_idx, ffn_norm_out);
         auto gate_out = createLocalTensor({seq_len, config_.getLayerConfig().d_ff});
         auto up_out = createLocalTensor({seq_len, config_.getLayerConfig().d_ff});
         {
@@ -393,6 +401,8 @@ namespace llaminar
         }
         // Stage capture: FFN output before residual
         capture_stage(ffn_out, "ffn_out");
+        // Parity capture: FFN down projection output (before final residual)
+        captureIfEnabled(PipelineStage::FFN_DOWN, layer_idx, ffn_out);
         std::vector<std::shared_ptr<TensorBase>> final_residual_inputs = {residual_tmp, ffn_out};
         std::vector<std::shared_ptr<TensorBase>> final_residual_outputs = {output};
         if (!executeKernel("residual", final_residual_inputs, final_residual_outputs))
@@ -402,6 +412,8 @@ namespace llaminar
         }
         // Diagnostics: capture last token row if enabled
         capture_stage(output, "layer_output");
+        // Parity capture: final layer output (after FFN residual)
+        captureIfEnabled(PipelineStage::FFN_RESIDUAL, layer_idx, output);
         return true;
     }
 
@@ -968,6 +980,10 @@ namespace llaminar
         {
             handle_prefill_stage_snapshot(getRank(), "embedding_output", embedded_output->data(), (size_t)embedded_output->size(), config_.getLayerConfig().d_model, 5e-4, capture_baseline, compare_baseline);
         }
+
+        // Parity capture: embedding output
+        captureIfEnabled(PipelineStage::EMBEDDING, -1, embedded_output);
+
         return true;
     }
 
@@ -1003,6 +1019,10 @@ namespace llaminar
             LOG_ERROR("Output projection norm failed");
             return false;
         }
+
+        // Parity capture: final norm output
+        captureIfEnabled(PipelineStage::FINAL_NORM, -1, normed);
+
         // Keep last hidden (rank0) for diagnostics
         if (getRank() == 0)
         {
@@ -1023,6 +1043,10 @@ namespace llaminar
             return false;
         }
         last_logits_ = output; // cache
+
+        // Parity capture: LM head output (final logits)
+        captureIfEnabled(PipelineStage::LM_HEAD, -1, output);
+
         // Optional baseline snapshot of final logits (rank 0 only)
         const bool capture_baseline = debugEnv().baseline.capture;
         const bool compare_baseline = debugEnv().baseline.compare;

@@ -179,6 +179,12 @@ bool ArgumentParser::parse(LlaminarParams &params)
         {
             params.kv_cache_stats = true;
         }
+        // Output options
+        else if (arg == "--output-json" && i + 1 < argc_)
+        {
+            params.output_json_file = argv_[i + 1];
+            i++;
+        }
         // Help and version
         else if (arg == "--help" || arg == "-h")
         {
@@ -263,6 +269,8 @@ void ArgumentParser::printUsage() const
     std::cout << "  --profile                Enable kernel profiling" << std::endl;
     std::cout << "  --validate               Enable result validation" << std::endl;
     std::cout << "  --kv-stats               Print KV cache capacity/usage summary at exit" << std::endl;
+    std::cout << "\nOutput Options:" << std::endl;
+    std::cout << "  --output-json <file>     Write logits and tokens to JSON file" << std::endl;
     std::cout << "\nInformation:" << std::endl;
     std::cout << "  --help, -h               Show this help message" << std::endl;
     std::cout << "  --version                Show version information" << std::endl;

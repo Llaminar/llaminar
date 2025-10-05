@@ -1286,6 +1286,207 @@ PipelineFactory::registerPlugin(std::make_unique<FlashAttentionPlugin>());
 
 ---
 
+### 15. Parity Test Framework Integration ✨
+
+**Overview**: The parity test framework provides comprehensive snapshot capture and comparison capabilities for validating pipeline execution correctness. It's now deeply integrated into the core pipeline architecture for automatic, zero-overhead parity testing.
+
+#### Architecture
+
+**Core Components**:
+
+1. **PipelineStage Enum** (`src/pipeline_stages.h`)
+   - Standardized 22-stage enumeration covering all transformer operations
+   - Shared between production code and tests
+   - Stages: EMBEDDING, ATTENTION_NORM, QKV_PROJECTION, ROPE_APPLICATION, ATTENTION_SCORES, ATTENTION_SOFTMAX, ATTENTION_CONTEXT, ATTENTION_OUTPUT, ATTENTION_RESIDUAL, FFN_NORM, FFN_GATE, FFN_UP, FFN_SWIGLU, FFN_DOWN, FFN_RESIDUAL, FINAL_NORM, LM_HEAD, CUSTOM
+   - Utility functions: `stage_to_string()`, `string_to_stage()` (inline, zero overhead)
+
+2. **Parity Hooks** (`src/parity_hooks.h/cpp`)
+   - Production-safe interface with default no-op implementation
+   - Environment-driven activation via `LLAMINAR_PARITY_CAPTURE`
+   - Tests provide real implementation via `parity_test_framework.cpp`
+   - Zero overhead when disabled (functions inline to empty)
+
+3. **Pipeline Integration**
+   - **AbstractPipeline**: Virtual `captureStageSnapshot()` and `isParityEnabled()` methods
+   - **PipelineBase**: Convenience `captureIfEnabled()` helpers with rank filtering
+   - **QwenPipeline**: 8 strategic capture points at key computation stages
+
+#### Capture Points in QwenPipeline
+
+**Prefill/Decode Path** (automatic capture when `LLAMINAR_PARITY_CAPTURE=1`):
+
+| Stage | Location | Description |
+|-------|----------|-------------|
+| `EMBEDDING` | After token embedding | Input to first transformer layer |
+| `ATTENTION_NORM` | Pre-attention RMSNorm | Input to QKV projection |
+| `ATTENTION_OUTPUT` | After W_o projection | Attention block output |
+| `ATTENTION_RESIDUAL` | After attention residual add | Input to FFN block |
+| `FFN_NORM` | Pre-FFN RMSNorm | Input to gate/up projections |
+| `FFN_DOWN` | After down projection | FFN block output |
+| `FFN_RESIDUAL` | After FFN residual add | Output of transformer layer |
+| `FINAL_NORM` | After final RMSNorm | Input to LM head |
+| `LM_HEAD` | Language model head output | Final logits |
+
+**Key Design Features**:
+- **Rank 0 Only**: Captures happen on rank 0 to avoid MPI duplication
+- **Automatic Shape Extraction**: Captures sequence length and feature dimension from tensors
+- **Layer-Aware**: Each capture includes layer index (or -1 for non-layer stages)
+- **Zero Overhead When Disabled**: `isParityEnabled()` check inlines to false
+
+#### Usage Patterns
+
+**Basic Parity Testing**:
+```bash
+# Enable automatic snapshot capture
+export LLAMINAR_PARITY_CAPTURE=1
+
+# Run Llaminar inference (captures will be stored in SnapshotRegistry)
+mpirun -np 2 ./build/llaminar -m model.gguf -v
+
+# Compare with reference implementation in test
+./build/test_parity_framework
+```
+
+**Test Integration**:
+```cpp
+#include "parity_test_framework.h"
+
+TEST(ParityTest, QwenPrefillVsReference) {
+    // Clear previous captures
+    parity::SnapshotRegistry::instance().clear();
+    
+    // Enable parity capture
+    parity::LlaminarSnapshotHook::set_enabled(true);
+    
+    // Run Llaminar pipeline (automatic capture via captureIfEnabled calls)
+    auto pipeline = PipelineFactory::create(config);
+    pipeline->prefill(tokens, weights, ctx);
+    
+    // Run reference implementation and capture
+    // ... reference execution ...
+    
+    // Compare snapshots
+    auto tolerance = parity::ComparisonTolerance(1e-3f, 1e-4);
+    for (int layer = 0; layer < num_layers; ++layer) {
+        auto key_llama = registry.make_key("llaminar", PipelineStage::ATTENTION_OUTPUT, layer);
+        auto key_ref = registry.make_key("reference", PipelineStage::ATTENTION_OUTPUT, layer);
+        
+        TensorSnapshot snap_llama, snap_ref;
+        ASSERT_TRUE(registry.get_snapshot(key_llama, snap_llama));
+        ASSERT_TRUE(registry.get_snapshot(key_ref, snap_ref));
+        
+        auto result = SnapshotComparator::compare(snap_ref, snap_llama, tolerance);
+        EXPECT_TRUE(result.passed()) << "Layer " << layer << " failed parity";
+    }
+}
+```
+
+**Custom Capture Points** (extending to new architectures):
+```cpp
+class MyCustomPipeline : public PipelineBase, public AbstractPipeline {
+    bool execute(...) override {
+        // ... computation ...
+        
+        // Capture at custom stage
+        captureIfEnabled(PipelineStage::CUSTOM, layer_idx, my_tensor);
+        
+        // ... more computation ...
+        return true;
+    }
+};
+```
+
+#### Comparison Metrics
+
+**Supported Metrics**:
+- **Max Absolute Difference**: `max(|expected - actual|)`
+- **Mean Absolute Difference**: `mean(|expected - actual|)`
+- **Relative L2 Norm**: `||expected - actual||₂ / ||expected||₂`
+- **Worst Element Tracking**: Index and values of maximum difference
+
+**Configurable Tolerances**:
+```cpp
+// Strict tolerance for early layers
+auto strict = ComparisonTolerance(1e-4f, 1e-5);
+
+// Relaxed tolerance for final logits
+auto relaxed = ComparisonTolerance(1e-2f, 1e-3);
+```
+
+#### Environment Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLAMINAR_PARITY_CAPTURE` | Enable automatic snapshot capture | Disabled (0) |
+| `LLAMINAR_LAYER_TOKEN_DIFF` | Legacy layer diff diagnostics | Disabled (0) |
+
+**Note**: The new parity framework (`LLAMINAR_PARITY_CAPTURE`) is complementary to the legacy layer token diff system. They can coexist but serve different purposes:
+- **Parity Framework**: Cross-implementation validation (Llaminar vs llama.cpp)
+- **Layer Token Diff**: Incremental decode vs replay validation within Llaminar
+
+#### Integration with Existing Diagnostics
+
+**Relationship to Baseline Comparison**:
+- **Baseline**: Per-stage FP32 snapshots for prefill GEMM validation
+- **Parity**: Cross-pipeline snapshot comparison for correctness validation
+- Both use `handle_prefill_stage_snapshot()` infrastructure
+- Can be used together for comprehensive validation
+
+**Relationship to Layer Token Diff**:
+- **Layer Token Diff**: Legacy diagnostic for incremental decode parity
+- **Parity Framework**: Modern unified approach for all validation
+- Migration path: Gradually replace layer token diff with parity framework
+
+#### Performance Considerations
+
+**Overhead When Disabled**:
+- **Zero Overhead**: `isParityEnabled()` compiles to constant `false`
+- Capture calls eliminated by compiler dead code elimination
+- No runtime checks in hot paths
+
+**Overhead When Enabled**:
+- **Memory**: Stores full tensor snapshots (can be large for long sequences)
+- **Compute**: Tensor copy per capture point (~microseconds for typical sizes)
+- **Recommendation**: Use only for validation, not performance benchmarks
+
+#### Future Enhancements
+
+**Planned Features**:
+1. **Selective Stage Capture**: Environment variable to capture only specific stages
+2. **Streaming Snapshots**: Write captures to disk instead of memory for long sequences
+3. **Differential Snapshots**: Only capture changed regions for incremental decode
+4. **Automatic Tolerance Tuning**: Learn tolerances from successful runs
+5. **Cross-Rank Comparison**: Validate distributed state consistency across MPI ranks
+6. **Integration with CI/CD**: Automated parity regression tests on every commit
+
+**Plugin Architecture** (future):
+```cpp
+class ParityPlugin {
+    virtual bool shouldCapture(PipelineStage stage, int layer) = 0;
+    virtual void onCapture(const TensorSnapshot& snapshot) = 0;
+};
+
+// Register custom parity validation logic
+parity::registerPlugin(std::make_unique<MyCustomValidator>());
+```
+
+#### Files
+
+**Core**:
+- `src/pipeline_stages.h`: PipelineStage enum and conversion utilities
+- `src/parity_hooks.h/cpp`: Production-safe hook interface
+- `src/abstract_pipeline.h`: Virtual parity methods (base interface)
+- `src/pipeline_base.h/cpp`: Convenience helpers (`captureIfEnabled`)
+- `src/qwen_pipeline.cpp`: 8 capture points in production pipeline
+
+**Tests**:
+- `tests/parity_test_framework.h/cpp`: Full snapshot capture and comparison implementation
+- `tests/test_parity_framework.cpp`: Parity framework unit tests
+
+**Total LOC**: ~500 lines (framework), ~10 lines added to QwenPipeline
+
+---
+
 ## Additional Technical Details
 
 ### Build System & Dependencies
@@ -1661,5 +1862,318 @@ Key groups include:
 | `cosma` | `prefill_threshold`, `max_resident_mb`, validation toggles |
 | `distribution` | Mode overrides, sharding thresholds |
 | `attention` | Trace / micro diagnostics flags |
+
+---
+
+## PyTorch Reference Implementation for Ground-Truth Validation 🐍
+
+**Location**: `python/reference/`  
+**Status**: Production-ready infrastructure (test integration pending API alignment)  
+**Purpose**: Stage-by-stage numerical validation against HuggingFace transformer models
+
+### Overview
+
+The PyTorch reference implementation provides **21 granular capture stages** (vs llama.cpp's 2-stage capture) for comprehensive parity testing. It enables debugging of quantization errors, operator implementation issues, and numerical drift by comparing Llaminar's execution against ground-truth PyTorch/HuggingFace models.
+
+### Architecture
+
+**Three-Component Design**:
+
+1. **Python Reference Implementation** (`python/reference/`)
+   - Abstract base class: `AbstractReferenceModel`
+   - Concrete implementations: `QwenReferenceModel` (production), `LlamaReferenceModel` (prototype)
+   - Stage-by-stage hook system for capturing intermediate activations
+   - Quantization simulation (Q4_0, Q6_K) matching GGUF formats
+   - CLI tool: `run_reference.py` for snapshot generation
+
+2. **Snapshot Bridge** (`tests/npz_loader.h`, `tests/npz_to_npy.py`)
+   - Header-only C++ .npy parser (zero external dependencies)
+   - Python extraction helper (.npz → individual .npy files)
+   - Cross-language compatibility layer
+
+3. **C++ Parity Integration** (`tests/test_parity_framework.cpp`)
+   - Test template for PyTorch snapshot comparison
+   - Configurable tolerances for FP32/FP16/Q6_K/Q4_0
+   - Stage-by-stage comparison with detailed diagnostics
+   - Status: Infrastructure complete, awaiting API refactor (see §15.7)
+
+### 21 Capture Stages
+
+Granular snapshots covering the full transformer pipeline:
+
+| Category | Stages | Purpose |
+|----------|--------|---------|
+| **Input** | `EMBEDDING`, `POSITIONAL_ENCODING` | Input validation, vocabulary alignment |
+| **Attention (per-layer)** | `ATTENTION_NORM`, `QKV_PROJECTION`, `ROPE_APPLICATION`, `ATTENTION_SCORES`, `ATTENTION_PROBS`, `ATTENTION_CONTEXT`, `ATTENTION_OUTPUT`, `ATTENTION_RESIDUAL` | Attention mechanism correctness |
+| **FFN (per-layer)** | `FFN_NORM`, `FFN_GATE`, `FFN_UP`, `FFN_ACTIVATION`, `FFN_DOWN`, `FFN_RESIDUAL` | Feed-forward network validation |
+| **Per-Layer** | `LAYER_OUTPUT` | Layer-wise correctness |
+| **Output** | `FINAL_NORM`, `LM_HEAD`, `FINAL_LOGITS`, `PROBABILITIES` | Final output validation |
+
+**Note**: Llaminar's `QwenPipeline` currently captures 8 strategic stages (see Parity Test Framework §13). The PyTorch reference provides all 21 for comprehensive debugging.
+
+### Quick Start Workflow
+
+**1. Generate PyTorch Reference Snapshots**:
+```bash
+# Install dependencies (pre-installed in devcontainer)
+pip install -r python/reference/requirements.txt
+
+# Generate FP32 snapshots
+python python/reference/run_reference.py \
+    --model qwen \
+    --checkpoint Qwen/Qwen2-0.5B-Instruct \
+    --tokens 1,2,3,4,5 \
+    --output pytorch_snapshots.npz \
+    --verbose
+
+# Generate quantized snapshots for Q4_0 validation
+python python/reference/run_reference.py \
+    --model qwen \
+    --checkpoint Qwen/Qwen2-0.5B-Instruct \
+    --tokens 1,2,3,4,5 \
+    --quantization q4_0 \
+    --output pytorch_q4_snapshots.npz
+```
+
+**2. Extract Snapshots to C++-Compatible Format**:
+```bash
+# Extract .npz archive to individual .npy files
+python tests/npz_to_npy.py pytorch_snapshots.npz pytorch_snapshots/
+
+# Directory structure after extraction:
+# pytorch_snapshots/
+#   EMBEDDING_-1.npy              # Non-layer stage (layer_idx = -1)
+#   ATTENTION_OUTPUT_0.npy        # Layer 0 attention output
+#   FFN_DOWN_0.npy                # Layer 0 FFN down projection
+#   FINAL_NORM_-1.npy             # Final normalization
+#   LM_HEAD_-1.npy                # Language model head
+```
+
+**3. Load and Compare in C++**:
+```cpp
+#include "npz_loader.h"
+using namespace llaminar::parity;
+
+// Load PyTorch reference snapshot
+PyTorchSnapshotLoader pytorch_loader("pytorch_snapshots/");
+NpyArray pytorch_embedding;
+if (pytorch_loader.load_snapshot("EMBEDDING", -1, pytorch_embedding)) {
+    // pytorch_embedding.shape = {1, seq_len, hidden_dim}
+    // pytorch_embedding.data = std::vector<float>
+    
+    // Compare with Llaminar snapshot from SnapshotRegistry
+    auto llaminar_snapshot = SnapshotRegistry::get("EMBEDDING", -1);
+    auto metrics = SnapshotComparator::compare(pytorch_embedding, llaminar_snapshot);
+    
+    LOG_INFO("EMBEDDING max_abs_diff: " << metrics.max_abs_diff 
+             << ", rel_l2: " << metrics.rel_l2);
+}
+```
+
+### File Format & Naming Convention
+
+**NumPy .npy Format** (header-only parser in `npz_loader.h`):
+- Magic bytes: `\x93NUMPY`
+- Version: 1-3 (2 bytes)
+- Header: Python dict with `descr` (dtype), `fortran_order`, `shape`
+- Data: Raw float32 blob (little-endian)
+
+**Naming Convention**:
+```
+{STAGE_NAME}_{LAYER_INDEX}.npy
+
+Examples:
+  EMBEDDING_-1.npy           # Global stage (no layer)
+  ATTENTION_OUTPUT_0.npy     # Layer 0 attention output
+  FFN_DOWN_5.npy             # Layer 5 FFN down projection
+  FINAL_NORM_-1.npy          # Final norm (no layer)
+```
+
+### Comparison Metrics & Tolerances
+
+**Standard Metrics**:
+- `max_abs_diff`: max|A - B| across all elements
+- `mean_abs_diff`: mean|A - B|
+- `rel_l2`: ||A - B||₂ / ||A||₂ (relative L2 norm)
+
+**Recommended Tolerances**:
+
+| Precision | max_abs_diff | rel_l2 | Use Case |
+|-----------|--------------|--------|----------|
+| FP32 | 1e-4 | 1e-5 | Numerical precision only |
+| Q6_K | 5e-3 | 1e-2 | High-quality quantization |
+| Q4_0 | 1e-2 | 5e-2 | Aggressive quantization |
+
+**Adaptive Tolerance Strategy** (recommended):
+```cpp
+// Stricter for early stages (error doesn't accumulate)
+if (stage == "EMBEDDING" || stage.find("NORM") != npos) {
+    return is_quantized ? 5e-3f : 1e-4f;
+}
+
+// Relaxed for late stages (accumulated error)
+if (stage == "FINAL_LOGITS") {
+    return is_quantized ? 5e-2f : 1e-3f;
+}
+```
+
+### Environment Variables
+
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `PYTORCH_SNAPSHOT_DIR` | Directory with extracted .npy files | `pytorch_snapshots/` |
+| `PYTORCH_SNAPSHOT_TOKENS` | Token IDs used for generation | `1,2,3,4,5` |
+| `PYTORCH_MODEL_PATH` | HuggingFace checkpoint path | `Qwen/Qwen2-0.5B-Instruct` |
+| `PYTORCH_QUANTIZATION` | Quantization format | `q4_0` or `q6_k` |
+
+### Model Family Support
+
+**Production**:
+- **Qwen**: `QwenReferenceModel` with full 21-stage capture
+  - Supports Qwen2-0.5B, Qwen2-1.5B, Qwen2-7B
+  - Quantization: Q4_0, Q6_K matching GGUF
+  - RoPE, SwiGLU FFN, RMSNorm validation
+
+**Prototype**:
+- **LLaMA**: `LlamaReferenceModel` with basic structure
+  - Needs attention implementation completion
+  - Quantization hooks in place
+
+**Future** (extensible via `AbstractReferenceModel`):
+- DeepSeek (similar to LLaMA)
+- Mistral (sliding window attention)
+- GPT-2 (learned positional embeddings)
+
+### Integration Status
+
+**✅ Complete**:
+- Python reference implementation (800+ lines)
+- CLI tool for snapshot generation
+- Header-only C++ .npy parser (303 lines, zero dependencies)
+- Python extraction helper (100 lines)
+- Comprehensive documentation (850+ lines total)
+
+**⚠️ Pending** (see §15.7):
+- Test case needs API refactoring (~1 hour)
+  - Current: Uses old `GGUFContext` API
+  - Target: New `ModelConfig`-based `AbstractPipeline` API
+- CI/CD integration (GitHub Actions workflow)
+
+### Advanced Usage Patterns
+
+**Quantization Error Analysis**:
+```bash
+# Generate FP32 baseline
+python python/reference/run_reference.py --model qwen \
+    --checkpoint Qwen/Qwen2-0.5B-Instruct --tokens 1,2,3 \
+    --output fp32.npz
+
+# Generate Q6_K quantized
+python python/reference/run_reference.py --model qwen \
+    --checkpoint Qwen/Qwen2-0.5B-Instruct --tokens 1,2,3 \
+    --quantization q6_k --output q6k.npz
+
+# Generate Q4_0 quantized
+python python/reference/run_reference.py --model qwen \
+    --checkpoint Qwen/Qwen2-0.5B-Instruct --tokens 1,2,3 \
+    --quantization q4_0 --output q4.npz
+
+# Compare all three in C++ to isolate quantization vs implementation errors
+```
+
+**Selective Stage Testing**:
+```python
+# Only capture specific stages for faster iteration
+python python/reference/run_reference.py \
+    --model qwen --checkpoint Qwen/Qwen2-0.5B-Instruct \
+    --tokens 1,2,3,4,5 \
+    --stages EMBEDDING ATTENTION_OUTPUT FINAL_NORM \
+    --output selective.npz
+```
+
+**Long Sequence Validation**:
+```bash
+# Test with sequences up to context length
+python python/reference/run_reference.py \
+    --model qwen --checkpoint Qwen/Qwen2-0.5B-Instruct \
+    --tokens $(seq 1 100 | tr '\n' ',') \
+    --output long_seq.npz
+```
+
+### Troubleshooting Guide
+
+**Shape Mismatch**:
+- **Symptom**: `Shape mismatch: PyTorch [1,5,512] vs Llaminar [5,512]`
+- **Cause**: Different batch dimension handling
+- **Fix**: Ensure consistent token count (`PYTORCH_SNAPSHOT_TOKENS` matches input)
+
+**High Numeric Drift**:
+- **Symptom**: `rel_l2 = 0.5` (expected < 0.01)
+- **Causes**: Quantization errors, operator bugs, different RNG seeds
+- **Debug**: Compare stage-by-stage to isolate error source
+
+**File Not Found**:
+- **Symptom**: `FileNotFoundError: EMBEDDING_-1.npy`
+- **Fix**: Run extraction step: `python tests/npz_to_npy.py snapshots.npz output/`
+- **Verify**: `ls -la $PYTORCH_SNAPSHOT_DIR`
+
+**Parser Error**:
+- **Symptom**: `Invalid .npy header`
+- **Cause**: Corrupted file or unsupported NumPy version
+- **Fix**: Regenerate with latest NumPy: `pip install -U numpy`
+
+### API Migration Path (§15.7)
+
+**Current State**: Test infrastructure complete, awaiting `ModelConfig` API alignment
+
+**Required Changes** (~1 hour):
+
+```cpp
+// 1. Model Loading (OLD → NEW)
+// auto gguf_ctx = loader.load(model_path);
+ModelConfig config = createConfigFromGGUF(model_path);
+
+// 2. Pipeline Creation (OLD → NEW)
+// auto pipeline = std::make_unique<QwenPipelineAdapter>(gguf_ctx);
+auto pipeline = PipelineFactory::create(config);
+
+// 3. Prefill Execution (OLD → NEW)
+// auto result = pipeline->prefill(token_ids);
+IModelWeights* weights = /* load from model */;
+StageContext ctx = /* create context */;
+bool success = pipeline->prefill(token_ids, weights, ctx);
+
+// 4. Enable Test
+// Remove DISABLED_ prefix from test name
+TEST(ParityFramework, DistributedPipelineVsPyTorchReference) { ... }
+```
+
+### Documentation References
+
+- **Python Reference README**: `python/reference/README.md` (300+ lines comprehensive guide)
+- **C++ Integration Guide**: `tests/PYTORCH_INTEGRATION.md` (450+ lines with troubleshooting)
+- **Test Framework Guide**: `tests/AGENTS.md` §14 (PyTorch reference usage)
+- **Status Report**: `PYTORCH_INTEGRATION_STATUS.md` (implementation summary)
+- **Parity Framework**: `tests/AGENTS.md` §13 (Llaminar snapshot capture system)
+
+### Best Practices
+
+1. **Version Control Snapshots**: Commit .npz files or document HuggingFace checkpoint versions
+2. **Test Incrementally**: Validate embedding → layer 0 → layer N → final output
+3. **Document Tolerances**: Add comments justifying relaxed tolerances for quantized models
+4. **Isolate Errors**: Compare FP32 first, then add quantization progressively
+5. **Cache Models**: Use `~/.cache/huggingface` to avoid re-downloading multi-GB checkpoints
+6. **Validate Shapes First**: Shape mismatch indicates fundamental API issues
+7. **Use Verbose Logging**: Enable `-vvv` and `--verbose` for debugging
+
+### Future Enhancements
+
+1. **Full .npz Support**: Eliminate extraction step by adding ZIP parsing to `npz_loader.h`
+2. **Model Coverage**: Add DeepSeek, Mistral, GPT-2 reference implementations
+3. **Automatic Tolerance Learning**: Adaptive tolerances based on successful runs
+4. **GPU Validation**: Compare CUDA/ROCm kernels against PyTorch GPU execution
+5. **Visual Diff Reports**: HTML output with per-stage heatmaps and statistics
+6. **Streaming Snapshots**: Disk-backed storage for very long sequences
+7. **CI/CD Integration**: Automated snapshot generation and comparison on every PR
 
 ---

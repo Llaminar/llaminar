@@ -1,20 +1,22 @@
 /**
  * @file test_parity_framework.cpp
- * @brief Parity test framework for comparing Llaminar with llama.cpp
+ * @brief Parity test framework for comparing Llaminar with llama.cpp and PyTorch
  * @author David Sanftenberg
  *
  * This test validates the distributed attention pipeline by comparing intermediate
- * tensor snapshots from Llaminar against llama.cpp reference implementation.
+ * tensor snapshots from Llaminar against reference implementations (llama.cpp, PyTorch).
  *
  * The framework is designed to be extensible to other model architectures.
  */
 
 #include "parity_test_framework.h"
+#include "npz_loader.h"
 #include "qwen_pipeline_adapter.h"
 #include "qwen_pipeline.h"
 #include "model_loader.h"
 #include "logger.h"
 #include "test_timeout_guard.h"
+#include "abstract_pipeline.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -498,6 +501,224 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
         }
 
         std::cout << "[PARITY_TEST] Test complete" << std::endl;
+    }
+}
+
+/**
+ * @brief Test comparing Llaminar pipeline with PyTorch reference snapshots
+ *
+ * This test loads pre-generated snapshots from the PyTorch reference implementation
+ * (python/reference) and compares them against Llaminar's execution.
+ *
+ * Prerequisites:
+ * 1. Generate PyTorch snapshots:
+ *    python python/reference/run_reference.py --model qwen \
+ *      --checkpoint Qwen/Qwen2-0.5B-Instruct --tokens 1,2,3,4,5 \
+ *      --output pytorch_snapshots.npz
+ *
+ * 2. Extract to .npy files:
+ *    python tests/npz_to_npy.py pytorch_snapshots.npz pytorch_snapshots/
+ *
+ * 3. Set environment variables:
+ *    export PYTORCH_SNAPSHOT_DIR=pytorch_snapshots/
+ *    export PYTORCH_SNAPSHOT_TOKENS=1,2,3,4,5
+ *    export LLAMINAR_PARITY_CAPTURE=1
+ *
+ * 4. Run test:
+ *    ./build/test_parity_framework --gtest_filter="*PyTorchReference*"
+ */
+TEST(ParityFramework, DistributedPipelineVsPyTorchReference)
+{
+    int world = 1;
+    int rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    // Check for PyTorch snapshot directory
+    const char *snapshot_dir_env = std::getenv("PYTORCH_SNAPSHOT_DIR");
+    if (!snapshot_dir_env)
+    {
+        GTEST_SKIP() << "PYTORCH_SNAPSHOT_DIR not set. See test documentation for setup instructions.";
+    }
+
+    // Check for token sequence
+    const char *tokens_env = std::getenv("PYTORCH_SNAPSHOT_TOKENS");
+    if (!tokens_env)
+    {
+        GTEST_SKIP() << "PYTORCH_SNAPSHOT_TOKENS not set (e.g., export PYTORCH_SNAPSHOT_TOKENS=1,2,3,4,5)";
+    }
+
+    // Parse token sequence
+    std::vector<int> token_ids;
+    std::stringstream ss(tokens_env);
+    std::string token_str;
+    while (std::getline(ss, token_str, ','))
+    {
+        token_ids.push_back(std::stoi(token_str));
+    }
+
+    if (token_ids.empty())
+    {
+        GTEST_SKIP() << "PYTORCH_SNAPSHOT_TOKENS is empty";
+    }
+
+    // Find model file
+    std::string model_path = find_test_model();
+    if (rank == 0 && model_path.empty())
+    {
+        GTEST_SKIP() << "No test model found in models/ directory";
+    }
+    broadcast_string(model_path, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+        std::cout << "[PYTORCH_PARITY] Model: " << model_path << std::endl;
+        std::cout << "[PYTORCH_PARITY] Snapshot dir: " << snapshot_dir_env << std::endl;
+        std::cout << "[PYTORCH_PARITY] Token sequence: " << tokens_env << " (" << token_ids.size() << " tokens)" << std::endl;
+    }
+
+    // Load PyTorch snapshots (rank 0 only)
+    PyTorchSnapshotLoader pytorch_loader(snapshot_dir_env);
+    std::vector<std::pair<std::string, int>> snapshot_stages = {
+        {"EMBEDDING", -1},
+        {"ATTENTION_OUTPUT", 0},
+        {"FFN_DOWN", 0},
+        {"FINAL_NORM", -1},
+        {"LM_HEAD", -1}};
+
+    // Enable snapshot capture for Llaminar
+    LlaminarSnapshotHook::set_enabled(true);
+    SnapshotRegistry &registry = SnapshotRegistry::instance();
+    registry.clear();
+
+    // Register Qwen pipeline with factory
+    registerQwenPipeline();
+
+    // Create pipeline using new API
+    ModelLoader loader;
+    ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load GGUF model: " << model_path;
+    TransformerLayerConfig base_config = loader.createLayerConfig();
+    ModelConfig model_cfg(base_config, "qwen");
+
+    // Create pipeline via factory
+    auto pipeline = PipelineFactory::instance().create(model_cfg);
+    ASSERT_NE(pipeline, nullptr) << "Failed to create Qwen pipeline";
+
+    // Load weights using new API
+    auto weights = pipeline->loadWeights(model_path);
+    ASSERT_NE(weights, nullptr) << "Failed to load weights";
+
+    if (rank == 0)
+    {
+        std::cout << "[PYTORCH_PARITY] Running Llaminar pipeline..." << std::endl;
+    }
+
+    // Execute prefill with new API
+    StageContext ctx;
+    ctx.stage = InferenceStage::Prefill;
+    ctx.seq_len = static_cast<int>(token_ids.size());
+
+    ASSERT_TRUE(pipeline->prefill(token_ids, *weights, ctx)) << "Prefill failed";
+
+    // Get logits
+    std::shared_ptr<TensorBase> logits_tensor;
+    ASSERT_TRUE(pipeline->logits(logits_tensor)) << "Failed to get logits";
+    ASSERT_NE(logits_tensor, nullptr) << "Logits tensor is null";
+
+    if (rank == 0)
+    {
+        std::cout << "[PYTORCH_PARITY] Comparing snapshots..." << std::endl;
+    }
+
+    // Compare snapshots stage-by-stage
+    int passed = 0;
+    int failed = 0;
+    int missing = 0;
+
+    for (const auto &[stage_name, layer_idx] : snapshot_stages)
+    {
+        if (rank != 0)
+            continue; // Only rank 0 compares
+
+        NpyArray pytorch_snapshot;
+
+        if (!pytorch_loader.load_snapshot(stage_name, layer_idx, pytorch_snapshot))
+        {
+            std::cout << "[PYTORCH_PARITY] MISSING: " << stage_name << "_" << layer_idx
+                      << " (PyTorch snapshot not found)" << std::endl;
+            missing++;
+            continue;
+        }
+
+        // Try to find corresponding Llaminar snapshot
+        std::string llaminar_key = registry.make_key("llaminar", stage_name, layer_idx);
+        TensorSnapshot llaminar_snapshot;
+
+        if (!registry.get_snapshot(llaminar_key, llaminar_snapshot))
+        {
+            std::cout << "[PYTORCH_PARITY] MISSING: " << stage_name << "_" << layer_idx
+                      << " (Llaminar snapshot not captured)" << std::endl;
+            missing++;
+            continue;
+        }
+
+        // Convert PyTorch snapshot to SnapshotMetadata for comparison
+        SnapshotMetadata pytorch_meta;
+        pytorch_meta.stage_name = stage_name;
+        pytorch_meta.layer_index = layer_idx;
+        pytorch_meta.seq_len = static_cast<int>(pytorch_snapshot.shape[0]);
+        pytorch_meta.feature_dim = static_cast<int>(pytorch_snapshot.shape.size() > 1 ? pytorch_snapshot.shape[1] : 1);
+        pytorch_meta.source = "pytorch";
+
+        TensorSnapshot pytorch_snap(pytorch_meta, pytorch_snapshot.data.data(), pytorch_snapshot.data.size());
+
+        // Compare with adaptive tolerances based on quantization
+        float max_abs_tolerance = 1e-3f; // Relaxed for Q4_0
+        double rel_l2_tolerance = 1e-2;  // Relaxed for Q4_0
+
+        // Tighter tolerances for early stages
+        if (stage_name == "EMBEDDING" || stage_name.find("NORM") != std::string::npos)
+        {
+            max_abs_tolerance = 5e-3f;
+            rel_l2_tolerance = 5e-2;
+        }
+
+        ComparisonTolerance tolerance(max_abs_tolerance, rel_l2_tolerance);
+        auto result = SnapshotComparator::compare(pytorch_snap, llaminar_snapshot, tolerance);
+
+        std::cout << "[PYTORCH_PARITY] " << stage_name << "_" << layer_idx
+                  << ": max_abs=" << result.metrics.max_abs_diff
+                  << " rel_l2=" << result.metrics.rel_l2
+                  << " (tolerance: " << max_abs_tolerance << "/" << rel_l2_tolerance << ")";
+
+        if (result.passed())
+        {
+            std::cout << " ✓ PASS" << std::endl;
+            passed++;
+        }
+        else
+        {
+            std::cout << " ✗ FAIL" << std::endl;
+            failed++;
+
+            // Log top differences for failed stages
+            std::cout << "  Top 5 differences:" << std::endl;
+            SnapshotComparator::log_top_differences(
+                pytorch_snapshot.data, llaminar_snapshot.data,
+                pytorch_meta.feature_dim, 5, stage_name.c_str());
+        }
+    }
+
+    if (rank == 0)
+    {
+        std::cout << "\n[PYTORCH_PARITY] Summary: "
+                  << passed << " passed, "
+                  << failed << " failed, "
+                  << missing << " missing" << std::endl;
+
+        // Overall test assertion
+        EXPECT_EQ(failed, 0) << "Some PyTorch parity checks failed";
+        EXPECT_GT(passed, 0) << "No successful parity comparisons";
     }
 }
 

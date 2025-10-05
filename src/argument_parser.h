@@ -48,6 +48,9 @@ struct LlaminarParams
     bool validate_results = false;
     bool kv_cache_stats = false; // --kv-stats : print KV cache capacity/usage summary at end
 
+    // Output parameters
+    std::string output_json_file = ""; // --output-json <file>: Write logits and tokens to JSON file
+
     // Help/version
     bool show_help = false;
     bool show_version = false;

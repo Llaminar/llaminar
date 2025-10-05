@@ -21,7 +21,7 @@ namespace llaminar
 
         // ==================== SnapshotRegistry Implementation ====================
 
-        SnapshotRegistry& SnapshotRegistry::instance()
+        SnapshotRegistry &SnapshotRegistry::instance()
         {
             static SnapshotRegistry registry;
             return registry;
@@ -32,17 +32,17 @@ namespace llaminar
             snapshots_.clear();
         }
 
-        void SnapshotRegistry::register_snapshot(const std::string& key, const TensorSnapshot& snapshot)
+        void SnapshotRegistry::register_snapshot(const std::string &key, const TensorSnapshot &snapshot)
         {
             snapshots_[key] = snapshot;
         }
 
-        bool SnapshotRegistry::has_snapshot(const std::string& key) const
+        bool SnapshotRegistry::has_snapshot(const std::string &key) const
         {
             return snapshots_.find(key) != snapshots_.end();
         }
 
-        bool SnapshotRegistry::get_snapshot(const std::string& key, TensorSnapshot& out_snapshot) const
+        bool SnapshotRegistry::get_snapshot(const std::string &key, TensorSnapshot &out_snapshot) const
         {
             auto it = snapshots_.find(key);
             if (it != snapshots_.end())
@@ -57,19 +57,19 @@ namespace llaminar
         {
             std::vector<std::string> keys;
             keys.reserve(snapshots_.size());
-            for (const auto& pair : snapshots_)
+            for (const auto &pair : snapshots_)
             {
                 keys.push_back(pair.first);
             }
             return keys;
         }
 
-        std::string SnapshotRegistry::make_key(const std::string& source, PipelineStage stage, int layer) const
+        std::string SnapshotRegistry::make_key(const std::string &source, PipelineStage stage, int layer) const
         {
-            return make_key(source, stage_to_string(stage), layer);
+            return make_key(source, llaminar::stage_to_string(stage), layer);
         }
 
-        std::string SnapshotRegistry::make_key(const std::string& source, const std::string& stage_name, int layer) const
+        std::string SnapshotRegistry::make_key(const std::string &source, const std::string &stage_name, int layer) const
         {
             std::ostringstream oss;
             oss << source;
@@ -84,9 +84,9 @@ namespace llaminar
         // ==================== SnapshotComparator Implementation ====================
 
         ComparisonResult SnapshotComparator::compare(
-            const TensorSnapshot& expected,
-            const TensorSnapshot& actual,
-            const ComparisonTolerance& tolerance)
+            const TensorSnapshot &expected,
+            const TensorSnapshot &actual,
+            const ComparisonTolerance &tolerance)
         {
             ComparisonResult result;
             result.stage_name = expected.metadata.stage_name;
@@ -132,11 +132,11 @@ namespace llaminar
         }
 
         ComparisonMetrics SnapshotComparator::compute_metrics(
-            const std::vector<float>& expected,
-            const std::vector<float>& actual)
+            const std::vector<float> &expected,
+            const std::vector<float> &actual)
         {
             ComparisonMetrics metrics;
-            
+
             if (expected.size() != actual.size() || expected.empty())
             {
                 return metrics;
@@ -167,7 +167,7 @@ namespace llaminar
             }
 
             metrics.mean_abs_diff = static_cast<float>(sum_abs_diff / expected.size());
-            
+
             if (sum_sq_ref > 0.0)
             {
                 metrics.rel_l2 = std::sqrt(sum_sq_diff) / std::sqrt(sum_sq_ref);
@@ -181,11 +181,11 @@ namespace llaminar
         }
 
         void SnapshotComparator::log_top_differences(
-            const std::vector<float>& expected,
-            const std::vector<float>& actual,
+            const std::vector<float> &expected,
+            const std::vector<float> &actual,
             int cols,
             int top_k,
-            const std::string& label)
+            const std::string &label)
         {
             if (expected.size() != actual.size() || expected.empty() || cols <= 0 || top_k <= 0)
             {
@@ -200,13 +200,14 @@ namespace llaminar
                 float actual_val;
             };
 
-            auto cmp = [](const DiffEntry& a, const DiffEntry& b) { return a.diff > b.diff; };
+            auto cmp = [](const DiffEntry &a, const DiffEntry &b)
+            { return a.diff > b.diff; };
             std::priority_queue<DiffEntry, std::vector<DiffEntry>, decltype(cmp)> min_heap(cmp);
 
             for (size_t i = 0; i < expected.size(); ++i)
             {
                 float diff = std::fabs(actual[i] - expected[i]);
-                
+
                 if (min_heap.size() < static_cast<size_t>(top_k))
                 {
                     min_heap.push({i, diff, expected[i], actual[i]});
@@ -227,7 +228,7 @@ namespace llaminar
             std::reverse(top_diffs.begin(), top_diffs.end());
 
             std::cout << "[PARITY_TOP_DIFF] " << label << " top_k=" << top_k << std::endl;
-            for (const auto& entry : top_diffs)
+            for (const auto &entry : top_diffs)
             {
                 size_t row = entry.index / static_cast<size_t>(cols);
                 size_t col = entry.index % static_cast<size_t>(cols);
@@ -242,17 +243,17 @@ namespace llaminar
         void LlaminarSnapshotHook::capture(
             PipelineStage stage,
             int layer_index,
-            const float* data,
+            const float *data,
             int seq_len,
             int feature_dim)
         {
-            capture(stage_to_string(stage), layer_index, data, seq_len, feature_dim);
+            capture(llaminar::stage_to_string(stage), layer_index, data, seq_len, feature_dim);
         }
 
         void LlaminarSnapshotHook::capture(
-            const std::string& stage_name,
+            const std::string &stage_name,
             int layer_index,
-            const float* data,
+            const float *data,
             int seq_len,
             int feature_dim)
         {
@@ -263,7 +264,7 @@ namespace llaminar
 
             SnapshotMetadata meta;
             meta.stage_name = stage_name;
-            meta.stage = string_to_stage(stage_name);
+            meta.stage = llaminar::string_to_stage(stage_name);
             meta.layer_index = layer_index;
             meta.seq_len = seq_len;
             meta.feature_dim = feature_dim;
@@ -272,7 +273,7 @@ namespace llaminar
             size_t count = static_cast<size_t>(seq_len) * static_cast<size_t>(feature_dim);
             TensorSnapshot snapshot(meta, data, count);
 
-            auto& registry = SnapshotRegistry::instance();
+            auto &registry = SnapshotRegistry::instance();
             std::string key = registry.make_key("llaminar", stage_name, layer_index);
             registry.register_snapshot(key, snapshot);
         }
@@ -288,54 +289,9 @@ namespace llaminar
         }
 
         // ==================== Utility Functions ====================
-
-        std::string stage_to_string(PipelineStage stage)
-        {
-            switch (stage)
-            {
-                case PipelineStage::EMBEDDING: return "embedding";
-                case PipelineStage::ATTENTION_NORM: return "attention_norm";
-                case PipelineStage::QKV_PROJECTION: return "qkv_projection";
-                case PipelineStage::ROPE_APPLICATION: return "rope";
-                case PipelineStage::ATTENTION_SCORES: return "attention_scores";
-                case PipelineStage::ATTENTION_SOFTMAX: return "attention_softmax";
-                case PipelineStage::ATTENTION_CONTEXT: return "attention_context";
-                case PipelineStage::ATTENTION_OUTPUT: return "attention_output";
-                case PipelineStage::ATTENTION_RESIDUAL: return "attention_residual";
-                case PipelineStage::FFN_NORM: return "ffn_norm";
-                case PipelineStage::FFN_GATE: return "ffn_gate";
-                case PipelineStage::FFN_UP: return "ffn_up";
-                case PipelineStage::FFN_SWIGLU: return "ffn_swiglu";
-                case PipelineStage::FFN_DOWN: return "ffn_down";
-                case PipelineStage::FFN_RESIDUAL: return "ffn_residual";
-                case PipelineStage::FINAL_NORM: return "final_norm";
-                case PipelineStage::LM_HEAD: return "lm_head";
-                case PipelineStage::CUSTOM: return "custom";
-                default: return "unknown";
-            }
-        }
-
-        PipelineStage string_to_stage(const std::string& str)
-        {
-            if (str == "embedding") return PipelineStage::EMBEDDING;
-            if (str == "attention_norm") return PipelineStage::ATTENTION_NORM;
-            if (str == "qkv_projection") return PipelineStage::QKV_PROJECTION;
-            if (str == "rope") return PipelineStage::ROPE_APPLICATION;
-            if (str == "attention_scores") return PipelineStage::ATTENTION_SCORES;
-            if (str == "attention_softmax") return PipelineStage::ATTENTION_SOFTMAX;
-            if (str == "attention_context") return PipelineStage::ATTENTION_CONTEXT;
-            if (str == "attention_output") return PipelineStage::ATTENTION_OUTPUT;
-            if (str == "attention_residual") return PipelineStage::ATTENTION_RESIDUAL;
-            if (str == "ffn_norm") return PipelineStage::FFN_NORM;
-            if (str == "ffn_gate") return PipelineStage::FFN_GATE;
-            if (str == "ffn_up") return PipelineStage::FFN_UP;
-            if (str == "ffn_swiglu") return PipelineStage::FFN_SWIGLU;
-            if (str == "ffn_down") return PipelineStage::FFN_DOWN;
-            if (str == "ffn_residual") return PipelineStage::FFN_RESIDUAL;
-            if (str == "final_norm") return PipelineStage::FINAL_NORM;
-            if (str == "lm_head") return PipelineStage::LM_HEAD;
-            return PipelineStage::CUSTOM;
-        }
+        // Note: stage_to_string() and string_to_stage() are now provided by
+        // the core pipeline_stages.h header (inline functions in llaminar namespace).
+        // We removed the duplicate implementations from this file.
 
     } // namespace parity
 } // namespace llaminar

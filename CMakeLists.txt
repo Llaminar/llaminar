@@ -132,6 +132,7 @@ add_subdirectory(llama.cpp)
 set(LLAMINAR_CORE_SOURCES
     src/common.cpp
     src/argument_parser.cpp
+    src/json_export.cpp
     src/topology_manager.cpp
     src/mpi_kernel_base.cpp
     src/cosma_prefill_manager.cpp
@@ -149,6 +150,7 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/common/softmax_core.cpp
     src/qwen_pipeline.cpp
     src/pipeline_base.cpp
+    src/parity_hooks.cpp
     src/backend_selector.cpp
     src/matmul_backend_selection.cpp
     src/large_matmul_plan.cpp

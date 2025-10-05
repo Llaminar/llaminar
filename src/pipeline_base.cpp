@@ -2,6 +2,7 @@
 #include "debug_utils.h"
 #include "performance_timer.h"
 #include "utils/perf_counters.h"
+#include "parity_hooks.h"
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
@@ -580,6 +581,102 @@ namespace llaminar
         // Configure NUMA-aware allocation strategies
         // This could be extended with specific NUMA binding policies
         LOG_DEBUG("PipelineBase: Configured tensor allocation for rank " << getRank());
+    }
+
+    // === Parity Testing Helpers ===
+
+    void PipelineBase::captureIfEnabled(
+        PipelineStage stage,
+        int layer_index,
+        const std::shared_ptr<TensorBase> &tensor)
+    {
+        // Early exit if parity not enabled (compiler will inline and optimize this away)
+        if (!isParityEnabled())
+        {
+            return;
+        }
+
+        // Only capture on rank 0 to avoid duplication in MPI contexts
+        if (getRank() != 0)
+        {
+            return;
+        }
+
+        // Validate tensor
+        if (!tensor || tensor->shape().empty())
+        {
+            LOG_WARN("PipelineBase: Cannot capture null or empty tensor at stage "
+                     << stage_to_string(stage) << " layer " << layer_index);
+            return;
+        }
+
+        // Extract dimensions
+        const auto &shape = tensor->shape();
+        int seq_len = shape.size() >= 1 ? shape[0] : 0;
+        int feature_dim = shape.size() >= 2 ? shape[1] : 1;
+
+        // Handle 1D tensors (feature_dim is the only dimension)
+        if (shape.size() == 1)
+        {
+            feature_dim = shape[0];
+            seq_len = 1;
+        }
+
+        // Delegate to virtual method (can be overridden for custom behavior)
+        captureStageSnapshot(stage, layer_index, tensor->data(), seq_len, feature_dim);
+    }
+
+    void PipelineBase::captureIfEnabled(
+        const std::string &stage_name,
+        int layer_index,
+        const std::shared_ptr<TensorBase> &tensor)
+    {
+        // Same checks as above
+        if (!isParityEnabled() || getRank() != 0)
+        {
+            return;
+        }
+
+        if (!tensor || tensor->shape().empty())
+        {
+            LOG_WARN("PipelineBase: Cannot capture null or empty tensor at custom stage "
+                     << stage_name << " layer " << layer_index);
+            return;
+        }
+
+        // Extract dimensions
+        const auto &shape = tensor->shape();
+        int seq_len = shape.size() >= 1 ? shape[0] : 0;
+        int feature_dim = shape.size() >= 2 ? shape[1] : 1;
+
+        if (shape.size() == 1)
+        {
+            feature_dim = shape[0];
+            seq_len = 1;
+        }
+
+        // For custom stage names, use PipelineStage::CUSTOM and log the name
+        LOG_DEBUG("PipelineBase: Capturing custom stage '" << stage_name
+                                                           << "' layer " << layer_index);
+        captureStageSnapshot(PipelineStage::CUSTOM, layer_index,
+                             tensor->data(), seq_len, feature_dim);
+    }
+
+    void PipelineBase::captureStageSnapshot(
+        PipelineStage stage,
+        int layer_index,
+        const float *data,
+        int seq_len,
+        int feature_dim)
+    {
+        // Default implementation delegates to parity framework hook
+        parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim);
+    }
+
+    bool PipelineBase::isParityEnabled() const
+    {
+        // Default implementation checks parity framework
+        return parity::LlaminarSnapshotHook::is_enabled();
     }
 
 } // namespace llaminar

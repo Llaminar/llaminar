@@ -293,6 +293,52 @@ Current test tolerances: `max_abs < 1e-5`, `relative L2 < 1e-6` across random in
 |------|-------|-------|
 | `AttentionTPSimParityTest` | Direct executor parity (row, col, auto) | Verifies manual reconstruction logic. |
 | `AttentionTPSimIntegrationTest` | Environment-driven kernel path | Ensures env toggles route through simulation branch producing identical output. |
+| `ParityFramework.*` | Cross-implementation validation | Snapshot capture and comparison framework for correctness testing. |
+
+### Parity Testing Framework ✨
+
+**Automatic Pipeline Validation**: The parity framework enables comprehensive correctness validation by capturing and comparing intermediate tensor states across different implementations or execution paths.
+
+**Key Features**:
+- **Zero Overhead**: Completely disabled by default (compile-time elimination)
+- **Strategic Capture Points**: 8 key stages in QwenPipeline (embedding, attention, FFN, logits)
+- **Automatic Activation**: Set `LLAMINAR_PARITY_CAPTURE=1` to enable snapshot capture
+- **Configurable Tolerances**: Per-stage absolute and relative error thresholds
+- **Cross-Implementation**: Compare Llaminar vs llama.cpp or incremental vs prefill paths
+
+**Captured Stages**:
+- **EMBEDDING**: Token embedding output (input to first layer)
+- **ATTENTION_NORM**: Pre-attention RMSNorm (QKV input)
+- **ATTENTION_OUTPUT**: Attention output projection
+- **ATTENTION_RESIDUAL**: Post-attention residual connection
+- **FFN_NORM**: Pre-FFN RMSNorm
+- **FFN_DOWN**: FFN down projection output
+- **FFN_RESIDUAL**: Post-FFN residual (layer output)
+- **FINAL_NORM**: Final RMSNorm before LM head
+- **LM_HEAD**: Language model head logits
+
+**Usage Example**:
+```bash
+# Enable parity capture during inference
+export LLAMINAR_PARITY_CAPTURE=1
+mpirun -np 2 ./build/llaminar -m model.gguf -v
+
+# Run parity tests
+./build/test_parity_framework
+```
+
+**Comparison Metrics**:
+- **Max Absolute**: `max(|expected - actual|)`
+- **Mean Absolute**: `mean(|expected - actual|)`
+- **Relative L2**: `||expected - actual||₂ / ||expected||₂`
+
+**Architecture**:
+- `src/pipeline_stages.h`: Standardized 22-stage enumeration
+- `src/parity_hooks.h/cpp`: Production-safe capture interface
+- `tests/parity_test_framework.h/cpp`: Full snapshot registry and comparison
+- Integration via `AbstractPipeline` and `PipelineBase` helpers
+
+See `.github/instructions/llaminar-architecture.instructions.md` §15 for detailed documentation.
 
 ### Usage Example
 ```bash

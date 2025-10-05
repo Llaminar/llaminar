@@ -2,6 +2,8 @@
 
 #include "mpi_kernel_base.h"
 #include "tensors/tensor_factory.h"
+#include "pipeline_stages.h"
+#include "abstract_pipeline.h"
 #include <unordered_map>
 #include <string>
 #include <memory>
@@ -241,6 +243,81 @@ namespace llaminar
         void logExecutionStats(const std::string &operation_name,
                                double execution_time_ms,
                                const std::vector<std::vector<size_t>> &tensor_shapes);
+
+        // === Parity Testing Helpers ===
+
+        /**
+         * @brief Capture tensor snapshot if parity testing is enabled
+         *
+         * Convenience method that handles:
+         * - Checking if parity is enabled (early exit if not)
+         * - Filtering to rank 0 only (avoids MPI duplication)
+         * - Extracting tensor shape dimensions
+         * - Delegating to captureStageSnapshot()
+         *
+         * @param stage Pipeline stage identifier
+         * @param layer_index Layer index (-1 for non-layer stages)
+         * @param tensor Tensor to capture
+         *
+         * Usage example:
+         * @code
+         *   auto embedding_output = embedKernel->execute(tokens);
+         *   captureIfEnabled(PipelineStage::EMBEDDING, -1, embedding_output);
+         * @endcode
+         */
+        void captureIfEnabled(
+            PipelineStage stage,
+            int layer_index,
+            const std::shared_ptr<TensorBase> &tensor);
+
+        /**
+         * @brief Capture tensor snapshot with custom stage name
+         *
+         * Overload for custom or architecture-specific stages that don't
+         * map to the standard PipelineStage enum.
+         *
+         * @param stage_name Custom stage name (for logging/comparison)
+         * @param layer_index Layer index (-1 for non-layer stages)
+         * @param tensor Tensor to capture
+         */
+        void captureIfEnabled(
+            const std::string &stage_name,
+            int layer_index,
+            const std::shared_ptr<TensorBase> &tensor);
+
+        /**
+         * @brief Default implementation of parity snapshot capture
+         *
+         * Pipelines can override this to provide custom capture logic.
+         * The default implementation delegates to parity::LlaminarSnapshotHook.
+         *
+         * @param stage Pipeline stage
+         * @param layer_index Layer index
+         * @param data Tensor data pointer
+         * @param seq_len Sequence length
+         * @param feature_dim Feature dimension
+         *
+         * @note This is virtual so derived classes that inherit from both
+         *       PipelineBase and AbstractPipeline can provide one implementation
+         */
+        virtual void captureStageSnapshot(
+            PipelineStage stage,
+            int layer_index,
+            const float *data,
+            int seq_len,
+            int feature_dim);
+
+        /**
+         * @brief Check if parity testing is enabled
+         *
+         * Default implementation checks parity::LlaminarSnapshotHook::is_enabled().
+         *
+         * @return true if parity capture is enabled
+         *
+         * @note This is virtual so derived classes that inherit from both
+         *       PipelineBase and AbstractPipeline can provide one implementation
+         */
+        virtual bool isParityEnabled() const;
 
     private:
         // Kernel registry

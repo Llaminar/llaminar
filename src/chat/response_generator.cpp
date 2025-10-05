@@ -1,6 +1,7 @@
 #include "response_generator.h"
 #include "../logger.h"
 #include "../tensors/tensor_factory.h"
+#include "../json_export.h"
 #include <algorithm>
 #include <random>
 #include <numeric>
@@ -71,6 +72,14 @@ namespace llaminar
                 std::string response_text;
                 std::vector<int32_t> current_sequence = prompt_tokens;
 
+                // For JSON export if requested
+                GenerationData export_data;
+                bool should_export = !params_.output_json_file.empty();
+                if (should_export)
+                {
+                    export_data.prompt_tokens = prompt_tokens;
+                }
+
                 if (!prefilled_)
                 {
                     if (!ensureWeights())
@@ -94,6 +103,12 @@ namespace llaminar
                     }
                     std::vector<float> logits = fetchLastLogitsRow(latest_logits);
 
+                    // Store logits for JSON export if requested
+                    if (should_export)
+                    {
+                        export_data.logits.push_back(logits);
+                    }
+
                     // Sample next token
                     int32_t next_token = sampleToken(logits);
 
@@ -113,6 +128,12 @@ namespace llaminar
 
                     generated_tokens.push_back(next_token);
                     current_sequence.push_back(next_token);
+
+                    // Store generated token for export
+                    if (should_export)
+                    {
+                        export_data.generated_tokens.push_back(next_token);
+                    }
 
                     // Prepare logits for next iteration (unless stopping this iteration)
                     if (!shouldStop(current_sequence, response_text))
@@ -160,6 +181,20 @@ namespace llaminar
                 }
 
                 LOG_INFO("Response generation completed. Generated " << generated_tokens.size() << " tokens");
+
+                // Export to JSON if requested
+                if (should_export)
+                {
+                    if (exportToJson(params_.output_json_file, export_data))
+                    {
+                        LOG_INFO("Generation data exported to " << params_.output_json_file);
+                    }
+                    else
+                    {
+                        LOG_ERROR("Failed to export generation data to " << params_.output_json_file);
+                    }
+                }
+
                 return response_text;
             }
             catch (const std::exception &e)

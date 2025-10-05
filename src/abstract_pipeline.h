@@ -7,6 +7,7 @@
 
 #include "transformer_config.h"
 #include "tensors/tensor_base.h"
+#include "pipeline_stages.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -93,6 +94,49 @@ namespace llaminar
         // KV cache management (optional – implementations without KV caching may return nullptr / false)
         virtual const KVCacheState *kvCacheState() const { return nullptr; }
         virtual bool ensureKVCapacity(int /*required_tokens*/) { return true; }
+
+        // === Parity Testing and Instrumentation ===
+
+        /**
+         * @brief Capture a snapshot of intermediate pipeline state for parity testing
+         *
+         * This is an optional hook that pipelines can implement to enable snapshot capture
+         * for comparison with reference implementations (e.g., llama.cpp). The default
+         * implementation is a no-op, ensuring zero overhead when parity testing is disabled.
+         *
+         * @param stage Pipeline stage identifier
+         * @param layer_index Layer index (-1 for non-layer stages like embedding, final norm)
+         * @param data Pointer to tensor data (float array)
+         * @param seq_len Sequence length dimension
+         * @param feature_dim Feature dimension (hidden size, vocab size, etc.)
+         *
+         * @note Implementations should check isParityEnabled() before performing work
+         * @note Typically only rank 0 should capture to avoid duplication in MPI contexts
+         */
+        virtual void captureStageSnapshot(
+            PipelineStage stage,
+            int layer_index,
+            const float *data,
+            int seq_len,
+            int feature_dim)
+        {
+            // Default no-op - override to enable parity capture
+            (void)stage;
+            (void)layer_index;
+            (void)data;
+            (void)seq_len;
+            (void)feature_dim;
+        }
+
+        /**
+         * @brief Check if parity testing/snapshot capture is enabled
+         *
+         * @return true if snapshots should be captured, false otherwise
+         *
+         * Default implementation returns false. Concrete pipelines can override to
+         * check environment variables or configuration flags.
+         */
+        virtual bool isParityEnabled() const { return false; }
     };
 
     /**
