@@ -18,6 +18,7 @@
 #include "pipeline_stages.h" // Core PipelineStage enum from src/
 #include <string>
 #include <vector>
+#include <map>
 #include <unordered_map>
 #include <memory>
 #include <functional>
@@ -213,6 +214,90 @@ namespace llaminar
 
         private:
             static bool enabled_;
+        };
+
+        /**
+         * @brief Load PyTorch reference snapshots from NPZ file for comparison
+         *
+         * This class extends the parity framework to support loading reference
+         * snapshots captured from PyTorch models. The NPZ file should contain
+         * layer outputs with keys matching the naming convention.
+         */
+        class PytorchSnapshotLoader
+        {
+        public:
+            /**
+             * @brief Load PyTorch snapshots from NPZ file into registry
+             *
+             * @param filepath Path to NPZ file containing PyTorch captures
+             * @param source_name Source identifier (default: "pytorch")
+             * @return Number of snapshots loaded
+             */
+            static size_t load_from_npz(const std::string &filepath,
+                                        const std::string &source_name = "pytorch");
+
+            /**
+             * @brief Parse layer information from snapshot key
+             *
+             * Extracts layer index and stage name from keys like:
+             * - "layer_0_attn_out" -> layer=0, stage="attn_out"
+             * - "layer_5_ffn_out" -> layer=5, stage="ffn_out"
+             * - "embeddings" -> layer=-1, stage="embeddings"
+             *
+             * @param key Snapshot key from NPZ
+             * @param layer_index Output: extracted layer index (-1 for non-layer)
+             * @param stage_name Output: extracted stage name
+             * @return true if parsing succeeded
+             */
+            static bool parse_key(const std::string &key,
+                                  int &layer_index,
+                                  std::string &stage_name);
+        };
+
+        /**
+         * @brief Automated layer-by-layer comparison between implementations
+         *
+         * Compares corresponding snapshots from different sources (e.g., Llaminar vs PyTorch)
+         * and generates a detailed report of differences.
+         */
+        class LayerByLayerComparator
+        {
+        public:
+            /**
+             * @brief Compare all matching snapshots between two sources
+             *
+             * @param source1 First source name (e.g., "llaminar")
+             * @param source2 Second source name (e.g., "pytorch")
+             * @param tolerance Comparison tolerances
+             * @return Map of layer keys to comparison results
+             */
+            static std::map<std::string, ComparisonResult> compare_all(
+                const std::string &source1,
+                const std::string &source2,
+                const ComparisonTolerance &tolerance = ComparisonTolerance());
+
+            /**
+             * @brief Find first layer with divergence above tolerance
+             *
+             * @param source1 First source name
+             * @param source2 Second source name
+             * @param tolerance Comparison tolerances
+             * @return Key of first diverging layer (empty if all match)
+             */
+            static std::string find_first_divergence(
+                const std::string &source1,
+                const std::string &source2,
+                const ComparisonTolerance &tolerance = ComparisonTolerance());
+
+            /**
+             * @brief Print comparison report to stdout
+             *
+             * @param results Map of comparison results
+             * @param verbose Print all layers or only failures
+             */
+            static void print_report(
+                const std::map<std::string, ComparisonResult> &results,
+                bool verbose = false);
         };
 
         // Note: stage_to_string() and string_to_stage() utilities are provided

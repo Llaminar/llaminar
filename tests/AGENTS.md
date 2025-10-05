@@ -861,6 +861,396 @@ When adding parity testing to a new component:
 
 ---
 
+### 15. Layer-by-Layer PyTorch Comparison via NPZ Loading 🔬
+
+**Status**: ✅ **Fully Implemented** (October 2025)
+
+The `CompareLlaminarVsPytorch` test enables systematic layer-by-layer comparison between Llaminar and PyTorch reference implementations by loading PyTorch snapshots from NPZ archives.
+
+#### Overview
+
+**Purpose**: Identify the **first diverging layer** between Llaminar and PyTorch to pinpoint bugs, quantization errors, or numerical drift.
+
+**Key Components**:
+- **NPZ Loader** (`tests/npz_loader.h`) - Header-only .npy file parser
+- **PyTorch Snapshot Integration** (`tests/parity_test_framework.cpp::PytorchSnapshotLoader`)
+- **Test** (`tests/test_layer_by_layer_parity.cpp::CompareLlaminarVsPytorch`)
+- **Python Capture Script** (`python/reference/capture_pytorch_layers.py`)
+
+**Implementation**: Fully functional NPZ→.npy extraction and loading pipeline with automatic snapshot registration.
+
+#### How It Works
+
+```
+┌──────────────────────────────────────────┐
+│    Python: capture_pytorch_layers.py     │
+│  Captures PyTorch layer outputs to NPZ   │
+└─────────────┬────────────────────────────┘
+              │
+              │ exports pytorch_layer_captures.npz
+              │ Keys: embeddings, layer_0_attn_out, layer_0_ffn_out, ...
+              ▼
+      ┌─────────────────────┐
+      │  NPZ Archive (ZIP)  │
+      │  ├─ embeddings.npy  │
+      │  ├─ layer_0_*.npy   │
+      │  └─ ...             │
+      └─────────┬───────────┘
+                │
+                │ PytorchSnapshotLoader::load_from_npz()
+                │  1. Extract to /tmp/pytorch_npz_extract_<pid>
+                │  2. Load each .npy with NpzLoader::load_npy()
+                │  3. Parse keys (layer_N_stage → layer, stage)
+                │  4. Convert to TensorSnapshot
+                │  5. Register in SnapshotRegistry
+                │
+                ▼
+      ┌──────────────────────┐
+      │  SnapshotRegistry    │
+      │  (In-Memory Store)   │
+      │  ├─ pytorch:*        │ ← PyTorch snapshots
+      │  └─ llaminar:*       │ ← Llaminar snapshots
+      └──────────┬───────────┘
+                 │
+                 │ LayerByLayerComparator::compare_all()
+                 │
+                 ▼
+      ┌──────────────────────────┐
+      │  Comparison Report       │
+      │  - Per-layer metrics     │
+      │  - First divergence      │
+      │  - Detailed diagnostics  │
+      └──────────────────────────┘
+```
+
+#### Quick Start (3 Steps)
+
+**Step 1: Capture PyTorch Reference**
+
+```bash
+# Generate PyTorch layer outputs for specific tokens
+python3 python/reference/capture_pytorch_layers.py \
+  -m models/qwen2.5-0.5b-instruct-q4_0.gguf \
+  --tokens 1639 266 285 17 10 17 30 \
+  --output pytorch_layer_captures.npz
+
+# This creates NPZ with keys like:
+#   embeddings.npy
+#   layer_0_attn_out.npy
+#   layer_0_ffn_out.npy
+#   ...
+#   final_norm_out.npy
+#   logits.npy
+```
+
+**Step 2: Capture Llaminar Snapshots**
+
+```bash
+# Enable Llaminar snapshot capture
+export LLAMINAR_PARITY_CAPTURE=1
+
+# Run Llaminar with SAME tokens (critical for comparison!)
+./build/llaminar -m models/qwen2.5-0.5b-instruct-q4_0.gguf \
+  --tokens 1639,266,285,17,10,17,30
+
+# Snapshots are automatically captured via PipelineSnapshotManager
+# QwenPipeline has 9 instrumentation points
+```
+
+**Step 3: Run Comparison Test**
+
+```bash
+# Ensure NPZ file is in test directory or use absolute path
+cp pytorch_layer_captures.npz /workspaces/llaminar/
+
+# Enable the test (remove DISABLED_ prefix in test_layer_by_layer_parity.cpp)
+# Then run:
+./build/test_layer_by_layer_parity \
+  --gtest_filter="*CompareLlaminarVsPytorch"
+```
+
+#### Expected Output
+
+**Success (No Divergence)**:
+```
+Loading PyTorch snapshots from: pytorch_layer_captures.npz
+Found 50 .npy files in NPZ
+Loaded 50 PyTorch snapshots
+
+Comparing layers:
+  ✓ embeddings: max_abs=0.0001, rel_l2=0.00001
+  ✓ layer_0_attn_out: max_abs=0.05, rel_l2=0.001
+  ✓ layer_0_ffn_out: max_abs=0.08, rel_l2=0.002
+  ...
+  ✓ logits: max_abs=0.1, rel_l2=0.01
+
+✓ All layers match within tolerance!
+```
+
+**Divergence Detected**:
+```
+Comparing layers:
+  ✓ embeddings: max_abs=0.0001, rel_l2=0.00001
+  ✓ layer_0_attn_out: max_abs=0.05, rel_l2=0.001
+  ✗ layer_0_ffn_out: max_abs=12.5, rel_l2=0.45 [FAILED]
+  ...
+
+🔍 FIRST DIVERGING LAYER: layer_0_ffn_out
+
+Test failed: Divergence detected at layer: layer_0_ffn_out
+```
+
+#### Key Naming Conventions
+
+**PyTorch Keys** (from Python export):
+- `embeddings` → Token embeddings
+- `layer_N_attn_in` → Attention input (after input norm)
+- `layer_N_attn_out` → Attention output (before residual)
+- `layer_N_ffn_in` → FFN input (after post-attention norm)
+- `layer_N_ffn_out` → FFN output (before residual)
+- `layer_N_layer_out` → Layer output (after both residuals)
+- `final_norm_out` → Final layer norm output
+- `logits` → Final logits
+
+**Llaminar Keys** (SnapshotRegistry format):
+- `llaminar:embeddings:-1`
+- `llaminar:attn_out:0`
+- `llaminar:ffn_out:0`
+- etc.
+
+**Mapping**: The `PytorchSnapshotLoader::parse_key()` function translates:
+- `layer_0_attn_out` → layer=0, stage="attn_out"
+- `embeddings` → layer=-1, stage="embeddings"
+
+#### Comparison Tolerances
+
+Default tolerances in the test:
+
+```cpp
+ComparisonTolerance tolerance;
+tolerance.max_abs = 0.1f;   // Maximum absolute difference
+tolerance.rel_l2 = 0.01f;   // 1% relative L2 error
+```
+
+**Recommended Tolerances by Model Type**:
+
+| Model Precision | max_abs | rel_l2 | Notes |
+|-----------------|---------|--------|-------|
+| FP32 (PyTorch) | 1e-4 | 1e-5 | Numerical precision only |
+| Q6_K (6-bit) | 5e-3 | 1e-2 | High-quality quantization |
+| Q4_0 (4-bit) | 0.1 | 0.05 | Significant quantization loss |
+
+Adjust based on your quantization format and tolerance for numeric drift.
+
+#### Implementation Details
+
+**NPZ Loading** (`tests/parity_test_framework.cpp:296-418`):
+
+```cpp
+size_t PytorchSnapshotLoader::load_from_npz(const std::string &filepath,
+                                            const std::string &source_name) {
+    // 1. Extract NPZ (ZIP archive) to /tmp/pytorch_npz_extract_<pid>
+    std::string temp_dir = "/tmp/pytorch_npz_extract_" + std::to_string(getpid());
+    system(("mkdir -p " + temp_dir).c_str());
+    system(("unzip -q -o " + filepath + " -d " + temp_dir).c_str());
+    
+    // 2. List extracted .npy files
+    FILE *ls_pipe = popen(("ls " + temp_dir + "/*.npy").c_str(), "r");
+    // ... read file list ...
+    
+    // 3. Load each .npy file
+    for (const auto &npy_path : npy_files) {
+        NpyArray array;
+        NpzLoader::load_npy(npy_path, array);  // Uses npz_loader.h
+        
+        // 4. Parse key (e.g., "layer_0_attn_out" → layer=0, stage="attn_out")
+        int layer_index;
+        std::string stage_name;
+        parse_key(filename, layer_index, stage_name);
+        
+        // 5. Convert to TensorSnapshot
+        SnapshotMetadata metadata;
+        metadata.source = source_name;
+        metadata.layer_index = layer_index;
+        metadata.stage_name = stage_name;
+        // ... set dimensions from array.shape ...
+        
+        TensorSnapshot snapshot(metadata, array.data.data(), array.data.size());
+        
+        // 6. Register in SnapshotRegistry
+        std::string registry_key = registry.make_key(source_name, stage_name, layer_index);
+        registry.register_snapshot(registry_key, snapshot);
+    }
+    
+    // 7. Cleanup temp directory
+    system(("rm -rf " + temp_dir).c_str());
+    
+    return count;
+}
+```
+
+**Key Parsing** (supports multiple formats):
+
+```cpp
+bool PytorchSnapshotLoader::parse_key(const std::string &key,
+                                      int &layer_index,
+                                      std::string &stage_name) {
+    // Special keys
+    if (key == "embeddings") { layer_index = -1; stage_name = "embeddings"; return true; }
+    if (key == "final_norm_out") { layer_index = -1; stage_name = "final_norm_out"; return true; }
+    if (key == "logits") { layer_index = -1; stage_name = "logits"; return true; }
+    
+    // layer_N_stage format
+    if (key.substr(0, 6) == "layer_") {
+        // Extract "N" and "stage" from "layer_N_stage"
+        // ...
+    }
+    
+    return false;
+}
+```
+
+#### Troubleshooting
+
+**1. "Failed to extract NPZ file"**
+
+**Problem**: `unzip` command not found
+
+**Solution**:
+```bash
+# Install unzip
+apt-get install unzip  # Debian/Ubuntu
+
+# Or manually extract:
+python3 -c "import numpy as np; data=np.load('pytorch_layer_captures.npz'); \
+            [np.save(f'{k}.npy', v) for k,v in data.items()]"
+```
+
+**2. "No PyTorch snapshots loaded"**
+
+**Problem**: NPZ file path incorrect or empty
+
+**Solution**:
+```bash
+# Verify NPZ exists
+ls -lh pytorch_layer_captures.npz
+
+# Check contents
+python3 -c "import numpy as np; \
+            print(list(np.load('pytorch_layer_captures.npz').keys()))"
+
+# Use absolute path in test
+./build/test_layer_by_layer_parity \
+  --npz-path=/workspaces/llaminar/pytorch_layer_captures.npz
+```
+
+**3. "Llaminar snapshots not found"**
+
+**Problem**: Llaminar pipeline not instrumented or capture not enabled
+
+**Solution**:
+```bash
+# 1. Enable capture
+export LLAMINAR_PARITY_CAPTURE=1
+
+# 2. Verify environment
+./build/llaminar --print-env | grep PARITY
+
+# 3. Check SnapshotRegistry has captures
+# (Add debug logging to test to print registry.list_keys())
+```
+
+**4. Token Mismatch Between PyTorch and Llaminar**
+
+**Problem**: Comparing different token sequences → guaranteed divergence
+
+**Solution**:
+```bash
+# CRITICAL: Use SAME tokens for both!
+
+# PyTorch capture
+python3 python/reference/capture_pytorch_layers.py \
+  --tokens 1639,266,285,17,10,17,30 \
+  --output pytorch.npz
+
+# Llaminar capture (exact same tokens!)
+./build/llaminar --tokens 1639,266,285,17,10,17,30
+```
+
+#### Enabling the Test
+
+The test is currently **DISABLED** (prefix: `DISABLED_CompareLlaminarVsPytorch`).
+
+**To enable**:
+
+1. **Edit** `tests/test_layer_by_layer_parity.cpp`:
+   ```cpp
+   // Change from:
+   TEST_F(LayerByLayerParityTest, DISABLED_CompareLlaminarVsPytorch)
+   
+   // To:
+   TEST_F(LayerByLayerParityTest, CompareLlaminarVsPytorch)
+   ```
+
+2. **Rebuild**:
+   ```bash
+   cmake --build build --target test_layer_by_layer_parity --parallel
+   ```
+
+3. **Run**:
+   ```bash
+   ./build/test_layer_by_layer_parity --gtest_filter="*CompareLlaminarVsPytorch"
+   ```
+
+#### Dependencies
+
+**System Requirements**:
+- `unzip` command (for NPZ extraction)
+- Python 3.x with `numpy`, `torch`, `transformers` (for PyTorch capture)
+
+**C++ Dependencies** (all included):
+- `tests/npz_loader.h` - Header-only .npy parser (no external deps)
+- `tests/parity_test_framework.{h,cpp}` - Snapshot registry and comparison
+- `src/pipeline_snapshot_manager.{h,cpp}` - Llaminar capture infrastructure
+
+**No External Libraries**:
+- No `cnpy` library needed
+- No `zlib` needed (uses system `unzip`)
+- No `boost` needed
+
+#### Best Practices
+
+1. **Always use the same token sequence** for PyTorch and Llaminar
+2. **Capture PyTorch first** (slower, once per model/quantization)
+3. **Iterate on Llaminar** with capture enabled for debugging
+4. **Start with embeddings** - if this fails, check tensor transpose bug
+5. **Narrow down layer-by-layer** - binary search for divergence
+6. **Document tolerances** - explain why you chose specific thresholds
+7. **Test quantization progressively** - FP32 → Q6_K → Q4_0
+
+#### Future Enhancements
+
+**Planned**:
+- [ ] Pure C++ ZIP parsing (eliminate `unzip` dependency)
+- [ ] Streaming NPZ loading (handle very large files)
+- [ ] Automatic tolerance tuning based on quantization format
+- [ ] Visual diff reports (HTML with per-layer heatmaps)
+- [ ] CI/CD integration (automated regression testing)
+
+**Possible**:
+- [ ] GPU snapshot comparison (CUDA/ROCm kernels)
+- [ ] Multi-model support (LLaMA, Mistral, DeepSeek)
+- [ ] Differential testing (compare Llaminar commits)
+
+#### Related Documentation
+
+- **Full Guide**: `docs/ENABLING_PYTORCH_PARITY_TEST.md` (comprehensive)
+- **NPZ Loader**: `tests/npz_loader.h` (inline documentation)
+- **Python Script**: `python/reference/capture_pytorch_layers.py` (docstrings)
+- **Architecture**: `.github/instructions/llaminar-architecture.instructions.md` §15
+
+---
+
 root‑only sections
 4. Patterns for distributed numeric correctness tests
 5. Environment flag scoping and cleanup

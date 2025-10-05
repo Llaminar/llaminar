@@ -156,6 +156,7 @@ set(LLAMINAR_CORE_SOURCES
     src/large_matmul_plan.cpp
     src/prefill_diagnostics.cpp
     src/abstract_pipeline.cpp
+    src/pipeline_snapshot_manager.cpp
     src/qwen_pipeline_adapter.cpp
     src/llama_pipeline_adapter.cpp
     src/tensors/simple_tensor.cpp
@@ -1018,19 +1019,57 @@ if(GTEST_FOUND)
     target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
     add_llaminar_mpi_test(PrefillAttentionGoldenTest 2 test_prefill_attention_golden)
     
-    # Parity test framework for comparing Llaminar with llama.cpp at intermediate stages
-    add_executable(test_parity_framework 
-        tests/test_parity_framework.cpp 
-        tests/parity_test_framework.cpp 
-        $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_parity_framework PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
-    add_llaminar_mpi_test(ParityFrameworkTest 2 test_parity_framework)
-    
-    add_executable(test_tp_partition tests/test_tp_partition.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_tp_partition PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)
 
-    # Embedding orientation diagnostic test (non-MPI critical, rank 0 does work)
+# Parity test framework for comparing Llaminar with llama.cpp at intermediate stages
+add_executable(test_parity_framework 
+    tests/test_parity_framework.cpp 
+    tests/parity_test_framework.cpp 
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_parity_framework PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(ParityFrameworkTest 2 test_parity_framework)
+
+# Layer-by-layer parity test for comparing Llaminar with PyTorch reference
+add_executable(test_layer_by_layer_parity
+    tests/test_layer_by_layer_parity.cpp
+    tests/parity_test_framework.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_layer_by_layer_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(LayerByLayerParityTest 2 test_layer_by_layer_parity)
+
+# ============================================================================
+# Integration Test Framework
+# ============================================================================
+# Comprehensive model integration tests with PyTorch layer-by-layer parity
+# Tests both prefill and decode stages across multiple precisions
+
+# Base model integration test framework
+add_executable(test_qwen_integration
+    tests/integration/qwen_integration_test.cpp
+    tests/integration/model_integration_test_base.cpp
+    tests/parity_test_framework.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_include_directories(test_qwen_integration PRIVATE 
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/tests
+    ${CMAKE_SOURCE_DIR}/tests/integration)
+target_link_libraries(test_qwen_integration PRIVATE llaminar_core GTest::gtest MPI::MPI_CXX)
+
+# Register integration tests with CTest
+# These tests auto-skip if golden references are missing
+add_llaminar_mpi_test(QwenIntegrationTests 2 test_qwen_integration)
+set_tests_properties(QwenIntegrationTests PROPERTIES 
+    TIMEOUT 300
+    LABELS "integration;qwen;parity"
+    ENVIRONMENT "LLAMINAR_PARITY_CAPTURE=1"
+)
+
+# Note: Tests require golden references in tests/golden_references/
+# Generate with: python3 tests/integration/generate_golden_references.py --model qwen2.5-0.5b-instruct
+# ============================================================================
+
+add_executable(test_tp_partition tests/test_tp_partition.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_tp_partition PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orientation diagnostic test (non-MPI critical, rank 0 does work)
     add_executable(test_embedding_orientation tests/test_embedding_orientation.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_embedding_orientation PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
     target_include_directories(test_embedding_orientation PRIVATE ${CMAKE_SOURCE_DIR}/llama.cpp/src)

@@ -291,12 +291,25 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     MPI_Comm_size(MPI_COMM_WORLD, &world);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    // Find model file
-    std::string model_path = find_test_model();
-    if (rank == 0 && model_path.empty())
+    // Find model file (rank 0 only)
+    std::string model_path;
+    int should_skip = 0;
+
+    if (rank == 0)
+    {
+        model_path = find_test_model();
+        should_skip = model_path.empty() ? 1 : 0;
+    }
+
+    // Broadcast skip decision to all ranks
+    MPI_Bcast(&should_skip, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (should_skip)
     {
         GTEST_SKIP() << "No test model found in models/ directory";
     }
+
+    // Broadcast model path to all ranks
     broadcast_string(model_path, 0, MPI_COMM_WORLD);
 
     if (rank == 0)
@@ -534,19 +547,39 @@ TEST(ParityFramework, DistributedPipelineVsPyTorchReference)
     MPI_Comm_size(MPI_COMM_WORLD, &world);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    // Check for PyTorch snapshot directory
-    const char *snapshot_dir_env = std::getenv("PYTORCH_SNAPSHOT_DIR");
-    if (!snapshot_dir_env)
+    // Check for PyTorch snapshot directory (rank 0 only, then broadcast decision)
+    int should_skip = 0;
+
+    if (rank == 0)
+    {
+        const char *snapshot_dir_env = std::getenv("PYTORCH_SNAPSHOT_DIR");
+        const char *tokens_env = std::getenv("PYTORCH_SNAPSHOT_TOKENS");
+
+        if (!snapshot_dir_env)
+        {
+            should_skip = 1;
+        }
+        else if (!tokens_env)
+        {
+            should_skip = 2;
+        }
+    }
+
+    // Broadcast skip decision to all ranks
+    MPI_Bcast(&should_skip, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (should_skip == 1)
     {
         GTEST_SKIP() << "PYTORCH_SNAPSHOT_DIR not set. See test documentation for setup instructions.";
     }
-
-    // Check for token sequence
-    const char *tokens_env = std::getenv("PYTORCH_SNAPSHOT_TOKENS");
-    if (!tokens_env)
+    else if (should_skip == 2)
     {
-        GTEST_SKIP() << "PYTORCH_SNAPSHOT_TOKENS not set (e.g., export PYTORCH_SNAPSHOT_TOKENS=1,2,3,4,5)";
+        GTEST_SKIP() << "PYTORCH_SNAPSHOT_TOKENS not set. See test documentation for setup instructions.";
     }
+
+    // Now all ranks proceed - re-fetch environment variables on all ranks
+    const char *snapshot_dir_env = std::getenv("PYTORCH_SNAPSHOT_DIR");
+    const char *tokens_env = std::getenv("PYTORCH_SNAPSHOT_TOKENS");
 
     // Parse token sequence
     std::vector<int> token_ids;
@@ -557,17 +590,36 @@ TEST(ParityFramework, DistributedPipelineVsPyTorchReference)
         token_ids.push_back(std::stoi(token_str));
     }
 
-    if (token_ids.empty())
+    // Check for empty token sequence (rank 0 checks, broadcasts decision)
+    int tokens_empty = 0;
+    if (rank == 0)
+    {
+        tokens_empty = token_ids.empty() ? 1 : 0;
+    }
+    MPI_Bcast(&tokens_empty, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (tokens_empty)
     {
         GTEST_SKIP() << "PYTORCH_SNAPSHOT_TOKENS is empty";
     }
 
-    // Find model file
-    std::string model_path = find_test_model();
-    if (rank == 0 && model_path.empty())
+    // Find model file (rank 0 checks, broadcasts decision and path)
+    std::string model_path;
+    int model_not_found = 0;
+
+    if (rank == 0)
+    {
+        model_path = find_test_model();
+        model_not_found = model_path.empty() ? 1 : 0;
+    }
+
+    MPI_Bcast(&model_not_found, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (model_not_found)
     {
         GTEST_SKIP() << "No test model found in models/ directory";
     }
+
     broadcast_string(model_path, 0, MPI_COMM_WORLD);
 
     if (rank == 0)

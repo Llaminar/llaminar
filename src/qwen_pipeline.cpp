@@ -119,6 +119,54 @@ namespace llaminar
 
     // (logFFNRowPreviewIfEnabled and isFFNShardTracingEnabledFor moved to prefill_diagnostics.h/.cpp)
 
+    /**
+     * @brief Helper to capture pipeline stage snapshots for parity testing
+     *
+     * This inline helper bridges existing capture call sites to the new PipelineSnapshotManager
+     * infrastructure. Only active in debug builds when LLAMINAR_PARITY_CAPTURE=1.
+     *
+     * @param stage Pipeline stage being captured (e.g., EMBEDDING, ATTENTION_NORM)
+     * @param layer_idx Layer index (-1 for non-layer stages like embedding/final_norm)
+     * @param tensor Tensor to capture (must be valid with data allocated)
+     *
+     * @note Compile-time no-op in release builds (NDEBUG defined)
+     * @note Only rank 0 performs captures to avoid redundant storage
+     */
+    inline void QwenPipeline::captureIfEnabled(
+        PipelineStage stage,
+        int layer_idx,
+        const std::shared_ptr<TensorBase> &tensor)
+    {
+        // Early exit if parity capture not enabled (no-op in release builds)
+        if (!AbstractPipeline::isParityEnabled())
+            return;
+
+        // Only rank 0 captures to avoid redundant multi-rank snapshots
+        if (getRank() != 0)
+            return;
+
+        // Validate tensor before accessing
+        if (!tensor || !tensor->data())
+        {
+            LOG_WARN("captureIfEnabled: invalid tensor for stage " << static_cast<int>(stage));
+            return;
+        }
+
+        // Validate tensor has at least 2D shape (seq_len, feature_dim)
+        if (tensor->shape().size() < 2)
+        {
+            LOG_WARN("captureIfEnabled: tensor has insufficient dimensions for stage "
+                     << static_cast<int>(stage));
+            return;
+        }
+
+        int seq_len = tensor->shape()[0];
+        int feature_dim = tensor->shape()[1];
+
+        // Delegate to AbstractPipeline base class method which calls PipelineSnapshotManager
+        AbstractPipeline::captureStageSnapshot(stage, layer_idx, tensor->data(), seq_len, feature_dim);
+    }
+
     bool QwenPipeline::executeTransformerLayer(int layer_idx,
                                                std::shared_ptr<TensorBase> &input,
                                                const ModelWeights &weights,
@@ -965,6 +1013,9 @@ namespace llaminar
             LOG_ERROR("Embedding broadcast failed");
             return false;
         }
+
+        // Parity capture: embedding output
+        captureIfEnabled(PipelineStage::EMBEDDING, -1, embedded_output);
 
         // Optional row trace
         if (!debugEnv().embedding.trace_rows_spec.empty())

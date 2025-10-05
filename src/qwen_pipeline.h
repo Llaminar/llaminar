@@ -260,6 +260,21 @@ namespace llaminar
                                       const float *data,
                                       int seq_len,
                                       int feature_dim);
+
+        /**
+         * @brief Helper to capture pipeline stage snapshots for parity testing
+         *
+         * This inline helper bridges existing capture call sites to the PipelineSnapshotManager.
+         * Only active in debug builds when LLAMINAR_PARITY_CAPTURE=1.
+         *
+         * @param stage Pipeline stage being captured
+         * @param layer_idx Layer index (-1 for non-layer stages)
+         * @param tensor Tensor to capture
+         */
+        inline void captureIfEnabled(PipelineStage stage,
+                                     int layer_idx,
+                                     const std::shared_ptr<TensorBase> &tensor);
+
         struct PrefillAttentionTiming
         {
             double norm_ms{0.0};

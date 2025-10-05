@@ -22,6 +22,8 @@ out/
 *.dylib
 *.dll
 *.exe
+*.pyc
+*.npz
 
 # CMake generated files
 CMakeCache.txt

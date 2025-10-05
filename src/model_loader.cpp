@@ -901,6 +901,48 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
             dims[1] = static_cast<int>(inferred_cols);
         }
     }
+
+    // GGUF stores embedding matrices transposed: [d_model, vocab_size] instead of [vocab_size, d_model]
+    // We need to transpose the data and swap dimensions for embedding tensors
+    bool need_transpose = false;
+    LOG_INFO("[TRANSPOSE_CHECK] tensor_name='" << tensor_name << "' n_dims=" << info->dimensions.size());
+    if (tensor_name == "token_embd.weight" || tensor_name == "output.weight")
+    {
+        LOG_INFO("[TRANSPOSE_MATCH] Found embedding tensor: " << tensor_name);
+        if (info->dimensions.size() == 2)
+        {
+            // GGUF has [d_model, vocab_size], we want [vocab_size, d_model]
+            // Swap dimensions
+            std::swap(dims[0], dims[1]);
+            need_transpose = true;
+            LOG_INFO("Transposing embedding tensor '" << tensor_name << "' from GGUF format ["
+                                                      << info->dimensions[0] << "x" << info->dimensions[1] << "] to ["
+                                                      << dims[0] << "x" << dims[1] << "]");
+        }
+    }
+
+    // Transpose data if needed
+    if (need_transpose)
+    {
+        int rows = static_cast<int>(info->dimensions[0]); // d_model in GGUF
+        int cols = static_cast<int>(info->dimensions[1]); // vocab_size in GGUF
+        std::vector<float> transposed(data_f32.size());
+
+// Transpose: GGUF[d_model, vocab] -> Our[vocab, d_model]
+// GGUF stores row-major: data[row * cols + col]
+// We want: transposed[col * rows + row]
+// Parallelize for large tensors
+#pragma omp parallel for schedule(static) if (rows * cols > 100000)
+        for (int r = 0; r < rows; ++r)
+        {
+            for (int c = 0; c < cols; ++c)
+            {
+                transposed[c * rows + r] = data_f32[r * cols + c];
+            }
+        }
+        data_f32 = std::move(transposed);
+    }
+
     auto simple = std::make_shared<llaminar::SimpleTensor>(dims, data_f32);
     if (role != llaminar::WeightRole::Unknown)
     {
@@ -1154,6 +1196,21 @@ bool ModelLoader::parseTensorInfo()
         {
             if (!readValue(tensor.dimensions[j]))
                 return false;
+        }
+
+        // Debug: Log raw dimensions from GGUF for embedding tensor
+        if (tensor.name == "token_embd.weight")
+        {
+            std::ostringstream oss;
+            oss << "[GGUF_DIMS_RAW] tensor='" << tensor.name << "' n_dims=" << n_dims << " dims=[";
+            for (uint32_t j = 0; j < n_dims; ++j)
+            {
+                if (j > 0)
+                    oss << ", ";
+                oss << tensor.dimensions[j];
+            }
+            oss << "]";
+            LOG_INFO(oss.str());
         }
 
         // Read tensor type

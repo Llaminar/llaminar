@@ -101,8 +101,11 @@ namespace llaminar
          * @brief Capture a snapshot of intermediate pipeline state for parity testing
          *
          * This is an optional hook that pipelines can implement to enable snapshot capture
-         * for comparison with reference implementations (e.g., llama.cpp). The default
-         * implementation is a no-op, ensuring zero overhead when parity testing is disabled.
+         * for comparison with reference implementations (e.g., PyTorch). The default
+         * implementation delegates to PipelineSnapshotManager, which is:
+         * - Zero overhead in release builds (compiled out)
+         * - Controlled by LLAMINAR_PARITY_CAPTURE=1 in debug builds
+         * - Thread-safe and MPI-aware (typically only rank 0 captures)
          *
          * @param stage Pipeline stage identifier
          * @param layer_index Layer index (-1 for non-layer stages like embedding, final norm)
@@ -110,33 +113,26 @@ namespace llaminar
          * @param seq_len Sequence length dimension
          * @param feature_dim Feature dimension (hidden size, vocab size, etc.)
          *
-         * @note Implementations should check isParityEnabled() before performing work
-         * @note Typically only rank 0 should capture to avoid duplication in MPI contexts
+         * @note Override only if you need custom snapshot behavior
+         * @note The default implementation uses PipelineSnapshotManager::instance()
          */
         virtual void captureStageSnapshot(
             PipelineStage stage,
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim)
-        {
-            // Default no-op - override to enable parity capture
-            (void)stage;
-            (void)layer_index;
-            (void)data;
-            (void)seq_len;
-            (void)feature_dim;
-        }
+            int feature_dim);
 
         /**
          * @brief Check if parity testing/snapshot capture is enabled
          *
          * @return true if snapshots should be captured, false otherwise
          *
-         * Default implementation returns false. Concrete pipelines can override to
-         * check environment variables or configuration flags.
+         * Default implementation checks PipelineSnapshotManager, which reads
+         * LLAMINAR_PARITY_CAPTURE environment variable in debug builds.
+         * Always returns false in release builds.
          */
-        virtual bool isParityEnabled() const { return false; }
+        virtual bool isParityEnabled() const;
     };
 
     /**
