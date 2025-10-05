@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include "distributed_transformer_pipeline.h" // provides getReplayFirstExceedFlag/resetReplayFirstExceedFlag friend access
+#include "qwen_pipeline.h" // provides getReplayFirstExceedFlag/resetReplayFirstExceedFlag friend access
 #include "model_loader.h"
 #include "utils/debug_env.h"
 #include <mpi.h>
@@ -37,13 +37,13 @@ namespace
     };
     static ::testing::Environment *const mpi_env = ::testing::AddGlobalTestEnvironment(new MPIGlobalEnvironment());
 
-    DistributedTransformerPipeline::ModelWeights makeTinyWeights(DistributedTransformerPipeline &pipe, const TransformerLayerConfig &cfg)
+    QwenPipeline::ModelWeights makeTinyWeights(QwenPipeline &pipe, const TransformerLayerConfig &cfg)
     {
         auto make_matrix = [&](int rows, int cols)
         { auto t = pipe.allocateTestLocalTensor({rows,cols}); for(int r=0;r<rows;++r) for(int c=0;c<cols;++c) t->data()[r*cols+c] = 0.001f*(r+1)+0.0001f*(c+3); return t; };
         auto make_vec = [&](int n)
         { auto t = pipe.allocateTestLocalTensor({n}); for(int i=0;i<n;++i) t->data()[i]=1.0f; return t; };
-        DistributedTransformerPipeline::ModelWeights W;
+        QwenPipeline::ModelWeights W;
         W.token_embedding = make_matrix(cfg.vocab_size, cfg.d_model);
         for (int l = 0; l < cfg.n_layers; ++l)
         {
@@ -96,7 +96,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
     cfg.vocab_size = 48;
     cfg.max_seq_len = 128;
     cfg.eps = 1e-5f;
-    auto pipeA = createDistributedTransformerPipeline(cfg);
+    auto pipeA = createQwenPipeline(ModelConfig(cfg, "qwen"));
     ASSERT_TRUE(pipeA);
     auto weights = makeTinyWeights(*pipeA, cfg);
     // Prefill sequence
@@ -108,7 +108,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
     std::memcpy(base_logits.data(), out_full->data() + ((prompt.size() - 1) * cfg.vocab_size), sizeof(float) * cfg.vocab_size);
 
     // Now incremental pipeline: prefill then decode tokens one by one comparing to replay extension
-    auto pipeInc = createDistributedTransformerPipeline(cfg);
+    auto pipeInc = createQwenPipeline(ModelConfig(cfg, "qwen"));
     ASSERT_TRUE(pipeInc);
     pipeInc->enableKVCache(true);
     // Prefill stage for incremental pipeline
@@ -132,7 +132,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
     {
         int next = (i * 7) % cfg.vocab_size; // incremental
         // Replay path: build combined sequence and run full execute
-        auto replay_pipe = createDistributedTransformerPipeline(cfg);
+        auto replay_pipe = createQwenPipeline(ModelConfig(cfg, "qwen"));
         auto replay_logits = TensorFactory::create_simple({(int)prompt.size() + (int)generated.size() + 1, cfg.vocab_size});
         auto replay_weights = weights; // reuse same weights
         std::vector<int> replay_seq = prompt;
@@ -156,7 +156,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
         const char *lt_env = std::getenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF");
         if (lt_env && std::string(lt_env) == "1")
         {
-            const auto &rows = DistributedTransformerPipeline::getLastLayerTokenRows();
+            const auto &rows = QwenPipeline::getLastLayerTokenRows();
             // rows vector accumulates across calls; last 2*n_layers entries should be the current iteration's replay + incremental
             // Heuristic: collect last incremental single-row captures (incremental flag true) and compare to a fresh replay executed above
             // For deeper diagnostics a dedicated harness can refine this, but we at least surface counts here.
@@ -198,7 +198,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalMultiRank)
     cfg.vocab_size = 64;
     cfg.max_seq_len = 128;
     cfg.eps = 1e-5f;
-    auto pipe = createDistributedTransformerPipeline(cfg);
+    auto pipe = createQwenPipeline(ModelConfig(cfg, "qwen"));
     ASSERT_TRUE(pipe);
     pipe->enableKVCache(true);
     auto weights = makeTinyWeights(*pipe, cfg);
@@ -214,7 +214,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalMultiRank)
     for (int step = 0; step < 3; ++step)
     {
         int next = (step * 5) % cfg.vocab_size; // Replay
-        auto replay_pipe = createDistributedTransformerPipeline(cfg);
+        auto replay_pipe = createQwenPipeline(ModelConfig(cfg, "qwen"));
         auto replay_logits = TensorFactory::create_simple({(int)prompt.size() + (int)generated.size() + 1, cfg.vocab_size});
         ASSERT_TRUE(replay_pipe->execute([&]()
                                          { std::vector<int> seq=prompt; seq.insert(seq.end(), generated.begin(), generated.end()); seq.push_back(next); return seq; }(), weights, replay_logits));

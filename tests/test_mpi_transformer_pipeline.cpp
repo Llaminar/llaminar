@@ -1,4 +1,4 @@
-#include "distributed_transformer_pipeline.h" // DistributedTransformerPipeline
+#include "qwen_pipeline.h" // QwenPipeline
 #include "logger.h"
 #include "test_timeout_guard.h"
 #include "tensors/tensor_factory.h"
@@ -13,7 +13,7 @@
 
 using namespace llaminar;
 
-class DistributedTransformerPipelineTest : public ::testing::Test
+class QwenPipelineTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -37,8 +37,9 @@ protected:
         config_.n_layers = 2; // Small for testing
         config_.eps = 1e-6f;
 
-        // Create transformer pipeline
-        pipeline_ = createDistributedTransformerPipeline(config_);
+        // Create transformer pipeline with ModelConfig
+        ModelConfig model_cfg(config_, "qwen");
+        pipeline_ = createQwenPipeline(model_cfg);
 
         // Initialize random generator with fixed seed for reproducibility
         generator_.seed(42);
@@ -64,9 +65,9 @@ protected:
         }
     }
 
-    DistributedTransformerPipeline::ModelWeights createTestWeights()
+    QwenPipeline::ModelWeights createTestWeights()
     {
-        DistributedTransformerPipeline::ModelWeights weights;
+        QwenPipeline::ModelWeights weights;
 
         // Token embedding
         weights.token_embedding = llaminar::TensorFactory::create_simple(std::vector<int>{config_.vocab_size, config_.d_model});
@@ -171,14 +172,14 @@ protected:
     }
 
 protected:
-    std::unique_ptr<DistributedTransformerPipeline> pipeline_;
-    DistributedTransformerPipeline::LayerConfig config_;
+    std::unique_ptr<QwenPipeline> pipeline_;
+    QwenPipeline::LayerConfig config_;
     std::mt19937 generator_;
 };
 
 // BasicFunctionality test removed (covered by ValidationTests + parity & sequence tests)
 
-TEST_F(DistributedTransformerPipelineTest, ValidationTests)
+TEST_F(QwenPipelineTest, ValidationTests)
 {
     // Test weight validation
     auto valid_weights = createTestWeights();
@@ -200,7 +201,7 @@ TEST_F(DistributedTransformerPipelineTest, ValidationTests)
     EXPECT_FALSE(pipeline_->validate(invalid_weights));
 }
 
-TEST_F(DistributedTransformerPipelineTest, DifferentSequenceLengths)
+TEST_F(QwenPipelineTest, DifferentSequenceLengths)
 {
     // Test with various sequence lengths
     auto weights = createTestWeights();
@@ -310,7 +311,7 @@ static uint64_t fnv1a_hash(const float *data, size_t count)
     return h;
 }
 
-TEST_F(DistributedTransformerPipelineTest, SmallSequenceFastPath)
+TEST_F(QwenPipelineTest, SmallSequenceFastPath)
 {
     int world_size = 1;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -319,7 +320,7 @@ TEST_F(DistributedTransformerPipelineTest, SmallSequenceFastPath)
         GTEST_SKIP() << "SmallSequenceFastPath test requires world_size >= 2 to trigger fast path reliably";
     }
     // Reset counter
-    llaminar::DistributedTransformerPipeline::resetSmallSeqFastPathCount();
+    llaminar::QwenPipeline::resetSmallSeqFastPathCount();
 
     // Choose seq_len=1 (< world_size) to force fast path
     int seq_len = 1;
@@ -337,14 +338,14 @@ TEST_F(DistributedTransformerPipelineTest, SmallSequenceFastPath)
     EXPECT_EQ(xor_hash, 0ULL) << "Ranks produced differing logits in small sequence fast path";
 
     // Counter should have incremented exactly once locally
-    EXPECT_EQ(llaminar::DistributedTransformerPipeline::getSmallSeqFastPathCount(), (size_t)1);
+    EXPECT_EQ(llaminar::QwenPipeline::getSmallSeqFastPathCount(), (size_t)1);
 }
 
 // ConsistencyAcrossRuns test removed (redundant with parity/incremental validation)
 
 // PerformanceBenchmark test removed (moved to dedicated benchmarking binaries)
 
-TEST_F(DistributedTransformerPipelineTest, LoadBalancingAnalysis)
+TEST_F(QwenPipelineTest, LoadBalancingAnalysis)
 {
     // Test load balancing across MPI processes
     const int seq_len = 8;

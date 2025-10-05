@@ -1,27 +1,55 @@
 # Llaminar LLM Inference Engine - Architecture Documentation
 
-*Last Updated: October 3, 2025*
+*Last Updated: October 5, 2025*
 
 ## Overview
 
-Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The original generic compute graph and non‑MPI kernels have been fully retired; all production execution flows through **MPI-aware kernels**, an **Abstract Pipeline** adapter layer, and a centralized **adaptive backend selector** (OpenBLAS vs COSMA) tuned for sequence length and operation size.
+Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The architecture is built on a **multi-architecture pipeline abstraction** with pluggable model-family adapters, centralized backend selection, and comprehensive observability.
 
-Key pillars:
-- **Abstract Pipeline Adapters**: Model‑family specific orchestration (e.g. Qwen adapter) implementing prefill + decode lifecycle over a fixed semantic stage graph (RMSNorm → Attention primitives → MLP Gate/Up/SwiGLU/Down → Residuals → Output Projection).
-- **Adaptive MatMul**: Single decision point (`adaptive_matmul.h`) governing local vs COSMA distributed matmuls; avoids policy drift.
-- **COSMA Prefill Manager**: High‑throughput large prompt (prefill) GEMMs with fused RMSNorm+QKV path and validation / orientation diagnostics.
-- **Tensor Sharding**: Current column (feature) partition for linear projections & planned evolution to hybrid 1D→2D sharding for future multi‑node scaling (see Roadmap).
-- **Centralized Environment Snapshot**: `debugEnv()` captures all tuning / debug flags once (no repeated `getenv` in hot loops).
-- **Observability**: Structured perf counters, stage timers (norm, attention, linear, activation), optional per-layer token diffs, dequant stats, COSMA tile validation & distributed GEMM forensic logs.
+### Core Architecture Pillars
 
-## Core Design Principles (Current State)
-1. **MPI Everywhere**: All compute kernels derive from `MPIKernelBase`; no legacy single‑process fallbacks remain.
-2. **Semantic Stages Over Generic Graphs**: Explicit transformer stages replace run‑time node scheduling overhead.
-3. **Single Policy Surface**: Backend selection & tuning centralized (predictable & testable).
-4. **Data Locality First**: Column partition weight shards + fused prefill pathways minimize movement.
-5. **Graceful Degradation**: COSMA failures auto‑fallback to OpenBLAS with logged reason.
-6. **Deterministic Debugging**: Environment snapshot + opt‑in reference comparisons (RMSNorm, attention output, FFN) for surgical diagnostics.
-7. **Incremental Evolution**: Design allows swapping in 2D sharding & mixed precision without re‑plumbing pipeline logic.
+1. **Abstract Pipeline System** ✨
+   - **Multi-Architecture Support**: Factory pattern for Qwen, LLaMA, and future model families
+   - **Clean Abstraction**: `AbstractPipeline` interface with `prefill()` / `decode()` lifecycle
+   - **Concrete Implementations**: `QwenPipeline` (production), `LlamaPipeline` (prototype)
+   - **Adapters**: `QwenPipelineAdapter`, `LlamaPipelineAdapter` implement standard interface
+   - **Factory Registration**: Automatic model-family selection via `PipelineFactory`
+
+2. **Centralized Backend Selection** ✨
+   - **MatMulBackendSelector**: Single decision point for all matrix multiplication paths
+   - **Stage-Aware**: Considers operation size, stage context (prefill vs decode), and MPI topology
+   - **Intelligent Routing**: Small ops → single-threaded OpenBLAS, medium → multi-threaded, large prefill → COSMA
+   - **Zero Duplication**: Kernels delegate to selector, no scattered threshold logic
+
+3. **COSMA Prefill Manager**
+   - High‑throughput large prompt (prefill) GEMMs with fused RMSNorm+QKV path
+   - Validation / orientation diagnostics and automatic fallback
+
+4. **Tensor Sharding**
+   - Current: 1D column partition for linear projections
+   - Planned: Hybrid 1D→2D sharding for multi‑node scaling
+
+5. **Centralized Environment Snapshot** ✨
+   - `debugEnv()`: Structured, typed access to all configuration flags
+   - Eliminates repeated `getenv()` calls in hot loops
+   - Single source of truth for tuning parameters
+
+6. **Comprehensive Observability**
+   - Structured perf counters and stage timers
+   - Optional per-layer token diffs and validation
+   - COSMA tile validation and distributed GEMM diagnostics
+   - Prefill diagnostics module for baseline comparison
+
+## Core Design Principles
+
+1. **MPI-First Architecture**: All compute kernels derive from `MPIKernelBase`
+2. **Multi-Architecture Pipeline**: Explicit model-family adapters (Qwen, LLaMA) behind unified interface
+3. **Centralized Policy**: Backend selection and tuning consolidated in `MatMulBackendSelector`
+4. **Stage-Driven Execution**: Semantic transformer stages (prefill/decode) replace generic graph scheduling
+5. **Data Locality First**: Column partition weight shards + fused prefill minimize communication
+6. **Graceful Degradation**: COSMA failures auto‑fallback to OpenBLAS with diagnostics
+7. **Deterministic Debugging**: Environment snapshot + opt‑in validation for surgical diagnostics
+8. **Clean Abstraction Boundaries**: Pipeline orchestrates, kernels compute, selector chooses backend
 
 ## Architecture Components
 
@@ -35,15 +63,15 @@ Key pillars:
   - Exception handling and graceful shutdown
   - Performance measurement and reporting
 
-**Execution Flow (Current)**:
-1. Parse CLI → build `LlaminarParams` (includes `--kv-stats`, verbosity, model path).
-2. Initialize logging + environment snapshot (`debugEnv()` lazy init).
-3. Detect topology (NUMA, cores) & optionally print.
-4. Register MPI kernels (attention, linear, rmsnorm, residual, swiglu) & adaptive backend.
-5. Load GGUF model → weight tensors (auto layout decisions) & create model adapter.
-6. Instantiate distributed Qwen pipeline (formerly MPITransformerPipeline + adapter) – adapter layer removed; factory now returns DistributedTransformerPipeline directly.
-7. Execute prefill (prompt) then iterative decode until token budget / stop condition.
-8. Emit KV cache summary if requested; output perf counters & adaptive backend stats.
+**Execution Flow**:
+1. **Initialization**: Parse CLI → build `LlaminarParams` (includes `--kv-stats`, verbosity, model path)
+2. **Environment Setup**: Initialize logging + `debugEnv()` snapshot
+3. **Topology Detection**: Detect NUMA, cores; optionally print system info
+4. **Pipeline Registration**: Register Qwen and LLaMA pipeline creators with `PipelineFactory`
+5. **Model Loading**: Load GGUF model → weight tensors → wrap in architecture-specific `IModelWeights`
+6. **Pipeline Creation**: Use `PipelineFactory::create(model_config)` to instantiate appropriate pipeline
+7. **Inference**: Execute prefill (prompt) then iterative decode until completion
+8. **Summary**: Emit KV cache stats, performance counters, backend statistics
 
 ### 2. Command Line Interface
 
@@ -183,42 +211,102 @@ auto upgraded = TensorFactory::from_tensor(legacy);
 - **Legacy Compatibility**: No performance penalty for existing code
 - **Smart Conversion**: Only copies data when necessary
 
-### 3. Abstract Pipeline Architecture
+### 3. Multi-Architecture Pipeline System ✨
 
-The legacy generic compute graph (ComputeGraph / ComputeNode / MatMulNode) has been removed. It has been replaced by a higher‑level, purpose‑built inference pipeline abstraction that maps directly onto transformer model structure and execution phases.
+The abstract pipeline architecture provides clean separation between model-family-specific logic and the core inference engine.
 
-**Key Components**:
-- `AbstractPipeline` (interface): Defines lifecycle (prefill / decode), tensor staging, and logits access.
-- Concrete adapter (e.g. `QwenPipelineAdapter`): Specializes AbstractPipeline for specific model families (Qwen2.5 today) translating model config + weights into orchestrated kernel invocations.
-- `DistributedTransformerPipeline` (formerly `MPITransformerPipeline`): Unified distributed transformer implementation (adapters removed).
-- `cosma_prefill_manager`: Orchestrates large prefill GEMMs (possibly distributed) and feeds activations into attention / MLP kernels.
+#### Architecture Components
 
-**Execution Phases**:
-1. **Prefill**: Fused RMSNorm+QKV (COSMA path if threshold & env allow) → attention primitives → MLP (gate/up/down) with adaptive backend per matmul.
-2. **Decode**: Single token; all GEMMs forced OpenBLAS (small shapes) & minimal allocations; KV cache append + attention over growing context.
-3. **Output Projection**: Adaptive matmul (prefill may use COSMA, decode stays OpenBLAS) → logits provided to sampler layer (external / future integration).
+**Files**: `src/abstract_pipeline.h`, `src/pipeline_base.h`, `src/pipeline_factory.h`
 
-**Design Principles vs Removed Graph**:
-- Eliminates generic node scheduling overhead in favor of fixed semantic stages (clear perf boundaries: attention phases, MLP phases).
-- Centralized environment snapshot (`debug_env`) governs all hot path toggles (no per-node ad‑hoc env checks).
-- Explicit performance counters instrumentation at semantic phases (RMSNorm, Attention QK, Attention Apply, MLP Gate/Up/Down) replaces per-node timing.
-- Simplifies memory lifetime: tensors owned / recycled within pipeline stages instead of heap of generic node objects.
+**Core Classes**:
+- **`AbstractPipeline`**: Pure virtual interface defining pipeline lifecycle
+- **`PipelineBase`**: MPI-aware base with kernel composition and tensor utilities  
+- **`PipelineFactory`**: Singleton registry for architecture-specific creators
+- **`IModelWeights`**: Polymorphic weight access interface
+- **`StageContext`**: Metadata for prefill/decode stage tracking
+- **`KVCacheState`**: KV cache capacity and usage tracking
 
-**Benefits**:
-- Eliminated graph scheduler overhead & dynamic allocations churn.
-- Uniform perf instrumentation surface (matmul counters, stage timers).
-- Consistent environment gating (no latent `getenv` in loops).
-- Simplified feature rollout (add adapter, not node graph rewrites).
+#### Pipeline Interface
 
-**Migration Summary**:
-- Removed files: `src/graph_compute.h`, `src/graph_compute.cpp`, `tests/test_graph.cpp`.
-- Deprecated concepts: generic topology sort, per-node cycle detection, MatMulNode micro-benchmark path.
-- Replacement: direct pipeline invocation inside `main.cpp` (abstract or legacy transformer), with fallback benchmark path removed.
+```cpp
+class AbstractPipeline {
+public:
+    virtual const ModelConfig& config() const = 0;
+    virtual bool prefill(const std::vector<int>& tokens,
+                        const IModelWeights& weights,
+                        StageContext& ctx) = 0;
+    virtual bool decode(int next_token,
+                       const IModelWeights& weights,
+                       StageContext& ctx) = 0;
+    virtual bool logits(std::shared_ptr<TensorBase>& out_logits) = 0;
+    virtual std::unique_ptr<IModelWeights> loadWeights(const std::string& path) = 0;
+    virtual std::string name() const = 0;
+};
+```
 
-**Future Extensions**:
-- Plugin registry for model-family adapters.
-- Mixed-precision policy injection (prefill vs decode) at pipeline boundary.
-- Streaming KV cache compaction & eviction policies integrated into pipeline state.
+#### Concrete Implementations
+
+**QwenPipeline** (`src/qwen_pipeline.{h,cpp}`):
+- Production implementation for Qwen 2.5 model family
+- Formerly `DistributedTransformerPipeline` (renamed for clarity)
+- Implements complete transformer execution with MPI distribution
+- Supports both prefill and decode with adaptive backend selection
+
+**QwenPipelineAdapter** (`src/qwen_pipeline_adapter.{h,cpp}`):
+- Wraps `QwenPipeline` behind `AbstractPipeline` interface
+- Provides `QwenModelWeights` implementing `IModelWeights`
+- Handles stage context management and logits caching
+- Implements `loadWeights()` for Qwen-specific GGUF parsing
+
+**LlamaPipelineAdapter** (`src/llama_pipeline_adapter.{h,cpp}`):
+- Prototype implementation for LLaMA model family
+- Currently delegates to `QwenPipeline` (similar architecture)
+- Demonstrates multi-architecture extensibility
+- Future: Specialized for LLaMA-specific features (GQA variations, etc.)
+
+#### Pipeline Factory Pattern
+
+```cpp
+// Registration (done at startup)
+PipelineFactory::instance().registerCreator("qwen", 
+    [](const ModelConfig& cfg) {
+        return std::make_unique<QwenPipelineAdapter>(cfg);
+    });
+
+// Usage in main.cpp
+auto pipeline = PipelineFactory::instance().create(model_config);
+```
+
+#### Stage-Driven Execution
+
+**Prefill Phase**:
+1. Embedding lookup
+2. Layer loop:
+   - RMSNorm (attention)
+   - QKV projection (may use fused COSMA path)
+   - Attention primitives (RoPE, scaled dot-product, output projection)
+   - Residual connection
+   - RMSNorm (FFN)
+   - MLP (Gate/Up/SwiGLU/Down with adaptive backend)
+   - Residual connection
+3. Output RMSNorm + LM head projection
+
+**Decode Phase**:
+1. Embedding lookup (single token)
+2. Layer loop (same structure, optimized for single token):
+   - Local OpenBLAS for all matmuls (latency-optimized)
+   - KV cache append
+   - Causal attention over growing context
+3. Output projection → logits
+
+#### Benefits Over Legacy Compute Graph
+
+- ✅ **Eliminated**: Generic node scheduling overhead
+- ✅ **Simplified**: Fixed semantic stages vs dynamic DAG
+- ✅ **Centralized**: Environment controls via `debugEnv()` snapshot
+- ✅ **Modular**: Clean adapter boundaries for new architectures
+- ✅ **Testable**: Explicit stage transitions and parity validation
 
 
 ### 4. Adaptive MatMul & Prefill Backend
@@ -230,149 +318,977 @@ The legacy generic compute graph (ComputeGraph / ComputeNode / MatMulNode) has b
 - Decode: Always OpenBLAS (saves collective overhead > latency).
 - Supports batched Q/K/V path (currently OpenBLAS-loop; future fused COSMA batch candidate).
 
-**File**: `src/cosma_prefill_manager*`
-- Fused RMSNorm + QKV extraction with orientation / validation hooks.
-- Unified COSMA strategy selection to prevent inconsistent tilings across operands.
-- Optional tile verification, reconstruction diagnostics & orientation auto-fix env flags.
+### 4. Backend Selection & Adaptive MatMul
 
-**Recent Extensions**:
-- Output projection & all FFN (gate/up/down) matmuls now routed through adaptive backend (COSMA allowed on large prefill only).
-- Performance counters record every GEMM (size, backend, time) for post-run summary.
+**Files**: `src/matmul_backend_selection.{h,cpp}`, `src/prefill_backend.{h,cpp}`, `src/inference_backend.{h,cpp}`
 
-**Fallback Semantics**:
-1. Attempt COSMA via prefill manager.
-2. On exception or validation failure → log + single-rank OpenBLAS fallback transparently.
+The backend selection system provides centralized policy for choosing between OpenBLAS and COSMA based on operation characteristics, system configuration, and execution phase.
 
-### 5. Distributed Linear Projection Kernel
+#### MatMulBackendSelector
+
+**Purpose**: Centralized decision logic for all matrix multiplication operations
+
+**Selection Criteria**:
+- **Operation Size**: Total elements (m × n × k)
+- **Execution Phase**: Prefill vs decode
+- **Sequence Length**: Token count in current batch
+- **MPI Context**: Number of ranks available
+- **Environment Overrides**: `ADAPTIVE_DISABLE_COSMA`, `LLAMINAR_COSMA_PREFILL_THRESHOLD`
+
+**Decision Logic**:
+```cpp
+MatMulBackend selectBackend(int m, int n, int k, 
+                           int seq_len, 
+                           bool is_prefill) {
+    // Very small: single-threaded OpenBLAS (minimize overhead)
+    if (total_elements < 8192) {
+        return MatMulBackend::SINGLE_THREADED_OPENBLAS;
+    }
+    
+    // Large prefill: COSMA for distributed throughput
+    if (is_prefill && seq_len >= cosma_threshold && 
+        total_elements >= 8388608) {
+        return MatMulBackend::DISTRIBUTED_COSMA;
+    }
+    
+    // Medium: multi-threaded OpenBLAS
+    return MatMulBackend::MULTI_THREADED_OPENBLAS;
+}
+```
+
+#### Backend Factories
+
+**PrefillBackend** (`src/prefill_backend.{h,cpp}`):
+- Handles large batch token processing
+- Delegates to `MatMulBackendSelector` for policy
+- Routes to COSMA path via `cosma_prefill_manager` when selected
+- Falls back to OpenBLAS on COSMA failure/validation errors
+
+**InferenceBackend** (`src/inference_backend.{h,cpp}`):
+- Handles single-token decode operations
+- Always uses local OpenBLAS (latency-optimized)
+- Avoids MPI collective overhead
+- Single-threaded for minimal context switch overhead
+
+#### Performance Characteristics
+
+Based on empirical benchmarking:
+
+| Operation Size | Tokens | Backend | Reason |
+|----------------|--------|---------|--------|
+| < 8K elements | Any | Single-threaded OpenBLAS | Overhead dominates |
+| 8K - 8M elements | < 4K | Multi-threaded OpenBLAS | Communication cost too high |
+| ≥ 8M elements | ≥ 4K | COSMA (if enabled) | Distributed throughput wins |
+| Decode (any) | 1 | Single-threaded OpenBLAS | Latency critical |
+
+#### Environment Controls
+
+- `ADAPTIVE_DISABLE_COSMA=1`: Force all operations to OpenBLAS
+- `LLAMINAR_COSMA_PREFILL_THRESHOLD=<tokens>`: Override sequence length threshold (default: 4096)
+- `LLAMINAR_COSMA_MAX_RESIDENT_MB=<mb>`: Memory budget for COSMA operations (default: 2048)
+- `LLAMINAR_COSMA_VALIDATE_TILE=<size>`: Enable correctness validation (debug only)
+
+#### Integration with Pipeline
+
+The pipeline uses backend selection through kernel composition:
+
+```cpp
+// In QwenPipeline::prefill()
+auto backend_choice = MatMulBackendSelector::selectBackend(
+    seq_len, hidden_size, proj_size, seq_len, true);
+
+if (backend_choice == MatMulBackend::DISTRIBUTED_COSMA) {
+    // Route through COSMA prefill manager
+    executePrefillAttentionCosma(...);
+} else {
+    // Use local OpenBLAS kernel
+    executeAttentionLocal(...);
+}
+```
+
+### 5. COSMA Prefill Manager
+
+**Files**: `src/cosma_prefill_manager.{h,cpp}`, `src/prefill_diagnostics.{h,cpp}`
+
+The COSMA prefill manager provides fused, distributed execution of large prefill operations with integrated diagnostics and validation.
+
+#### Core Functionality
+
+**Fused RMSNorm + QKV**:
+- Combines layer normalization and QKV projection into single distributed operation
+- Avoids intermediate activation materialization
+- Unified COSMA strategy selection prevents inconsistent tiling
+
+**Orientation & Layout Management**:
+- Automatic orientation detection and correction
+- Validation hooks for debugging mismatches
+- Auto-fix capability via `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE`
+
+**Distributed Execution**:
+- Coordinates across MPI ranks with barriers
+- Handles partial matrix reconstruction and gathering
+- Manages COSMA buffer allocation lifecycle
+
+#### Diagnostics Integration
+
+**Prefill Diagnostics Module** (`src/prefill_diagnostics.{h,cpp}`):
+- **BufferStats**: Min/max/mean/L2 norm computation
+- **DiffSummary**: Relative L2 error and maximum absolute difference
+- **PrefillBaselineRegistry**: Reference execution for validation
+
+**Usage Pattern**:
+```cpp
+// Optional baseline comparison
+if (env.prefill_debug.compare_baseline) {
+    auto baseline_result = PrefillBaselineRegistry::computeBaseline(...);
+    auto diff = PrefillBaselineRegistry::compareResults(
+        cosma_result, baseline_result);
+    LOG_INFO("Prefill diff: rel_l2=" << diff.rel_l2 
+             << ", max_abs=" << diff.max_abs);
+}
+```
+
+#### Performance Counters
+
+Tracks all GEMM operations with:
+- Operation dimensions (m × n × k)
+- Backend used (COSMA vs OpenBLAS)
+- Execution time
+- GFLOPS achieved
+
+Post-run summary shows aggregate statistics for optimization.
+
+#### Fallback Behavior
+
+1. **Attempt COSMA Path**: Try distributed execution via COSMA
+2. **Validation Check**: Optionally verify results against OpenBLAS tile
+3. **On Failure**: Log warning and fall back to single-rank OpenBLAS
+4. **Transparent Recovery**: Pipeline continues without user intervention
+
+#### Environment Controls
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLAMINAR_COSMA_FORCE_DIRECT` | Force COSMA direct path | Unset |
+| `LLAMINAR_COSMA_COMPARE_REPLICATED` | Full OpenBLAS validation | Unset (expensive) |
+| `LLAMINAR_COSMA_VALIDATE_TILE` | Small tile validation | 0 (off) |
+| `LLAMINAR_COSMA_DEBUG_RECON` | Verbose reconstruction logs | Unset |
+| `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE` | Auto-correct orientation | Unset |
+| `LLAMINAR_COSMA_LOG_LEVEL` | Prefill logging verbosity | info |
+
+#### Integration Points
+
+- Called from `QwenPipeline::prefill()` for attention QKV projection
+- Used for MLP gate/up/down projections in large prefill
+- Coordinates with `MatMulBackendSelector` for policy enforcement
+- Reports statistics via `debugEnv().prefill_debug` snapshot
+
+### 6. Distributed Linear Projection
 
 **File**: `src/kernels/MPILinearKernel.cpp`
-**Role**: Column-partitioned dense layer implementation used when adaptive path selects OpenBLAS and we want distributed weight shards.
-**Flow**: Distribute weight slice → local GEMM (OpenBLAS) → Allgatherv assemble full output rows → optional bias.
-**Adaptive Interaction**: Invokes `adaptiveMatMul(... distributed_partition=true)` to ensure COSMA is not (incorrectly) applied to partial matrices.
 
-### 6. Attention Primitives
-- Fused QKV path (prefill COSMA) or kernel-based multi-head attention (decode & small prefill).
-- RoPE applied per head with direct loop (possible future vectorization / LUT sincos reuse).
-- All reductions / softmax executed locally (causal masking enforced row-wise); future: distributed softmax for large multi-rank KV spans.
+Provides column-partitioned dense layer implementation for distributed weight storage with local OpenBLAS computation.
 
-### 7. KV Cache Management
-**State**: `KVCacheState` tracked in `AbstractPipeline` & CLI flag `--kv-stats` prints usage & capacity.
-**Growth**: Capacity ensured before decode; parity tests validate state after prefill vs incremental decode path.
-**Future**: Segment compaction & eviction policies (LRU / sliding window) pluggable at pipeline layer.
+#### Architecture
 
-### 8. Environment & Observability
-**Central Snapshot**: `debugEnv()` groups: attention, baseline, cosma, adaptive, pipeline, linear, embedding, layer_capture, prefill_debug, etc.
-**Rules**: No hot path `std::getenv`; all flags registered & typed (bool/int/strings) once.
-**Diagnostics**:
-- Per-stage diff (optional reference recomputation) with rel_l2 & top sample logging.
-- Row capture for RMSNorm & FFN forensic modes.
-- COSMA orientation / reconstruction debug channels.
-- Perf counters + adaptive backend aggregated summary.
+**Weight Distribution**:
+- Weights partitioned by columns across MPI ranks
+- Each rank holds `[hidden_size, proj_size / num_ranks]` slice
+- Input activations replicated across all ranks
 
-### 9. Model Loading & Quantization
-**File**: `src/model_loader.*`
-- Parses GGUF → instantiates weight tensors (Simple/COSMA) based on size & env.
-- Supports quant formats (Q4K / Q6K etc.) with dequant stats & anomaly detection flags.
-**Repacker**: Performs any layout adaptation required by fused prefill manager (e.g., contiguous block ordering for QKV concatenated strategies).
+**Execution Flow**:
+1. **Local GEMM**: Each rank computes `input @ local_weight_slice`
+2. **Gather Results**: `MPI_Allgatherv` assembles full output across ranks  
+3. **Optional Bias**: Add bias vector if provided
 
-### 10. Testing Infrastructure (Current Representative Set)
-Key test families (non-exhaustive):
-- `test_prefill_attention_golden`, `test_cosma_prefill_*`: Fused COSMA correctness & stats.
-- `test_adaptive_matmul*`: Backend decision correctness & performance constraints.
-- `test_mpi_transformer_pipeline`, `test_abstract_pipeline_parity`: Adapter parity & end-to-end invariants.
-- `test_kv_cache_growth*`: KV capacity correctness across modes.
-- `test_rmsnorm_*`, `test_attention_*`: Primitive parity & edge cases.
-- `test_tp_*`, `test_mlp_tp_parity`: Tensor partition correctness.
+**Backend Integration**:
+- Explicitly uses OpenBLAS for local matmul
+- Coordinates with `MatMulBackendSelector` to avoid COSMA on partial matrices
+- Ensures consistent execution with adaptive backend policy
 
-Removed tests: `test_graph.cpp`, `LinearKernelTest` (documented as historical in guidelines).
+#### Use Cases
 
-### 11. Performance Strategy Summary
-| Phase | Typical Matmuls | Backend Policy | Rationale |
-|-------|-----------------|----------------|-----------|
-| Prefill (short) | many small/medium | OpenBLAS (single/multi-thread) | COSMA overhead not amortized |
-| Prefill (large ≥4K tokens) | tall skinny (seq_len × hidden) * (hidden × proj) | COSMA | Collective reuse + fused QKV normalization |
-| Decode | 1 × hidden * hidden × proj | OpenBLAS single-thread (often) | Min latency, avoids collectives |
-| FFN large prefill | seq_len × hidden * hidden × d_ff | COSMA candidate | Throughput scaling |
-| LM Head (future) | seq_len × hidden * hidden × vocab | Policy TBD (likely still local) | Avoid huge all-gather unless 2D shard implemented |
+- Distributed weight storage when model exceeds single-node memory
+- Balanced computation across MPI ranks
+- Compatible with both prefill and decode phases
 
-### 12. Tensor Sharding Roadmap (Forward Looking)
-Current: 1D column partition for linear weights; activations replicated.
-Planned Phases:
-1. Activation micro-sharding for very large batch prefill (reduce per-rank memory).
-2. 2D block cyclic strategy for extreme vocab or d_ff expansions (align w/ COSMA tiling to eliminate post-gather).
-3. Owner-aware KV cache distribution (shard past sequence to reduce memory duplication) + distributed attention softmax.
-4. Mixed precision (FP16 / BF16) activation buffers with on-the-fly dequant for matmuls.
+#### Performance Characteristics
 
-### 13. Future Enhancements
-- 2D sharded matmul path unifying MPILinearKernel + COSMA strategy (remove gather step where possible).
-- Adaptive decode micro-batching (multiple next-token candidates) with latency guardrails.
-- Runtime reconfiguration: dynamic environment snapshot refresh & remote control channel.
-- Streaming KV compaction & eviction strategies.
-- Quantized fused prefill (direct dequant into COSMA layout without intermediate float buffer).
+**Advantages**:
+- Distributes memory footprint across ranks
+- Balances computation load
+- Leverages fast local OpenBLAS for small/medium operations
 
-### 14. Current vs Target End-State Snapshot
-| Aspect | Current | Target |
-|--------|---------|--------|
-| Pipeline | Abstract adapters + legacy MPI pipeline (deprecated) | Pure adapters (legacy removed) |
-| MatMul Policy | Central adaptive manager | Same + 2D shard extension |
-| Attention Prefill | Fused RMSNorm+QKV (COSMA) + local softmax | Fully distributed softmax + partial KV ownership |
-| Linear Sharding | 1D column gather | 1D/2D hybrid (gather-less) |
-| KV Cache | Replicated per rank | Sharded + eviction/compaction |
-| Mixed Precision | Primarily FP32 (with weight quant) | Activation FP16/BF16 + selective FP32 accum |
-| Env Flags | Static snapshot at init | Hot-reloadable snapshot |
+**Overhead**:
+- `MPI_Allgatherv` communication cost
+- Beneficial when communication < local GEMM time savings
+
+#### Interaction with Adaptive Backend
+
+The kernel ensures COSMA is not applied to partial weight slices:
+
+```cpp
+// In MPILinearKernel::execute()
+adaptiveMatMul(input, local_weight, local_output,
+               /* distributed_partition= */ true);
+// Flag prevents COSMA selection for partial matrix
+```
+
+This maintains correctness while allowing adaptive selection at higher pipeline levels.
+
+### 7. Attention Implementation
+
+**Files**: `src/kernels/MPIAttentionKernel.{h,cpp}`, `src/kernels/attention_primitives.{h,cpp}`
+
+The attention system provides multi-head attention with RoPE positional encoding, supporting both fused COSMA prefill and local kernel-based execution.
+
+#### Execution Paths
+
+**Large Prefill (COSMA Path)**:
+1. Fused RMSNorm + QKV projection via `cosma_prefill_manager`
+2. Reshape to multi-head format: `[batch, seq_len, num_heads, head_dim]`
+3. Apply RoPE positional encoding per head
+4. Scaled dot-product attention: `softmax(QK^T / sqrt(d_k)) V`
+5. Output projection (adaptive backend)
+
+**Decode / Small Prefill (Local Path)**:
+1. Separate RMSNorm, Q/K/V projection kernels
+2. RoPE encoding
+3. KV cache append
+4. Causal attention over growing context
+5. Local OpenBLAS output projection
+
+#### RoPE (Rotary Position Embedding)
+
+**Implementation**: Direct per-head loop with sin/cos computation
+**Format**: Applied to Q and K tensors before attention
+**Future Optimization**: Vectorization, LUT-based sin/cos reuse
+
+```cpp
+// Simplified RoPE application
+for (int head = 0; head < num_heads; ++head) {
+    for (int pos = 0; pos < seq_len; ++pos) {
+        float theta = pos / pow(10000.0, 2.0 * dim / head_dim);
+        float cos_theta = cos(theta);
+        float sin_theta = sin(theta);
+        // Apply rotation to Q[head][pos] and K[head][pos]
+    }
+}
+```
+
+#### Attention Mechanism
+
+**Scaled Dot-Product**:
+- Query-Key product: `scores = Q @ K^T`
+- Scaling: `scores /= sqrt(head_dim)`
+- Causal masking: Set future positions to -inf
+- Softmax: `probs = softmax(scores)` (row-wise normalization)
+- Apply to values: `output = probs @ V`
+
+**Execution**:
+- All reductions and softmax executed locally (single rank)
+- Causal masking enforced row-wise
+- Future enhancement: Distributed softmax for large multi-rank KV spans
+
+#### Multi-Head Attention
+
+**Head Configuration**:
+- Number of heads from `ModelConfig::n_heads`
+- Head dimension: `hidden_size / n_heads`
+- Supports Grouped Query Attention (GQA) variations
+
+**Reshaping**:
+- Input: `[batch, seq_len, hidden_size]`
+- Multi-head: `[batch, seq_len, num_heads, head_dim]`
+- Transposed for attention: `[batch, num_heads, seq_len, head_dim]`
+
+#### Performance Optimizations
+
+- **RoPE Caching**: Future LUT-based sin/cos precomputation
+- **Fused Kernels**: Combined operations reduce memory traffic
+- **Adaptive Backend**: Large operations use COSMA, small use OpenBLAS
+- **KV Cache**: Avoid recomputing past positions in decode
+
+### 8. KV Cache Management
+
+**Files**: `src/abstract_pipeline.h`, `src/qwen_pipeline.cpp`
+
+The KV cache system stores past key and value tensors to avoid recomputation during autoregressive decode.
+
+#### KVCacheState Structure
+
+```cpp
+struct KVCacheState {
+    int max_seq_len;      // Maximum capacity
+    int current_pos;      // Current fill position
+    bool initialized;     // Cache allocation status
+    
+    // Per-layer storage
+    std::vector<std::shared_ptr<TensorBase>> key_cache;   
+    std::vector<std::shared_ptr<TensorBase>> value_cache;
+};
+```
+
+#### Lifecycle
+
+**Initialization**: During first prefill
+- Allocate `[num_layers, max_seq_len, num_heads, head_dim]` tensors
+- Set `max_seq_len` from config or CLI `--max-seq-len`
+- Mark `initialized = true`
+
+**Prefill**: Write initial sequence
+- Store computed K and V for all positions
+- Set `current_pos = prefill_length`
+
+**Decode**: Append new tokens
+1. Check capacity: `current_pos + 1 <= max_seq_len`
+2. Compute K, V for new token
+3. Append to cache at `current_pos`
+4. Increment `current_pos`
+
+#### Observability
+
+**CLI Flag**: `--kv-stats`
+- Prints cache usage and capacity after each operation
+- Shows per-layer memory footprint
+- Reports fill percentage
+
+**Example Output**:
+```
+KV Cache Stats:
+  Position: 127/512 (24.8%)
+  Layers: 24
+  Memory per layer: 2.1 MB
+  Total KV cache: 50.4 MB
+```
+
+#### Testing
+
+**Parity Tests**: `test_abstract_pipeline_parity.cpp`
+- Validates KV cache state after prefill
+- Compares incremental decode vs full replay
+- Ensures `current_pos` consistency
+
+#### Future Enhancements
+
+**Planned Features**:
+- **Eviction Policies**: LRU, sliding window, selective retention
+- **Compaction**: Remove unused sequence segments
+- **Distribution**: Shard KV cache across MPI ranks (owner-aware)
+- **Quantization**: Store K/V in reduced precision (INT8, FP16)
+
+**Pluggable Strategy**:
+```cpp
+class KVCacheEvictionPolicy {
+public:
+    virtual void compact(KVCacheState& cache, int min_retained) = 0;
+};
+```
+
+Integration point: `AbstractPipeline::decode()` invokes policy before cache append.
+
+### 9. Environment & Observability
+
+**Files**: `src/debug_env.{h,cpp}`
+
+Centralized environment configuration system eliminating hot-path `std::getenv` calls with structured, typed snapshots.
+
+#### Debug Environment Snapshot
+
+**Access Pattern**:
+```cpp
+const auto& env = debugEnv();
+if (env.attention.micro_trace && rank == 0) {
+    LOG_TRACE("Attention Q shape: " << q_shape);
+}
+```
+
+**Configuration Groups**:
+- `attention`: Attention kernel diagnostics and tracing
+- `baseline`: Reference execution and comparison
+- `cosma`: COSMA-specific controls and validation
+- `adaptive`: Backend selection overrides
+- `pipeline`: Pipeline-level instrumentation
+- `linear`: Linear kernel diagnostics
+- `embedding`: Embedding layer controls
+- `layer_capture`: Per-layer forensic capture
+- `prefill_debug`: Prefill diagnostics and validation
+
+#### Design Principles
+
+**Mandatory Rules**:
+1. **No Hot-Path getenv**: All environment variables parsed once at initialization
+2. **Typed Fields**: Boolean, integer, and string fields with proper defaults
+3. **Single Registry**: All flags documented in `debug_env.h`
+4. **Lazy Initialization**: Snapshot created on first `debugEnv()` call
+
+**Migration Guidance**:
+- New flags MUST be added to appropriate group in `debug_env.h`
+- Existing raw `std::getenv` calls should be migrated on file touch
+- Experimental flags staged in snapshot early to prevent drift
+
+#### Diagnostic Capabilities
+
+**Per-Stage Validation**:
+- Optional reference recomputation for correctness checking
+- Relative L2 error computation
+- Top sample value logging
+- Per-layer diff summaries
+
+**Forensic Modes**:
+- Row capture for RMSNorm intermediate values
+- FFN gate/up/down activation dumps
+- COSMA orientation and reconstruction debugging
+- Attention QKV tensor inspection
+
+**Performance Instrumentation**:
+- Per-operation timing (via performance counters)
+- Adaptive backend decision logging
+- GEMM statistics aggregation
+- Post-run summary reports
+
+#### Common Environment Variables
+
+| Variable | Purpose | Group | Type |
+|----------|---------|-------|------|
+| `LLAMINAR_ATTN_MICRO_TRACE` | Detailed attention tracing | attention | bool |
+| `ADAPTIVE_DISABLE_COSMA` | Force OpenBLAS path | adaptive | bool |
+| `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Sequence length threshold | cosma | int |
+| `LLAMINAR_COSMA_VALIDATE_TILE` | Tile validation size | cosma | int |
+| `LLAMINAR_DEQUANT_STATS` | Dequantization statistics | pipeline | bool |
+| `LLAMINAR_COSMA_LOG_LEVEL` | COSMA log verbosity | cosma | string |
+
+#### Usage Examples
+
+```cpp
+// Attention tracing
+const auto& env = debugEnv();
+if (env.attention.micro_trace) {
+    LOG_TRACE("QK product shape: " << qk_shape);
+}
+
+// Backend override
+if (env.adaptive.disable_cosma) {
+    return MatMulBackend::MULTI_THREADED_OPENBLAS;
+}
+
+// Validation control
+if (env.cosma.validate_tile > 0) {
+    performTileValidation(env.cosma.validate_tile);
+}
+```
+
+#### Future Extensions
+
+- **Hot Reload**: Dynamic snapshot refresh without restart
+- **Remote Control**: External configuration channel
+- **Profiling Modes**: Predefined diagnostic profiles
+- **Conditional Compilation**: Debug-only snapshot fields
+
+### 10. Model Loading & Weight Management
+
+**Files**: `src/model_loader.{h,cpp}`, `src/qwen_pipeline_adapter.cpp`, `src/llama_pipeline_adapter.cpp`
+
+Model loading system parses GGUF format files and instantiates architecture-specific weight implementations.
+
+#### Loading Pipeline
+
+**1. Format Detection**:
+- Read GGUF header and magic bytes
+- Validate file version compatibility
+- Parse metadata section
+
+**2. Configuration Extraction**:
+- Model dimensions (vocab size, hidden size, layer count)
+- Architecture parameters (attention heads, MLP ratio)
+- Tokenizer vocabulary
+- Create `ModelConfig` structure
+
+**3. Tensor Enumeration**:
+- Scan tensor directory
+- Map tensor names to pipeline weight keys
+- Record shapes and data types
+
+**4. Quantization Handling**:
+- Detect quantization format (Q4_K, Q6_K, etc.)
+- Dequantize to FP32 on load (per-tensor)
+- Optional statistics logging via `LLAMINAR_DEQUANT_STATS`
+- Anomaly detection via `LLAMINAR_DEQUANT_ANOMALIES`
+
+**5. MPI Distribution**:
+- Rank 0 reads GGUF file
+- Broadcast metadata to all ranks
+- For distributed tensors: partition and distribute slices
+- For replicated tensors: broadcast full tensor
+
+**6. Tensor Instantiation**:
+- Select tensor type (SimpleTensor vs COSMATensor) based on size
+- Apply environment-driven selection policy
+- Populate weight containers
+
+#### IModelWeights Implementations
+
+**QwenModelWeights**:
+```cpp
+class QwenModelWeights : public IModelWeights {
+    std::shared_ptr<TensorBase> getEmbedding(int token_id) const override;
+    std::shared_ptr<TensorBase> getWeight(const std::string& key) const override;
+    bool hasWeight(const std::string& key) const override;
+    ModelConfig config() const override;
+private:
+    std::unordered_map<std::string, std::shared_ptr<TensorBase>> weights_;
+    std::shared_ptr<TensorBase> embedding_table_;
+};
+```
+
+**LlamaModelWeights**:
+- Currently delegates to QwenModelWeights (similar architecture)
+- Future: Handle LLaMA-specific weight layouts
+
+#### Weight Naming Conventions
+
+**Standard Keys**:
+- Embedding: `token_embd.weight`
+- QKV projections: `layers.{L}.attention.{q,k,v}_weight`
+- Attention output: `layers.{L}.attention.wo_weight`
+- MLP gates: `layers.{L}.mlp.{gate,up,down}_proj`
+- Layer norms: `layers.{L}.{attn,mlp}_norm.weight`
+- Output projection: `output.weight`
+
+#### Quantization Support
+
+**Supported Formats**:
+- **Q4_K**: 4-bit with block-wise quantization
+- **Q6_K**: 6-bit with block-wise quantization  
+- **FP32**: Full precision (no quantization)
+
+**Dequantization**:
+- Performed on load (eager dequantization)
+- Per-tensor statistics logged if enabled
+- Anomaly detection: NaN, Inf, extreme values
+
+**Statistics Example**:
+```
+Dequant [layers.0.attention.q_weight]:
+  Min: -0.234, Max: 0.198
+  Mean: 0.003, Std: 0.067
+  Samples: [-0.012, 0.045, -0.023, ...]
+```
+
+#### Layout Adaptation
+
+**Repacker**: Performs layout transformations for fused kernels
+- Contiguous block ordering for QKV concatenation
+- COSMA-compatible memory layouts
+- Alignment requirements for vectorization
+
+#### Future Enhancements
+
+- **Lazy Dequantization**: Keep quantized format, dequant on-the-fly
+- **Mixed Precision**: FP16/BF16 activation buffers
+- **Streaming Load**: Memory-mapped incremental loading
+- **Weight Sharding**: Automatic partitioning for large models
+
+### 11. Testing Infrastructure
+
+**Files**: `tests/test_*.cpp`, `tests/parity_*.cpp`
+
+Comprehensive test suite validating pipeline correctness, backend selection, and distributed execution.
+
+#### Test Categories
+
+**Pipeline Tests**:
+- **`test_pipeline_factory.cpp`**: Factory registration and creation
+- **`test_abstract_pipeline_parity.cpp`**: Prefill vs incremental decode equivalence
+- **`test_qwen_pipeline.cpp`**: Qwen-specific pipeline functionality (4 test cases)
+
+**Backend & COSMA Tests**:
+- **`test_cosma_prefill_*.cpp`**: Fused COSMA correctness and statistics
+- **`test_adaptive_matmul*.cpp`**: Backend decision logic validation
+- **`test_cosma.cpp`**: Core COSMA integration
+
+**Primitive Kernel Tests**:
+- **`test_rmsnorm_*.cpp`**: RMSNorm parity and edge cases
+- **`test_attention_*.cpp`**: Attention mechanism validation
+- **`test_rope_*.cpp`**: RoPE positional encoding
+- **`test_softmax_*.cpp`**: Softmax numerical stability
+
+**Distributed Execution Tests**:
+- **`test_tp_*.cpp`**: Tensor partition correctness
+- **`test_mlp_tp_parity.cpp`**: MLP distributed parity
+- **`test_mpi_linear_kernel.cpp`**: MPILinearKernel validation
+
+**Infrastructure Tests**:
+- **`test_basic.cpp`**: MPI initialization and basic functionality
+- **`test_numa.cpp`**: NUMA topology detection and affinity
+- **`test_kv_cache_growth*.cpp`**: KV cache capacity management
+
+#### Removed Tests
+
+Historical tests no longer needed after architecture refactor:
+- ❌ `test_graph.cpp`: Generic compute graph (removed architecture)
+- ❌ `LinearKernelTest`: Legacy non-MPI linear kernel (retired)
+
+#### Parity Testing Framework
+
+**Purpose**: Ensure mathematical equivalence across execution paths
+
+**Key Parity Tests**:
+1. **Prefill vs Incremental Decode**: 
+   - Full sequence prefill should match token-by-token decode
+   - KV cache state must be identical
+   - Logits must match within numerical tolerance
+
+2. **COSMA vs OpenBLAS**:
+   - Large operations should produce equivalent results
+   - Relative L2 error < 1e-4 threshold
+   - Maximum absolute difference tracking
+
+3. **Distributed vs Single-Rank**:
+   - Multi-rank execution matches single-rank reference
+   - Gather/reduction correctness
+   - No data loss or corruption
+
+**Example Parity Check**:
+```cpp
+TEST_CASE("Prefill vs Incremental Parity") {
+    // Full sequence prefill
+    pipeline->prefill(all_tokens, weights, prefill_ctx);
+    auto prefill_logits = pipeline->getLogits();
+    
+    // Incremental decode
+    pipeline->prefill({all_tokens[0]}, weights, decode_ctx);
+    for (int i = 1; i < all_tokens.size(); ++i) {
+        pipeline->decode(all_tokens[i], weights, decode_ctx);
+    }
+    auto decode_logits = pipeline->getLogits();
+    
+    // Validate equivalence
+    float rel_error = computeRelativeL2(prefill_logits, decode_logits);
+    REQUIRE(rel_error < 1e-4);
+}
+```
+
+#### Test Execution
+
+**Run All Tests**:
+```bash
+ctest --test-dir build --output-on-failure --parallel
+```
+
+**Core Tests Only** (recommended during development):
+```bash
+ctest --test-dir build -R "^(BasicTest|PipelineFactoryTest|QwenPipelineTest)$"
+```
+
+**With Verbose Output**:
+```bash
+ctest --test-dir build --output-on-failure --verbose
+```
+
+**MPI Tests**:
+```bash
+mpirun -np 2 ./build/test_abstract_pipeline_parity
+```
+
+#### Current Test Status
+
+**Passing Tests**:
+- ✅ BasicTest (MPI initialization)
+- ✅ PipelineFactoryTest (factory mechanics)  
+- ✅ QwenPipelineTest (3/4 subtests)
+
+**Known Issues**:
+- ⚠️ QwenPipelineTest.ValidationTests (pre-existing precision issue, unrelated to refactor)
+- ⚠️ Some COSMA tests have numerical precision edge cases
+
+#### Testing Best Practices
+
+1. **Always run tests after kernel changes**
+2. **Use parity tests to validate optimizations**
+3. **Check both single-rank and multi-rank execution**
+4. **Verify KV cache state consistency**
+5. **Enable validation flags during development** (`LLAMINAR_COSMA_VALIDATE_TILE`, etc.)
+6. **Disable heavy validation for benchmarking**
+
+### 12. Performance Strategy Summary
+
+Empirically-tuned backend selection based on operation characteristics and execution phase.
+
+#### Backend Selection by Phase
+
+| Phase | Sequence Length | Matrix Dims | Backend Policy | Rationale |
+|-------|----------------|-------------|----------------|-----------|
+| **Prefill (short)** | < 4K tokens | Many small/medium | OpenBLAS (single/multi-thread) | COSMA overhead not amortized |
+| **Prefill (large)** | ≥ 4K tokens | seq_len × hidden → projections | COSMA | Collective reuse + fused QKV |
+| **Decode** | 1 token | 1 × hidden → projections | OpenBLAS single-thread | Min latency, avoid collectives |
+| **FFN (large prefill)** | ≥ 4K tokens | seq_len × hidden → d_ff | COSMA candidate | Throughput scaling |
+| **LM Head** | Any | seq_len × hidden → vocab | Local (policy TBD) | Avoid huge all-gather unless 2D shard |
+
+#### Empirical Performance Data
+
+**Small Operations (< 8K elements)**:
+- OpenBLAS single-threaded: **134x faster** than COSMA for 1×896×896
+- Communication overhead dominates COSMA performance
+- Recommendation: Always use local OpenBLAS
+
+**Medium Operations (8K - 8M elements)**:
+- OpenBLAS multi-threaded competitive for < 64 tokens
+- COSMA overhead still significant
+- Recommendation: Multi-threaded OpenBLAS
+
+**Large Operations (≥ 8M elements)**:
+- COSMA becomes competitive at ≥ 8K tokens
+- **COSMA 3.6x faster** at 64K tokens vs single-rank OpenBLAS
+- Distributed memory bandwidth advantage
+- Recommendation: COSMA for large prefill
+
+#### Threading Strategy
+
+**Small Operations (< 8K elements)**:
+```cpp
+openblas_set_num_threads(1);  // Minimize overhead
+```
+
+**Medium Operations (8K - 1M elements)**:
+```cpp
+openblas_set_num_threads(omp_get_max_threads());  // Full socket
+```
+
+**Large Distributed Operations**:
+```cpp
+openblas_set_num_threads(cores_per_numa_node);  // Per-rank threading
+// + COSMA distributed execution
+```
+
+#### Memory Considerations
+
+**COSMA Buffer Allocation**:
+- Soft limit: 2048 MB per rank (configurable via `LLAMINAR_COSMA_MAX_RESIDENT_MB`)
+- Fallback to OpenBLAS if allocation exceeds budget
+- Prevents memory exhaustion on large models
+
+**Tensor Type Selection**:
+- **SimpleTensor**: < 256×256 elements or latency-critical
+- **COSMATensor**: ≥ 256×256 and distributed execution
+
+#### Optimization Priorities
+
+1. **Latency** (Decode): Single-threaded OpenBLAS, minimal overhead
+2. **Throughput** (Large Prefill): COSMA distributed, fused kernels
+3. **Memory Efficiency**: Adaptive tensor types, buffer reuse
+4. **Correctness**: Parity validation, fallback paths
+
+### 13. Tensor Sharding & Future Roadmap
+
+Current distributed execution capabilities and planned enhancements for scaling to larger models and longer contexts.
+
+#### Current State (1D Column Sharding)
+
+**Weight Distribution**:
+- Linear weights partitioned by columns across MPI ranks
+- Each rank holds `[hidden_size, proj_size / num_ranks]` slice
+- Activations replicated across all ranks
+
+**Communication Pattern**:
+- Local GEMM on weight slice
+- `MPI_Allgatherv` to assemble full output
+- Works well for moderate model sizes
+
+**Limitations**:
+- Activations fully replicated (memory scaling bottleneck)
+- All-gather communication cost grows with output size
+- KV cache duplicated across ranks
+
+#### Planned Enhancements
+
+**Phase 1: Activation Micro-Sharding**
+- **Goal**: Reduce per-rank memory for very large batch prefill
+- **Approach**: Partition activation tensors across sequence dimension
+- **Benefit**: Linear memory scaling with rank count
+- **Challenges**: Attention computation requires gather or ring-reduce
+
+**Phase 2: 2D Block-Cyclic Distribution**
+- **Goal**: Eliminate all-gather for extreme vocab or d_ff expansions
+- **Approach**: Align 2D tensor distribution with COSMA tiling strategy
+- **Benefit**: Zero-copy distributed matmul without post-gather
+- **Integration**: Seamless with COSMA's `BlockCyclicMatrix` layout
+
+**Phase 3: Distributed KV Cache**
+- **Goal**: Shard past sequence to reduce memory duplication
+- **Components**:
+  - Owner-aware KV cache distribution
+  - Distributed attention softmax (ring-reduce pattern)
+  - Partial sequence ownership per rank
+- **Benefit**: Support longer contexts with same memory budget
+
+**Phase 4: Mixed Precision Execution**
+- **Goal**: Reduce activation memory footprint by 50%
+- **Approach**: 
+  - FP16/BF16 activation buffers
+  - On-the-fly dequantization for matmuls
+  - Selective FP32 accumulation for numerical stability
+- **Benefit**: 2x memory reduction, potential speedup on modern hardware
+
+#### Implementation Strategy
+
+**Incremental Rollout**:
+1. Implement and validate each phase independently
+2. Maintain backward compatibility with existing 1D path
+3. Add environment flags to enable/disable features
+4. Comprehensive parity testing at each phase
+
+**Environment Controls** (Future):
+- `LLAMINAR_ACTIVATION_SHARDING={none,1d,2d}`: Activation distribution mode
+- `LLAMINAR_KV_CACHE_DISTRIBUTED=1`: Enable distributed KV cache
+- `LLAMINAR_MIXED_PRECISION={fp32,fp16,bf16}`: Activation precision
+- `LLAMINAR_2D_SHARD_THRESHOLD=<size>`: Minimum size for 2D sharding
+
+#### Research Directions
+
+**Adaptive Sharding**:
+- Automatically select 1D vs 2D based on model dimensions
+- Hybrid strategies for different layers (e.g., 2D for MLP, 1D for attention)
+
+**Memory-Optimal Schedules**:
+- Recompute vs cache trade-offs for activations
+- Gradient checkpointing patterns (if extending to fine-tuning)
+
+**Communication Optimization**:
+- Overlapped computation and communication
+- Hierarchical reduction trees for large rank counts
+- NCCL/RCCL integration for GPU backends
+
+### 14. Additional Future Enhancements
+
+Beyond tensor sharding, several high-impact features are planned for production deployment and advanced use cases.
+
+#### Runtime Reconfiguration
+
+**Dynamic Environment Snapshot**:
+- Reload `debugEnv()` snapshot without process restart
+- Hot-swap backend policies during long-running inference
+- Remote control channel for runtime configuration
+
+**Use Cases**:
+- A/B testing different backend strategies
+- Adaptive optimization based on workload
+- Debug flag toggle without restart
+
+**Implementation**:
+```cpp
+// Future API
+debugEnv().reload();
+debugEnv().setRemoteChannel("tcp://controller:5555");
+```
+
+#### Adaptive Decode Micro-Batching
+
+**Goal**: Process multiple next-token candidates in parallel
+
+**Approach**:
+- Beam search or speculative decoding
+- Batch multiple decode operations
+- Latency guardrails to prevent slowdown
+
+**Challenges**:
+- KV cache management for multiple hypotheses
+- Memory overhead for parallel paths
+- Efficient pruning and selection
+
+#### Streaming KV Cache Management
+
+**Compaction Strategies**:
+- **LRU**: Evict least-recently-used sequence segments
+- **Sliding Window**: Fixed-size context window
+- **Selective Retention**: Keep important tokens (e.g., system prompt)
+
+**Eviction Policies**:
+```cpp
+class StreamingKVCache {
+    void compact(int target_size);
+    void evictLRU(int num_tokens);
+    void slidingWindow(int window_size);
+    void selectiveRetain(const std::vector<int>& important_positions);
+};
+```
+
+**Integration**: Pluggable policy at `AbstractPipeline::decode()` level
+
+#### Quantized Fused Prefill
+
+**Goal**: Direct dequantization into COSMA layout
+
+**Current**: 
+1. Load quantized weights → dequantize to FP32 → SimpleTensor
+2. Convert to COSMATensor for COSMA operations
+
+**Optimized**:
+1. Load quantized weights → direct dequant into COSMA layout
+2. Skip intermediate FP32 buffer allocation
+3. Fuse dequant kernel with COSMA distribution
+
+**Benefits**:
+- 50%+ memory reduction during load
+- Faster initialization
+- Reduced allocation pressure
+
+#### GPU Backend Support
+
+**Multi-Backend Architecture**:
+- Unified `TensorBase` interface supports CPU and GPU
+- CUDA/HIP kernels for attention, matmul, softmax
+- NCCL for GPU-to-GPU communication
+- Hybrid CPU/GPU execution
+
+**Challenges**:
+- Unified memory management
+- CPU ↔ GPU data transfer overhead
+- NUMA awareness for PCIe topology
+
+#### Production Deployment Features
+
+**Model Serving**:
+- gRPC/REST API for inference requests
+- Request batching and queue management
+- Dynamic model loading/unloading
+- Multi-tenancy support
+
+**Observability**:
+- Prometheus metrics export
+- OpenTelemetry tracing integration
+- Performance profiling hooks
+- Health check endpoints
+
+**Fault Tolerance**:
+- Checkpoint/resume for long sequences
+- Rank failure recovery (MPI fault tolerance)
+- Graceful degradation on resource exhaustion
+
+#### Research Integration
+
+**Experimental Features**:
+- Flash Attention integration
+- PagedAttention for KV cache
+- Mixture-of-Experts (MoE) support
+- Continuous batching (Orca-style)
+
+**Plugin System**:
+```cpp
+class InferencePlugin {
+    virtual bool shouldIntercept(const Operation& op) = 0;
+    virtual bool execute(const Operation& op) = 0;
+};
+
+// Register custom optimizations
+PipelineFactory::registerPlugin(std::make_unique<FlashAttentionPlugin>());
+```
 
 ---
-**Deprecations**:
-- Compute Graph (removed)
-- Non-MPI kernels (removed)
-- `DistributedTransformerPipeline` (successor to deprecated `MPITransformerPipeline`; extend this for distributed transformer behavior)
-- Legacy MatMulKernel (replaced by adaptive path + MPILinearKernel + COSMA prefill manager)
 
-**Authoritative Hot Paths**:
-1. `executePrefillAttentionCosma` (fused + distributed GEMMs)
-2. FFN matmuls via adaptive backend (gate/up/down)
-3. Attention decode kernel (MPI primitives + RoPE + softmax)
-4. Output projection adaptiveMatMul
+## Additional Technical Details
 
-Maintain invariants:
-- No direct `getenv` in hot loops.
-- All distributed collectives bracketed by safe ordering (barriers where needed) to avoid hidden hangs.
-- Fallback to OpenBLAS must never silently change numerical rank agreement; diffs logged if validation toggles enabled.
-
-This document supersedes any earlier graph-centric or non‑MPI kernel guidance.
-
-### 8. Model Loading System
-
-**Files**: `src/model_loader.h/cpp`
-- **Class**: `ModelLoader`
-- **Format**: GGUF (GPT-Generated Unified Format)
-- **Features**:
-  - GGUF file parsing and validation
-  - Metadata extraction (architecture, parameters)
-  - **Hybrid Tensor Creation**: Automatic selection of optimal tensor types
-  - Tensor loading with format conversion
-  - Quantization support (Q8_0 implemented)
-
-**GGUF Support**:
-- **Architectures**: Qwen2.5, LLaMA family support
-- **Quantization**: Q8_0, F16, F32 (extensible)
-- **Metadata**: Model parameters, tokenizer info, training details
-- **Validation**: Magic number verification, version compatibility
-- **Tensor Optimization**: Large weight matrices automatically use COSMATensor
-
-### 9. Data Format Conversion
-
-**Files**: `src/repacker.h/cpp`
-- **Class**: `Repacker`
-- **Purpose**: Convert between GGUF and hybrid tensor formats
-- **Features**:
-  - Memory layout transformation
-  - Type conversion (F16 ↔ F32, quantized formats)
-  - **Tensor Type Selection**: Automatic SimpleTensor vs COSMATensor choice
-  - Efficient memory management
-  - Distributed data placement
-
-### 10. Build System & Dependencies
+### Build System & Dependencies
 
 **File**: `CMakeLists.txt`
 - **Pattern**: Modern CMake with submodules
@@ -402,13 +1318,50 @@ test_*          # Unit test executables
 4. **Output Generation**: Logits → Sampling → Token generation
 5. **Result Collection**: Distributed gather → Response formatting
 
-### Current State (Abstract Pipeline)
+## Execution Flow
 
-1. **Initialization**: MPI setup → Topology detection → Environment snapshot
-2. **Model Load**: GGUF parse → Weight tensors (auto Simple/COSMA selection) → Optional adapter wrapping
-3. **Prefill**: Abstract pipeline issues RMSNorm, QKV projection, attention primitives, MLP phases (distributed prefill manager engaged above thresholds)
-4. **Decode Loop** (interactive / generation): Repeated attention + MLP using latency‑optimized local backends
-5. **Output**: Logits retrieval → Sampling / chat interface → Optional validation & perf summary
+### Runtime Lifecycle
+
+1. **Initialization**: 
+   - MPI setup (`MPI_Init_thread` with `MPI_THREAD_MULTIPLE`)
+   - NUMA topology detection
+   - Environment snapshot creation (`debugEnv()`)
+   - OpenMP thread configuration
+
+2. **Model Loading**:
+   - GGUF file parsing (metadata + tensor directory)
+   - Weight tensor instantiation (auto SimpleTensor/COSMATensor selection)
+   - MPI broadcast/distribution of weights
+   - Pipeline creation via `PipelineFactory::create(config)`
+
+3. **Prefill Phase**:
+   - Token sequence → embedding lookup
+   - Per-layer execution:
+     - RMSNorm (attention)
+     - QKV projection (COSMA path if threshold met via `cosma_prefill_manager`)
+     - Multi-head attention (RoPE + scaled dot-product)
+     - Residual connection
+     - RMSNorm (MLP)
+     - MLP (Gate/Up/SwiGLU/Down with adaptive backend)
+     - Residual connection
+   - Output RMSNorm + LM head projection
+   - KV cache initialization
+
+4. **Decode Loop** (Autoregressive Generation):
+   - Single token → embedding lookup
+   - Per-layer execution (same structure, latency-optimized):
+     - Local OpenBLAS for all matmuls
+     - KV cache append
+     - Causal attention over growing context
+   - Output projection → logits
+   - External sampling/chat interface
+   - Repeat until stopping condition
+
+5. **Completion**:
+   - Optional performance summary (if perf counters enabled)
+   - Optional KV cache statistics (if `--kv-stats` flag set)
+   - Validation logging (if diagnostics enabled)
+   - MPI cleanup (`MPI_Finalize`)
 
 ## Performance Characteristics
 
@@ -431,19 +1384,45 @@ test_*          # Unit test executables
 - **Kernel Registration**: Pluggable optimization for different operations
 - **Topology Awareness**: Hardware-specific optimizations
 
-## Testing Infrastructure
+## Testing Strategy
 
 **Directory**: `tests/`
-- **test_basic.cpp**: MPI initialization and basic functionality
-- **test_numa.cpp**: NUMA topology detection and affinity
-- **test_cosma.cpp**: Matrix multiplication and COSMA integration
-- **test_graph.cpp**: Compute graph construction and execution
 
-**Test Coverage**:
-- Component initialization and configuration
-- MPI communication and coordination
-- System topology detection accuracy
-- Matrix operation correctness and performance
+**Core Infrastructure Tests**:
+- `test_basic.cpp`: MPI initialization and basic functionality
+- `test_numa.cpp`: NUMA topology detection and affinity  
+- `test_pipeline_factory.cpp`: Pipeline factory registration and creation
+
+**Pipeline & Parity Tests**:
+- `test_qwen_pipeline.cpp`: Qwen pipeline functionality (4 test cases)
+- `test_abstract_pipeline_parity.cpp`: Prefill vs incremental decode equivalence
+- `test_kv_cache_growth*.cpp`: KV cache capacity management
+
+**Backend & Kernel Tests**:
+- `test_cosma_prefill_*.cpp`: Fused COSMA correctness and statistics
+- `test_adaptive_matmul*.cpp`: Backend selection validation
+- `test_mpi_linear_kernel.cpp`: Distributed linear projection
+- `test_cosma.cpp`: Core COSMA integration
+
+**Primitive Tests**:
+- `test_rmsnorm_*.cpp`: RMSNorm correctness and parity
+- `test_attention_*.cpp`: Attention mechanism validation
+- `test_rope_*.cpp`: RoPE positional encoding
+- `test_softmax_*.cpp`: Softmax numerical stability
+- `test_mlp_tp_parity.cpp`: MLP distributed parity
+- `test_tp_*.cpp`: Tensor partition correctness
+
+**Test Coverage Focus**:
+- ✅ Mathematical equivalence across execution paths (parity tests)
+- ✅ MPI communication correctness and coordination
+- ✅ Backend selection policy validation
+- ✅ KV cache state management
+- ✅ NUMA topology detection accuracy
+- ✅ Distributed execution correctness
+
+**Removed Historical Tests**:
+- ❌ `test_graph.cpp`: Generic compute graph (architecture removed)
+- ❌ `LinearKernelTest`: Legacy non-MPI kernel (retired after MPI migration)
 
 ## Development Patterns
 

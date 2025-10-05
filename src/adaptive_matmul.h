@@ -35,14 +35,12 @@
 #include <omp.h>
 #endif
 
+#include "matmul_backend_selection.h" // For MatMulBackend enum and MatMulBackendSelector
+
 namespace llaminar
 {
-
-    enum class MatMulBackend
-    {
-        OPENBLAS, // For small operations and single token inference
-        COSMA     // For large operations and prefill
-    };
+    // Note: MatMulBackend enum now defined in matmul_backend_selection.h
+    // Legacy MULTI_THREADED_OPENBLAS/COSMA values used directly
 
     class AdaptiveMatMulManager
     {
@@ -102,7 +100,7 @@ namespace llaminar
 
         mutable std::map<std::string, OperationStats> backend_stats_;
         // Track last backend used (for test introspection)
-        mutable MatMulBackend last_backend_ = MatMulBackend::OPENBLAS;
+        mutable MatMulBackend last_backend_ = MatMulBackend::MULTI_THREADED_OPENBLAS;
 
     public:
         AdaptiveMatMulManager()
@@ -131,7 +129,7 @@ namespace llaminar
             // 1. If MPI not initialized or only one rank -> OpenBLAS.
             if (!mpi_initialized_ || mpi_size_ == 1)
             {
-                return MatMulBackend::OPENBLAS;
+                return MatMulBackend::MULTI_THREADED_OPENBLAS;
             }
 
             // Access centralized debug environment snapshot
@@ -140,7 +138,7 @@ namespace llaminar
 
             if (adaptive_disabled || cosma_disabled)
             {
-                return MatMulBackend::OPENBLAS;
+                return MatMulBackend::MULTI_THREADED_OPENBLAS;
             }
 
             auto &prefill_mgr = CosmaPrefillManager::instance();
@@ -153,7 +151,7 @@ namespace llaminar
             // 2. Skip COSMA for massive vocab projections (n very large)
             if (n > VOCAB_PROJECTION_THRESHOLD)
             {
-                return MatMulBackend::OPENBLAS;
+                return MatMulBackend::MULTI_THREADED_OPENBLAS;
             }
 
             // 3. Use CosmaPrefillManager gating (env + world size) for prefill path
@@ -162,7 +160,7 @@ namespace llaminar
                 // Enforce explicit minimum sequence length for COSMA (policy): >= 4096 tokens
                 if (m < static_cast<int>(PREFILL_COSMA_SEQ_THRESHOLD))
                 {
-                    return MatMulBackend::OPENBLAS; // force OpenBLAS below threshold
+                    return MatMulBackend::MULTI_THREADED_OPENBLAS; // force OpenBLAS below threshold
                 }
                 if (prefill_mgr.enabled_for(m))
                 {
@@ -171,7 +169,7 @@ namespace llaminar
             }
 
             // 4. Everything else -> OpenBLAS.
-            return MatMulBackend::OPENBLAS;
+            return MatMulBackend::MULTI_THREADED_OPENBLAS;
         }
 
         // High-level matrix multiplication interface
@@ -186,7 +184,7 @@ namespace llaminar
                       bool is_prefill = false,
                       bool distributed_partition = false)
         {
-            MatMulBackend backend = MatMulBackend::OPENBLAS;
+            MatMulBackend backend = MatMulBackend::MULTI_THREADED_OPENBLAS;
             if (!distributed_partition)
             {
                 backend = selectBackend(m, n, k, is_prefill);
@@ -263,7 +261,7 @@ namespace llaminar
                 }
                 break;
             }
-            case MatMulBackend::OPENBLAS:
+            case MatMulBackend::MULTI_THREADED_OPENBLAS:
             {
                 success = multiply_openblas(A, B, C, m, n, k, transpose_A, transpose_B, alpha, beta);
                 break;
@@ -306,7 +304,7 @@ namespace llaminar
                     return false;
                 }
             }
-            last_backend_ = MatMulBackend::OPENBLAS;
+            last_backend_ = MatMulBackend::MULTI_THREADED_OPENBLAS;
             return true;
         }
 
@@ -656,7 +654,7 @@ namespace llaminar
                             beta, C, ldc);
                 auto t1 = std::chrono::high_resolution_clock::now();
                 double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::OPENBLAS, false);
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::MULTI_THREADED_OPENBLAS, false);
                 return true;
             }
             catch (const std::exception &e)
@@ -667,7 +665,7 @@ namespace llaminar
                 }
                 auto t1 = std::chrono::high_resolution_clock::now();
                 double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::OPENBLAS, false);
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::MULTI_THREADED_OPENBLAS, false);
                 return false;
             }
         }

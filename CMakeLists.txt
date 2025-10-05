@@ -147,10 +147,15 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/common/attention_primitives.cpp
     src/kernels/common/rmsnorm_core.cpp
     src/kernels/common/softmax_core.cpp
-    src/distributed_transformer_pipeline.cpp
+    src/qwen_pipeline.cpp
     src/pipeline_base.cpp
     src/backend_selector.cpp
+    src/matmul_backend_selection.cpp
+    src/large_matmul_plan.cpp
+    src/prefill_diagnostics.cpp
     src/abstract_pipeline.cpp
+    src/qwen_pipeline_adapter.cpp
+    src/llama_pipeline_adapter.cpp
     src/tensors/simple_tensor.cpp
     src/tensors/cosma_tensor.cpp
     src/tensors/tensor_factory.cpp
@@ -165,6 +170,7 @@ set(LLAMINAR_CORE_SOURCES
     src/backends/inference_backend.cpp
     # Adaptive architecture components
     src/adaptive_matmul.h
+    src/matmul_backend_selection.h
     src/adaptive_transformer_pipeline.h
     # Chat interface components
     src/chat/gguf_tokenizer.cpp
@@ -387,6 +393,14 @@ endif()
 add_executable(test_basic tests/test_basic.cpp)
 target_link_libraries(test_basic llaminar_core GTest::gtest GTest::gtest_main)
 add_test(NAME BasicTest COMMAND test_basic)
+
+add_executable(test_pipeline_factory tests/test_pipeline_factory.cpp)
+target_link_libraries(test_pipeline_factory llaminar_core GTest::gtest GTest::gtest_main)
+add_test(NAME PipelineFactoryTest COMMAND test_pipeline_factory)
+
+add_executable(test_large_matmul_plan tests/test_large_matmul_plan.cpp)
+target_link_libraries(test_large_matmul_plan llaminar_core GTest::gtest GTest::gtest_main)
+add_test(NAME LargeMatmulPlanTest COMMAND test_large_matmul_plan)
 
 add_executable(test_numa tests/test_numa.cpp)
 target_link_libraries(test_numa llaminar_core)
@@ -853,10 +867,10 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_transformer_pipeline PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_transformer_pipeline ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
-    # Renamed to reflect DistributedTransformerPipeline implementation (was MPITransformerPipelineTest)
-    add_llaminar_mpi_test(DistributedTransformerPipelineTest 2 test_mpi_transformer_pipeline)
+    # Renamed to reflect QwenPipeline implementation (was MPITransformerPipelineTest)
+    add_llaminar_mpi_test(QwenPipelineTest 2 test_mpi_transformer_pipeline)
     # Ensure this long-running MPI test cannot hang indefinitely; internal watchdog < 60s, external timeout at 60s
-    set_tests_properties(DistributedTransformerPipelineTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(QwenPipelineTest PROPERTIES TIMEOUT 60)
     
     # Adaptive Matrix Multiplication test
     # Shared logging bootstrap (object library) to unify test logging levels

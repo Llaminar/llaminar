@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "distributed_transformer_pipeline.h" // Provides DistributedTransformerPipeline definition
+#include "qwen_pipeline.h" // Provides QwenPipeline definition
 #include "adaptive_matmul.h"
 #include "logger.h"
 #include <memory>
@@ -22,15 +22,15 @@
 namespace llaminar
 {
 
-    class AdaptiveTransformerPipeline : public DistributedTransformerPipeline
+    class AdaptiveTransformerPipeline : public QwenPipeline
     {
     private:
         std::unique_ptr<AdaptiveMatMulManager> matmul_manager_;
         bool enable_performance_logging_;
 
     public:
-        AdaptiveTransformerPipeline(const TransformerLayerConfig &config, bool enable_logging = true)
-            : DistributedTransformerPipeline(config), enable_performance_logging_(enable_logging)
+        AdaptiveTransformerPipeline(const ModelConfig &config, bool enable_logging = true)
+            : QwenPipeline(config), enable_performance_logging_(enable_logging)
         {
             matmul_manager_ = std::make_unique<AdaptiveMatMulManager>();
 

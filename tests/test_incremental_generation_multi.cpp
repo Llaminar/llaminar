@@ -4,7 +4,7 @@
 // deterministic weight initialization and sampling temperature=0 (argmax sampling).
 
 #include "gtest/gtest.h"
-#include "distributed_transformer_pipeline.h"
+#include "qwen_pipeline.h"
 #include "chat/response_generator.h"
 #include "model_loader.h"
 #include "utils/debug_env.h"
@@ -42,9 +42,9 @@ namespace
 
     struct MiniDeterministicWeights
     {
-        static DistributedTransformerPipeline::ModelWeights build(DistributedTransformerPipeline &pipe, const TransformerLayerConfig &cfg)
+        static QwenPipeline::ModelWeights build(QwenPipeline &pipe, const TransformerLayerConfig &cfg)
         {
-            DistributedTransformerPipeline::ModelWeights W;
+            QwenPipeline::ModelWeights W;
             auto make_matrix = [&](int rows, int cols)
             {
                 auto t = pipe.allocateTestLocalTensor({rows, cols});
@@ -100,7 +100,7 @@ TEST(IncrementalGenerationMultiRankTest, PrefillDecodeIdenticalAcrossRanks)
     cfg.vocab_size = 32;
     cfg.max_seq_len = 64;
     cfg.eps = 1e-5f;
-    auto pipe_unique = createDistributedTransformerPipeline(cfg);
+    auto pipe_unique = createQwenPipeline(ModelConfig(cfg, "qwen"));
     ASSERT_NE(pipe_unique, nullptr);
     auto weights = MiniDeterministicWeights::build(*pipe_unique, cfg);
     auto shared_pipe = std::shared_ptr<AbstractPipeline>(pipe_unique.release());
@@ -152,7 +152,7 @@ TEST(IncrementalGenerationMultiRankTest, PrefillDecodeIdenticalAcrossRanks)
 
     // Perform a couple of decode steps deterministically: choose argmax.
     int steps = 3;
-    auto *dist_pipeline = dynamic_cast<DistributedTransformerPipeline *>(shared_pipe.get());
+    auto *dist_pipeline = dynamic_cast<QwenPipeline *>(shared_pipe.get());
     ASSERT_NE(dist_pipeline, nullptr);
     for (int s = 0; s < steps; ++s)
     {
@@ -206,7 +206,7 @@ TEST(IncrementalGenerationMultiRankTest, PrefillDecodeStopsOnEOS)
     cfg.vocab_size = 32;
     cfg.max_seq_len = 64;
     cfg.eps = 1e-5f;
-    auto pipe_unique = createDistributedTransformerPipeline(cfg);
+    auto pipe_unique = createQwenPipeline(ModelConfig(cfg, "qwen"));
     ASSERT_NE(pipe_unique, nullptr);
     auto weights = MiniDeterministicWeights::build(*pipe_unique, cfg);
     auto shared_pipe = std::shared_ptr<AbstractPipeline>(pipe_unique.release());
@@ -237,7 +237,7 @@ TEST(IncrementalGenerationMultiRankTest, PrefillDecodeStopsOnEOS)
     std::memcpy(last_row.data(), logits_tensor->data() + (rows - 1) * cols, sizeof(float) * cols);
 
     const int eos_id = cols - 1; // deterministic largest logit expected at final column
-    auto *dist_pipeline = dynamic_cast<DistributedTransformerPipeline *>(shared_pipe.get());
+    auto *dist_pipeline = dynamic_cast<QwenPipeline *>(shared_pipe.get());
     ASSERT_NE(dist_pipeline, nullptr);
 
     int max_steps = 8;

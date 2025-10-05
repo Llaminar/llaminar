@@ -15,6 +15,12 @@ namespace llaminar
         LOG_DEBUG("PipelineBase initialized on rank " << getRank() << "/" << getSize());
     }
 
+    PipelineBase::PipelineBase(const MPIContext &ctx) : MPIKernelBase(ctx)
+    {
+        initializePipeline();
+        LOG_DEBUG("PipelineBase initialized from MPIContext: " << mpi_ctx_.toString());
+    }
+
     bool PipelineBase::registerKernel(const std::string &name, std::unique_ptr<MPIKernelBase> kernel)
     {
         if (hasKernel(name))

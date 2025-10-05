@@ -1,15 +1,15 @@
 /**
- * @file distributed_transformer_pipeline.cpp
- * @brief Canonical implementation of the DistributedTransformerPipeline class.
+ * @file qwen_pipeline.cpp
+ * @brief Canonical implementation of the QwenPipeline class.
  * @author David Sanftenberg
  *
- * This is the primary implementation translation unit for the distributed transformer pipeline.
- * It was migrated from the legacy mpi_transformer_pipeline.cpp (now a deprecation shim).
+ * This is the primary implementation translation unit for the Qwen-specific transformer pipeline.
+ * It was migrated from the legacy distributed_transformer_pipeline.cpp.
  * Historical implementation details remain in the legacy file for reference.
  *
  * @section architecture Architecture Overview
  *
- * The DistributedTransformerPipeline implements a multi-stage transformer inference engine
+ * The QwenPipeline implements a multi-stage transformer inference engine
  * with support for:
  * - Multi-node MPI-based distribution
  * - NUMA-aware tensor placement
@@ -53,7 +53,7 @@
  * Production incremental decode remains unchanged and incurs no overhead.
  */
 
-#include "distributed_transformer_pipeline.h"
+#include "qwen_pipeline.h"
 #include "qwen_pipeline_adapter.h" // For QwenModelWeights
 #include "prefill_diagnostics.h"   // For baseline comparison and FFN tracing
 #include "model_loader.h"
@@ -108,23 +108,23 @@ void resetReplayFirstExceedFlag() { g_replay_first_exceed.store(false); }
 namespace llaminar
 {
     // Forward declaration of internal bridge (defined later in this TU)
-    DistributedTransformerPipeline::ModelWeights loadModelWeights_impl_bridge(
+    QwenPipeline::ModelWeights loadModelWeights_impl_bridge(
         ModelLoader &loader,
-        const DistributedTransformerPipeline::LayerConfig &config);
+        const QwenPipeline::LayerConfig &config);
     // Factory helper implementation (migrated from legacy)
-    std::unique_ptr<DistributedTransformerPipeline> createDistributedTransformerPipeline(const ModelConfig &config)
+    std::unique_ptr<QwenPipeline> createQwenPipeline(const ModelConfig &config)
     {
-        return std::make_unique<DistributedTransformerPipeline>(config);
+        return std::make_unique<QwenPipeline>(config);
     }
 
     // (logFFNRowPreviewIfEnabled and isFFNShardTracingEnabledFor moved to prefill_diagnostics.h/.cpp)
 
-    bool DistributedTransformerPipeline::executeTransformerLayer(int layer_idx,
-                                                                 std::shared_ptr<TensorBase> &input,
-                                                                 const ModelWeights &weights,
-                                                                 std::shared_ptr<TensorBase> &output)
+    bool QwenPipeline::executeTransformerLayer(int layer_idx,
+                                               std::shared_ptr<TensorBase> &input,
+                                               const ModelWeights &weights,
+                                               std::shared_ptr<TensorBase> &output)
     {
-        PERF_SCOPED_TIMER("DistributedTransformerPipeline::executeTransformerLayer");
+        PERF_SCOPED_TIMER("QwenPipeline::executeTransformerLayer");
         int seq_len = input->shape()[0];
 
         // Initialize thread-local attention instrumentation context (consumed inside MPIAttentionKernel)
@@ -136,7 +136,7 @@ namespace llaminar
             int layer = -1;
             int seq_len = 0;
             int n_past = 0;
-            DistributedTransformerPipeline *pipeline = nullptr;
+            QwenPipeline *pipeline = nullptr;
         };
         static thread_local AttnInternalCaptureContext g_attn_ctx; // thread-local to remain safe under possible OMP parallelism later
         g_attn_ctx.active = debugEnv().pipeline.layer_token_diff && debugEnv().attention.internal_diff && getRank() == 0;
@@ -443,17 +443,17 @@ namespace llaminar
     //     std::call_once(qwen_register_flag, []()
     //                    { PipelineFactory::instance().registerCreator("qwen", [](const ModelConfig &cfg) -> std::unique_ptr<AbstractPipeline>
     //                                                                  {
-    // 			auto impl = std::make_unique<DistributedTransformerPipeline>(cfg);
+    // 			auto impl = std::make_unique<QwenPipeline>(cfg);
     // 			return std::unique_ptr<AbstractPipeline>(impl.release()); }); });
     // }
 
-    std::atomic<size_t> DistributedTransformerPipeline::small_seq_fast_path_calls_{0};
-    std::vector<float> DistributedTransformerPipeline::last_pre_lm_hidden_;
-    std::vector<DistributedTransformerPipeline::LayerActivationStat> DistributedTransformerPipeline::last_layer_stats_;
-    std::vector<DistributedTransformerPipeline::LayerTokenDiffRow> DistributedTransformerPipeline::last_layer_token_rows_;
+    std::atomic<size_t> QwenPipeline::small_seq_fast_path_calls_{0};
+    std::vector<float> QwenPipeline::last_pre_lm_hidden_;
+    std::vector<QwenPipeline::LayerActivationStat> QwenPipeline::last_layer_stats_;
+    std::vector<QwenPipeline::LayerTokenDiffRow> QwenPipeline::last_layer_token_rows_;
     // (parity sentinel atomic declared globally below outside namespace for accessor simplicity)
 
-    DistributedTransformerPipeline::DistributedTransformerPipeline(const ModelConfig &config)
+    QwenPipeline::QwenPipeline(const ModelConfig &config)
         : PipelineBase(), config_(config), use_kv_cache_(true), n_past_(0),
           total_embedding_time_(0.0), total_attention_time_(0.0), total_linear_time_(0.0),
           total_norm_time_(0.0), total_activation_time_(0.0), total_communication_time_(0.0)
@@ -478,12 +478,12 @@ namespace llaminar
                 LOG_INFO("[KVCacheInitMode] post-initial-capacity this=" << (const void *)this << " capacity_tokens=" << kv_cache_state_.capacity_tokens);
             }
         }
-        LOG_INFO("DistributedTransformerPipeline initialized on rank " << getRank() << "/" << getSize()
-                                                                       << " with arch='" << config_.architecture << "', " << config_.getLayerConfig().n_layers
-                                                                       << " layers, " << config_.getLayerConfig().n_head << " heads");
+        LOG_INFO("QwenPipeline initialized on rank " << getRank() << "/" << getSize()
+                                                     << " with arch='" << config_.architecture << "', " << config_.getLayerConfig().n_layers
+                                                     << " layers, " << config_.getLayerConfig().n_head << " heads");
     }
 
-    DistributedTransformerPipeline::DistributedTransformerPipeline(const ModelConfig &config, const MPIContext &ctx)
+    QwenPipeline::QwenPipeline(const ModelConfig &config, const MPIContext &ctx)
         : PipelineBase(ctx), config_(config), use_kv_cache_(true), n_past_(0),
           total_embedding_time_(0.0), total_attention_time_(0.0), total_linear_time_(0.0),
           total_norm_time_(0.0), total_activation_time_(0.0), total_communication_time_(0.0)
@@ -506,14 +506,14 @@ namespace llaminar
                 LOG_INFO("[KVCacheInitMode] post-initial-capacity this=" << (const void *)this << " capacity_tokens=" << kv_cache_state_.capacity_tokens);
             }
         }
-        LOG_INFO("DistributedTransformerPipeline initialized with " << mpi_ctx_.toString()
-                                                                    << " arch='" << config_.architecture << "', " << config_.getLayerConfig().n_layers
-                                                                    << " layers, " << config_.getLayerConfig().n_head << " heads");
+        LOG_INFO("QwenPipeline initialized with " << mpi_ctx_.toString()
+                                                  << " arch='" << config_.architecture << "', " << config_.getLayerConfig().n_layers
+                                                  << " layers, " << config_.getLayerConfig().n_head << " heads");
     }
 
-    DistributedTransformerPipeline::~DistributedTransformerPipeline() = default;
+    QwenPipeline::~QwenPipeline() = default;
 
-    void DistributedTransformerPipeline::initializeKernels()
+    void QwenPipeline::initializeKernels()
     {
         {
             auto embedding_kernel = std::make_unique<MPIEmbeddingKernel>(config_.getLayerConfig().vocab_size, config_.getLayerConfig().d_model);
@@ -545,7 +545,7 @@ namespace llaminar
         if (!registerKernel("residual", std::move(residual_kernel)))
             throw std::runtime_error("Failed to register Residual kernel");
 
-        LOG_DEBUG("DistributedTransformerPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
+        LOG_DEBUG("QwenPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
     }
 
     /**
@@ -560,10 +560,10 @@ namespace llaminar
      *  4. Emit summary header line
      *  5. Optionally emit sampled rows (bounded by cfg.limit)
      */
-    void DistributedTransformerPipeline::traceFFNShardDiagnostics(const std::string &label,
-                                                                  const float *data,
-                                                                  int seq_len,
-                                                                  int feature_dim)
+    void QwenPipeline::traceFFNShardDiagnostics(const std::string &label,
+                                                const float *data,
+                                                int seq_len,
+                                                int feature_dim)
     {
         // --- Stage 1: Guards ---
         const auto &cfg = debugEnv().ffn_shard_trace;
@@ -666,11 +666,11 @@ namespace llaminar
 // Out-of-line full weight loader implementation.
 namespace llaminar
 {
-    DistributedTransformerPipeline::ModelWeights loadModelWeights_impl_bridge(
+    QwenPipeline::ModelWeights loadModelWeights_impl_bridge(
         ModelLoader &loader,
-        const DistributedTransformerPipeline::LayerConfig &config)
+        const QwenPipeline::LayerConfig &config)
     {
-        DistributedTransformerPipeline::ModelWeights weights;
+        QwenPipeline::ModelWeights weights;
         LOG_INFO("[WeightLoad] begin vocab=" << config.vocab_size << " d_model=" << config.d_model << " layers=" << config.n_layers);
 
         // === Token Embedding ===
@@ -912,11 +912,11 @@ namespace llaminar
         return rows;
     }
 
-    bool DistributedTransformerPipeline::executeEmbedding(const std::vector<int> &token_ids,
-                                                          const std::shared_ptr<TensorBase> &embedding_weight,
-                                                          std::shared_ptr<TensorBase> &embedded_output)
+    bool QwenPipeline::executeEmbedding(const std::vector<int> &token_ids,
+                                        const std::shared_ptr<TensorBase> &embedding_weight,
+                                        std::shared_ptr<TensorBase> &embedded_output)
     {
-        PERF_SCOPED_TIMER("DistributedTransformerPipeline::executeEmbedding");
+        PERF_SCOPED_TIMER("QwenPipeline::executeEmbedding");
         int seq_len = (int)token_ids.size();
         if (seq_len <= 0)
         {
@@ -972,16 +972,16 @@ namespace llaminar
     }
 
     // Simple intermediate tensor factory
-    std::vector<std::shared_ptr<TensorBase>> DistributedTransformerPipeline::createIntermediateTensors(int seq_len)
+    std::vector<std::shared_ptr<TensorBase>> QwenPipeline::createIntermediateTensors(int seq_len)
     {
         return {createLocalTensor({seq_len, config_.getLayerConfig().d_model}), createLocalTensor({seq_len, config_.getLayerConfig().d_model})};
     }
 
-    bool DistributedTransformerPipeline::executeOutputProjection(std::shared_ptr<TensorBase> &input,
-                                                                 const ModelWeights &weights,
-                                                                 std::shared_ptr<TensorBase> &output)
+    bool QwenPipeline::executeOutputProjection(std::shared_ptr<TensorBase> &input,
+                                               const ModelWeights &weights,
+                                               std::shared_ptr<TensorBase> &output)
     {
-        PERF_SCOPED_TIMER("DistributedTransformerPipeline::executeOutputProjection");
+        PERF_SCOPED_TIMER("QwenPipeline::executeOutputProjection");
         int seq_len = input->shape()[0];
 
         // Debug instrumentation: trace entry for layer 0 when layer token diff enabled to diagnose
@@ -1033,7 +1033,7 @@ namespace llaminar
         return true;
     }
 
-    bool DistributedTransformerPipeline::validate(const ModelWeights &w) const
+    bool QwenPipeline::validate(const ModelWeights &w) const
     {
         // Helper: validate a vector of per-layer tensors
         auto check_vec = [&](const std::vector<std::shared_ptr<TensorBase>> &v, const char *name) -> bool
@@ -1085,7 +1085,7 @@ namespace llaminar
     }
 
     // KV cache initialization (simple replicated per-layer key/value buffers)
-    void DistributedTransformerPipeline::initializeKVCache(int seq_len)
+    void QwenPipeline::initializeKVCache(int seq_len)
     {
         if (!use_kv_cache_)
             return;
@@ -1105,7 +1105,7 @@ namespace llaminar
         kv_cache_state_.growth_events = 0;
     }
 
-    bool DistributedTransformerPipeline::ensureKVCapacityInternal(int required_tokens)
+    bool QwenPipeline::ensureKVCapacityInternal(int required_tokens)
     {
         if (!use_kv_cache_)
             return true;
@@ -1121,9 +1121,9 @@ namespace llaminar
         return required_tokens <= kv_cache_state_.capacity_tokens;
     }
 
-    bool DistributedTransformerPipeline::ensureKVCapacity(int required_tokens) { return ensureKVCapacityInternal(required_tokens); }
+    bool QwenPipeline::ensureKVCapacity(int required_tokens) { return ensureKVCapacityInternal(required_tokens); }
 
-    std::unique_ptr<IModelWeights> DistributedTransformerPipeline::loadWeights(const std::string &path)
+    std::unique_ptr<IModelWeights> QwenPipeline::loadWeights(const std::string &path)
     {
         // Use ModelLoader directly instead of deprecated free function
         ModelLoader loader;
@@ -1137,15 +1137,15 @@ namespace llaminar
         return weights;
     }
 
-    bool DistributedTransformerPipeline::execute(const std::vector<int> &token_ids,
-                                                 const ModelWeights &weights,
-                                                 std::shared_ptr<TensorBase> &output)
+    bool QwenPipeline::execute(const std::vector<int> &token_ids,
+                               const ModelWeights &weights,
+                               std::shared_ptr<TensorBase> &output)
     {
-        PERF_SCOPED_TIMER("DistributedTransformerPipeline::execute");
+        PERF_SCOPED_TIMER("QwenPipeline::execute");
         start_time_ = std::chrono::high_resolution_clock::now();
         if (!validate(weights))
         {
-            LOG_ERROR("DistributedTransformerPipeline: Weight validation failed");
+            LOG_ERROR("QwenPipeline: Weight validation failed");
             return false;
         }
         int seq_len = (int)token_ids.size();
@@ -1420,15 +1420,15 @@ namespace llaminar
     }
 
     // Override variant from AbstractPipeline not yet supported here
-    bool DistributedTransformerPipeline::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                                 std::vector<std::shared_ptr<TensorBase>> &outputs)
+    bool QwenPipeline::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                               std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        LOG_ERROR("DistributedTransformerPipeline::execute(vector) not supported; use execute(token_ids, weights, output) overload");
+        LOG_ERROR("QwenPipeline::execute(vector) not supported; use execute(token_ids, weights, output) overload");
         return false;
     }
 
     // Minimal logits() implementation – returns cached last logits tensor
-    bool DistributedTransformerPipeline::logits(std::shared_ptr<TensorBase> &out_logits)
+    bool QwenPipeline::logits(std::shared_ptr<TensorBase> &out_logits)
     {
         if (!last_logits_)
         {
@@ -1439,7 +1439,7 @@ namespace llaminar
         return true;
     }
 
-    const KVCacheState *DistributedTransformerPipeline::kvCacheState() const
+    const KVCacheState *QwenPipeline::kvCacheState() const
     {
         kv_snapshot_.capacity_tokens = kv_cache_state_.capacity_tokens;
         kv_snapshot_.used_tokens = kv_cache_state_.used_tokens;
@@ -1453,17 +1453,17 @@ namespace llaminar
 // === Section 4: AbstractPipeline interface (prefill/decode/logits) partial migration ===
 namespace llaminar
 {
-    bool DistributedTransformerPipeline::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                                  const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+    bool QwenPipeline::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.empty() || outputs.empty())
             return false;
         return true;
     }
 
-    bool DistributedTransformerPipeline::prefill(const std::vector<int> &tokens,
-                                                 const IModelWeights &weights_iface,
-                                                 StageContext &ctx)
+    bool QwenPipeline::prefill(const std::vector<int> &tokens,
+                               const IModelWeights &weights_iface,
+                               StageContext &ctx)
     {
         setStagePrefill();
         current_tokens_ = tokens;
@@ -1488,9 +1488,9 @@ namespace llaminar
         return true;
     }
 
-    bool DistributedTransformerPipeline::decode(int next_token,
-                                                const IModelWeights &weights_iface,
-                                                StageContext &ctx)
+    bool QwenPipeline::decode(int next_token,
+                              const IModelWeights &weights_iface,
+                              StageContext &ctx)
     {
         const auto *w = dynamic_cast<const QwenModelWeights *>(&weights_iface);
         if (!w)
@@ -1546,9 +1546,9 @@ namespace llaminar
      *  true  -> incremental path executed (logits written to output_logits, parity check optional)
      *  false -> caller should fall back to full prefill+decode (e.g. guards, capacity failure)
      */
-    bool DistributedTransformerPipeline::incrementalDecodeToken(int token_id,
-                                                                const ModelWeights &weights,
-                                                                std::shared_ptr<TensorBase> &output_logits)
+    bool QwenPipeline::incrementalDecodeToken(int token_id,
+                                              const ModelWeights &weights,
+                                              std::shared_ptr<TensorBase> &output_logits)
     {
         // === Stage 1: Environment + guard checks ===
         const auto &env = debugEnv();
@@ -1735,7 +1735,7 @@ namespace llaminar
                         last_layer_token_rows_.clear(); // prepare for replay capture
 
                     // Execute replay in fresh pipeline
-                    auto replay_pipe = createDistributedTransformerPipeline(config_);
+                    auto replay_pipe = createQwenPipeline(config_);
                     auto replay_logits = TensorFactory::create_simple({(int)replay_seq.size(), config_.getLayerConfig().vocab_size});
                     bool replay_ok = replay_pipe && replay_pipe->execute(replay_seq, weights, replay_logits);
                     std::vector<LayerTokenDiffRow> rep_rows;
@@ -1877,15 +1877,15 @@ namespace llaminar
      * This implementation uses the optimized attention primitives from attention_primitives.cpp
      * which provide vectorized RoPE, efficient QK score computation, and numerically stable softmax.
      */
-    bool DistributedTransformerPipeline::executePrefillAttentionCosma(int layer_idx,
-                                                                      const LargeMatmulPlan &plan,
-                                                                      std::shared_ptr<TensorBase> &input,
-                                                                      const ModelWeights &weights,
-                                                                      std::shared_ptr<TensorBase> &attn_norm_out,
-                                                                      std::shared_ptr<TensorBase> &attn_out,
-                                                                      PrefillAttentionTiming &timing)
+    bool QwenPipeline::executePrefillAttentionCosma(int layer_idx,
+                                                    const LargeMatmulPlan &plan,
+                                                    std::shared_ptr<TensorBase> &input,
+                                                    const ModelWeights &weights,
+                                                    std::shared_ptr<TensorBase> &attn_norm_out,
+                                                    std::shared_ptr<TensorBase> &attn_out,
+                                                    PrefillAttentionTiming &timing)
     {
-        PERF_SCOPED_TIMER("DistributedTransformerPipeline::executePrefillAttentionCosma");
+        PERF_SCOPED_TIMER("QwenPipeline::executePrefillAttentionCosma");
 
         // Validate plan
         if (!plan.is_valid())

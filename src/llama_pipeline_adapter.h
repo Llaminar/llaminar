@@ -1,6 +1,16 @@
 /**
- * @file qwen_pipeline_adapter.h
- * @brief Adapter wrapping DistributedTransformerPipeline behind AbstractPipeline interface.
+ * @file llama_pipeline_adapter.h
+ * @brief Adapter wrapping DistributedTransformerPipeline for Llama models.
+ * @author David Sanftenberg
+ *
+ * This is a stub implementation that validates the multi-architecture interface.
+ * Initially reuses the Qwen/DistributedTransformerPipeline implementation since
+ * both architectures share similar transformer structures.
+ *
+ * Future enhancements can specialize Llama-specific features:
+ * - Different attention mechanisms (e.g., GQA)
+ * - Llama-specific normalization (RMSNorm variations)
+ * - Rope frequency adjustments
  */
 #pragma once
 
@@ -11,12 +21,13 @@
 namespace llaminar
 {
     /**
-     * @brief Qwen-specific model weights implementing IModelWeights interface.
+     * @brief Llama-specific model weights implementing IModelWeights interface.
      *
      * Wraps DistributedTransformerPipeline::ModelWeights and provides typed accessors
-     * for architecture-agnostic code to access common weight components.
+     * for architecture-agnostic code. Currently identical to QwenModelWeights structure
+     * since both use the same underlying weight layout.
      */
-    struct QwenModelWeights : public IModelWeights
+    struct LlamaModelWeights : public IModelWeights
     {
         QwenPipeline::ModelWeights inner;
 
@@ -38,23 +49,30 @@ namespace llaminar
         const std::shared_ptr<TensorBase> &w_down(int layer) const { return inner.w_down[layer]; }
     };
 
-    class QwenPipelineAdapter : public AbstractPipeline
+    /**
+     * @brief Llama pipeline adapter implementing AbstractPipeline interface.
+     *
+     * This stub implementation delegates to DistributedTransformerPipeline,
+     * validating the multi-architecture factory pattern. Future versions can
+     * specialize Llama-specific optimizations while maintaining the same interface.
+     */
+    class LlamaPipelineAdapter : public AbstractPipeline
     {
     public:
-        explicit QwenPipelineAdapter(const ModelConfig &cfg);
+        explicit LlamaPipelineAdapter(const ModelConfig &cfg);
         const ModelConfig &config() const override { return cfg_; }
         bool prefill(const std::vector<int> &tokens, const IModelWeights &weights, StageContext &ctx) override;
         bool decode(int next_token, const IModelWeights &weights, StageContext &ctx) override;
         bool logits(std::shared_ptr<TensorBase> &out_logits) override;
-        std::string name() const override { return "QwenPipelineAdapter"; }
+        std::string name() const override { return "LlamaPipelineAdapter"; }
         const KVCacheState *kvCacheState() const override;
         bool ensureKVCapacity(int required_tokens) override;
 
         /**
-         * @brief Load Qwen model weights from file.
+         * @brief Load Llama model weights from file.
          *
          * @param path Path to GGUF model file
-         * @return QwenModelWeights wrapping the loaded weights
+         * @return LlamaModelWeights wrapping the loaded weights
          */
         std::unique_ptr<IModelWeights> loadWeights(const std::string &path) override;
 
@@ -65,6 +83,11 @@ namespace llaminar
         std::vector<int> current_tokens_;
     };
 
-    // Registration helper
-    void registerQwenPipeline();
+    /**
+     * @brief Register Llama pipeline with the factory.
+     *
+     * Call once during initialization to enable "llama" architecture support.
+     */
+    void registerLlamaPipeline();
+
 } // namespace llaminar

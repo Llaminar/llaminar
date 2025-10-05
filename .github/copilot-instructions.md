@@ -16,16 +16,26 @@ This document provides comprehensive guidelines for working with the Llaminar LL
 ## Project Overview
 
 Llaminar is a high-performance, distributed LLM inference engine built on:
+- **Multi-Architecture Pipeline System**: Factory-based extensible architecture for Qwen, LLaMA, and future models
+- **Centralized Backend Selection**: Single decision point via MatMulBackendSelector for OpenBLAS vs COSMA
 - **Hybrid Tensor System**: Zero-copy COSMA optimization with backward compatibility
 - **MPI Distribution**: Multi-node inference with NUMA-aware deployment
 - **Adaptive Backends**: OpenBLAS for small operations, COSMA for large-scale distributed computing
-- **Modular Architecture**: Clean separation of concerns with pluggable components
+- **Comprehensive Observability**: Structured environment snapshot, performance counters, validation framework
 
 ### Key Architecture Components
-- `src/main.cpp`: Application entry point with 7-stage execution pipeline
-- `src/kernels/`: Matrix operations, attention, and transformer components
+- `src/main.cpp`: Application entry point with pipeline factory-based execution
+- `src/abstract_pipeline.h`: Pipeline interface defining prefill/decode lifecycle
+- `src/pipeline_factory.h`: Factory registration system for model architectures
+- `src/qwen_pipeline.{h,cpp}`: Production Qwen model implementation
+- `src/qwen_pipeline_adapter.{h,cpp}`: Qwen adapter implementing AbstractPipeline
+- `src/llama_pipeline_adapter.{h,cpp}`: LLaMA adapter (prototype)
+- `src/matmul_backend_selection.{h,cpp}`: Centralized backend decision logic
+- `src/cosma_prefill_manager.{h,cpp}`: COSMA distributed prefill coordination
+- `src/prefill_diagnostics.{h,cpp}`: Modular prefill validation and comparison
+- `src/kernels/`: MPI-aware matrix operations, attention, and transformer components
 - `src/tensors/`: Hybrid tensor system (SimpleTensor + COSMATensor)
-- `src/mpi_*.cpp`: MPI-aware distributed computing components
+- `src/debug_env.{h,cpp}`: Centralized environment snapshot (replaces scattered getenv)
 
 ## Build System
 
@@ -149,9 +159,21 @@ bash -lc 'set -m; mpirun -np 2 gdb -q --batch -ex "handle SIGUSR1 pass nostop no
 
 - **BasicTest**: MPI initialization and basic functionality
 - **NumaTest**: NUMA topology detection and affinity
-- **CosmaTest**: Matrix multiplication and COSMA integration (currently failing due to precision issues)
-- **GraphTest**: Compute graph construction and execution
-// (Removed) LinearKernelTest: legacy non-MPI linear kernel test has been retired after full MPI migration.
+- **PipelineFactoryTest**: Pipeline factory registration and creation
+- **QwenPipelineTest**: Qwen pipeline functionality (4 test cases)
+- **AbstractPipelineParity**: Prefill vs incremental decode equivalence
+- **CosmaTest**: Matrix multiplication and COSMA integration (some precision edge cases)
+- **CosmaPrefillTests**: Fused COSMA correctness and statistics
+- **AdaptiveMatmulTests**: Backend decision logic validation
+- **MPILinearKernelTest**: Distributed linear projection
+- **AttentionTests**: Attention mechanism validation  
+- **RMSNormTests**: RMSNorm parity and edge cases
+- **KVCacheTests**: KV cache capacity management
+- **TPTests**: Tensor partition correctness
+
+**Removed Historical Tests:**
+- ❌ `test_graph.cpp`: Generic compute graph (architecture removed)
+- ❌ `LinearKernelTest`: Legacy non-MPI kernel (retired after MPI migration)
 
 ## Debugging with GDB
 

@@ -1,4 +1,5 @@
-#include "distributed_transformer_pipeline.h"
+#include "qwen_pipeline.h"
+#include "qwen_pipeline_adapter.h"
 #include "cosma_prefill_manager.h"
 #include "tensors/tensor_factory.h"
 #include "model_loader.h"
@@ -436,8 +437,19 @@ TEST(PrefillAttentionGolden, PipelineMatchesLlamaBaseline)
             continue;
         }
 
-        auto weights = loadModelWeights(loader, config);
-        DistributedTransformerPipeline pipeline(config);
+        ModelConfig model_cfg(config, "qwen");
+        QwenPipeline pipeline(model_cfg);
+
+        // Use pipeline's loadWeights method
+        auto loaded_weights = pipeline.loadWeights(model_path);
+        auto *qwen_weights = dynamic_cast<QwenModelWeights *>(loaded_weights.get());
+        if (!qwen_weights)
+        {
+            ADD_FAILURE() << "Failed to load weights as QwenModelWeights";
+            continue;
+        }
+        auto weights = std::move(qwen_weights->inner);
+
         const int vocab = config.vocab_size;
 
         for (const auto &pattern : token_patterns)
@@ -583,7 +595,7 @@ TEST(PrefillAttentionGolden, PipelineMatchesLlamaBaseline)
             // Fetch layerwise stats for spike detection (must be after execute)
             if (layerwise_scan && rank == 0)
             {
-                const auto &stats = DistributedTransformerPipeline::getLastLayerActivationStats();
+                const auto &stats = QwenPipeline::getLastLayerActivationStats();
                 // Simple heuristic: compute per-layer deltas vs previous layer
                 for (size_t i = 1; i < stats.size(); ++i)
                 {
@@ -611,7 +623,7 @@ TEST(PrefillAttentionGolden, PipelineMatchesLlamaBaseline)
             // True elementwise pre-LM hidden comparison (post final norm, before LM head) rank 0 only
             if (compare_pre_lm && rank == 0)
             {
-                const auto &pre_hidden = DistributedTransformerPipeline::getLastPreLMHidden();
+                const auto &pre_hidden = QwenPipeline::getLastPreLMHidden();
                 if (pre_hidden.empty())
                 {
                     std::cout << "[PRE_LM_HIDDEN] capture empty; skipping diff" << std::endl;

@@ -32,16 +32,16 @@ namespace llaminar
         LOG_INFO("PipelineFactory: registered pipeline arch='" << arch << "'");
     }
 
-    std::unique_ptr<AbstractPipeline> PipelineFactory::create(const std::string &arch, const TransformerLayerConfig &cfg) const
+    std::unique_ptr<AbstractPipeline> PipelineFactory::create(const ModelConfig &cfg) const
     {
         for (const auto &p : creators_)
         {
-            if (p.first == arch)
+            if (p.first == cfg.architecture)
             {
                 return p.second(cfg);
             }
         }
-        LOG_ERROR("PipelineFactory: no creator registered for arch='" << arch << "'");
+        LOG_ERROR("PipelineFactory: no creator registered for arch='" << cfg.architecture << "'");
         return nullptr;
     }
 } // namespace llaminar

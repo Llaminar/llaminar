@@ -61,7 +61,15 @@ namespace llaminar
     {
     public:
         virtual ~AbstractPipeline() = default;
-        virtual const TransformerLayerConfig &config() const = 0;
+
+        /**
+         * @brief Get the model configuration.
+         *
+         * Returns the full ModelConfig including architecture and feature flags.
+         * For backward compatibility, the layer config can be accessed via config().getLayerConfig().
+         */
+        virtual const ModelConfig &config() const = 0;
+
         virtual bool prefill(const std::vector<int> &tokens,
                              const IModelWeights &weights,
                              StageContext &ctx) = 0;
@@ -70,6 +78,17 @@ namespace llaminar
                             StageContext &ctx) = 0;
         virtual bool logits(std::shared_ptr<TensorBase> &out_logits) = 0; // obtain last computed logits
         virtual std::string name() const = 0;
+
+        /**
+         * @brief Load model weights from file path.
+         *
+         * @param path Path to the model file (e.g., GGUF file)
+         * @return Loaded weights wrapped in architecture-specific IModelWeights implementation
+         *
+         * This replaces the legacy free loadModelWeights() functions with a virtual
+         * method that allows each architecture adapter to handle its own loading logic.
+         */
+        virtual std::unique_ptr<IModelWeights> loadWeights(const std::string &path) = 0;
 
         // KV cache management (optional – implementations without KV caching may return nullptr / false)
         virtual const KVCacheState *kvCacheState() const { return nullptr; }
@@ -82,10 +101,10 @@ namespace llaminar
     class PipelineFactory
     {
     public:
-        using CreateFn = std::unique_ptr<AbstractPipeline> (*)(const TransformerLayerConfig &);
+        using CreateFn = std::unique_ptr<AbstractPipeline> (*)(const ModelConfig &);
         static PipelineFactory &instance();
         void registerCreator(const std::string &arch, CreateFn fn);
-        std::unique_ptr<AbstractPipeline> create(const std::string &arch, const TransformerLayerConfig &cfg) const;
+        std::unique_ptr<AbstractPipeline> create(const ModelConfig &cfg) const;
 
     private:
         PipelineFactory() = default;

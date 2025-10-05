@@ -1,4 +1,4 @@
-#include "distributed_transformer_pipeline.h" // DistributedTransformerPipeline
+#include "qwen_pipeline.h" // QwenPipeline
 #include "gtest/gtest.h"
 #include <cstdlib>
 
@@ -25,7 +25,7 @@ protected:
         cfg.vocab_size = 32;
         cfg.max_seq_len = 64;
         cfg.eps = 1e-5f;
-        pipeline_ = createDistributedTransformerPipeline(cfg);
+        pipeline_ = createQwenPipeline(ModelConfig(cfg, "qwen"));
 
         // Minimal weight tensors sized per config
         auto make_matrix = [&](int rows, int cols)
@@ -61,8 +61,8 @@ protected:
         weights_.lm_head = make_matrix(cfg.d_model, cfg.vocab_size);
     }
 
-    std::unique_ptr<DistributedTransformerPipeline> pipeline_;
-    DistributedTransformerPipeline::ModelWeights weights_;
+    std::unique_ptr<QwenPipeline> pipeline_;
+    QwenPipeline::ModelWeights weights_;
 };
 
 TEST_F(KVCacheGrowthTest, DynamicInitializationAndGrowth)

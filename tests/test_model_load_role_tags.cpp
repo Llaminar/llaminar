@@ -9,13 +9,8 @@
 
 #include "logger.h"
 #include "model_loader.h"
-#include "distributed_transformer_pipeline.h"
-
-// Forward declaration of helper (inside llaminar namespace)
-namespace llaminar
-{
-    DistributedTransformerPipeline::ModelWeights loadModelWeights(const std::string &model_path, const DistributedTransformerPipeline::LayerConfig &config);
-}
+#include "qwen_pipeline.h"
+#include "qwen_pipeline_adapter.h"
 
 namespace
 {
@@ -267,10 +262,15 @@ namespace
                 EXPECT_FALSE(saw_unsupported) << "Unsupported tensor encountered under REQUIRE_KNOWN_TYPES in model " << model_path;
             }
             auto config = loader.createLayerConfig();
-            auto pipeline = std::make_unique<llaminar::DistributedTransformerPipeline>(config);
-            auto weights = llaminar::loadModelWeights(model_path, config);
+            ModelConfig model_cfg(config, "qwen");
+            auto pipeline = std::make_unique<llaminar::QwenPipeline>(model_cfg);
+
+            // Use pipeline's loadWeights method
+            auto loaded_weights = pipeline->loadWeights(model_path);
+            auto *qwen_weights = dynamic_cast<llaminar::QwenModelWeights *>(loaded_weights.get());
+            ASSERT_NE(qwen_weights, nullptr) << "Failed to load weights as QwenModelWeights";
+            auto weights = std::move(qwen_weights->inner);
             (void)weights;
-            (void)pipeline;
             auto lines = Logger::getInstance().recent_lines();
             if (rank == 0)
             {

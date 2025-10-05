@@ -1,5 +1,12 @@
 # Llaminar
-An LLM inferencing engine using COSMA / Open MPI for hyper-scalability 
+
+A high-performance, MPI-first LLM inference engine with multi-architecture pipeline support, adaptive backend selection, and distributed execution capabilities.
+
+**Key Features:**
+- ✨ **Multi-Architecture Pipeline**: Factory-based system supporting Qwen, LLaMA, and extensible to new model families
+- 🚀 **Adaptive Backend Selection**: Intelligent routing between OpenBLAS (low latency) and COSMA (high throughput)
+- 🔧 **Distributed Execution**: MPI-aware kernels with 1D tensor sharding and NUMA optimization
+- 📊 **Comprehensive Observability**: Structured environment controls, performance counters, and validation
 
 ## Quick Start
 
@@ -81,86 +88,100 @@ mpirun -np 2 --bind-to socket --map-by socket \
 
 ## Architecture
 
-### Architecture Overview (ASCII Diagram)
+### Architecture Overview
+
 ```
-         +-----------------------------------------+
-         |            Inference Flow               |
-         +-----------------------------------------+
-   Model Load & Init (GGUF parse, quant tensors, topology)      
-         |
+┌─────────────────────────────────────────────────────────────┐
+│                      Llaminar Architecture                  │
+└─────────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│ Model Config │ (GGUF metadata: arch, dims, layers)
+└──────┬───────┘
+       │
+       v
+┌────────────────────┐
+│ PipelineFactory    │ ──> Registered creators: {"qwen", "llama", ...}
+└────────┬───────────┘
+         │ create(config)
          v
-     +----------------------+    Environment / Heuristic    
-     | Distribution Mode    |<-----------------------------+
-     |  replicated / sharded|   (param count, mem fraction)
-     +----------+-----------+
-          |
-          v
-     +----------------------+      +----------------------+
-     | Shard / TP Metadata  |      |   Debug Env Snapshot |
-     |  ShardSpec (heads/h) |      |  (prefill thresholds) |
-     |  TPPartitionSpec (*) |      |                      |
-     +----------+-----------+      +----------+-----------+
-          |                            |
-          +--------------+-------------+
-                |
-                v
-          +-------------------------------+
-          |      Layer Forward Pass       |
-          +-------------------------------+
-          |  Attention  |   MLP   | Norm  |
-          +------+------+--------+--------+
-           |         |        |
-           v         v        v
-       (Per MatMul) Backend Selection
-           |
-       +---------+------------------+
-       | PrefillBackend (large seq) |
-       | InferenceBackend (decode)  |
-       +---------------+------------+
-              |
-            launch(OpDesc,Ctx)
-              |
-        +--------------+---------------+
-        |  Fallback if Unsupported ->  |
-        |      adaptive_matmul()       |
-        +--------------+---------------+
-              |
-          Heuristic Arbitration
-              |
-       +------------------+------------------+
-       |     OpenBLAS (local)      | COSMA (dist) |
-       +--------------+------------+--------------+
-              |
-            Local/Dist Output
-              |
-        +-----------+------------+
-        | Attention Output Modes |
-        | local | gather_pre     |
-        | gather_post | replicated |
-        +-----------+------------+
-              |
-              Residual
-              |
-            Next Layer → ...
+┌──────────────────────────────────────────────────────────────┐
+│              AbstractPipeline (interface)                    │
+│  • prefill(tokens, weights, ctx)                            │
+│  • decode(token, weights, ctx)                              │
+│  • logits(out_logits)                                       │
+│  • loadWeights(path) -> IModelWeights                       │
+└──────────────────────────────────────────────────────────────┘
+         │
+         ├─────────────────┬─────────────────┐
+         v                 v                 v
+  ┌─────────────┐   ┌─────────────┐   ┌──────────────┐
+  │QwenPipeline │   │LlamaPipeline│   │Future Models │
+  │  Adapter    │   │  Adapter    │   │   (plugin)   │
+  └──────┬──────┘   └──────┬──────┘   └──────┬───────┘
+         │                 │                  │
+         └────────┬────────┴──────────────────┘
+                  │
+                  v
+         ┌────────────────────┐
+         │ Per-Layer Execution│
+         └────────┬───────────┘
+                  │
+    ┌─────────────┼─────────────┐
+    │             │             │
+    v             v             v
+┌─────────┐  ┌───────┐  ┌─────────┐
+│Attention│  │  MLP  │  │ RMSNorm │
+└────┬────┘  └───┬───┘  └────┬────┘
+     │           │           │
+     └───────┬───┴───┬───────┘
+             │       │
+             v       v
+    ┌────────────────────────┐
+    │MatMulBackendSelector  │ (Centralized policy)
+    └────────┬───────────────┘
+             │
+      ┌──────┴──────┐
+      │             │
+      v             v
+ ┌─────────┐  ┌──────────┐
+ │OpenBLAS │  │  COSMA   │
+ │ (local) │  │ (distrib)│
+ └─────────┘  └──────────┘
 
-(* planned future TP executor enabling row/col shard execution.)
-
-Rank 0 One-Time Logs:
-  MODEL_DIST ...
-  BACKEND_DECISION_SUMMARY component=Attention ...
-  BACKEND_DECISION_SUMMARY component=MLP ...
+Execution Flow:
+1. Factory creates architecture-specific pipeline
+2. Pipeline loads weights via IModelWeights interface
+3. Prefill: Large batch processing with COSMA path (if threshold met)
+4. Decode: Single-token autoregressive with local OpenBLAS
+5. Backend selection: Automatic based on operation size and stage
 ```
 
 
-All execution paths now go through MPI-aware kernels; legacy non-MPI kernels (LinearKernel, AttentionKernel, RMSNormKernel, MatMulKernel) have been removed. Backend selection (OpenBLAS vs COSMA) is centralized in `adaptive_matmul.h`, ensuring a single decision point and preventing divergence between sequential and distributed code paths.
+### Core Architecture Principles
 
-Design principles:
-1. Single backend arbitration layer (adaptive_matmul)
-2. MPI kernels handle both single-rank (np=1) and multi-rank modes
-3. No duplicate sequential test harnesses; tests target MPI variants directly
-4. Future distributed layout optimization (COSTA) will replace copy-in/copy-out in COSMA path (TODO)
+**Multi-Architecture Pipeline System:**
+- All model families implement `AbstractPipeline` interface
+- `PipelineFactory` provides registration and creation
+- Architecture-specific adapters (Qwen, LLaMA) handle model differences
+- Clean separation: pipeline orchestrates, kernels compute, selector chooses backend
 
-Implication: For local benchmarking use `mpirun -np 1` instead of reinstating legacy kernels.
+**MPI-First Design:**
+- All kernels derive from `MPIKernelBase`
+- Handles both single-rank (np=1) and multi-rank execution
+- NUMA-aware topology detection and binding
+- Legacy non-MPI kernels removed (LinearKernel, AttentionKernel, RMSNormKernel, MatMulKernel)
+
+**Centralized Backend Selection:**
+- `MatMulBackendSelector` is the single decision point
+- Stage-aware: different policies for prefill vs decode
+- Size-aware: small ops → single-thread, medium → multi-thread, large → distributed
+- Environment-driven: `ADAPTIVE_DISABLE_COSMA`, `LLAMINAR_COSMA_PREFILL_THRESHOLD`
+
+**Graceful Degradation:**
+- COSMA failures automatically fall back to OpenBLAS
+- Validation and diagnostics available via environment flags
+- Performance counters track backend decisions and execution time
 
 ### Attention Output Contract (Post-Gather Removal)
 The MPI attention kernel now always emits a per-rank *partial* output (only the contribution from

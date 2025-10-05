@@ -13,8 +13,11 @@
 #include "logger.h"
 #include "topology_manager.h"
 #include "model_loader.h"
-#include "distributed_transformer_pipeline.h" // DistributedTransformerPipeline (implements AbstractPipeline)
+#include "mpi_context.h"
+#include "qwen_pipeline.h" // QwenPipeline (implements AbstractPipeline)
 #include "abstract_pipeline.h"
+#include "qwen_pipeline_adapter.h"
+#include "llama_pipeline_adapter.h"
 #include "performance_timer.h"
 #include "utils/debug_env.h"
 #include "utils/perf_counters.h"
@@ -30,9 +33,12 @@ int main(int argc, char **argv)
 {
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
-    int rank = 0, size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Capture MPI context once at startup
+    MPIContext mpi_ctx = MPIContext::capture();
+    int rank = mpi_ctx.rank;
+    int size = mpi_ctx.size;
+
     // Initialize performance counters rank context (no-op if disabled)
     ::llaminar::perfCounters().set_rank(rank);
     int exit_code = 0;
@@ -150,21 +156,35 @@ int main(int argc, char **argv)
                 if (model_loader->loadModel(params.model_file))
                 {
                     LOG_INFO("Model loaded successfully");
-                    auto config = model_loader->createLayerConfig();
-                    LOG_INFO("Extracted model config: " << config.n_layers << " layers, "
-                                                        << config.n_head << " heads, " << config.d_model << " dimensions");
-                    LOG_INFO("Model config details: vocab_size=" << config.vocab_size
-                                                                 << ", max_seq_len=" << config.max_seq_len << ", d_ff=" << config.d_ff);
+                    auto layer_config = model_loader->createLayerConfig();
+                    LOG_INFO("Extracted model config: " << layer_config.n_layers << " layers, "
+                                                        << layer_config.n_head << " heads, " << layer_config.d_model << " dimensions");
+                    LOG_INFO("Model config details: vocab_size=" << layer_config.vocab_size
+                                                                 << ", max_seq_len=" << layer_config.max_seq_len << ", d_ff=" << layer_config.d_ff);
+
+                    // Create ModelConfig with architecture "qwen"
+                    ModelConfig model_config(layer_config, "qwen");
+                    // Auto-detect GQA from layer config
+                    model_config.has_gqa = (layer_config.n_head_kv < layer_config.n_head);
+
+                    // Register available architectures
                     registerQwenPipeline();
-                    pipeline = PipelineFactory::instance().create("qwen", config);
+                    registerLlamaPipeline();
+
+                    pipeline = PipelineFactory::instance().create(model_config);
                     if (!pipeline)
                         RETURN_FAIL(1, "Failed to create pipeline instance for architecture 'qwen'");
                     LOG_INFO("Pipeline initialized: " << pipeline->name());
                     try
                     {
-                        auto loaded = loadModelWeights(*model_loader, config);
-                        wrapped_weights = std::make_unique<QwenModelWeights>();
-                        wrapped_weights->inner = std::move(loaded);
+                        // Use the pipeline's loadWeights method instead of deprecated free function
+                        auto loaded_weights = pipeline->loadWeights(params.model_file);
+                        wrapped_weights = std::unique_ptr<QwenModelWeights>(
+                            dynamic_cast<QwenModelWeights *>(loaded_weights.release()));
+                        if (!wrapped_weights)
+                        {
+                            RETURN_FAIL(1, "Failed to cast loaded weights to QwenModelWeights");
+                        }
                         LOG_INFO("Model weights loaded");
                         if (rank == 0 && params.print_topology)
                         {

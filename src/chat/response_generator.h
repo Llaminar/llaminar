@@ -3,7 +3,7 @@
 #include "tokenizer_interface.h"
 #include "../argument_parser.h"
 #include "../abstract_pipeline.h"
-#include "../distributed_transformer_pipeline.h" // for QwenModelWeights definition (inherits IModelWeights)
+#include "../qwen_pipeline_adapter.h" // for QwenModelWeights definition (inherits IModelWeights)
 #include <memory>
 #include <vector>
 #include <string>

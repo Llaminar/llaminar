@@ -3,7 +3,7 @@
 // replaying the full sequence. Keeps model tiny & synthetic for speed.
 
 #include "gtest/gtest.h"
-#include "distributed_transformer_pipeline.h" // for createDistributedTransformerPipeline & weights struct
+#include "qwen_pipeline.h" // for createQwenPipeline & weights struct
 #include "chat/response_generator.h"
 #include "chat/gguf_tokenizer.h"
 #include "model_loader.h"
@@ -84,7 +84,7 @@ namespace
         std::string getTokenString(int32_t token_id) override { return std::string(1, (char)('a' + (token_id % 26))); }
     };
 
-    DistributedTransformerPipeline::ModelWeights makeTinyWeights(DistributedTransformerPipeline &pipe, const TransformerLayerConfig &cfg)
+    QwenPipeline::ModelWeights makeTinyWeights(QwenPipeline &pipe, const TransformerLayerConfig &cfg)
     {
         auto make_matrix = [&](int rows, int cols)
         {
@@ -98,7 +98,7 @@ namespace
         {
         auto t = pipe.allocateTestLocalTensor({dim});
         for (int i=0;i<dim;++i) t->data()[i] = 1.0f; return t; };
-        DistributedTransformerPipeline::ModelWeights W;
+        QwenPipeline::ModelWeights W;
         W.token_embedding = make_matrix(cfg.vocab_size, cfg.d_model);
         for (int l = 0; l < cfg.n_layers; ++l)
         {
@@ -142,7 +142,8 @@ TEST(IncrementalGenerationTest, PrefillThenDecodeIncrementsState)
     cfg.vocab_size = 32;
     cfg.max_seq_len = 64;
     cfg.eps = 1e-5f;
-    auto pipeline = createDistributedTransformerPipeline(cfg);
+    ModelConfig model_cfg(cfg, "qwen");
+    auto pipeline = createQwenPipeline(model_cfg);
     ASSERT_NE(pipeline, nullptr);
     auto weights = makeTinyWeights(*pipeline, cfg);
 
@@ -169,7 +170,7 @@ TEST(IncrementalGenerationTest, PrefillThenDecodeIncrementsState)
     EXPECT_GE(full.size(), 0u);
 
     // Access underlying distributed pipeline again for KV cache stats
-    auto *dist = dynamic_cast<DistributedTransformerPipeline *>(shared_pipe.get());
+    auto *dist = dynamic_cast<QwenPipeline *>(shared_pipe.get());
     ASSERT_NE(dist, nullptr);
     // After prefill + at least one decode, used tokens should be >= prompt size
     EXPECT_GE(dist->getKVCacheUsed(), (int)prompt.size());
@@ -200,7 +201,8 @@ TEST(IncrementalGenerationTest, PrefillDecodeStopsOnEOS)
     cfg.vocab_size = 32;
     cfg.max_seq_len = 64;
     cfg.eps = 1e-5f;
-    auto pipeline = createDistributedTransformerPipeline(cfg);
+    ModelConfig model_cfg(cfg, "qwen");
+    auto pipeline = createQwenPipeline(model_cfg);
     ASSERT_NE(pipeline, nullptr);
     auto weights = makeTinyWeights(*pipeline, cfg);
     auto shared_pipe = std::shared_ptr<AbstractPipeline>(pipeline.release());
@@ -217,7 +219,7 @@ TEST(IncrementalGenerationTest, PrefillDecodeStopsOnEOS)
     // We'll manually drive decode to observe KV usage & detect EOS.
     StageContext ctx;
     ASSERT_TRUE(shared_pipe->prefill(prompt, wrapper, ctx));
-    auto *dist = dynamic_cast<DistributedTransformerPipeline *>(shared_pipe.get());
+    auto *dist = dynamic_cast<QwenPipeline *>(shared_pipe.get());
     ASSERT_NE(dist, nullptr);
     EXPECT_EQ(dist->getKVCacheUsed(), (int)prompt.size());
 

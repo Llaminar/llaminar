@@ -88,12 +88,12 @@ namespace llaminar
     TEST_F(AdaptiveMatMulTest, BackendSelectionPolicy)
     {
         // All inference path operations should stay on OpenBLAS regardless of size
-        testBackendSelection(1, 896, 896, false, MatMulBackend::OPENBLAS);
-        testBackendSelection(128, 896, 896, false, MatMulBackend::OPENBLAS);
-        testBackendSelection(4096, 896, 896, false, MatMulBackend::OPENBLAS);
+        testBackendSelection(1, 896, 896, false, MatMulBackend::MULTI_THREADED_OPENBLAS);
+        testBackendSelection(128, 896, 896, false, MatMulBackend::MULTI_THREADED_OPENBLAS);
+        testBackendSelection(4096, 896, 896, false, MatMulBackend::MULTI_THREADED_OPENBLAS);
 
         // Prefill below threshold -> OpenBLAS
-        testBackendSelection(2048, 896, 896, true, MatMulBackend::OPENBLAS);
+        testBackendSelection(2048, 896, 896, true, MatMulBackend::MULTI_THREADED_OPENBLAS);
 
         // Prefill at threshold (requires multi-rank to actually select COSMA)
         if (size_ >= 2)
@@ -103,11 +103,11 @@ namespace llaminar
         else
         {
             // Single rank cannot use COSMA (falls back) even if threshold met
-            testBackendSelection(4096, 896, 896, true, MatMulBackend::OPENBLAS);
+            testBackendSelection(4096, 896, 896, true, MatMulBackend::MULTI_THREADED_OPENBLAS);
         }
 
         // Huge vocab projection always forced to OpenBLAS
-        testBackendSelection(4096, 151936, 896, true, MatMulBackend::OPENBLAS);
+        testBackendSelection(4096, 151936, 896, true, MatMulBackend::MULTI_THREADED_OPENBLAS);
     }
 
     // Test matrix multiplication correctness
@@ -158,7 +158,7 @@ namespace llaminar
         AdaptiveMatMulManager ref_mgr;
         ASSERT_TRUE(ref_mgr.multiply(A.data(), B.data(), C_openblas.data(), m, n, k,
                                      false, false, 1.0f, 0.0f, false));
-        ASSERT_EQ(ref_mgr.last_backend(), MatMulBackend::OPENBLAS);
+        ASSERT_EQ(ref_mgr.last_backend(), MatMulBackend::MULTI_THREADED_OPENBLAS);
 
         const char *ref_override = std::getenv("LLAMINAR_COSMA_TEST_REF");
         if (ref_override && std::string(ref_override) == std::string("1"))
@@ -239,7 +239,8 @@ namespace llaminar
 
         // Should not throw during initialization
         EXPECT_NO_THROW({
-            AdaptiveTransformerPipeline pipeline(config, false); // Disable logging for test
+            ModelConfig model_cfg(config, "qwen");
+            AdaptiveTransformerPipeline pipeline(model_cfg, false); // Disable logging for test
         });
     }
 
@@ -274,7 +275,7 @@ namespace llaminar
         ASSERT_TRUE(matmul_manager_->multiply(A.data(), B.data(), C.data(), m, 896, 896,
                                               false, false, 1.0f, 0.0f, true, /*distributed_partition*/ true));
         // Should have used OpenBLAS regardless of size
-        EXPECT_EQ(matmul_manager_->last_backend(), MatMulBackend::OPENBLAS);
+        EXPECT_EQ(matmul_manager_->last_backend(), MatMulBackend::MULTI_THREADED_OPENBLAS);
     }
 
     // Confirm COSMA actually chosen (multi-rank) and last_backend reflects it

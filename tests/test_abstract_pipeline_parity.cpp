@@ -1,5 +1,5 @@
 // Incremental decode parity test (adapter removed).
-// Ensures that for a unified DistributedTransformerPipeline implementation:
+// Ensures that for a unified QwenPipeline implementation:
 // 1. Prefill forward pass logits (final token row) are used as baseline.
 // 2. For each new decode token we compute a reference by replaying the entire sequence (prefill + decoded so far + next).
 // 3. The incremental decode path using KV cache must append a logits row identical (within 1e-5) to the replay reference row.
@@ -7,7 +7,7 @@
 // Tolerance kept tight (1e-5) because computation order is identical.
 
 #include "gtest/gtest.h"
-#include "distributed_transformer_pipeline.h" // provides DistributedTransformerPipeline & factory
+#include "qwen_pipeline.h" // provides QwenPipeline & factory
 #include "abstract_pipeline.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
@@ -44,9 +44,9 @@ namespace
         {
             gen.seed(123);
         }
-        DistributedTransformerPipeline::ModelWeights build()
+        QwenPipeline::ModelWeights build()
         {
-            DistributedTransformerPipeline::ModelWeights w;
+            QwenPipeline::ModelWeights w;
             auto randTensor = [&](const std::vector<int> &shape, float a = -0.01f, float b = 0.01f)
             {
                 auto t = TensorFactory::create_simple(shape);
@@ -94,7 +94,7 @@ namespace
     // Helper to wrap weights for AbstractPipeline factory
     struct WrappedQwenWeights : public QwenModelWeights
     {
-        explicit WrappedQwenWeights(const DistributedTransformerPipeline::ModelWeights &mw) { inner = mw; }
+        explicit WrappedQwenWeights(const QwenPipeline::ModelWeights &mw) { inner = mw; }
     };
 
 } // namespace
@@ -125,10 +125,15 @@ TEST(AbstractPipelineParity, PrefillAndIncrementalDecodeParity)
     ParityConfig pc;
     RandomWeightBuilder builder(pc.cfg);
     auto weights = builder.build();
-    auto pipeline = createDistributedTransformerPipeline(pc.cfg);
+
+    // Create ModelConfig with architecture "qwen"
+    ModelConfig model_config(pc.cfg, "qwen");
+    model_config.has_gqa = (pc.cfg.n_head_kv < pc.cfg.n_head);
+
+    auto pipeline = createQwenPipeline(model_config);
     // Create abstract instance (same underlying implementation now)
     registerQwenPipeline();
-    auto ap_pipeline = PipelineFactory::instance().create("qwen", pc.cfg);
+    auto ap_pipeline = PipelineFactory::instance().create(model_config);
     ASSERT_TRUE(ap_pipeline);
     // Prepare tokens
     const int prefill_len = 5;

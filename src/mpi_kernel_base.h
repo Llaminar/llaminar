@@ -2,6 +2,7 @@
 
 #include "kernel_base.h"
 #include "tensors/tensor_factory.h"
+#include "mpi_context.h"
 #include <mpi.h>
 #include <vector>
 #include <memory>
@@ -42,9 +43,10 @@ namespace llaminar
     class MPIKernelBase : public KernelBase
     {
     protected:
-        MPI_Comm comm_;        // MPI communicator
-        int rank_;             // Current process rank
-        int size_;             // Total number of processes
+        MPIContext mpi_ctx_;   // MPI context (rank, size, comm)
+        MPI_Comm comm_;        // MPI communicator (alias for mpi_ctx_.comm)
+        int rank_;             // Current process rank (alias for mpi_ctx_.rank)
+        int size_;             // Total number of processes (alias for mpi_ctx_.size)
         bool mpi_initialized_; // Whether MPI was initialized by this class
 
         // Communication buffers for optimization
@@ -60,6 +62,13 @@ namespace llaminar
         explicit MPIKernelBase(MPI_Comm comm = MPI_COMM_WORLD, bool init_mpi = true);
 
         /**
+         * Constructor with MPIContext (preferred for new code)
+         * @param ctx MPI context with rank, size, and communicator
+         * @param init_mpi Whether to initialize MPI if not already initialized
+         */
+        explicit MPIKernelBase(const MPIContext &ctx, bool init_mpi = true);
+
+        /**
          * Destructor - handles MPI cleanup if this class initialized it
          */
         virtual ~MPIKernelBase();
@@ -71,6 +80,11 @@ namespace llaminar
         // Allow move operations
         MPIKernelBase(MPIKernelBase &&other) noexcept;
         MPIKernelBase &operator=(MPIKernelBase &&other) noexcept;
+
+        /**
+         * Get MPI context
+         */
+        const MPIContext &mpiContext() const { return mpi_ctx_; }
 
         /**
          * Get current MPI rank

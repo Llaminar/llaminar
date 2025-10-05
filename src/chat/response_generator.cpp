@@ -379,15 +379,15 @@ namespace llaminar
                 return true;
             try
             {
-                // We need DistributedTransformerPipeline to load weights for now; dynamic cast ok
-                auto *dist = dynamic_cast<DistributedTransformerPipeline *>(pipeline_.get());
-                if (!dist)
+                // Use pipeline's loadWeights method instead of deprecated free function
+                auto loaded_weights = pipeline_->loadWeights(params_.model_file);
+                auto *qwen_weights = dynamic_cast<QwenModelWeights *>(loaded_weights.get());
+                if (!qwen_weights)
                 {
-                    LOG_ERROR("ensureWeights: underlying pipeline is not DistributedTransformerPipeline; external weight loading not implemented");
+                    LOG_ERROR("ensureWeights: loaded weights are not QwenModelWeights");
                     return false;
                 }
-                auto loaded = loadModelWeights(params_.model_file, dist->getConfig());
-                weights_.inner = std::move(loaded);
+                weights_.inner = std::move(qwen_weights->inner);
                 have_weights_ = true;
                 LOG_INFO("Weights loaded lazily in ensureWeights()");
                 return true;

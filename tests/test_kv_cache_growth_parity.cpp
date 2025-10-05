@@ -1,5 +1,5 @@
 // Parity test: prefill + incremental decodes (with KV cache growth) vs replaying full sequence.
-#include "distributed_transformer_pipeline.h" // DistributedTransformerPipeline
+#include "qwen_pipeline.h" // QwenPipeline
 #include "gtest/gtest.h"
 #include <cstdlib>
 #include <cmath>
@@ -10,10 +10,10 @@ namespace
 {
     struct TestWeightsBuilder
     {
-        static DistributedTransformerPipeline::ModelWeights build(std::unique_ptr<DistributedTransformerPipeline> &pipeline,
-                                                                  const DistributedTransformerPipeline::LayerConfig &cfg)
+        static QwenPipeline::ModelWeights build(std::unique_ptr<QwenPipeline> &pipeline,
+                                                                  const QwenPipeline::LayerConfig &cfg)
         {
-            DistributedTransformerPipeline::ModelWeights w;
+            QwenPipeline::ModelWeights w;
             auto make_matrix = [&](int rows, int cols)
             {
                 auto t = pipeline->allocateTestLocalTensor({rows, cols});
@@ -54,7 +54,7 @@ protected:
     void SetUp() override
     {
         // Ensure global capture store starts empty for this test (avoid contamination from prior tests)
-        DistributedTransformerPipeline::resetLayerTokenRows();
+        QwenPipeline::resetLayerTokenRows();
         setenv("LLAMINAR_KV_DYNAMIC_INIT", "1", 1);
         setenv("LLAMINAR_KV_GROWTH_FACTOR", "2", 1);
         setenv("LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF", "1", 1); // enable per-layer last-token capture
@@ -72,22 +72,22 @@ protected:
         cfg_.vocab_size = 32;
         cfg_.max_seq_len = 64;
         cfg_.eps = 1e-5f;
-        pipeline_dynamic_ = createDistributedTransformerPipeline(cfg_);
+        pipeline_dynamic_ = createQwenPipeline(cfg_);
         weights_ = TestWeightsBuilder::build(pipeline_dynamic_, cfg_);
         // Replay pipeline (allocate full cache up front by disabling dynamic init)
         unsetenv("LLAMINAR_KV_DYNAMIC_INIT");
         debugEnvRefresh();
-        pipeline_replay_ = createDistributedTransformerPipeline(cfg_);
+        pipeline_replay_ = createQwenPipeline(cfg_);
         weights_replay_ = TestWeightsBuilder::build(pipeline_replay_, cfg_);
         // Re-enable dynamic init for remainder (for subsequent tests if any)
         setenv("LLAMINAR_KV_DYNAMIC_INIT", "1", 1);
         debugEnvRefresh();
     }
-    DistributedTransformerPipeline::LayerConfig cfg_;
-    std::unique_ptr<DistributedTransformerPipeline> pipeline_dynamic_;
-    std::unique_ptr<DistributedTransformerPipeline> pipeline_replay_;
-    DistributedTransformerPipeline::ModelWeights weights_;
-    DistributedTransformerPipeline::ModelWeights weights_replay_;
+    QwenPipeline::LayerConfig cfg_;
+    std::unique_ptr<QwenPipeline> pipeline_dynamic_;
+    std::unique_ptr<QwenPipeline> pipeline_replay_;
+    QwenPipeline::ModelWeights weights_;
+    QwenPipeline::ModelWeights weights_replay_;
 };
 
 TEST_F(KVCacheGrowthParityTest, LogitsParityAcrossGrowth)
@@ -151,7 +151,7 @@ TEST_F(KVCacheGrowthParityTest, LogitsParityAcrossGrowth)
     full_seq.insert(full_seq.end(), generated.begin(), generated.end());
 
     // Capture incremental pre-LM hidden (static buffer) BEFORE running the full replay execute which will overwrite it.
-    std::vector<float> inc_pre_lm = DistributedTransformerPipeline::getLastPreLMHidden();
+    std::vector<float> inc_pre_lm = QwenPipeline::getLastPreLMHidden();
     if (getenv("GTEST_PARITY_VERBOSE") && pipeline_dynamic_->getRank() == 0)
     {
         LOG_INFO(std::string("[PreLMIncCapture] size=") + std::to_string(inc_pre_lm.size()));
@@ -221,7 +221,7 @@ TEST_F(KVCacheGrowthParityTest, LogitsParityAcrossGrowth)
     ASSERT_TRUE(pipeline_replay_->execute(full_seq, weights_replay_, full_logits_replay));
 
     // Capture replay pre-LM hidden after full execute
-    std::vector<float> rep_pre_lm = DistributedTransformerPipeline::getLastPreLMHidden();
+    std::vector<float> rep_pre_lm = QwenPipeline::getLastPreLMHidden();
     if (getenv("GTEST_PARITY_VERBOSE") && pipeline_dynamic_->getRank() == 0)
     {
         LOG_INFO(std::string("[PreLMRepCapture] size=") + std::to_string(rep_pre_lm.size()));
@@ -384,7 +384,7 @@ TEST_F(KVCacheGrowthParityTest, LogitsParityAcrossGrowth)
     // Per-layer last-token diff diagnostics (always on rank 0 for this test to aid debugging)
     if (pipeline_dynamic_->getRank() == 0)
     {
-        const auto &rows_all = DistributedTransformerPipeline::getLastLayerTokenRows();
+        const auto &rows_all = QwenPipeline::getLastLayerTokenRows();
         if (getenv("GTEST_PARITY_VERBOSE"))
         {
             LOG_INFO(std::string("[LayerTokenDiff] captured_rows=") + std::to_string(rows_all.size()));
@@ -392,8 +392,8 @@ TEST_F(KVCacheGrowthParityTest, LogitsParityAcrossGrowth)
         const void *dyn_ptr = pipeline_dynamic_.get();
         const void *rep_ptr = pipeline_replay_.get();
         // For incremental path, seq_len == 1 always (single token). We want the LAST captured incremental row for each layer.
-        std::vector<const DistributedTransformerPipeline::LayerTokenDiffRow *> dyn_last_inc(cfg_.n_layers, nullptr);
-        std::vector<const DistributedTransformerPipeline::LayerTokenDiffRow *> rep_final(cfg_.n_layers, nullptr);
+        std::vector<const QwenPipeline::LayerTokenDiffRow *> dyn_last_inc(cfg_.n_layers, nullptr);
+        std::vector<const QwenPipeline::LayerTokenDiffRow *> rep_final(cfg_.n_layers, nullptr);
         int final_seq = (int)full_seq.size();
         for (const auto &r : rows_all)
         {

@@ -1,4 +1,4 @@
-#include "../src/distributed_transformer_pipeline.h"
+#include "../src/qwen_pipeline.h"
 #include "../src/cosma_prefill_manager.h"
 #include "../src/tensors/tensor_factory.h"
 #include <gtest/gtest.h>
@@ -91,10 +91,11 @@ TEST(CosmaPrefillAttentionIntegration, PrefillPathMatchesBaseline)
     config.n_layers = 2;
     config.eps = 1e-5f;
 
-    DistributedTransformerPipeline pipeline(config);
+    ModelConfig model_cfg(config, "qwen");
+    QwenPipeline pipeline(model_cfg);
 
     std::mt19937 rng(42);
-    DistributedTransformerPipeline::ModelWeights weights;
+    QwenPipeline::ModelWeights weights;
     weights.token_embedding = makeTensor({config.vocab_size, config.d_model}, rng);
     weights.output_norm_weight = makeTensor({config.d_model}, rng);
     weights.lm_head = makeTensor({config.d_model, config.vocab_size}, rng);

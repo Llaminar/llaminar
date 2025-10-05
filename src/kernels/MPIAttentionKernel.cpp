@@ -60,7 +60,7 @@
 #include <sstream>
 #include <mpi.h>
 #include "tensors/tp_partition.h"
-#include "../distributed_transformer_pipeline.h" // for LayerTokenDiffRow instrumentation
+#include "../qwen_pipeline.h" // for LayerTokenDiffRow instrumentation
 
 namespace llaminar
 {
@@ -246,12 +246,12 @@ namespace llaminar
             size_t offset = (seq_len - 1) * slice;
             bool incr = (seq_len == 1 && n_past_ > 0);
             int capture_seq_len_meta = incr ? (n_past_ + 1) : (int)seq_len;
-            DistributedTransformerPipeline::appendInternalAttnRow(nullptr,
-                                                                  layer_index_, capture_seq_len_meta, incr,
-                                                                  "attn_int_q_proj", local_q->data() + offset, slice);
-            DistributedTransformerPipeline::appendInternalAttnRow(nullptr,
-                                                                  layer_index_, capture_seq_len_meta, incr,
-                                                                  "attn_int_k_proj", local_k->data() + offset, slice);
+            QwenPipeline::appendInternalAttnRow(nullptr,
+                                                layer_index_, capture_seq_len_meta, incr,
+                                                "attn_int_q_proj", local_q->data() + offset, slice);
+            QwenPipeline::appendInternalAttnRow(nullptr,
+                                                layer_index_, capture_seq_len_meta, incr,
+                                                "attn_int_k_proj", local_k->data() + offset, slice);
         }
         // Apply RoPE to local Q and K
         {
@@ -265,8 +265,8 @@ namespace llaminar
             size_t offset = (seq_len - 1) * slice;
             bool incr = (seq_len == 1 && n_past_ > 0);
             int capture_seq_len_meta = incr ? (n_past_ + 1) : (int)seq_len;
-            DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_q_rope", local_q->data() + offset, slice);
-            DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_k_rope", local_k->data() + offset, slice);
+            QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_q_rope", local_q->data() + offset, slice);
+            QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_k_rope", local_k->data() + offset, slice);
         }
 
         // Prefill KV cache population (only once at sequence start). Support both full and grouped KV heads.
@@ -498,7 +498,7 @@ namespace llaminar
                 if(debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank()==0) {
                     size_t slice = (size_t)local_heads * head_dim_;
                     const float *last_row_full = full_out->data() + (T - 1) * slice;
-                    DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, (int)T, true, "attn_int_context_full", last_row_full, slice);
+                    QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, (int)T, true, "attn_int_context_full", last_row_full, slice);
                 }
                 if(ade.decode_diag && ade.dump_full_qkv && getRank()==0 && (int)local_head_dim_sz <= ade.dump_limit) {
                     auto dump_vec = [&](const char* tag, const float* ptr){ std::ostringstream oss; oss<<"[DecodeAttnDump] "<<tag<<":"; for(size_t i=0;i<local_head_dim_sz;++i){ oss<<ptr[i]; if(i+1<local_head_dim_sz) oss<<","; } LOG_WARN(oss.str()); };
@@ -535,7 +535,7 @@ namespace llaminar
                 {
                     std::memcpy(tmp.data(), src_base, slice * sizeof(float));
                 }
-                DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, true, "attn_int_context", tmp.data(), slice);
+                QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, true, "attn_int_context", tmp.data(), slice);
             }
         }
         else
@@ -580,7 +580,7 @@ namespace llaminar
                     const float *src = local_attended_output->data() + (seq_len - 1) * slice;
                     std::memcpy(tmp.data(), src, slice * sizeof(float));
                 }
-                DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_context", tmp.data(), slice);
+                QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_context", tmp.data(), slice);
             }
         }
 
@@ -743,7 +743,7 @@ namespace llaminar
         if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
         {
             const float *src = local_final_output->data() + (seq_len - 1) * d_model;
-            DistributedTransformerPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_out_partial", src, (size_t)d_model);
+            QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_out_partial", src, (size_t)d_model);
         }
 
         bool performed_collective = false;

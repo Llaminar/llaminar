@@ -172,7 +172,8 @@ void demonstrateTokenGeneration()
 
     try
     {
-        AdaptiveTransformerPipeline pipeline(config, true);
+        ModelConfig model_cfg(config, "qwen");
+        AdaptiveTransformerPipeline pipeline(model_cfg, true);
 
         std::cout << "Initialized AdaptiveTransformerPipeline with Qwen 2.5 0.5B configuration:" << std::endl;
         std::cout << "  Hidden size: " << config.d_model << std::endl;

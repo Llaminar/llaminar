@@ -10,7 +10,8 @@
  */
 
 #include "parity_test_framework.h"
-#include "distributed_transformer_pipeline.h"
+#include "qwen_pipeline_adapter.h"
+#include "qwen_pipeline.h"
 #include "model_loader.h"
 #include "logger.h"
 #include "test_timeout_guard.h"
@@ -426,8 +427,17 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     bool enable_capture = std::getenv(kParityCaptureEnv) != nullptr || rank == 0;
     LlaminarSnapshotHook::set_enabled(enable_capture);
 
-    auto weights = loadModelWeights(loader, config);
-    DistributedTransformerPipeline pipeline(config);
+    ModelConfig model_cfg(config, "qwen");
+    QwenPipeline pipeline(model_cfg);
+
+    // Use pipeline's loadWeights method
+    auto loaded_weights = pipeline.loadWeights(model_path);
+    auto *qwen_weights = dynamic_cast<QwenModelWeights *>(loaded_weights.get());
+    if (!qwen_weights)
+    {
+        FAIL() << "Failed to load weights as QwenModelWeights";
+    }
+    auto weights = std::move(qwen_weights->inner);
 
     // Enable pre-LM capture for comparison
     setenv("LLAMINAR_PIPELINE_CAPTURE_PRE_LM", "1", 1);
@@ -469,7 +479,7 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
         }
 
         // Compare pre-LM hidden state if available
-        const auto &pre_lm_hidden = DistributedTransformerPipeline::getLastPreLMHidden();
+        const auto &pre_lm_hidden = QwenPipeline::getLastPreLMHidden();
         if (!pre_lm_hidden.empty())
         {
             SnapshotRegistry &registry = SnapshotRegistry::instance();

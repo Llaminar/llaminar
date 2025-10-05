@@ -34,9 +34,15 @@ namespace llaminar
     {
     public:
         /**
-         * @brief Construct PipelineBase
+         * @brief Construct PipelineBase (legacy - queries MPI context)
          */
         PipelineBase();
+
+        /**
+         * @brief Construct PipelineBase with explicit MPI context (preferred)
+         * @param ctx MPI context with rank, size, and communicator
+         */
+        explicit PipelineBase(const MPIContext &ctx);
 
         /**
          * @brief Virtual destructor

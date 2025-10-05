@@ -36,7 +36,39 @@ namespace llaminar
         checkMPIError(MPI_Comm_rank(comm_, &rank_), "MPI_Comm_rank");
         checkMPIError(MPI_Comm_size(comm_, &size_), "MPI_Comm_size");
 
+        // Populate MPIContext
+        mpi_ctx_ = MPIContext(rank_, size_, comm_);
+
         LOG_DEBUG("MPIKernelBase initialized: rank=" << rank_ << ", size=" << size_);
+
+        // Call virtual initialization method
+        initializeMPI();
+    }
+
+    MPIKernelBase::MPIKernelBase(const MPIContext &ctx, bool init_mpi)
+        : mpi_ctx_(ctx), comm_(ctx.comm), rank_(ctx.rank), size_(ctx.size), mpi_initialized_(false)
+    {
+        int provided, required = MPI_THREAD_MULTIPLE;
+        int mpi_init_flag;
+
+        // Check if MPI is already initialized
+        checkMPIError(MPI_Initialized(&mpi_init_flag), "MPI_Initialized");
+
+        if (!mpi_init_flag && init_mpi)
+        {
+            // Initialize MPI with thread support
+            checkMPIError(MPI_Init_thread(nullptr, nullptr, required, &provided), "MPI_Init_thread");
+            mpi_initialized_ = true;
+
+            if (provided < required)
+            {
+                LOG_WARN("MPI thread support level " << provided << " is less than required " << required);
+            }
+
+            LOG_DEBUG("MPI initialized by MPIKernelBase with MPIContext");
+        }
+
+        LOG_DEBUG("MPIKernelBase initialized from MPIContext: " << mpi_ctx_.toString());
 
         // Call virtual initialization method
         initializeMPI();
