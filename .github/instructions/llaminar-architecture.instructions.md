@@ -1,10 +1,10 @@
 # Llaminar LLM Inference Engine - Architecture Documentation
 
-*Last Updated: October 5, 2025*
+*Last Updated: October 6, 2025*
 
 ## Overview
 
-Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The architecture is built on a **multi-architecture pipeline abstraction** with pluggable model-family adapters, centralized backend selection, and comprehensive observability.
+Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The architecture is built on a **multi-architecture pipeline abstraction** with pluggable model-family adapters, **strategy-pattern prefill providers**, and comprehensive observability.
 
 ### Core Architecture Pillars
 
@@ -15,15 +15,17 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
    - **Adapters**: `QwenPipelineAdapter`, `LlamaPipelineAdapter` implement standard interface
    - **Factory Registration**: Automatic model-family selection via `PipelineFactory`
 
-2. **Centralized Backend Selection** ✨
-   - **MatMulBackendSelector**: Single decision point for all matrix multiplication paths
-   - **Stage-Aware**: Considers operation size, stage context (prefill vs decode), and MPI topology
-   - **Intelligent Routing**: Small ops → single-threaded OpenBLAS, medium → multi-threaded, large prefill → COSMA
-   - **Zero Duplication**: Kernels delegate to selector, no scattered threshold logic
+2. **Prefill Provider Abstraction** ✨ *NEW*
+   - **Strategy Pattern**: Swappable prefill backends (OpenBLAS, COSMA, future GPU)
+   - **Built-in Snapshot Capture**: Base class provides parity testing utilities for all providers
+   - **Runtime Selection**: `PrefillProviderFactory` chooses optimal provider based on sequence length and MPI context
+   - **Isolated Testing**: Each provider testable in isolation with unified metrics
+   - **Clean Separation**: Pipeline orchestrates, providers execute with stage-by-stage instrumentation
 
 3. **COSMA Prefill Manager**
    - High‑throughput large prompt (prefill) GEMMs with fused RMSNorm+QKV path
    - Validation / orientation diagnostics and automatic fallback
+   - Integrated with `COSMAPrefillProvider` for distributed execution
 
 4. **Tensor Sharding**
    - Current: 1D column partition for linear projections
@@ -36,7 +38,7 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
 
 6. **Comprehensive Observability**
    - Structured perf counters and stage timers
-   - Optional per-layer token diffs and validation
+   - Provider-integrated snapshot capture for parity testing
    - COSMA tile validation and distributed GEMM diagnostics
    - Prefill diagnostics module for baseline comparison
 
@@ -44,12 +46,128 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
 
 1. **MPI-First Architecture**: All compute kernels derive from `MPIKernelBase`
 2. **Multi-Architecture Pipeline**: Explicit model-family adapters (Qwen, LLaMA) behind unified interface
-3. **Centralized Policy**: Backend selection and tuning consolidated in `MatMulBackendSelector`
+3. **Strategy Pattern for Backends**: Prefill providers encapsulate execution logic with runtime selection
 4. **Stage-Driven Execution**: Semantic transformer stages (prefill/decode) replace generic graph scheduling
 5. **Data Locality First**: Column partition weight shards + fused prefill minimize communication
-6. **Graceful Degradation**: COSMA failures auto‑fallback to OpenBLAS with diagnostics
+6. **Graceful Degradation**: Provider factory falls back to OpenBLAS with diagnostics
 7. **Deterministic Debugging**: Environment snapshot + opt‑in validation for surgical diagnostics
-8. **Clean Abstraction Boundaries**: Pipeline orchestrates, kernels compute, selector chooses backend
+8. **Clean Abstraction Boundaries**: Pipeline orchestrates, kernels compute, providers execute
+
+## Recent Architectural Improvements (October 2025)
+
+### Prefill Provider Refactoring ✨
+
+**Motivation**: The original `QwenPipeline` contained monolithic prefill logic with scattered backend selection, making it difficult to:
+- Test COSMA vs OpenBLAS execution paths in isolation
+- Capture consistent snapshots across backends for parity testing
+- Switch backends without modifying pipeline code
+- Add new execution backends (GPU) without tangled dependencies
+
+**Solution**: Extracted prefill execution into a **strategy pattern** with pluggable providers:
+
+#### Before (Monolithic Pipeline)
+```cpp
+class QwenPipeline {
+    bool prefill(...) {
+        // 500+ lines of prefill logic
+        if (use_cosma) {
+            // COSMA-specific execution
+            executePrefillAttentionCosma(...);
+        } else {
+            // OpenBLAS-specific execution  
+            executeAttentionLocal(...);
+        }
+        // Ad-hoc snapshot capture scattered throughout
+    }
+};
+```
+
+**Problems**:
+- ❌ Backend logic tangled with pipeline orchestration
+- ❌ Hard to test backends in isolation (need full pipeline)
+- ❌ Snapshot capture inconsistent between backends
+- ❌ Adding GPU backend requires pipeline modifications
+- ❌ No unified metrics across backends
+
+#### After (Provider Abstraction)
+```cpp
+// Base abstraction
+class PrefillProvider {
+    virtual bool execute(tokens, weights, output, ctx, metrics) = 0;
+protected:
+    void captureSnapshot(...);  // Built-in for all providers
+};
+
+// Concrete implementations
+class OpenBLASPrefillProvider : public PrefillProvider { ... };
+class COSMAPrefillProvider : public PrefillProvider { ... };
+
+// Factory selection
+auto provider = PrefillProviderFactory::create(config, mpi_ctx, seq_len);
+bool success = provider->execute(tokens, weights, output, ctx, metrics);
+```
+
+**Benefits**:
+- ✅ **Separation of Concerns**: Pipeline orchestrates, providers execute
+- ✅ **Isolated Testing**: Each provider testable independently with mocked weights
+- ✅ **Consistent Snapshots**: Base class provides capture utilities for all providers
+- ✅ **Runtime Selection**: Factory chooses optimal provider based on workload
+- ✅ **Extensible**: GPU provider can be added without touching pipeline/kernel code
+- ✅ **Unified Metrics**: `PrefillMetrics` struct tracks timing/FLOPS/snapshots consistently
+- ✅ **Parity Testing**: Both providers capture at identical stages for A/B comparison
+
+#### Migration Impact
+
+**Files Refactored**:
+- **New**: `src/prefill_provider.{h,cpp}` - Base abstraction and factory
+- **New**: `src/openblas_prefill_provider.{h,cpp}` - Baseline CPU provider
+- **New**: `src/cosma_prefill_provider.{h,cpp}` - Distributed COSMA provider
+- **Modified**: `src/qwen_pipeline.cpp` - Now delegates to provider factory
+- **Tests**: `tests/test_prefill_providers.cpp` - Isolated provider tests
+- **Tests**: `tests/test_parity_framework.cpp` - Provider-aware parity tests
+
+**No Breaking Changes**:
+- External API unchanged (`AbstractPipeline::prefill()` signature preserved)
+- Environment variables honored (`ADAPTIVE_DISABLE_COSMA`, etc.)
+- Backend selection logic preserved (sequence length thresholds)
+- Performance characteristics identical
+
+**Testing Coverage**:
+- ✅ `test_prefill_providers`: Isolated provider unit tests
+- ✅ `test_embedding_parity`: Embedding layer validation
+- ✅ `test_parity_framework`: End-to-end multi-provider parity testing
+- ✅ `test_embedding_standalone`: Standalone embedding correctness
+
+#### Future Extensions Enabled
+
+This refactoring makes the following additions straightforward:
+
+1. **GPU Provider** (future):
+   ```cpp
+   class GpuPrefillProvider : public PrefillProvider {
+       // cuBLAS/rocBLAS matmuls, device memory management
+   };
+   ```
+   - No pipeline changes needed
+   - Factory adds GPU detection logic
+   - Inherits snapshot capture automatically
+
+2. **Decode Provider** (future):
+   ```cpp
+   class DecodeProvider {
+       virtual bool execute(token, weights, output, ctx, metrics) = 0;
+   };
+   ```
+   - Mirror prefill pattern for decode phase
+   - Enables latency-optimized GPU decode
+
+3. **Fused Kernels**:
+   - Providers can use specialized fused ops (FlashAttention, etc.)
+   - Interface unchanged, implementation swapped
+
+4. **Multi-Model Support**:
+   - Factory can select provider based on model architecture
+   - Different strategies for different model families
 
 ## Architecture Components
 
@@ -309,102 +427,223 @@ auto pipeline = PipelineFactory::instance().create(model_config);
 - ✅ **Testable**: Explicit stage transitions and parity validation
 
 
-### 4. Adaptive MatMul & Prefill Backend
+### 4. Prefill Provider Abstraction ✨
 
-**File**: `src/adaptive_matmul.h`
-**Concepts**:
-- `AdaptiveMatMulManager` chooses backend per (m,n,k,is_prefill, MPI size, env overrides).
-- Prefill: Potential COSMA offload if seq_len ≥ threshold & world_size>1.
-- Decode: Always OpenBLAS (saves collective overhead > latency).
-- Supports batched Q/K/V path (currently OpenBLAS-loop; future fused COSMA batch candidate).
+**Files**: `src/prefill_provider.{h,cpp}`, `src/openblas_prefill_provider.{h,cpp}`, `src/cosma_prefill_provider.{h,cpp}`
 
-### 4. Backend Selection & Adaptive MatMul
+The prefill provider architecture implements a **strategy pattern** for swappable prefill execution backends, enabling:
+- Multiple prefill implementations (OpenBLAS, COSMA, future GPU)
+- Built-in snapshot capture for parity testing
+- Runtime backend selection based on workload characteristics
+- Isolated testing of individual providers
+- Stage-by-stage instrumentation and validation
 
-**Files**: `src/matmul_backend_selection.{h,cpp}`, `src/prefill_backend.{h,cpp}`, `src/inference_backend.{h,cpp}`
+#### Architecture Hierarchy
 
-The backend selection system provides centralized policy for choosing between OpenBLAS and COSMA based on operation characteristics, system configuration, and execution phase.
+```
+AbstractPipeline::prefill()
+  └─> QwenPipeline::prefill()
+       └─> PrefillProvider::execute()  [with snapshot hooks]
+            ├─> OpenBLASPrefillProvider  (baseline, CPU matmuls)
+            ├─> COSMAPrefillProvider     (distributed matmuls)
+            └─> (future) GPUPrefillProvider
+```
 
-#### MatMulBackendSelector
+#### PrefillProvider Base Class
 
-**Purpose**: Centralized decision logic for all matrix multiplication operations
+**Purpose**: Abstract interface for prefill execution with built-in observability
 
-**Selection Criteria**:
-- **Operation Size**: Total elements (m × n × k)
-- **Execution Phase**: Prefill vs decode
-- **Sequence Length**: Token count in current batch
-- **MPI Context**: Number of ranks available
-- **Environment Overrides**: `ADAPTIVE_DISABLE_COSMA`, `LLAMINAR_COSMA_PREFILL_THRESHOLD`
+**Key Features**:
+- **Strategy Pattern**: Swap providers at runtime based on config/workload
+- **Snapshot Utilities**: Base class provides capture methods inherited by all providers
+- **Zero Overhead**: Snapshots compiled out in release builds
+- **MPI-Aware**: Providers handle distributed execution and rank coordination
+- **Metrics Tracking**: Timing, FLOP counting, and stage-level instrumentation
 
-**Decision Logic**:
+**Core Interface**:
 ```cpp
-MatMulBackend selectBackend(int m, int n, int k, 
-                           int seq_len, 
-                           bool is_prefill) {
-    // Very small: single-threaded OpenBLAS (minimize overhead)
-    if (total_elements < 8192) {
-        return MatMulBackend::SINGLE_THREADED_OPENBLAS;
+class PrefillProvider {
+public:
+    virtual bool execute(
+        const std::vector<int>& tokens,
+        const IModelWeights& weights,
+        std::shared_ptr<TensorBase>& output,
+        StageContext& ctx,
+        PrefillMetrics& metrics) = 0;
+    
+    virtual std::string name() const = 0;
+    
+protected:
+    void captureSnapshot(PipelineStage stage, int layer_index,
+                        const float* data, int seq_len, int feature_dim);
+    bool isSnapshotEnabled() const;
+};
+```
+
+#### OpenBLASPrefillProvider
+
+**File**: `src/openblas_prefill_provider.{h,cpp}`
+
+**Purpose**: CPU-based prefill using OpenBLAS for matrix multiplications
+
+**Characteristics**:
+- **Baseline Implementation**: Well-tested, predictable behavior
+- **Optimal For**: Small to medium sequences (< 4K tokens), single-node setups
+- **MatMul Backend**: OpenBLAS (single/multi-threaded based on operation size)
+- **Kernel Architecture**: Uses existing MPI kernel infrastructure
+  - `MPIEmbeddingKernel`: Token embedding lookup
+  - `MPIRMSNormKernel`: Layer normalization (sequence-wise distribution)
+  - `MPIAttentionKernel`: Complete attention (Q/K/V/O projections + primitives)
+  - `MPILinearKernel`: FFN linear projections
+  - `MPISwiGLUKernel`: SwiGLU activation
+
+**Stage Flow**:
+1. **EMBEDDING**: Token embedding lookup
+2. **Per Layer**:
+   - ATTENTION_NORM → Attention (Q/K/V/RoPE/scores/softmax/context/output) → ATTENTION_RESIDUAL
+   - FFN_NORM → FFN_GATE/UP → FFN_SWIGLU → FFN_DOWN → FFN_RESIDUAL
+3. **FINAL_NORM** → **LM_HEAD**
+
+**Snapshot Capture**: All standardized stages for PyTorch comparison
+
+#### COSMAPrefillProvider
+
+**File**: `src/cosma_prefill_provider.{h,cpp}`
+
+**Purpose**: Distributed prefill using COSMA for large-scale matrix multiplications
+
+**Characteristics**:
+- **Optimal For**: Large sequences (≥ 4K tokens), multi-node setups (2+ MPI ranks)
+- **Performance**: Up to 3.6x faster than OpenBLAS for large operations (≥64K tokens)
+- **MatMul Backend**: COSMA for distributed compute, with adaptive fallback
+- **Fused Operations**: Combines RMSNorm + QKV projection for efficiency
+
+**Key Differences from OpenBLAS**:
+- **Attention**: Fused norm+QKV via COSMA → CPU attention primitives → adaptive output projection
+- **FFN**: Uses `adaptiveMatMul` (may use COSMA for gate/up/down based on size)
+- **Memory**: Distributed weight layout, higher communication overhead
+- **Tradeoff**: Better throughput for large ops, worse for small ops (<4K tokens)
+
+**Snapshot Alignment**:
+- Captures at **same stages** as OpenBLASPrefillProvider
+- Enables A/B testing: run both providers, compare snapshots stage-by-stage
+- Identifies divergence source (COSMA matmul vs attention primitives vs etc.)
+
+#### PrefillProviderFactory
+
+**File**: `src/prefill_provider.cpp`
+
+**Purpose**: Automatic provider selection based on configuration and workload
+
+**Selection Logic**:
+```cpp
+std::unique_ptr<PrefillProvider> PrefillProviderFactory::create(
+    const ModelConfig& config,
+    const MPIContext& mpi_ctx,
+    int seq_len) {
+    
+    const auto& env = debugEnv();
+    
+    // Check global COSMA disable
+    if (env.adaptive.disable_cosma) {
+        return std::make_unique<OpenBLASPrefillProvider>(config, mpi_ctx);
     }
     
-    // Large prefill: COSMA for distributed throughput
-    if (is_prefill && seq_len >= cosma_threshold && 
-        total_elements >= 8388608) {
-        return MatMulBackend::DISTRIBUTED_COSMA;
+    // Check for forced COSMA execution (debug/validation)
+    if (env.cosma.force_direct || env.cosma.force_replicated) {
+        return std::make_unique<COSMAPrefillProvider>(config, mpi_ctx);
     }
     
-    // Medium: multi-threaded OpenBLAS
-    return MatMulBackend::MULTI_THREADED_OPENBLAS;
+    // Sequence length-based decision
+    int threshold = env.cosma.prefill_threshold;  // default: 4096
+    if (seq_len >= threshold && mpi_ctx.size > 1) {
+        return std::make_unique<COSMAPrefillProvider>(config, mpi_ctx);
+    }
+    
+    // Default: OpenBLAS for small/medium sequences
+    return std::make_unique<OpenBLASPrefillProvider>(config, mpi_ctx);
 }
 ```
 
-#### Backend Factories
+**Decision Criteria**:
+1. **Environment Override**: `ADAPTIVE_DISABLE_COSMA=1` → always OpenBLAS
+2. **Debug Forcing**: `LLAMINAR_COSMA_FORCE_DIRECT=1` → always COSMA
+3. **Sequence Length**: `seq_len >= threshold` (default 4096) → COSMA (if multi-rank)
+4. **Default Fallback**: OpenBLAS for small sequences or single-rank
 
-**PrefillBackend** (`src/prefill_backend.{h,cpp}`):
-- Handles large batch token processing
-- Delegates to `MatMulBackendSelector` for policy
-- Routes to COSMA path via `cosma_prefill_manager` when selected
-- Falls back to OpenBLAS on COSMA failure/validation errors
+#### PrefillMetrics
 
-**InferenceBackend** (`src/inference_backend.{h,cpp}`):
-- Handles single-token decode operations
-- Always uses local OpenBLAS (latency-optimized)
-- Avoids MPI collective overhead
-- Single-threaded for minimal context switch overhead
+**Purpose**: Comprehensive instrumentation for prefill execution
 
-#### Performance Characteristics
+**Tracked Metrics**:
+- **Timing**: Per-stage breakdown (embedding, attention, FFN, norm, LM head)
+- **Compute**: Total FLOP count and GFLOPS throughput
+- **Execution**: Layers executed, snapshots captured
+- **Backend**: Provider name for performance attribution
 
-Based on empirical benchmarking:
+**Usage Example**:
+```cpp
+PrefillMetrics metrics;
+auto provider = PrefillProviderFactory::create(config, mpi_ctx, seq_len);
+bool success = provider->execute(tokens, weights, output, ctx, metrics);
 
-| Operation Size | Tokens | Backend | Reason |
-|----------------|--------|---------|--------|
-| < 8K elements | Any | Single-threaded OpenBLAS | Overhead dominates |
-| 8K - 8M elements | < 4K | Multi-threaded OpenBLAS | Communication cost too high |
-| ≥ 8M elements | ≥ 4K | COSMA (if enabled) | Distributed throughput wins |
-| Decode (any) | 1 | Single-threaded OpenBLAS | Latency critical |
+if (success) {
+    LOG_INFO("Prefill completed: " << metrics.total_ms() << "ms, "
+             << metrics.gflops() << " GFLOPS, "
+             << "backend=" << metrics.backend_name);
+}
+```
 
 #### Environment Controls
 
-- `ADAPTIVE_DISABLE_COSMA=1`: Force all operations to OpenBLAS
-- `LLAMINAR_COSMA_PREFILL_THRESHOLD=<tokens>`: Override sequence length threshold (default: 4096)
-- `LLAMINAR_COSMA_MAX_RESIDENT_MB=<mb>`: Memory budget for COSMA operations (default: 2048)
-- `LLAMINAR_COSMA_VALIDATE_TILE=<size>`: Enable correctness validation (debug only)
+**Provider Selection**:
+- `ADAPTIVE_DISABLE_COSMA=1`: Force OpenBLAS provider globally
+- `LLAMINAR_COSMA_PREFILL_THRESHOLD=<tokens>`: Sequence length threshold (default: 4096)
+- `LLAMINAR_COSMA_FORCE_DIRECT=1`: Force COSMA provider (debug)
+- `LLAMINAR_COSMA_FORCE_REPLICATED=1`: Force COSMA replicated path (validation)
+
+**COSMA-Specific Controls**:
+- `LLAMINAR_COSMA_MAX_RESIDENT_MB=<mb>`: Memory budget (default: 2048)
+- `LLAMINAR_COSMA_VALIDATE_TILE=<size>`: Enable correctness validation (debug)
+- `LLAMINAR_COSMA_COMPARE_REPLICATED=1`: Full replicated comparison (expensive)
+- `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE=1`: Automatic orientation correction
+
+**Snapshot Controls**:
+- `LLAMINAR_PARITY_CAPTURE=1`: Enable snapshot capture in debug builds
+- `LLAMINAR_COSMA_TEST_TRACE=1`: Escalate COSMA test verbosity
 
 #### Integration with Pipeline
 
-The pipeline uses backend selection through kernel composition:
+The pipeline uses the factory for automatic provider selection:
 
 ```cpp
 // In QwenPipeline::prefill()
-auto backend_choice = MatMulBackendSelector::selectBackend(
-    seq_len, hidden_size, proj_size, seq_len, true);
+PrefillMetrics metrics;
+auto provider = PrefillProviderFactory::create(config_, mpi_ctx_, tokens.size());
 
-if (backend_choice == MatMulBackend::DISTRIBUTED_COSMA) {
-    // Route through COSMA prefill manager
-    executePrefillAttentionCosma(...);
-} else {
-    // Use local OpenBLAS kernel
-    executeAttentionLocal(...);
+bool success = provider->execute(tokens, weights, hidden_states, ctx, metrics);
+
+if (success) {
+    // Cache logits, update metrics, etc.
+    ctx.backend_stats.prefill_backend = metrics.backend_name;
+    ctx.backend_stats.prefill_gflops = metrics.gflops();
 }
 ```
+
+#### Benefits Over Previous Architecture
+
+**Before (Monolithic QwenPipeline)**:
+- ✗ Prefill logic scattered across pipeline class
+- ✗ Hard to test backends in isolation
+- ✗ Snapshot capture ad-hoc and inconsistent
+- ✗ Backend switching required code changes
+
+**After (Provider Abstraction)**:
+- ✓ Clean separation: pipeline orchestrates, providers execute
+- ✓ Testable in isolation: unit tests for each provider
+- ✓ Consistent snapshots: base class provides utilities
+- ✓ Runtime selection: factory chooses optimal provider
+- ✓ Extensible: GPU provider can be added without pipeline changes
 
 ### 5. COSMA Prefill Manager
 
@@ -478,9 +717,9 @@ Post-run summary shows aggregate statistics for optimization.
 
 #### Integration Points
 
-- Called from `QwenPipeline::prefill()` for attention QKV projection
+- Called from `COSMAPrefillProvider` for attention QKV projection
 - Used for MLP gate/up/down projections in large prefill
-- Coordinates with `MatMulBackendSelector` for policy enforcement
+- Coordinates with `PrefillProviderFactory` for automatic backend selection
 - Reports statistics via `debugEnv().prefill_debug` snapshot
 
 ### 6. Distributed Linear Projection
@@ -503,8 +742,8 @@ Provides column-partitioned dense layer implementation for distributed weight st
 
 **Backend Integration**:
 - Explicitly uses OpenBLAS for local matmul
-- Coordinates with `MatMulBackendSelector` to avoid COSMA on partial matrices
-- Ensures consistent execution with adaptive backend policy
+- Used by `OpenBLASPrefillProvider` for all linear projections
+- Ensures consistent execution with provider-based architecture
 
 #### Use Cases
 
@@ -1775,52 +2014,77 @@ To prepare for future GPU offload while retaining the current CPU-only implement
 4. Centralize prefill-vs-inference path decisions for consistent logging and experimentation
 
 ### Components
-**Files**: `src/backends/prefill_backend.h/cpp`, `src/backends/inference_backend.h/cpp`, `src/backends/device_kind.h`
+**Current Architecture**: `src/prefill_provider.{h,cpp}`, `src/openblas_prefill_provider.{h,cpp}`, `src/cosma_prefill_provider.{h,cpp}`
 
 | Element | Description |
 |---------|-------------|
-| `DeviceKind` | Enum declaring `CPU`, `GPU` (future) |
-| `PrefillBackendInterface` | Interface for large, throughput-oriented (prompt / prefill) GEMMs |
-| `InferenceBackendInterface` | Interface for small, latency-critical (decode) GEMMs |
-| `CpuPrefillBackend` | Delegates to `adaptive_matmul` honoring COSMA thresholds |
-| `CpuInferenceBackend` | Delegates to `adaptive_matmul` optimized for small/medium ops |
-| `Gpu*BackendStub` | Placeholder implementations returning `Unsupported` status |
-| `PrefillBackendFactory` / `InferenceBackendFactory` | Simple factories (later: pluggable registry) |
+| `PrefillProvider` | Abstract base class for prefill execution strategies |
+| `OpenBLASPrefillProvider` | CPU-based prefill using OpenBLAS (baseline, optimal for <4K tokens) |
+| `COSMAPrefillProvider` | Distributed prefill using COSMA (optimal for ≥4K tokens, multi-rank) |
+| `PrefillProviderFactory` | Automatic provider selection based on sequence length and MPI context |
+| `PrefillMetrics` | Comprehensive instrumentation (timing, FLOPS, snapshots) |
+| `GpuPrefillProvider` (future) | GPU-accelerated prefill with device memory management |
 
-### Invocation Pattern (Attention / MLP)
-At each projection (Q, K, V, Out, Gate, Up, Down) the kernel:
-1. Computes `is_prefill_like = seq_len >= debugEnv().cosma.prefill_threshold`
-2. Chooses Prefill vs Inference backend interface
-3. Attempts backend `launch()` with a small descriptor struct (M,N,K + flags)
-4. On non-success (`Unsupported`, `Error`) logs a WARN and falls back to `adaptive_matmul`
+**Decode Path**: Currently uses local OpenBLAS in `QwenPipeline::decode()` for latency optimization. Future work may extract decode provider abstraction.
 
-All fallbacks preserve the exact previous semantics; there is no behavioral drift.
+### Invocation Pattern (from QwenPipeline)
+```cpp
+// In QwenPipeline::prefill()
+PrefillMetrics metrics;
+auto provider = PrefillProviderFactory::create(config_, mpi_ctx_, tokens.size());
+bool success = provider->execute(tokens, weights, output, ctx, metrics);
+
+if (success) {
+    // Cache results, update context
+    ctx.backend_stats.prefill_backend = metrics.backend_name;
+    ctx.backend_stats.prefill_gflops = metrics.gflops();
+}
+```
+
+Provider selection logic:
+1. **Environment Override**: `ADAPTIVE_DISABLE_COSMA=1` → OpenBLAS
+2. **Debug Forcing**: `LLAMINAR_COSMA_FORCE_DIRECT=1` → COSMA
+3. **Sequence Length**: `seq_len >= threshold` (default 4096) + multi-rank → COSMA
+4. **Default**: OpenBLAS for small sequences or single-rank
 
 ### Descriptor Structures
-| Prefill | Inference |
-|---------|-----------|
-| `PrefillOpDesc { kind, M,N,K, is_prefill }` | `InferenceOpDesc { kind, M,N,K, latency_critical }` |
-| `PrefillLaunchContext { A,B,C }` | `InferenceLaunchContext { A,B,C }` |
+| Provider Metrics | Captured Data |
+|------------------|---------------|
+| `PrefillMetrics::embedding_ms` | Embedding lookup time |
+| `PrefillMetrics::attention_ms` | Total attention time across layers |
+| `PrefillMetrics::ffn_ms` | Total FFN time across layers |
+| `PrefillMetrics::norm_ms` | Normalization time |
+| `PrefillMetrics::total_flops` | Floating point operations count |
+| `PrefillMetrics::backend_name` | Provider identifier ("OpenBLAS", "COSMA") |
 
-Currently only `MatMul` kind is implemented; future kinds (fused epilogs, attention assembly, quant-dequant fusion) can extend these enums without touching call sites.
+All providers capture snapshots at standardized stages for parity testing when `LLAMINAR_PARITY_CAPTURE=1`.
 
 ### Logging & Observability
-First use per kernel (rank 0 only) emits a single structured line:
+Providers emit structured metrics on completion:
 ```
-BACKEND_DECISION_SUMMARY component=Attention seq_len=... threshold=... path=prefill prefill_backend=cpu_stub inference_backend=cpu_stub phases=QKV+Out fallback=adaptive_matmul
+[INFO] OpenBLASPrefillProvider completed: 347.2ms, 12.3 GFLOPS, 24 layers, 147 snapshots
+[INFO] COSMAPrefillProvider completed: 96.5ms, 44.1 GFLOPS, 24 layers, 147 snapshots
 ```
-This enables quick grep-based validation of which path dominated a run without log spam.
 
-### Relationship to Adaptive MatMul
-`adaptive_matmul` remains the authoritative CPU arbitration layer (single-thread vs multi-thread vs distributed COSMA). Backends **delegate** rather than re-implement heuristics, ensuring a single tuning locus. When GPU support lands, only backend implementations change; kernel code and adaptive CPU logic remain intact.
+Each provider captures at identical stages for A/B comparison:
+- EMBEDDING, ATTENTION_NORM, Q/K/V_PROJECTION, ROPE_APPLICATION
+- ATTENTION_SCORES, ATTENTION_SOFTMAX, ATTENTION_CONTEXT, ATTENTION_OUTPUT
+- FFN_NORM, FFN_GATE, FFN_UP, FFN_SWIGLU, FFN_DOWN
+- FINAL_NORM, LM_HEAD
+
+### Relationship to COSMA Prefill Manager
+`COSMAPrefillProvider` delegates to `CosmaPrefillManager` for distributed matmul coordination, maintaining separation of concerns:
+- **Provider**: Orchestrates transformer layer execution, snapshot capture, metrics
+- **Manager**: Handles COSMA-specific matmul, orientation validation, memory management
 
 ### Future Extensions (Non-Breaking)
 | Extension | Impact |
 |-----------|--------|
-| GPU BLAS (cuBLAS / rocBLAS) | Implement `GpuPrefillBackend` & `GpuInferenceBackend` with stream / handle caching |
-| Triton / CK kernels | Register specialized fused attention or MLP epilogs via additional `OpKind` values |
-| Auto-tuning | Backends collect lightweight perf stats, feed heuristic refinement engine |
-| JSON decision trace | Optional per-op structured emission for offline analysis |
+| GPU Provider | Implement `GpuPrefillProvider` with cuBLAS/rocBLAS, no pipeline changes |
+| Decode Provider | Extract `DecodeProvider` abstraction mirroring prefill pattern |
+| Fused Kernels | Providers can use specialized fused ops without interface changes |
+| Auto-tuning | Providers collect perf stats for heuristic refinement |
+| Multi-Model | Factory can select provider based on model architecture
 
 ---
 
