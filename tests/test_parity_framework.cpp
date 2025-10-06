@@ -156,9 +156,17 @@ namespace
                     token_str << ",";
             }
 
-            // Build command
+            // Build command - use absolute path to script
             std::ostringstream cmd;
-            cmd << "python3 python/reference/generate_test_snapshots.py"
+            // Get workspace root (parent of build directory if we're in build/)
+            std::string script_path = "python/reference/generate_test_snapshots.py";
+            std::filesystem::path cwd = std::filesystem::current_path();
+            if (cwd.filename() == "build")
+            {
+                script_path = (cwd.parent_path() / script_path).string();
+            }
+
+            cmd << "python3 " << script_path
                 << " --model \"" << model_path << "\""
                 << " --tokens \"" << token_str.str() << "\""
                 << " --output-dir \"" << output_dir << "\""
@@ -882,7 +890,7 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
 
     if (model_not_found)
     {
-        GTEST_SKIP() << "No test model found in models/ directory";
+        GTEST_FAIL() << "No test model found in models/ directory - cannot run parity tests without a model";
     }
 
     broadcast_string(model_path, 0, MPI_COMM_WORLD);
@@ -907,9 +915,16 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
                 std::cout << ",";
         }
         std::cout << " (" << token_ids.size() << " tokens)" << std::endl;
+
+        // Clean up old snapshots to ensure fresh generation
+        std::string cleanup_cmd = "rm -rf " + snapshot_dir;
+        system(cleanup_cmd.c_str());
     }
 
-    // Generate PyTorch reference snapshots
+    // Synchronize after cleanup
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Generate PyTorch reference snapshots (always fresh)
     if (!generate_pytorch_snapshots(model_path, token_ids, snapshot_dir, rank))
     {
         GTEST_FAIL() << "Failed to generate PyTorch reference snapshots";

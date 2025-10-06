@@ -291,7 +291,7 @@
                 "--output-on-failure",
                 "--stop-on-failure",
                 "-R",
-                "^(BasicTest|NumaTest|GraphTest|MPILinearKernelTest)$"
+                "^(BasicTest|NumaTest|AttentionGoldenTest|GraphTest|MPILinearKernelTest)$"
             ],
             "group": "test",
             "presentation": {

@@ -451,3 +451,47 @@ mpirun -np 2 ./build/test_parity_framework
 **Status**: ✅ Complete and ready for use
 **Version**: 1.0
 **Date**: 2025-01-04
+
+## Golden Oracle Validation Results
+
+### Test Summary (All Passing ✅)
+We created comprehensive golden oracle tests for all attention primitives, comparing against PyTorch reference implementations.
+
+**Results: ALL 12 TESTS PASS**
+
+1. **Softmax Tests** (4/4 passing):
+   - Basic: `[1,2,3]` → `[0.090, 0.245, 0.665]` ✅
+   - Negative values: Correct handling ✅
+   - Large range (numerical stability): `[0,10,20]` → `[2e-9, 4e-5, 0.99995]` ✅
+   - Uniform distribution: `[1,1,1,1]` → `[0.25, 0.25, 0.25, 0.25]` ✅
+
+2. **RoPE Tests** (2/2 passing):
+   - Position 0 (identity): No rotation applied ✅
+   - Position 1 (rotation): Proper rotation applied ✅
+
+3. **QK Scores Tests** (3/3 passing):
+   - Simple dot product with 1/√d scaling: `1.0 → 0.707` ✅
+   - 2x2 attention matrix: Diagonal pattern with scaling ✅
+   - With softmax: Proper normalization (rows sum to 1.0) ✅
+
+4. **Attention Output Tests** (2/2 passing):
+   - Simple weighted sum: `1.0*V[0] + 0.0*V[1]` ✅
+   - Fractional weights: `0.6*V[0] + 0.4*V[1]` ✅
+
+5. **End-to-End Fused Attention** (1/1 passing):
+   - Full pipeline with causal masking ✅
+
+### Key Finding: **Primitives are Mathematically Correct**
+
+The attention primitives (softmax, RoPE, QK scores, weighted sum) are all working correctly at the atomic operation level. This means the parity test divergence is NOT due to mathematical errors in the core kernels.
+
+### Implications
+
+The divergence must be occurring at the **integration level**:
+- Parameter passing issues (wrong dimensions, strides)
+- Tensor layout/orientation mismatches
+- Missing operations or wrong execution order
+- Distributed MPI coordination errors
+- Different numerical precision handling at higher levels
+
+**Next Steps**: Focus investigation on MPIAttentionKernel integration, tensor transformations, and MPI communication patterns rather than primitive mathematical correctness.

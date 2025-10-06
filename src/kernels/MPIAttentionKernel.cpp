@@ -66,7 +66,13 @@ namespace llaminar
 {
 
     MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim, float rope_freq_base, DistributionStrategy strategy)
-        : n_head_(n_head), n_head_kv_(n_head_kv), head_dim_(head_dim), rope_freq_base_(rope_freq_base), strategy_(strategy)
+        : n_head_(n_head),
+          n_head_kv_(n_head_kv),
+          head_dim_(head_dim),
+          n_past_(0),                  // Initialize to 0 for first token
+          d_model_(n_head * head_dim), // Initialize based on architecture
+          rope_freq_base_(rope_freq_base),
+          strategy_(strategy)
     {
         if (head_dim_ <= 0 || n_head_ <= 0 || n_head_kv_ <= 0)
         {
@@ -161,6 +167,28 @@ namespace llaminar
 
         bool pre_sharded = is_head_sharded(global_wq) && is_head_sharded(global_wk) &&
                            is_head_sharded(global_wv) && is_head_sharded(global_wo);
+
+        // CRITICAL ASSERTION: Detect invalid output mode configuration
+        //
+        // If weights are NOT head-sharded (i.e., replicated or row-partitioned) AND we have
+        // multiple MPI ranks, then LocalHeads mode is INCORRECT because it will only return
+        // partial contributions without summing across ranks.
+        //
+        // This was the root cause of 98.6% parity test failures - see investigation in
+        // docs/OPENBLAS_PREFILL_ROOT_CAUSE_ANALYSIS.md
+        if (!pre_sharded && getSize() > 1 && output_mode_ == AttentionOutputMode::LocalHeads)
+        {
+            LOG_ERROR("MPIAttentionKernel: INVALID CONFIGURATION DETECTED!");
+            LOG_ERROR("  - Weights are NOT head-sharded (replicated or row-partitioned)");
+            LOG_ERROR("  - Running with multiple MPI ranks (" << getSize() << " ranks)");
+            LOG_ERROR("  - Output mode is LocalHeads (returns only partial results)");
+            LOG_ERROR("  - This will produce INCORRECT outputs (missing contributions from other ranks)");
+            LOG_ERROR("  - SOLUTION: Call setOutputMode(AttentionOutputMode::GatherHeadsPostProjection)");
+            LOG_ERROR("             before registering the kernel to enable MPI_Allreduce");
+            throw std::runtime_error(
+                "MPIAttentionKernel: LocalHeads mode requires head-sharded weights. "
+                "For replicated/row-partitioned weights with multiple ranks, use GatherHeadsPostProjection mode.");
+        }
 
         std::shared_ptr<TensorBase> local_wq;
         std::shared_ptr<TensorBase> local_wk;
@@ -1245,10 +1273,31 @@ namespace llaminar
         // Q, K, V
         if (!do_projection("Q", local_wq, local_q, 1))
             return;
+        // Capture Q projection snapshot (before RoPE)
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            auto [local_h, _] = getHeadDistribution();
+            snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, local_q->data(), seq_len, local_h * head_dim_);
+        }
+
         if (!do_projection("K", local_wk, local_k, 2))
             return;
+        // Capture K projection snapshot (before RoPE)
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            auto [local_h, _] = getHeadDistribution();
+            snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_h * head_dim_);
+        }
+
         if (!do_projection("V", local_wv, local_v, 3))
             return;
+        // Capture V projection snapshot (no RoPE applied to V)
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            auto [local_h, _] = getHeadDistribution();
+            snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_h * head_dim_);
+        }
+
         auto [lh_final, _off] = getHeadDistribution();
         LOG_DEBUG("Computed local projections using COSMA/adaptive for " << lh_final << " heads on rank " << getRank());
     }
@@ -1263,8 +1312,22 @@ namespace llaminar
         // Compute attention scores and apply softmax
         computeLocalAttentionScores(local_q, local_k, scores.get(), seq_len, local_heads);
 
+        // Capture attention scores after softmax (attention weights)
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            // Note: Scores are in [heads, seq_len, seq_len] layout
+            // For snapshot we'll capture as [seq_len * local_heads, seq_len]
+            snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.get(), seq_len * local_heads, seq_len);
+        }
+
         // Apply attention to values
         applyLocalAttention(scores.get(), local_v, local_output, seq_len, local_heads);
+
+        // Capture attention context (output of attention before output projection)
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, local_output, seq_len, local_heads * head_dim_);
+        }
 
         // Optional debug validation: re-run scalar reference primitives on already RoPE-rotated Q/K
         // and compare with kernel path. Enabled when LLAMINAR_ATTN_PRIMITIVES_VALIDATE is set.

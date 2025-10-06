@@ -587,6 +587,30 @@ namespace llaminar
             throw std::runtime_error("Failed to register RMSNorm kernel");
 
         auto attention_kernel = std::make_unique<MPIAttentionKernel>(config_.getLayerConfig().n_head, config_.getLayerConfig().n_head_kv, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base);
+
+        // CRITICAL FIX: Must set GatherHeadsPostProjection mode for multi-rank execution!
+        //
+        // Background: MPIAttentionKernel defaults to LocalHeads mode, which was designed for
+        // future tensor-parallel sharding where each rank owns a subset of heads. In that mode,
+        // the kernel returns only the local rank's head contributions WITHOUT summing across ranks.
+        //
+        // Problem: For our current row-partitioned W_o implementation, each rank computes PARTIAL
+        // contributions to ALL output dimensions. These must be summed via MPI_Allreduce.
+        //
+        // Without this setOutputMode() call:
+        //   - Each rank returns only its partial W_o @ heads contribution
+        //   - Missing other ranks' contributions → systematic negative bias
+        //   - Cascading errors through all downstream layers
+        //   - 98.6% parity test failure rate (145/147 checks failing)
+        //
+        // With GatherHeadsPostProjection mode:
+        //   - Triggers MPI_Allreduce(MPI_SUM) to sum all ranks' contributions
+        //   - Produces correct full attention output
+        //   - All parity tests pass
+        //
+        // See: Investigation in docs/OPENBLAS_PREFILL_ROOT_CAUSE_ANALYSIS.md
+        attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+
         if (!registerKernel("attention", std::move(attention_kernel)))
             throw std::runtime_error("Failed to register Attention kernel");
 
@@ -835,7 +859,33 @@ namespace llaminar
         {
             // No dedicated LM head found, use weight tying (common in many models)
             LOG_WARN("[WeightLoad] output.weight missing; using tied embeddings as LM head");
-            weights.lm_head = weights.token_embedding;
+
+            // Token embedding is [vocab_size, d_model] but lm_head needs [d_model, vocab_size]
+            // Transpose the tied embedding for lm_head usage
+            auto emb_shape = weights.token_embedding->shape();
+            if (emb_shape.size() == 2 && emb_shape[0] == config.vocab_size && emb_shape[1] == config.d_model)
+            {
+                const float *src = weights.token_embedding->data();
+                int rows = emb_shape[0]; // vocab_size
+                int cols = emb_shape[1]; // d_model
+
+                std::vector<float> transposed((size_t)rows * cols);
+                for (int r = 0; r < rows; ++r)
+                    for (int c = 0; c < cols; ++c)
+                        transposed[(size_t)c * rows + r] = src[(size_t)r * cols + c];
+
+                weights.lm_head = std::make_shared<llaminar::SimpleTensor>(
+                    std::vector<int>{config.d_model, config.vocab_size}, transposed);
+
+                LOG_INFO("[WeightLoad] Transposed tied embeddings for lm_head: [" << rows << "," << cols
+                                                                                  << "] -> [" << config.d_model << "," << config.vocab_size << "]");
+            }
+            else
+            {
+                LOG_ERROR("[WeightLoad] Token embedding has unexpected shape for tied lm_head: ["
+                          << emb_shape[0] << "," << emb_shape[1] << "]");
+                weights.lm_head = weights.token_embedding; // fallback to untransposed (will likely fail)
+            }
         }
 
         // === Per-Layer Weight Vectors ===

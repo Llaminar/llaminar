@@ -60,10 +60,32 @@ namespace llaminar
         // Attention kernel (handles Q/K/V/O projections internally)
         {
             auto attention_kernel = std::make_unique<MPIAttentionKernel>(
-                layer_cfg.n_head,
-                layer_cfg.n_head_kv,
-                layer_cfg.head_dim,
-                layer_cfg.rope_freq_base);
+                layer_cfg.n_head, layer_cfg.n_head_kv,
+                layer_cfg.head_dim, layer_cfg.rope_freq_base);
+
+            // CRITICAL FIX: Must set GatherHeadsPostProjection mode for multi-rank execution!
+            //
+            // Background: MPIAttentionKernel defaults to LocalHeads mode, which was designed for
+            // future tensor-parallel sharding where each rank owns a subset of heads. In that mode,
+            // the kernel returns only the local rank's head contributions WITHOUT summing across ranks.
+            //
+            // Problem: For our current row-partitioned W_o implementation, each rank computes PARTIAL
+            // contributions to ALL output dimensions. These must be summed via MPI_Allreduce.
+            //
+            // Without this setOutputMode() call:
+            //   - Each rank returns only its partial W_o @ heads contribution
+            //   - Missing other ranks' contributions → systematic negative bias
+            //   - Cascading errors through all downstream layers
+            //   - 98.6% parity test failure rate (145/147 checks failing)
+            //
+            // With GatherHeadsPostProjection mode:
+            //   - Triggers MPI_Allreduce(MPI_SUM) to sum all ranks' contributions
+            //   - Produces correct full attention output
+            //   - All parity tests pass
+            //
+            // See: Investigation in docs/OPENBLAS_PREFILL_ROOT_CAUSE_ANALYSIS.md
+            attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+
             if (!registerKernel("attention", std::move(attention_kernel)))
             {
                 throw std::runtime_error("OpenBLASPrefillProvider: Failed to register attention kernel");
@@ -325,6 +347,21 @@ namespace llaminar
             {
                 attention_kernel->setSequencePosition(n_past_);
                 attention_kernel->setLayerIndex(layer_idx);
+
+                // Set snapshot callback to capture intermediate attention states
+                // Hook snapshot callback for intermediate attention stages
+                attention_kernel->setSnapshotCallback(
+                    [this, layer_idx](PipelineStage stage, int layer, const float *data, int seq_len, int feature_dim)
+                    {
+                        // Log first few values for debugging (only layer 0)
+                        if (layer == 0)
+                        {
+                            LOG_INFO("Layer " << layer << " stage=" << static_cast<int>(stage) << ": "
+                                              << "shape=[" << seq_len << "," << feature_dim << "] "
+                                              << "first_vals=[" << data[0] << "," << data[1] << "," << data[2] << "]");
+                        }
+                        this->captureSnapshot(stage, layer, data, seq_len, feature_dim);
+                    });
             }
 
             // Prepare KV cache tensors

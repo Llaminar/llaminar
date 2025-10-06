@@ -1,9 +1,11 @@
 #pragma once
 
 #include "../mpi_kernel_base.h"
+#include "../pipeline_stages.h"
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
 
 namespace llaminar
 {
@@ -157,6 +159,18 @@ namespace llaminar
                                          seq_len, local_heads, d_model);
         }
 
+        /**
+         * @brief Callback for capturing intermediate attention snapshots
+         * @param stage Pipeline stage identifier
+         * @param layer_idx Layer index
+         * @param data Pointer to tensor data
+         * @param seq_len Sequence length
+         * @param feature_dim Feature dimension
+         */
+        using SnapshotCallback = std::function<void(PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)>;
+
+        void setSnapshotCallback(SnapshotCallback callback) { snapshot_callback_ = callback; }
+
     private:
         /**
          * @brief Distribute input data and weights to all processes
@@ -268,11 +282,13 @@ namespace llaminar
         int head_dim_;                                                      ///< Dimension per attention head
         int n_past_;                                                        ///< Number of past tokens for position embedding
         int layer_index_ = -1;                                              ///< Layer index for diagnostics
+        int d_model_;                                                       ///< Model dimension
+        AttentionOutputMode output_mode_ = AttentionOutputMode::LocalHeads; ///< Attention output mode (DEFAULT: LocalHeads is for future head-sharded TP; current row-partitioned W_o requires GatherHeadsPostProjection!)
+        SnapshotCallback snapshot_callback_;                                ///< Optional callback for intermediate snapshots
         size_t expected_total_window_ = 0;                                  ///< Expected causal window (external assertion)
         size_t last_seen_decode_T_ = 0;                                     ///< Per-instance last seen T for monotonic check
         float rope_freq_base_;                                              ///< Base frequency for rotary embeddings
         DistributionStrategy strategy_;                                     ///< Distribution strategy
-        AttentionOutputMode output_mode_ = AttentionOutputMode::LocalHeads; ///< selected output mode
         AttentionResultMeta last_meta_{};                                   ///< metadata from last execute
     };
 

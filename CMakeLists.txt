@@ -508,6 +508,32 @@ if(GTEST_FOUND)
     add_executable(minimal_mpi_probe tests/minimal_mpi_probe.cpp)
     target_link_libraries(minimal_mpi_probe llaminar_core MPI::MPI_CXX)
 
+    # Comprehensive MPI Attention Components Test (validates kernel uses shared primitives)
+    add_executable(test_mpi_attention_components tests/test_mpi_attention_components.cpp)
+    target_link_libraries(test_mpi_attention_components llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_mpi_attention_components GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_mpi_attention_components PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_attention_components ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME MPIAttentionComponentsTest COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mpi_attention_components>)
+    set_tests_properties(MPIAttentionComponentsTest PROPERTIES TIMEOUT 60 LABELS "attention;mpi;kernel;components" RUN_SERIAL TRUE)
+
+    # Attention Output Mode Validation Test (regression test for LocalHeads bug)
+    # This test ensures that LocalHeads mode correctly throws an error when used with
+    # non-sharded weights on multiple ranks (the bug that caused 98.6% parity failures)
+    add_executable(test_attention_output_mode_validation tests/test_attention_output_mode_validation.cpp)
+    target_link_libraries(test_attention_output_mode_validation llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_attention_output_mode_validation GTest::gtest pthread)
+    else()
+        target_include_directories(test_attention_output_mode_validation PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_attention_output_mode_validation ${GTEST_LIBRARY} pthread)
+    endif()
+    add_test(NAME AttentionOutputModeValidation COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_output_mode_validation>)
+    set_tests_properties(AttentionOutputModeValidation PROPERTIES TIMEOUT 30 LABELS "attention;mpi;regression;validation" RUN_SERIAL TRUE)
+
     # Parity test wrapper integration: use the standalone binary with parameter variants.
     # We keep the binary (test_attention_shard_correctness) but add several CTest entries.
     # Variant matrix chosen to exercise small vs medium shapes and uneven head distribution.
@@ -803,6 +829,18 @@ if(GTEST_FOUND)
     # Use generator expression for reliable path regardless of multi-config or output dir layout
     add_test(NAME AttentionPrimitivesTest COMMAND $<TARGET_FILE:test_attention_primitives>)
     set_tests_properties(AttentionPrimitivesTest PROPERTIES TIMEOUT 5)
+
+    # Golden oracle tests for attention primitives (PyTorch reference)
+    add_executable(test_attention_golden tests/test_attention_golden.cpp)
+    target_link_libraries(test_attention_golden llaminar_core)
+    if (GTest_FOUND)
+        target_link_libraries(test_attention_golden GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_attention_golden PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_attention_golden ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME AttentionGoldenTest COMMAND $<TARGET_FILE:test_attention_golden>)
+    set_tests_properties(AttentionGoldenTest PROPERTIES TIMEOUT 10 LABELS "golden;quick")
     if(GTest_FOUND)
         target_link_libraries(test_attention_micro GTest::gtest GTest::gtest_main)
     else()
@@ -1268,6 +1306,7 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
         test_linear_orientation_correctness
         test_mpi_rmsnorm_kernel
         test_mpi_attention_kernel
+        test_mpi_attention_components
     test_attention_micro
     test_attention_primitives
         test_mpi_transformer_pipeline
