@@ -1,8 +1,18 @@
 """
 GGUF Dequantization Utilities
 
-Converts quantized GGUF tensor data to FP32 for PyTorch model loading.
-Supports Q4_0, Q8_0, Q6_K, and F16 quantization formats.
+Converts quantized GGUF tensor data to FP32 for PyTorch model load    # Interleave to get correct order (low, high, low, high, ...)
+    unpacked = np.empty((full_blocks, 32), dtype=np.uint8)
+    unpacked[:, 0::2] = low_nibbles
+    unpacked[:, 1::2] = high_nibbles
+    
+    # Convert unsigned 4-bit to signed: subtract 8 to get range (-8 to 7)
+    # This matches llama.cpp's dequantize_row_q4_0: (nibble - 8)
+    # Previous code used (nibble > 7 ? nibble - 16 : nibble) which was WRONG
+    unpacked_signed = unpacked.astype(np.int16) - 8  # Use int16 to avoid overflow
+    
+    # Apply scales (broadcast over block elements)
+    dequantized = unpacked_signed.astype(np.float32) * scales[:, np.newaxis]ts Q4_0, Q8_0, Q6_K, and F16 quantization formats.
 
 Port of dequantization logic from:
 - src/repacker.cpp (Q4_0, Q8_0, F16)
@@ -99,15 +109,19 @@ def dequantize_q4_0(data: bytes, n_elements: int) -> np.ndarray:
     low_nibbles = quant_data & 0x0F  # Lower 4 bits
     high_nibbles = (quant_data >> 4) & 0x0F  # Upper 4 bits
     
-    # Interleave to get correct order (low, high, low, high, ...)
+    # Layout matches llama.cpp: low nibbles in first half, high nibbles in second half
+    # For a block of 32 values from 16 bytes:
+    # byte[0] -> values[0] (low) and values[16] (high)
+    # byte[1] -> values[1] (low) and values[17] (high)
+    # ...
+    # byte[15] -> values[15] (low) and values[31] (high)
     unpacked = np.empty((full_blocks, 32), dtype=np.uint8)
-    unpacked[:, 0::2] = low_nibbles
-    unpacked[:, 1::2] = high_nibbles
+    unpacked[:, :16] = low_nibbles   # First half: low nibbles
+    unpacked[:, 16:] = high_nibbles  # Second half: high nibbles
     
-    # Convert unsigned 4-bit to signed (-8 to 7)
-    # Values > 7 become negative
-    unpacked_signed = unpacked.astype(np.int8)
-    unpacked_signed = np.where(unpacked > 7, unpacked - 16, unpacked).astype(np.int8)
+    # Convert unsigned 4-bit to signed: subtract 8 to get range (-8 to 7)
+    # This matches llama.cpp's dequantize_row_q4_0: (nibble - 8)
+    unpacked_signed = unpacked.astype(np.int16) - 8  # Use int16 to avoid overflow
     
     # Apply scales (broadcast over block elements)
     dequantized = unpacked_signed.astype(np.float32) * scales[:, np.newaxis]
@@ -135,10 +149,10 @@ def dequantize_q4_0(data: bytes, n_elements: int) -> np.ndarray:
                 else:
                     quantized_val = (packed_byte >> 4) & 0x0F
                 
-                if quantized_val > 7:
-                    quantized_val -= 16
+                # Match llama.cpp: subtract 8 from nibble value (not conditional subtraction)
+                quantized_val_signed = quantized_val - 8
                 
-                partial_result[i] = scale * quantized_val
+                partial_result[i] = scale * quantized_val_signed
             
             result = np.concatenate([result, partial_result])
     
@@ -657,6 +671,7 @@ def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...])
     
     # Reshape to match tensor shape
     return result.reshape(shape)
+
 
 
 def get_quantization_info(tensor_type: GGUFTensorType) -> dict:

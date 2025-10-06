@@ -243,19 +243,9 @@ class GGUFLoader:
                 else:
                     tensor = fp32_array
                 
-                # GGUF stores weight matrices transposed compared to PyTorch
-                # Transpose 2D weight tensors (but not 1D biases or norms)
-                needs_transpose = (
-                    len(tensor.shape) == 2 and 
-                    ('weight' in hf_name) and
-                    ('norm' not in hf_name.lower())  # Don't transpose norm weights
-                )
-                
-                if needs_transpose:
-                    if as_torch:
-                        tensor = tensor.t().contiguous()
-                    else:
-                        tensor = tensor.T.copy()
+                # NOTE: As of the dimension reversal fix in gguf_parser.py, dimensions are now
+                # in standard row-major order (matching PyTorch/NumPy conventions).
+                # No additional transposition is needed.
                 
                 state_dict[hf_name] = tensor
             

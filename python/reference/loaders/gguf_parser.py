@@ -301,7 +301,10 @@ class GGUFParser:
             n_dims = self._read('<I')[0]
             
             # Read dimensions (uint64 array)
+            # GGUF stores dimensions in REVERSE order compared to standard numpy/PyTorch convention
+            # E.g., GGUF stores [896, 151936] for what should be [151936, 896]
             dimensions = [self._read('<Q')[0] for _ in range(n_dims)]
+            dimensions.reverse()  # Reverse to get standard row-major order
             
             # Read tensor type (uint32)
             tensor_type = GGUFTensorType(self._read('<I')[0])

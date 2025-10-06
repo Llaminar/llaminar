@@ -413,6 +413,15 @@ add_executable(test_cosma tests/test_cosma.cpp)
 target_link_libraries(test_cosma llaminar_core)
 add_test(NAME CosmaTest COMMAND test_cosma)
 
+# Embedding standalone test (minimal isolation test for debugging)
+add_executable(test_embedding_standalone 
+    tests/test_embedding_standalone.cpp
+    tests/parity_test_framework.cpp
+)
+target_link_libraries(test_embedding_standalone llaminar_core GTest::gtest MPI::MPI_CXX)
+add_test(NAME EmbeddingStandaloneTest COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 
+    ${CMAKE_CURRENT_BINARY_DIR}/test_embedding_standalone)
+set_tests_properties(EmbeddingStandaloneTest PROPERTIES TIMEOUT 60)
 
 # Kernel unit tests (if Google Test is available)
 if(GTEST_FOUND)
@@ -1360,3 +1369,8 @@ message(STATUS "CBLAS include: ${CBLAS_INCLUDE_DIR}")
 message(STATUS "COSMA BLAS backend: ${COSMA_BLAS}")
 message(STATUS "COSMA ScaLAPACK backend: ${COSMA_SCALAPACK}")
 message(STATUS "===============================")
+
+# Test dequantization verification tool
+add_executable(test_dequant_verify test_dequant_verify.cpp)
+target_link_libraries(test_dequant_verify PRIVATE ggml)
+target_include_directories(test_dequant_verify PRIVATE ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include)
