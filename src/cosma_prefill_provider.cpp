@@ -529,26 +529,14 @@ namespace llaminar
         // Handle GQA (Grouped Query Attention) by replicating K/V heads
         if (n_kv_heads != n_heads)
         {
-            // Expand K and V to match number of query heads
+            // Expand K and V to match number of query heads using optimized primitive
             std::vector<float> k_expanded((size_t)seq_len * total_head_dim, 0.f);
             std::vector<float> v_expanded((size_t)seq_len * total_head_dim, 0.f);
 
-            for (int row = 0; row < seq_len; ++row)
-            {
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    int kv_h = h % n_kv_heads; // Map query head to KV head
-
-                    const float *k_src = k_buf.data() + (size_t)row * kv_head_dim + kv_h * head_dim;
-                    const float *v_src = v_buf.data() + (size_t)row * kv_head_dim + kv_h * head_dim;
-
-                    float *k_dst = k_expanded.data() + (size_t)row * total_head_dim + h * head_dim;
-                    float *v_dst = v_expanded.data() + (size_t)row * total_head_dim + h * head_dim;
-
-                    std::memcpy(k_dst, k_src, head_dim * sizeof(float));
-                    std::memcpy(v_dst, v_src, head_dim * sizeof(float));
-                }
-            }
+            llaminar::attn::expand_kv_for_gqa(
+                k_buf.data(), v_buf.data(),
+                k_expanded.data(), v_expanded.data(),
+                seq_len, head_dim, n_heads, n_kv_heads);
 
             // Apply RoPE and attention with expanded K/V
             llaminar::attn::apply_rope(
@@ -564,19 +552,14 @@ namespace llaminar
         }
         else
         {
-            // Standard MHA: expand K/V to match Q layout
+            // Standard MHA: expand K/V to match Q layout using optimized primitive
             std::vector<float> k_expanded((size_t)seq_len * total_head_dim, 0.f);
             std::vector<float> v_expanded((size_t)seq_len * total_head_dim, 0.f);
 
-            for (int row = 0; row < seq_len; ++row)
-            {
-                std::memcpy(k_expanded.data() + (size_t)row * total_head_dim,
-                            k_buf.data() + (size_t)row * kv_head_dim,
-                            kv_head_dim * sizeof(float));
-                std::memcpy(v_expanded.data() + (size_t)row * total_head_dim,
-                            v_buf.data() + (size_t)row * kv_head_dim,
-                            kv_head_dim * sizeof(float));
-            }
+            llaminar::attn::expand_kv_for_mha(
+                k_buf.data(), v_buf.data(),
+                k_expanded.data(), v_expanded.data(),
+                seq_len, kv_head_dim, total_head_dim);
 
             // Apply RoPE to Q and K in-place
             llaminar::attn::apply_rope(

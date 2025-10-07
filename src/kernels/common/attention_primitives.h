@@ -32,6 +32,54 @@ namespace llaminar::attn
     void apply_scores_to_v(const float *scores, const float *v, float *out, int seq_len, int head_dim, int heads);
     void fused_attention(const float *q, const float *k, const float *v, float *out, int seq_len, int head_dim, int heads, bool causal);
 
+    /**
+     * @brief Expand KV heads for Grouped Query Attention (GQA)
+     *
+     * Maps n_kv_heads to n_heads by replicating each KV head group.
+     * Parallelized with OpenMP over sequence positions for optimal performance.
+     *
+     * @param k_compact Input K tensor [seq_len, n_kv_heads * head_dim] row-major
+     * @param v_compact Input V tensor [seq_len, n_kv_heads * head_dim] row-major
+     * @param k_expanded Output K tensor [seq_len, n_heads * head_dim] row-major
+     * @param v_expanded Output V tensor [seq_len, n_heads * head_dim] row-major
+     * @param seq_len Sequence length
+     * @param head_dim Dimension per head
+     * @param n_heads Number of query heads (output)
+     * @param n_kv_heads Number of key/value heads (input, n_kv_heads < n_heads)
+     */
+    void expand_kv_for_gqa(
+        const float *k_compact,
+        const float *v_compact,
+        float *k_expanded,
+        float *v_expanded,
+        int seq_len,
+        int head_dim,
+        int n_heads,
+        int n_kv_heads);
+
+    /**
+     * @brief Expand KV for Multi-Head Attention (MHA)
+     *
+     * Simple parallel copy when n_kv_heads == n_heads (no head replication needed).
+     * Parallelized with OpenMP over sequence positions.
+     *
+     * @param k_compact Input K tensor [seq_len, kv_head_dim] row-major
+     * @param v_compact Input V tensor [seq_len, kv_head_dim] row-major
+     * @param k_expanded Output K tensor [seq_len, total_head_dim] row-major
+     * @param v_expanded Output V tensor [seq_len, total_head_dim] row-major
+     * @param seq_len Sequence length
+     * @param kv_head_dim Input KV dimension (n_kv_heads * head_dim)
+     * @param total_head_dim Output dimension (n_heads * head_dim)
+     */
+    void expand_kv_for_mha(
+        const float *k_compact,
+        const float *v_compact,
+        float *k_expanded,
+        float *v_expanded,
+        int seq_len,
+        int kv_head_dim,
+        int total_head_dim);
+
     struct RowSoftmaxStats
     {
         float max_row_deviation;

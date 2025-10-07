@@ -135,11 +135,24 @@ ctest --test-dir build --output-on-failure --parallel
 # Verbose output
 ctest --test-dir build --output-on-failure --verbose --parallel
 
-# Only passing tests (recommended during development)
-ctest --test-dir build --output-on-failure -R "^(BasicTest|NumaTest)$"
-
 # Test status summary
 ctest --test-dir build --output-on-failure --parallel | tail -20
+
+# Smoke Tests (1.16s)
+ctest --test-dir build --output-on-failure --parallel \
+  -R "^(BasicTest|NumaTest|ModelLoaderGoldenTest|PipelineFactoryTest|DequantTest|TPPartitionSpecTest|LargeMatmulPlanTest|WeightRoleClassification|MPILinearKernelTest|MPIRMSNormKernelTest|MPIAttentionKernelTest|MPISoftmaxCorrectnessTest|RMSNormCoreCorrectness|SoftmaxCoreCorrectness|LinearOrientationCorrectnessTest)$"
+
+# Unit Tests (2m30s)
+ctest --test-dir build --output-on-failure --parallel \
+  -E "(Integration|ParityFramework|Incremental|Qwen|Prefill|.*Stress.*)"
+
+# Parity Integration (24.5s)
+ctest --test-dir build --output-on-failure --verbose \
+  -R "(ParityFramework|AbstractPipelineParity)"
+
+# Integration Tests (3m0s)
+ctest --test-dir build --output-on-failure --verbose \
+  -R "(Integration|Incremental|Qwen|Prefill|End2End|KVCache)"
 ```
 
 ### MPI Testing

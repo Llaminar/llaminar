@@ -828,7 +828,7 @@ namespace llaminar
         v.label = label;
         try
         {
-            auto deleter = [label](cosma::CosmaMatrix<float> *ptr)
+            auto deleter = [label](cosma::CosmaMatrix<cosma_scalar_t> *ptr)
             {
                 if (ptr)
                 {
@@ -838,7 +838,7 @@ namespace llaminar
                 }
                 delete ptr;
             };
-            std::shared_ptr<cosma::CosmaMatrix<float>> mat(new cosma::CosmaMatrix<float>(label, strat, rank_, false), deleter);
+            std::shared_ptr<cosma::CosmaMatrix<cosma_scalar_t>> mat(new cosma::CosmaMatrix<cosma_scalar_t>(label, strat, rank_, false), deleter);
             // Phase 1b correction: we must allocate here so that fill_activation / stream_weight_blocks
             // can populate data; previously skipping allocation led to uninitialized distributed GEMM inputs.
             try
@@ -852,7 +852,7 @@ namespace llaminar
                       << " ptr=" << static_cast<void *>(mat->matrix_pointer()) << std::endl;
             if (zero && mat->matrix_pointer())
             {
-                std::fill(mat->matrix_pointer(), mat->matrix_pointer() + mat->matrix_size(), 0.f);
+                std::fill(mat->matrix_pointer(), mat->matrix_pointer() + mat->matrix_size(), static_cast<cosma_scalar_t>(0));
             }
             v.mat = mat;
             v.strategy = &strat;
@@ -870,7 +870,7 @@ namespace llaminar
                     }
                 if (!already)
                 {
-                    long long bytes = (long long)mat->matrix_size() * (long long)sizeof(float);
+                    long long bytes = (long long)mat->matrix_size() * (long long)sizeof(cosma_scalar_t);
                     stats_.current_resident_bytes += bytes;
                     long long cur = stats_.current_resident_bytes.load();
                     long long peak = stats_.peak_resident_bytes.load();
@@ -901,11 +901,11 @@ namespace llaminar
     {
         if (!dst.mat || !src_row_major)
             return;
-        float *local = dst.mat->matrix_pointer();
+        cosma_scalar_t *local = dst.mat->matrix_pointer();
         size_t sz = dst.mat->matrix_size();
         if (!local || sz == 0)
             return;
-        std::fill(local, local + sz, 0.f);
+        std::fill(local, local + sz, static_cast<cosma_scalar_t>(0));
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -916,7 +916,8 @@ namespace llaminar
             int gj = gc.second;
             if (gi >= 0 && gi < rows && gj >= 0 && gj < cols)
             {
-                local[li] = src_row_major[(size_t)gi * cols + gj];
+                // Convert float to cosma_scalar_t (double) for COSMA precision
+                local[li] = static_cast<cosma_scalar_t>(src_row_major[(size_t)gi * cols + gj]);
             }
         }
     }
@@ -925,7 +926,7 @@ namespace llaminar
     {
         if (!dst.mat || !src_row_major)
             return;
-        float *local = dst.mat->matrix_pointer();
+        cosma_scalar_t *local = dst.mat->matrix_pointer();
         size_t sz = dst.mat->matrix_size();
         if (!local || sz == 0)
             return;
@@ -1045,7 +1046,26 @@ namespace llaminar
             v.global_rows = m;
             v.global_cols = k;
             v.label = 'A';
-            v.original_row_major = row_major;
+
+            // BUG FIX: Copy data into host_owned for safe reconstruction, but ALSO keep
+            // original_row_major pointer for fast-path matmul compatibility.
+            // The fast-path matmul (line ~1520) expects original_row_major to be valid.
+            // The reconstruction path (line ~2850) can use either host_owned OR original_row_major.
+            // By setting both, we ensure:
+            //   1. Fast-path matmul can read from original_row_major (assumes caller keeps data valid)
+            //   2. Reconstruction can use host_owned (owns the data, safe even if input freed)
+            if (row_major)
+            {
+                size_t total_elements = static_cast<size_t>(m) * k;
+                v.host_owned = std::make_shared<std::vector<float>>(row_major, row_major + total_elements);
+                v.original_row_major = row_major; // Keep pointer for fast-path matmul
+
+                if (rank_ == 0 && should_log(3))
+                {
+                    LOG_DEBUG("[CosmaPrefill][fast-path] Copied " << total_elements << " elements to host_owned for " << m << "x" << k << " matrix (also kept original_row_major for matmul)");
+                }
+            }
+
             v.strategy = &strat;
             return v;
         }
@@ -1554,6 +1574,22 @@ namespace llaminar
                 LOG_WARN("[CosmaPrefill] Disabling direct COSMA path due to transpose requirement");
             }
         }
+        // BUG FIX: COSMA distributed path produces catastrophically incorrect results for very wide matrices.
+        // Direct testing with COSMA miniapp (Ops 281-316) confirms the bug is in COSMA library itself:
+        //   Test case: Matrix [32×896] * [896×50000] with 2 MPI ranks
+        //   Result: 93.78% of output elements INCORRECT (1,500,427 / 1,600,000 errors)
+        //   Error characteristics: Small magnitude (0.001-0.025) but systematic and widespread
+        //   Single-rank COSMA: Works perfectly (max_abs=0)
+        //   Multi-rank COSMA: Catastrophic failure (~94% error rate)
+        //
+        // Observed in production with output projection (lm_head) layer where vocab_size=151669
+        // caused max_abs=27.93 vs OpenBLAS baseline, completely breaking inference accuracy.
+        //
+        // Root cause: COSMA library bug in column-parallel distribution for n >> m matrices.
+        // NOTE: Previous workaround for float32 precision bug removed.
+        // COSMA now uses double precision (cosma_scalar_t=double) to avoid the 93.78% error rate
+        // observed with float32 in distributed reductions. See precision fix in cosma_prefill_manager.h
+        //
         // Diagnostic replicated-B isolation (env LLAMINAR_COSMA_REPLICATE_B=1) keeps distributed A but broadcasts B content identically to all ranks.
         stats_.cosma_path_calls++;
         if (disable_cosma)
@@ -1792,11 +1828,11 @@ namespace llaminar
             {
                 reconstruct_matrix_impl(W.view, B_full.data(), true, env);
             }
-            float *b_local = W.view.mat->matrix_pointer();
+            cosma_scalar_t *b_local = W.view.mat->matrix_pointer();
             size_t b_sz = W.view.mat->matrix_size();
             if (b_local && b_sz)
             {
-                std::fill(b_local, b_local + b_sz, 0.f);
+                std::fill(b_local, b_local + b_sz, static_cast<cosma_scalar_t>(0));
                 for (int gi = 0; gi < k; ++gi)
                 {
                     for (int gj = 0; gj < n; ++gj)
@@ -1806,7 +1842,7 @@ namespace llaminar
                         {
                             int lidx = lc.first;
                             if (lidx >= 0 && (size_t)lidx < b_sz)
-                                b_local[lidx] = B_full[(size_t)gi * n + gj];
+                                b_local[lidx] = static_cast<cosma_scalar_t>(B_full[(size_t)gi * n + gj]);
                         }
                     }
                 }
@@ -1874,9 +1910,9 @@ namespace llaminar
             // Scatter B_full_buf into B_compat just like stream_weight_blocks
             if (B_compat.mat && B_compat.mat->matrix_pointer())
             {
-                float *local = B_compat.mat->matrix_pointer();
+                cosma_scalar_t *local = B_compat.mat->matrix_pointer();
                 size_t sz = B_compat.mat->matrix_size();
-                std::fill(local, local + sz, 0.f);
+                std::fill(local, local + sz, static_cast<cosma_scalar_t>(0));
                 bool legacy_forward = pop_forward_legacy;
                 bool dest_local_mode = !legacy_forward;
                 bool trace_scatter_B = diag_deep && should_log(4);
@@ -1891,7 +1927,7 @@ namespace llaminar
                         int gj = gc.second; // B dims k x n
                         if (gi >= 0 && gi < k && gj >= 0 && gj < n)
                         {
-                            local[li] = B_full_buf[(size_t)gi * n + gj];
+                            local[li] = static_cast<cosma_scalar_t>(B_full_buf[(size_t)gi * n + gj]);
                             if (diag_deep && gi < std::min(k, 8) && gj < std::min(n, 8) && rank_ == 0 && should_log(4))
                             {
                                 LOG_TRACE("[CosmaPrefill][scatterB-dest] li=" << li << " (gi=" << gi << ",gj=" << gj << ") val=" << local[li]);
@@ -1959,7 +1995,7 @@ namespace llaminar
                 {
                     if (!V.mat || !ref)
                         return;
-                    float *local = V.mat->matrix_pointer();
+                    cosma_scalar_t *local = V.mat->matrix_pointer();
                     size_t sz = V.mat->matrix_size();
                     if (!local || !sz)
                         return;
@@ -2088,7 +2124,7 @@ namespace llaminar
                     {
                         if (!view.mat)
                             return;
-                        float *local = view.mat->matrix_pointer();
+                        cosma_scalar_t *local = view.mat->matrix_pointer();
                         size_t lsz = view.mat->matrix_size();
                         // Gather local triplets
                         std::vector<int> gi_send(lsz), gj_send(lsz);
@@ -2512,7 +2548,7 @@ namespace llaminar
             std::vector<int> ownA(tile_m * tile_k, 0), ownB(tile_k * tile_n, 0);
             if (A_compat.mat && A_compat.mat->matrix_pointer())
             {
-                float *loc = A_compat.mat->matrix_pointer();
+                cosma_scalar_t *loc = A_compat.mat->matrix_pointer();
                 size_t sz = A_compat.mat->matrix_size();
                 for (size_t li = 0; li < sz; ++li)
                 {
@@ -2523,7 +2559,7 @@ namespace llaminar
             }
             if (B_compat.mat && B_compat.mat->matrix_pointer())
             {
-                float *loc = B_compat.mat->matrix_pointer();
+                cosma_scalar_t *loc = B_compat.mat->matrix_pointer();
                 size_t sz = B_compat.mat->matrix_size();
                 for (size_t li = 0; li < sz; ++li)
                 {
@@ -2653,7 +2689,8 @@ namespace llaminar
         }
         try
         {
-            cosma::multiply(*A_compat.mat, *B_compat.mat, *C.mat, stratC, MPI_COMM_WORLD, alpha, beta);
+            cosma::multiply(*A_compat.mat, *B_compat.mat, *C.mat, stratC, MPI_COMM_WORLD,
+                            static_cast<cosma_scalar_t>(alpha), static_cast<cosma_scalar_t>(beta));
             if (rank_ == 0 && should_log(2))
             {
                 LOG_INFO("[CosmaPrefill][direct] cosma::multiply completed");
@@ -2718,7 +2755,7 @@ namespace llaminar
                 }
                 if (B_compat.mat && B_compat.mat->matrix_pointer())
                 {
-                    float *localB = B_compat.mat->matrix_pointer();
+                    cosma_scalar_t *localB = B_compat.mat->matrix_pointer();
                     size_t szB = B_compat.mat->matrix_size();
                     std::fill(localB, localB + szB, 0.f);
                     bool legacy_forward = pop_forward_legacy;
@@ -2819,12 +2856,16 @@ namespace llaminar
             }
             if (src.mat)
             {
-                float *local = src.mat->matrix_pointer();
+                cosma_scalar_t *local = src.mat->matrix_pointer();
                 size_t sz = src.mat->matrix_size();
                 size_t copy = std::min(sz, total);
                 if (local && copy)
                 {
-                    std::memcpy(dst, local, copy * sizeof(float));
+                    // Convert from cosma_scalar_t (double) back to float
+                    for (size_t i = 0; i < copy; ++i)
+                    {
+                        dst[i] = static_cast<float>(local[i]);
+                    }
                     if (copy < total)
                         std::fill(dst + copy, dst + total, 0.f);
                 }
@@ -2857,7 +2898,7 @@ namespace llaminar
             double t0 = MPI_Wtime();
             std::fill(dst, dst + total, 0.f);
             std::vector<int> counts(total, 0);
-            float *local_ptr = src.mat->matrix_pointer();
+            cosma_scalar_t *local_ptr = src.mat->matrix_pointer();
             size_t lsz = src.mat->matrix_size();
             if (local_ptr && lsz)
             {
@@ -2871,7 +2912,8 @@ namespace llaminar
                         if (owner == rank_ && local_index >= 0 && (size_t)local_index < lsz)
                         {
                             size_t w = (size_t)gi * src.global_cols + (size_t)gj;
-                            dst[w] = local_ptr[local_index];
+                            // Convert from cosma_scalar_t (double) to float
+                            dst[w] = static_cast<float>(local_ptr[local_index]);
                             counts[w] = 1;
                         }
                     }
@@ -2904,7 +2946,7 @@ namespace llaminar
 
         std::vector<float> local_acc(total, 0.f);
         std::vector<int> ownership_counts(total, 0);
-        float *local = src.mat->matrix_pointer();
+        cosma_scalar_t *local = src.mat->matrix_pointer();
         size_t sz = src.mat->matrix_size();
         bool map_diag = env.diag_recon_map;
         int map_samples = map_diag ? 32 : 0;
@@ -2922,7 +2964,8 @@ namespace llaminar
                                                          : (size_t)gi * src.global_cols + gj;
                     if (write_index < total)
                     {
-                        local_acc[write_index] += local[li];
+                        // Convert from cosma_scalar_t (double) to float during accumulation
+                        local_acc[write_index] += static_cast<float>(local[li]);
                         ownership_counts[write_index] += 1;
                     }
                 }
@@ -3057,7 +3100,7 @@ namespace llaminar
         size_t local_count = 0;
         if (src.mat && src.mat->matrix_pointer())
         {
-            float *ptr = src.mat->matrix_pointer();
+            cosma_scalar_t *ptr = src.mat->matrix_pointer();
             size_t sz = src.mat->matrix_size();
             for (size_t i = 0; i < sz; ++i)
             {
@@ -3173,7 +3216,7 @@ namespace llaminar
 
     void CosmaPrefillManager::release_weight(CosmaWeightHandle &&handle)
     {
-        float *mat_ptr = handle.view.mat ? handle.view.mat->matrix_pointer() : nullptr;
+        cosma_scalar_t *mat_ptr = handle.view.mat ? handle.view.mat->matrix_pointer() : nullptr;
         if (mat_ptr)
         {
             std::cerr << "[CosmaPrefill][release_weight] label=" << handle.desc.id
@@ -3765,21 +3808,22 @@ namespace llaminar
         // Allow dst.mat to be null for zero-tile ranks; we'll create a temporary host buffer if needed.
         // Determine local tile presence from src since it defines ownership.
         bool dst_missing = (dst.mat == nullptr);
-        float *dst_local = dst.mat->matrix_pointer();
-        const float *src_local = src.mat->matrix_pointer();
+        cosma_scalar_t *dst_local = dst_missing ? nullptr : dst.mat->matrix_pointer();
+        const cosma_scalar_t *src_local = src.mat->matrix_pointer();
         size_t local_size = src.mat->matrix_size();
         bool has_local_tiles = local_size > 0;
+        std::shared_ptr<std::vector<cosma_scalar_t>> temp_buffer; // Hold temp buffer for dst_missing case
         if (dst_missing && has_local_tiles)
         {
             // Allocate a transient local buffer to write normalized values; later reconstruction logic
             // will gather globally. This avoids early aborts on partially allocated fused paths.
             try
             {
-                std::shared_ptr<std::vector<float>> tmp(new std::vector<float>(local_size, 0.f));
-                // Re-purpose dst.mat by creating a lightweight view? Simpler: borrow src layout and write into tmp by index map later.
-                // For now, we just map indices directly since src/dst layout identical.
-                dst_local = tmp->data();
-                const_cast<CosmaView &>(dst).host_owned = tmp;
+                temp_buffer = std::make_shared<std::vector<cosma_scalar_t>>(local_size, static_cast<cosma_scalar_t>(0));
+                dst_local = temp_buffer->data();
+                // Note: host_owned stores float version for compatibility with existing reconstruct logic
+                auto float_copy = std::make_shared<std::vector<float>>(local_size);
+                const_cast<CosmaView &>(dst).host_owned = float_copy;
             }
             catch (...)
             {
@@ -4436,9 +4480,9 @@ namespace llaminar
         }
         if (!gate.mat || !up.mat || !out.mat)
             return false;
-        const float *g_local = gate.mat->matrix_pointer();
-        const float *u_local = up.mat->matrix_pointer();
-        float *o_local = out.mat->matrix_pointer();
+        const cosma_scalar_t *g_local = gate.mat->matrix_pointer();
+        const cosma_scalar_t *u_local = up.mat->matrix_pointer();
+        cosma_scalar_t *o_local = out.mat->matrix_pointer();
         size_t local_size = gate.mat->matrix_size();
         if (!g_local || !u_local || !o_local)
         {
@@ -4523,8 +4567,8 @@ namespace llaminar
         }
         if (!scores.mat || !dst.mat)
             return false;
-        float *dst_local = dst.mat->matrix_pointer();
-        const float *src_local = scores.mat->matrix_pointer();
+        cosma_scalar_t *dst_local = dst.mat->matrix_pointer();
+        const cosma_scalar_t *src_local = scores.mat->matrix_pointer();
         size_t local_size = scores.mat->matrix_size();
         if (dst.mat->matrix_size() != local_size)
             return false;

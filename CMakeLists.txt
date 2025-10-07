@@ -416,6 +416,18 @@ add_executable(test_cosma tests/test_cosma.cpp)
 target_link_libraries(test_cosma llaminar_core)
 add_test(NAME CosmaTest COMMAND test_cosma)
 
+# COSMA precision comparison test (float vs double in multi-rank)
+add_executable(test_cosma_precision tests/test_cosma_precision.cpp)
+target_link_libraries(test_cosma_precision 
+    PRIVATE 
+    cosma 
+    GTest::gtest 
+    MPI::MPI_CXX
+    ${BLAS_LIBRARIES}
+)
+add_llaminar_mpi_test(CosmaPrecision 2 test_cosma_precision)
+set_tests_properties(CosmaPrecision PROPERTIES TIMEOUT 120)
+
 # Embedding standalone test (minimal isolation test for debugging)
 add_executable(test_embedding_standalone 
     tests/test_embedding_standalone.cpp
@@ -993,6 +1005,12 @@ if(GTEST_FOUND)
     endif()
     add_test(NAME CosmaPrefillManagerOrientationAutoFixTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_orientation_autofix)
     set_tests_properties(CosmaPrefillManagerOrientationAutoFixTest PROPERTIES TIMEOUT 60)
+
+    # Minimal scatter/gather coordinate mapping test
+    add_executable(test_cosma_scatter_gather test_cosma_scatter_gather.cpp)
+    target_link_libraries(test_cosma_scatter_gather PRIVATE llaminar_core MPI::MPI_CXX)
+    add_llaminar_mpi_test(CosmaScatterGatherTest 2 test_cosma_scatter_gather)
+    set_tests_properties(CosmaScatterGatherTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_cosma_prefill_manager_env_audit tests/test_cosma_prefill_manager_env_audit.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_env_audit llaminar_core)

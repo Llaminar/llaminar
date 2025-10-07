@@ -1183,4 +1183,74 @@ namespace llaminar::attn
         return st;
     }
 
+    void expand_kv_for_gqa(
+        const float *k_compact,
+        const float *v_compact,
+        float *k_expanded,
+        float *v_expanded,
+        int seq_len,
+        int head_dim,
+        int n_heads,
+        int n_kv_heads)
+    {
+        const int kv_head_dim = n_kv_heads * head_dim;
+        const int total_head_dim = n_heads * head_dim;
+
+        // Parallelize over sequence tokens (outer loop)
+        // This gives good work distribution for long sequences
+#pragma omp parallel for schedule(static)
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const float *k_row_src = k_compact + (size_t)row * kv_head_dim;
+            const float *v_row_src = v_compact + (size_t)row * kv_head_dim;
+            float *k_row_dst = k_expanded + (size_t)row * total_head_dim;
+            float *v_row_dst = v_expanded + (size_t)row * total_head_dim;
+
+            // For each query head, map to corresponding KV head group
+            for (int h = 0; h < n_heads; ++h)
+            {
+                int kv_h = h % n_kv_heads;
+                const float *k_src = k_row_src + kv_h * head_dim;
+                const float *v_src = v_row_src + kv_h * head_dim;
+                float *k_dst = k_row_dst + h * head_dim;
+                float *v_dst = v_row_dst + h * head_dim;
+
+                // Use vectorized copy (memcpy is often SIMD-optimized by compiler)
+                std::memcpy(k_dst, k_src, head_dim * sizeof(float));
+                std::memcpy(v_dst, v_src, head_dim * sizeof(float));
+            }
+        }
+    }
+
+    void expand_kv_for_mha(
+        const float *k_compact,
+        const float *v_compact,
+        float *k_expanded,
+        float *v_expanded,
+        int seq_len,
+        int kv_head_dim,
+        int total_head_dim)
+    {
+        // Simple parallel copy when dimensions differ
+        // (typically kv_head_dim < total_head_dim, need zero-padding)
+#pragma omp parallel for schedule(static)
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const float *k_src = k_compact + (size_t)row * kv_head_dim;
+            const float *v_src = v_compact + (size_t)row * kv_head_dim;
+            float *k_dst = k_expanded + (size_t)row * total_head_dim;
+            float *v_dst = v_expanded + (size_t)row * total_head_dim;
+
+            std::memcpy(k_dst, k_src, kv_head_dim * sizeof(float));
+            std::memcpy(v_dst, v_src, kv_head_dim * sizeof(float));
+
+            // Zero-pad the remaining dimensions if needed
+            if (total_head_dim > kv_head_dim)
+            {
+                std::memset(k_dst + kv_head_dim, 0, (total_head_dim - kv_head_dim) * sizeof(float));
+                std::memset(v_dst + kv_head_dim, 0, (total_head_dim - kv_head_dim) * sizeof(float));
+            }
+        }
+    }
+
 } // namespace llaminar::attn

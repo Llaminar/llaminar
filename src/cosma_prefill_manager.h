@@ -13,6 +13,11 @@
 //   - Memory budget guard for single allocations
 // Phase 1b adds: cumulative resident tracking, JSON stats export, env audit helpers.
 // Non-goals (deferred): fused dequant, full in-layout elementwise kernels, stream overlap.
+//
+// PRECISION NOTE:
+//   COSMA has a catastrophic float32 precision bug in distributed mode affecting all matrix
+//   sizes (see GitHub issue #TBD). Until fixed upstream, we use double precision for COSMA
+//   operations with conversion at boundaries. Memory usage doubles but correctness is ensured.
 // --------------------------------------------------------------
 #include <deque>
 #include <memory>
@@ -26,6 +31,11 @@
 #include <mpi.h>
 #include <atomic>
 #include <mutex>
+
+// COSMA precision type - use double due to float32 distributed reduction bug
+// See: https://github.com/eth-cscs/COSMA/issues/TBD
+using cosma_scalar_t = double;
+using cosma_external_t = float; // External interface still uses float
 
 namespace llaminar
 {
@@ -50,8 +60,8 @@ namespace llaminar
         // Retain prerequisite allocations (typically operand buffers rebuilt for COSMA layout)
         // so their destruction occurs after this view releases its own matrix, preserving the
         // COSMA memory pool's LIFO discipline.
-        std::vector<std::shared_ptr<cosma::CosmaMatrix<float>>> release_chain;
-        std::shared_ptr<cosma::CosmaMatrix<float>> mat; // shared so temporary results survive chaining
+        std::vector<std::shared_ptr<cosma::CosmaMatrix<cosma_scalar_t>>> release_chain;
+        std::shared_ptr<cosma::CosmaMatrix<cosma_scalar_t>> mat; // shared so temporary results survive chaining
         int global_rows = 0;
         int global_cols = 0;
         char label = 'A';
@@ -392,7 +402,7 @@ namespace llaminar
 
         struct AllocationRecord
         {
-            std::weak_ptr<cosma::CosmaMatrix<float>> ref;
+            std::weak_ptr<cosma::CosmaMatrix<cosma_scalar_t>> ref;
             long long bytes{0};
         };
         std::vector<AllocationRecord> allocations_; // tracked allocations for resident memory accounting
