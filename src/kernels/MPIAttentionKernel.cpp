@@ -43,6 +43,7 @@
 #include "../utils/debug_env.h"
 #include "../utils/debug_sharding.h"
 #include "kernels/common/attention_primitives.h" // shared fast paths (RoPE, QK scores, scores@V)
+#include "kernels/common/softmax_core.h" // softmax primitives for attention scores
 #include "../adaptive_matmul.h"
 #include "../backends/prefill_backend.h"
 #include "../backends/inference_backend.h"
@@ -295,6 +296,16 @@ namespace llaminar
             t_rope_ms = time_block([&]
                                    { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads); });
         }
+        
+        // Capture Q and K after RoPE for parity testing
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            auto [local_h, _] = getHeadDistribution();
+            // Capture full Q tensor post-RoPE (flatten from [seq_len, local_heads, head_dim] to [seq_len, local_head_dim])
+            snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_, local_q->data(), seq_len, local_h * head_dim_);
+            // Note: We capture Q for ROPE_APPLICATION stage; K is also RoPE'd but can be validated via attention scores
+        }
+        
         if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
         {
             size_t slice = (size_t)local_heads * head_dim_;
@@ -1609,7 +1620,29 @@ namespace llaminar
     void MPIAttentionKernel::computeLocalAttentionScores(const float *local_q, const float *local_k, float *scores,
                                                          size_t seq_len, int local_heads)
     {
-        llaminar::attn::compute_qk_scores(local_q, local_k, scores, (int)seq_len, head_dim_, local_heads, /*causal=*/true, /*apply_softmax=*/true);
+        // Compute Q@K^T scores first (before softmax) for debugging
+        llaminar::attn::compute_qk_scores(local_q, local_k, scores, (int)seq_len, head_dim_, local_heads, /*causal=*/true, /*apply_softmax=*/false);
+        
+        // Capture attention scores BEFORE softmax for parity testing
+        if (snapshot_callback_ && getRank() == 0)
+        {
+            // Scores are in [heads, seq_len, seq_len] layout
+            // For snapshot we'll capture as [seq_len * local_heads, seq_len]
+            snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, scores, seq_len * local_heads, seq_len);
+        }
+        
+        // Now apply softmax in-place (one call per head)
+        for (int h = 0; h < local_heads; ++h)
+        {
+            llaminar::kernels::SoftmaxRowArgs args;
+            args.scores = scores + (std::size_t)h * seq_len * seq_len;
+            args.rows = (int)seq_len;
+            args.cols = (int)seq_len;
+            args.causal = true;
+            args.scale = 1.0f;
+            llaminar::kernels::softmax_row_major(args);
+        }
+        
         LOG_DEBUG("Computed local attention scores for " << local_heads << " heads on rank " << getRank());
     }
 

@@ -445,55 +445,68 @@ namespace llaminar
                                               std::string &stage_name)
         {
             // Handle special keys
-            if (key == "embeddings")
+            if (key == "embeddings" || key == "EMBEDDING")
             {
                 layer_index = -1;
-                stage_name = "embeddings";
+                stage_name = "EMBEDDING";
                 return true;
             }
-            if (key == "final_norm_out")
+            if (key == "final_norm_out" || key == "FINAL_NORM")
             {
                 layer_index = -1;
-                stage_name = "final_norm_out";
+                stage_name = "FINAL_NORM";
                 return true;
             }
-            if (key == "logits")
+            if (key == "logits" || key == "LM_HEAD")
             {
                 layer_index = -1;
-                stage_name = "logits";
+                stage_name = "LM_HEAD";
                 return true;
             }
 
-            // Parse layer_N_stage format
+            // Try parsing layer_N_stage format first (old convention)
             std::string prefix = "layer_";
-            if (key.substr(0, prefix.length()) != prefix)
+            if (key.substr(0, prefix.length()) == prefix)
             {
-                return false;
+                // Find next underscore after "layer_"
+                size_t first_underscore = prefix.length();
+                size_t second_underscore = key.find('_', first_underscore);
+                if (second_underscore != std::string::npos)
+                {
+                    // Extract layer number
+                    std::string layer_str = key.substr(first_underscore,
+                                                       second_underscore - first_underscore);
+                    try
+                    {
+                        layer_index = std::stoi(layer_str);
+                        stage_name = key.substr(second_underscore + 1);
+                        return true;
+                    }
+                    catch (...)
+                    {
+                        // Fall through to try STAGE_N format
+                    }
+                }
             }
 
-            // Find next underscore after "layer_"
-            size_t first_underscore = prefix.length();
-            size_t second_underscore = key.find('_', first_underscore);
-            if (second_underscore == std::string::npos)
+            // Try parsing STAGE_N format (new convention: "ATTENTION_OUTPUT_0")
+            size_t last_underscore = key.rfind('_');
+            if (last_underscore != std::string::npos && last_underscore > 0)
             {
-                return false;
+                std::string potential_number = key.substr(last_underscore + 1);
+                try
+                {
+                    layer_index = std::stoi(potential_number);
+                    stage_name = key.substr(0, last_underscore);
+                    return true;
+                }
+                catch (...)
+                {
+                    // Not a valid number
+                }
             }
 
-            // Extract layer number
-            std::string layer_str = key.substr(first_underscore,
-                                               second_underscore - first_underscore);
-            try
-            {
-                layer_index = std::stoi(layer_str);
-            }
-            catch (...)
-            {
-                return false;
-            }
-
-            // Extract stage name
-            stage_name = key.substr(second_underscore + 1);
-            return true;
+            return false;
         }
 
         // ==================== Layer-by-Layer Comparator ====================
