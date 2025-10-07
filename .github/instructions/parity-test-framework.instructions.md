@@ -604,6 +604,148 @@ When a comparison fails:
 - Compiled out completely in release builds (`#ifdef NDEBUG`)
 - Use stage filtering to reduce capture overhead during development
 
+## ⚠️ CRITICAL: Comparison Stage Whitelist
+
+### Overview
+
+**The parity test framework uses a hard-coded whitelist** of stages to compare in `tests/test_parity_framework.cpp`. Intermediate stages captured in kernels (like `ATTENTION_CONTEXT`, `Q_PROJECTION`, `ATTENTION_SCORES`, etc.) are **automatically captured** but **NOT automatically compared** unless explicitly added to the whitelist.
+
+### Location
+
+File: `tests/test_parity_framework.cpp`  
+Function: `compare_all_stages_vs_pytorch()`  
+Lines: ~330-350 (search for `std::vector<StageInfo> stages;`)
+
+### How It Works
+
+```cpp
+bool compare_all_stages_vs_pytorch(...) {
+    // Hard-coded whitelist of stages to compare
+    std::vector<StageInfo> stages;
+    
+    // Global stages
+    stages.push_back({"EMBEDDING", -1, 0.05f, 0.02});
+    
+    // Per-layer stages (for each layer 0..n_layers-1)
+    for (int layer = 0; layer < n_layers; ++layer) {
+        stages.push_back({"ATTENTION_NORM", layer, 0.05f, 0.02});
+        stages.push_back({"ATTENTION_OUTPUT", layer, 0.1f, 0.05});
+        stages.push_back({"ATTENTION_RESIDUAL", layer, 0.1f, 0.05});
+        stages.push_back({"FFN_NORM", layer, 0.05f, 0.02});
+        stages.push_back({"FFN_DOWN", layer, 0.1f, 0.05});
+        stages.push_back({"FFN_RESIDUAL", layer, 0.1f, 0.05});
+    }
+    
+    // Final stages
+    stages.push_back({"FINAL_NORM", -1, 0.05f, 0.02});
+    stages.push_back({"LM_HEAD", -1, 0.15f, 0.1});
+    
+    // Only these stages are compared!
+    for (const auto& stage_info : stages) {
+        // ... comparison logic ...
+    }
+}
+```
+
+### When to Update the Whitelist
+
+**You MUST update this whitelist when:**
+
+1. **Adding new intermediate capture stages** for debugging (e.g., `ATTENTION_CONTEXT`, `ATTENTION_SCORES`)
+2. **Adding new kernel-level snapshots** that need validation
+3. **Debugging divergence** and need to see intermediate comparisons
+4. **Implementing new pipeline stages** (new layer types, new operations)
+
+**Symptoms that whitelist needs updating:**
+- Snapshots show up in registry listing but not in comparison output
+- Test says "Comparing N stages" but you expect more
+- Intermediate captures work (`snapshot_callback_` fires) but no comparison results
+
+### Adding New Stages to Whitelist
+
+**Step 1**: Identify the stage name and layer index
+```cpp
+// Example: ATTENTION_CONTEXT is captured at each layer
+Stage name: "ATTENTION_CONTEXT"
+Layer index: 0..n_layers-1 (per-layer)
+```
+
+**Step 2**: Add to the whitelist with appropriate tolerances
+```cpp
+for (int layer = 0; layer < n_layers; ++layer) {
+    stages.push_back({"ATTENTION_NORM", layer, 0.05f, 0.02});
+    
+    // NEW: Add intermediate attention stages
+    stages.push_back({"Q_PROJECTION", layer, 0.1f, 0.05});
+    stages.push_back({"K_PROJECTION", layer, 0.1f, 0.05});
+    stages.push_back({"V_PROJECTION", layer, 0.1f, 0.05});
+    stages.push_back({"ROPE_APPLICATION", layer, 0.1f, 0.05});
+    stages.push_back({"ATTENTION_SCORES", layer, 0.1f, 0.05});
+    stages.push_back({"ATTENTION_SOFTMAX", layer, 0.1f, 0.05});
+    stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05});  // ⭐ Critical!
+    
+    stages.push_back({"ATTENTION_OUTPUT", layer, 0.1f, 0.05});
+    // ... rest of stages ...
+}
+```
+
+**Step 3**: Rebuild and verify
+```bash
+cmake --build build --target test_parity_framework
+./build/test_parity_framework --gtest_filter="*OpenBLASPrefillVsPyTorch"
+
+# Should now see:
+# [OPENBLAS_PYTORCH] Comparing 219 stages...  (was 147)
+# [OPENBLAS_PYTORCH] ATTENTION_CONTEXT_layer0: rel_l2=... ✓ PASS
+```
+
+### Tolerance Guidelines
+
+Choose tolerances based on operation type:
+
+| Operation Type | max_abs_tol | rel_l2_tol | Rationale |
+|----------------|-------------|------------|-----------|
+| RMSNorm | 0.05 | 0.02 | Tight - simple operation |
+| Matmul (Q/K/V) | 0.1 | 0.05 | Relaxed - accumulation errors |
+| RoPE | 0.1 | 0.05 | Relaxed - trigonometric ops |
+| Softmax | 0.1 | 0.05 | Relaxed - exponentials |
+| Attention context | 0.1 | 0.05 | Relaxed - matmul result |
+| LM Head | 0.15 | 0.1 | Most relaxed - large dimensions |
+
+### Common Pitfall
+
+**WRONG**: Adding snapshot callback without updating whitelist
+```cpp
+// In MPIAttentionKernel.cpp
+snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, ...);  // ✅ Captures
+
+// In test_parity_framework.cpp
+// ❌ Whitelist unchanged - stage NOT compared!
+```
+
+**RIGHT**: Add to both capture point AND whitelist
+```cpp
+// In MPIAttentionKernel.cpp
+snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, ...);  // ✅ Captures
+
+// In test_parity_framework.cpp
+stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05});  // ✅ Compares
+```
+
+### Why Use a Whitelist?
+
+**Advantages:**
+- Explicit tolerance specification per stage
+- Control over what's compared (avoid noisy intermediate stages)
+- Execution order guarantees (stages compared in defined sequence)
+- Easy to adjust tolerances without changing capture code
+
+**Trade-off:**
+- Must manually maintain (could miss new stages)
+- Debugging confusion when captures don't appear in output
+
+**Future Enhancement**: Could auto-discover all captured stages and use default tolerances, but explicit whitelist provides better control for production tests.
+
 ## See Also
 
 - **[PREFILL_PARITY_TESTING_GUIDE.md](PREFILL_PARITY_TESTING_GUIDE.md)**: Comprehensive guide to PrefillProvider stage-by-stage parity testing

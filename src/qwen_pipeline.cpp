@@ -611,6 +611,10 @@ namespace llaminar
         // See: Investigation in docs/OPENBLAS_PREFILL_ROOT_CAUSE_ANALYSIS.md
         attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
 
+        // Wire up snapshot callback for intermediate attention stages (Q/K/V proj, RoPE, scores, etc.)
+        attention_kernel->setSnapshotCallback([this](PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)
+                                              { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim); });
+
         if (!registerKernel("attention", std::move(attention_kernel)))
             throw std::runtime_error("Failed to register Attention kernel");
 

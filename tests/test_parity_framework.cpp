@@ -339,6 +339,16 @@ namespace
         for (int layer = 0; layer < n_layers; ++layer)
         {
             stages.push_back({"ATTENTION_NORM", layer, 0.05f, 0.02});  // Tight for norm
+            
+            // Intermediate attention stages (for debugging divergence)
+            stages.push_back({"Q_PROJECTION", layer, 0.1f, 0.05});      // Q linear projection
+            stages.push_back({"K_PROJECTION", layer, 0.1f, 0.05});      // K linear projection  
+            stages.push_back({"V_PROJECTION", layer, 0.1f, 0.05});      // V linear projection
+            stages.push_back({"ROPE_APPLICATION", layer, 0.1f, 0.05});  // After RoPE rotation
+            stages.push_back({"ATTENTION_SCORES", layer, 0.1f, 0.05});  // Q@K^T before softmax
+            stages.push_back({"ATTENTION_SOFTMAX", layer, 0.1f, 0.05}); // After softmax
+            stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05}); // Scores@V (before W_o)
+            
             stages.push_back({"ATTENTION_OUTPUT", layer, 0.1f, 0.05}); // Relaxed for matmul
             stages.push_back({"ATTENTION_RESIDUAL", layer, 0.1f, 0.05});
             stages.push_back({"FFN_NORM", layer, 0.05f, 0.02}); // Tight for norm
