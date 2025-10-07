@@ -258,15 +258,32 @@ namespace llaminar
         else
         {
             // Legacy path: allocate local slices then copy/distribute.
-            local_wq = createLocalSimpleTensor({d_model, local_head_dim});
-            local_wk = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
-            local_wv = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
-            local_wo = createLocalSimpleTensor({local_head_dim, d_model});
+            // For single-rank execution, skip distribution and use global weights directly
+            if (getSize() == 1)
             {
-                PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
-                t_distribute_ms = time_block([&]
-                                             { distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
-                                                                local_wq, local_wk, local_wv, local_wo, seq_len, d_model); });
+                // Single rank: use full global weights (no distribution needed)
+                local_wq = global_wq;
+                local_wk = global_wk;
+                local_wv = global_wv;
+                local_wo = global_wo;
+                if (getRank() == 0)
+                {
+                    LOG_DEBUG("MPIAttentionKernel: single-rank execution, using global weights directly (no distribution)");
+                }
+            }
+            else
+            {
+                // Multi-rank: allocate local slices and distribute
+                local_wq = createLocalSimpleTensor({d_model, local_head_dim});
+                local_wk = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
+                local_wv = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
+                local_wo = createLocalSimpleTensor({local_head_dim, d_model});
+                {
+                    PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
+                    t_distribute_ms = time_block([&]
+                                                 { distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
+                                                                    local_wq, local_wk, local_wv, local_wo, seq_len, d_model); });
+                }
             }
         }
         // Create local projection tensors
@@ -1324,6 +1341,18 @@ namespace llaminar
                 return false;
             }
             size_t local_head_dim = static_cast<size_t>(OUT->shape()[1]);
+            
+            // Debug: Log weight and output shapes
+            if (getRank() == 0 && layer_index_ == 0)
+            {
+                LOG_INFO(tag << " projection: weight shape=[" << W->shape()[0] << "," << W->shape()[1] 
+                         << "], output shape=[" << OUT->shape()[0] << "," << OUT->shape()[1]
+                         << "], M=" << seq_len << ", N=" << local_head_dim << ", K=" << d_model);
+                // Sample first few weight values
+                const float *w_data = W->data();
+                LOG_INFO(tag << " weight samples: w[0]=" << w_data[0] << ", w[1]=" << w_data[1] 
+                         << ", w[10]=" << w_data[10] << ", w[100]=" << w_data[100]);
+            }
             
             if (force_scalar)
             {
