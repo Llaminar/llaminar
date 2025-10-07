@@ -43,8 +43,54 @@ Full end-to-end comparison of Llaminar pipeline against llama.cpp:
 
 ## Environment Variables
 
-- `LLAMINAR_PARITY_CAPTURE`: Enable snapshot capture
-- `LLAMINAR_PARITY_COMPARE`: Enable automatic comparison
+- `LLAMINAR_PARITY_CAPTURE`: Enable snapshot capture (set to "1")
+- `LLAMINAR_PARITY_COMPARE`: Enable automatic comparison (set to "1")
+- `PYTORCH_SNAPSHOT_DIR`: Directory containing PyTorch reference snapshots (e.g., "python/reference/")
+- `PYTORCH_SNAPSHOT_TOKENS`: Comma-separated token IDs for snapshot generation (e.g., "1,2,3,4,5")
+
+## Key Pipeline Stages
+
+The framework captures snapshots at these transformer pipeline stages:
+
+**Global Stages:**
+- `EMBEDDING`: Token embedding output
+- `FINAL_NORM`: After final RMSNorm
+- `LM_HEAD`: Logits output
+
+**Per-Layer Stages (repeated for each transformer layer):**
+- `ATTENTION_NORM`: RMSNorm before attention
+- `ATTENTION_OUTPUT`: After attention output projection
+- `ATTENTION_RESIDUAL`: After attention residual add
+- `FFN_NORM`: RMSNorm before FFN
+- `FFN_DOWN`: After FFN down projection
+- `FFN_RESIDUAL`: After FFN residual add
+
+**Attention Sub-Stages** (for detailed debugging) ✨:
+- `ATTENTION_SCORES`: Q @ K^T scores
+- `ATTENTION_SOFTMAX`: After softmax normalization
+- **`ATTENTION_CONTEXT`**: Attention weights @ V **(before output projection)**
+  - **Critical for debugging**: Isolates whether divergence is in attention mechanism or output projection
+  - **Validated**: Achieves rel_l2 < 3e-06 vs PyTorch
+  - **Usage**: If ATTENTION_CONTEXT ✅ but ATTENTION_OUTPUT ❌ → focus on W_o weight loading/orientation
+
+## Quick ATTENTION_CONTEXT Debugging
+
+```bash
+# 1. Generate PyTorch reference with ATTENTION_CONTEXT
+cd python/reference
+python generate_test_snapshots.py --model qwen2.5-0.5b-instruct --tokens 1,2,3,4,5 --output snapshots.npz
+
+# 2. Run Llaminar with parity capture
+export LLAMINAR_PARITY_CAPTURE=1
+export PYTORCH_SNAPSHOT_DIR=python/reference/
+./build/test_parity_framework --gtest_filter="*OpenBLASPrefillVsPyTorch"
+
+# 3. Check results
+# If ATTENTION_CONTEXT passes but ATTENTION_OUTPUT fails:
+#   → Problem is in output projection (W_o matrix multiplication)
+# If ATTENTION_CONTEXT fails:
+#   → Problem is earlier (Q/K/V projections, RoPE, scores, softmax)
+```
 
 ## Adding New Parity Tests
 

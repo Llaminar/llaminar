@@ -841,9 +841,9 @@ namespace llaminar
                 // Check if debug override bypasses orientation enforcement
                 bool raw = debugEnv().lm_head.raw_orientation;
 
-                // Enforce expected layout (d_model x vocab_size) unless raw mode
+                // Enforce expected layout [vocab_size, d_model] = [out, in] per new convention
                 if (!raw)
-                    enforce_matrix_layout_compat(lm_head, config.d_model, config.vocab_size, "output.weight");
+                    enforce_matrix_layout_compat(lm_head, config.vocab_size, config.d_model, "output.weight");
 
                 weights.lm_head = lm_head;
             }
@@ -860,31 +860,22 @@ namespace llaminar
             // No dedicated LM head found, use weight tying (common in many models)
             LOG_WARN("[WeightLoad] output.weight missing; using tied embeddings as LM head");
 
-            // Token embedding is [vocab_size, d_model] but lm_head needs [d_model, vocab_size]
-            // Transpose the tied embedding for lm_head usage
+            // With our new convention, token_embedding is already [vocab_size, d_model] = [out, in]
+            // This is exactly what we need for lm_head! No transpose needed.
             auto emb_shape = weights.token_embedding->shape();
             if (emb_shape.size() == 2 && emb_shape[0] == config.vocab_size && emb_shape[1] == config.d_model)
             {
-                const float *src = weights.token_embedding->data();
-                int rows = emb_shape[0]; // vocab_size
-                int cols = emb_shape[1]; // d_model
-
-                std::vector<float> transposed((size_t)rows * cols);
-                for (int r = 0; r < rows; ++r)
-                    for (int c = 0; c < cols; ++c)
-                        transposed[(size_t)c * rows + r] = src[(size_t)r * cols + c];
-
-                weights.lm_head = std::make_shared<llaminar::SimpleTensor>(
-                    std::vector<int>{config.d_model, config.vocab_size}, transposed);
-
-                LOG_INFO("[WeightLoad] Transposed tied embeddings for lm_head: [" << rows << "," << cols
-                                                                                  << "] -> [" << config.d_model << "," << config.vocab_size << "]");
+                // Use tied embedding directly - already in correct orientation
+                weights.lm_head = weights.token_embedding;
+                LOG_INFO("[WeightLoad] Using tied embeddings for lm_head (no transpose needed): [" 
+                        << emb_shape[0] << ", " << emb_shape[1] << "]");
             }
             else
             {
                 LOG_ERROR("[WeightLoad] Token embedding has unexpected shape for tied lm_head: ["
-                          << emb_shape[0] << "," << emb_shape[1] << "]");
-                weights.lm_head = weights.token_embedding; // fallback to untransposed (will likely fail)
+                          << emb_shape[0] << "," << emb_shape[1] << "] - expected [" 
+                          << config.vocab_size << ", " << config.d_model << "]");
+                weights.lm_head = weights.token_embedding; // fallback
             }
         }
 

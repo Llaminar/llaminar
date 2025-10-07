@@ -1,5 +1,51 @@
 #pragma once
 
+/**
+ * @file model_loader.h
+ * @brief GGUF Model Loader with Canonical Weight Matrix Conventions
+ * @author David Sanftenberg
+ * 
+ * ============================================================================
+ * WEIGHT MATRIX STORAGE CONVENTION (CRITICAL - READ FIRST!)
+ * ============================================================================
+ * 
+ * ALL weight matrices in Llaminar are stored as [out_features, in_features].
+ * This matches:
+ *   - GGUF on-disk format (no unnecessary conversions)
+ *   - PyTorch nn.Linear convention
+ *   - Industry standard (most ML frameworks)
+ * 
+ * GGUF STORAGE FORMAT (from llama.cpp):
+ *   - Q/K/V projections: [projection_dim, d_model]
+ *     Example: K weight [128, 896] for 896→128 projection
+ *   
+ *   - O projection: [d_model, n_heads*head_dim]
+ *     Example: O weight [896, 896] for 896→896 projection
+ *   
+ *   - FFN weights: [out_features, in_features]
+ *     gate: [4864, 896], up: [4864, 896], down: [896, 4864]
+ *   
+ *   - Embeddings: [vocab_size, d_model]
+ *     Example: token_embd [151936, 896]
+ * 
+ * DIMENSION REVERSAL RULE:
+ *   ❌ NO REVERSALS NEEDED!
+ *   GGUF already stores weights in our target format [out, in].
+ *   We load dimensions exactly as stored in the file.
+ * 
+ * USAGE IN KERNELS:
+ *   Linear layer computes: output = input @ weight^T
+ *   
+ *   Example: K projection
+ *     input: [seq_len, 896]
+ *     weight: [128, 896]  ← stored as [out, in]
+ *     operation: matmul(input, weight, transpose_a=false, transpose_b=true)
+ *     result: [seq_len, 128] ✓
+ * 
+ * See docs/WEIGHT_MATRIX_CONVENTIONS.md for full details.
+ * ============================================================================
+ */
+
 #include "common.h"
 #include "tensors/tensor_base.h"
 #include "transformer_config.h"

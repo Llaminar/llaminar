@@ -145,6 +145,7 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/MPIResidualKernel.cpp
     src/kernels/MPIRoPEKernel.cpp
     src/kernels/MPISwiGLUKernel.cpp
+    src/kernels/attention/AttentionValidator.cpp
     src/kernels/common/attention_primitives.cpp
     src/kernels/common/rmsnorm_core.cpp
     src/kernels/common/softmax_core.cpp

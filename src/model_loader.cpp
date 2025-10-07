@@ -1071,6 +1071,13 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
     {
         dims.push_back(static_cast<int>(info->dimensions[i]));
     }
+    
+    // DEBUG: Log info->dimensions before any processing
+    if (tensor_name.find("attn_k") != std::string::npos)
+    {
+        LOG_ERROR("[DIMS_DEBUG] tensor='" << tensor_name << "' info->dimensions=[" << info->dimensions[0] << ", " << info->dimensions[1] << "] dims=[" << dims[0] << ", " << dims[1] << "]");
+    }
+    
     // If we sliced, adjust the last dimension to match data length
     if (sliced_applied && info->dimensions.size() == 2)
     {
@@ -1350,32 +1357,44 @@ bool ModelLoader::parseTensorInfo()
             return false;
 
         // Read dimensions
-        // NOTE: GGUF spec stores dimensions in specific order that depends on tensor type
-        // - For embedding matrices (token_embd.weight, output.weight): GGUF stores [d_model, vocab_size]
-        //   but we want [vocab_size, d_model], so they need reversal
-        // - For weight matrices (attention, FFN): GGUF stores [out_features, in_features] which matches
-        //   PyTorch convention but Llaminar expects [in_features, out_features], so NO reversal
+        // 
+        // GGUF DIMENSION STORAGE CONVENTION:
+        // ==================================
+        // GGUF stores tensor dimensions in llama.cpp's convention (TRANSPOSED from our needs):
+        //   - GGUF stores: [in_features, out_features] for weight matrices
+        //   - GGUF stores: [d_model, vocab_size] for embeddings
+        //   - llama.cpp's ggml_mul_mat implicitly transposes, so this works for them
+        // 
+        // Llaminar uses PyTorch/NumPy convention (row-major, explicit transposes):
+        //   - We need: [out_features, in_features] for weight matrices
+        //   - We need: [vocab_size, d_model] for embeddings
+        // 
+        // SOLUTION: Reverse dimensions for all 2D tensors after reading from GGUF
+        // 
+        // See docs/WEIGHT_MATRIX_CONVENTIONS.md for full explanation.
+        //
         tensor.dimensions.resize(n_dims);
         for (uint32_t j = 0; j < n_dims; ++j)
         {
             if (!readValue(tensor.dimensions[j]))
                 return false;
         }
-
-        // ONLY reverse dimensions for embedding tensors (not weight matrices)
-        bool is_embedding = (tensor.name == "token_embd.weight" || tensor.name == "output.weight");
-        if (is_embedding && tensor.dimensions.size() == 2)
+        
+        // CRITICAL: Reverse dimensions for 2D tensors to convert from GGUF/llama.cpp convention
+        // to Llaminar/PyTorch convention
+        if (n_dims == 2)
         {
-            std::reverse(tensor.dimensions.begin(), tensor.dimensions.end());
-            LOG_INFO("[GGUF_DIMS] Embedding tensor '" << tensor.name << "' reversed to ["
-                                                      << tensor.dimensions[0] << "x" << tensor.dimensions[1] << "]");
+            std::swap(tensor.dimensions[0], tensor.dimensions[1]);
         }
 
-        // Debug: Log dimensions for key tensors
-        if (tensor.name == "token_embd.weight" || tensor.name == "blk.0.attn_k.weight")
+        // Debug: Log dimensions for key tensors to verify correct loading
+        if (tensor.name == "token_embd.weight" || 
+            tensor.name == "blk.0.attn_k.weight" ||
+            tensor.name == "blk.0.attn_v.weight" ||
+            tensor.name == "blk.0.attn_output.weight")
         {
             std::ostringstream oss;
-            oss << "[GGUF_DIMS] tensor='" << tensor.name << "' n_dims=" << n_dims << " dims=[";
+            oss << "[GGUF_DIMS] tensor='" << tensor.name << "' dims_after_swap=[";
             for (uint32_t j = 0; j < n_dims; ++j)
             {
                 if (j > 0)
@@ -1383,6 +1402,13 @@ bool ModelLoader::parseTensorInfo()
                 oss << tensor.dimensions[j];
             }
             oss << "]";
+            
+            // Expected shapes after swap:
+            // token_embd.weight: [151936, 896] (vocab_size, d_model)
+            // blk.0.attn_k.weight: [128, 896] (out_features, in_features)
+            // blk.0.attn_v.weight: [128, 896] (out_features, in_features)
+            // blk.0.attn_output.weight: [896, 896] (out_features, in_features)
+            
             LOG_INFO(oss.str());
         }
 

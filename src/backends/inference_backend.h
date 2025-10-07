@@ -22,6 +22,8 @@ namespace llaminar
         InferenceOpKind kind = InferenceOpKind::MatMul;
         int64_t M = 0, N = 0, K = 0;  // for matmul
         bool latency_critical = true; // decode path vs bulk
+        bool transpose_A = false;     // transpose first operand
+        bool transpose_B = false;     // transpose second operand (weight)
     };
 
     struct InferenceLaunchContext

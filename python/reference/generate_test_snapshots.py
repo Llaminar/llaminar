@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Dict
 import numpy as np
 import torch
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 # Add parent directories to path
 script_dir = Path(__file__).parent.absolute()
@@ -120,14 +121,77 @@ class PipelineStageCapture:
                 else:
                     normed = hidden_states
                 
-                # Attention computation with proper arguments
+                # Attention computation with detailed intermediate captures
                 if hasattr(layer, 'self_attn'):
-                    # Call with all required arguments for transformers 4.57+
-                    attn_out = layer.self_attn(
-                        hidden_states=normed,
-                        position_embeddings=position_embeddings,
-                        attention_mask=attention_mask
-                    )[0]
+                    attn_layer = layer.self_attn
+                    
+                    # Get architecture parameters from config
+                    config = hf_model.config
+                    num_heads = config.num_attention_heads
+                    num_kv_heads = config.num_key_value_heads
+                    head_dim = attn_layer.head_dim
+                    num_key_value_groups = attn_layer.num_key_value_groups
+                    
+                    # Capture Q, K, V projections (before RoPE)
+                    bsz, q_len, _ = normed.shape
+                    
+                    # Q projection
+                    query_states = attn_layer.q_proj(normed)
+                    self.captures[f'Q_PROJECTION_layer{i}'] = query_states.detach().cpu().numpy()
+                    
+                    # K projection
+                    key_states = attn_layer.k_proj(normed)
+                    self.captures[f'K_PROJECTION_layer{i}'] = key_states.detach().cpu().numpy()
+                    
+                    # V projection
+                    value_states = attn_layer.v_proj(normed)
+                    self.captures[f'V_PROJECTION_layer{i}'] = value_states.detach().cpu().numpy()
+                    
+                    # Reshape for multi-head attention
+                    query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+                    key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+                    value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+                    
+                    # Apply RoPE
+                    cos, sin = position_embeddings
+                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+                    
+                    # Capture post-RoPE Q and K
+                    self.captures[f'Q_ROPE_layer{i}'] = query_states.transpose(1, 2).contiguous().view(bsz, q_len, -1).detach().cpu().numpy()
+                    self.captures[f'K_ROPE_layer{i}'] = key_states.transpose(1, 2).contiguous().view(bsz, q_len, -1).detach().cpu().numpy()
+                    
+                    # Repeat K/V for GQA if needed
+                    key_states = repeat_kv(key_states, num_key_value_groups)
+                    value_states = repeat_kv(value_states, num_key_value_groups)
+                    
+                    # Compute attention scores (Q @ K^T / sqrt(d))
+                    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(torch.tensor(head_dim, dtype=torch.float32))
+                    
+                    # Capture attention scores (before softmax)
+                    self.captures[f'ATTENTION_SCORES_layer{i}'] = attn_weights.detach().cpu().numpy()
+                    
+                    # Apply attention mask
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
+                    
+                    # Apply softmax
+                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    
+                    # Capture attention weights (after softmax)
+                    self.captures[f'ATTENTION_SOFTMAX_layer{i}'] = attn_weights.detach().cpu().numpy()
+                    
+                    # Compute context (attention @ V)
+                    attn_output = torch.matmul(attn_weights, value_states)
+                    
+                    # Reshape back
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    attn_output = attn_output.reshape(bsz, q_len, -1)
+                    
+                    # Capture context (before output projection)
+                    self.captures[f'ATTENTION_CONTEXT_layer{i}'] = attn_output.detach().cpu().numpy()
+                    
+                    # Apply output projection
+                    attn_out = attn_layer.o_proj(attn_output)
                     
                     # ATTENTION_OUTPUT: After attention projection (before residual)
                     self.captures[f'ATTENTION_OUTPUT_layer{i}'] = attn_out.detach().cpu().numpy()

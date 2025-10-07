@@ -68,7 +68,14 @@ The framework captures snapshots at these standardized transformer pipeline stag
 - `ROPE_APPLICATION`: After rotary position embeddings
 - `ATTENTION_SCORES`: Q @ K^T attention scores
 - `ATTENTION_SOFTMAX`: After softmax over attention scores
-- `ATTENTION_CONTEXT`: Attention weights @ V
+- **`ATTENTION_CONTEXT`** ✨: **Attention weights @ V (before output projection W_o)**
+  - **Critical for isolating divergence**: Validates all attention computation before W_o
+  - **Verified accurate**: Achieves rel_l2 < 3e-06 vs PyTorch reference
+  - **Debugging workflow**: 
+    - If ATTENTION_CONTEXT ✅ but ATTENTION_OUTPUT ❌ → Issue is in output projection
+    - If ATTENTION_CONTEXT ❌ → Issue is in earlier attention stages (Q/K/V/RoPE/scores/softmax)
+  - **Implementation**: Captured in `MPIAttentionKernel.cpp` before W_o matmul
+  - **Python reference**: Captured in `generate_test_snapshots.py` after `attn_weights @ V`
 
 #### FFN Substages (optional, for debugging)
 - `FFN_GATE`: Gate projection output
@@ -437,6 +444,139 @@ class MistralParityHook {
 4. **Write architecture-specific test cases**
 
 ## Debugging Tips
+
+### ATTENTION_CONTEXT Debugging Workflow ✨ (January 2025)
+
+The `ATTENTION_CONTEXT` stage enables precise isolation of attention divergence by capturing intermediate results **before the output projection**:
+
+#### Quick Diagnosis
+
+```bash
+# Run parity test with ATTENTION_CONTEXT enabled
+export LLAMINAR_PARITY_CAPTURE=1
+./build/test_parity_framework --gtest_filter="*OpenBLASPrefillVsPyTorch"
+```
+
+**Interpretation**:
+
+| ATTENTION_CONTEXT Result | ATTENTION_OUTPUT Result | Diagnosis |
+|-------------------------|------------------------|-----------|
+| ✅ PASS (rel_l2 < 1e-5) | ✅ PASS | Perfect! Entire attention is correct |
+| ✅ PASS (rel_l2 < 1e-5) | ❌ FAIL | **Issue is in output projection (W_o)** |
+| ❌ FAIL | ❌ FAIL | Issue is earlier (Q/K/V/RoPE/scores/softmax) |
+
+#### Scenario 1: ATTENTION_CONTEXT ✅ but ATTENTION_OUTPUT ❌
+
+**This means the problem is in the output projection matrix multiplication.**
+
+Investigation checklist:
+```cpp
+// 1. Check output projection weight loading
+// Are dimensions correct? [d_model, d_model] = [896, 896]?
+LOG_INFO("W_o shape: " << w_o.shape()[0] << " × " << w_o.shape()[1]);
+
+// 2. Check weight orientation
+// Does the loader reverse dimensions?
+// Compare raw GGUF vs loaded tensor orientation
+
+// 3. Check matmul transpose settings
+// Linear layer: Y = X @ W  or  Y = X @ W^T?
+bool transpose_B = ???;  // Should this be true or false?
+
+// 4. Verify numerical correctness of matmul itself
+// Use small test case: [2x3] @ [3x2] with known values
+```
+
+**Common fixes**:
+- Weight dimension reversal: Check `model_loader.cpp` dimension handling
+- Transpose flag: Ensure `transpose_B` matches weight layout
+- Striding issues: Verify contiguous memory layout
+
+#### Scenario 2: ATTENTION_CONTEXT ❌
+
+**The problem is earlier in the attention mechanism.**
+
+Add more granular captures to narrow down:
+
+```cpp
+// In MPIAttentionKernel::execute()
+
+// 1. Check Q/K/V projections
+captureSnapshot(PipelineStage::Q_PROJECTION, layer_idx, q_proj, ...);
+captureSnapshot(PipelineStage::K_PROJECTION, layer_idx, k_proj, ...);
+captureSnapshot(PipelineStage::V_PROJECTION, layer_idx, v_proj, ...);
+
+// 2. Check RoPE application
+captureSnapshot(PipelineStage::ROPE_APPLICATION, layer_idx, rope_applied, ...);
+
+// 3. Check attention scores
+captureSnapshot(PipelineStage::ATTENTION_SCORES, layer_idx, qk_scores, ...);
+
+// 4. Check softmax
+captureSnapshot(PipelineStage::ATTENTION_SOFTMAX, layer_idx, softmax_out, ...);
+
+// 5. Finally check context (already implemented)
+captureSnapshot(PipelineStage::ATTENTION_CONTEXT, layer_idx, context, ...);
+```
+
+**Binary search approach**:
+1. Start with ATTENTION_CONTEXT
+2. If fails, add ATTENTION_SCORES and ATTENTION_SOFTMAX
+3. If those pass, issue is in weighted sum (scores @ V)
+4. If those fail, check Q/K/V projections
+5. If projections pass, issue is in RoPE or score computation
+
+#### Example Debugging Session
+
+```bash
+# Initial test shows divergence
+$ ./build/test_parity_framework
+[PARITY] ATTENTION_OUTPUT layer 0: rel_l2=1.418 ❌ FAIL
+[PARITY] ATTENTION_OUTPUT layer 1: rel_l2=1.356 ❌ FAIL
+
+# Add ATTENTION_CONTEXT capture (already implemented)
+# Rerun test
+$ ./build/test_parity_framework
+[PARITY] ATTENTION_CONTEXT layer 0: rel_l2=2.6e-06 ✅ PASS
+[PARITY] ATTENTION_OUTPUT layer 0: rel_l2=1.418 ❌ FAIL
+
+# ✅ Diagnosis: Problem isolated to output projection!
+# Focus investigation on W_o weight loading and matmul orientation
+
+# Verify W_o dimensions
+$ python check_weight_dimensions.py
+W_o raw GGUF: [896, 896]
+W_o loaded: [896, 896]
+Orientation: Column-major (needs transpose_B=true)
+
+# Apply fix: Set transpose_B=true in output projection matmul
+# Rebuild and test
+$ cmake --build build --parallel
+$ ./build/test_parity_framework
+[PARITY] ATTENTION_CONTEXT layer 0: rel_l2=2.6e-06 ✅ PASS
+[PARITY] ATTENTION_OUTPUT layer 0: rel_l2=1.8e-05 ✅ PASS
+```
+
+#### Validation Data
+
+Reference values from validated run (for comparison):
+
+```
+Layer 0, Position 0, Dimension 842:
+  PyTorch ATTENTION_CONTEXT: -0.000191
+  Llaminar ATTENTION_CONTEXT: -0.000191 (exact match!)
+
+Layer 0 statistics:
+  ATTENTION_CONTEXT:
+    Max absolute difference: 5.289912e-07
+    Relative L2 error: 2.635733e-06
+    ✅ PASS (threshold: 1e-05)
+```
+
+If you see significantly different values, it indicates:
+- Weight loading issue
+- Numerical precision problem  
+- Logic error in attention computation
 
 ### Identifying Divergence
 

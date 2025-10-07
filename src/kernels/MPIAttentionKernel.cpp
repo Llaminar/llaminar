@@ -38,6 +38,7 @@
  * @author David Sanftenberg
  */
 #include "MPIAttentionKernel.h"
+#include "attention/AttentionValidator.h"
 #include "../utils/perf_counters.h"
 #include "../utils/debug_env.h"
 #include "../utils/debug_sharding.h"
@@ -52,6 +53,7 @@
 #include "../tensors/sharded_simple_tensor.h"
 #include "../tensors/shard_spec.h"
 #include "../tensors/tp_output_projection_executor.h" // TP simulation executor
+#include "../pipeline_snapshot_manager.h" // For parity testing snapshots
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -117,6 +119,12 @@ namespace llaminar
 
         size_t seq_len = static_cast<size_t>(global_input->shape()[0]);
         size_t d_model = static_cast<size_t>(global_input->shape()[1]);
+
+        // DEBUG: Trace execution at the very start
+        if (getRank() == 0 && layer_index_ == 0) {
+            std::cout << "[ATTN_ENTRY] layer=0 seq_len=" << seq_len << " d_model=" << d_model << std::endl;
+            std::cout << std::flush;
+        }
 
         // Heuristic auto-switch: if user did NOT explicitly request a mode via env var earlier,
         // choose GatherHeadsPreProjection when sequence length exceeds threshold.
@@ -761,6 +769,79 @@ namespace llaminar
         // Create local final output tensor
         auto local_final_output = createLocalSimpleTensor({seq_len, d_model});
 
+        // DEBUG: Always log layer 0 context values for debugging (temporary)
+        if (layer_index_ == 0 && seq_len > 0 && getRank() == 0)
+        {
+            const float *context_data = local_attended_output->data();
+            int local_head_dim = local_heads * head_dim_;
+            size_t dim_842 = 842;
+            if (dim_842 < static_cast<size_t>(local_head_dim))
+            {
+                float val_842 = context_data[dim_842];  // Position 0, dim 842
+                std::cout << "[LLAMINAR_CONTEXT] layer=0 pos=0 dim=842 value=" << val_842
+                          << " (PyTorch: -0.000191)" << std::endl;
+                
+                // Also log min/max/mean for position 0
+                float min_val = context_data[0];
+                float max_val = context_data[0];
+                double sum = 0.0;
+                for (int i = 0; i < local_head_dim; ++i)
+                {
+                    float v = context_data[i];
+                    if (v < min_val) min_val = v;
+                    if (v > max_val) max_val = v;
+                    sum += v;
+                }
+                double mean_val = sum / local_head_dim;
+                std::cout << "[LLAMINAR_CONTEXT] layer=0 pos=0 min=" << min_val 
+                          << " max=" << max_val << " mean=" << mean_val << std::endl;
+            }
+        }
+        
+        // Capture ATTENTION_CONTEXT (before output projection) for parity testing
+        // This is the attention-weighted sum of values (attention @ V) before the final o_proj
+        if (PipelineSnapshotManager::instance().isEnabled() && getRank() == 0)
+        {
+            // For multi-rank attention, local_attended_output contains partial heads
+            // We capture the local contribution which will be aggregated later
+            int local_head_dim = local_heads * head_dim_;
+            PipelineSnapshotManager::instance().capture(
+                PipelineStage::ATTENTION_CONTEXT,
+                layer_index_,
+                local_attended_output->data(),
+                seq_len,
+                local_head_dim,
+                "llaminar");
+            
+            // DEBUG: Log specific values for layer 0 to diagnose divergence
+            if (layer_index_ == 0 && seq_len > 0)
+            {
+                const float *context_data = local_attended_output->data();
+                size_t dim_842 = 842;
+                if (dim_842 < static_cast<size_t>(local_head_dim))
+                {
+                    float val_842 = context_data[dim_842];  // Position 0, dim 842
+                    std::cout << "[ATTENTION_CONTEXT_DEBUG] layer=0 pos=0 dim=842 value=" << val_842
+                              << " (PyTorch expects: -0.000191)" << std::endl;
+                    
+                    // Also log min/max/mean for position 0
+                    float min_val = context_data[0];
+                    float max_val = context_data[0];
+                    double sum = 0.0;
+                    for (int i = 0; i < local_head_dim; ++i)
+                    {
+                        float v = context_data[i];
+                        if (v < min_val) min_val = v;
+                        if (v > max_val) max_val = v;
+                        sum += v;
+                    }
+                    double mean_val = sum / local_head_dim;
+                    std::cout << "[ATTENTION_CONTEXT_DEBUG] layer=0 pos=0 min=" << min_val 
+                              << " max=" << max_val << " mean=" << mean_val << std::endl;
+                }
+            }
+        }
+
         // Compute output projection for local heads using COSMA
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalOutputProjection");
@@ -939,82 +1020,89 @@ namespace llaminar
             size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
             if (wq_head_sharded)
             {
-                if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != d_model || (size_t)wq->shape()[1] != local_head_dim)
+                if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != local_head_dim || (size_t)wq->shape()[1] != d_model)
                 {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wq shape mismatch");
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wq shape mismatch - expected [" << local_head_dim << ", " << d_model << "], got [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
                     return false;
                 }
             }
-            else if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != d_model || (size_t)wq->shape()[1] != total_head_dim)
+            else if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != total_head_dim || (size_t)wq->shape()[1] != d_model)
             {
-                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch - expected [" << total_head_dim << ", " << d_model << "], got [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
                 return false;
             }
             if (wk_head_sharded)
             {
-                if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != d_model || (size_t)wk->shape()[1] != local_head_dim)
+                if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != local_head_dim || (size_t)wk->shape()[1] != d_model)
                 {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wk shape mismatch");
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wk shape mismatch - expected [" << local_head_dim << ", " << d_model << "], got [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
                     return false;
                 }
             }
-            else if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != d_model || (size_t)wk->shape()[1] != (size_t)(n_head_kv_ * head_dim_))
+            else if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != (size_t)(n_head_kv_ * head_dim_) || (size_t)wk->shape()[1] != d_model)
             {
-                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
                 return false;
             }
             if (wv_head_sharded)
             {
-                if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != d_model || (size_t)wv->shape()[1] != local_head_dim)
+                if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != local_head_dim || (size_t)wv->shape()[1] != d_model)
                 {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wv shape mismatch");
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wv shape mismatch - expected [" << local_head_dim << ", " << d_model << "], got [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
                     return false;
                 }
             }
-            else if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != d_model || (size_t)wv->shape()[1] != (size_t)(n_head_kv_ * head_dim_))
+            else if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != (size_t)(n_head_kv_ * head_dim_) || (size_t)wv->shape()[1] != d_model)
             {
-                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
                 return false;
             }
             if (wo_head_sharded)
             {
-                if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != local_head_dim || (size_t)wo->shape()[1] != d_model)
+                if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != d_model || (size_t)wo->shape()[1] != local_head_dim)
                 {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wo shape mismatch");
+                    LOG_ERROR("MPIAttentionKernel: pre-sharded wo shape mismatch - expected [" << d_model << ", " << local_head_dim << "], got [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
                     return false;
                 }
             }
-            else if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != total_head_dim || (size_t)wo->shape()[1] != d_model)
+            else if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != d_model || (size_t)wo->shape()[1] != total_head_dim)
             {
-                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch - expected [" << d_model << ", " << total_head_dim << "], got [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
                 return false;
             }
         }
         else
         {
             // Original global dimension checks (unchanged)
-            if (wq->shape().size() != 2 || static_cast<size_t>(wq->shape()[0]) != d_model ||
-                static_cast<size_t>(wq->shape()[1]) != total_head_dim)
+            // DEBUG: Log actual weight shapes received
+            LOG_ERROR("[WEIGHT_DEBUG] wq shape=[" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
+            LOG_ERROR("[WEIGHT_DEBUG] wk shape=[" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
+            LOG_ERROR("[WEIGHT_DEBUG] wv shape=[" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
+            LOG_ERROR("[WEIGHT_DEBUG] wo shape=[" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
+            LOG_ERROR("[WEIGHT_DEBUG] Expected: wk=[" << (n_head_kv_ * head_dim_) << ", " << d_model << "]");
+            
+            if (wq->shape().size() != 2 || static_cast<size_t>(wq->shape()[0]) != total_head_dim ||
+                static_cast<size_t>(wq->shape()[1]) != d_model)
             {
-                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch - expected [" << total_head_dim << ", " << d_model << "], got [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
                 return false;
             }
-            if (wk->shape().size() != 2 || static_cast<size_t>(wk->shape()[0]) != d_model ||
-                static_cast<size_t>(wk->shape()[1]) != static_cast<size_t>(n_head_kv_ * head_dim_))
+            if (wk->shape().size() != 2 || static_cast<size_t>(wk->shape()[0]) != static_cast<size_t>(n_head_kv_ * head_dim_) ||
+                static_cast<size_t>(wk->shape()[1]) != d_model)
             {
-                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
                 return false;
             }
-            if (wv->shape().size() != 2 || static_cast<size_t>(wv->shape()[0]) != d_model ||
-                static_cast<size_t>(wv->shape()[1]) != static_cast<size_t>(n_head_kv_ * head_dim_))
+            if (wv->shape().size() != 2 || static_cast<size_t>(wv->shape()[0]) != static_cast<size_t>(n_head_kv_ * head_dim_) ||
+                static_cast<size_t>(wv->shape()[1]) != d_model)
             {
-                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
                 return false;
             }
-            if (wo->shape().size() != 2 || static_cast<size_t>(wo->shape()[0]) != total_head_dim ||
-                static_cast<size_t>(wo->shape()[1]) != d_model)
+            if (wo->shape().size() != 2 || static_cast<size_t>(wo->shape()[0]) != d_model ||
+                static_cast<size_t>(wo->shape()[1]) != total_head_dim)
             {
-                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch");
+                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch - expected [" << d_model << ", " << total_head_dim << "], got [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
                 return false;
             }
         }
@@ -1168,31 +1256,20 @@ namespace llaminar
         const auto &attnEnv = debugEnv().attention;
         bool force_scalar = attnEnv.force_scalar;
         bool validate_proj = attnEnv.validate_proj;
-        auto scalar_matmul = [](const float *A, const float *B, float *C, size_t M, size_t N, size_t K)
-        {
-            for (size_t i = 0; i < M; ++i)
-            {
-                const float *a_row = A + i * K;
-                float *c_row = C + i * N;
-                for (size_t j = 0; j < N; ++j)
-                    c_row[j] = 0.f;
-                for (size_t k = 0; k < K; ++k)
-                {
-                    float a = a_row[k];
-                    const float *b_col = B + k * N;
-                    for (size_t j = 0; j < N; ++j)
-                        c_row[j] += a * b_col[j];
-                }
-            }
-        };
 
         auto do_projection = [&](const char *tag, const std::shared_ptr<TensorBase> &W, std::shared_ptr<TensorBase> &OUT, int phase_id)
         {
             auto [lh, _ho] = getHeadDistribution();
             size_t local_head_dim = static_cast<size_t>(lh * head_dim_);
+            
             if (force_scalar)
             {
-                scalar_matmul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model);
+                // Use scalar reference implementation for debugging
+                attention::AttentionValidator::scalarMatMul(
+                    input->data(), W->data(), OUT->data(),
+                    seq_len, local_head_dim, d_model,
+                    true  // transpose_B=true for PyTorch nn.Linear convention
+                );
             }
             else
             {
@@ -1207,12 +1284,14 @@ namespace llaminar
                     desc.N = local_head_dim;
                     desc.K = d_model;
                     desc.is_prefill = true;
+                    desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
                     PrefillLaunchContext ctx{input->data(), W->data(), OUT->data()};
                     auto decision = prefill_backend->launch(desc, ctx);
                     if (decision.status != PrefillStatus::Success)
                     {
                         LOG_WARN(tag << " projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                        if (!adaptive_matmul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false))
+                        // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
+                        if (!adaptiveMatMul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false, false, false, true))
                         {
                             LOG_ERROR(tag << " projection failed on rank " << getRank());
                             return false;
@@ -1228,12 +1307,14 @@ namespace llaminar
                     desc.N = local_head_dim;
                     desc.K = d_model;
                     desc.latency_critical = true;
+                    desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
                     InferenceLaunchContext ctx{input->data(), W->data(), OUT->data()};
                     auto decision = infer_backend->launch(desc, ctx);
                     if (decision.status != InferenceStatus::Success)
                     {
                         LOG_WARN(tag << " projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                        if (!adaptive_matmul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false))
+                        // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
+                        if (!adaptiveMatMul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false, false, false, true))
                         {
                             LOG_ERROR(tag << " projection failed on rank " << getRank());
                             return false;
@@ -1241,30 +1322,26 @@ namespace llaminar
                     }
                 }
             }
+            
+            // Validation: compare against scalar reference if enabled
             if (validate_proj || force_scalar)
             {
                 auto [lh2, _] = getHeadDistribution();
                 size_t lhd2 = (size_t)lh2 * head_dim_;
-                std::vector<float> ref(seq_len * lhd2);
-                scalar_matmul(input->data(), W->data(), ref.data(), seq_len, lhd2, d_model);
-                // Lightweight diff metrics (log only)
-                double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
-                const float *dst = OUT->data();
-                for (size_t i = 0; i < ref.size(); ++i)
+                
+                auto result = attention::AttentionValidator::validateProjection(
+                    input->data(), W->data(), OUT->data(),
+                    seq_len, lhd2, d_model,
+                    true  // transpose_B=true for PyTorch nn.Linear
+                );
+                
+                if (!result.passed)
                 {
-                    double r = ref[i];
-                    double g = dst[i];
-                    double d = std::fabs(r - g);
-                    if (d > max_abs)
-                        max_abs = d;
-                    sum_sq_ref += r * r;
-                    sum_sq_diff += d * d;
-                }
-                double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
-                if (max_abs > 1e-5 || rel_l2 > 1e-5)
-                {
-                    if (getRank() == 0)
-                        LOG_WARN("Projection validation diverged tag=" << tag << " max_abs=" << max_abs << " rel_l2=" << rel_l2);
+                    if (getRank() == 0) {
+                        LOG_WARN("Projection validation diverged tag=" << tag 
+                                << " max_abs=" << result.max_abs 
+                                << " rel_l2=" << result.rel_l2);
+                    }
                 }
             }
             return true;
@@ -1694,12 +1771,14 @@ namespace llaminar
                         desc.N = d_model;
                         desc.K = local_head_dim;
                         desc.is_prefill = true;
+                        desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
                         PrefillLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
                         auto decision = prefill_backend->launch(desc, ctx);
                         if (decision.status != PrefillStatus::Success)
                         {
                             LOG_WARN("Output projection prefill fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                            // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
+                            if (!adaptiveMatMul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false, false, false, true))
                             {
                                 LOG_ERROR("Output projection failed on rank " << getRank());
                                 return;
@@ -1715,12 +1794,14 @@ namespace llaminar
                         desc.N = d_model;
                         desc.K = local_head_dim;
                         desc.latency_critical = true;
+                        desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
                         InferenceLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
                         auto decision = infer_backend->launch(desc, ctx);
                         if (decision.status != InferenceStatus::Success)
                         {
                             LOG_WARN("Output projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                            // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
+                            if (!adaptiveMatMul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false, false, false, true))
                             {
                                 LOG_ERROR("Output projection failed on rank " << getRank());
                                 return;
@@ -1741,7 +1822,8 @@ namespace llaminar
                     int col_off = (int)spec.local_offset;
                     const float *B_sub = B + col_off;
                     float *C_sub = C + col_off;
-                    if (!adaptive_matmul(local_attended_output->data(), B_sub, C_sub, seq_len, n_sub, local_head_dim, false))
+                    // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
+                    if (!adaptiveMatMul(local_attended_output->data(), B_sub, C_sub, seq_len, n_sub, local_head_dim, false, false, false, true))
                     {
                         LOG_ERROR("[TP] partition projection failed part=" << part);
                     }

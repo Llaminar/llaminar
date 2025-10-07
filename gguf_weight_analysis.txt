@@ -1,0 +1,227 @@
+================================================================================
+GGUF WEIGHT STORAGE CONVENTIONS ANALYSIS
+================================================================================
+
+Loading model: models/qwen2.5-0.5b-instruct-q4_0.gguf
+GGUF version: 3
+Tensor count: 291
+Metadata KV count: 26
+Parsed 26 metadata entries
+Parsed 291 tensor infos
+Tensor data starts at offset: 5947744
+Total tensors: 291
+
+================================================================================
+1. GGUF RAW STORAGE FORMAT
+================================================================================
+
+token_embd.weight:
+  GGUF raw shape: (151936, 896)
+  Quantization: Q4_0
+  Special case: Embedding/LM head
+  PyTorch Embedding: [vocab_size, d_model]
+  GGUF stores: (151936, 896)
+
+blk.0.attn_q.weight:
+  GGUF raw shape: (896, 896)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, d_model=896] @ W -> Output[seq, ?]
+  Expected W shape for x @ W: [d_model=896, out_features]
+  Expected W shape for x @ W^T: [out_features, d_model=896]
+  ✓ GGUF stores as [896, 896] → Suitable for x @ W^T
+
+blk.0.attn_k.weight:
+  GGUF raw shape: (128, 896)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, d_model=896] @ W -> Output[seq, ?]
+  Expected W shape for x @ W: [d_model=896, out_features]
+  Expected W shape for x @ W^T: [out_features, d_model=896]
+  ✓ GGUF stores as [128, 896] → Suitable for x @ W
+
+blk.0.attn_v.weight:
+  GGUF raw shape: (128, 896)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, d_model=896] @ W -> Output[seq, ?]
+  Expected W shape for x @ W: [d_model=896, out_features]
+  Expected W shape for x @ W^T: [out_features, d_model=896]
+  ✓ GGUF stores as [128, 896] → Suitable for x @ W
+
+blk.0.attn_output.weight:
+  GGUF raw shape: (896, 896)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, n_heads*head_dim] @ W -> Output[seq, d_model=896]
+  Expected W shape for x @ W: [n_heads*head_dim, 896]
+  Expected W shape for x @ W^T: [896, n_heads*head_dim]
+  ✓ GGUF stores as [896, 896] → Suitable for x @ W
+
+blk.0.ffn_gate.weight:
+  GGUF raw shape: (4864, 896)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, d_model=896] @ W -> Output[seq, n_ff]
+  Expected W shape for x @ W: [896, n_ff]
+  Expected W shape for x @ W^T: [n_ff, 896]
+
+blk.0.ffn_up.weight:
+  GGUF raw shape: (4864, 896)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, d_model=896] @ W -> Output[seq, n_ff]
+  Expected W shape for x @ W: [896, n_ff]
+  Expected W shape for x @ W^T: [n_ff, 896]
+
+blk.0.ffn_down.weight:
+  GGUF raw shape: (896, 4864)
+  Quantization: Q4_0
+  Mathematical usage: Input[seq, n_ff] @ W -> Output[seq, d_model=896]
+  Expected W shape for x @ W: [n_ff, 896]
+  Expected W shape for x @ W^T: [896, n_ff]
+
+output.weight:
+  GGUF raw shape: (151936, 896)
+  Quantization: Q8_0
+  Special case: Embedding/LM head
+  PyTorch Embedding: [vocab_size, d_model]
+  GGUF stores: (151936, 896)
+
+================================================================================
+2. LLAMA.CPP CONVENTIONS (from llama-model.cpp)
+================================================================================
+
+From llama.cpp/src/llama-model.cpp (Qwen2/Granite architecture):
+
+  layer.wq = create_tensor({n_embd, n_embd_head_k * n_head}, ...)
+             n_embd=896, n_embd_head_k*n_head=896 → [896, 896]
+  
+  layer.wk = create_tensor({n_embd, n_embd_k_gqa}, ...)
+             n_embd=896, n_embd_k_gqa=128 → [896, 128]
+  
+  layer.wv = create_tensor({n_embd, n_embd_v_gqa}, ...)
+             n_embd=896, n_embd_v_gqa=128 → [896, 128]
+  
+  layer.wo = create_tensor({n_embd_head_k * n_head, n_embd}, ...)
+             n_embd_head_k*n_head=896, n_embd=896 → [896, 896]
+
+From llama.cpp/ggml/src/ggml.c:
+
+  ggml_mul_mat(a, b):
+    - a: weight matrix [k, n]  (a->ne[0]=k, a->ne[1]=n)
+    - b: input activations [k, m, ...]  (b->ne[0]=k, b->ne[1]=m)
+    - output: [n, m, ...]  (result->ne[0]=a->ne[1], result->ne[1]=b->ne[1])
+    
+  This computes: C = A^T @ B
+  
+  So ggml_mul_mat implicitly transposes the weight matrix!
+  If weight is stored as [k, n], it's used as [n, k] in the multiplication.
+
+
+================================================================================
+3. PYTORCH CONVENTIONS
+================================================================================
+
+PyTorch nn.Linear:
+  - Stores weight as [out_features, in_features]
+  - Applies as: output = input @ weight.T
+  - So for Linear(896, 128): weight shape is [128, 896]
+  - And computes: x[..., 896] @ W.T[896, 128] = output[..., 128]
+
+PyTorch Embedding:
+  - Stores as [vocab_size, embedding_dim]
+  - Indexes into: embedding[token_ids, :]
+
+
+================================================================================
+4. CONVENTION COMPARISON
+================================================================================
+
+| Component        | GGUF Storage      | llama.cpp Usage    | PyTorch Storage   |
+|------------------|-------------------|--------------------|-------------------|
+| Q projection     | [896, 896]        | W^T @ x implicit   | [896, 896]        |
+| K projection     | [896, 128]        | W^T @ x implicit   | [128, 896]        |
+| V projection     | [896, 128]        | W^T @ x implicit   | [128, 896]        |
+| O projection     | [896, 896]        | W^T @ x implicit   | [896, 896]        |
+| FFN gate         | [896, n_ff]       | W^T @ x implicit   | [n_ff, 896]       |
+| FFN up           | [896, n_ff]       | W^T @ x implicit   | [n_ff, 896]       |
+| FFN down         | [n_ff, 896]       | W^T @ x implicit   | [896, n_ff]       |
+| Token embedding  | [896, vocab] *    | Index[tokens, :]   | [vocab, 896]      |
+| Output (LM head) | [896, vocab] *    | W^T @ x implicit   | [vocab, 896]      |
+
+* Embeddings need dimension reversal
+
+KEY INSIGHT: GGUF stores weights in [k, n] format where:
+  - k is the input feature dimension
+  - n is the output feature dimension
+  - ggml_mul_mat automatically computes W^T @ x
+  
+PyTorch stores weights as [out_features, in_features] and computes x @ W^T
+
+So: GGUF[k, n] = PyTorch[n, k]
+
+
+================================================================================
+5. LLAMINAR WEIGHT ORIENTATION ANALYSIS
+================================================================================
+
+Analyzing what Llaminar currently expects:
+
+For K projection (Qwen 0.5B):
+  Input: [seq_len, d_model=896]
+  Output: [seq_len, n_heads_kv * head_dim = 2 * 64 = 128]
+  Mathematical operation: x @ W
+  Required W shape: [896, 128]
+  GGUF provides: (128, 896)
+  ✗ GGUF orientation [128, 896] is TRANSPOSED vs Llaminar expectation
+  ✗ Dimension reversal IS needed
+
+For O projection (output):
+  Input: [seq_len, n_heads * head_dim = 14 * 64 = 896]
+  Output: [seq_len, d_model=896]
+  Mathematical operation: x @ W
+  Required W shape: [896, 896]
+  GGUF provides: (896, 896)
+  ✓ GGUF orientation [896, 896] (symmetric, either way works)
+  ✓ NO dimension reversal needed for O weights
+
+================================================================================
+6. PROPOSED LLAMINAR CONVENTIONS
+================================================================================
+
+WEIGHT MATRIX CONVENTION:
+-------------------------
+All weight matrices in Llaminar should be stored as [in_features, out_features]
+and applied as: output = input @ weight
+
+This means:
+  - Q/K/V projections: W shape [d_model, projection_dim]
+  - O projection: W shape [n_heads*head_dim, d_model]
+  - FFN gate/up: W shape [d_model, n_ff]
+  - FFN down: W shape [n_ff, d_model]
+
+GGUF LOADING RULE:
+------------------
+For GGUF files following llama.cpp convention:
+  1. Embedding tensors (token_embd.weight, output.weight):
+     - GGUF stores: [d_model, vocab_size]
+     - Llaminar needs: [vocab_size, d_model]
+     - ACTION: REVERSE dimensions
+  
+  2. Weight matrices (Q/K/V/O, FFN):
+     - GGUF stores: [in_features, out_features]
+     - Llaminar needs: [in_features, out_features]
+     - ACTION: NO reversal (keep as-is)
+
+MATMUL CONVENTION:
+------------------
+Linear layer: output = input @ weight
+  - input: [..., in_features]
+  - weight: [in_features, out_features]
+  - output: [..., out_features]
+
+NO implicit transposes in matmul calls - explicit is better!
+
+KERNEL CONTRACT:
+----------------
+All kernels should document:
+  - Expected input shape
+  - Expected weight shape  
+  - Applied operation (e.g., "x @ W" not "x @ W^T")
+  - No hidden transposes
+
