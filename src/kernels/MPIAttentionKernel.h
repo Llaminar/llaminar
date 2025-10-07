@@ -145,6 +145,19 @@ namespace llaminar
         std::pair<int, int> getHeadDistribution(int rank) const;
 
         /**
+         * @brief Get K/V head distribution for this process (for GQA models)
+         * @return Pair of (local_kv_heads, kv_head_offset)
+         */
+        std::pair<int, int> getKVHeadDistribution() const;
+
+        /**
+         * @brief Get K/V head distribution for a specific rank (for GQA models)
+         * @param rank Target rank
+         * @return Pair of (local_kv_heads, kv_head_offset)
+         */
+        std::pair<int, int> getKVHeadDistribution(int rank) const;
+
+        /**
          * @brief Test harness helper: invoke the private output projection path directly.
          *        Exposed for unit/integration testing of TP simulation logic without
          *        running the full attention pipeline.

@@ -160,6 +160,10 @@ namespace llaminar
         auto [local_heads, head_offset] = getHeadDistribution();
         size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
 
+        // Get K/V head distribution for GQA models (where n_head_kv != n_head)
+        auto [local_kv_heads, kv_head_offset] = getKVHeadDistribution();
+        size_t local_kv_head_dim = static_cast<size_t>(local_kv_heads * head_dim_);
+
         // Detect pre-sharded weights (Head axis) to bypass legacy distributeInputs.
         auto is_head_sharded = [](const std::shared_ptr<TensorBase> &t) -> bool
         {
@@ -206,7 +210,7 @@ namespace llaminar
 
         if (local_heads == 0)
         {
-            // No heads assigned to this rank (imbalanced head/world configuration). Allocate minimal tensors and skip work.
+            // No Q heads assigned to this rank (imbalanced head/world configuration). Allocate minimal tensors and skip work.
             local_wq = createLocalSimpleTensor({d_model, 0});
             local_wk = createLocalSimpleTensor({d_model, 0});
             local_wv = createLocalSimpleTensor({d_model, 0});
@@ -237,9 +241,9 @@ namespace llaminar
             size_t wk_cols = static_cast<size_t>(global_wk->shape()[1]);
             size_t wv_cols = static_cast<size_t>(global_wv->shape()[1]);
             size_t wo_rows = static_cast<size_t>(global_wo->shape()[0]);
-            if (wq_cols != local_head_dim || wk_cols != local_head_dim || wv_cols != local_head_dim || wo_rows != local_head_dim)
+            if (wq_cols != local_head_dim || wk_cols != local_kv_head_dim || wv_cols != local_kv_head_dim || wo_rows != local_head_dim)
             {
-                LOG_ERROR("MPIAttentionKernel: pre-sharded weight dims mismatch local expectation (expected " << local_head_dim << ")");
+                LOG_ERROR("MPIAttentionKernel: pre-sharded weight dims mismatch local expectation (Q expected " << local_head_dim << ", KV expected " << local_kv_head_dim << ")");
                 return false;
             }
             local_wq = global_wq;
@@ -255,8 +259,8 @@ namespace llaminar
         {
             // Legacy path: allocate local slices then copy/distribute.
             local_wq = createLocalSimpleTensor({d_model, local_head_dim});
-            local_wk = createLocalSimpleTensor({d_model, local_head_dim});
-            local_wv = createLocalSimpleTensor({d_model, local_head_dim});
+            local_wk = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
+            local_wv = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
             local_wo = createLocalSimpleTensor({local_head_dim, d_model});
             {
                 PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
@@ -267,8 +271,8 @@ namespace llaminar
         }
         // Create local projection tensors
         auto local_q = createLocalSimpleTensor({seq_len, local_head_dim});
-        auto local_k = createLocalSimpleTensor({seq_len, local_head_dim});
-        auto local_v = createLocalSimpleTensor({seq_len, local_head_dim});
+        auto local_k = createLocalSimpleTensor({seq_len, local_kv_head_dim});  // Use K/V dimensions for GQA
+        auto local_v = createLocalSimpleTensor({seq_len, local_kv_head_dim});  // Use K/V dimensions for GQA
 
         // Compute Q, K, V projections for local heads using COSMA
         {
@@ -294,7 +298,43 @@ namespace llaminar
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::applyLocalRoPE");
             t_rope_ms = time_block([&]
-                                   { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads); });
+                                   { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_kv_heads); });  // Use K/V head count for RoPE
+        }
+        
+        // For GQA (n_head != n_head_kv), replicate K and V to match Q head dimensions
+        // This allows the attention computation to work with the expected dimensions
+        std::shared_ptr<TensorBase> local_k_replicated, local_v_replicated;
+        if (n_head_ != n_head_kv_)
+        {
+            // Allocate replicated K/V with Q head dimensions
+            local_k_replicated = createLocalSimpleTensor({seq_len, local_head_dim});
+            local_v_replicated = createLocalSimpleTensor({seq_len, local_head_dim});
+            
+            // Replicate K/V heads to match Q
+            for (size_t s = 0; s < seq_len; ++s)
+            {
+                for (int q_head = 0; q_head < local_heads; ++q_head)
+                {
+                    int global_q_head = head_offset + q_head;
+                    int kv_head = global_q_head % n_head_kv_;  // Map Q head to corresponding K/V head
+                    int local_kv_head = kv_head - kv_head_offset;  // Local K/V head index
+                    
+                    if (local_kv_head >= 0 && local_kv_head < local_kv_heads)
+                    {
+                        // Copy this K/V head to the Q head position
+                        const float *src_k = local_k->data() + s * local_kv_head_dim + local_kv_head * head_dim_;
+                        const float *src_v = local_v->data() + s * local_kv_head_dim + local_kv_head * head_dim_;
+                        float *dst_k = local_k_replicated->data() + s * local_head_dim + q_head * head_dim_;
+                        float *dst_v = local_v_replicated->data() + s * local_head_dim + q_head * head_dim_;
+                        memcpy(dst_k, src_k, head_dim_ * sizeof(float));
+                        memcpy(dst_v, src_v, head_dim_ * sizeof(float));
+                    }
+                }
+            }
+            
+            // Use replicated versions for attention
+            local_k = local_k_replicated;
+            local_v = local_v_replicated;
         }
         
         // Capture Q and K after RoPE for parity testing
@@ -1160,6 +1200,22 @@ namespace llaminar
         return {local_heads, head_offset};
     }
 
+    std::pair<int, int> MPIAttentionKernel::getKVHeadDistribution() const
+    {
+        return getKVHeadDistribution(getRank());
+    }
+
+    std::pair<int, int> MPIAttentionKernel::getKVHeadDistribution(int rank) const
+    {
+        int heads_per_rank = n_head_kv_ / getSize();
+        int remainder = n_head_kv_ % getSize();
+
+        int local_heads = heads_per_rank + (rank < remainder ? 1 : 0);
+        int head_offset = rank * heads_per_rank + std::min(rank, remainder);
+
+        return {local_heads, head_offset};
+    }
+
     void MPIAttentionKernel::distributeInputs(const std::shared_ptr<TensorBase> &global_input,
                                               const std::shared_ptr<TensorBase> &global_wq,
                                               const std::shared_ptr<TensorBase> &global_wk,
@@ -1174,6 +1230,11 @@ namespace llaminar
         auto [local_heads, head_offset] = getHeadDistribution();
         size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
         size_t head_offset_dim = static_cast<size_t>(head_offset * head_dim_);
+
+        // Get K/V head distribution for GQA
+        auto [local_kv_heads, kv_head_offset] = getKVHeadDistribution();
+        size_t local_kv_head_dim = static_cast<size_t>(local_kv_heads * head_dim_);
+        size_t kv_head_offset_dim = static_cast<size_t>(kv_head_offset * head_dim_);
 
         const float *global_wq_ptr = global_wq ? global_wq->data() : nullptr;
         const float *global_wk_ptr = global_wk ? global_wk->data() : nullptr;
@@ -1216,32 +1277,18 @@ namespace llaminar
             memcpy(local_row, global_row + head_offset_dim, local_head_dim * sizeof(float));
         }
 
-        // SIMPLE FIX: For grouped attention where n_head_kv != n_head
-        // Just replicate the available KV heads to match the local Q heads
-        // This is not optimal but prevents buffer overruns and NaN values
-
+        // Extract local K and V weights (for GQA, these use K/V head dimensions, not Q)
+        // Simply copy the slice for this rank's K/V heads without replication
         for (size_t i = 0; i < d_model; ++i)
         {
             const float *global_k_row = global_wk_ptr + i * n_head_kv_ * head_dim_;
             const float *global_v_row = global_wv_ptr + i * n_head_kv_ * head_dim_;
-            float *local_k_row = local_wk_ptr + i * local_head_dim;
-            float *local_v_row = local_wv_ptr + i * local_head_dim;
+            float *local_k_row = local_wk_ptr + i * local_kv_head_dim;
+            float *local_v_row = local_wv_ptr + i * local_kv_head_dim;
 
-            // For each local Q head, assign the corresponding KV head
-            // Use modulo to handle the case where we have more Q heads than KV heads
-            for (int local_head = 0; local_head < local_heads; ++local_head)
-            {
-                int global_q_head = head_offset + local_head;
-                int kv_head = global_q_head % n_head_kv_; // Map Q head to KV head
-
-                const float *src_k = global_k_row + kv_head * head_dim_;
-                const float *src_v = global_v_row + kv_head * head_dim_;
-                float *dst_k = local_k_row + local_head * head_dim_;
-                float *dst_v = local_v_row + local_head * head_dim_;
-
-                memcpy(dst_k, src_k, head_dim_ * sizeof(float));
-                memcpy(dst_v, src_v, head_dim_ * sizeof(float));
-            }
+            // Copy the K/V head slice for this rank
+            memcpy(local_k_row, global_k_row + kv_head_offset_dim, local_kv_head_dim * sizeof(float));
+            memcpy(local_v_row, global_v_row + kv_head_offset_dim, local_kv_head_dim * sizeof(float));
         }
 
         // Extract local output weights (rows for assigned heads)
@@ -1270,8 +1317,13 @@ namespace llaminar
 
         auto do_projection = [&](const char *tag, const std::shared_ptr<TensorBase> &W, std::shared_ptr<TensorBase> &OUT, int phase_id)
         {
-            auto [lh, _ho] = getHeadDistribution();
-            size_t local_head_dim = static_cast<size_t>(lh * head_dim_);
+            // Infer projection dimension from output tensor shape (handles both Q and K/V)
+            if (OUT->shape().size() < 2)
+            {
+                LOG_ERROR(tag << " projection: invalid output shape");
+                return false;
+            }
+            size_t local_head_dim = static_cast<size_t>(OUT->shape()[1]);
             
             if (force_scalar)
             {
@@ -1337,12 +1389,9 @@ namespace llaminar
             // Validation: compare against scalar reference if enabled
             if (validate_proj || force_scalar)
             {
-                auto [lh2, _] = getHeadDistribution();
-                size_t lhd2 = (size_t)lh2 * head_dim_;
-                
                 auto result = attention::AttentionValidator::validateProjection(
                     input->data(), W->data(), OUT->data(),
-                    seq_len, lhd2, d_model,
+                    seq_len, local_head_dim, d_model,
                     true  // transpose_B=true for PyTorch nn.Linear
                 );
                 
@@ -1373,8 +1422,8 @@ namespace llaminar
         // Capture K projection snapshot (before RoPE)
         if (snapshot_callback_ && getRank() == 0)
         {
-            auto [local_h, _] = getHeadDistribution();
-            snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_h * head_dim_);
+            auto [local_kv_h, _] = getKVHeadDistribution();  // Use K/V head distribution for GQA
+            snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_kv_h * head_dim_);
         }
 
         if (!do_projection("V", local_wv, local_v, 3))
@@ -1382,8 +1431,8 @@ namespace llaminar
         // Capture V projection snapshot (no RoPE applied to V)
         if (snapshot_callback_ && getRank() == 0)
         {
-            auto [local_h, _] = getHeadDistribution();
-            snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_h * head_dim_);
+            auto [local_kv_h, _] = getKVHeadDistribution();  // Use K/V head distribution for GQA
+            snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_kv_h * head_dim_);
         }
 
         auto [lh_final, _off] = getHeadDistribution();
