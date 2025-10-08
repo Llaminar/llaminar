@@ -50,6 +50,9 @@ Thumbs.db
 Testing/
 **/pytorch_layer_captures/**/*
 **/pytorch_snapshots*/**/*
+**/test_pytorch*/**/*
+*.npy
+*.npz
 
 # Package managers
 node_modules/
