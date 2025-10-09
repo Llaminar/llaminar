@@ -1509,6 +1509,10 @@ void ModelLoader::extractModelMetadata()
     // Qwen2.5 uses 1000000.0, while older models typically use 10000.0
     model_.rope_freq_base = model_.getMetadata<float>("qwen2.rope.freq_base", 10000.0f);
 
+    // CRITICAL: Load RMSNorm epsilon from model (defaults to 1e-6 for PyTorch/HuggingFace compatibility)
+    // This value must match the training configuration to ensure numerical parity
+    model_.rms_norm_eps = model_.getMetadata<float>("qwen2.attention.layer_norm_rms_epsilon", 1e-6f);
+
     if (model_.hasMetadata("tokenizer.ggml.tokens"))
     {
         model_.token_list = model_.metadata.at("tokenizer.ggml.tokens").asStringArray();
@@ -1585,7 +1589,7 @@ TransformerLayerConfig ModelLoader::createLayerConfig() const
     cfg.vocab_size = static_cast<int>(model_.token_list.size());
     cfg.max_seq_len = static_cast<int>(model_.context_length);
     cfg.n_layers = static_cast<int>(model_.block_count);
-    cfg.eps = 1e-5f;                            // default RMSNorm epsilon; TODO: pull from metadata if present
+    cfg.eps = model_.rms_norm_eps;              // RMSNorm epsilon from GGUF metadata
     cfg.rope_freq_base = model_.rope_freq_base; // RoPE frequency base from GGUF metadata
     return cfg;
 }

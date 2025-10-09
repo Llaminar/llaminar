@@ -1764,7 +1764,7 @@ namespace llaminar
             LOG_DEBUG("✓ Attended output validated");
         }
 
-        // Snapshot attended values
+        // Snapshot attended values (ATTENTION_CONTEXT: scores @ V before output projection)
         if (snapshot_callback_)
         {
             if (world_size > 1)
@@ -1786,13 +1786,13 @@ namespace llaminar
 
                 if (rank == 0)
                 {
-                    snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, global_attended->data(),
+                    snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, global_attended->data(),
                                        seq_len, n_head_ * head_dim_);
                 }
             }
             else
             {
-                snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, local_attended->data(),
+                snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, local_attended->data(),
                                    seq_len, local_head_dim);
             }
         }
@@ -1866,6 +1866,13 @@ namespace llaminar
         {
             MPI_Allreduce(MPI_IN_PLACE, local_output->data(), local_output->size(),
                           MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        }
+
+        // Snapshot final attention output (after output projection and MPI reduction)
+        if (snapshot_callback_ && rank == 0)
+        {
+            snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, local_output->data(),
+                               seq_len, d_model);
         }
 
         if (rank == 0)

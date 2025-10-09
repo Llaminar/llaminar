@@ -150,6 +150,7 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/attention/AttentionValidator.cpp
     src/kernels/common/attention_primitives.cpp
     src/kernels/common/rmsnorm_core.cpp
+    src/kernels/common/rmsnorm_t5.cpp
     src/kernels/common/softmax_core.cpp
     src/qwen_pipeline.cpp
     src/pipeline_base.cpp

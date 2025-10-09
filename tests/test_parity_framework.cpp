@@ -1087,13 +1087,10 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
         GTEST_FAIL() << "Failed to generate PyTorch reference snapshots with variance analysis";
     }
 
-    // Load dynamic thresholds (rank 0 only)
+    // Load dynamic thresholds (ALL RANKS - needed for comparison)
     DynamicThresholdLoader threshold_loader;
-    if (rank == 0)
-    {
-        std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
-        threshold_loader.load(threshold_path);
-    }
+    std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
+    threshold_loader.load(threshold_path);
 
     // Disable COSMA to ensure OpenBLAS path
     setenv("ADAPTIVE_DISABLE_COSMA", "1", 1);
@@ -1282,13 +1279,10 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
         GTEST_FAIL() << "Failed to generate PyTorch reference snapshots with variance analysis";
     }
 
-    // Load dynamic thresholds (rank 0 only)
+    // Load dynamic thresholds (ALL RANKS - needed for comparison)
     DynamicThresholdLoader threshold_loader;
-    if (rank == 0)
-    {
-        std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
-        threshold_loader.load(threshold_path);
-    }
+    std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
+    threshold_loader.load(threshold_path);
 
     // Force COSMA path (lower threshold to ensure COSMA is used)
     setenv("LLAMINAR_COSMA_PREFILL_THRESHOLD", "500", 1);

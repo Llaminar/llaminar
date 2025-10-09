@@ -358,6 +358,7 @@ struct GGUFModel
     uint32_t head_count;                 ///< Number of attention heads (n_head)
     uint32_t head_count_kv;              ///< Number of KV heads (n_head_kv, for GQA)
     float rope_freq_base = 10000.0f;     ///< RoPE frequency base
+    float rms_norm_eps = 1e-6f;          ///< RMSNorm epsilon (default 1e-6 for PyTorch/HuggingFace)
     std::vector<std::string> token_list; ///< Tokenizer vocabulary (if present)
 
     /**

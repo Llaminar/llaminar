@@ -27,13 +27,43 @@ from pathlib import Path
 # Add python directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
 
-from reference.modeling_qwen2_reference import Qwen2ForCausalLM
-from reference.gguf_loader import load_model_from_gguf
+from reference import PipelineStage
+from reference.generate_test_snapshots import PipelineStageCapture
+
+
+def stage_key_to_str(key):
+    """
+    Convert stage key to C++ test format: STAGE_<layer_idx>.npy
+    
+    Handles both tuple keys (PipelineStage, int) and string keys like "STAGE_layerN".
+    """
+    if isinstance(key, tuple):
+        stage, layer = key
+        stage_name = stage.name if hasattr(stage, 'name') else str(stage)
+        return f"{stage_name}_{layer}"
+    
+    # Handle string keys from PipelineStageCapture like "ATTENTION_OUTPUT_layer5"
+    if isinstance(key, str):
+        if '_layer' in key:
+            # Parse "STAGE_layerN" -> "STAGE_N"
+            parts = key.split('_layer')
+            if len(parts) == 2:
+                try:
+                    layer_idx = int(parts[1])
+                    stage_name = parts[0]
+                    return f"{stage_name}_{layer_idx}"
+                except ValueError:
+                    pass
+        # Global stages like "EMBEDDING", "FINAL_NORM", "LM_HEAD" without layer index
+        # These should have -1 as layer index
+        return f"{key}_-1"
+    
+    return str(key)
 
 
 def run_pytorch_inference(model_path: str, tokens: list[int], verbose: bool = False):
     """
-    Run PyTorch inference and capture all intermediate tensors.
+    Run PyTorch inference and capture ALL intermediate tensors (detailed stages).
     
     Returns:
         dict: Mapping from stage_name -> numpy array
@@ -41,22 +71,20 @@ def run_pytorch_inference(model_path: str, tokens: list[int], verbose: bool = Fa
     if verbose:
         print(f"Loading model from {model_path}...")
     
-    model = load_model_from_gguf(model_path, Qwen2ForCausalLM)
+    # Use detailed PipelineStageCapture for comprehensive snapshot collection
+    capturer = PipelineStageCapture(model_path, verbose=verbose)
     
     if verbose:
         print(f"Running inference on tokens: {tokens}")
     
-    # Run inference with snapshot capture
-    _ = model(tokens, capture_snapshots=True)
+    # Run inference and capture all stages
+    capturer.capture_stages(tokens)
     
-    # Extract snapshots
-    snapshots = {}
-    for stage_name, tensor in model.snapshots.items():
-        if isinstance(tensor, np.ndarray):
-            snapshots[stage_name] = tensor.copy()
-        else:
-            # Handle any non-numpy types
-            snapshots[stage_name] = np.array(tensor)
+    # Get captures (dict of stage_name -> numpy array)
+    snapshots = capturer.captures.copy()
+    
+    # Clean up
+    capturer.cleanup()
     
     if verbose:
         print(f"Captured {len(snapshots)} snapshots")
@@ -88,7 +116,8 @@ def compute_variance_statistics(runs: list[dict], verbose: bool = False):
     mean_snapshots = {}
     variance_stats = {}
     
-    for stage_name in sorted(stage_names):
+    # Sort stages by string representation (enum values can't be sorted directly)
+    for stage_name in sorted(stage_names, key=str):
         # Collect tensors from all runs
         tensors = [run[stage_name] for run in runs]
         
@@ -133,7 +162,9 @@ def compute_variance_statistics(runs: list[dict], verbose: bool = False):
             "tensor_rms": float(tensor_rms),
         }
         
-        if verbose and stage_name.startswith("ATTENTION_SCORES"):
+        # Handle tuple keys (PipelineStage, layer_idx)
+        stage_str = str(stage_name[0]) if isinstance(stage_name, tuple) else str(stage_name)
+        if verbose and "ATTENTION_SCORES" in stage_str:
             print(f"{stage_name}: max_abs_dev={max_abs_dev:.6e}, rms_dev={rms_dev:.6e}, tensor_rms={tensor_rms:.6e}")
     
     return mean_snapshots, variance_stats
@@ -204,21 +235,30 @@ def save_snapshots_and_thresholds(mean_snapshots: dict,
     
     # Save individual snapshot files
     for stage_name, tensor in mean_snapshots.items():
-        snapshot_path = output_dir / f"{stage_name}.npy"
+        stage_str = stage_key_to_str(stage_name)
+        snapshot_path = output_dir / f"{stage_str}.npy"
         np.save(snapshot_path, tensor)
         if verbose:
-            print(f"Saved {stage_name}: shape={tensor.shape}, dtype={tensor.dtype}")
+            print(f"Saved {stage_str}: shape={tensor.shape}, dtype={tensor.dtype}")
+    
+    # Convert keys to strings for JSON serialization
+    variance_stats_serializable = {
+        stage_key_to_str(k): v for k, v in variance_stats.items()
+    }
+    thresholds_serializable = {
+        stage_key_to_str(k): v for k, v in thresholds.items()
+    }
     
     # Save variance statistics
     variance_path = output_dir / "variance_statistics.json"
     with open(variance_path, 'w') as f:
-        json.dump(variance_stats, f, indent=2)
+        json.dump(variance_stats_serializable, f, indent=2)
     print(f"Saved variance statistics to {variance_path}")
     
     # Save dynamic thresholds
     thresholds_path = output_dir / "dynamic_thresholds.json"
     with open(thresholds_path, 'w') as f:
-        json.dump(thresholds, f, indent=2)
+        json.dump(thresholds_serializable, f, indent=2)
     print(f"Saved dynamic thresholds to {thresholds_path}")
     
     # Generate summary report
@@ -228,9 +268,10 @@ def save_snapshots_and_thresholds(mean_snapshots: dict,
         f.write("DYNAMIC THRESHOLD SUMMARY\n")
         f.write("=" * 80 + "\n\n")
         
+        # Use serializable thresholds (already have string keys)
         # Group by stage type
         stage_groups = {}
-        for stage_name in sorted(thresholds.keys()):
+        for stage_name in sorted(thresholds_serializable.keys()):
             stage_type = stage_name.rsplit('_', 1)[0] if '_' in stage_name else stage_name
             if stage_type not in stage_groups:
                 stage_groups[stage_type] = []
@@ -238,8 +279,8 @@ def save_snapshots_and_thresholds(mean_snapshots: dict,
         
         for stage_type, stages in sorted(stage_groups.items()):
             # Compute statistics across this group
-            max_abs_values = [thresholds[s]["max_abs"] for s in stages]
-            variance_values = [thresholds[s]["variance_metric"] for s in stages]
+            max_abs_values = [thresholds_serializable[s]["max_abs"] for s in stages]
+            variance_values = [thresholds_serializable[s]["variance_metric"] for s in stages]
             
             avg_max_abs = np.mean(max_abs_values)
             avg_variance = np.mean(variance_values)
@@ -252,9 +293,9 @@ def save_snapshots_and_thresholds(mean_snapshots: dict,
         f.write("DETAILED THRESHOLDS\n")
         f.write("=" * 80 + "\n\n")
         
-        for stage_name in sorted(thresholds.keys()):
-            t = thresholds[stage_name]
-            s = variance_stats[stage_name]
+        for stage_name in sorted(thresholds_serializable.keys()):
+            t = thresholds_serializable[stage_name]
+            s = variance_stats_serializable[stage_name]
             f.write(f"{stage_name}:\n")
             f.write(f"  max_abs_threshold: {t['max_abs']:.6e}\n")
             f.write(f"  rel_l2_threshold:  {t['rel_l2']:.6f}\n")
