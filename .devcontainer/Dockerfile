@@ -11,11 +11,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Core utilities (ensures sleep, etc. are available)
+    # Core utilities (ensures sleep, sed, grep, etc. are available)
     coreutils \
     util-linux \
     procps \
     passwd \
+    sed \
+    grep \
+    findutils \
     # Build essentials
     build-essential \
     gcc \
@@ -122,8 +125,8 @@ RUN groupadd -f render && \
     usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-# Ensure bash is set as the default shell (explicitly)
-RUN chsh -s /bin/bash vscode
+# Verify user was created successfully
+RUN id vscode && grep vscode /etc/passwd
 
 # Set up workspace directory
 RUN mkdir -p /workspace && \
