@@ -9,16 +9,21 @@ ENV INSTALL_ROCM=${INSTALL_ROCM}
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# CRITICAL: Install sed, grep, and core utilities FIRST before anything else
+# These are required by VS Code's UID update process
+RUN apt-get update && apt-get install -y \
+    sed \
+    grep \
+    coreutils \
+    findutils \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Core utilities (ensures sleep, sed, grep, etc. are available)
-    coreutils \
+    # Core utilities (sed, grep, coreutils, findutils already installed above)
     util-linux \
     procps \
     passwd \
-    sed \
-    grep \
-    findutils \
     # Build essentials
     build-essential \
     gcc \

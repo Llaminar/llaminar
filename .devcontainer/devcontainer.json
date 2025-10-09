@@ -68,8 +68,7 @@
         5000
     ],
     "containerEnv": {
-        "VIRTUAL_ENV": "/workspaces/llaminar/.venv",
-        "PATH": "/workspaces/llaminar/.venv/bin:${containerEnv:PATH}"
+        "VIRTUAL_ENV": "/workspaces/llaminar/.venv"
     },
     "postCreateCommand": "bash -c 'sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && cmake --version && gcc --version'",
     "remoteUser": "vscode",
