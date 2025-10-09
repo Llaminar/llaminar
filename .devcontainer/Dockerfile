@@ -11,6 +11,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core utilities (ensures sleep, etc. are available)
+    coreutils \
+    util-linux \
+    procps \
+    passwd \
     # Build essentials
     build-essential \
     gcc \
@@ -117,6 +122,9 @@ RUN groupadd -f render && \
     usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
+# Ensure bash is set as the default shell (explicitly)
+RUN chsh -s /bin/bash vscode
+
 # Set up workspace directory
 RUN mkdir -p /workspace && \
     chown vscode:vscode /workspace
@@ -164,5 +172,5 @@ RUN echo 'alias ll="ls -la"' >> ~/.bashrc && \
 # Expose commonly used ports
 EXPOSE 8080 3000 5000
 
-# Set default command
-CMD ["/bin/bash"]
+# Keep container running (Dev Containers will override this)
+CMD ["sleep", "infinity"]
