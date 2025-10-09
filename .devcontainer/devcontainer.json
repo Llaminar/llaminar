@@ -14,7 +14,6 @@
                 "ms-vscode.cpptools",
                 "ms-vscode.cpptools-extension-pack",
                 "ms-vscode.cmake-tools",
-                "twxs.cmake",
                 "ms-vscode.cpptools-themes",
                 "ms-python.python",
                 "ms-python.pylint",
@@ -43,7 +42,23 @@
                     "CMakeLists.txt": "cmake",
                     "*.cmake": "cmake"
                 },
-                "terminal.integrated.defaultProfile.linux": "bash"
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "python.defaultInterpreterPath": "/workspaces/llaminar/.venv/bin/python",
+                "python.terminal.activateEnvironment": true,
+                "python.terminal.activateEnvInCurrentTerminal": true,
+                "python.analysis.extraPaths": [
+                    "/workspaces/llaminar/python"
+                ],
+                "python.autoComplete.extraPaths": [
+                    "/workspaces/llaminar/python"
+                ],
+                "python.testing.pytestEnabled": true,
+                "python.testing.pytestArgs": [
+                    "python/reference/tests"
+                ],
+                "python.linting.enabled": true,
+                "python.linting.pylintEnabled": true,
+                "python.formatting.provider": "black"
             }
         }
     },
@@ -52,7 +67,11 @@
         3000,
         5000
     ],
-    "postCreateCommand": "sudo chown -R vscode:vscode /workspace && git config --global --add safe.directory /workspaces/llaminar && cmake --version && gcc --version",
+    "containerEnv": {
+        "VIRTUAL_ENV": "/workspaces/llaminar/.venv",
+        "PATH": "/workspaces/llaminar/.venv/bin:${containerEnv:PATH}"
+    },
+    "postCreateCommand": "sudo chown -R vscode:vscode /workspace && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && cmake --version && gcc --version",
     "remoteUser": "vscode",
     "mounts": [
         "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"

@@ -63,3 +63,7 @@ node_modules/
 
 # Model files
 models/**.gguf
+# Python virtual environment
+.venv/
+*.pyc
+__pycache__/

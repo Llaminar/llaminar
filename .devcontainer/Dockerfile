@@ -52,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-dev \
+    python3-venv \
+    python3.12-venv \
     # Additional libraries that might be useful
     libssl-dev \
     libcurl4-openssl-dev \
@@ -143,12 +145,8 @@ ENV HIP_PATH="${ROCM_HOME}"
 # Set PATH to include user local bin directory
 ENV PATH="/home/vscode/.local/bin:$PATH"
 
-# Install Python packages that might be useful
-RUN pip3 install --user --break-system-packages \
-    conan \
-    numpy \
-    matplotlib \
-    pytest
+# Note: Python packages will be installed in a virtual environment
+# See .devcontainer/setup-python-env.sh which is run via postCreateCommand
 
 # Install vcpkg (C++ package manager) properly
 RUN git clone https://github.com/Microsoft/vcpkg.git ~/vcpkg && \

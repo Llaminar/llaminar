@@ -53,6 +53,7 @@ TEST(AttentionPrimitives, RoPEPairNormInvariant)
     std::vector<float> q(seq * heads * head_dim), k(q.size());
     fill(q, 0.02f);
     k = q;
+    // HuggingFace split-half pattern: pairs are (0, head_dim/2), (1, head_dim/2+1), etc.
     std::vector<float> before;
     before.reserve(seq * head_dim / 2);
     for (int t = 0; t < seq; ++t)
@@ -60,7 +61,7 @@ TEST(AttentionPrimitives, RoPEPairNormInvariant)
         float *row = q.data() + t * head_dim;
         for (int pair = 0; pair < head_dim / 2; ++pair)
         {
-            float a = row[2 * pair], b = row[2 * pair + 1];
+            float a = row[pair], b = row[pair + head_dim / 2];
             before.push_back(std::sqrt(a * a + b * b));
         }
     }
@@ -71,7 +72,7 @@ TEST(AttentionPrimitives, RoPEPairNormInvariant)
         float *row = q.data() + t * head_dim;
         for (int pair = 0; pair < head_dim / 2; ++pair)
         {
-            float a = row[2 * pair], b = row[2 * pair + 1];
+            float a = row[pair], b = row[pair + head_dim / 2];
             float r = std::sqrt(a * a + b * b);
             ASSERT_NEAR(r, before[idx++], 1e-6f);
         }
@@ -102,6 +103,7 @@ TEST(AttentionPrimitives, RoPEPositionZeroIsIdentity)
 }
 
 // Test RoPE with explicit manual calculation for a simple case
+// Uses HuggingFace canonical split-half RoPE pattern
 TEST(AttentionPrimitives, RoPEManualCalculation)
 {
     const int heads = 1, head_dim = 4, seq = 2;
@@ -120,27 +122,25 @@ TEST(AttentionPrimitives, RoPEManualCalculation)
 
     std::vector<float> k = q; // Same for K
 
-    // Calculate expected values manually
-    // For head_dim=4, we have 2 pairs (pairs = head_dim/2 = 2)
-    // pair 0: indices (0,1), pair 1: indices (2,3)
+    // Calculate expected values manually following HuggingFace rotate_half pattern
+    // For head_dim=4, split into first_half=[0,1] and second_half=[2,3]
+    // Pairs are (0,2) and (1,3) - each element in first half pairs with corresponding element in second half
+    //
+    // inv_freq[i] = 1 / (freq_base^(2*i/head_dim))
+    // angle[i] = position * inv_freq[i]
+    // cos/sin arrays are duplicated: [cos(angle0), cos(angle1), cos(angle0), cos(angle1)]
+    //
+    // rotate_half([x0, x1, x2, x3]) = [-x2, -x3, x0, x1]
+    // output = input * cos + rotate_half(input) * sin
 
-    // Theta calculation: theta[p] = 1 / (freq_base^(2*p/head_dim))
-    float theta0 = 1.0f / std::pow(freq_base, 0.0f / head_dim); // = 1.0
-    float theta1 = 1.0f / std::pow(freq_base, 2.0f / head_dim); // = 1 / 10000^0.5 = ~0.01
+    float inv_freq0 = 1.0f / std::pow(freq_base, 0.0f / head_dim); // = 1.0
+    float inv_freq1 = 1.0f / std::pow(freq_base, 2.0f / head_dim); // = 1 / 10000^0.5 = ~0.01
 
-    // Token 0 (position 0): angle = 0 for both pairs -> identity
-    // Expected: no change
-
-    // Token 1 (position 1):
-    // pair 0: angle = 1 * theta0 = 1.0 rad
-    //   cos(1.0) ≈ 0.5403, sin(1.0) ≈ 0.8415
-    //   q[4] = 3.0*0.5403 - 0.0*0.8415 ≈ 1.6209
-    //   q[5] = 3.0*0.8415 + 0.0*0.5403 ≈ 2.5245
-
-    // pair 1: angle = 1 * theta1 ≈ 0.01 rad
-    //   cos(0.01) ≈ 0.99995, sin(0.01) ≈ 0.01
-    //   q[6] = 4.0*0.99995 - 0.0*0.01 ≈ 3.9998
-    //   q[7] = 4.0*0.01 + 0.0*0.99995 ≈ 0.04
+    // Token 0 (position 0): all angles = 0 -> identity
+    EXPECT_NEAR(q[0], 1.0f, 1e-5f);
+    EXPECT_NEAR(q[1], 0.0f, 1e-5f);
+    EXPECT_NEAR(q[2], 2.0f, 1e-5f);
+    EXPECT_NEAR(q[3], 0.0f, 1e-5f);
 
     apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, freq_base);
 
@@ -150,26 +150,38 @@ TEST(AttentionPrimitives, RoPEManualCalculation)
     EXPECT_NEAR(q[2], 2.0f, 1e-5f);
     EXPECT_NEAR(q[3], 0.0f, 1e-5f);
 
-    // Token 1 calculations
-    float cos1 = std::cos(1.0f * theta0);
-    float sin1 = std::sin(1.0f * theta0);
-    EXPECT_NEAR(q[4], 3.0f * cos1, 1e-4f) << "pair 0, first element";
-    EXPECT_NEAR(q[5], 3.0f * sin1, 1e-4f) << "pair 0, second element";
+    // Token 1 (position 1): input = [3, 0, 4, 0]
+    // angle0 = 1 * inv_freq0 = 1.0
+    // angle1 = 1 * inv_freq1 = 0.01
+    float angle0 = 1.0f * inv_freq0;
+    float angle1 = 1.0f * inv_freq1;
+    float cos0 = std::cos(angle0);
+    float sin0 = std::sin(angle0);
+    float cos1 = std::cos(angle1);
+    float sin1 = std::sin(angle1);
 
-    float angle_pair1 = 1.0f * theta1;
-    float cos_p1 = std::cos(angle_pair1);
-    float sin_p1 = std::sin(angle_pair1);
-    EXPECT_NEAR(q[6], 4.0f * cos_p1, 1e-4f) << "pair 1, first element";
-    EXPECT_NEAR(q[7], 4.0f * sin_p1, 1e-4f) << "pair 1, second element";
+    // Pair (0,2) with angle0:
+    //   q[4] = 3 * cos0 - 4 * sin0
+    //   q[6] = 3 * sin0 + 4 * cos0
+    EXPECT_NEAR(q[4], 3.0f * cos0 - 4.0f * sin0, 1e-4f) << "pair (0,2), index 0";
+    EXPECT_NEAR(q[6], 3.0f * sin0 + 4.0f * cos0, 1e-4f) << "pair (0,2), index 2";
+
+    // Pair (1,3) with angle1:
+    //   q[5] = 0 * cos1 - 0 * sin1 = 0
+    //   q[7] = 0 * sin1 + 0 * cos1 = 0
+    EXPECT_NEAR(q[5], 0.0f, 1e-4f) << "pair (1,3), index 1";
+    EXPECT_NEAR(q[7], 0.0f, 1e-4f) << "pair (1,3), index 3";
 }
 
 // Test RoPE with multi-head layout to expose tensor layout issues
+// Uses HuggingFace canonical split-half RoPE pattern
 TEST(AttentionPrimitives, RoPEMultiHeadLayout)
 {
     const int heads = 2, head_dim = 4, seq = 2;
     const float freq_base = 10000.f;
 
     // Create input with distinguishable pattern for each head
+    // Layout: [seq_len, num_heads, head_dim]
     std::vector<float> q(seq * heads * head_dim);
 
     // Token 0, Head 0: [1, 0, 2, 0]
@@ -203,20 +215,23 @@ TEST(AttentionPrimitives, RoPEMultiHeadLayout)
     EXPECT_NEAR(q[0], 1.0f, 1e-5f) << "Token 0, Head 0, dim 0";
     EXPECT_NEAR(q[4], 10.0f, 1e-5f) << "Token 0, Head 1, dim 0";
 
-    // Token 1, Head 0 - check rotation was applied
-    float theta0 = 1.0f / std::pow(freq_base, 0.0f / head_dim);
-    float cos1 = std::cos(1.0f * theta0);
-    float sin1 = std::sin(1.0f * theta0);
+    // Token 1 - check rotation was applied using HuggingFace split-half pattern
+    // inv_freq0 = 1.0, angle0 = 1.0 rad
+    float inv_freq0 = 1.0f / std::pow(freq_base, 0.0f / head_dim);
+    float angle0 = 1.0f * inv_freq0;
+    float cos0 = std::cos(angle0);
+    float sin0 = std::sin(angle0);
 
-    // The indexing here depends on the expected layout
-    // If layout is [token][head][dim], index = token * (heads*head_dim) + head * head_dim + dim
-    // Token 1, Head 0, pair 0: indices 8, 9
-    EXPECT_NEAR(q[8], 3.0f * cos1, 1e-4f) << "Token 1, Head 0, pair 0, first";
-    EXPECT_NEAR(q[9], 3.0f * sin1, 1e-4f) << "Token 1, Head 0, pair 0, second";
+    // Token 1, Head 0: input = [3, 0, 4, 0]
+    // Pair (0,2) with angle0: q[8] = 3*cos0 - 4*sin0, q[10] = 3*sin0 + 4*cos0
+    // Pair (1,3) with angle1: q[9] = 0, q[11] = 0
+    EXPECT_NEAR(q[8], 3.0f * cos0 - 4.0f * sin0, 1e-4f) << "Token 1, Head 0, pair (0,2), idx 0";
+    EXPECT_NEAR(q[10], 3.0f * sin0 + 4.0f * cos0, 1e-4f) << "Token 1, Head 0, pair (0,2), idx 2";
 
-    // Token 1, Head 1, pair 0: indices 12, 13
-    EXPECT_NEAR(q[12], 30.0f * cos1, 1e-4f) << "Token 1, Head 1, pair 0, first";
-    EXPECT_NEAR(q[13], 30.0f * sin1, 1e-4f) << "Token 1, Head 1, pair 0, second";
+    // Token 1, Head 1: input = [30, 0, 40, 0]
+    // Pair (0,2) with angle0: q[12] = 30*cos0 - 40*sin0, q[14] = 30*sin0 + 40*cos0
+    EXPECT_NEAR(q[12], 30.0f * cos0 - 40.0f * sin0, 1e-4f) << "Token 1, Head 1, pair (0,2), idx 0";
+    EXPECT_NEAR(q[14], 30.0f * sin0 + 40.0f * cos0, 1e-4f) << "Token 1, Head 1, pair (0,2), idx 2";
 }
 
 // Test to verify theta (frequency) calculation matches PyTorch

@@ -375,6 +375,7 @@ function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
 
     add_test(NAME ${TEST_NAME}
         COMMAND ${_mpi_command}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
     set_tests_properties(${TEST_NAME} PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")

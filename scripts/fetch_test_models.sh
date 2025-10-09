@@ -6,6 +6,7 @@ MODEL_DIR="models"
 
 # Stable variants confirmed to exist upstream (reduce noise by default)
 STABLE_MODELS=(
+  "qwen2.5-0.5b-instruct-fp16.gguf"
   "qwen2.5-0.5b-instruct-q2_k.gguf"
   "qwen2.5-0.5b-instruct-q4_0.gguf"
   "qwen2.5-0.5b-instruct-q5_0.gguf"
