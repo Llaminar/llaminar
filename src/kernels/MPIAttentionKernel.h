@@ -10,6 +10,8 @@
 
 namespace llaminar
 {
+    // Forward declaration for optional COSMA backend
+    class CosmaPrefillManager;
 
     /**
      * @brief MPI-enabled multi-head attention kernel with head-wise distribution
@@ -133,6 +135,16 @@ namespace llaminar
         void setDistributionStrategy(DistributionStrategy strategy) { strategy_ = strategy; }
 
         /**
+         * @brief Set optional COSMA backend manager for distributed matmul
+         * @param cosma_mgr Pointer to CosmaPrefillManager (nullptr to disable COSMA)
+         *
+         * When set, the kernel will use MatMulBackendSelector to choose between
+         * OpenBLAS (with CblasTrans for transpose) and COSMA (with proper shape
+         * contracts) based on operation size and context.
+         */
+        void setCosmaManager(CosmaPrefillManager *cosma_mgr) { cosma_mgr_ = cosma_mgr; }
+
+        /**
          * @brief Get head distribution for this process
          * @return Pair of (local_heads, head_offset)
          */
@@ -239,6 +251,21 @@ namespace llaminar
                                      size_t seq_len, size_t d_model);
 
         /**
+         * @brief Backend-agnostic matrix multiplication with optional bias
+         * @param input Input matrix (row-major, M x K)
+         * @param weight Weight matrix (row-major, N x K) - transposed during multiply
+         * @param output Output matrix (row-major, M x N)
+         * @param bias Optional bias vector (length N)
+         * @param M Rows in input/output
+         * @param N Columns in output (rows in weight)
+         * @param K Columns in input/weight
+         * @param operation_label Optional label for logging
+         */
+        void matmul_with_bias(const float *input, const float *weight, float *output,
+                              const float *bias, int M, int N, int K,
+                              const char *operation_label = nullptr);
+
+        /**
          * @brief Compute attention for local heads
          * @param local_q Local query projections
          * @param local_k Local key projections
@@ -333,6 +360,11 @@ namespace llaminar
         StageContract contract_gqa_replication_;   ///< Stage 3: K/V replication for GQA
         StageContract contract_attention_;         ///< Stage 4: Attention computation
         StageContract contract_output_projection_; ///< Stage 5: Output projection
+
+        // ========================================================================
+        // COSMA BACKEND SUPPORT (Optional)
+        // ========================================================================
+        CosmaPrefillManager *cosma_mgr_ = nullptr; ///< Optional COSMA backend for distributed matmul
     };
 
 } // namespace llaminar

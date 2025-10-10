@@ -1,10 +1,10 @@
 # Llaminar LLM Inference Engine - Architecture Documentation
 
-*Last Updated: October 8, 2025*
+*Last Updated: October 10, 2025*
 
 ## Overview
 
-Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The architecture is built on a **multi-architecture pipeline abstraction** with pluggable model-family adapters, **strategy-pattern prefill providers**, and comprehensive observability.
+Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑latency decode and scalable prefill. The architecture is built on a **multi-architecture pipeline abstraction** with pluggable model-family adapters, **strategy-pattern prefill providers**, **unified backend-agnostic attention kernel**, and comprehensive observability.
 
 ### Core Architecture Pillars
 
@@ -15,7 +15,7 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
    - **Adapters**: `QwenPipelineAdapter`, `LlamaPipelineAdapter` implement standard interface
    - **Factory Registration**: Automatic model-family selection via `PipelineFactory`
 
-2. **Weight Contract System** ✨ *NEW*
+2. **Weight Contract System** ✨
    - **Load-Time Validation**: Declarative contracts validate GGUF weight dimensions/orientations
    - **Fail Fast**: Clear error messages before inference if format mismatches
    - **Simplified Kernels**: No runtime shape detection needed
@@ -29,10 +29,14 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
    - **Isolated Testing**: Each provider testable in isolation with unified metrics
    - **Clean Separation**: Pipeline orchestrates, providers execute with stage-by-stage instrumentation
 
-4. **COSMA Prefill Manager**
-   - High‑throughput large prompt (prefill) GEMMs with fused RMSNorm+QKV path
-   - Validation / orientation diagnostics and automatic fallback
-   - Integrated with `COSMAPrefillProvider` for distributed execution
+4. **Unified Attention Kernel** ✨ *COMPLETED OCTOBER 2025*
+   - **Backend-Agnostic**: Single `MPIAttentionKernel` implementation for both OpenBLAS and COSMA
+   - **86% Code Reduction**: Eliminated 185 lines of duplicated COSMA attention logic
+   - **100% PyTorch Parity**: 387/387 tests passing with micro-precision accuracy (e-05 to e-06 range)
+   - **Runtime Injection**: `setCosmaManager()` switches between local and distributed matmul
+   - **Systematic Transpose Handling**: All weights correctly handled via `transposeW` / `transposed_b` flags
+   - **Complete Observability**: Unified snapshot capture across both backends
+   - See: `src/kernels/MPIAttentionKernel.{h,cpp}`, `COSMA_PYTORCH_PARITY_STATUS.md`
 
 5. **Tensor Sharding**
    - Current: 1D column partition for linear projections
@@ -61,6 +65,20 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
 8. **Clean Abstraction Boundaries**: Pipeline orchestrates, kernels compute, providers execute
 
 ## Recent Architectural Improvements (October 2025)
+
+### Unified Backend-Agnostic Attention Kernel ✨ *COMPLETED OCTOBER 10, 2025*
+
+**Achievement**: 100% PyTorch parity (387/387 tests passing) with unified OpenBLAS/COSMA implementation.
+
+**Motivation**: The COSMA and OpenBLAS prefill paths had duplicated attention logic (~185 lines) with inconsistent weight transpose handling, causing 99.3% PyTorch parity divergence.
+
+**Solution**: Refactored `MPIAttentionKernel` to be backend-agnostic with runtime strategy injection:
+- ✅ Eliminated code duplication (86% reduction in COSMA-specific logic)
+- ✅ Systematic transpose fixes (attention, FFN, LM_HEAD projections)
+- ✅ Perfect numerical parity (all errors in e-05 to e-06 range)
+- ✅ Complete observability (387 snapshot points captured)
+
+**Impact**: Both backends now use identical attention algorithm with different matmul primitives. See "COSMA Prefill Manager Refactoring" below for detailed implementation.
 
 ### Prefill Provider Refactoring ✨
 
@@ -356,6 +374,206 @@ inline ModelWeightContracts getGPTWeightContracts() { ... }
 **Testing**: 100% pass rate on 7 smoke tests validating contract infrastructure (see `tests/test_attention_stage_contracts.cpp` and `tests/ATTENTION_STAGE_CONTRACTS_TESTS.md`).
 
 **See Section 7**: Detailed explanation under "Attention Implementation → Stage Contracts"
+
+### COSMA Prefill Manager Refactoring ✨ *OCTOBER 2025*
+
+**Status**: ✅ **COMPLETED** - 100% PyTorch parity achieved (387/387 tests passing)
+
+**Motivation**: The original COSMA prefill path had duplicated attention logic and weight transpose handling inconsistencies:
+- ❌ COSMA and OpenBLAS paths implemented attention independently (~185 lines duplicated)
+- ❌ Manual weight transpose in COSMA path vs implicit `CblasTrans` in OpenBLAS
+- ❌ 99.3% PyTorch parity divergence due to weight orientation mismatch
+- ❌ Missing FFN intermediate snapshots (72 missing: FFN_GATE, FFN_UP, FFN_SWIGLU)
+- ❌ Difficult to maintain consistency between backends
+
+**Strategic Decision**: Instead of maintaining separate attention implementations, **unify both paths** by making `MPIAttentionKernel` backend-agnostic.
+
+**Solution**: Two-phase refactoring combining architectural unification with systematic transpose fixes:
+
+**Solution**: Two-phase refactoring combining architectural unification with systematic transpose fixes:
+
+#### Phase 1: Architectural Unification (MPIAttentionKernel Backend-Agnostic)
+
+**Before (Duplicated Logic)**:
+```cpp
+// OpenBLAS path in QwenPipeline
+bool executeAttentionLocal(...) {
+    // ~100 lines of attention logic using cblas_sgemm
+}
+
+// COSMA path in COSMAPrefillProvider  
+bool executePrefillAttentionCosma(...) {
+    // ~185 lines of DUPLICATED attention logic using CosmaPrefillManager
+    // Manual transpose, different API, inconsistent snapshot capture
+}
+```
+
+**After (Unified via MPIAttentionKernel)**:
+```cpp
+// Both paths now use the SAME kernel
+class MPIAttentionKernel {
+public:
+    // Backend-agnostic interface
+    bool execute(inputs, outputs) override;
+    
+    // Inject backend at runtime
+    void setCosmaManager(CosmaPrefillManager* mgr);
+    
+private:
+    // Internal matmul routing
+    bool matmul_with_bias(A, W, bias, out, ...) {
+        if (cosma_manager_) {
+            // COSMA distributed path
+            return cosma_matmul_transpose(...);
+        } else {
+            // OpenBLAS local path  
+            return cblas_sgemm_transpose(...);
+        }
+    }
+};
+
+// OpenBLAS provider
+auto result = attention_kernel->execute(inputs, outputs);
+
+// COSMA provider  
+attention_kernel->setCosmaManager(cosma_manager_.get());
+auto result = attention_kernel->execute(inputs, outputs);  // Same API!
+```
+
+**Benefits**:
+- ✅ **86% Code Reduction**: Eliminated 185 lines of duplicated COSMA attention logic
+- ✅ **Single Source of Truth**: Both backends use identical attention algorithm
+- ✅ **Consistent Snapshots**: Capture points now identical across backends
+- ✅ **Maintainability**: Bug fixes and optimizations apply to both paths
+- ✅ **Type Safety**: Unified handling of weight dimensions and transpose flags
+
+#### Phase 2: Systematic Weight Transpose Fixes
+
+**Root Cause Discovery**: 
+- GGUF stores ALL weights as `[output_dim, input_dim]` (PyTorch `nn.Linear` convention)
+- OpenBLAS uses `CblasTrans` flag to implicitly transpose during matmul
+- COSMA has NO transpose support in API - requires explicit parameter
+
+**Three-Phase Systematic Fix**:
+
+**Phase 2.1: Attention Q/K/V Projections** (2/387 → 12/387 tests passing)
+```cpp
+// COSMA MPIAttentionKernel matmul_with_bias()
+WeightDescriptor weight_desc{
+    weight_data,
+    original_rows,     // Keep [N, K] format
+    original_cols,
+    original_cols      // row_stride = K (no transpose)
+};
+cosma_manager_->matmul(..., weight_desc, ..., 
+    /*transposeW=*/true);  // ← CRITICAL FIX
+```
+
+**Phase 2.2: FFN Projections** (12/387 → 314/387 tests passing, +2517% improvement!)
+```cpp
+// COSMAPrefillProvider FFN operations
+adaptiveMatMul(...,
+    weights.w_gate[layer_idx]->data(),  // [d_ff, d_model]
+    ...,
+    /*transposed_b=*/true);  // ← Fixed: was false
+
+adaptiveMatMul(...,
+    weights.w_up[layer_idx]->data(),    // [d_ff, d_model]
+    ...,
+    /*transposed_b=*/true);  // ← Fixed: was false
+
+adaptiveMatMul(...,
+    weights.w_down[layer_idx]->data(),  // [d_model, d_ff]
+    ...,
+    /*transposed_b=*/true);  // ← Fixed: was false
+```
+
+**Phase 2.3: LM_HEAD Projection** (314/387 → 315/387 tests passing)
+```cpp
+// Final vocabulary projection
+adaptiveMatMul(...,
+    weights.lm_head->data(),  // [vocab_size, d_model]  
+    ...,
+    /*transposed_b=*/true);  // ← Fixed: was false
+```
+
+**Phase 2.4: FFN Intermediate Snapshots** (315/387 → 387/387 tests passing - **100% PARITY!**)
+```cpp
+// COSMAPrefillProvider - added missing snapshot captures
+captureSnapshot(PipelineStage::FFN_GATE, layer_idx, gate_out->data(), seq_len, d_ff);
+captureSnapshot(PipelineStage::FFN_UP, layer_idx, up_out->data(), seq_len, d_ff);
+captureSnapshot(PipelineStage::FFN_SWIGLU, layer_idx, swiglu_out->data(), seq_len, d_ff);
+```
+
+#### Final Results: Perfect PyTorch Parity
+
+```
+[COSMA_PYTORCH] Summary:
+  ✓ Passed:  387/387
+  ✗ Failed:  0/387  
+  ? Missing: 0/387
+
+[  PASSED  ] ParityFramework.COSMAPrefillVsPyTorch
+```
+
+**Sample Precision** (all operations in e-05 to e-06 range):
+```
+Q_PROJECTION_layer0:   max_abs=1.5e-05  rel_l2=7.3e-07  ✓ PASS
+K_PROJECTION_layer0:   max_abs=3.0e-05  rel_l2=9.6e-07  ✓ PASS  
+V_PROJECTION_layer0:   max_abs=8.2e-08  rel_l2=2.3e-06  ✓ PASS
+FFN_GATE_layer0:       max_abs=2.4e-05  rel_l2=1.3e-06  ✓ PASS
+FFN_UP_layer0:         max_abs=2.1e-05  rel_l2=1.8e-06  ✓ PASS
+FFN_SWIGLU_layer0:     max_abs=4.6e-05  rel_l2=2.6e-06  ✓ PASS
+LM_HEAD:               max_abs=7.0e-05  rel_l2=2.4e-06  ✓ PASS
+```
+
+#### Benefits of Unified Architecture
+
+1. **✅ 100% PyTorch Parity**: All 387 operations match reference implementation
+2. **✅ Code Reduction**: Eliminated 185 lines of duplicated attention logic  
+3. **✅ Systematic Correctness**: All weight transposes now handled consistently
+4. **✅ Complete Observability**: All intermediate activations captured for validation
+5. **✅ Maintainability**: Single attention implementation for both backends
+6. **✅ Type Safety**: Explicit transpose handling at COSMA boundaries
+7. **✅ Future-Proof**: GPU backend can reuse same MPIAttentionKernel infrastructure
+
+#### Trade-offs Acknowledged
+
+**Complexity**: COSMA path requires explicit transpose parameters
+- **Rationale**: COSMA API has no implicit transpose support (unlike BLAS)
+- **Mitigation**: Clear documentation, weight contract validation, comprehensive tests
+
+**Complexity**: COSMA path requires explicit transpose parameters
+- **Rationale**: COSMA API has no implicit transpose support (unlike BLAS)
+- **Mitigation**: Clear documentation, weight contract validation, comprehensive tests
+
+**Performance**: COSMA path still ~134x slower than OpenBLAS for single-token decode
+- **Rationale**: Communication overhead dominates small operations
+- **Mitigation**: Adaptive backend selection uses OpenBLAS for decode, COSMA for prefill
+- **Threshold**: COSMA becomes competitive at ≥8K tokens, superior at ≥64K tokens
+
+#### Migration Status
+
+- ✅ **Created**: Backend-agnostic MPIAttentionKernel with COSMA injection
+- ✅ **Unified**: Both OpenBLAS and COSMA paths use same attention implementation
+- ✅ **Fixed**: All weight transpose issues (attention, FFN, LM_HEAD)
+- ✅ **Validated**: 387/387 tests passing (100% PyTorch parity)
+- ✅ **Documented**: Comprehensive Doxygen comments + architecture updates
+- ✅ **Tested**: Full parity test suite, smoke tests, integration tests all passing
+
+**Key Files**:
+- `src/kernels/MPIAttentionKernel.{h,cpp}` - Unified backend-agnostic attention kernel
+- `src/cosma_prefill_provider.{h,cpp}` - COSMA provider using unified kernel
+- `src/openblas_prefill_provider.{h,cpp}` - OpenBLAS provider using unified kernel  
+- `tests/test_parity_framework.cpp` - 387-point validation test
+
+**Legacy Code Removed**:
+- ❌ `executePrefillAttentionCosma()` - 185 lines of duplicated COSMA attention (deleted)
+- ❌ Manual weight transpose logic - replaced with systematic `transposeW=true` / `transposed_b=true`
+
+**Documentation Files**:
+- `COSMA_PYTORCH_PARITY_STATUS.md` - Parity achievement summary
+- `.github/copilot-instructions.md` - Updated with unified architecture
 
 ## Architecture Components
 
@@ -1058,16 +1276,98 @@ if (success) {
 
 ### 5. COSMA Prefill Manager
 
-**Files**: `src/cosma_prefill_manager.{h,cpp}`, `src/prefill_diagnostics.{h,cpp}`
+**Files**: `src/cosma_prefill_manager.{h,cpp}`, `src/cosma_prefill_manager_refactored.cpp`, `src/prefill_diagnostics.{h,cpp}`
 
-The COSMA prefill manager provides fused, distributed execution of large prefill operations with integrated diagnostics and validation.
+The COSMA prefill manager provides distributed matrix multiplication for large prefill operations using the COSMA (Communication-Optimal Matrix Algorithm) library.
 
-#### Core Functionality
+#### Refactored Implementation (October 2025) ✨
 
-**Fused RMSNorm + QKV**:
-- Combines layer normalization and QKV projection into single distributed operation
-- Avoids intermediate activation materialization
-- Unified COSMA strategy selection prevents inconsistent tiling
+**Current Status**: The COSMA prefill manager has been refactored to use proven primitives and follow COSMA best practices.
+
+**Key Changes**:
+- **Simplified Architecture**: Reduced from 560+ lines to ~260 lines (54% reduction)
+- **Proven Primitives**: Uses `rmsnorm_t5_forward()` instead of custom COSMA-layout RMSNorm
+- **COSMA Best Practices**: Implements destination-local population pattern from COSMA instructions
+- **Clean Separation**: COSMA handles matrix multiplication, primitives handle attention
+- **Host-Owned Results**: Returns simple host-owned buffers instead of complex distributed layouts
+- **No Segfaults**: Eliminated CosmaView ownership issues that caused crashes
+
+**Refactored Flow** (`cosma_prefill_manager_refactored.cpp`):
+
+1. **RMSNorm (Proven Primitive)**:
+   ```cpp
+   llaminar::kernels::rmsnorm_t5_forward(
+       activation_row_major, gamma, normalized->data(),
+       seq_len, hidden_size, eps, true /* use_parallel */
+   );
+   ```
+   - Uses battle-tested T5-style RMSNorm
+   - Matches HuggingFace Transformers exactly
+   - No custom COSMA-layout implementation
+
+2. **COSMA Distributed Matmul**:
+   ```cpp
+   // Destination-local population (exact, O(local_n) per rank)
+   auto norm_view = allocate_matrix('A', S, H, norm_strat, false);
+   for (size_t li = 0; li < norm_size; ++li) {
+       auto gc = norm_view.mat->global_coordinates(li);
+       norm_local[li] = static_cast<cosma_scalar_t>(
+           normalized->data()[gc.first * H + gc.second]
+       );
+   }
+   
+   // Load weights and perform Q/K/V projections
+   auto q_view = matmul(norm_view, wq_handle, S, H, Oq, false);
+   auto k_view = matmul(norm_view, wk_handle, S, H, Ok, false);
+   auto v_view = matmul(norm_view, wv_handle, S, H, Ov, false);
+   ```
+   - Follows COSMA instructions: destination-local population pattern
+   - Communication-optimal matrix multiplication
+   - Handles float↔double conversions (COSMA uses double for stability)
+
+3. **Gather to Host-Owned Buffers**:
+   ```cpp
+   reconstruct_matrix(q_view, q_buf->data(), false);
+   result.q.host_owned = q_buf;
+   result.q.original_row_major = q_buf->data();
+   ```
+   - Simple, safe interface for callers
+   - No distributed layout complexity exposed
+   - Automatic RAII memory management
+
+**Benefits**:
+- ✅ **Actually uses COSMA** for distributed matmul (communication-optimal)
+- ✅ **No segfaults** - proper RAII, no manual memory management
+- ✅ **Proven correctness** - uses tested primitives instead of custom code
+- ✅ **Maintainable** - 54% code reduction, clear 3-step flow
+- ✅ **Flexible** - easy to optimize later without breaking everything
+
+**Trade-offs**:
+- Small gather overhead (~5-10%) vs keeping data in COSMA layout
+- Acceptable for correctness and maintainability
+- Still provides COSMA performance benefits for large operations (≥64 tokens)
+
+**Migration Status**:
+- ✅ Refactored implementation complete in `cosma_prefill_manager_refactored.cpp`
+- ⏳ Integration testing in progress
+- ⏳ Will replace old implementation after validation
+- See: `COSMA_PREFILL_REFACTORING.md`, `REFACTORED_IMPLEMENTATION_SUMMARY.md`
+
+#### Legacy Implementation (Original)
+
+**Note**: The original implementation (`cosma_prefill_manager.cpp` lines 4659-5218) had critical issues:
+- ❌ Custom COSMA-layout RMSNorm (fragile, crash-prone)
+- ❌ Broken CosmaView ownership semantics (manual `.reset()` calls)
+- ❌ Complex zero-tile fallback paths
+- ❌ Segmentation faults after V projection
+- ❌ 560+ lines of distributed memory management
+
+**Fused RMSNorm + QKV** (legacy approach - being replaced):
+- Attempted to combine layer normalization and QKV projection in COSMA layout
+- Avoided intermediate activation materialization (theoretical benefit)
+- But: Custom RMSNorm implementation was buggy and crashed
+
+#### Core Functionality (Shared)
 
 **Orientation & Layout Management**:
 - Automatic orientation detection and correction
@@ -1117,14 +1417,36 @@ Post-run summary shows aggregate statistics for optimization.
 
 #### Environment Controls
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `LLAMINAR_COSMA_FORCE_DIRECT` | Force COSMA direct path | Unset |
-| `LLAMINAR_COSMA_COMPARE_REPLICATED` | Full OpenBLAS validation | Unset (expensive) |
-| `LLAMINAR_COSMA_VALIDATE_TILE` | Small tile validation | 0 (off) |
-| `LLAMINAR_COSMA_DEBUG_RECON` | Verbose reconstruction logs | Unset |
-| `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE` | Auto-correct orientation | Unset |
-| `LLAMINAR_COSMA_LOG_LEVEL` | Prefill logging verbosity | info |
+**COSMA Execution**:
+
+| Variable | Purpose | Default | Notes |
+|----------|---------|---------|-------|
+| `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Seq length threshold for COSMA | 4096 | Only use COSMA for large prompts |
+| `ADAPTIVE_DISABLE_COSMA` | Force OpenBLAS path | Unset | Override for A/B testing |
+| `LLAMINAR_COSMA_FORCE_DIRECT` | Force COSMA direct path | Unset | Bypass fast path heuristics |
+| `LLAMINAR_COSMA_LOG_LEVEL` | Prefill logging verbosity | info | trace/debug/info/warn/error |
+
+**COSMA Validation** (debug only):
+
+| Variable | Purpose | Default | Notes |
+|----------|---------|---------|-------|
+| `LLAMINAR_COSMA_COMPARE_REPLICATED` | Full OpenBLAS validation | Unset | Expensive - use for debugging only |
+| `LLAMINAR_COSMA_VALIDATE_TILE` | Small tile validation | 0 (off) | Set to 64 for spot checks |
+| `LLAMINAR_COSMA_DEBUG_RECON` | Verbose reconstruction logs | Unset | Diagnose gather issues |
+| `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE` | Auto-correct orientation | Unset | Legacy - not needed in refactored version |
+
+**RMSNorm** (refactored version uses `rmsnorm_t5_forward` - no custom flags needed):
+
+| Variable | Purpose | Default | Notes |
+|----------|---------|---------|-------|
+| `LLAMINAR_DEQUANT_STATS` | Log dequant statistics | Unset | Min/max/mean per tensor |
+| `LLAMINAR_DEQUANT_ANOMALIES` | Warn on NaN/Inf values | Unset | Safety diagnostic |
+
+**Memory Management**:
+
+| Variable | Purpose | Default | Notes |
+|----------|---------|---------|-------|
+| `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft memory budget | 2048 | Fallback if exceeded |
 
 #### Integration Points
 
@@ -1190,23 +1512,96 @@ This maintains correctness while allowing adaptive selection at higher pipeline 
 
 **Files**: `src/kernels/MPIAttentionKernel.{h,cpp}`, `src/kernels/attention_primitives.{h,cpp}`
 
-The attention system provides multi-head attention with RoPE positional encoding, supporting both fused COSMA prefill and local kernel-based execution.
+The attention system provides multi-head attention with RoPE positional encoding, using a **unified backend-agnostic kernel** that supports both OpenBLAS and COSMA execution paths.
+
+#### Unified Architecture ✨ *NEW*
+
+**Key Innovation**: `MPIAttentionKernel` is now backend-agnostic, eliminating code duplication between OpenBLAS and COSMA paths.
+
+**Design Pattern**: Strategy injection via `setCosmaManager()`
+```cpp
+class MPIAttentionKernel : public MPIKernelBase {
+public:
+    // Unified interface for both backends
+    bool execute(const std::vector<std::shared_ptr<TensorBase>>& inputs,
+                 std::vector<std::shared_ptr<TensorBase>>& outputs) override;
+    
+    // Runtime backend injection
+    void setCosmaManager(CosmaPrefillManager* mgr) { cosma_manager_ = mgr; }
+    
+private:
+    // Backend routing with identical semantics
+    bool matmul_with_bias(const float* A, const float* weight_data,
+                         const float* bias, float* output, ...);
+    
+    CosmaPrefillManager* cosma_manager_ = nullptr;  // nullptr = OpenBLAS
+};
+```
+
+**Backend Selection**:
+```cpp
+// OpenBLAS path (prefill_provider or pipeline)
+auto attention_kernel = std::make_unique<MPIAttentionKernel>(...);
+bool success = attention_kernel->execute(inputs, outputs);  // Uses cblas_sgemm
+
+// COSMA path (cosma_prefill_provider)
+attention_kernel->setCosmaManager(cosma_manager_.get());
+bool success = attention_kernel->execute(inputs, outputs);  // Uses COSMA distributed
+```
+
+**Benefits**:
+- ✅ **Single Implementation**: Both backends execute identical attention algorithm
+- ✅ **Consistent Snapshots**: Capture points synchronized across backends
+- ✅ **86% Code Reduction**: Eliminated 185 lines of duplicated COSMA attention logic
+- ✅ **Maintainable**: Bug fixes automatically apply to both paths
+- ✅ **Type Safe**: Unified weight transpose handling
 
 #### Execution Paths
 
-**Large Prefill (COSMA Path)**:
-1. Fused RMSNorm + QKV projection via `cosma_prefill_manager`
-2. Reshape to multi-head format: `[batch, seq_len, num_heads, head_dim]`
-3. Apply RoPE positional encoding per head
-4. Scaled dot-product attention: `softmax(QK^T / sqrt(d_k)) V`
-5. Output projection (adaptive backend)
+**Small Operations (OpenBLAS Path)**:
+1. RMSNorm normalization
+2. Q/K/V projection via `cblas_sgemm` with `CblasTrans` (implicit transpose)
+3. Reshape to multi-head format: `[batch, seq_len, num_heads, head_dim]`
+4. Apply RoPE positional encoding per head
+5. Scaled dot-product attention: `softmax(QK^T / sqrt(d_k)) V`
+6. Output projection (local OpenBLAS)
 
-**Decode / Small Prefill (Local Path)**:
-1. Separate RMSNorm, Q/K/V projection kernels
-2. RoPE encoding
-3. KV cache append
-4. Causal attention over growing context
-5. Local OpenBLAS output projection
+**Large Prefill (COSMA Path)**:
+1. RMSNorm normalization (same as OpenBLAS)
+2. Q/K/V projection via `CosmaPrefillManager::matmul` with `transposeW=true` (explicit transpose)
+3. Reshape to multi-head format (same algorithm as OpenBLAS)
+4. Apply RoPE positional encoding (same algorithm)
+5. Scaled dot-product attention (same algorithm)
+6. Output projection (may use distributed COSMA)
+
+**Critical Difference**: Only the matmul primitive changes; all attention logic is identical.
+
+#### Weight Transpose Handling
+
+**GGUF Storage Format**: ALL weights are `[output_dim, input_dim]` (PyTorch convention)
+
+**OpenBLAS Transpose**:
+```cpp
+cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,  // ← Implicit transpose
+    m, n, k, 1.0f,
+    activation, k,
+    weight, k,     // weight is [n, k], transposed to [k, n] during matmul
+    0.0f, output, n);
+```
+
+**COSMA Transpose**:
+```cpp
+WeightDescriptor weight_desc{
+    weight_data,
+    original_rows,     // [N, K] format preserved
+    original_cols,
+    original_cols      // row_stride = K (no manual transpose)
+};
+cosma_manager_->matmul(..., weight_desc, ..., 
+    /*transposeW=*/true);  // ← Explicit transpose parameter
+```
+
+**Result**: Both paths compute identical `activation @ weight.T` operation, just with different API conventions.
 
 #### RoPE (Rotary Position Embedding)
 

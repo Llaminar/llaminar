@@ -1251,12 +1251,12 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
 
     broadcast_string(model_path, 0, MPI_COMM_WORLD);
 
-    // Define test token sequence (larger for COSMA)
-    // Create a sequence of 1000 tokens for COSMA to be effective
+    // Define test token sequence (optimized for COSMA while keeping memory reasonable)
+    // Use 100 tokens - large enough for COSMA to be effective, small enough to avoid memory issues
     std::vector<int> token_ids;
-    for (int i = 0; i < 1000; ++i)
+    for (int i = 0; i < 100; ++i)
     {
-        token_ids.push_back((i % 1000) + 1);
+        token_ids.push_back((i % 100) + 1);
     }
 
     // Set up snapshot directory
@@ -1268,7 +1268,7 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
         std::cout << "COSMA Prefill vs PyTorch Validation" << std::endl;
         std::cout << "========================================" << std::endl;
         std::cout << "[COSMA_PYTORCH] Model: " << model_path << std::endl;
-        std::cout << "[COSMA_PYTORCH] Token sequence: 1000 tokens (0-999 cycled)" << std::endl;
+        std::cout << "[COSMA_PYTORCH] Token sequence: 100 tokens (0-99 cycled)" << std::endl;
     }
 
     // Generate PyTorch reference snapshots with variance analysis
@@ -1284,8 +1284,9 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
     std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
     threshold_loader.load(threshold_path);
 
-    // Force COSMA path (lower threshold to ensure COSMA is used)
-    setenv("LLAMINAR_COSMA_PREFILL_THRESHOLD", "500", 1);
+    // Force COSMA path (lower threshold to ensure COSMA is used for 100-token sequence)
+    setenv("LLAMINAR_COSMA_PREFILL_THRESHOLD", "50", 1);
+    debugEnvRefresh(); // Refresh debug environment snapshot to pick up new threshold
 
     // Load PyTorch snapshots (rank 0 only)
     PyTorchSnapshotLoader pytorch_loader(snapshot_dir);

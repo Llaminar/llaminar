@@ -26,6 +26,7 @@
 #include "../logger.h"
 #include "../tensors/tensor_factory.h"
 #include "../matmul_backend_selection.h"
+#include "../cosma_prefill_manager.h"
 #include "common/attention_primitives.h"
 #include "common/softmax_core.h"
 #include "attention/AttentionStageContracts.h"
@@ -226,15 +227,114 @@ namespace llaminar
     }
 
     // ============================================================================
-    // Helper: Matrix multiplication with optional bias
+    // Helper: Backend-agnostic matrix multiplication with optional bias
     // ============================================================================
-    void matmul_with_bias(const float *input, const float *weight, float *output,
-                          const float *bias, int M, int N, int K)
+    /**
+     * @brief Perform matrix multiplication with optional bias using selected backend
+     *
+     * @param input Input matrix (row-major, M x K)
+     * @param weight Weight matrix (row-major, N x K) - will be transposed during multiplication
+     * @param output Output matrix (row-major, M x N)
+     * @param bias Optional bias vector (length N)
+     * @param M Number of rows in input and output
+     * @param N Number of columns in output (rows in weight)
+     * @param K Number of columns in input (columns in weight)
+     * @param operation_label Human-readable operation name for logging
+     *
+     * @note Weight layout: Stored as [N, K] in row-major format
+     *       OpenBLAS: Uses CblasTrans flag to transpose [N,K] -> [K,N] during multiplication
+     *       COSMA: Requires explicit pre-transposed [K,N] layout (handled internally)
+     *
+     * @note This method chooses between OpenBLAS and COSMA based on:
+     *       - Operation size (M*N*K)
+     *       - CosmaPrefillManager availability (cosma_mgr_ != nullptr)
+     *       - MatMulBackendSelector decision logic
+     */
+    void MPIAttentionKernel::matmul_with_bias(
+        const float *input, const float *weight, float *output,
+        const float *bias, int M, int N, int K,
+        const char *operation_label)
     {
+        const int rank = getRank();
+        const int world_size = getSize();
+
+        // Backend selection: Use COSMA when manager is available
+        // NOTE: For parity testing, we want COSMA to be used when available
+        // In production, you might want stricter thresholds (e.g., M >= 8192)
+        const bool use_cosma = (cosma_mgr_ != nullptr);
+        // Execute based on selected backend
+        if (use_cosma)
+        {
+            // COSMA path: Use transposeW=true to handle [N,K] -> [K,N] transpose
+            // OpenBLAS uses CblasTrans for the same purpose
+
+            // Step 1: Create WeightDescriptor with original [N,K] layout
+            // Step 2: Create WeightDescriptor with ORIGINAL dimensions (not transposed)
+            // COSMA will handle the transpose internally when transposeW=true
+            WeightDescriptor weight_desc{
+                operation_label ? operation_label : "weight", // id
+                N,                                            // rows (n = output_dim, original layout)
+                K,                                            // cols (k = input_dim, original layout)
+                static_cast<int64_t>(K),                      // row_stride (K elements per row in [N,K] layout)
+                1,                                            // col_stride
+                0,                                            // quant_type (0 = float32)
+                weight,                                       // base_ptr (use original, not transposed!)
+                0                                             // quant_block_size
+            };
+
+            // Step 3: Convert input to COSMA view
+            CosmaView input_view = cosma_mgr_->convert_activation_in(input, M, K);
+            if (!input_view.mat && !input_view.host_owned)
+            {
+                LOG_ERROR("[MPIAttentionKernel] Failed to convert input for COSMA");
+                // Fall back to OpenBLAS
+                goto openblas_fallback;
+            }
+
+            // Step 4: Load weight
+            auto weight_handle = cosma_mgr_->load_weight(weight_desc);
+            if (!weight_handle.view.mat)
+            {
+                LOG_ERROR("[MPIAttentionKernel] Failed to load weight for COSMA");
+                goto openblas_fallback;
+            }
+
+            // Step 5: Perform COSMA matmul with transposeW=true
+            CosmaView result_view = cosma_mgr_->matmul(input_view, weight_handle, M, K, N, true);
+            if (!result_view.mat && !result_view.host_owned)
+            {
+                LOG_ERROR("[MPIAttentionKernel] COSMA matmul failed");
+                goto openblas_fallback;
+            }
+
+            // Step 6: Reconstruct result to output buffer
+            cosma_mgr_->reconstruct_matrix(result_view, output, true);
+
+            // Step 7: Add bias if provided
+            if (bias)
+            {
+                for (int m = 0; m < M; ++m)
+                {
+                    for (int n = 0; n < N; ++n)
+                    {
+                        output[m * N + n] += bias[n];
+                    }
+                }
+            }
+
+            // Step 8: Release COSMA resources
+            cosma_mgr_->release_weight(std::move(weight_handle));
+
+            return; // COSMA path complete
+        }
+
+    openblas_fallback:
+        // OpenBLAS path (default and fallback)
         // Force single-threaded execution to avoid threading bugs
         openblas_set_num_threads(1);
 
         // output = input @ weight^T  (input is MxK, weight is NxK, output is MxN)
+        // CblasTrans flag transposes weight from [N,K] to [K,N] during multiplication
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     M, N, K,
                     1.0f, input, K, weight, K,
@@ -262,6 +362,17 @@ namespace llaminar
     {
         const int rank = getRank();
         const int world_size = getSize();
+
+        // DEBUG: Confirm execution
+        if (rank == 0)
+        {
+            std::cerr << "[EXECUTE] MPIAttentionKernel::execute() called"
+                      << " layer=" << layer_index_
+                      << " cosma_mgr=" << (void *)cosma_mgr_
+                      << " snapshot_cb=" << (snapshot_callback_ ? "SET" : "NULL")
+                      << std::endl;
+        }
+
         const auto &debug_snapshot = debugEnv();
         const bool enable_validation = debug_snapshot.attention.validate_output;
         const bool validate_projections = debug_snapshot.attention.validate_proj;
@@ -722,140 +833,20 @@ namespace llaminar
         auto local_k = TensorFactory::create_simple({seq_len, local_kv_head_dim});
         auto local_v = TensorFactory::create_simple({seq_len, local_kv_head_dim});
 
-        if (rank == 0)
-        {
-            std::cerr << "[DEBUG-MATMUL] local_q created: size=" << local_q->size()
-                      << " data_ptr=" << (void *)local_q->data()
-                      << " first=" << local_q->data()[0]
-                      << " last=" << local_q->data()[local_q->size() - 1] << std::endl;
-        }
-
+        // Q projection: [seq_len, d_model] @ [d_model, local_head_dim] = [seq_len, local_head_dim]
         matmul_with_bias(input->data(), local_wq->data(), local_q->data(),
                          local_bq ? local_bq->data() : nullptr,
-                         seq_len, local_head_dim, d_model);
+                         seq_len, local_head_dim, d_model, "Q_projection");
 
-        // IMMEDIATE INLINE CHECK - grab the value BEFORE any code
-        float immediate_val_8 = (local_q->size() > 8) ? local_q->data()[8] : -999.0f;
-
-        if (rank == 0)
-        {
-            std::cerr << "[CHECK-INLINE] Immediate inline value at index 8: " << immediate_val_8 << std::endl;
-
-            // IMMEDIATE check - before any other code runs
-            asm volatile("" ::: "memory");
-            float *q_ptr = local_q->data();
-            std::cerr << "[CHECK-1] Q ptr IMMEDIATELY after matmul call: " << (void *)q_ptr << std::endl;
-            std::cerr << "[CHECK-1] Q[8] via ptr: " << q_ptr[8] << std::endl;
-            std::cerr << "[CHECK-1] Q[8] via local_q->data(): " << local_q->data()[8] << std::endl;
-
-            // Scan for garbage
-            bool has_garbage = false;
-            for (int i = 0; i < local_q->size(); ++i)
-            {
-                if (std::abs(q_ptr[i]) > 1e10f)
-                {
-                    std::cerr << "[CHECK-1] GARBAGE at index " << i << ": " << q_ptr[i] << std::endl;
-                    has_garbage = true;
-                    break;
-                }
-            }
-            if (!has_garbage)
-            {
-                std::cerr << "[CHECK-1] NO GARBAGE - all values look normal!" << std::endl;
-            }
-        }
-
-        if (rank == 0)
-        {
-            // Force compiler to not reorder this code
-            asm volatile("" ::: "memory");
-            float *q_ptr = local_q->data();
-            std::cerr << "[DEBUG-MATMUL] Q ptr after matmul: " << (void *)q_ptr << std::endl;
-            float min_q = q_ptr[0], max_q = q_ptr[0];
-            int garbage_idx = -1;
-            for (int i = 0; i < local_q->size(); ++i)
-            {
-                float val = q_ptr[i];
-                if (std::abs(val) > 1e10f && garbage_idx < 0)
-                {
-                    garbage_idx = i;
-                    std::cerr << "[DEBUG-MATMUL] GARBAGE FOUND at index " << i << ": " << val << std::endl;
-                }
-                min_q = std::min(min_q, val);
-                max_q = std::max(max_q, val);
-            }
-            std::cerr << "[DEBUG-MATMUL] IMMEDIATELY after Q matmul: range=["
-                      << min_q << ", " << max_q << "]" << std::endl;
-            // Print first and last few values
-            std::cerr << "[DEBUG-MATMUL] Q first 4: " << q_ptr[0] << ", " << q_ptr[1] << ", " << q_ptr[2] << ", " << q_ptr[3] << std::endl;
-            std::cerr << "[DEBUG-MATMUL] Q last 4: " << q_ptr[124] << ", " << q_ptr[125] << ", " << q_ptr[126] << ", " << q_ptr[127] << std::endl;
-        }
-
+        // K projection: [seq_len, d_model] @ [d_model, local_kv_head_dim] = [seq_len, local_kv_head_dim]
         matmul_with_bias(input->data(), local_wk->data(), local_k->data(),
                          local_bk ? local_bk->data() : nullptr,
-                         seq_len, local_kv_head_dim, d_model);
+                         seq_len, local_kv_head_dim, d_model, "K_projection");
 
-        if (rank == 0)
-        {
-            float min_k = local_k->data()[0], max_k = local_k->data()[0];
-            for (int i = 0; i < local_k->size(); ++i)
-            {
-                min_k = std::min(min_k, local_k->data()[i]);
-                max_k = std::max(max_k, local_k->data()[i]);
-            }
-            std::cerr << "[DEBUG-MATMUL] IMMEDIATELY after K matmul: range=["
-                      << min_k << ", " << max_k << "]" << std::endl;
-
-            // CHECK IF Q WAS CORRUPTED
-            float *q_ptr = local_q->data();
-            bool q_corrupted = false;
-            for (int i = 0; i < local_q->size(); ++i)
-            {
-                if (std::abs(q_ptr[i]) > 1e10f)
-                {
-                    std::cerr << "[CHECK-AFTER-K] ⚠️ Q CORRUPTED after K matmul! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
-                    q_corrupted = true;
-                    break;
-                }
-            }
-            if (!q_corrupted)
-            {
-                std::cerr << "[CHECK-AFTER-K] Q still clean after K matmul" << std::endl;
-            }
-        }
-
+        // V projection: [seq_len, d_model] @ [d_model, local_kv_head_dim] = [seq_len, local_kv_head_dim]
         matmul_with_bias(input->data(), local_wv->data(), local_v->data(),
                          local_bv ? local_bv->data() : nullptr,
-                         seq_len, local_kv_head_dim, d_model);
-
-        if (rank == 0)
-        {
-            float min_v = local_v->data()[0], max_v = local_v->data()[0];
-            for (int i = 0; i < local_v->size(); ++i)
-            {
-                min_v = std::min(min_v, local_v->data()[i]);
-                max_v = std::max(max_v, local_v->data()[i]);
-            }
-            std::cerr << "[DEBUG-MATMUL] IMMEDIATELY after V matmul: range=["
-                      << min_v << ", " << max_v << "]" << std::endl;
-
-            // CHECK IF Q WAS CORRUPTED
-            float *q_ptr = local_q->data();
-            bool q_corrupted = false;
-            for (int i = 0; i < local_q->size(); ++i)
-            {
-                if (std::abs(q_ptr[i]) > 1e10f)
-                {
-                    std::cerr << "[CHECK-AFTER-V] ⚠️ Q CORRUPTED after V matmul! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
-                    q_corrupted = true;
-                    break;
-                }
-            }
-            if (!q_corrupted)
-            {
-                std::cerr << "[CHECK-AFTER-V] Q still clean after V matmul" << std::endl;
-            }
-        }
+                         seq_len, local_kv_head_dim, d_model, "V_projection");
 
         // CONTRACT: QKV projections
         if (enable_validation)
@@ -1020,6 +1011,10 @@ namespace llaminar
         // We gather row-by-row (per token) to maintain proper layout
         // Each rank has [seq_len, local_head_dim] in row-major order
         // We need to concatenate the head dimension per row to get [seq_len, total_head_dim]
+
+        std::cerr << "[MPIAttentionKernel] Layer " << layer_index_ << ": snapshot_callback_="
+                  << (snapshot_callback_ ? "SET" : "NULL") << ", world_size=" << world_size << std::endl;
+
         if (snapshot_callback_ && world_size > 1)
         {
             // Allocate global tensors

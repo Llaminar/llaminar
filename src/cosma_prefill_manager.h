@@ -57,11 +57,17 @@ namespace llaminar
 
     struct CosmaView
     {
-        // Retain prerequisite allocations (typically operand buffers rebuilt for COSMA layout)
-        // so their destruction occurs after this view releases its own matrix, preserving the
-        // COSMA memory pool's LIFO discipline.
+        // CRITICAL: Destruction order is the REVERSE of declaration order.
+        // We need result matrix C (mat) to be destroyed BEFORE the operand
+        // references held in release_chain (A, W, possibly others) to respect
+        // COSMA's internal pool LIFO discipline (alloc A -> alloc W -> alloc C).
+        // Therefore: declare release_chain FIRST, then mat SECOND so that
+        // on destruction: mat is destroyed first, THEN release_chain elements.
+        // (A previous refactor inverted this order causing double-free / pool
+        // corruption when operands were freed prior to results.)
         std::vector<std::shared_ptr<cosma::CosmaMatrix<cosma_scalar_t>>> release_chain;
         std::shared_ptr<cosma::CosmaMatrix<cosma_scalar_t>> mat; // shared so temporary results survive chaining
+
         int global_rows = 0;
         int global_cols = 0;
         char label = 'A';
@@ -71,18 +77,23 @@ namespace llaminar
         const float *original_row_major = nullptr;      // points to source data (A or B) if available
         std::shared_ptr<std::vector<float>> host_owned; // for outputs or copies when needed
 
+        // Use default special member functions - shared_ptr handles cleanup automatically
+        CosmaView() = default;
+        CosmaView(const CosmaView &) = default;
+        CosmaView(CosmaView &&) noexcept = default;
+        CosmaView &operator=(const CosmaView &) = default;
+        CosmaView &operator=(CosmaView &&) noexcept = default;
         ~CosmaView()
         {
-            if (mat)
+            static int dtor_trace = []()
             {
-                mat.reset();
-            }
-            for (auto it = release_chain.rbegin(); it != release_chain.rend(); ++it)
+                const char *v = std::getenv("LLAMINAR_COSMA_DTOR_TRACE");
+                return (v && *v && std::string(v) != "0") ? 1 : 0;
+            }();
+            if (dtor_trace && mat)
             {
-                if (*it)
-                {
-                    it->reset();
-                }
+                fprintf(stderr, "[CosmaView::dtor] mat=%p use_count=%ld chain=%zu\n",
+                        (void *)mat.get(), mat.use_count(), release_chain.size());
             }
         }
     };

@@ -219,6 +219,16 @@ gdb ./build/llaminar core
 (gdb) x/10i $pc  # Examine instructions around crash
 ```
 
+Use ASAN for localizing more complex double-free style issues:
+
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 timeout 240 mpirun -np 2 ./build/<your_test> --gtest_filter=<your_test_filter>
+```
+
+Just don't forget to reconfigure cmake to disable ASAN when you're done debugging!
+
 ### MPI-Specific Debugging
 
 ```bash

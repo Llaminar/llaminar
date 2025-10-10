@@ -31,6 +31,27 @@ namespace llaminar
     {
         const auto &layer_cfg = config().getLayerConfig();
 
+        // Attention kernel (used by COSMA path)
+        {
+            auto attention_kernel = std::make_unique<MPIAttentionKernel>(
+                layer_cfg.n_head,
+                layer_cfg.n_head_kv,
+                layer_cfg.head_dim,
+                layer_cfg.rope_freq_base);
+
+            // Configure output mode
+            attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+
+            // Wire up snapshot callback for intermediate stages
+            attention_kernel->setSnapshotCallback([this](PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)
+                                                  { captureSnapshot(stage, layer_idx, data, seq_len, feature_dim); });
+
+            if (!registerKernel("attention", std::move(attention_kernel)))
+            {
+                throw std::runtime_error("COSMAPrefillProvider: Failed to register attention kernel");
+            }
+        }
+
         // SwiGLU activation kernel
         {
             auto swiglu_kernel = std::make_unique<MPISwiGLUKernel>(
@@ -183,6 +204,7 @@ namespace llaminar
         auto logits = createLocalTensor({seq_len, vocab_size});
         {
             // Use adaptiveMatMul for LM head (may use COSMA for large ops)
+            // Weight is [vocab_size, d_model], needs transpose to [d_model, vocab_size]
             bool ok = adaptiveMatMul(
                 final_norm_out->data(),
                 qwen_weights->lm_head->data(),
@@ -193,7 +215,7 @@ namespace llaminar
                 /*is_prefill=*/true,
                 /*is_decode=*/false,
                 /*transposed_a=*/false,
-                /*transposed_b=*/false,
+                /*transposed_b=*/true, // Weight stored as [vocab_size, d_model], transpose for matmul
                 1.0f,
                 0.0f);
 
@@ -342,7 +364,7 @@ namespace llaminar
                 /*is_prefill=*/true,
                 /*is_decode=*/false,
                 /*transposed_a=*/false,
-                /*transposed_b=*/false,
+                /*transposed_b=*/true, // Weight is [d_ff, d_model], needs transpose to [d_model, d_ff]
                 1.0f,
                 0.0f);
 
@@ -352,6 +374,10 @@ namespace llaminar
                 return false;
             }
         }
+
+        // Capture FFN gate projection snapshot
+        captureSnapshot(PipelineStage::FFN_GATE, layer_idx, gate_out->data(), seq_len, d_ff);
+        incrementSnapshotCounter(metrics);
 
         {
             bool ok = adaptiveMatMul(
@@ -364,7 +390,7 @@ namespace llaminar
                 /*is_prefill=*/true,
                 /*is_decode=*/false,
                 /*transposed_a=*/false,
-                /*transposed_b=*/false,
+                /*transposed_b=*/true, // Weight is [d_ff, d_model], needs transpose to [d_model, d_ff]
                 1.0f,
                 0.0f);
 
@@ -374,6 +400,10 @@ namespace llaminar
                 return false;
             }
         }
+
+        // Capture FFN up projection snapshot
+        captureSnapshot(PipelineStage::FFN_UP, layer_idx, up_out->data(), seq_len, d_ff);
+        incrementSnapshotCounter(metrics);
 
         // SwiGLU activation
         auto swiglu_out = createLocalTensor({seq_len, d_ff});
@@ -388,6 +418,10 @@ namespace llaminar
             }
         }
 
+        // Capture FFN SwiGLU activation snapshot
+        captureSnapshot(PipelineStage::FFN_SWIGLU, layer_idx, swiglu_out->data(), seq_len, d_ff);
+        incrementSnapshotCounter(metrics);
+
         // Down projection (via adaptiveMatMul - may use COSMA)
         {
             bool ok = adaptiveMatMul(
@@ -400,7 +434,7 @@ namespace llaminar
                 /*is_prefill=*/true,
                 /*is_decode=*/false,
                 /*transposed_a=*/false,
-                /*transposed_b=*/false,
+                /*transposed_b=*/true, // Weight is [d_model, d_ff], needs transpose to [d_ff, d_model]
                 1.0f,
                 0.0f);
 
@@ -451,158 +485,77 @@ namespace llaminar
     {
         PERF_SCOPED_TIMER("COSMAPrefillProvider::executeAttentionCosma");
 
-        // Extract from plan
-        const int seq_len = plan.seq_len;
-        const int hidden_size = plan.d_model;
-        const int head_dim = plan.head_dim;
-        const int n_heads = plan.n_heads;
-        const int n_kv_heads = plan.n_kv_heads;
-        const int total_head_dim = plan.total_head_dim();
-        const int kv_head_dim = plan.kv_head_dim();
-
-        CosmaPrefillManager &manager = CosmaPrefillManager::instance();
-
-        // === Stage 1: Fused RMSNorm + QKV projection ===
-        auto make_desc = [&](const std::shared_ptr<TensorBase> &tensor, const std::string &id) -> WeightDescriptor
+        // Validate plan
+        if (!plan.is_valid())
         {
-            const auto &shape = tensor->shape();
-            return WeightDescriptor{
-                id,
-                shape.size() > 0 ? shape[0] : 0,
-                shape.size() > 1 ? shape[1] : 0,
-                (int64_t)(shape.size() > 1 ? shape[1] : 0),
-                1,
-                0,
-                tensor->data(),
-                0};
-        };
-
-        WeightDescriptor wq_desc = make_desc(weights.wq[layer_idx], "layer" + std::to_string(layer_idx) + "_wq");
-        WeightDescriptor wk_desc = make_desc(weights.wk[layer_idx], "layer" + std::to_string(layer_idx) + "_wk");
-        WeightDescriptor wv_desc = make_desc(weights.wv[layer_idx], "layer" + std::to_string(layer_idx) + "_wv");
-
-        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-        auto fused_start = std::chrono::high_resolution_clock::now();
-
-        auto fused = manager.fused_rmsnorm_qkv(
-            input->data(),
-            weights.attn_norm_weight[layer_idx]->data(),
-            wq_desc, wk_desc, wv_desc,
-            seq_len, hidden_size,
-            config().getLayerConfig().eps,
-            scale,
-            false);
-
-        auto fused_end = std::chrono::high_resolution_clock::now();
-
-        // Validate fused results
-        if ((!fused.normalized.mat && !fused.normalized.host_owned) ||
-            (!fused.q.mat && !fused.q.host_owned) ||
-            (!fused.k.mat && !fused.k.host_owned) ||
-            (!fused.v.mat && !fused.v.host_owned))
-        {
-            LOG_ERROR("COSMAPrefillProvider: COSMA fused_rmsnorm_qkv incomplete for layer " << layer_idx);
+            LOG_ERROR("COSMAPrefillProvider::executeAttentionCosma called with invalid plan: " << plan.rationale);
             return false;
         }
 
-        // === Stage 2: Materialize row-major normalized + Q/K/V ===
-        std::vector<float> norm_buf((size_t)seq_len * hidden_size, 0.f);
-        manager.to_row_major(fused.normalized, norm_buf.data());
-        std::memcpy(attn_norm_out->data(), norm_buf.data(), norm_buf.size() * sizeof(float));
+        CosmaPrefillManager &manager = CosmaPrefillManager::instance();
+        const int seq_len = plan.seq_len;
+        const int hidden_size = plan.d_model;
 
-        std::vector<float> q_buf((size_t)seq_len * total_head_dim, 0.f);
-        std::vector<float> k_buf((size_t)seq_len * kv_head_dim, 0.f);
-        std::vector<float> v_buf((size_t)seq_len * kv_head_dim, 0.f);
+        // --- Stage 1: RMSNorm (separate kernel, like OpenBLAS path) ---
+        auto norm_start = std::chrono::high_resolution_clock::now();
 
-        manager.to_row_major(fused.q, q_buf.data(), true);
-        manager.to_row_major(fused.k, k_buf.data(), true);
-        manager.to_row_major(fused.v, v_buf.data(), true);
+        std::vector<std::shared_ptr<TensorBase>> norm_inputs = {
+            input,
+            weights.attn_norm_weight[layer_idx]};
+        std::vector<std::shared_ptr<TensorBase>> norm_outputs = {attn_norm_out};
 
-        timing.norm_ms = std::chrono::duration<double, std::milli>(fused_end - fused_start).count();
+        if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
+        {
+            LOG_ERROR("COSMAPrefillProvider: Layer " << layer_idx << " attention norm failed");
+            return false;
+        }
 
-        // === Stage 3: Apply RoPE and compute attention ===
+        auto norm_end = std::chrono::high_resolution_clock::now();
+        timing.norm_ms = std::chrono::duration<double, std::milli>(norm_end - norm_start).count();
+
+        // --- Stage 2: Attention via MPIAttentionKernel with COSMA backend ---
         auto attention_start = std::chrono::high_resolution_clock::now();
 
-        std::vector<float> context_concat((size_t)seq_len * total_head_dim, 0.f);
-
-        // Handle GQA (Grouped Query Attention) by replicating K/V heads
-        if (n_kv_heads != n_heads)
+        // Configure attention kernel
+        auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
+        if (attention_kernel)
         {
-            // Expand K and V to match number of query heads using optimized primitive
-            std::vector<float> k_expanded((size_t)seq_len * total_head_dim, 0.f);
-            std::vector<float> v_expanded((size_t)seq_len * total_head_dim, 0.f);
-
-            llaminar::attn::expand_kv_for_gqa(
-                k_buf.data(), v_buf.data(),
-                k_expanded.data(), v_expanded.data(),
-                seq_len, head_dim, n_heads, n_kv_heads);
-
-            // Apply RoPE and attention with expanded K/V
-            llaminar::attn::apply_rope(
-                q_buf.data(), k_expanded.data(),
-                seq_len, head_dim, n_heads, n_heads,
-                n_past_, config().getLayerConfig().rope_freq_base);
-
-            llaminar::attn::fused_attention(
-                q_buf.data(), k_expanded.data(), v_expanded.data(),
-                context_concat.data(),
-                seq_len, head_dim, n_heads,
-                /*causal=*/true);
+            attention_kernel->setSequencePosition(n_past_);
+            attention_kernel->setLayerIndex(layer_idx);
+            attention_kernel->setCosmaManager(&manager); // INJECT COSMA BACKEND!
         }
-        else
+
+        // Prepare KV cache tensors (use placeholder tensors since we don't have kv_cache in provider)
+        const auto &layer_cfg = config().getLayerConfig();
+        auto k_cache = createLocalTensor({seq_len, layer_cfg.n_head_kv * layer_cfg.head_dim});
+        auto v_cache = createLocalTensor({seq_len, layer_cfg.n_head_kv * layer_cfg.head_dim});
+
+        // Call attention kernel (SAME as OpenBLAS path!)
+        std::vector<std::shared_ptr<TensorBase>> attn_inputs = {
+            attn_norm_out,
+            weights.wq[layer_idx],
+            weights.wk[layer_idx],
+            weights.wv[layer_idx],
+            weights.wo[layer_idx],
+            weights.bq[layer_idx],
+            weights.bk[layer_idx],
+            weights.bv[layer_idx],
+            k_cache,
+            v_cache};
+        std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
+
+        if (!executeKernel("attention", attn_inputs, attn_outputs))
         {
-            // Standard MHA: expand K/V to match Q layout using optimized primitive
-            std::vector<float> k_expanded((size_t)seq_len * total_head_dim, 0.f);
-            std::vector<float> v_expanded((size_t)seq_len * total_head_dim, 0.f);
-
-            llaminar::attn::expand_kv_for_mha(
-                k_buf.data(), v_buf.data(),
-                k_expanded.data(), v_expanded.data(),
-                seq_len, kv_head_dim, total_head_dim);
-
-            // Apply RoPE to Q and K in-place
-            llaminar::attn::apply_rope(
-                q_buf.data(), k_expanded.data(),
-                seq_len, head_dim, n_heads, n_heads,
-                n_past_, config().getLayerConfig().rope_freq_base);
-
-            // Compute full attention
-            llaminar::attn::fused_attention(
-                q_buf.data(), k_expanded.data(), v_expanded.data(),
-                context_concat.data(),
-                seq_len, head_dim, n_heads,
-                /*causal=*/true);
+            LOG_ERROR("COSMAPrefillProvider: Layer " << layer_idx << " attention failed");
+            return false;
         }
 
         auto attention_end = std::chrono::high_resolution_clock::now();
         timing.attention_ms = std::chrono::duration<double, std::milli>(attention_end - attention_start).count();
 
-        // === Stage 4: Output projection ===
-        auto proj_start = std::chrono::high_resolution_clock::now();
-
-        bool ok = adaptiveMatMul(
-            context_concat.data(),
-            weights.wo[layer_idx]->data(),
-            attn_out->data(),
-            seq_len,
-            hidden_size,
-            total_head_dim,
-            /*is_prefill=*/true,
-            /*is_decode=*/false,
-            /*transposed_a=*/false,
-            /*transposed_b=*/false,
-            1.0f,
-            0.0f);
-
-        if (!ok)
-        {
-            LOG_ERROR("COSMAPrefillProvider: COSMA attention output projection failed layer=" << layer_idx);
-            return false;
-        }
-
-        auto proj_end = std::chrono::high_resolution_clock::now();
-        timing.linear_ms = std::chrono::duration<double, std::milli>(proj_end - proj_start).count();
+        // Note: Output projection is now handled inside MPIAttentionKernel
+        // No need for separate adaptiveMatMul call
+        timing.linear_ms = 0.0; // Included in attention_ms
 
         return true;
     }

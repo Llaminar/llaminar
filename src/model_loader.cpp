@@ -1073,7 +1073,7 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
     }
 
     // DEBUG: Log info->dimensions before any processing
-    if (tensor_name.find("attn_k") != std::string::npos)
+    if (tensor_name.find("attn_k") != std::string::npos && info->dimensions.size() >= 2)
     {
         LOG_ERROR("[DIMS_DEBUG] tensor='" << tensor_name << "' info->dimensions=[" << info->dimensions[0] << ", " << info->dimensions[1] << "] dims=[" << dims[0] << ", " << dims[1] << "]");
     }

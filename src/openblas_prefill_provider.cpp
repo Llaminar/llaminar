@@ -175,8 +175,8 @@ namespace llaminar
                 qwen_weights->token_embedding};
             std::vector<std::shared_ptr<TensorBase>> embed_outputs = {embedded};
 
-            // Create temporary token tensor for embedding kernel
-            auto token_tensor = createLocalTensor({static_cast<int>(tokens.size()), 1});
+            // Create temporary 1D token tensor for embedding kernel
+            auto token_tensor = createLocalTensor({static_cast<int>(tokens.size())});
             float *token_data = token_tensor->data();
             for (size_t i = 0; i < tokens.size(); ++i)
             {
@@ -378,6 +378,9 @@ namespace llaminar
                 weights.wk[layer_idx],
                 weights.wv[layer_idx],
                 weights.wo[layer_idx],
+                weights.bq[layer_idx],
+                weights.bk[layer_idx],
+                weights.bv[layer_idx],
                 k_cache,
                 v_cache};
             std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
