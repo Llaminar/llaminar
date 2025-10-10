@@ -40,6 +40,9 @@ namespace llaminar
             std::vector<std::shared_ptr<TensorBase>> wk;
             std::vector<std::shared_ptr<TensorBase>> wv;
             std::vector<std::shared_ptr<TensorBase>> wo;
+            std::vector<std::shared_ptr<TensorBase>> bq; // Q projection bias
+            std::vector<std::shared_ptr<TensorBase>> bk; // K projection bias
+            std::vector<std::shared_ptr<TensorBase>> bv; // V projection bias
             std::vector<std::shared_ptr<TensorBase>> ffn_norm_weight;
             std::vector<std::shared_ptr<TensorBase>> w_gate;
             std::vector<std::shared_ptr<TensorBase>> w_up;

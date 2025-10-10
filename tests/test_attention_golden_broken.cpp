@@ -180,7 +180,7 @@ TEST(AttentionGolden, RoPEBasic) {
     std::vector<float> q_expected = {1.0f, 0.0f, 1.0f, 0.0f};  // No change at position 0
     std::vector<float> k_expected = {0.0f, 1.0f, 0.0f, 1.0f};
     
-    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 0, 10000.0f);
+    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 1, 0, 10000.0f);
     
     for (size_t i = 0; i < 4; ++i) {
         EXPECT_NEAR(q[i], q_expected[i], 1e-5f);
@@ -203,7 +203,7 @@ TEST(AttentionGolden, RoPENonZeroPosition) {
     // q[0:2] rotation: [1,0] -> [1*0.5403 - 0*0.8415, 1*0.8415 + 0*0.5403] = [0.5403, 0.8415]
     // q[2:4] rotation: [0,1] -> [0*1.0 - 1*0.01, 0*0.01 + 1*1.0] = [-0.01, 1.0]
     
-    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 1, 10000.0f);
+    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 1, 1, 10000.0f);
     
     // These are approximate - need exact PyTorch reference
     EXPECT_NEAR(q[0], 0.5403f, 0.001f);

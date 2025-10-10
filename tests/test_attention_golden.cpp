@@ -127,7 +127,7 @@ TEST(AttentionGolden, RoPEBasic) {
     std::vector<float> q_expected = q;
     std::vector<float> k_expected = k;
     
-    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 0, 10000.0f);
+    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 1, 0, 10000.0f);
     
     for (size_t i = 0; i < 4; ++i) {
         EXPECT_NEAR(q[i], q_expected[i], 1e-4f);
@@ -140,7 +140,7 @@ TEST(AttentionGolden, RoPENonZeroPosition) {
     std::vector<float> q = {1.0f, 0.0f, 1.0f, 0.0f};
     std::vector<float> k = {1.0f, 0.0f, 1.0f, 0.0f};
     
-    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 1, 10000.0f);
+    llaminar::attn::apply_rope(q.data(), k.data(), 1, 4, 1, 1, 1, 10000.0f);
     
     // Verify values have changed (rotated)
     EXPECT_NE(q[0], 1.0f);  // First element should be rotated

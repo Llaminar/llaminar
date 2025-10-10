@@ -69,6 +69,9 @@ int main(int argc, char **argv)
     auto wk_g = TensorFactory::create_simple({d_model, n_head_kv * head_dim});
     auto wv_g = TensorFactory::create_simple({d_model, n_head_kv * head_dim});
     auto wo_g = TensorFactory::create_simple({n_head * head_dim, d_model});
+    auto bq_g = TensorFactory::create_simple({n_head * head_dim});
+    auto bk_g = TensorFactory::create_simple({n_head_kv * head_dim});
+    auto bv_g = TensorFactory::create_simple({n_head_kv * head_dim});
     auto k_cache = TensorFactory::create_simple({seq_len, n_head_kv * head_dim});
     auto v_cache = TensorFactory::create_simple({seq_len, n_head_kv * head_dim});
     auto out_partial = TensorFactory::create_simple({seq_len, d_model});
@@ -78,12 +81,15 @@ int main(int argc, char **argv)
     fill_seq(wk_g->data(), wk_g->size(), 0.002f);
     fill_seq(wv_g->data(), wv_g->size(), 0.002f);
     fill_seq(wo_g->data(), wo_g->size(), 0.002f);
+    fill_seq(bq_g->data(), bq_g->size(), 0.0001f);
+    fill_seq(bk_g->data(), bk_g->size(), 0.0001f);
+    fill_seq(bv_g->data(), bv_g->size(), 0.0001f);
     std::memset(k_cache->data(), 0, sizeof(float) * k_cache->size());
     std::memset(v_cache->data(), 0, sizeof(float) * v_cache->size());
 
     // Execute kernel (replicated weight path triggers internal slicing)
     MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
-    std::vector<std::shared_ptr<TensorBase>> inputs = {input, wq_g, wk_g, wv_g, wo_g, k_cache, v_cache};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, wq_g, wk_g, wv_g, wo_g, bq_g, bk_g, bv_g, k_cache, v_cache};
     std::vector<std::shared_ptr<TensorBase>> outputs = {out_partial};
     bool ok = kernel.execute(inputs, outputs);
     int all_ok = 0;

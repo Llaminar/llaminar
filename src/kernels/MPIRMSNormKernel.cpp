@@ -32,6 +32,7 @@
 #include "../debug_utils.h"
 #include "../utils/debug_env.h"
 #include "common/rmsnorm_core.h" // centralized RMSNorm primitives
+#include "common/rmsnorm_t5.h"   // T5-style RMSNorm matching HuggingFace
 #include <cmath>
 #include <chrono>
 #include <algorithm>
@@ -497,48 +498,43 @@ namespace llaminar
         }
         double local_mean = local_count ? (local_sum / local_count) : 0.0;
 
-        // Compute per-row RMS using core helpers
+        // Use T5-style RMSNorm computation (matches HuggingFace Transformers exactly)
+        // This replaces the old multi-step computation with a direct implementation
+        // Formula: output = weight * input / sqrt(mean(input^2) + eps)
+        bool use_parallel = local_seq_len > 1;
+
+        // Use double precision accumulation to potentially reduce numerical errors
+        // PyTorch T5LayerNorm uses float32 by default, but we'll try double
+        kernels::rmsnorm_t5_forward_double_acc(
+            local_input, weight, local_output,
+            local_seq_len, hidden_size, epsilon_, use_parallel);
+
+        // Compute diagnostic statistics for logging (per-row variance)
         std::vector<double> row_sumsq(local_seq_len, 0.0);
-        std::vector<float> row_inv_rms(local_seq_len, 0.f);
+        for (size_t r = 0; r < local_seq_len; ++r)
         {
-            kernels::RMSNormExecOptions opts; // default heuristics
-            kernels::rmsnorm_compute_row_sumsq(local_input, local_seq_len, hidden_size, row_sumsq.data(), opts);
-            kernels::rmsnorm_compute_inv(row_sumsq.data(), local_seq_len, hidden_size, epsilon_, row_inv_rms.data());
+            const float *row = local_input + r * hidden_size;
+            double sum_sq = 0.0;
+            for (size_t c = 0; c < hidden_size; ++c)
+            {
+                double val = static_cast<double>(row[c]);
+                sum_sq += val * val;
+            }
+            row_sumsq[r] = sum_sq;
         }
+
         double local_sum_sq_total = 0.0;
         for (size_t r = 0; r < local_seq_len; ++r)
             local_sum_sq_total += row_sumsq[r];
-        size_t denom = hidden_size > 0 ? hidden_size : 1;
 
         // Aggregate statistics for logging (global averages are informational only)
         double global_sum_sq = 0.0;
         checkMPIError(PerfAllreduce(&local_sum_sq_total, &global_sum_sq, 1, MPI_DOUBLE, MPI_SUM, getComm()),
                       "MPI_Allreduce for RMS statistics");
 
-        double rms_global = 0.0;
-        bool legacy_stats = debugEnv().rmsnorm.legacy_global_stats;
-        // Parity override: when per-layer incremental replay comparison is active,
-        // force row-local statistics to avoid sequence-length dependent global RMS aggregation
-        // that causes divergence between replay (long seq) and incremental (seq_len=1) paths.
-        if (debugEnv().pipeline.layer_replay_compare)
-        {
-            legacy_stats = false;
-        }
-        if (legacy_stats)
-        {
-            // Legacy behavior: aggregate across all rows (sequence-length dependent)
-            rms_global = std::sqrt((global_seq_len * hidden_size)
-                                       ? (global_sum_sq / static_cast<double>(global_seq_len * hidden_size) + static_cast<double>(epsilon_))
-                                       : static_cast<double>(epsilon_));
-        }
-        else
-        {
-            // Parity-oriented behavior: use per-row normalization only (already applied) and report first-row rms as representative.
-            // row_sumsq holds local rows only; gather first row from rank that owns it (rank 0 in current replicated row distribution).
-            double first_row_sumsq = row_sumsq.empty() ? 0.0 : row_sumsq[0];
-            // In replicated current path, each rank has same row 0; if sharded future variant emerges we would Allreduce here.
-            rms_global = std::sqrt(hidden_size ? (first_row_sumsq / (double)hidden_size + (double)epsilon_) : (double)epsilon_);
-        }
+        // Compute representative RMS for logging (using first row)
+        double first_row_sumsq = row_sumsq.empty() ? 0.0 : row_sumsq[0];
+        double rms_global = std::sqrt(hidden_size ? (first_row_sumsq / (double)hidden_size + (double)epsilon_) : (double)epsilon_);
 
         // Gather global stats for debugging (min, max, mean)
         float global_min = 0.0f, global_max = 0.0f;
@@ -571,21 +567,10 @@ namespace llaminar
 
         if (getRank() == 0)
         {
-            if (legacy_stats)
-            {
-                LOG_INFO("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
-                                                                   << " global_sum_sq=" << global_sum_sq << " rms_avg=" << rms_global << " mode=legacy_global");
-            }
-            else
-            {
-                LOG_INFO("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
-                                                                   << " rms_first_row=" << rms_global << " mode=row_local");
-            }
+            LOG_INFO("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
+                                                               << " rms_first_row=" << rms_global << " mode=T5");
             LOG_INFO("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
-
-        // Apply via core primitive (replicated gamma semantics)
-        kernels::rmsnorm_apply(local_input, weight, row_inv_rms.data(), local_seq_len, hidden_size, local_output, kernels::GammaMode::REPLICATED, 0, kernels::RMSNormExecOptions{});
 
         // Post-norm local stats to detect zeroing (parallel)
         float out_local_min = std::numeric_limits<float>::infinity();
@@ -609,12 +594,12 @@ namespace llaminar
         double out_global_mean = (global_seq_len * hidden_size) ? (out_global_sum / (double)(global_seq_len * hidden_size)) : 0.0;
         if (getRank() == 0)
         {
-            LOG_INFO("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean << (legacy_stats ? " mode=legacy_global" : " mode=row_local"));
+            LOG_INFO("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean << " mode=T5");
         }
 
         LOG_DEBUG("Computed distributed RMS normalization: rms_metric=" << rms_global
                                                                         << ", local_seq_len=" << local_seq_len << " on rank " << getRank()
-                                                                        << (legacy_stats ? " mode=legacy_global" : " mode=row_local"));
+                                                                        << " mode=T5");
     }
 
     std::shared_ptr<TensorBase> MPIRMSNormKernel::createLocalTensor(const std::vector<size_t> &shape)

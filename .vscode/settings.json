@@ -69,7 +69,8 @@
         "iterator": "cpp",
         "memory_resource": "cpp",
         "stop_token": "cpp",
-        "cmath": "cpp"
+        "cmath": "cpp",
+        "iosfwd": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,

@@ -1,6 +1,7 @@
 #include "repacker.h"
 #include "tensors/tensor_base.h"
 #include "tensors/tensor_factory.h"
+#include "quant_dequant.h" // For proper Q4_0/Q8_0 dequantization matching llama.cpp
 #include <iostream>
 #include <algorithm>
 #include <numeric>
@@ -260,37 +261,25 @@ std::vector<double> TensorRepacker::dequantizeQ4_0(const uint8_t *data, size_t n
     std::vector<double> result(n_elements);
 
     const size_t block_size = 32;
+    const size_t block_bytes = 18; // 2 (scale) + 16 (quantized data)
     const size_t num_blocks = (n_elements + block_size - 1) / block_size;
 
+    // Use the quant_dequant.h implementation which matches llama.cpp exactly
     for (size_t block = 0; block < num_blocks; ++block)
     {
-        const size_t block_offset = block * 18; // 16 bytes of data + 2 bytes scale
+        const size_t block_offset = block * block_bytes;
+        const size_t elements_in_block = std::min(block_size, n_elements - block * block_size);
 
-        // Read scale factor
-        uint16_t scale_bits;
-        std::memcpy(&scale_bits, data + block_offset, 2);
-        double scale = static_cast<double>(scale_bits) / 32768.0;
+        // Temporary float buffer for dequant_block_q4_0
+        float block_result[32];
 
-        // Dequantize 32 4-bit values (packed in 16 bytes)
-        for (size_t i = 0; i < block_size && (block * block_size + i) < n_elements; ++i)
+        // Use the correct implementation from quant_dequant.h
+        llaminar::dequant_block_q4_0(data + block_offset, block_result, elements_in_block);
+
+        // Convert float to double for result
+        for (size_t i = 0; i < elements_in_block; ++i)
         {
-            size_t byte_idx = i / 2;
-            uint8_t packed_byte = data[block_offset + 2 + byte_idx];
-
-            int8_t quantized_val;
-            if (i % 2 == 0)
-            {
-                quantized_val = packed_byte & 0x0F; // Lower 4 bits
-            }
-            else
-            {
-                quantized_val = (packed_byte >> 4) & 0x0F; // Upper 4 bits
-            }
-
-            // Convert to signed and apply scale
-            if (quantized_val > 7)
-                quantized_val -= 16; // Convert to signed 4-bit
-            result[block * block_size + i] = scale * static_cast<double>(quantized_val);
+            result[block * block_size + i] = static_cast<double>(block_result[i]);
         }
     }
 

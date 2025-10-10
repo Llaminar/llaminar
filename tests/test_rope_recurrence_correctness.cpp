@@ -28,13 +28,13 @@ static void run_case(int heads, int head_dim, int seq_len)
     // Force legacy path
     ::setenv("LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE", "1", 1);
     llaminar::debugEnvRefresh();
-    apply_rope(q_ref.data(), k_ref.data(), seq_len, head_dim, heads, n_past, 10000.f);
+    apply_rope(q_ref.data(), k_ref.data(), seq_len, head_dim, heads, heads, n_past, 10000.f);
 
     // Enable recurrence (and allow auto-tune); tweak threshold low so it activates
     ::setenv("LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE", "0", 1);
     ::setenv("LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD", "1", 1);
     llaminar::debugEnvRefresh();
-    apply_rope(q_test.data(), k_test.data(), seq_len, head_dim, heads, n_past, 10000.f);
+    apply_rope(q_test.data(), k_test.data(), seq_len, head_dim, heads, heads, n_past, 10000.f);
 
     double max_abs_q = 0.0, max_abs_k = 0.0, rel_l2_q = 0.0, rel_l2_k = 0.0;
     double ref_q_norm = 0.0, diff_q_norm = 0.0, ref_k_norm = 0.0, diff_k_norm = 0.0;

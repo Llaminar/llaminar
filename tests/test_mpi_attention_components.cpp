@@ -225,7 +225,7 @@ TEST_F(MPIAttentionComponentsTest, RoPEPreservesPairNorms)
     }
 
     // Apply RoPE
-    llaminar::attn::apply_rope(q.data(), k.data(), seq_len, head_dim, n_heads, n_past, freq_base);
+    llaminar::attn::apply_rope(q.data(), k.data(), seq_len, head_dim, n_heads, n_heads, n_past, freq_base);
 
     // Verify pair norms are preserved
     size_t norm_idx = 0;
@@ -266,7 +266,7 @@ TEST_F(MPIAttentionComponentsTest, QKScoresAndSoftmaxValid)
     }
 
     // Apply RoPE first (attention primitives expect RoPE'd Q/K)
-    llaminar::attn::apply_rope(q.data(), k.data(), seq_len, head_dim, n_heads, 0, 10000.0f);
+    llaminar::attn::apply_rope(q.data(), k.data(), seq_len, head_dim, n_heads, n_heads, 0, 10000.0f);
 
     // Compute QK scores with softmax
     llaminar::attn::compute_qk_scores(q.data(), k.data(), scores.data(),
@@ -327,7 +327,7 @@ TEST_F(MPIAttentionComponentsTest, FusedAttentionMatchesStepByStep)
     auto q2 = q, k2 = k;
 
     // Step-by-step path
-    llaminar::attn::apply_rope(q.data(), k.data(), seq_len, head_dim, n_heads, 0, 10000.0f);
+    llaminar::attn::apply_rope(q.data(), k.data(), seq_len, head_dim, n_heads, n_heads, 0, 10000.0f);
 
     std::vector<float> scores(n_heads * seq_len * seq_len);
     llaminar::attn::compute_qk_scores(q.data(), k.data(), scores.data(),

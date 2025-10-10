@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Dict
 import numpy as np
 import torch
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
 # Add parent directories to path
 script_dir = Path(__file__).parent.absolute()
@@ -120,14 +121,113 @@ class PipelineStageCapture:
                 else:
                     normed = hidden_states
                 
-                # Attention computation with proper arguments
+                # Attention computation with detailed intermediate captures
                 if hasattr(layer, 'self_attn'):
-                    # Call with all required arguments for transformers 4.57+
-                    attn_out = layer.self_attn(
-                        hidden_states=normed,
-                        position_embeddings=position_embeddings,
-                        attention_mask=attention_mask
-                    )[0]
+                    attn_layer = layer.self_attn
+                    
+                    # Get architecture parameters from config
+                    config = hf_model.config
+                    num_heads = config.num_attention_heads
+                    num_kv_heads = config.num_key_value_heads
+                    head_dim = attn_layer.head_dim
+                    num_key_value_groups = attn_layer.num_key_value_groups
+                    
+                    # Capture Q, K, V projections (before RoPE)
+                    bsz, q_len, _ = normed.shape
+                    
+                    # Q projection
+                    query_states = attn_layer.q_proj(normed)
+                    self.captures[f'Q_PROJECTION_layer{i}'] = query_states.detach().cpu().numpy()
+                    
+                    # K projection
+                    key_states = attn_layer.k_proj(normed)
+                    self.captures[f'K_PROJECTION_layer{i}'] = key_states.detach().cpu().numpy()
+                    
+                    # V projection
+                    value_states = attn_layer.v_proj(normed)
+                    self.captures[f'V_PROJECTION_layer{i}'] = value_states.detach().cpu().numpy()
+                    
+                    # Reshape for multi-head attention
+                    query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+                    key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+                    value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+                    
+                    # Apply RoPE
+                    cos, sin = position_embeddings
+                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+                    
+                    # Capture post-RoPE Q and K combined as ROPE_APPLICATION
+                    # Flatten Q and K: shape (bsz, q_len, hidden_size)
+                    q_rope_flat = query_states.transpose(1, 2).contiguous().view(bsz, q_len, -1).detach().cpu().numpy()
+                    k_rope_flat = key_states.transpose(1, 2).contiguous().view(bsz, q_len, -1).detach().cpu().numpy()
+                    
+                    # DEBUG: Show shapes and layout
+                    if i == 0:
+                        print(f"[PYTORCH_ROPE_DEBUG] Layer {i}:")
+                        print(f"  query_states shape after RoPE (before transpose): {query_states.shape}")
+                        print(f"  q_rope_flat shape: {q_rope_flat.shape}")
+                        print(f"  k_rope_flat shape: {k_rope_flat.shape}")
+                        print(f"  q_rope_flat[0,0,:10]: {q_rope_flat[0,0,:10]}")
+                        print(f"  k_rope_flat[0,0,:10]: {k_rope_flat[0,0,:10]}")
+                        print(f"  num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
+                        print(f"  Expected q_rope_flat last dim: {num_heads * head_dim}")
+                        print(f"  Expected k_rope_flat last dim: {num_kv_heads * head_dim}")
+                    
+                    # Concatenate Q and K along feature dimension: [Q | K]
+                    # This matches Llaminar's ROPE_APPLICATION which includes both
+                    rope_combined = np.concatenate([q_rope_flat, k_rope_flat], axis=-1)
+                    
+                    if i == 0:
+                        print(f"  rope_combined shape: {rope_combined.shape}")
+                        print(f"  rope_combined[0,0,:10] (Q start): {rope_combined[0,0,:10]}")
+                        print(f"  rope_combined[0,0,{num_heads*head_dim}:{num_heads*head_dim+10}] (K start): {rope_combined[0,0,num_heads*head_dim:num_heads*head_dim+10]}")
+                    
+                    self.captures[f'ROPE_APPLICATION_layer{i}'] = rope_combined
+                    
+                    # Repeat K/V for GQA if needed
+                    key_states = repeat_kv(key_states, num_key_value_groups)
+                    value_states = repeat_kv(value_states, num_key_value_groups)
+                    
+                    # Compute attention scores (Q @ K^T / sqrt(d))
+                    sqrt_head_dim = torch.sqrt(torch.tensor(head_dim, dtype=torch.float32))
+                    attn_weights_unscaled = torch.matmul(query_states, key_states.transpose(2, 3))
+                    attn_weights = attn_weights_unscaled / sqrt_head_dim
+                    
+                    # DEBUG: Verify scaling
+                    if i == 0:
+                        print(f"[DEBUG] Layer {i} ATTENTION_SCORES:")
+                        print(f"  sqrt_head_dim: {sqrt_head_dim}")
+                        print(f"  Before scaling: min={attn_weights_unscaled.min():.2f} max={attn_weights_unscaled.max():.2f}")
+                        print(f"  After scaling: min={attn_weights.min():.2f} max={attn_weights.max():.2f}")
+                    
+                    # Capture attention scores (before softmax)
+                    # Reshape from [batch=1, heads, seq_len, seq_len] to [heads*seq_len, seq_len]
+                    # This matches Llaminar's flattened 2D layout for easier comparison
+                    self.captures[f'ATTENTION_SCORES_layer{i}'] = attn_weights[0].reshape(-1, attn_weights.shape[-1]).detach().cpu().numpy()
+                    
+                    # Apply attention mask
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
+                    
+                    # Apply softmax
+                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    
+                    # Capture attention weights (after softmax)
+                    # Also reshape to 2D for consistency
+                    self.captures[f'ATTENTION_SOFTMAX_layer{i}'] = attn_weights[0].reshape(-1, attn_weights.shape[-1]).detach().cpu().numpy()
+                    
+                    # Compute context (attention @ V)
+                    attn_output = torch.matmul(attn_weights, value_states)
+                    
+                    # Reshape back
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    attn_output = attn_output.reshape(bsz, q_len, -1)
+                    
+                    # Capture context (before output projection)
+                    self.captures[f'ATTENTION_CONTEXT_layer{i}'] = attn_output.detach().cpu().numpy()
+                    
+                    # Apply output projection
+                    attn_out = attn_layer.o_proj(attn_output)
                     
                     # ATTENTION_OUTPUT: After attention projection (before residual)
                     self.captures[f'ATTENTION_OUTPUT_layer{i}'] = attn_out.detach().cpu().numpy()
@@ -145,11 +245,46 @@ class PipelineStageCapture:
                 else:
                     normed = hidden_states
                 
-                # FFN computation
+                # FFN computation - break down MLP internals for detailed snapshots
                 if hasattr(layer, 'mlp'):
-                    ffn_out = layer.mlp(normed)
+                    # Qwen2MLP structure: gate_proj, up_proj, act_fn (silu), down_proj
+                    mlp = layer.mlp
                     
-                    # FFN_DOWN: After FFN down projection (before residual)
+                    # FFN_GATE: Gate projection output
+                    if hasattr(mlp, 'gate_proj'):
+                        gate_out = mlp.gate_proj(normed)
+                        self.captures[f'FFN_GATE_layer{i}'] = gate_out.detach().cpu().numpy()
+                    else:
+                        gate_out = None
+                    
+                    # FFN_UP: Up projection output
+                    if hasattr(mlp, 'up_proj'):
+                        up_out = mlp.up_proj(normed)
+                        self.captures[f'FFN_UP_layer{i}'] = up_out.detach().cpu().numpy()
+                    else:
+                        up_out = None
+                    
+                    # FFN_SWIGLU: SwiGLU activation output (silu(gate) * up)
+                    if gate_out is not None and up_out is not None:
+                        if hasattr(mlp, 'act_fn'):
+                            activated_gate = mlp.act_fn(gate_out)
+                        else:
+                            # Fallback to manual silu if act_fn not available
+                            import torch.nn.functional as F
+                            activated_gate = F.silu(gate_out)
+                        swiglu_out = activated_gate * up_out
+                        self.captures[f'FFN_SWIGLU_layer{i}'] = swiglu_out.detach().cpu().numpy()
+                    else:
+                        # Fallback: use the full MLP forward to get intermediate
+                        swiglu_out = None
+                    
+                    # FFN_DOWN: Down projection output
+                    if swiglu_out is not None and hasattr(mlp, 'down_proj'):
+                        ffn_out = mlp.down_proj(swiglu_out)
+                    else:
+                        # Fallback: use full MLP forward
+                        ffn_out = mlp(normed)
+                    
                     self.captures[f'FFN_DOWN_layer{i}'] = ffn_out.detach().cpu().numpy()
                     
                     # FFN_RESIDUAL: After residual add

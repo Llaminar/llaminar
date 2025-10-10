@@ -125,18 +125,20 @@ namespace llaminar
         bool validate_output = false;     // LLAMINAR_ATTN_OUTPUT_VALIDATE
         bool use_primitives = true;       // LLAMINAR_ATTN_USE_PRIMITIVES (toggle new centralized primitive path)
         // Newly centralized flags
-        std::string output_mode;         // LLAMINAR_ATTN_OUTPUT_MODE
-        bool output_mode_forced = false; // presence of mode env
-        int gather_threshold = -1;       // LLAMINAR_ATTN_GATHER_THRESHOLD
-        bool force_scalar = false;       // LLAMINAR_ATTN_FORCE_SCALAR
-        bool validate_proj = false;      // LLAMINAR_ATTN_VALIDATE_PROJ
-        bool micro_trace = false;        // LLAMINAR_ATTN_MICRO_TRACE
-        bool dump_attention = false;     // LLAMINAR_ATTN_DUMP_ATTENTION
-        bool tp_disable = false;         // LLAMINAR_ATTN_TP_DISABLE
-        int tp_partitions = 1;           // LLAMINAR_ATTN_TP_PARTITIONS
-        bool tp_auto = false;            // LLAMINAR_ATTN_TP_AUTO
-        bool tp_force_splitter = false;  // LLAMINAR_ATTN_TP_FORCE_SPLITTER
-        bool internal_diff = false;      // LLAMINAR_ATTN_INTERNAL_DIFF (capture internal per-stage last-token rows for parity forensics)
+        std::string output_mode;           // LLAMINAR_ATTN_OUTPUT_MODE
+        bool output_mode_forced = false;   // presence of mode env
+        int gather_threshold = -1;         // LLAMINAR_ATTN_GATHER_THRESHOLD
+        bool force_scalar = false;         // LLAMINAR_ATTN_FORCE_SCALAR
+        bool validate_proj = false;        // LLAMINAR_ATTN_VALIDATE_PROJ
+        bool micro_trace = false;          // LLAMINAR_ATTN_MICRO_TRACE
+        bool trace_weight_slicing = false; // LLAMINAR_ATTN_TRACE_WEIGHT_SLICE (log weight partitioning per rank)
+        bool trace_k_projection = false;   // LLAMINAR_ATTN_TRACE_K_PROJECTION (dump local K projection stats before RoPE)
+        bool dump_attention = false;       // LLAMINAR_ATTN_DUMP_ATTENTION
+        bool tp_disable = false;           // LLAMINAR_ATTN_TP_DISABLE
+        int tp_partitions = 1;             // LLAMINAR_ATTN_TP_PARTITIONS
+        bool tp_auto = false;              // LLAMINAR_ATTN_TP_AUTO
+        bool tp_force_splitter = false;    // LLAMINAR_ATTN_TP_FORCE_SPLITTER
+        bool internal_diff = false;        // LLAMINAR_ATTN_INTERNAL_DIFF (capture internal per-stage last-token rows for parity forensics)
         // Primitive optimization knobs
         int prim_parallel_elems_threshold = 32768;   // LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS (heads*seq_len*seq_len or heads*seq_len*D)
         bool prim_force_scalar = false;              // LLAMINAR_ATTN_PRIM_FORCE_SCALAR

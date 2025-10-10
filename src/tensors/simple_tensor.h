@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
+#include <iostream>
 
 namespace llaminar
 {
@@ -33,7 +34,52 @@ namespace llaminar
                 }
                 total_size *= dim;
             }
-            data_.resize(total_size);
+            data_.resize(total_size, 0.0f); // Initialize to zero to prevent garbage values
+
+            // DEBUG: Verify zero-initialization
+            static int tensor_count = 0;
+            if (++tensor_count <= 20)
+            {
+                std::string shape_str = "[";
+                for (size_t i = 0; i < dims.size(); ++i)
+                {
+                    if (i > 0)
+                        shape_str += ",";
+                    shape_str += std::to_string(dims[i]);
+                }
+                shape_str += "]";
+
+                // Check first 16 values to detect any non-zero corruption
+                bool has_nonzero = false;
+                size_t check_count = std::min(static_cast<size_t>(total_size), static_cast<size_t>(16));
+                for (size_t i = 0; i < check_count; ++i)
+                {
+                    if (data_[i] != 0.0f)
+                    {
+                        std::cerr << "[SimpleTensor-CTOR-" << tensor_count
+                                  << "] ⚠️ NON-ZERO at index " << i << ": " << data_[i] << std::endl;
+                        has_nonzero = true;
+                        break;
+                    }
+                }
+
+                if (!has_nonzero)
+                {
+                    std::cerr << "[SimpleTensor-CTOR-" << tensor_count << "] shape=" << shape_str
+                              << " size=" << total_size
+                              << " data_ptr=" << (void *)data_.data()
+                              << " first_val=" << (total_size > 0 ? data_[0] : 0.0f)
+                              << " last_val=" << (total_size > 0 ? data_[total_size - 1] : 0.0f)
+                              << " all_zeros=YES" << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[SimpleTensor-CTOR-" << tensor_count << "] shape=" << shape_str
+                              << " size=" << total_size
+                              << " data_ptr=" << (void *)data_.data()
+                              << " CORRUPTED!" << std::endl;
+                }
+            }
         }
 
         SimpleTensor(const std::vector<int> &dims, const std::vector<float> &values)

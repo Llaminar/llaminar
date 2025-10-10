@@ -6,6 +6,7 @@
 
 #include "abstract_pipeline.h"
 #include "qwen_pipeline.h"
+#include "weight_contracts.h"
 #include <memory>
 
 namespace llaminar
@@ -15,6 +16,12 @@ namespace llaminar
      *
      * Wraps DistributedTransformerPipeline::ModelWeights and provides typed accessors
      * for architecture-agnostic code to access common weight components.
+     *
+     * IMPORTANT: All weights are guaranteed to match the canonical GGUF format:
+     * - Q/K/V: [out_features, in_features] = [n_head*head_dim, d_model]
+     * - Output: [in_features, out_features] = [d_model, n_head*head_dim]
+     *
+     * This contract is validated at load time via weight_contracts.h
      */
     struct QwenModelWeights : public IModelWeights
     {
@@ -36,6 +43,40 @@ namespace llaminar
         const std::shared_ptr<TensorBase> &w_gate(int layer) const { return inner.w_gate[layer]; }
         const std::shared_ptr<TensorBase> &w_up(int layer) const { return inner.w_up[layer]; }
         const std::shared_ptr<TensorBase> &w_down(int layer) const { return inner.w_down[layer]; }
+
+        /**
+         * @brief Validate all weights against canonical contracts.
+         *
+         * Ensures loaded weights match expected GGUF format. Called automatically
+         * during loading to fail fast with clear error messages.
+         *
+         * @param cfg Model configuration
+         * @throws std::runtime_error if any weight violates its contract
+         */
+        void validate(const TransformerLayerConfig &cfg) const
+        {
+            auto contracts = getQwenWeightContracts();
+
+            // Validate global weights
+            contracts.validate_global(inner.token_embedding, inner.output_norm_weight,
+                                      inner.lm_head, cfg);
+
+            // Validate each layer
+            for (int layer = 0; layer < layer_count(); ++layer)
+            {
+                contracts.validate_layer(layer,
+                                         inner.attn_norm_weight[layer],
+                                         inner.wq[layer],
+                                         inner.wk[layer],
+                                         inner.wv[layer],
+                                         inner.wo[layer],
+                                         inner.ffn_norm_weight[layer],
+                                         inner.w_gate[layer],
+                                         inner.w_up[layer],
+                                         inner.w_down[layer],
+                                         cfg);
+            }
+        }
     };
 
     class QwenPipelineAdapter : public AbstractPipeline

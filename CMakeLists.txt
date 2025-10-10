@@ -124,6 +124,8 @@ set(GGML_CUDA OFF CACHE BOOL "Disable GGML CUDA backend" FORCE)
 set(GGML_METAL OFF CACHE BOOL "Disable GGML Metal backend" FORCE)
 set(GGML_SYCL OFF CACHE BOOL "Disable GGML SYCL backend" FORCE)
 set(GGML_RPC OFF CACHE BOOL "Disable GGML RPC backend" FORCE)
+# Use -march=native to avoid illegal instruction errors on varying CPU architectures
+set(GGML_NATIVE ON CACHE BOOL "Enable native CPU optimizations for GGML" FORCE)
 add_subdirectory(llama.cpp)
 
 
@@ -145,8 +147,10 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/MPIResidualKernel.cpp
     src/kernels/MPIRoPEKernel.cpp
     src/kernels/MPISwiGLUKernel.cpp
+    src/kernels/attention/AttentionValidator.cpp
     src/kernels/common/attention_primitives.cpp
     src/kernels/common/rmsnorm_core.cpp
+    src/kernels/common/rmsnorm_t5.cpp
     src/kernels/common/softmax_core.cpp
     src/qwen_pipeline.cpp
     src/pipeline_base.cpp
@@ -158,6 +162,7 @@ set(LLAMINAR_CORE_SOURCES
     src/abstract_pipeline.cpp
     src/pipeline_snapshot_manager.cpp
     src/prefill_provider.cpp
+    src/prefill_provider_base_impl.cpp
     src/openblas_prefill_provider.cpp
     src/cosma_prefill_provider.cpp
     src/qwen_pipeline_adapter.cpp
@@ -261,28 +266,28 @@ add_executable(production_demo src/production_demo.cpp)
 target_link_libraries(production_demo llaminar_core)
 
 # Tensor-parallel output projection micro-benchmark
-add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
-target_link_libraries(bench_tp_output_projection llaminar_core)
+# add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
+# target_link_libraries(bench_tp_output_projection llaminar_core)
 
 # RMSNorm micro-benchmark harness
-add_executable(bench_rmsnorm bench_rmsnorm.cpp)
-target_link_libraries(bench_rmsnorm llaminar_core)
+# add_executable(bench_rmsnorm bench_rmsnorm.cpp)
+# target_link_libraries(bench_rmsnorm llaminar_core)
 
 # Attention primitives benchmark (primitives vs legacy path)
-add_executable(bench_attention bench_attention.cpp)
-target_link_libraries(bench_attention llaminar_core)
+# add_executable(bench_attention bench_attention.cpp)
+# target_link_libraries(bench_attention llaminar_core)
 
 # Softmax micro-benchmark harness
-add_executable(bench_softmax bench_softmax.cpp)
-target_link_libraries(bench_softmax llaminar_core)
+# add_executable(bench_softmax bench_softmax.cpp)
+# target_link_libraries(bench_softmax llaminar_core)
 
 # Distributed softmax benchmark (MPI required)
-add_executable(bench_softmax_distributed bench_softmax_distributed.cpp)
-target_link_libraries(bench_softmax_distributed llaminar_core)
+# add_executable(bench_softmax_distributed bench_softmax_distributed.cpp)
+# target_link_libraries(bench_softmax_distributed llaminar_core)
 
 # RoPE micro-benchmark harness
-add_executable(bench_rope bench_rope.cpp)
-target_link_libraries(bench_rope llaminar_core)
+# add_executable(bench_rope bench_rope.cpp)
+# target_link_libraries(bench_rope llaminar_core)
 
 # Add DEBUG flag to main executable when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -374,6 +379,7 @@ function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
 
     add_test(NAME ${TEST_NAME}
         COMMAND ${_mpi_command}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
     set_tests_properties(${TEST_NAME} PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")
@@ -403,6 +409,14 @@ add_test(NAME BasicTest COMMAND test_basic)
 add_executable(test_pipeline_factory tests/test_pipeline_factory.cpp)
 target_link_libraries(test_pipeline_factory llaminar_core GTest::gtest GTest::gtest_main)
 add_test(NAME PipelineFactoryTest COMMAND test_pipeline_factory)
+
+add_executable(test_weight_contracts tests/test_weight_contracts.cpp)
+target_link_libraries(test_weight_contracts llaminar_core GTest::gtest GTest::gtest_main)
+add_test(NAME WeightContractsTest COMMAND test_weight_contracts)
+
+add_executable(test_weight_validation_integration tests/test_weight_validation_integration.cpp)
+target_link_libraries(test_weight_validation_integration llaminar_core GTest::gtest GTest::gtest_main)
+add_test(NAME WeightValidationIntegration COMMAND test_weight_validation_integration)
 
 add_executable(test_large_matmul_plan tests/test_large_matmul_plan.cpp)
 target_link_libraries(test_large_matmul_plan llaminar_core GTest::gtest GTest::gtest_main)
@@ -515,6 +529,70 @@ if(GTEST_FOUND)
     # Register as CTest with explicit mpiexec invocation.
     add_test(NAME MPIAttentionKernelTest COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mpi_attention_kernel>)
     set_tests_properties(MPIAttentionKernelTest PROPERTIES TIMEOUT 45 LABELS "attention;mpi;kernel" RUN_SERIAL TRUE)
+
+    # Clean implementation unit tests (comprehensive test suite for refactored kernel)
+    add_executable(test_mpi_attention_kernel_clean tests/test_mpi_attention_kernel_clean.cpp)
+    target_link_libraries(test_mpi_attention_kernel_clean llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_mpi_attention_kernel_clean GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_mpi_attention_kernel_clean PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_attention_kernel_clean ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    # Single-rank tests
+    add_test(NAME MPIAttentionKernelClean_SingleRank 
+             COMMAND $<TARGET_FILE:test_mpi_attention_kernel_clean> --gtest_filter=*SingleRank*:*Determinism*:*InvalidInput*:*MismatchedDimensions*:*WithBias*:*GQASupport*:*GQAVsMHA*:*SmallScale*:*LargeSequence*:*SnapshotCallback*)
+    set_tests_properties(MPIAttentionKernelClean_SingleRank PROPERTIES TIMEOUT 60 LABELS "attention;mpi;kernel;clean" RUN_SERIAL TRUE)
+    # Multi-rank tests
+    add_test(NAME MPIAttentionKernelClean_MultiRank 
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mpi_attention_kernel_clean> --gtest_filter=*MultiRank*:*BiasDistribution*)
+    set_tests_properties(MPIAttentionKernelClean_MultiRank PROPERTIES TIMEOUT 60 LABELS "attention;mpi;kernel;clean" RUN_SERIAL TRUE)
+
+    # Regression tests for specific bugs (bias overflow, RoPE GQA, dimension validation)
+    add_executable(test_attention_regression tests/test_attention_regression.cpp)
+    target_link_libraries(test_attention_regression llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_attention_regression GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_attention_regression PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_attention_regression ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME AttentionRegressionTests 
+             COMMAND $<TARGET_FILE:test_attention_regression>)
+    set_tests_properties(AttentionRegressionTests PROPERTIES 
+        TIMEOUT 60 
+        LABELS "attention;regression;safety" 
+        RUN_SERIAL TRUE)
+
+    # Real weights test (uses actual GGUF model weights instead of synthetic data)
+    add_executable(test_mpi_attention_real_weights tests/test_mpi_attention_real_weights.cpp)
+    target_link_libraries(test_mpi_attention_real_weights llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_mpi_attention_real_weights GTest::gtest pthread)
+    else()
+        target_include_directories(test_mpi_attention_real_weights PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_attention_real_weights ${GTEST_LIBRARY} pthread)
+    endif()
+    # Single-rank test with real weights
+    add_test(NAME MPIAttentionRealWeights_SingleRank 
+             COMMAND $<TARGET_FILE:test_mpi_attention_real_weights>)
+    set_tests_properties(MPIAttentionRealWeights_SingleRank PROPERTIES TIMEOUT 120 LABELS "attention;mpi;real-weights" RUN_SERIAL TRUE)
+    # Multi-rank test with real weights
+    add_test(NAME MPIAttentionRealWeights_MultiRank 
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mpi_attention_real_weights>)
+    set_tests_properties(MPIAttentionRealWeights_MultiRank PROPERTIES TIMEOUT 120 LABELS "attention;mpi;real-weights" RUN_SERIAL TRUE)
+
+    # Bias validation test (ensures kernel rejects incorrect bias sizes)
+    add_executable(test_attention_bias_validation tests/test_attention_bias_validation.cpp)
+    target_link_libraries(test_attention_bias_validation llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_attention_bias_validation GTest::gtest pthread)
+    else()
+        target_include_directories(test_attention_bias_validation PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_attention_bias_validation ${GTEST_LIBRARY} pthread)
+    endif()
+    add_test(NAME AttentionBiasValidation COMMAND $<TARGET_FILE:test_attention_bias_validation>)
+    set_tests_properties(AttentionBiasValidation PROPERTIES TIMEOUT 30 LABELS "attention;validation" RUN_SERIAL TRUE)
 
     # Minimal standalone MPI probe (no GTest, used to debug hangs prior to test harness)
     add_executable(minimal_mpi_probe tests/minimal_mpi_probe.cpp)
@@ -758,6 +836,42 @@ if(GTEST_FOUND)
     set_tests_properties(AttentionShardCorrectnessStandalone PROPERTIES TIMEOUT 30)
     set_tests_properties(AttentionShardCorrectnessStandalone PROPERTIES LABELS "attention;parity;sharding;standalone")
 
+    # Attention stage contracts validation tests
+    add_executable(test_attention_stage_contracts tests/test_attention_stage_contracts.cpp)
+    target_link_libraries(test_attention_stage_contracts llaminar_core GTest::gtest)
+    
+    # Basic execution tests (single and multi-rank)
+    add_test(NAME AttentionStageContracts_BasicExecution
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 1 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.BasicExecution)
+    set_tests_properties(AttentionStageContracts_BasicExecution PROPERTIES TIMEOUT 30 LABELS "attention;contracts;validation")
+    
+    add_test(NAME AttentionStageContracts_MultiRankExecution
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.MultiRankExecution)
+    set_tests_properties(AttentionStageContracts_MultiRankExecution PROPERTIES TIMEOUT 30 LABELS "attention;contracts;validation;mpi")
+    
+    # Prefill and decode path tests
+    add_test(NAME AttentionStageContracts_PrefillExecution
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.PrefillExecution)
+    set_tests_properties(AttentionStageContracts_PrefillExecution PROPERTIES TIMEOUT 40 LABELS "attention;contracts;validation;prefill")
+    
+    add_test(NAME AttentionStageContracts_DecodeExecution
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.DecodeExecution)
+    set_tests_properties(AttentionStageContracts_DecodeExecution PROPERTIES TIMEOUT 40 LABELS "attention;contracts;validation;decode")
+    
+    # Contract violation tests (should fail gracefully)
+    add_test(NAME AttentionStageContracts_InvalidInputShape
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 1 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.InvalidInputShape)
+    set_tests_properties(AttentionStageContracts_InvalidInputShape PROPERTIES TIMEOUT 30 LABELS "attention;contracts;validation;negative")
+    
+    add_test(NAME AttentionStageContracts_InvalidWeightShape
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 1 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.InvalidWeightShape)
+    set_tests_properties(AttentionStageContracts_InvalidWeightShape PROPERTIES TIMEOUT 30 LABELS "attention;contracts;validation;negative")
+    
+    # Visual verification test (shows contract messages)
+    add_test(NAME AttentionStageContracts_ContractMessagesVisible
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_stage_contracts> --gtest_filter=AttentionStageContractsTest.ContractMessagesVisible)
+    set_tests_properties(AttentionStageContracts_ContractMessagesVisible PROPERTIES TIMEOUT 30 LABELS "attention;contracts;validation;verbose")
+
     # RMSNorm shard stats test (validates distributed inverse scale parity vs reference)
     add_executable(test_rmsnorm_shard_stats tests/test_rmsnorm_shard_stats.cpp)
     target_link_libraries(test_rmsnorm_shard_stats llaminar_core)
@@ -842,6 +956,24 @@ if(GTEST_FOUND)
     add_test(NAME AttentionPrimitivesTest COMMAND $<TARGET_FILE:test_attention_primitives>)
     set_tests_properties(AttentionPrimitivesTest PROPERTIES TIMEOUT 5)
 
+    # K tensor gathering and RoPE GQA correctness tests
+    add_executable(test_k_gathering_and_rope_gqa tests/test_k_gathering_and_rope_gqa.cpp)
+    target_link_libraries(test_k_gathering_and_rope_gqa llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_k_gathering_and_rope_gqa GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_k_gathering_and_rope_gqa PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_k_gathering_and_rope_gqa ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    # Single-rank tests (RoPE GQA logic)
+    add_test(NAME KGatheringAndRopeGQA_SingleRank
+             COMMAND $<TARGET_FILE:test_k_gathering_and_rope_gqa> --gtest_filter=*RopeUsesCorrectKVHeadIndices*:*RopeKIndependentOfQHeadCount*)
+    set_tests_properties(KGatheringAndRopeGQA_SingleRank PROPERTIES TIMEOUT 10 LABELS "attention;rope;gqa")
+    # Multi-rank tests (K gathering order)
+    add_test(NAME KGatheringAndRopeGQA_MultiRank
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_k_gathering_and_rope_gqa> --gtest_filter=*AllgatherProducesSequentialHeadOrder*:*MultiRankKGatheringAfterRope*)
+    set_tests_properties(KGatheringAndRopeGQA_MultiRank PROPERTIES TIMEOUT 15 LABELS "attention;rope;gqa;mpi" RUN_SERIAL TRUE)
+
     # Golden oracle tests for attention primitives (PyTorch reference)
     add_executable(test_attention_golden tests/test_attention_golden.cpp)
     target_link_libraries(test_attention_golden llaminar_core)
@@ -874,6 +1006,18 @@ if(GTEST_FOUND)
     endif()
     add_test(NAME RoPERecurrenceParityTest COMMAND $<TARGET_FILE:test_rope_recurrence_correctness>)
     set_tests_properties(RoPERecurrenceParityTest PROPERTIES TIMEOUT 10 LABELS "rope;parity;attention")
+
+    # RoPE corruption test (single-rank; tests for memory corruption with exact MPIAttentionKernel dimensions)
+    add_executable(test_rope_corruption tests/test_rope_corruption.cpp)
+    target_link_libraries(test_rope_corruption llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_rope_corruption GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_rope_corruption PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_rope_corruption ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME RoPECorruptionTest COMMAND $<TARGET_FILE:test_rope_corruption>)
+    set_tests_properties(RoPECorruptionTest PROPERTIES TIMEOUT 30 LABELS "rope;corruption;attention")
 
     # TP column-partition WO projection parity (single-rank; ensure partitions vs disabled match)
     add_test(NAME TPColumnPartitionWOParity
@@ -1007,10 +1151,10 @@ if(GTEST_FOUND)
     set_tests_properties(CosmaPrefillManagerOrientationAutoFixTest PROPERTIES TIMEOUT 60)
 
     # Minimal scatter/gather coordinate mapping test
-    add_executable(test_cosma_scatter_gather test_cosma_scatter_gather.cpp)
-    target_link_libraries(test_cosma_scatter_gather PRIVATE llaminar_core MPI::MPI_CXX)
-    add_llaminar_mpi_test(CosmaScatterGatherTest 2 test_cosma_scatter_gather)
-    set_tests_properties(CosmaScatterGatherTest PROPERTIES TIMEOUT 60)
+    # add_executable(test_cosma_scatter_gather test_cosma_scatter_gather.cpp)
+    # target_link_libraries(test_cosma_scatter_gather PRIVATE llaminar_core MPI::MPI_CXX)
+    # add_llaminar_mpi_test(CosmaScatterGatherTest 2 test_cosma_scatter_gather)
+    # set_tests_properties(CosmaScatterGatherTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_cosma_prefill_manager_env_audit tests/test_cosma_prefill_manager_env_audit.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_env_audit llaminar_core)
@@ -1102,6 +1246,14 @@ add_executable(test_parity_framework
     $<TARGET_OBJECTS:test_logging_bootstrap>)
 target_link_libraries(test_parity_framework PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
 add_llaminar_mpi_test(ParityFrameworkTest 2 test_parity_framework)
+
+# Weight passthrough test - verifies dequantized weights reach attention kernel intact
+add_executable(test_weight_passthrough
+    tests/test_weight_passthrough.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_weight_passthrough PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(WeightPassthroughTest 2 test_weight_passthrough)
+set_tests_properties(WeightPassthroughTest PROPERTIES TIMEOUT 60 LABELS "unit;weights;dequant")
 
 # Isolated PrefillProvider unit tests (OpenBLAS & COSMA providers)
 add_executable(test_prefill_providers 

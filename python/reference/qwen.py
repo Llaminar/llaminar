@@ -149,6 +149,11 @@ class QwenReferenceModel(AbstractReferenceModel):
         if unexpected_keys:
             warnings.warn(f"Unexpected keys when loading GGUF: {unexpected_keys}")
         
+        # Handle tied embeddings: if lm_head.weight is missing, tie it to embed_tokens
+        if 'lm_head.weight' in missing_keys or missing_keys == ['lm_head.weight']:
+            print("Tying lm_head.weight to model.embed_tokens.weight (weight sharing)")
+            self.hf_model.lm_head.weight = self.hf_model.model.embed_tokens.weight
+        
         # Move to device and set to eval mode
         self.hf_model = self.hf_model.to(self.device)
         self.hf_model.eval()

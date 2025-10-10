@@ -28,6 +28,8 @@ namespace llaminar
         int64_t M = 0, N = 0, K = 0; // GEMM dims (M x K) * (K x N) = (M x N)
         bool is_quantized = false;   // future: adjust epilog / dequant
         bool is_prefill = true;      // prefill vs decode nuance if reused
+        bool transpose_A = false;    // transpose first operand
+        bool transpose_B = false;    // transpose second operand (weight)
     };
 
     struct PrefillLaunchContext

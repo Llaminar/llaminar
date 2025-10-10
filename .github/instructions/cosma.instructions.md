@@ -2,6 +2,7 @@
 
 ## Table of Contents
 - [Overview](#overview)
+- [CRITICAL: COSMA Memory Pool LIFO Invariant](#critical-cosma-memory-pool-lifo-invariant)
 - [Performance Analysis and Recommendations](#performance-analysis-and-recommendations)
 - [COSMA Fundamentals](#cosma-fundamentals)
 - [Tensor Formats and Data Layouts](#tensor-formats-and-data-layouts)
@@ -25,6 +26,182 @@ This document provides comprehensive guidance for integrating COSMA (Communicati
 - Memory-efficient tensor management
 - ScaLAPACK compatibility for existing BLAS code
 - **Hybrid deployment**: OpenBLAS for small ops, COSMA for prefill/large batch
+
+## CRITICAL: COSMA Memory Pool LIFO Invariant
+
+### Memory Management Constraint
+
+**COSMA uses a global strict LIFO (Last-In-First-Out) bump allocator for all matrix buffers.** This is a fundamental architectural constraint that affects all COSMA usage.
+
+#### The LIFO Invariant
+
+```cpp
+// COSMA's memory_pool.cpp enforces:
+void memory_pool::free_buffer(T* ptr, size_t size) {
+    // CRITICAL: Can only free the most recently allocated buffer
+    assert(pool_.data() + pool_size_ == ptr);  // Must be stack top
+    pool_size_ -= size;  // Pop from stack
+}
+```
+
+**Consequences:**
+- Buffers MUST be freed in exact reverse order of allocation
+- Overlapping matrix lifetimes violate this invariant
+- Violation causes assertion failure: `Assertion 'pool_.data() + pool_size_ == ptr' failed`
+
+#### Ring Buffer Diagnostics
+
+When LIFO violations occur, COSMA's ring buffer shows the allocation history:
+
+```
+[COSMA][memory_pool] Allocation History (last 7 allocations):
+  [0] offset=0 size=16384 ptr=0x7afa2219f010
+  [1] offset=16384 size=16384 ptr=0x7afa221bf010
+  [2] offset=32768 size=16384 ptr=0x7afa221df010  ← Trying to free this
+  [3] offset=49152 size=8192 ptr=0x7afa221ff010
+  [4] offset=57344 size=8192 ptr=0x7afa2220f010   ← Pool expects this to be freed first
+```
+
+### Safe Patterns
+
+#### ❌ WRONG: Overlapping Matrix Lifetimes
+
+```cpp
+// DANGER: Creates overlapping lifetimes - violates LIFO!
+auto q_view = matmul(norm_view, wq_handle, seq_len, hidden_size, wq.cols);
+auto k_view = matmul(norm_view, wk_handle, seq_len, hidden_size, wk.cols);
+auto v_view = matmul(norm_view, wv_handle, seq_len, hidden_size, wv.cols);
+
+// At this point: Q, K, V matrices all alive simultaneously
+// When function returns, destruction order is implementation-defined
+// Result: COSMA free mismatch assertion failure
+```
+
+#### ✅ CORRECT: Immediate Reconstruction and Destruction
+
+```cpp
+// SAFE: Reconstruct to host memory and destroy COSMA matrix immediately
+auto q_view = matmul(norm_view, wq_handle, seq_len, hidden_size, wq.cols);
+auto k_view = matmul(norm_view, wk_handle, seq_len, hidden_size, wk.cols);
+auto v_view = matmul(norm_view, wv_handle, seq_len, hidden_size, wv.cols);
+
+// Immediately capture to host memory and destroy in LIFO order (V→K→Q)
+auto capture_host_owned = [&](CosmaView& view) {
+    size_t elements = view.global_rows * view.global_cols;
+    
+    // Reconstruct distributed matrix to host buffer
+    auto buf = std::make_shared<std::vector<float>>(elements, 0.f);
+    reconstruct_matrix(view, buf->data(), view.label != 'C');
+    view.host_owned = buf;
+    view.original_row_major = buf->data();
+    
+    // CRITICAL: Destroy COSMA matrix to free buffers in LIFO order
+    view.mat.reset();
+    
+    // Clear release chain to allow dependency cleanup
+    for (auto it = view.release_chain.rbegin(); it != view.release_chain.rend(); ++it) {
+        it->reset();
+    }
+    view.release_chain.clear();
+};
+
+// MUST process in reverse allocation order
+capture_host_owned(v_view);  // Free V buffer (allocated last)
+capture_host_owned(k_view);  // Free K buffer
+capture_host_owned(q_view);  // Free Q buffer (allocated first)
+```
+
+### Implementation Guidelines
+
+#### 1. Fused Operations with Multiple Outputs
+
+When creating multiple output matrices in a single function (like `fused_rmsnorm_qkv`):
+
+1. **Execute operations** normally
+2. **Immediately reconstruct** each output to host memory
+3. **Destroy COSMA matrices** in reverse allocation order
+4. **Return** views with `host_owned` buffers and `mat=nullptr`
+
+#### 2. Release Chain Management
+
+The `release_chain` vector extends operand lifetimes but doesn't control COSMA buffer timing:
+
+```cpp
+// Release chain keeps operands alive but doesn't help with LIFO
+result.release_chain.push_back(A.mat);  // Extends A lifetime
+result.release_chain.push_back(W.mat);  // Extends W lifetime
+
+// PROBLEM: Clearing chains doesn't free COSMA buffers immediately
+result.release_chain.clear();  // Only decrements ref counts
+
+// SOLUTION: Must explicitly destroy matrices
+result.mat.reset();  // Frees COSMA buffer NOW
+```
+
+#### 3. Testing for LIFO Violations
+
+Enable ring buffer diagnostics to detect violations:
+
+```cpp
+// In memory_pool.cpp - already instrumented
+[COSMA][memory_pool] free mismatch size=16384 
+  expected=0x7afa221ef010 
+  got=0x7afa221df010 
+  pool_size(after_subtract)=40960 
+  n_buffers=3
+```
+
+### Real-World Example: Fused RMSNorm + QKV
+
+The refactored `fused_rmsnorm_qkv` demonstrates the complete pattern:
+
+```cpp
+FusedRmsnormQkvResult CosmaPrefillManager::fused_rmsnorm_qkv(...) {
+    // Step 1: Compute normalized activations
+    CosmaView norm_view = allocate_matrix('A', seq_len, hidden_size, act_strat);
+    rmsnorm_in_layout(act_view, norm_view, gamma, seq_len, hidden_size, eps);
+    
+    // Step 2: Execute Q/K/V matmuls (creates overlapping lifetimes temporarily)
+    CosmaView q_view = matmul(norm_view, wq_handle, seq_len, hidden_size, wq.cols);
+    CosmaView k_view = matmul(norm_view, wk_handle, seq_len, hidden_size, wk.cols);
+    CosmaView v_view = matmul(norm_view, wv_handle, seq_len, hidden_size, wv.cols);
+    
+    // Step 3: CRITICAL - Reconstruct and destroy in LIFO order
+    auto capture_host_owned = [&](CosmaView& view) { /* ... */ };
+    
+    capture_host_owned(v_view);    // Free V (allocated last)
+    capture_host_owned(k_view);    // Free K
+    capture_host_owned(q_view);    // Free Q
+    capture_host_owned(norm_view); // Free norm (allocated first)
+    
+    // Step 4: Return views with host_owned buffers
+    result.q = std::move(q_view);  // mat=nullptr, host_owned populated
+    result.k = std::move(k_view);
+    result.v = std::move(v_view);
+    return result;
+}
+```
+
+### Debugging LIFO Violations
+
+1. **Check ring buffer output** - identifies which buffer is out of order
+2. **Trace allocation sequence** - determine creation order
+3. **Verify destruction order** - must be exact reverse of allocation
+4. **Use explicit reset()** - don't rely on destructor ordering
+5. **Reconstruct early** - convert to host memory ASAP
+
+### Performance Impact
+
+**Immediate reconstruction has minimal overhead:**
+- Single-rank: ~0.1ms for 64×128 matrix
+- Multi-rank: ~1-4ms for distributed gather (unavoidable)
+- Benefit: Eliminates crashes and enables correct execution
+- Trade-off: Converts distributed matrices to host memory earlier than optimal
+
+**When this matters:**
+- ✅ Prefill operations: Reconstruction needed anyway for downstream ops
+- ✅ Fused operations: Multiple outputs require materialization
+- ⚠️ Large sequences: Consider pipelined execution with explicit staging
 
 ## Performance Analysis and Recommendations
 

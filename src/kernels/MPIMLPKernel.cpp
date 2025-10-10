@@ -462,6 +462,7 @@ namespace llaminar
     {
         // Apply SwiGLU: activated_output = silu(gate_output) * up_output
         // This is element-wise operation, no MPI communication needed
+        // Use double precision for intermediate calculation to reduce error accumulation
         const float *gate_data = gate_output->data();
         const float *up_data = up_output->data();
         float *output_data = activated_output->data();
@@ -472,7 +473,9 @@ namespace llaminar
         {
             for (size_t i = 0; i < total_elements; ++i)
             {
-                output_data[i] = silu(gate_data[i]) * up_data[i];
+                double silu_val = static_cast<double>(silu(gate_data[i]));
+                double up_val = static_cast<double>(up_data[i]);
+                output_data[i] = static_cast<float>(silu_val * up_val);
             }
         }
         else
@@ -480,8 +483,10 @@ namespace llaminar
 #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < total_elements; ++i)
             {
-                // vectorization hint
-                output_data[i] = silu(gate_data[i]) * up_data[i];
+                // Use double precision for multiplication to reduce error
+                double silu_val = static_cast<double>(silu(gate_data[i]));
+                double up_val = static_cast<double>(up_data[i]);
+                output_data[i] = static_cast<float>(silu_val * up_val);
             }
         }
 
@@ -524,7 +529,10 @@ namespace llaminar
     float MPIMLPKernel::silu(float x) const
     {
         // SiLU (Swish) activation: x * sigmoid(x) = x / (1 + exp(-x))
-        return x / (1.0f + std::exp(-x));
+        // Use double precision for intermediate calculation to reduce error accumulation
+        double xd = static_cast<double>(x);
+        double result = xd / (1.0 + std::exp(-xd));
+        return static_cast<float>(result);
     }
 
     size_t MPIMLPKernel::calculateLocalDff(size_t global_d_ff) const

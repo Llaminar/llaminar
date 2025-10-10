@@ -2,6 +2,7 @@
 
 #include "../mpi_kernel_base.h"
 #include "../pipeline_stages.h"
+#include "attention/AttentionStageContracts.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -9,6 +10,8 @@
 
 namespace llaminar
 {
+    // Forward declaration for optional COSMA backend
+    class CosmaPrefillManager;
 
     /**
      * @brief MPI-enabled multi-head attention kernel with head-wise distribution
@@ -117,7 +120,7 @@ namespace llaminar
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
         std::string getKernelType() const override { return "MPIAttention"; }
-        size_t getExpectedInputCount() const override { return 7; } // input, wq, wk, wv, wo, k_cache, v_cache
+        size_t getExpectedInputCount() const override { return 10; } // input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache
         size_t getExpectedOutputCount() const override { return 1; }
 
         // Configuration methods
@@ -132,6 +135,16 @@ namespace llaminar
         void setDistributionStrategy(DistributionStrategy strategy) { strategy_ = strategy; }
 
         /**
+         * @brief Set optional COSMA backend manager for distributed matmul
+         * @param cosma_mgr Pointer to CosmaPrefillManager (nullptr to disable COSMA)
+         *
+         * When set, the kernel will use MatMulBackendSelector to choose between
+         * OpenBLAS (with CblasTrans for transpose) and COSMA (with proper shape
+         * contracts) based on operation size and context.
+         */
+        void setCosmaManager(CosmaPrefillManager *cosma_mgr) { cosma_mgr_ = cosma_mgr; }
+
+        /**
          * @brief Get head distribution for this process
          * @return Pair of (local_heads, head_offset)
          */
@@ -143,6 +156,19 @@ namespace llaminar
          * @return Pair of (local_heads, head_offset)
          */
         std::pair<int, int> getHeadDistribution(int rank) const;
+
+        /**
+         * @brief Get K/V head distribution for this process (for GQA models)
+         * @return Pair of (local_kv_heads, kv_head_offset)
+         */
+        std::pair<int, int> getKVHeadDistribution() const;
+
+        /**
+         * @brief Get K/V head distribution for a specific rank (for GQA models)
+         * @param rank Target rank
+         * @return Pair of (local_kv_heads, kv_head_offset)
+         */
+        std::pair<int, int> getKVHeadDistribution(int rank) const;
 
         /**
          * @brief Test harness helper: invoke the private output projection path directly.
@@ -203,6 +229,9 @@ namespace llaminar
          * @param local_wq Local query weight tensor
          * @param local_wk Local key weight tensor
          * @param local_wv Local value weight tensor
+         * @param local_bq Local query bias tensor
+         * @param local_bk Local key bias tensor
+         * @param local_bv Local value bias tensor
          * @param local_q Output local query projection tensor
          * @param local_k Output local key projection tensor
          * @param local_v Output local value projection tensor
@@ -213,10 +242,28 @@ namespace llaminar
                                      const std::shared_ptr<TensorBase> &local_wq,
                                      const std::shared_ptr<TensorBase> &local_wk,
                                      const std::shared_ptr<TensorBase> &local_wv,
+                                     const std::shared_ptr<TensorBase> &local_bq,
+                                     const std::shared_ptr<TensorBase> &local_bk,
+                                     const std::shared_ptr<TensorBase> &local_bv,
                                      std::shared_ptr<TensorBase> &local_q,
                                      std::shared_ptr<TensorBase> &local_k,
                                      std::shared_ptr<TensorBase> &local_v,
                                      size_t seq_len, size_t d_model);
+
+        /**
+         * @brief Backend-agnostic matrix multiplication with optional bias
+         * @param input Input matrix (row-major, M x K)
+         * @param weight Weight matrix (row-major, N x K) - transposed during multiply
+         * @param output Output matrix (row-major, M x N)
+         * @param bias Optional bias vector (length N)
+         * @param M Rows in input/output
+         * @param N Columns in output (rows in weight)
+         * @param K Columns in input/weight
+         * @param operation_label Optional label for logging
+         */
+        void matmul_with_bias(const float *input, const float *weight, float *output,
+                              const float *bias, int M, int N, int K,
+                              const char *operation_label = nullptr);
 
         /**
          * @brief Compute attention for local heads
@@ -276,6 +323,14 @@ namespace llaminar
 
         std::shared_ptr<TensorBase> createLocalSimpleTensor(const std::vector<size_t> &shape) const;
 
+        /**
+         * @brief Initialize stage contracts for runtime validation
+         * @param seq_len Sequence length (can be -1 for dynamic)
+         * @param local_heads Local head count for this rank
+         * @param local_kv_heads Local K/V head count for this rank
+         */
+        void initializeStageContracts(int seq_len, int local_heads, int local_kv_heads);
+
         // Configuration parameters
         int n_head_;                                                        ///< Total number of attention heads
         int n_head_kv_;                                                     ///< Number of key-value heads (grouped attention)
@@ -290,6 +345,26 @@ namespace llaminar
         float rope_freq_base_;                                              ///< Base frequency for rotary embeddings
         DistributionStrategy strategy_;                                     ///< Distribution strategy
         AttentionResultMeta last_meta_{};                                   ///< metadata from last execute
+
+        // ========================================================================
+        // STAGE CONTRACTS - Explicit data flow validation
+        // ========================================================================
+        // These contracts define expected shapes, layouts, and semantics at each
+        // transformation stage. They catch dimension mismatches and transpose bugs
+        // early with clear error messages.
+
+        bool contracts_enabled_ = true; ///< Whether contract validation is active (disable for benchmarks)
+
+        StageContract contract_projection_;        ///< Stage 1: Q/K/V projections
+        StageContract contract_rope_;              ///< Stage 2: RoPE application
+        StageContract contract_gqa_replication_;   ///< Stage 3: K/V replication for GQA
+        StageContract contract_attention_;         ///< Stage 4: Attention computation
+        StageContract contract_output_projection_; ///< Stage 5: Output projection
+
+        // ========================================================================
+        // COSMA BACKEND SUPPORT (Optional)
+        // ========================================================================
+        CosmaPrefillManager *cosma_mgr_ = nullptr; ///< Optional COSMA backend for distributed matmul
     };
 
 } // namespace llaminar

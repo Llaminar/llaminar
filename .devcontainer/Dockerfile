@@ -9,8 +9,21 @@ ENV INSTALL_ROCM=${INSTALL_ROCM}
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# CRITICAL: Install sed, grep, and core utilities FIRST before anything else
+# These are required by VS Code's UID update process
+RUN apt-get update && apt-get install -y \
+    sed \
+    grep \
+    coreutils \
+    findutils \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core utilities (sed, grep, coreutils, findutils already installed above)
+    util-linux \
+    procps \
+    passwd \
     # Build essentials
     build-essential \
     gcc \
@@ -52,6 +65,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-dev \
+    python3-venv \
+    python3.12-venv \
     # Additional libraries that might be useful
     libssl-dev \
     libcurl4-openssl-dev \
@@ -115,6 +130,9 @@ RUN groupadd -f render && \
     usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
+# Verify user was created successfully
+RUN id vscode && grep vscode /etc/passwd
+
 # Set up workspace directory
 RUN mkdir -p /workspace && \
     chown vscode:vscode /workspace
@@ -143,12 +161,8 @@ ENV HIP_PATH="${ROCM_HOME}"
 # Set PATH to include user local bin directory
 ENV PATH="/home/vscode/.local/bin:$PATH"
 
-# Install Python packages that might be useful
-RUN pip3 install --user --break-system-packages \
-    conan \
-    numpy \
-    matplotlib \
-    pytest
+# Note: Python packages will be installed in a virtual environment
+# See .devcontainer/setup-python-env.sh which is run via postCreateCommand
 
 # Install vcpkg (C++ package manager) properly
 RUN git clone https://github.com/Microsoft/vcpkg.git ~/vcpkg && \
@@ -166,5 +180,5 @@ RUN echo 'alias ll="ls -la"' >> ~/.bashrc && \
 # Expose commonly used ports
 EXPOSE 8080 3000 5000
 
-# Set default command
-CMD ["/bin/bash"]
+# Keep container running (Dev Containers will override this)
+CMD ["sleep", "infinity"]

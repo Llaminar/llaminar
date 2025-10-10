@@ -61,18 +61,21 @@ namespace
             };
             w.token_embedding = randTensor({cfg.vocab_size, cfg.d_model});
             w.output_norm_weight = randTensor({cfg.d_model}, 0.8f, 1.2f);
-            w.lm_head = randTensor({cfg.d_model, cfg.vocab_size});
+            w.lm_head = randTensor({cfg.vocab_size, cfg.d_model}); // GGUF: [vocab_size, d_model]
             for (int i = 0; i < cfg.n_layers; ++i)
             {
                 w.attn_norm_weight.push_back(randTensor({cfg.d_model}, 0.8f, 1.2f));
-                w.wq.push_back(randTensor({cfg.d_model, cfg.n_head * cfg.head_dim}));
-                w.wk.push_back(randTensor({cfg.d_model, cfg.n_head_kv * cfg.head_dim}));
-                w.wv.push_back(randTensor({cfg.d_model, cfg.n_head_kv * cfg.head_dim}));
-                w.wo.push_back(randTensor({cfg.n_head * cfg.head_dim, cfg.d_model}));
+                // CRITICAL: Use GGUF canonical format [out_features, in_features] for Q/K/V
+                w.wq.push_back(randTensor({cfg.n_head * cfg.head_dim, cfg.d_model}));
+                w.wk.push_back(randTensor({cfg.n_head_kv * cfg.head_dim, cfg.d_model}));
+                w.wv.push_back(randTensor({cfg.n_head_kv * cfg.head_dim, cfg.d_model}));
+                // Output projection remains [in_features, out_features]
+                w.wo.push_back(randTensor({cfg.d_model, cfg.n_head * cfg.head_dim}));
                 w.ffn_norm_weight.push_back(randTensor({cfg.d_model}, 0.8f, 1.2f));
-                w.w_gate.push_back(randTensor({cfg.d_model, cfg.d_ff}));
-                w.w_up.push_back(randTensor({cfg.d_model, cfg.d_ff}));
-                w.w_down.push_back(randTensor({cfg.d_ff, cfg.d_model}));
+                // FFN projections: all [out_features, in_features] in GGUF
+                w.w_gate.push_back(randTensor({cfg.d_ff, cfg.d_model}));
+                w.w_up.push_back(randTensor({cfg.d_ff, cfg.d_model}));
+                w.w_down.push_back(randTensor({cfg.d_model, cfg.d_ff}));
             }
             return w;
         }

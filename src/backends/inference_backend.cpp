@@ -31,7 +31,7 @@ namespace llaminar
         auto backend = mgr.selectBackend((int)d.M, (int)d.N, (int)d.K, /*is_prefill=*/false);
         decision.backend = (backend == MatMulBackend::COSMA) ? "cosma" : "openblas";
         decision.reason = d.latency_critical ? "latency-critical decode" : "generic decode";
-        if (!adaptive_matmul(ctx.A, ctx.B, ctx.C, (int)d.M, (int)d.N, (int)d.K, false))
+        if (!adaptiveMatMul(ctx.A, ctx.B, ctx.C, (int)d.M, (int)d.N, (int)d.K, false, false, d.transpose_A, d.transpose_B))
         {
             decision.status = InferenceStatus::Error;
             decision.reason = "adaptive_matmul failure";

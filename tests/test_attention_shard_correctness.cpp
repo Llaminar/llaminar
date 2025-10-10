@@ -64,10 +64,13 @@ int main(int argc, char **argv)
     auto make = [](std::vector<int> shape)
     { return TensorFactory::create_simple(shape); };
     auto input = make({seq_len, d_model});
-    auto wq_global = make({d_model, n_head * head_dim});
-    auto wk_global = make({d_model, n_head_kv * head_dim});
-    auto wv_global = make({d_model, n_head_kv * head_dim});
-    auto wo_global = make({n_head * head_dim, d_model});
+    auto wq_global = make({n_head * head_dim, d_model}); // GGUF format: [out_features, in_features]
+    auto wk_global = make({n_head_kv * head_dim, d_model});
+    auto wv_global = make({n_head_kv * head_dim, d_model});
+    auto wo_global = make({d_model, n_head * head_dim}); // wo is [in_features, out_features]
+    auto bq_global = make({n_head * head_dim});
+    auto bk_global = make({n_head_kv * head_dim});
+    auto bv_global = make({n_head_kv * head_dim});
     auto k_cache = make({seq_len, n_head_kv * head_dim});
     auto v_cache = make({seq_len, n_head_kv * head_dim});
     auto out_multi = make({seq_len, d_model});
@@ -77,6 +80,9 @@ int main(int argc, char **argv)
     fill_deterministic(wk_global, 0.002f);
     fill_deterministic(wv_global, 0.002f);
     fill_deterministic(wo_global, 0.002f);
+    fill_deterministic(bq_global, 0.0001f);
+    fill_deterministic(bk_global, 0.0001f);
+    fill_deterministic(bv_global, 0.0001f);
     std::fill(k_cache->data(), k_cache->data() + k_cache->size(), 0.f);
     std::fill(v_cache->data(), v_cache->data() + v_cache->size(), 0.f);
 
@@ -109,6 +115,21 @@ int main(int argc, char **argv)
         matmul(input->data(), wq_global->data(), Q.data(), seq_len, d_model, n_head * head_dim);
         matmul(input->data(), wk_global->data(), K.data(), seq_len, d_model, n_head_kv * head_dim);
         matmul(input->data(), wv_global->data(), V.data(), seq_len, d_model, n_head_kv * head_dim);
+
+        // Add biases (reference must match kernel behavior)
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int i = 0; i < n_head * head_dim; ++i)
+            {
+                Q[t * n_head * head_dim + i] += bq_global->data()[i];
+            }
+            for (int i = 0; i < n_head_kv * head_dim; ++i)
+            {
+                K[t * n_head_kv * head_dim + i] += bk_global->data()[i];
+                V[t * n_head_kv * head_dim + i] += bv_global->data()[i];
+            }
+        }
+
         std::vector<float> Ocat(seq_len * n_head * head_dim, 0.f);
         const float scale = 1.0f / std::sqrt((float)head_dim);
         // Apply RoPE (same as kernel). rope_freq_base_ default assumed 10000.f.
@@ -194,6 +215,7 @@ int main(int argc, char **argv)
             }
         }
         // Final projection Ocat * Wo
+        // wo_global is [d_model, n_head*head_dim], already in correct orientation for matmul
         matmul(Ocat.data(), wo_global->data(), ref_out.data(), seq_len, n_head * head_dim, d_model);
     }
     // Broadcast reference to all (optional; parity check only rank 0 needed but allows future per-rank checks)
@@ -212,10 +234,15 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "[parity-test] rank %d local_heads=%d head_offset=%d\n", rank, local_heads, head_offset);
     std::fflush(stderr);
 
-    auto wq = TensorFactory::create_heads_sharded(wq_global->shape(), 1, n_head, head_dim, world, rank);
-    auto wk = TensorFactory::create_heads_sharded(wk_global->shape(), 1, n_head_kv, head_dim, world, rank);
-    auto wv = TensorFactory::create_heads_sharded(wv_global->shape(), 1, n_head_kv, head_dim, world, rank);
-    auto wo = TensorFactory::create_heads_sharded(wo_global->shape(), 0, n_head, head_dim, world, rank);
+    auto wq = TensorFactory::create_heads_sharded(wq_global->shape(), 0, n_head, head_dim, world, rank);
+    auto wk = TensorFactory::create_heads_sharded(wk_global->shape(), 0, n_head_kv, head_dim, world, rank);
+    auto wv = TensorFactory::create_heads_sharded(wv_global->shape(), 0, n_head_kv, head_dim, world, rank);
+    auto wo = TensorFactory::create_heads_sharded(wo_global->shape(), 1, n_head, head_dim, world, rank);
+
+    // Create sharded bias tensors (1D, sharded along head dimension)
+    auto bq = TensorFactory::create_heads_sharded({n_head * head_dim}, 0, n_head, head_dim, world, rank);
+    auto bk = TensorFactory::create_heads_sharded({n_head_kv * head_dim}, 0, n_head_kv, head_dim, world, rank);
+    auto bv = TensorFactory::create_heads_sharded({n_head_kv * head_dim}, 0, n_head_kv, head_dim, world, rank);
 
     auto copy_col_shard = [&](std::shared_ptr<TensorBase> shard, std::shared_ptr<TensorBase> global)
     {
@@ -247,15 +274,33 @@ int main(int argc, char **argv)
             std::memcpy(shard->data() + i * cols, global->data() + g * cols, sizeof(float) * cols);
         }
     };
-    copy_col_shard(wq, wq_global);
-    copy_col_shard(wk, wk_global);
-    copy_col_shard(wv, wv_global);
-    copy_row_shard(wo, wo_global);
+    copy_row_shard(wq, wq_global);
+    copy_row_shard(wk, wk_global);
+    copy_row_shard(wv, wv_global);
+    copy_col_shard(wo, wo_global);
+
+    // Copy bias shards (1D tensors, treated as row shards)
+    auto copy_bias_shard = [&](std::shared_ptr<TensorBase> shard, std::shared_ptr<TensorBase> global)
+    {
+        auto *raw = dynamic_cast<ShardedSimpleTensor *>(shard.get());
+        if (!raw)
+            fail_and_abort("bias shard dynamic_cast failed");
+        const auto &spec = raw->shard_spec();
+        std::memcpy(shard->data(), global->data() + spec.local_offset, sizeof(float) * spec.local_dim);
+    };
+    copy_bias_shard(bq, bq_global);
+    copy_bias_shard(bk, bk_global);
+    copy_bias_shard(bv, bv_global);
+
     std::fprintf(stderr, "[parity-test] rank %d shards populated\n", rank);
+    std::fprintf(stderr, "[parity-test] rank %d wo shape: [%d, %d]\n",
+                 rank, wo->shape()[0], wo->shape()[1]);
+    std::fprintf(stderr, "[parity-test] rank %d wo[0,0:4]: %.6f, %.6f, %.6f, %.6f\n",
+                 rank, wo->data()[0], wo->data()[1], wo->data()[2], wo->data()[3]);
     std::fflush(stderr);
 
     auto kernel_multi = std::make_unique<MPIAttentionKernel>(n_head, n_head_kv, head_dim);
-    std::vector<std::shared_ptr<TensorBase>> inputs_multi = {input, wq, wk, wv, wo, k_cache, v_cache};
+    std::vector<std::shared_ptr<TensorBase>> inputs_multi = {input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache};
     std::vector<std::shared_ptr<TensorBase>> outputs_multi = {out_multi};
     bool exec_ok = kernel_multi->execute(inputs_multi, outputs_multi);
     int local_ok = exec_ok ? 1 : 0;

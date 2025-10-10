@@ -27,7 +27,7 @@
 namespace llaminar::attn
 {
 
-    void apply_rope(float *q, float *k, int seq_len, int head_dim, int heads, int n_past, float freq_base);
+    void apply_rope(float *q, float *k, int seq_len, int head_dim, int q_heads, int k_heads, int n_past, float freq_base);
     void compute_qk_scores(const float *q, const float *k, float *scores, int seq_len, int head_dim, int heads, bool causal, bool apply_softmax);
     void apply_scores_to_v(const float *scores, const float *v, float *out, int seq_len, int head_dim, int heads);
     void fused_attention(const float *q, const float *k, const float *v, float *out, int seq_len, int head_dim, int heads, bool causal);
@@ -44,8 +44,10 @@ namespace llaminar::attn
      * @param v_expanded Output V tensor [seq_len, n_heads * head_dim] row-major
      * @param seq_len Sequence length
      * @param head_dim Dimension per head
-     * @param n_heads Number of query heads (output)
-     * @param n_kv_heads Number of key/value heads (input, n_kv_heads < n_heads)
+     * @param n_heads Number of query heads for THIS rank (local count in distributed)
+     * @param n_kv_heads Number of key/value heads (GLOBAL count, always)
+     * @param head_offset Global head offset for this rank (0 for single-rank)
+     * @param total_q_heads Total number of Q heads across ALL ranks (GLOBAL count)
      */
     void expand_kv_for_gqa(
         const float *k_compact,
@@ -55,7 +57,9 @@ namespace llaminar::attn
         int seq_len,
         int head_dim,
         int n_heads,
-        int n_kv_heads);
+        int n_kv_heads,
+        int head_offset = 0,
+        int total_q_heads = -1);
 
     /**
      * @brief Expand KV for Multi-Head Attention (MHA)

@@ -25,34 +25,52 @@ namespace llaminar
         auto loaded = llaminar::loadModelWeights_impl_bridge(loader, cfg_.getLayerConfig());
         auto weights = std::make_unique<QwenModelWeights>();
         weights->inner = std::move(loaded);
+
+        // CRITICAL: Validate all weights against canonical GGUF format contracts
+        // This ensures kernels can trust the weight dimensions/orientations without runtime detection
+        try
+        {
+            weights->validate(cfg_.getLayerConfig());
+            LOG_INFO("✓ All weights validated against canonical GGUF format");
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("Weight validation failed: " << e.what());
+            throw; // Re-throw to fail fast with clear error
+        }
+
         return weights;
     }
     bool QwenPipelineAdapter::prefill(const std::vector<int> &tokens, const IModelWeights &weights_base, StageContext &ctx)
     {
+        // Use the new provider-based prefill path (PrefillProviderFactory)
+        // This enables proper COSMA vs OpenBLAS selection based on sequence length
         ctx.stage = InferenceStage::Prefill;
         ctx.seq_len = (int)tokens.size();
         current_tokens_ = tokens; // retain for decode continuation
-        if (legacy_)
-            legacy_->setStagePrefill();
-        const auto *wm = dynamic_cast<const QwenModelWeights *>(&weights_base);
-        if (!wm)
-        {
-            LOG_ERROR("QwenPipelineAdapter: invalid weights type");
-            return false;
-        }
-        // Legacy pipeline executes entire forward pass and produces logits for last token
+        
         if (!legacy_)
-            return false;
-        if (!legacy_->execute(tokens, wm->inner, last_logits_))
         {
-            LOG_ERROR("QwenPipelineAdapter: legacy execute failed in prefill");
+            LOG_ERROR("QwenPipelineAdapter: legacy pipeline is null");
             return false;
         }
-        if (legacy_)
+
+        // Call the new provider-based prefill method (NOT legacy execute)
+        // This will use PrefillProviderFactory to select OpenBLAS or COSMA based on sequence length
+        if (!legacy_->prefill(tokens, weights_base, ctx))
         {
-            ctx.kv_capacity = legacy_->getKVCacheCapacity();
-            ctx.kv_used = legacy_->getKVCacheUsed();
+            LOG_ERROR("QwenPipelineAdapter: provider-based prefill failed");
+            return false;
         }
+
+        // Get the logits from the pipeline
+        if (!legacy_->logits(last_logits_))
+        {
+            LOG_ERROR("QwenPipelineAdapter: failed to retrieve logits after prefill");
+            return false;
+        }
+
+        // Context already updated by legacy_->prefill()
         return true;
     }
 

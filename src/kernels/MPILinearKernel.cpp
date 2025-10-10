@@ -5,13 +5,17 @@
  * @section Contract
  * Inputs:
  *  - inputs[0]: Activations tensor [seq_len, in_dim] (row-major, replicated on all ranks).
- *  - inputs[1]: Global weight tensor [in_dim, out_dim] (row-major; will be column-partition distributed).
+ *  - inputs[1]: Global weight tensor [out_dim, in_dim] (row-major; will be column-partition distributed).
  *  - inputs[2] (optional): Global bias [out_dim].
  * Outputs:
  *  - outputs[0]: Global output tensor [seq_len, out_dim] (row-major; assembled via Allgatherv over column partitions).
+ * Weight Convention:
+ *  - Weights are stored as [out_features, in_features] matching PyTorch nn.Linear and GGUF format.
+ *  - Applied as output = input @ weight^T (transpose during matmul).
+ *  - See docs/WEIGHT_MATRIX_CONVENTIONS.md for detailed rationale.
  * Distribution Strategy:
  *  - Weight columns are block-distributed across ranks; activations are replicated.
- *  - Local GEMM: [seq_len, in_dim] * [in_dim, out_dim_local] -> [seq_len, out_dim_local].
+ *  - Local GEMM: [seq_len, in_dim] @ [in_dim, out_dim_local]^T -> [seq_len, out_dim_local].
  *  - Optional local bias add then global gather.
  * Numerical Expectations:
  *  - Deterministic for identical OpenMP scheduling when OMP_NUM_THREADS=1.
@@ -72,13 +76,22 @@ namespace llaminar
         // Extract dimensions
         size_t seq_len = input->shape()[0];
         size_t input_size = input->shape()[1];
-        size_t output_size = global_weight->shape()[1];
+        // Weight is [out_dim, in_dim] per new convention
+        size_t output_size = global_weight->shape()[0];
+        size_t weight_in_dim = global_weight->shape()[1];
+
+        // Validate dimension compatibility
+        if (weight_in_dim != input_size)
+        {
+            LOG_ERROR("MPILinear: Weight input dimension mismatch - weight[" << global_weight->shape()[0] << ", " << global_weight->shape()[1] << "] vs input[" << seq_len << ", " << input_size << "]");
+            return false;
+        }
 
         // Calculate local distribution
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
 
-        // Create local tensors
-        auto local_weight = createLocalTensor({input_size, static_cast<size_t>(local_output_size)});
+        // Create local tensors - weight is [local_out_dim, in_dim]
+        auto local_weight = createLocalTensor({static_cast<size_t>(local_output_size), input_size});
         auto local_output = createLocalTensor({seq_len, static_cast<size_t>(local_output_size)});
 
         // Distribute weight matrix
@@ -116,25 +129,14 @@ namespace llaminar
 
         // Use adaptive matrix multiplication
         auto start = std::chrono::high_resolution_clock::now();
-        // We pass distributed_partition=true because weights are column-partitioned across ranks.
-        // This prevents the adaptive path from invoking COSMA (which expects full global matrices)
-        // and instead uses local OpenBLAS for correctness.
-        // NOTE: The previous implementation passed arguments in the wrong order to adaptiveMatMul:
-        //   adaptiveMatMul(A,B,C, m,n,k, is_prefill, distributed_partition, transpose_A, transpose_B, alpha, beta)
-        // Was mistakenly invoked as: (m,n,k, false, 1.0f, 0.0f, false, true)
-        // Which actually mapped to:  is_prefill=false,
-        //   distributed_partition=1.0f (true), transpose_A=0.0f (false), transpose_B=false,
-        //   alpha=true (1.0f), beta(default 0.0f).
-        // While this looked harmless (alpha still 1, beta 0, distributed_partition true), it fed float literals
-        // into bool parameters relying on implicit conversions and omitted an explicit beta, creating fragile
-        // and potentially backend‑dependent behavior (and can hinder future signature changes).
-        // We correct this to explicitly provide all flags in canonical order for clarity & numerical stability.
+        // Matrix multiplication: output = input @ weight^T
+        // Weight is [local_out_dim, in_dim], so we transpose it during matmul
         bool matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
                                              seq_len_int, d_out, d_model,
                                              /*is_prefill*/ false,
                                              /*distributed_partition*/ true,
                                              /*transpose_A*/ false,
-                                             /*transpose_B*/ false,
+                                             /*transpose_B*/ true, // CRITICAL: Transpose weight per PyTorch/GGUF convention
                                              /*alpha*/ 1.0f,
                                              /*beta*/ 0.0f);
         auto end = std::chrono::high_resolution_clock::now();
@@ -203,27 +205,30 @@ namespace llaminar
             return false;
         }
 
-        // Check weight is 2D [input_size, output_size]
+        // Check weight is 2D [output_size, input_size] per new convention
         if (weight->shape().size() != 2)
         {
             LOG_ERROR("MPILinearKernel: Weight must be 2D, got " << weight->shape().size() << " dimensions");
             return false;
         }
 
-        // Check dimensions match
-        if (input->shape()[1] != weight->shape()[0])
+        // Check dimensions match: input[1] (in_dim) should match weight[1] (in_dim)
+        if (input->shape()[1] != weight->shape()[1])
         {
             LOG_ERROR("MPILinearKernel: Input size " << input->shape()[1]
-                                                     << " doesn't match weight input size " << weight->shape()[0]);
+                                                     << " doesn't match weight input size " << weight->shape()[1]
+                                                     << " (weight shape=[" << weight->shape()[0] << ", " << weight->shape()[1] << "])");
             return false;
         }
 
         // Check output is 2D [seq_len, output_size]
+        // output[1] should match weight[0] (out_dim)
         if (output->shape().size() != 2 ||
             output->shape()[0] != input->shape()[0] ||
-            output->shape()[1] != weight->shape()[1])
+            output->shape()[1] != weight->shape()[0]) // Changed from weight->shape()[1]
         {
-            LOG_ERROR("MPILinearKernel: Output shape mismatch");
+            LOG_ERROR("MPILinearKernel: Output shape mismatch - expected [" << input->shape()[0]
+                                                                            << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
             return false;
         }
 
@@ -245,29 +250,28 @@ namespace llaminar
                                            std::shared_ptr<TensorBase> &local_weight,
                                            size_t output_size)
     {
-        size_t input_size = global_weight->shape()[0];
+        // New convention: weight is [output_size, input_size]
+        size_t input_size = global_weight->shape()[1];
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
 
         // Extract local portion of weight matrix
-        // Global weight: [input_size, output_size]
-        // Local weight: [input_size, local_output_size]
+        // Global weight: [output_size, input_size] - row-major storage
+        // Local weight: [local_output_size, input_size] - subset of rows
         const float *global_data = global_weight->data();
         float *local_data = local_weight->data();
 
-        // Previous implementation copied element-by-element causing poor vectorization.
-        // Each row slice we need (contiguous block of columns) can be transferred with a single memcpy.
-        // Parallelize over rows; heuristic threshold avoids oversubscribing threads for tiny matrices.
-        const size_t elements_to_copy = input_size * local_output_size;
-        const bool do_parallel = elements_to_copy > 4096; // heuristic: ~16KB (float) before threading helps
-#pragma omp parallel for if (do_parallel)
-        for (size_t i = 0; i < input_size; ++i)
-        {
-            const float *src_row = global_data + i * output_size + output_offset;
-            float *dst_row = local_data + i * local_output_size;
-            std::memcpy(dst_row, src_row, local_output_size * sizeof(float));
-        }
+        // With weight as [output_size, input_size], each row is one output feature.
+        // We partition output features across ranks, so each rank gets a contiguous block of rows.
+        // Row offset in global: output_offset
+        // Number of rows to copy: local_output_size
+        // Each row has input_size elements (contiguous in memory).
+        const size_t elements_to_copy = local_output_size * input_size;
+        const float *src_start = global_data + output_offset * input_size;
 
-        LOG_DEBUG("Distributed weight matrix: local size [" << input_size << ", " << local_output_size
+        // Single contiguous memcpy is optimal for row-major slicing
+        std::memcpy(local_data, src_start, elements_to_copy * sizeof(float));
+
+        LOG_DEBUG("Distributed weight matrix: local size [" << local_output_size << ", " << input_size
                                                             << "], offset " << output_offset << " on rank " << getRank());
     }
 

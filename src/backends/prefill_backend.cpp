@@ -31,7 +31,7 @@ namespace llaminar
         decision.backend = (backend == MatMulBackend::COSMA) ? "cosma" : "openblas";
         decision.reason = is_prefill ? "prefill path" : "generic path";
 
-        if (!adaptive_matmul(ctx.A, ctx.B, ctx.C, (int)d.M, (int)d.N, (int)d.K, is_prefill))
+        if (!adaptiveMatMul(ctx.A, ctx.B, ctx.C, (int)d.M, (int)d.N, (int)d.K, is_prefill, false, d.transpose_A, d.transpose_B))
         {
             decision.status = PrefillStatus::Error;
             decision.reason = "adaptive_matmul failure";

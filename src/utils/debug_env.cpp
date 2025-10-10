@@ -200,6 +200,8 @@ namespace llaminar
     s.attention.force_scalar = flag(std::getenv("LLAMINAR_ATTN_FORCE_SCALAR"));
     s.attention.validate_proj = flag(std::getenv("LLAMINAR_ATTN_VALIDATE_PROJ"));
     s.attention.micro_trace = flag(std::getenv("LLAMINAR_ATTN_MICRO_TRACE"));
+    s.attention.trace_weight_slicing = flag(std::getenv("LLAMINAR_ATTN_TRACE_WEIGHT_SLICE"));
+    s.attention.trace_k_projection = flag(std::getenv("LLAMINAR_ATTN_TRACE_K_PROJECTION"));
     s.attention.dump_attention = flag(std::getenv("LLAMINAR_ATTN_DUMP_ATTENTION"));
     s.attention.tp_disable = flag(std::getenv("LLAMINAR_ATTN_TP_DISABLE"));
     if(const char* tpp = std::getenv("LLAMINAR_ATTN_TP_PARTITIONS")) { int v=std::atoi(tpp); if(v>0 && v<1024) s.attention.tp_partitions = v; }
