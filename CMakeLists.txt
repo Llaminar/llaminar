@@ -162,6 +162,7 @@ set(LLAMINAR_CORE_SOURCES
     src/abstract_pipeline.cpp
     src/pipeline_snapshot_manager.cpp
     src/prefill_provider.cpp
+    src/prefill_provider_base_impl.cpp
     src/openblas_prefill_provider.cpp
     src/cosma_prefill_provider.cpp
     src/qwen_pipeline_adapter.cpp
