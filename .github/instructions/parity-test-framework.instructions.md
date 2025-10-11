@@ -1385,8 +1385,237 @@ The Parity Test Framework has evolved from manual llama.cpp comparison to automa
 **Recent Success Stories**:
 - **ATTENTION_CONTEXT**: Isolated output projection divergence (W_o orientation fix)
 - **FFN intermediates**: Identified Layer 2 UP projection weight corruption (688× error explosion traced to 126 max_abs at UP stage)
+- **KV Cache Integration** ✨ **(October 2025)**: Fixed incremental decode attention scores using full KV cache history
 
 For detailed workflows, debugging strategies, and advanced usage, see [PREFILL_PARITY_TESTING_GUIDE.md](PREFILL_PARITY_TESTING_GUIDE.md).
+
+---
+
+## Incremental Decode Parity Testing ✨ *NEW: October 2025*
+
+The parity framework now supports **incremental decode validation**, enabling verification that autoregressive generation correctly uses KV cache for attention over growing context windows.
+
+### Overview
+
+**Incremental decode testing** validates that:
+1. ✅ Prefill correctly initializes KV cache with initial sequence
+2. ✅ Each decode step appends new K/V to cache (not overwriting)
+3. ✅ Attention computed against **full cache** (n_past + 1), not just current token
+4. ✅ Attention scores have correct shape: `[n_heads, 1, n_past+1]`
+5. ✅ Numerically matches PyTorch autoregressive generation
+6. ✅ KV cache state grows correctly: [5] → [6] → [7] → [8]
+
+### Test Architecture
+
+**Test**: `ParityFramework.IncrementalDecodeVsPyTorch` (in `test_parity_framework.cpp`)
+
+**Workflow**:
+```
+1. PyTorch Reference Generation (Variance Analysis)
+   ├─ Run 1: Prefill [1,2,3,4,5] → Decode 3 steps → Capture 387 snapshots per step
+   ├─ Run 2: Repeat with same tokens
+   └─ Run 3: Repeat with same tokens
+   → Compute variance-based thresholds for each decode step
+
+2. Llaminar Incremental Execution
+   ├─ Prefill [1,2,3,4,5] with snapshot capture
+   ├─ Decode step 1 (token 6) with snapshot capture
+   ├─ Decode step 2 (token 7) with snapshot capture
+   └─ Decode step 3 (token 8) with snapshot capture
+
+3. Stage-by-Stage Comparison
+   └─ For each decode step, compare all 387 pipeline stages against PyTorch
+```
+
+### Decode Snapshot Stages
+
+**Per Decode Step** (identical to prefill stages):
+- `EMBEDDING_decode{N}`: Single token embedding (N = 1, 2, 3)
+- `ATTENTION_NORM_layer{L}_decode{N}`: Pre-attention normalization
+- `Q_PROJECTION_layer{L}_decode{N}`: Query projection (shape: [1, 896])
+- `K_PROJECTION_layer{L}_decode{N}`: Key projection (shape: [1, 128])
+- `V_PROJECTION_layer{L}_decode{N}`: Value projection (shape: [1, 128])
+- `ROPE_APPLICATION_layer{L}_decode{N}`: Post-RoPE Q|K concatenated (shape: [1, 1024])
+- **`ATTENTION_SCORES_layer{L}_decode{N}`** ✨: **Attention scores against full cache**
+  - **Critical validation point**: Shape must be `[n_heads * q_seq_len, k_seq_len]`
+  - **Decode step 1**: `[14, 1, 6]` = 84 elements (5 prefill + 1 current)
+  - **Decode step 2**: `[14, 1, 7]` = 98 elements (5 prefill + 2 decode)
+  - **Decode step 3**: `[14, 1, 8]` = 112 elements (5 prefill + 3 decode)
+  - **Bug symptoms**: If only 14 elements → computing Q@K^T instead of Q@K_cache^T
+- `ATTENTION_SOFTMAX_layer{L}_decode{N}`: Attention probabilities over full cache
+- `ATTENTION_CONTEXT_layer{L}_decode{N}`: Weighted sum of values
+- `ATTENTION_OUTPUT_layer{L}_decode{N}`: After output projection
+- `ATTENTION_RESIDUAL_layer{L}_decode{N}`: Post-attention residual
+- `FFN_NORM_layer{L}_decode{N}`, `FFN_GATE_layer{L}_decode{N}`, etc.: Standard FFN stages
+- `FINAL_NORM_decode{N}`: Final layer normalization
+- `LM_HEAD_decode{N}`: Logits for next token prediction
+
+### KV Cache Validation
+
+**Cache Growth Check**:
+```cpp
+// In test: verify cache grows correctly
+EXPECT_EQ(k_cache_[0]->shape()[0], 5);  // After prefill: [5, 128]
+
+pipeline->decode(next_token_1, weights, ctx);
+EXPECT_EQ(k_cache_[0]->shape()[0], 6);  // After decode 1: [6, 128]
+
+pipeline->decode(next_token_2, weights, ctx);
+EXPECT_EQ(k_cache_[0]->shape()[0], 7);  // After decode 2: [7, 128]
+
+pipeline->decode(next_token_3, weights, ctx);
+EXPECT_EQ(k_cache_[0]->shape()[0], 8);  // After decode 3: [8, 128]
+```
+
+**Attention Score Shape Validation**:
+```cpp
+// Decode step 2: Attention should be over 7 positions (5 prefill + 2 decode)
+TensorSnapshot attn_scores_snap;
+ASSERT_TRUE(registry.get_snapshot("ATTENTION_SCORES_layer0_decode2", attn_scores_snap));
+
+// Expected: [14 heads, 1 query, 7 keys] = 98 elements
+EXPECT_EQ(attn_scores_snap.data.size(), 14 * 1 * 7);  // 98 elements
+EXPECT_EQ(attn_scores_snap.seq_len, 14 * 1);  // 14 (heads × query tokens)
+EXPECT_EQ(attn_scores_snap.feature_dim, 7);    // 7 (cache length)
+```
+
+### Example Test Code
+
+```cpp
+TEST(ParityFramework, IncrementalDecodeVsPyTorch)
+{
+    // 1. Generate PyTorch reference with variance analysis
+    std::string pytorch_dir = "pytorch_snapshots_decode/";
+    std::vector<int> prefill_tokens = {1, 2, 3, 4, 5};
+    int decode_steps = 3;
+    
+    generatePyTorchDecodeReference(model_path, prefill_tokens, decode_steps, 
+                                   pytorch_dir, /*num_runs=*/3, /*safety_margin=*/5.0);
+    
+    // 2. Load dynamic thresholds
+    DynamicThresholdLoader threshold_loader(pytorch_dir);
+    
+    // 3. Run Llaminar incremental execution
+    PipelineSnapshotManager::instance().setEnabled(true);
+    
+    auto pipeline = PipelineFactory::create(config);
+    auto weights = pipeline->loadWeights(model_path);
+    
+    // Prefill
+    StageContext prefill_ctx(prefill_tokens.size());
+    ASSERT_TRUE(pipeline->prefill(prefill_tokens, *weights, prefill_ctx));
+    
+    // Decode steps
+    for (int step = 1; step <= decode_steps; ++step) {
+        int next_token = 5 + step;  // Tokens 6, 7, 8
+        StageContext decode_ctx(1);  // Single token
+        decode_ctx.setDecodeStep(step);
+        
+        ASSERT_TRUE(pipeline->decode(next_token, *weights, decode_ctx));
+        
+        // Validate KV cache growth
+        EXPECT_EQ(k_cache_[0]->shape()[0], 5 + step);
+        
+        // Compare all stages against PyTorch for this decode step
+        compareDecodeStep(step, threshold_loader);
+    }
+}
+
+void compareDecodeStep(int step, DynamicThresholdLoader& thresholds) {
+    PyTorchSnapshotLoader pytorch("pytorch_snapshots_decode/");
+    SnapshotRegistry& registry = SnapshotRegistry::instance();
+    
+    std::string decode_suffix = "_decode" + std::to_string(step);
+    
+    // Global stages
+    compareSnapshot(registry, pytorch, thresholds, 
+                   "EMBEDDING" + decode_suffix, -1);
+    
+    // Per-layer stages
+    for (int layer = 0; layer < config.n_layers; ++layer) {
+        // Attention substages
+        compareSnapshot(registry, pytorch, thresholds,
+                       "ATTENTION_NORM_layer" + std::to_string(layer) + decode_suffix, layer);
+        compareSnapshot(registry, pytorch, thresholds,
+                       "Q_PROJECTION_layer" + std::to_string(layer) + decode_suffix, layer);
+        compareSnapshot(registry, pytorch, thresholds,
+                       "K_PROJECTION_layer" + std::to_string(layer) + decode_suffix, layer);
+        compareSnapshot(registry, pytorch, thresholds,
+                       "V_PROJECTION_layer" + std::to_string(layer) + decode_suffix, layer);
+        compareSnapshot(registry, pytorch, thresholds,
+                       "ROPE_APPLICATION_layer" + std::to_string(layer) + decode_suffix, layer);
+        
+        // Critical: Attention scores over full cache
+        compareSnapshot(registry, pytorch, thresholds,
+                       "ATTENTION_SCORES_layer" + std::to_string(layer) + decode_suffix, layer);
+        
+        compareSnapshot(registry, pytorch, thresholds,
+                       "ATTENTION_SOFTMAX_layer" + std::to_string(layer) + decode_suffix, layer);
+        // ... remaining stages ...
+    }
+    
+    compareSnapshot(registry, pytorch, thresholds,
+                   "FINAL_NORM" + decode_suffix, -1);
+    compareSnapshot(registry, pytorch, thresholds,
+                   "LM_HEAD" + decode_suffix, -1);
+}
+```
+
+### Common Issues & Debugging
+
+**Issue 1: Attention Scores Size Mismatch**
+```
+[ERROR] Size mismatch for ATTENTION_SCORES_layer0_decode2:
+  Expected: 98 elements (PyTorch: [14, 1, 7])
+  Got: 14 elements (Llaminar: [14, 1, 1])
+```
+
+**Diagnosis**: Kernel computing `Q @ K^T` instead of `Q @ K_cache^T`
+- Check: MPIAttentionKernel receives k_cache as inputs[8]
+- Check: Kernel detects `is_decode_mode` based on cache presence
+- Check: Attention uses `attn_seq_len` (cache length) not `seq_len` (current token count)
+- Fix: Update kernel to append to cache and compute scores against full cache
+
+**Issue 2: KV Cache Not Growing**
+```
+[ERROR] KV cache size mismatch:
+  Expected after decode 2: [7, 128]
+  Got: [5, 128]
+```
+
+**Diagnosis**: Cache not being updated from kernel outputs
+- Check: Kernel returns 3 outputs (attention_out, k_cache, v_cache)
+- Check: Pipeline updates cache: `k_cache_[layer] = attn_outputs[1]`
+- Fix: Ensure kernel appends new K/V and returns updated cache
+
+**Issue 3: Numerical Divergence Grows Over Decode Steps**
+```
+Decode 1: ATTENTION_OUTPUT_layer0: max_abs=1e-5 ✅
+Decode 2: ATTENTION_OUTPUT_layer0: max_abs=1e-4 ⚠️
+Decode 3: ATTENTION_OUTPUT_layer0: max_abs=1e-2 ❌
+```
+
+**Diagnosis**: Error accumulation in KV cache
+- Check: Cache tensors use correct precision (float32)
+- Check: No quantization artifacts in cache storage
+- Check: Cache updates preserve numerical stability
+- Fix: Ensure cache operations maintain precision
+
+### Environment Variables
+
+**Decode-Specific Variables**:
+- `LLAMINAR_DECODE_CAPTURE=1`: Enable snapshot capture during decode steps
+- `LLAMINAR_DECODE_STEP_FILTER=<range>`: Capture only specific decode steps (e.g., `1-3`)
+- `PYTORCH_DECODE_STEPS=<N>`: Number of decode steps in PyTorch reference (default: 3)
+
+### Benefits
+
+1. ✅ **Catch KV Cache Bugs Early**: Detects cache misuse before integration testing
+2. ✅ **Precise Error Attribution**: Pinpoint exact decode step where divergence begins
+3. ✅ **Validate Cache Growth**: Ensures cache size increases correctly
+4. ✅ **Attention Score Verification**: Confirms attention computed over full context
+5. ✅ **Autoregressive Correctness**: Validates entire generation pipeline, not just prefill
+6. ✅ **Dynamic Thresholds**: Automatic threshold adjustment for growing context lengths
 
 ---
 

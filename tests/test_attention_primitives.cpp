@@ -22,9 +22,9 @@ TEST(AttentionPrimitives, FusedMatchesStep)
     apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, 10000.f);
     apply_rope(q2.data(), k2.data(), seq, head_dim, heads, heads, 0, 10000.f);
     std::vector<float> scores(size_t(heads) * seq * seq);
-    compute_qk_scores(q.data(), k.data(), scores.data(), seq, head_dim, heads, true, true);
+    compute_qk_scores(q.data(), k.data(), scores.data(), seq, seq, head_dim, heads, true, true);
     std::vector<float> out_step(seq * heads * head_dim);
-    apply_scores_to_v(scores.data(), v.data(), out_step.data(), seq, head_dim, heads);
+    apply_scores_to_v(scores.data(), v.data(), out_step.data(), seq, seq, head_dim, heads);
     std::vector<float> out_fused(out_step.size());
     fused_attention(q2.data(), k2.data(), v.data(), out_fused.data(), seq, head_dim, heads, true);
     for (size_t i = 0; i < out_step.size(); ++i)
@@ -40,7 +40,7 @@ TEST(AttentionPrimitives, SoftmaxProperties)
     fill(v, 0.012f);
     apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, 10000.f);
     std::vector<float> scores(size_t(heads) * seq * seq);
-    compute_qk_scores(q.data(), k.data(), scores.data(), seq, head_dim, heads, true, true);
+    compute_qk_scores(q.data(), k.data(), scores.data(), seq, seq, head_dim, heads, true, true);
     auto stats = validate_softmax_rows(scores.data(), seq, heads);
     EXPECT_LT(stats.max_row_deviation, 1e-6f);
     EXPECT_GE(stats.max_negative, 0.f);

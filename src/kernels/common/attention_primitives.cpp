@@ -257,7 +257,7 @@ namespace llaminar::attn
      * @param apply_softmax Whether to apply softmax after computing scores
      */
     void compute_qk_scores(const float *q, const float *k, float *scores,
-                           int seq_len, int head_dim, int heads,
+                           int q_seq_len, int k_seq_len, int head_dim, int heads,
                            bool causal, bool apply_softmax)
     {
         const auto &env = llaminar::debugEnv().attention;
@@ -267,13 +267,13 @@ namespace llaminar::attn
 #pragma omp parallel for collapse(2) if (!env.prim_force_scalar)
         for (int h = 0; h < heads; ++h)
         {
-            for (int i = 0; i < seq_len; ++i)
+            for (int i = 0; i < q_seq_len; ++i)
             {
-                float *score_row = head_row(scores, h, i, seq_len);
+                float *score_row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
                 const float *qi = q + (size_t)i * heads * head_dim + (size_t)h * head_dim;
 
                 // Compute dot product with each key position
-                for (int j = 0; j < seq_len; ++j)
+                for (int j = 0; j < k_seq_len; ++j)
                 {
                     // Apply causal mask: can't attend to future tokens
                     if (causal && j > i)
@@ -296,21 +296,8 @@ namespace llaminar::attn
             }
         }
 
-        // Apply softmax if requested
-        if (apply_softmax)
-        {
-            for (int h = 0; h < heads; ++h)
-            {
-                llaminar::kernels::SoftmaxRowArgs args;
-                args.scores = scores + (size_t)h * seq_len * seq_len;
-                args.rows = seq_len;
-                args.cols = seq_len;
-                args.causal = causal;
-                args.scale = 1.0f; // Already applied scale above
-
-                llaminar::kernels::softmax_row_major(args);
-            }
-        }
+        // Note: apply_softmax parameter is deprecated - softmax is always applied separately
+        (void)apply_softmax;
     }
 
     // ============================================================================
@@ -320,32 +307,33 @@ namespace llaminar::attn
     /**
      * @brief Apply attention scores to values: out = scores @ V
      *
-     * @param scores Attention scores [heads, seq_len, seq_len]
-     * @param v Value tensor [seq_len, heads, head_dim]
-     * @param out Output tensor [seq_len, heads, head_dim]
-     * @param seq_len Sequence length
+     * @param scores Attention scores [heads, q_seq_len, k_seq_len]
+     * @param v Value tensor [k_seq_len, heads, head_dim]
+     * @param out Output tensor [q_seq_len, heads, head_dim]
+     * @param q_seq_len Query sequence length
+     * @param k_seq_len Key/Value sequence length
      * @param head_dim Dimension per head
      * @param heads Number of heads
      */
     void apply_scores_to_v(const float *scores, const float *v, float *out,
-                           int seq_len, int head_dim, int heads)
+                           int q_seq_len, int k_seq_len, int head_dim, int heads)
     {
         const auto &env = llaminar::debugEnv().attention;
 
         // Initialize output to zero
-        std::fill(out, out + (size_t)seq_len * heads * head_dim, 0.0f);
+        std::fill(out, out + (size_t)q_seq_len * heads * head_dim, 0.0f);
 
 // Parallelize over (head, output_position) pairs
 #pragma omp parallel for collapse(2) if (!env.prim_force_scalar)
         for (int h = 0; h < heads; ++h)
         {
-            for (int i = 0; i < seq_len; ++i)
+            for (int i = 0; i < q_seq_len; ++i)
             {
                 float *out_ptr = out + (size_t)i * heads * head_dim + (size_t)h * head_dim;
-                const float *score_row = head_row(scores, h, i, seq_len);
+                const float *score_row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
 
                 // Weighted sum: out[i] = sum_j scores[i,j] * V[j]
-                for (int j = 0; j < seq_len; ++j)
+                for (int j = 0; j < k_seq_len; ++j)
                 {
                     const float weight = score_row[j];
                     const float *vj = v + (size_t)j * heads * head_dim + (size_t)h * head_dim;
@@ -493,8 +481,8 @@ namespace llaminar::attn
         {
             // Standard path: materialize scores
             std::vector<float> scores((size_t)heads * seq_len * seq_len);
-            compute_qk_scores(q, k, scores.data(), seq_len, head_dim, heads, causal, true);
-            apply_scores_to_v(scores.data(), v, out, seq_len, head_dim, heads);
+            compute_qk_scores(q, k, scores.data(), seq_len, seq_len, head_dim, heads, causal, false);
+            apply_scores_to_v(scores.data(), v, out, seq_len, seq_len, head_dim, heads);
         }
     }
 

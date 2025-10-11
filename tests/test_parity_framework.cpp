@@ -708,6 +708,17 @@ namespace
 
             auto result = SnapshotComparator::compare(pytorch_snap, llaminar_snapshot, tolerance);
 
+            // DEBUG: Check for comparison errors
+            if (!result.error_message.empty())
+            {
+                std::cout << "[" << test_name << "] " << stage_name;
+                if (layer_idx >= 0)
+                    std::cout << "_layer" << layer_idx;
+                std::cout << " COMPARISON ERROR: " << result.error_message << std::endl;
+                std::cout << "  PyTorch data size: " << pytorch_snap.data.size() << std::endl;
+                std::cout << "  Llaminar data size: " << llaminar_snapshot.data.size() << std::endl;
+            }
+
             // DETAILED ERROR DISTRIBUTION ANALYSIS for Q_PROJECTION
             if (stage_name == "Q_PROJECTION" && layer_idx == 0 && rank == 0)
             {

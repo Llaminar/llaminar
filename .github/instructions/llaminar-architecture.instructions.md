@@ -1928,21 +1928,21 @@ ERROR: Stage 'Q/K/V Projections' input[2] (local_wk): Contract violation!
 
 See `tests/ATTENTION_STAGE_CONTRACTS_TESTS.md` for full test documentation.
 
-### 8. KV Cache Management
+### 8. KV Cache Management ✨ *UPDATED OCTOBER 2025*
 
-**Files**: `src/abstract_pipeline.h`, `src/qwen_pipeline.cpp`
+**Files**: `src/abstract_pipeline.h`, `src/qwen_pipeline.cpp`, `src/kernels/MPIAttentionKernel.cpp`
 
-The KV cache system stores past key and value tensors to avoid recomputation during autoregressive decode.
+The KV cache system stores past key and value tensors to avoid recomputation during autoregressive decode. **As of October 2025**, the MPIAttentionKernel has been updated to properly use KV cache for incremental decode, fixing previous issues where attention was only computed against the current token.
 
 #### KVCacheState Structure
 
 ```cpp
 struct KVCacheState {
     int max_seq_len;      // Maximum capacity
-    int current_pos;      // Current fill position
+    int current_pos;      // Current fill position (n_past)
     bool initialized;     // Cache allocation status
     
-    // Per-layer storage
+    // Per-layer storage (distributed across MPI ranks for KV heads)
     std::vector<std::shared_ptr<TensorBase>> key_cache;   
     std::vector<std::shared_ptr<TensorBase>> value_cache;
 };
@@ -1951,19 +1951,99 @@ struct KVCacheState {
 #### Lifecycle
 
 **Initialization**: During first prefill
-- Allocate `[num_layers, max_seq_len, num_heads, head_dim]` tensors
+- Allocate `[num_layers, max_seq_len, n_head_kv * head_dim]` tensors (partitioned by KV heads across MPI ranks)
 - Set `max_seq_len` from config or CLI `--max-seq-len`
 - Mark `initialized = true`
 
 **Prefill**: Write initial sequence
-- Store computed K and V for all positions
+- Store computed K and V for all positions: `[seq_len, n_head_kv * head_dim]`
 - Set `current_pos = prefill_length`
+- Cache passed to MPIAttentionKernel as inputs[8] (k_cache) and inputs[9] (v_cache)
 
-**Decode**: Append new tokens
+**Decode**: Append new tokens ✨ *FIXED OCTOBER 2025*
 1. Check capacity: `current_pos + 1 <= max_seq_len`
-2. Compute K, V for new token
-3. Append to cache at `current_pos`
-4. Increment `current_pos`
+2. MPIAttentionKernel receives cache as inputs[8] and inputs[9]
+3. Kernel detects decode mode: `is_decode_mode = (cache present && cache_size > 0)`
+4. After RoPE, kernel **appends** new K/V to cache:
+   ```cpp
+   // Create new cache: [n_past + 1, local_kv_head_dim]
+   local_k_cache = TensorFactory::create_simple({cache_seq_len + seq_len, local_kv_head_dim});
+   
+   // Copy old cache + append new K/V
+   memcpy(local_k_cache->data(), k_cache_in->data(), old_cache_bytes);
+   memcpy(local_k_cache->data() + old_cache_size, local_k->data(), new_kv_bytes);
+   ```
+5. Attention computed against **full cache** (not just current token):
+   ```cpp
+   int attn_seq_len = cache_seq_len + seq_len;  // n_past + 1 for decode
+   scores_size = local_heads * seq_len * attn_seq_len;  // [heads, 1, n_past+1]
+   
+   compute_qk_scores(local_q, local_k_cache, scores, 
+                     seq_len, attn_seq_len, ...);  // Q@K_cache^T
+   ```
+6. Updated cache returned as outputs[1] (k_cache) and outputs[2] (v_cache)
+7. Pipeline updates cache state: `k_cache_[layer] = attn_outputs[1]`
+8. Increment `current_pos`
+
+#### Key Fixes (October 2025)
+
+**Before** (Bug):
+- Attention kernel received KV cache but **didn't use it**
+- Attention scores computed as `Q @ K^T` where K is only current token `[1, dim]`
+- Result: Wrong attention shape `[heads, 1, 1]` instead of `[heads, 1, n_past+1]`
+- Numerical error: Attention only looked at current token, not full context
+
+**After** (Fixed):
+- Kernel appends new K/V to cache after RoPE
+- `attn_seq_len` tracks full cache length (n_past + seq_len)
+- Attention scores computed as `Q @ K_cache^T` where K_cache is `[n_past+1, dim]`
+- Result: Correct attention shape `[heads, 1, n_past+1]`
+- GQA expansion operates on full cache, not just current K/V
+- Updated cache returned to pipeline for next decode step
+
+**Impact**:
+- ✅ Fixed size mismatch in parity tests: "expected 896 but got 14" → now 112 elements correct
+- ✅ Incremental decode now computes attention over full context
+- ✅ KV cache grows correctly: [5] → [6] → [7] → [8] as expected
+- ✅ Numerical parity with PyTorch reference improves significantly
+
+#### Kernel Integration
+
+**MPIAttentionKernel Input Format** (10 inputs):
+```cpp
+auto input       = inputs[0];  // Attention input [seq_len, hidden_size]
+auto wq          = inputs[1];  // Q weight
+auto wk          = inputs[2];  // K weight  
+auto wv          = inputs[3];  // V weight
+auto wo          = inputs[4];  // Output weight
+auto bq          = inputs[5];  // Q bias
+auto bk          = inputs[6];  // K bias
+auto bv          = inputs[7];  // V bias
+auto k_cache     = inputs[8];  // ✅ KV cache (key) - used in decode mode
+auto v_cache     = inputs[9];  // ✅ KV cache (value) - used in decode mode
+```
+
+**MPIAttentionKernel Output Format** (3 outputs):
+```cpp
+outputs[0] = attention_output;  // [seq_len, d_model]
+outputs[1] = updated_k_cache;   // ✅ [n_past+seq_len, local_kv_head_dim]
+outputs[2] = updated_v_cache;   // ✅ [n_past+seq_len, local_kv_head_dim]
+```
+
+**Pipeline Cache Update**:
+```cpp
+// QwenPipeline::prefill() / decode()
+std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out, nullptr, nullptr};
+if (!executeKernel("attention", attn_inputs, attn_outputs)) {
+    return false;
+}
+
+// Update cache with kernel outputs
+if (use_kv_cache_ && attn_outputs.size() >= 3) {
+    k_cache_[layer_idx] = attn_outputs[1];  // ✅ Updated K cache
+    v_cache_[layer_idx] = attn_outputs[2];  // ✅ Updated V cache
+}
+```
 
 #### Observability
 
@@ -1981,19 +2061,34 @@ KV Cache Stats:
   Total KV cache: 50.4 MB
 ```
 
+**Debug Logging** (when enabled):
+```cpp
+LOG_DEBUG("[KVCacheReturn] layer=" << layer_index_ 
+          << " k_cache_shape=[" << local_k_cache->shape()[0] << "," << local_k_cache->shape()[1] << "]"
+          << " attn_seq_len=" << attn_seq_len);
+```
+
 #### Testing
 
-**Parity Tests**: `test_abstract_pipeline_parity.cpp`
+**Parity Tests**: `test_parity_framework.cpp`
 - Validates KV cache state after prefill
 - Compares incremental decode vs full replay
 - Ensures `current_pos` consistency
+- ✅ **NEW**: Verifies attention scores shape matches PyTorch (e.g., 112 elements for decode step 2)
+- ✅ **NEW**: Validates KV cache growth: [5]→[6]→[7]→[8]
+
+**Snapshot Comparison**:
+- `ATTENTION_SCORES_layerN`: Now captures `[n_head * seq_len, attn_seq_len]` for incremental decode
+- Expected shape for decode step 2 with 14 heads: `[14, 1, 8]` = 112 elements
+- Before fix: Only 14 elements (1 per head) - wrong!
+- After fix: 112 elements (14 heads × 1 query × 8 keys) - correct!
 
 #### Future Enhancements
 
 **Planned Features**:
 - **Eviction Policies**: LRU, sliding window, selective retention
 - **Compaction**: Remove unused sequence segments
-- **Distribution**: Shard KV cache across MPI ranks (owner-aware)
+- **Distribution**: Shard KV cache across MPI ranks (owner-aware) - **currently each rank stores local KV heads**
 - **Quantization**: Store K/V in reduced precision (INT8, FP16)
 
 **Pluggable Strategy**:
@@ -2005,6 +2100,12 @@ public:
 ```
 
 Integration point: `AbstractPipeline::decode()` invokes policy before cache append.
+
+**Current Architecture Notes**:
+- KV cache is **partitioned by KV heads** across MPI ranks (each rank owns subset of KV heads)
+- For GQA models (Qwen 2.5): 2 KV heads distributed across ranks
+- Cache gathering happens in MPIAttentionKernel via MPI_Allgatherv when expanding for GQA
+- This enables memory-efficient distributed inference while maintaining correctness
 
 ### 9. GGUF Format & Model Loading
 

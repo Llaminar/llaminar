@@ -28,8 +28,23 @@ namespace llaminar::attn
 {
 
     void apply_rope(float *q, float *k, int seq_len, int head_dim, int q_heads, int k_heads, int n_past, float freq_base);
-    void compute_qk_scores(const float *q, const float *k, float *scores, int seq_len, int head_dim, int heads, bool causal, bool apply_softmax);
-    void apply_scores_to_v(const float *scores, const float *v, float *out, int seq_len, int head_dim, int heads);
+    /**
+     * @brief Compute attention scores Q @ K^T (with optional causal masking)
+     * @param q Query tensor [q_seq_len, heads * head_dim]
+     * @param k Key tensor [k_seq_len, heads * head_dim]
+     * @param scores Output scores [heads, q_seq_len, k_seq_len]
+     * @param q_seq_len Sequence length of queries (1 for decode, N for prefill)
+     * @param k_seq_len Sequence length of keys (n_past+1 for decode with cache)
+     * @param head_dim Dimension per head
+     * @param heads Number of heads
+     * @param causal Apply causal masking (j > i → -inf)
+     * @param apply_softmax Apply softmax after scoring
+     */
+    void compute_qk_scores(const float *q, const float *k, float *scores,
+                           int q_seq_len, int k_seq_len, int head_dim, int heads,
+                           bool causal, bool apply_softmax);
+    void apply_scores_to_v(const float *scores, const float *v, float *out,
+                           int q_seq_len, int k_seq_len, int head_dim, int heads);
     void fused_attention(const float *q, const float *k, const float *v, float *out, int seq_len, int head_dim, int heads, bool causal);
 
     /**

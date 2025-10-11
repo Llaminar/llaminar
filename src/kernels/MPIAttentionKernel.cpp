@@ -396,11 +396,56 @@ namespace llaminar
         auto bq_global = inputs[5];
         auto bk_global = inputs[6];
         auto bv_global = inputs[7];
-        // k_cache = inputs[8];  // Not used in prefill mode
-        // v_cache = inputs[9];  // Not used in prefill mode
+        auto k_cache_in = inputs[8]; // KV cache from previous step (or empty for prefill)
+        auto v_cache_in = inputs[9]; // KV cache from previous step (or empty for prefill)
 
         const int seq_len = static_cast<int>(input->shape()[0]);
         const int d_model = static_cast<int>(input->shape()[1]);
+
+        // Determine mode based on n_past (authoritative signal)
+        // Prefill: n_past=0, use full input sequence for Q/K/V
+        // Decode: n_past>0, use cache for K/V history, input for new Q
+        const bool is_decode_mode = (n_past_ > 0);
+        const int cache_seq_len = is_decode_mode ? n_past_ : 0;
+
+        // Validate cache presence in decode mode
+        if (is_decode_mode)
+        {
+            if (!k_cache_in || !v_cache_in)
+            {
+                LOG_ERROR("Decode mode (n_past=" << n_past_ << ") requires KV cache inputs");
+                return false;
+            }
+            // Cache capacity must be >= n_past (used length)
+            const int k_cache_capacity = static_cast<int>(k_cache_in->shape()[0]);
+            const int v_cache_capacity = static_cast<int>(v_cache_in->shape()[0]);
+            if (k_cache_capacity < n_past_)
+            {
+                LOG_ERROR("KV cache insufficient: k_cache capacity " << k_cache_capacity
+                                                                     << " < n_past=" << n_past_);
+                return false;
+            }
+            if (v_cache_capacity < n_past_)
+            {
+                LOG_ERROR("KV cache insufficient: v_cache capacity " << v_cache_capacity
+                                                                     << " < n_past=" << n_past_);
+                return false;
+            }
+            if (rank == 0)
+            {
+                LOG_DEBUG("[KV_CACHE] Decode mode: n_past=" << n_past_
+                                                            << ", cache_len=" << cache_seq_len
+                                                            << ", new_seq_len=" << seq_len);
+            }
+        }
+        else
+        {
+            if (rank == 0)
+            {
+                LOG_DEBUG("[KV_CACHE] Prefill mode: seq_len=" << seq_len
+                                                              << ", will initialize cache");
+            }
+        }
 
         // Get head distribution
         auto [local_heads, head_offset] = getHeadDistribution();
@@ -1148,7 +1193,7 @@ namespace llaminar
             LOG_INFO("  head_dim: " << head_dim_ << " (expected: 64 for Qwen-0.5B)");
             LOG_INFO("  local_heads (q_heads param): " << local_heads << " (expected: 7 per rank for 14 total)");
             LOG_INFO("  local_kv_heads (k_heads param): " << local_kv_heads << " (expected: 1 per rank for 2 total)");
-            LOG_INFO("  n_past: 0 (hardcoded - prefill)");
+            LOG_INFO("  n_past: " << n_past_ << " (KV cache position)");
             LOG_INFO("  rope_freq_base: " << rope_freq_base_ << " (expected: 10000)");
 
             LOG_DEBUG("[ROPE_TENSORS] Tensor shapes before RoPE:");
@@ -1178,7 +1223,7 @@ namespace llaminar
 
         llaminar::attn::apply_rope(local_q->data(), local_k->data(),
                                    seq_len, head_dim_, local_heads, local_kv_heads,
-                                   0, rope_freq_base_);
+                                   n_past_, rope_freq_base_);
 
         // =======================================================================
         // POST-ROPE VALUE LOGGING
@@ -1257,6 +1302,57 @@ namespace llaminar
             TensorHealthCheck k_rope_health("K_after_RoPE");
             k_rope_health.check(local_k->data(), local_k->size());
             k_rope_health.log(rank);
+        }
+
+        // ========================================================================
+        // STEP 5.1: UPDATE KV CACHE (after RoPE, before attention)
+        // ========================================================================
+        // For decode: append new K/V to existing cache
+        // For prefill: initialize cache with current K/V
+        std::shared_ptr<TensorBase> local_k_cache, local_v_cache;
+        int attn_seq_len; // Total sequence length for attention (n_past + seq_len)
+
+        if (is_decode_mode)
+        {
+            // DECODE MODE: Append new K/V to existing cache
+            attn_seq_len = cache_seq_len + seq_len; // n_past + 1
+
+            local_k_cache = TensorFactory::create_simple({attn_seq_len, local_kv_head_dim});
+            local_v_cache = TensorFactory::create_simple({attn_seq_len, local_kv_head_dim});
+
+            // Copy existing cache
+            std::memcpy(local_k_cache->data(), k_cache_in->data(),
+                        cache_seq_len * local_kv_head_dim * sizeof(float));
+            std::memcpy(local_v_cache->data(), v_cache_in->data(),
+                        cache_seq_len * local_kv_head_dim * sizeof(float));
+
+            // Append new K/V (after RoPE rotation)
+            std::memcpy(local_k_cache->data() + cache_seq_len * local_kv_head_dim,
+                        local_k->data(),
+                        seq_len * local_kv_head_dim * sizeof(float));
+            std::memcpy(local_v_cache->data() + cache_seq_len * local_kv_head_dim,
+                        local_v->data(),
+                        seq_len * local_kv_head_dim * sizeof(float));
+
+            if (rank == 0 && layer_index_ == 0)
+            {
+                LOG_INFO("[KV_CACHE] Decode: appended " << seq_len << " new tokens to cache");
+                LOG_INFO("  Old cache size: " << cache_seq_len << ", New cache size: " << attn_seq_len);
+                LOG_INFO("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
+            }
+        }
+        else
+        {
+            // PREFILL MODE: Initialize cache with current K/V
+            attn_seq_len = seq_len;
+            local_k_cache = local_k; // Share the tensor (no copy needed)
+            local_v_cache = local_v;
+
+            if (rank == 0 && layer_index_ == 0)
+            {
+                LOG_INFO("[KV_CACHE] Prefill: initialized cache with " << seq_len << " tokens");
+                LOG_INFO("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
+            }
         }
 
         // STEP 5.5: Capture ROPE_APPLICATION snapshot (post-RoPE Q and K)
@@ -1455,15 +1551,52 @@ namespace llaminar
         // IMPORTANT: For GQA, we need ALL KV heads from ALL ranks to replicate them
         // to the query heads. The global_k_rope and global_v_rope gathered above
         // contain all KV heads concatenated across ranks.
+        // NOW USING KV CACHE INSTEAD OF JUST CURRENT K/V!
 
         std::shared_ptr<TensorBase> local_k_expanded, local_v_expanded;
 
         if (n_head_ != n_head_kv_)
         {
-            // GQA: replicate K/V heads to match Q head count
-            // Use global K/V (gathered from all ranks) not local K/V
-            local_k_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
-            local_v_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
+            // GQA: replicate K/V heads from CACHE to match Q head count
+            // Use cache (which contains all past tokens + current token)
+            local_k_expanded = TensorFactory::create_simple({attn_seq_len, local_head_dim});
+            local_v_expanded = TensorFactory::create_simple({attn_seq_len, local_head_dim});
+
+            // First gather the full cache from all ranks if needed
+            std::shared_ptr<TensorBase> global_k_cache, global_v_cache;
+
+            if (world_size > 1)
+            {
+                // Need to gather full cache from all ranks for GQA expansion
+                const int k_v_dim = n_head_kv_ * head_dim_;
+                global_k_cache = TensorFactory::create_simple({attn_seq_len, k_v_dim});
+                global_v_cache = TensorFactory::create_simple({attn_seq_len, k_v_dim});
+
+                std::vector<int> recvcounts_k(world_size);
+                std::vector<int> displs_k(world_size);
+                int sendcount_k = attn_seq_len * local_kv_head_dim;
+
+                MPI_Allgather(&sendcount_k, 1, MPI_INT, recvcounts_k.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+                int offset_k = 0;
+                for (int r = 0; r < world_size; ++r)
+                {
+                    displs_k[r] = offset_k;
+                    offset_k += recvcounts_k[r];
+                }
+
+                MPI_Allgatherv(local_k_cache->data(), sendcount_k, MPI_FLOAT,
+                               global_k_cache->data(), recvcounts_k.data(), displs_k.data(),
+                               MPI_FLOAT, MPI_COMM_WORLD);
+                MPI_Allgatherv(local_v_cache->data(), sendcount_k, MPI_FLOAT,
+                               global_v_cache->data(), recvcounts_k.data(), displs_k.data(),
+                               MPI_FLOAT, MPI_COMM_WORLD);
+            }
+            else
+            {
+                global_k_cache = local_k_cache;
+                global_v_cache = local_v_cache;
+            }
 
             // CRITICAL FIX: Pass head_offset and total Q heads so GQA expansion uses correct mapping
             // For Qwen: 14 Q heads, 2 KV heads → group_size=7
@@ -1471,14 +1604,16 @@ namespace llaminar
             //   Q heads [7-13] (rank 1) → KV head 1
             // Formula: kv_head = (local_h + head_offset) / (total_q_heads / n_kv_heads)
             llaminar::attn::expand_kv_for_gqa(
-                global_k_rope->data(), global_v_rope->data(),
+                global_k_cache->data(), global_v_cache->data(),
                 local_k_expanded->data(), local_v_expanded->data(),
-                seq_len, head_dim_, local_heads, n_head_kv_, head_offset, n_head_);
+                attn_seq_len, head_dim_, local_heads, n_head_kv_, head_offset, n_head_); // Use cache length!
 
             // DEBUG: Log after GQA expansion (layer 0 only)
             if (layer_index_ == 0)
             {
-                LOG_DEBUG("[RANK=" << rank << "] After GQA expansion:");
+                LOG_DEBUG("[RANK=" << rank << "] After GQA expansion (using cache):");
+                LOG_INFO("  attn_seq_len=" << attn_seq_len << " (n_past + seq_len)");
+                LOG_INFO("  K_expanded shape: [" << attn_seq_len << ", " << local_head_dim << "]");
                 LOG_INFO("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
                                                  << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
 
@@ -1489,15 +1624,16 @@ namespace llaminar
         }
         else
         {
-            // MHA: no replication needed
-            local_k_expanded = local_k;
-            local_v_expanded = local_v;
+            // MHA: no replication needed, use cache directly
+            local_k_expanded = local_k_cache;
+            local_v_expanded = local_v_cache;
         }
 
         // ========================================================================
         // STEP 7: Compute attention scores and apply softmax
         // ========================================================================
-        const int scores_size = local_heads * seq_len * seq_len;
+        // CRITICAL: Now using full cache length for K dimension!
+        const int scores_size = local_heads * seq_len * attn_seq_len;
         std::vector<float> scores(scores_size);
 
         // IMPORTANT: For parity testing, we need to capture scores BEFORE causal masking
@@ -1509,9 +1645,11 @@ namespace llaminar
             {
                 LOG_INFO("[RANK=" << rank << "] Before compute_qk_scores for snapshot:");
                 LOG_INFO("  local_q size=" << (local_heads * seq_len * head_dim_)
-                                           << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
-                LOG_INFO("  local_k_expanded size=" << (local_heads * seq_len * head_dim_)
-                                                    << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
+                                           << " shape=[" << seq_len << ", " << (local_heads * head_dim_) << "]");
+                LOG_INFO("  local_k_expanded size=" << (local_heads * attn_seq_len * head_dim_)
+                                                    << " shape=[" << attn_seq_len << ", " << (local_heads * head_dim_) << "]");
+                LOG_INFO("  scores shape will be: [" << local_heads << ", " << seq_len << ", " << attn_seq_len << "]");
+                LOG_INFO("  scores total elements: " << scores_size);
 
                 // CRITICAL: Verify memory layout expectations
                 LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
@@ -1569,7 +1707,9 @@ namespace llaminar
             // Compute unmasked scores for snapshot
             std::vector<float> unmasked_scores(scores_size);
             llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
-                                              unmasked_scores.data(), seq_len, head_dim_, local_heads,
+                                              unmasked_scores.data(),
+                                              seq_len, attn_seq_len, // q_seq_len, k_seq_len
+                                              head_dim_, local_heads,
                                               false, false); // causal=FALSE for snapshot
 
             // DEBUG: Log computed scores (layer 0 only)
@@ -1583,12 +1723,12 @@ namespace llaminar
             // Gather and snapshot unmasked scores
             if (world_size > 1)
             {
-                auto global_scores = std::vector<float>(n_head_ * seq_len * seq_len, 0.0f);
+                auto global_scores = std::vector<float>(n_head_ * seq_len * attn_seq_len, 0.0f);
 
                 std::vector<int> recvcounts(world_size);
                 std::vector<int> displs(world_size);
 
-                int sendcount = local_heads * seq_len * seq_len;
+                int sendcount = local_heads * seq_len * attn_seq_len;
                 MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
 
                 int offset = 0;
@@ -1605,19 +1745,18 @@ namespace llaminar
                 if (rank == 0)
                 {
                     snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, global_scores.data(),
-                                       n_head_ * seq_len, seq_len);
+                                       n_head_ * seq_len, attn_seq_len); // rows, cols
                 }
             }
             else
             {
                 snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, unmasked_scores.data(),
-                                   local_heads * seq_len, seq_len);
+                                   local_heads * seq_len, attn_seq_len); // rows, cols
             }
-        }
-
-        // Now compute MASKED scores for actual attention (causal masking, scaling, NO softmax yet)
+        } // Now compute MASKED scores for actual attention (causal masking, scaling, NO softmax yet)
         llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
-                                          scores.data(), seq_len, head_dim_, local_heads,
+                                          scores.data(), seq_len, attn_seq_len,
+                                          head_dim_, local_heads,
                                           true, false); // causal=TRUE for actual computation
 
         // Contract: Validate attention scores (raw QK^T)
@@ -1644,9 +1783,9 @@ namespace llaminar
         for (int h = 0; h < local_heads; ++h)
         {
             llaminar::kernels::SoftmaxRowArgs args;
-            args.scores = scores.data() + static_cast<size_t>(h) * seq_len * seq_len;
+            args.scores = scores.data() + static_cast<size_t>(h) * seq_len * attn_seq_len;
             args.rows = seq_len;
-            args.cols = seq_len;
+            args.cols = attn_seq_len;
             args.causal = true;
             args.scale = 1.0f;
             llaminar::kernels::softmax_row_major(args);
@@ -1657,13 +1796,13 @@ namespace llaminar
         {
             if (world_size > 1)
             {
-                // Gather softmax scores across ranks: [local_heads, seq_len, seq_len] -> [n_head, seq_len, seq_len]
-                auto global_softmax = std::vector<float>(n_head_ * seq_len * seq_len, 0.0f);
+                // Gather softmax scores across ranks: [local_heads, seq_len, attn_seq_len] -> [n_head, seq_len, attn_seq_len]
+                auto global_softmax = std::vector<float>(n_head_ * seq_len * attn_seq_len, 0.0f);
 
                 std::vector<int> recvcounts(world_size);
                 std::vector<int> displs(world_size);
 
-                int sendcount = local_heads * seq_len * seq_len;
+                int sendcount = local_heads * seq_len * attn_seq_len;
                 MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
 
                 int offset = 0;
@@ -1680,13 +1819,13 @@ namespace llaminar
                 if (rank == 0)
                 {
                     snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, global_softmax.data(),
-                                       n_head_ * seq_len, seq_len);
+                                       n_head_ * seq_len, attn_seq_len);
                 }
             }
             else
             {
                 snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.data(),
-                                   local_heads * seq_len, seq_len);
+                                   local_heads * seq_len, attn_seq_len);
             }
         }
 
@@ -1710,8 +1849,8 @@ namespace llaminar
                 for (int r = 0; r < seq_len; ++r)
                 {
                     float row_sum = 0.0f;
-                    const float *row = scores.data() + h * seq_len * seq_len + r * seq_len;
-                    for (int c = 0; c < seq_len; ++c)
+                    const float *row = scores.data() + h * seq_len * attn_seq_len + r * attn_seq_len;
+                    for (int c = 0; c < attn_seq_len; ++c)
                     {
                         if (row[c] < 0.0f || row[c] > 1.0f)
                         {
@@ -1742,7 +1881,8 @@ namespace llaminar
         auto local_attended = TensorFactory::create_simple({seq_len, local_head_dim});
 
         llaminar::attn::apply_scores_to_v(scores.data(), local_v_expanded->data(),
-                                          local_attended->data(), seq_len, head_dim_, local_heads);
+                                          local_attended->data(), seq_len, attn_seq_len,
+                                          head_dim_, local_heads);
 
         // Contract: Validate attended output (scores @ V)
         if (enable_validation && rank == 0)
@@ -1912,9 +2052,32 @@ namespace llaminar
         if (outputs.empty())
         {
             outputs.push_back(TensorFactory::create_simple({seq_len, d_model}));
+            outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
+            outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
+        }
+        else if (outputs.size() == 1)
+        {
+            // Legacy: only attention output was expected, add cache outputs
+            outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
+            outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
         }
 
+        // outputs[0] = attention output
         memcpy(outputs[0]->data(), local_output->data(), seq_len * d_model * sizeof(float));
+
+        // outputs[1] = updated K cache (local portion for this rank's KV heads)
+        memcpy(outputs[1]->data(), local_k_cache->data(), local_k_cache->size() * sizeof(float));
+
+        // outputs[2] = updated V cache (local portion for this rank's KV heads)
+        memcpy(outputs[2]->data(), local_v_cache->data(), local_v_cache->size() * sizeof(float));
+
+        if (rank == 0 && debugEnv().attention.micro_trace)
+        {
+            LOG_DEBUG("[KVCacheReturn] layer=" << layer_index_
+                                               << " k_cache_shape=[" << local_k_cache->shape()[0] << "," << local_k_cache->shape()[1] << "]"
+                                               << " v_cache_shape=[" << local_v_cache->shape()[0] << "," << local_v_cache->shape()[1] << "]"
+                                               << " attn_seq_len=" << attn_seq_len);
+        }
 
         return true;
     }

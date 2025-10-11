@@ -306,8 +306,8 @@ namespace llaminar
             if (getRank() == 0)
             {
                 LOG_DEBUG("[BACKEND_DECISION_PREFILL] layer=" << layer_idx
-                          << " use_cosma=" << dec.use_cosma()
-                          << " seq_len=" << seq_len);
+                                                              << " use_cosma=" << dec.use_cosma()
+                                                              << " seq_len=" << seq_len);
             }
             if (dec.use_cosma())
             {
@@ -355,11 +355,27 @@ namespace llaminar
                     }
                 }
                 std::vector<std::shared_ptr<TensorBase>> attn_inputs = {attn_norm_out, weights.wq[layer_idx], weights.wk[layer_idx], weights.wv[layer_idx], weights.wo[layer_idx], weights.bq[layer_idx], weights.bk[layer_idx], weights.bv[layer_idx], use_kv_cache_ ? k_cache_[layer_idx] : createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim}), use_kv_cache_ ? v_cache_[layer_idx] : createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim})};
-                std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
+                // Expect 3 outputs: [0]=attention_output, [1]=updated_k_cache, [2]=updated_v_cache
+                std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out, nullptr, nullptr};
                 if (!executeKernel("attention", attn_inputs, attn_outputs))
                 {
                     LOG_ERROR("Layer " << layer_idx << " attention failed");
                     return false;
+                }
+                // Update KV cache with kernel outputs
+                if (use_kv_cache_ && attn_outputs.size() >= 3)
+                {
+                    if (attn_outputs[1] && attn_outputs[2])
+                    {
+                        k_cache_[layer_idx] = attn_outputs[1];
+                        v_cache_[layer_idx] = attn_outputs[2];
+                        if (debugEnv().pipeline.layer_token_diff_verbose && getRank() == 0)
+                        {
+                            LOG_DEBUG("[CacheUpdate] layer=" << layer_idx
+                                                             << " k_cache_seq_len=" << k_cache_[layer_idx]->shape()[0]
+                                                             << " v_cache_seq_len=" << v_cache_[layer_idx]->shape()[0]);
+                        }
+                    }
                 }
                 total_attention_time_ += 0; // (timing omitted for non-COSMA path placeholder)
             }
@@ -1724,6 +1740,13 @@ namespace llaminar
         kv_snapshot_.used_tokens = getKVCacheUsed();
         kv_snapshot_.growth_events = getKVCacheGrowthEvents();
 
+        // CRITICAL: Update n_past_ for incremental decode to work correctly
+        // The incremental decode relies on n_past_ to know the current KV cache position
+        if (use_kv_cache_)
+        {
+            n_past_ = (int)tokens.size();
+        }
+
         // Update stage context
         ctx.stage = InferenceStage::Prefill;
         ctx.seq_len = (int)tokens.size();
@@ -1843,6 +1866,10 @@ namespace llaminar
         auto current = embedSingleToken(token_id, weights.token_embedding);
         if (!current)
             return false;
+
+        // Capture embedding snapshot for parity testing
+        captureIfEnabled(PipelineStage::EMBEDDING, -1, current);
+
         size_t layer_rows_offset_before = last_layer_token_rows_.size();
         if (env.pipeline.incr_trace && getRank() == 0)
         {
