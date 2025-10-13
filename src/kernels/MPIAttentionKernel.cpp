@@ -2129,19 +2129,25 @@ namespace llaminar
         }
 
         // Apply softmax to each head (sequential loop - softmax_row_major parallelizes internally)
+        // CRITICAL FIX: In incremental decode (seq_len=1), disable causal masking because
+        // the query token is attending to the full cache which only contains PAST tokens.
+        // Causal masking with rows=1 would incorrectly mask based on relative position (row 0 -> mask all c > 0).
+        const bool use_causal_mask = (seq_len > 1); // Only use causal mask in prefill/batch mode
+
         for (int h = 0; h < local_heads; ++h)
         {
             llaminar::kernels::SoftmaxRowArgs args;
             args.scores = scores.data() + static_cast<size_t>(h) * seq_len * attn_seq_len;
             args.rows = seq_len;
             args.cols = attn_seq_len;
-            args.causal = true;
+            args.causal = use_causal_mask; // FIX: Disable for incremental decode
             args.scale = 1.0f;
 
             // DEBUG: Log scores before softmax for layer 0, head 0
             if (layer_index_ == 0 && h == 0 && rank == 0)
             {
                 LOG_INFO("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
+                LOG_INFO("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
                 LOG_INFO("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
                                            << args.scores[2] << " " << args.scores[3] << " "
                                            << args.scores[4] << " " << args.scores[5]);
@@ -2156,6 +2162,10 @@ namespace llaminar
                 LOG_INFO("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
                                            << args.scores[2] << " " << args.scores[3] << " "
                                            << args.scores[4] << " " << args.scores[5]);
+                float sum = 0.0f;
+                for (int i = 0; i < attn_seq_len; ++i)
+                    sum += args.scores[i];
+                LOG_INFO("  Sum (should be ~1.0): " << sum);
             }
         }
 
