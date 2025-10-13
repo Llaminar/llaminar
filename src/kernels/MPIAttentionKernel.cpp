@@ -262,16 +262,16 @@ namespace llaminar
         // DEBUG: Trace bias status at function entry
         if (layer_index_ == 0 && operation_label)
         {
-            LOG_INFO("[MATMUL_BIAS] Layer " << layer_index_ << " Rank " << rank
+            LOG_DEBUG("[MATMUL_BIAS] Layer " << layer_index_ << " Rank " << rank
                                             << " Operation: " << operation_label);
             if (bias)
             {
-                LOG_INFO("[MATMUL_BIAS] BIAS PRESENT - will apply bias after matmul");
-                LOG_INFO("[MATMUL_BIAS] bias[0:3]: [" << bias[0] << ", " << bias[1] << ", " << bias[2] << "]");
+                LOG_DEBUG("[MATMUL_BIAS] BIAS PRESENT - will apply bias after matmul");
+                LOG_DEBUG("[MATMUL_BIAS] bias[0:3]: [" << bias[0] << ", " << bias[1] << ", " << bias[2] << "]");
             }
             else
             {
-                LOG_INFO("[MATMUL_BIAS] NO BIAS - bias pointer is NULL");
+                LOG_DEBUG("[MATMUL_BIAS] NO BIAS - bias pointer is NULL");
             }
         }
 
@@ -353,14 +353,14 @@ namespace llaminar
         // DEBUG: Log cblas_sgemm parameters for layer 0
         if (operation_label && std::string(operation_label) == "Q_projection")
         {
-            LOG_INFO("[CBLAS_DEBUG] Rank " << rank << " cblas_sgemm call:");
-            LOG_INFO("  Operation: " << (operation_label ? operation_label : "unknown"));
-            LOG_INFO("  M=" << M << " N=" << N << " K=" << K);
-            LOG_INFO("  input ptr=" << (void *)input << " leading dim=" << K);
-            LOG_INFO("  weight ptr=" << (void *)weight << " leading dim=" << K << " (will be transposed)");
-            LOG_INFO("  output ptr=" << (void *)output << " leading dim=" << N);
-            LOG_INFO("  input[0:5]: [" << input[0] << ", " << input[1] << ", " << input[2] << ", " << input[3] << ", " << input[4] << "]");
-            LOG_INFO("  weight[0:5]: [" << weight[0] << ", " << weight[1] << ", " << weight[2] << ", " << weight[3] << ", " << weight[4] << "]");
+            LOG_DEBUG("[CBLAS_DEBUG] Rank " << rank << " cblas_sgemm call:");
+            LOG_DEBUG("  Operation: " << (operation_label ? operation_label : "unknown"));
+            LOG_DEBUG("  M=" << M << " N=" << N << " K=" << K);
+            LOG_DEBUG("  input ptr=" << (void *)input << " leading dim=" << K);
+            LOG_DEBUG("  weight ptr=" << (void *)weight << " leading dim=" << K << " (will be transposed)");
+            LOG_DEBUG("  output ptr=" << (void *)output << " leading dim=" << N);
+            LOG_DEBUG("  input[0:5]: [" << input[0] << ", " << input[1] << ", " << input[2] << ", " << input[3] << ", " << input[4] << "]");
+            LOG_DEBUG("  weight[0:5]: [" << weight[0] << ", " << weight[1] << ", " << weight[2] << ", " << weight[3] << ", " << weight[4] << "]");
         }
 
         // output = input @ weight^T  (input is MxK, weight is NxK, output is MxN)
@@ -461,14 +461,14 @@ namespace llaminar
         // DEBUG: Trace bias flow from input extraction
         if (layer_index_ == 0)
         {
-            LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+            LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                           << " bq_global=" << (bq_global ? "PRESENT" : "null")
                                           << " size=" << (bq_global ? bq_global->size() : 0)
                                           << " first_val=" << (bq_global && bq_global->size() > 0 ? bq_global->data()[0] : 0.0f));
-            LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+            LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                           << " bk_global=" << (bk_global ? "PRESENT" : "null")
                                           << " size=" << (bk_global ? bk_global->size() : 0));
-            LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+            LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                           << " bv_global=" << (bv_global ? "PRESENT" : "null")
                                           << " size=" << (bv_global ? bv_global->size() : 0));
         }
@@ -531,7 +531,7 @@ namespace llaminar
         {
             if (rank == 0)
             {
-                LOG_INFO("Rank " << rank << " has no Q heads to process (local_heads=0). "
+                LOG_DEBUG("Rank " << rank << " has no Q heads to process (local_heads=0). "
                                  << "Creating zero-filled output and participating in collectives only.");
             }
 
@@ -642,7 +642,7 @@ namespace llaminar
 
         if (rank == 0)
         {
-            LOG_INFO("Attention layer " << layer_index_ << ": seq_len=" << seq_len
+            LOG_DEBUG("Attention layer " << layer_index_ << ": seq_len=" << seq_len
                                         << ", d_model=" << d_model << ", local_heads=" << local_heads
                                         << "/" << n_head_ << ", local_kv_heads=" << local_kv_heads << "/" << n_head_kv_
                                         << ", weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
@@ -767,15 +767,15 @@ namespace llaminar
             // DEBUG: Verify bias assignment (sharded path)
             if (layer_index_ == 0)
             {
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " SHARDED PATH: weights_are_sharded=true");
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bq ? local_bq->size() : 0));
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bk=" << (local_bk ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bk ? local_bk->size() : 0));
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bv=" << (local_bv ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bv ? local_bv->size() : 0));
             }
@@ -783,11 +783,11 @@ namespace llaminar
             // DEBUG: Verify pointer assignment
             if (layer_index_ == 0)
             {
-                LOG_INFO("[PTR_DEBUG] Layer " << layer_index_ << " Rank " << rank << " weight pointer assignment:");
-                LOG_INFO("  wq_global ptr: " << (void *)wq_global->data() << " first 5: ["
+                LOG_DEBUG("[PTR_DEBUG] Layer " << layer_index_ << " Rank " << rank << " weight pointer assignment:");
+                LOG_DEBUG("  wq_global ptr: " << (void *)wq_global->data() << " first 5: ["
                                              << wq_global->data()[0] << ", " << wq_global->data()[1] << ", " << wq_global->data()[2] << ", "
                                              << wq_global->data()[3] << ", " << wq_global->data()[4] << "]");
-                LOG_INFO("  local_wq ptr: " << (void *)local_wq->data() << " first 5: ["
+                LOG_DEBUG("  local_wq ptr: " << (void *)local_wq->data() << " first 5: ["
                                             << local_wq->data()[0] << ", " << local_wq->data()[1] << ", " << local_wq->data()[2] << ", "
                                             << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
                 if (wq_global->data() != local_wq->data())
@@ -796,24 +796,24 @@ namespace llaminar
                 }
                 else
                 {
-                    LOG_INFO("  ✅ Pointers match");
+                    LOG_DEBUG("  ✅ Pointers match");
                 }
             }
 
             // DEBUG: Verify wq_global content for both ranks
             if (layer_index_ == 0)
             {
-                LOG_INFO("[WQ_VERIFY] Layer " << layer_index_ << " Rank " << rank << " wq_global stats:");
+                LOG_DEBUG("[WQ_VERIFY] Layer " << layer_index_ << " Rank " << rank << " wq_global stats:");
                 float wq_min = *std::min_element(wq_global->data(), wq_global->data() + wq_global->size());
                 float wq_max = *std::max_element(wq_global->data(), wq_global->data() + wq_global->size());
                 float wq_sum = std::accumulate(wq_global->data(), wq_global->data() + wq_global->size(), 0.0f);
                 float wq_mean = wq_sum / wq_global->size();
-                LOG_INFO("  wq_global: size=" << wq_global->size() << " min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean);
-                LOG_INFO("  wq_global[0:10]: [" << wq_global->data()[0] << ", " << wq_global->data()[1] << ", "
+                LOG_DEBUG("  wq_global: size=" << wq_global->size() << " min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean);
+                LOG_DEBUG("  wq_global[0:10]: [" << wq_global->data()[0] << ", " << wq_global->data()[1] << ", "
                                                 << wq_global->data()[2] << ", " << wq_global->data()[3] << ", " << wq_global->data()[4] << ", "
                                                 << wq_global->data()[5] << ", " << wq_global->data()[6] << ", " << wq_global->data()[7] << ", "
                                                 << wq_global->data()[8] << ", " << wq_global->data()[9] << "]");
-                LOG_INFO("  wq_global[400000:400010]: [" << wq_global->data()[400000] << ", " << wq_global->data()[400001] << ", "
+                LOG_DEBUG("  wq_global[400000:400010]: [" << wq_global->data()[400000] << ", " << wq_global->data()[400001] << ", "
                                                          << wq_global->data()[400002] << ", " << wq_global->data()[400003] << ", " << wq_global->data()[400004] << ", "
                                                          << wq_global->data()[400005] << ", " << wq_global->data()[400006] << ", " << wq_global->data()[400007] << ", "
                                                          << wq_global->data()[400008] << ", " << wq_global->data()[400009] << "]");
@@ -826,7 +826,7 @@ namespace llaminar
                 std::ofstream outfile(filename, std::ios::binary);
                 outfile.write(reinterpret_cast<const char *>(wq_global->data()), wq_global->size() * sizeof(float));
                 outfile.close();
-                LOG_INFO("  Saved wq_global to " << filename);
+                LOG_DEBUG("  Saved wq_global to " << filename);
 
                 // Ensure all ranks finish saving before proceeding
                 MPI_Barrier(MPI_COMM_WORLD);
@@ -858,9 +858,9 @@ namespace llaminar
             // DEBUG: Verify bias assignment (single-rank path)
             if (layer_index_ == 0)
             {
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " SINGLE-RANK PATH: weights_are_sharded=false, world_size=1");
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bq ? local_bq->size() : 0));
             }
@@ -899,16 +899,16 @@ namespace llaminar
             // DEBUG: Verify bias assignment (multi-rank global weights path)
             if (layer_index_ == 0)
             {
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " MULTI-RANK PATH: weights_are_sharded=false, world_size>1");
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bq ? local_bq->size() : 0)
                                               << " first_val=" << (local_bq && local_bq->size() > 0 ? local_bq->data()[0] : 0.0f));
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bk=" << (local_bk ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bk ? local_bk->size() : 0));
-                LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+                LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                               << " local_bv=" << (local_bv ? "PRESENT" : "nullptr")
                                               << " size=" << (local_bv ? local_bv->size() : 0));
             }
@@ -928,7 +928,7 @@ namespace llaminar
                 {
                     max_abs_diff = std::max(max_abs_diff, std::fabs(local_ptr[idx] - global_ptr[idx]));
                 }
-                LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                      << " layer=" << layer_index_
                                                      << " kv_head_offset=" << kv_head_offset
                                                      << " local_kv_heads=" << local_kv_heads
@@ -938,7 +938,7 @@ namespace llaminar
             }
             else
             {
-                LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                      << " layer=" << layer_index_
                                                      << " kv_head_offset=" << kv_head_offset
                                                      << " local_kv_heads=" << local_kv_heads
@@ -954,14 +954,14 @@ namespace llaminar
                 const int local_row_base = kv * head_dim_;
                 const float *local_row0 = local_wk->data() + static_cast<size_t>(local_row_base) * stride;
 
-                LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                      << " layer=" << layer_index_
                                                      << " kv_head_global=" << global_kv_head
                                                      << " row0_cols0-3={" << local_row0[0] << ", " << local_row0[1]
                                                      << ", " << local_row0[2] << ", " << local_row0[3] << "}");
                 if (has_extra_cols)
                 {
-                    LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                    LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                          << " layer=" << layer_index_
                                                          << " kv_head_global=" << global_kv_head
                                                          << " row0_cols32-33={" << local_row0[32] << ", " << local_row0[33] << "}");
@@ -971,14 +971,14 @@ namespace llaminar
                 {
                     const size_t global_head_row_base = static_cast<size_t>(global_kv_head) * static_cast<size_t>(head_dim_);
                     const float *global_row0 = wk_global->data() + global_head_row_base * stride;
-                    LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                    LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                          << " layer=" << layer_index_
                                                          << " kv_head_global=" << global_kv_head
                                                          << " GLOBAL_row0_cols0-3={" << global_row0[0] << ", " << global_row0[1]
                                                          << ", " << global_row0[2] << ", " << global_row0[3] << "}");
                     if (has_extra_cols)
                     {
-                        LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                        LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                              << " layer=" << layer_index_
                                                              << " kv_head_global=" << global_kv_head
                                                              << " GLOBAL_row0_cols32-33={" << global_row0[32] << ", " << global_row0[33] << "}");
@@ -988,14 +988,14 @@ namespace llaminar
                 if (head_dim_ > 32)
                 {
                     const float *local_row32 = local_wk->data() + static_cast<size_t>(local_row_base + 32) * stride;
-                    LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                    LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                          << " layer=" << layer_index_
                                                          << " kv_head_global=" << global_kv_head
                                                          << " row32_cols0-3={" << local_row32[0] << ", " << local_row32[1]
                                                          << ", " << local_row32[2] << ", " << local_row32[3] << "}");
                     if (has_extra_cols)
                     {
-                        LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                        LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                              << " layer=" << layer_index_
                                                              << " kv_head_global=" << global_kv_head
                                                              << " row32_cols32-33={" << local_row32[32] << ", " << local_row32[33] << "}");
@@ -1005,14 +1005,14 @@ namespace llaminar
                     {
                         const size_t global_row32_index = static_cast<size_t>(global_kv_head) * static_cast<size_t>(head_dim_) + 32;
                         const float *global_row32 = wk_global->data() + global_row32_index * stride;
-                        LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                        LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                              << " layer=" << layer_index_
                                                              << " kv_head_global=" << global_kv_head
                                                              << " GLOBAL_row32_cols0-3={" << global_row32[0] << ", " << global_row32[1]
                                                              << ", " << global_row32[2] << ", " << global_row32[3] << "}");
                         if (has_extra_cols)
                         {
-                            LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                            LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
                                                                  << " layer=" << layer_index_
                                                                  << " kv_head_global=" << global_kv_head
                                                                  << " GLOBAL_row32_cols32-33={" << global_row32[32] << ", " << global_row32[33] << "}");
@@ -1032,18 +1032,18 @@ namespace llaminar
         // DEBUG: Log input and weight stats before Q projection
         if (layer_index_ == 0)
         {
-            LOG_INFO("[Q_PROJ_DEBUG] Layer " << layer_index_ << " Rank " << rank << " BEFORE Q projection:");
-            LOG_INFO("  input shape: [" << seq_len << ", " << d_model << "]");
-            LOG_INFO("  local_wq expected shape (PyTorch convention): [" << local_head_dim << ", " << d_model << "]");
-            LOG_INFO("  Expected output shape: [" << seq_len << ", " << local_head_dim << "]");
+            LOG_DEBUG("[Q_PROJ_DEBUG] Layer " << layer_index_ << " Rank " << rank << " BEFORE Q projection:");
+            LOG_DEBUG("  input shape: [" << seq_len << ", " << d_model << "]");
+            LOG_DEBUG("  local_wq expected shape (PyTorch convention): [" << local_head_dim << ", " << d_model << "]");
+            LOG_DEBUG("  Expected output shape: [" << seq_len << ", " << local_head_dim << "]");
 
             // Input stats
             float input_min = *std::min_element(input->data(), input->data() + input->size());
             float input_max = *std::max_element(input->data(), input->data() + input->size());
             float input_sum = std::accumulate(input->data(), input->data() + input->size(), 0.0f);
             float input_mean = input_sum / input->size();
-            LOG_INFO("  input stats: min=" << input_min << " max=" << input_max << " mean=" << input_mean);
-            LOG_INFO("  input[0, 0:5]: [" << input->data()[0] << ", " << input->data()[1] << ", "
+            LOG_DEBUG("  input stats: min=" << input_min << " max=" << input_max << " mean=" << input_mean);
+            LOG_DEBUG("  input[0, 0:5]: [" << input->data()[0] << ", " << input->data()[1] << ", "
                                           << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
 
             // Weight stats
@@ -1051,35 +1051,35 @@ namespace llaminar
             float wq_max = *std::max_element(local_wq->data(), local_wq->data() + local_wq->size());
             float wq_sum = std::accumulate(local_wq->data(), local_wq->data() + local_wq->size(), 0.0f);
             float wq_mean = wq_sum / local_wq->size();
-            LOG_INFO("  local_wq stats: min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean);
-            LOG_INFO("  local_wq[0:5]: [" << local_wq->data()[0] << ", " << local_wq->data()[1] << ", "
+            LOG_DEBUG("  local_wq stats: min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean);
+            LOG_DEBUG("  local_wq[0:5]: [" << local_wq->data()[0] << ", " << local_wq->data()[1] << ", "
                                           << local_wq->data()[2] << ", " << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
         }
 
         // Q projection: [seq_len, d_model] @ [d_model, local_head_dim] = [seq_len, local_head_dim]
         if (layer_index_ == 0)
         {
-            LOG_INFO("[MATMUL_DEBUG] Layer " << layer_index_ << " Rank " << rank << " Q projection matmul parameters:");
-            LOG_INFO("  M=" << seq_len << " N=" << local_head_dim << " K=" << d_model);
-            LOG_INFO("  input ptr=" << (void *)input->data() << " weight ptr=" << (void *)local_wq->data() << " output ptr=" << (void *)local_q->data());
-            LOG_INFO("  local_wq shape: [" << local_wq->shape()[0] << ", " << local_wq->shape()[1] << "]");
-            LOG_INFO("  local_wq first 5 values: [" << local_wq->data()[0] << ", " << local_wq->data()[1] << ", " << local_wq->data()[2] << ", " << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
-            LOG_INFO("  local_wq offset 896 values (2nd row if [448,896]): [" << local_wq->data()[896] << ", " << local_wq->data()[897] << ", " << local_wq->data()[898] << ", " << local_wq->data()[899] << ", " << local_wq->data()[900] << "]");
-            LOG_INFO("  input first 5 values: [" << input->data()[0] << ", " << input->data()[1] << ", " << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
-            LOG_INFO("  local_wq size: " << local_wq->size());
+            LOG_DEBUG("[MATMUL_DEBUG] Layer " << layer_index_ << " Rank " << rank << " Q projection matmul parameters:");
+            LOG_DEBUG("  M=" << seq_len << " N=" << local_head_dim << " K=" << d_model);
+            LOG_DEBUG("  input ptr=" << (void *)input->data() << " weight ptr=" << (void *)local_wq->data() << " output ptr=" << (void *)local_q->data());
+            LOG_DEBUG("  local_wq shape: [" << local_wq->shape()[0] << ", " << local_wq->shape()[1] << "]");
+            LOG_DEBUG("  local_wq first 5 values: [" << local_wq->data()[0] << ", " << local_wq->data()[1] << ", " << local_wq->data()[2] << ", " << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
+            LOG_DEBUG("  local_wq offset 896 values (2nd row if [448,896]): [" << local_wq->data()[896] << ", " << local_wq->data()[897] << ", " << local_wq->data()[898] << ", " << local_wq->data()[899] << ", " << local_wq->data()[900] << "]");
+            LOG_DEBUG("  input first 5 values: [" << input->data()[0] << ", " << input->data()[1] << ", " << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
+            LOG_DEBUG("  local_wq size: " << local_wq->size());
         }
 
         // DEBUG: Verify local_bq status before Q projection
         if (layer_index_ == 0)
         {
-            LOG_INFO("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
+            LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
                                           << " BEFORE Q_projection call:");
-            LOG_INFO("[BIAS_FLOW] local_bq=" << (local_bq ? "PRESENT" : "nullptr")
+            LOG_DEBUG("[BIAS_FLOW] local_bq=" << (local_bq ? "PRESENT" : "nullptr")
                                              << " size=" << (local_bq ? local_bq->size() : 0)
                                              << " will_pass=" << (local_bq ? "local_bq->data()" : "nullptr"));
             if (local_bq && local_bq->size() > 0)
             {
-                LOG_INFO("[BIAS_FLOW] local_bq[0:3]: [" << local_bq->data()[0] << ", "
+                LOG_DEBUG("[BIAS_FLOW] local_bq[0:3]: [" << local_bq->data()[0] << ", "
                                                         << local_bq->data()[1] << ", " << local_bq->data()[2] << "]");
             }
         }
@@ -1091,13 +1091,13 @@ namespace llaminar
         // DEBUG: Log Q projection output
         if (layer_index_ == 0)
         {
-            LOG_INFO("[Q_PROJ_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER Q projection:");
+            LOG_DEBUG("[Q_PROJ_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER Q projection:");
             float q_min = *std::min_element(local_q->data(), local_q->data() + local_q->size());
             float q_max = *std::max_element(local_q->data(), local_q->data() + local_q->size());
             float q_sum = std::accumulate(local_q->data(), local_q->data() + local_q->size(), 0.0f);
             float q_mean = q_sum / local_q->size();
-            LOG_INFO("  local_q stats: min=" << q_min << " max=" << q_max << " mean=" << q_mean);
-            LOG_INFO("  local_q[0, 0:10]: [" << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+            LOG_DEBUG("  local_q stats: min=" << q_min << " max=" << q_max << " mean=" << q_mean);
+            LOG_DEBUG("  local_q[0, 0:10]: [" << local_q->data()[0] << ", " << local_q->data()[1] << ", "
                                              << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4] << ", "
                                              << local_q->data()[5] << ", " << local_q->data()[6] << ", " << local_q->data()[7] << ", "
                                              << local_q->data()[8] << ", " << local_q->data()[9] << "]");
@@ -1290,11 +1290,11 @@ namespace llaminar
             // DEBUG: Log local Q before gather
             if (layer_index_ == 0)
             {
-                LOG_INFO("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " BEFORE gather:");
-                LOG_INFO("  local_q shape: [" << seq_len << ", " << local_head_dim << "]");
-                LOG_INFO("  local_head_dim: " << local_head_dim << " (= " << local_heads << " heads * " << head_dim_ << " dims)");
-                LOG_INFO("  Expected rank " << rank << " heads: [" << (rank * local_heads) << ", " << ((rank + 1) * local_heads) << ")");
-                LOG_INFO("  local_q[t=0, first 10]: ["
+                LOG_DEBUG("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " BEFORE gather:");
+                LOG_DEBUG("  local_q shape: [" << seq_len << ", " << local_head_dim << "]");
+                LOG_DEBUG("  local_head_dim: " << local_head_dim << " (= " << local_heads << " heads * " << head_dim_ << " dims)");
+                LOG_DEBUG("  Expected rank " << rank << " heads: [" << (rank * local_heads) << ", " << ((rank + 1) * local_heads) << ")");
+                LOG_DEBUG("  local_q[t=0, first 10]: ["
                          << local_q->data()[0] << ", " << local_q->data()[1] << ", " << local_q->data()[2] << ", "
                          << local_q->data()[3] << ", " << local_q->data()[4] << ", " << local_q->data()[5] << ", "
                          << local_q->data()[6] << ", " << local_q->data()[7] << ", " << local_q->data()[8] << ", "
@@ -1305,7 +1305,7 @@ namespace llaminar
                 {
                     int global_head_idx = rank * local_heads + h;
                     int offset = h * head_dim_;
-                    LOG_INFO("  Head " << global_head_idx << " (local head " << h << ") first 5 dims: ["
+                    LOG_DEBUG("  Head " << global_head_idx << " (local head " << h << ") first 5 dims: ["
                                        << local_q->data()[offset] << ", " << local_q->data()[offset + 1] << ", "
                                        << local_q->data()[offset + 2] << ", " << local_q->data()[offset + 3] << ", "
                                        << local_q->data()[offset + 4] << "]");
@@ -1328,9 +1328,9 @@ namespace llaminar
             // DEBUG: Log global Q after gather
             if (layer_index_ == 0)
             {
-                LOG_INFO("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER gather:");
-                LOG_INFO("  global_q shape: [" << seq_len << ", " << (n_head_ * head_dim_) << "]");
-                LOG_INFO("  global_q[t=0, first 10]: ["
+                LOG_DEBUG("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER gather:");
+                LOG_DEBUG("  global_q shape: [" << seq_len << ", " << (n_head_ * head_dim_) << "]");
+                LOG_DEBUG("  global_q[t=0, first 10]: ["
                          << global_q->data()[0] << ", " << global_q->data()[1] << ", " << global_q->data()[2] << ", "
                          << global_q->data()[3] << ", " << global_q->data()[4] << ", " << global_q->data()[5] << ", "
                          << global_q->data()[6] << ", " << global_q->data()[7] << ", " << global_q->data()[8] << ", "
@@ -1341,18 +1341,18 @@ namespace llaminar
                 {
                     int offset = h * head_dim_;
                     int source_rank = h / local_heads;
-                    LOG_INFO("  Global head " << h << " (from rank " << source_rank << ") first 5 dims: ["
+                    LOG_DEBUG("  Global head " << h << " (from rank " << source_rank << ") first 5 dims: ["
                                               << global_q->data()[offset] << ", " << global_q->data()[offset + 1] << ", "
                                               << global_q->data()[offset + 2] << ", " << global_q->data()[offset + 3] << ", "
                                               << global_q->data()[offset + 4] << "]");
                 }
 
                 // Critical check: verify heads 7 and 8 (boundary between ranks)
-                LOG_INFO("  CRITICAL CHECK - Head boundary (rank 0 last head vs rank 1 first head):");
+                LOG_DEBUG("  CRITICAL CHECK - Head boundary (rank 0 last head vs rank 1 first head):");
                 int h7_offset = 7 * head_dim_;
                 int h8_offset = 8 * head_dim_;
-                LOG_INFO("    Head 7 (rank 0): [" << global_q->data()[h7_offset] << ", " << global_q->data()[h7_offset + 1] << ", " << global_q->data()[h7_offset + 2] << "]");
-                LOG_INFO("    Head 8 (rank 1): [" << global_q->data()[h8_offset] << ", " << global_q->data()[h8_offset + 1] << ", " << global_q->data()[h8_offset + 2] << "]");
+                LOG_DEBUG("    Head 7 (rank 0): [" << global_q->data()[h7_offset] << ", " << global_q->data()[h7_offset + 1] << ", " << global_q->data()[h7_offset + 2] << "]");
+                LOG_DEBUG("    Head 8 (rank 1): [" << global_q->data()[h8_offset] << ", " << global_q->data()[h8_offset + 1] << ", " << global_q->data()[h8_offset + 2] << "]");
             }
 
             // Same for K
@@ -1421,10 +1421,10 @@ namespace llaminar
                     oss << ", ...";
                 }
                 oss << "}";
-                LOG_INFO(oss.str());
+                LOG_DEBUG(oss.str());
             };
 
-            LOG_INFO("[ATTN_K_TRACE] rank=" << rank
+            LOG_DEBUG("[ATTN_K_TRACE] rank=" << rank
                                             << " layer=" << log_layer
                                             << " local_heads=" << local_heads
                                             << " local_kv_heads=" << local_kv_heads
@@ -1465,18 +1465,18 @@ namespace llaminar
         {
             LOG_DEBUG("========== ROPE_APPLICATION DEBUG STEP 1: PRE-ROPE VALIDATION ==========");
             LOG_DEBUG("[ROPE_PARAMS] Parameters being passed to apply_rope():");
-            LOG_INFO("  seq_len: " << seq_len << " (expected: 5 for test prompt)");
-            LOG_INFO("  head_dim: " << head_dim_ << " (expected: 64 for Qwen-0.5B)");
-            LOG_INFO("  local_heads (q_heads param): " << local_heads << " (expected: 7 per rank for 14 total)");
-            LOG_INFO("  local_kv_heads (k_heads param): " << local_kv_heads << " (expected: 1 per rank for 2 total)");
-            LOG_INFO("  n_past: " << n_past_ << " (KV cache position)");
-            LOG_INFO("  rope_freq_base: " << rope_freq_base_ << " (expected: 10000)");
+            LOG_DEBUG("  seq_len: " << seq_len << " (expected: 5 for test prompt)");
+            LOG_DEBUG("  head_dim: " << head_dim_ << " (expected: 64 for Qwen-0.5B)");
+            LOG_DEBUG("  local_heads (q_heads param): " << local_heads << " (expected: 7 per rank for 14 total)");
+            LOG_DEBUG("  local_kv_heads (k_heads param): " << local_kv_heads << " (expected: 1 per rank for 2 total)");
+            LOG_DEBUG("  n_past: " << n_past_ << " (KV cache position)");
+            LOG_DEBUG("  rope_freq_base: " << rope_freq_base_ << " (expected: 10000)");
 
             LOG_DEBUG("[ROPE_TENSORS] Tensor shapes before RoPE:");
-            LOG_INFO("  local_q size: " << local_q->size() << " shape: [" << seq_len << ", " << local_head_dim << "]");
-            LOG_INFO("  local_k size: " << local_k->size() << " shape: [" << seq_len << ", " << local_kv_head_dim << "]");
-            LOG_INFO("  local_head_dim: " << local_head_dim << " = " << local_heads << " heads * " << head_dim_ << " dims");
-            LOG_INFO("  local_kv_head_dim: " << local_kv_head_dim << " = " << local_kv_heads << " heads * " << head_dim_ << " dims");
+            LOG_DEBUG("  local_q size: " << local_q->size() << " shape: [" << seq_len << ", " << local_head_dim << "]");
+            LOG_DEBUG("  local_k size: " << local_k->size() << " shape: [" << seq_len << ", " << local_kv_head_dim << "]");
+            LOG_DEBUG("  local_head_dim: " << local_head_dim << " = " << local_heads << " heads * " << head_dim_ << " dims");
+            LOG_DEBUG("  local_kv_head_dim: " << local_kv_head_dim << " = " << local_kv_heads << " heads * " << head_dim_ << " dims");
 
             LOG_DEBUG("[PRE_ROPE_Q] Token 0, head 0, first 10 dims: ["
                       << local_q->data()[0] << ", " << local_q->data()[1] << ", "
@@ -1539,7 +1539,7 @@ namespace llaminar
         if (layer_index_ == 0)
         {
             LOG_DEBUG("[RANK=" << rank << "] AFTER RoPE:");
-            LOG_INFO("  local_q[token=0, head=0, dim=0:10]: ["
+            LOG_DEBUG("  local_q[token=0, head=0, dim=0:10]: ["
                      << local_q->data()[0] << ", " << local_q->data()[1] << ", "
                      << local_q->data()[2] << ", " << local_q->data()[3] << ", "
                      << local_q->data()[4] << ", " << local_q->data()[5] << ", "
@@ -1547,20 +1547,20 @@ namespace llaminar
                      << local_q->data()[8] << ", " << local_q->data()[9] << "]");
             // Check token 1 (t=1) which SHOULD be rotated (pos=1, non-zero angle)
             int token1_offset = local_head_dim; // Start of second token
-            LOG_INFO("  local_q[token=1, head=0, dim=0:10]: ["
+            LOG_DEBUG("  local_q[token=1, head=0, dim=0:10]: ["
                      << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
                      << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
                      << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
                      << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
                      << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
-            LOG_INFO("  local_k[token=0, head=0, dim=0:10]: ["
+            LOG_DEBUG("  local_k[token=0, head=0, dim=0:10]: ["
                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
                      << local_k->data()[2] << ", " << local_k->data()[3] << ", "
                      << local_k->data()[4] << ", " << local_k->data()[5] << ", "
                      << local_k->data()[6] << ", " << local_k->data()[7] << ", "
                      << local_k->data()[8] << ", " << local_k->data()[9] << "]");
             int k_token1_offset = local_kv_head_dim;
-            LOG_INFO("  local_k[token=1, head=0, dim=0:10]: ["
+            LOG_DEBUG("  local_k[token=1, head=0, dim=0:10]: ["
                      << local_k->data()[k_token1_offset + 0] << ", " << local_k->data()[k_token1_offset + 1] << ", "
                      << local_k->data()[k_token1_offset + 2] << ", " << local_k->data()[k_token1_offset + 3] << ", "
                      << local_k->data()[k_token1_offset + 4] << ", " << local_k->data()[k_token1_offset + 5] << ", "
@@ -1596,13 +1596,13 @@ namespace llaminar
             // DEBUG: Check input cache
             if (rank == 0 && layer_index_ == 0)
             {
-                LOG_INFO("[CACHE_DEBUG] Input K cache (first 10 of first row): "
+                LOG_DEBUG("[CACHE_DEBUG] Input K cache (first 10 of first row): "
                          << k_cache_in->data()[0] << " " << k_cache_in->data()[1] << " "
                          << k_cache_in->data()[2] << " " << k_cache_in->data()[3] << " "
                          << k_cache_in->data()[4] << " " << k_cache_in->data()[5] << " "
                          << k_cache_in->data()[6] << " " << k_cache_in->data()[7] << " "
                          << k_cache_in->data()[8] << " " << k_cache_in->data()[9]);
-                LOG_INFO("  Cache shape: [" << k_cache_in->shape()[0] << ", " << k_cache_in->shape()[1] << "]");
+                LOG_DEBUG("  Cache shape: [" << k_cache_in->shape()[0] << ", " << k_cache_in->shape()[1] << "]");
             }
 
             local_k_cache = TensorFactory::create_simple({attn_seq_len, local_kv_head_dim});
@@ -1624,15 +1624,15 @@ namespace llaminar
 
             if (rank == 0 && layer_index_ == 0)
             {
-                LOG_INFO("[KV_CACHE] Decode: appended " << seq_len << " new tokens to cache");
-                LOG_INFO("  Old cache size: " << cache_seq_len << ", New cache size: " << attn_seq_len);
-                LOG_INFO("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
+                LOG_DEBUG("[KV_CACHE] Decode: appended " << seq_len << " new tokens to cache");
+                LOG_DEBUG("  Old cache size: " << cache_seq_len << ", New cache size: " << attn_seq_len);
+                LOG_DEBUG("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
 
-                LOG_INFO("[CACHE_DEBUG] Updated K cache (first 10 of first 3 rows):");
+                LOG_DEBUG("[CACHE_DEBUG] Updated K cache (first 10 of first 3 rows):");
                 for (int t = 0; t < std::min(3, attn_seq_len); ++t)
                 {
                     int offset = t * local_kv_head_dim;
-                    LOG_INFO("  Row " << t << ": "
+                    LOG_DEBUG("  Row " << t << ": "
                                       << local_k_cache->data()[offset + 0] << " " << local_k_cache->data()[offset + 1] << " "
                                       << local_k_cache->data()[offset + 2] << " " << local_k_cache->data()[offset + 3] << " "
                                       << local_k_cache->data()[offset + 4] << " " << local_k_cache->data()[offset + 5] << " "
@@ -1650,14 +1650,14 @@ namespace llaminar
 
             if (rank == 0 && layer_index_ == 0)
             {
-                LOG_INFO("[KV_CACHE] Prefill: initialized cache with " << seq_len << " tokens");
-                LOG_INFO("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
+                LOG_DEBUG("[KV_CACHE] Prefill: initialized cache with " << seq_len << " tokens");
+                LOG_DEBUG("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
 
-                LOG_INFO("[CACHE_DEBUG] Prefill K cache (first 10 of first 3 rows):");
+                LOG_DEBUG("[CACHE_DEBUG] Prefill K cache (first 10 of first 3 rows):");
                 for (int t = 0; t < std::min(3, attn_seq_len); ++t)
                 {
                     int offset = t * local_kv_head_dim;
-                    LOG_INFO("  Row " << t << ": "
+                    LOG_DEBUG("  Row " << t << ": "
                                       << local_k_cache->data()[offset + 0] << " " << local_k_cache->data()[offset + 1] << " "
                                       << local_k_cache->data()[offset + 2] << " " << local_k_cache->data()[offset + 3] << " "
                                       << local_k_cache->data()[offset + 4] << " " << local_k_cache->data()[offset + 5] << " "
@@ -1680,15 +1680,15 @@ namespace llaminar
             if (rank == 0 && layer_index_ == 0)
             {
                 LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] Gathering ROPE_APPLICATION:");
-                LOG_INFO("  world_size=" << world_size << " local_heads=" << local_heads
+                LOG_DEBUG("  world_size=" << world_size << " local_heads=" << local_heads
                                          << " local_kv_heads=" << local_kv_heads);
-                LOG_INFO("  n_head_=" << n_head_ << " n_head_kv_=" << n_head_kv_ << " head_dim_=" << head_dim_);
-                LOG_INFO("  local_head_dim=" << local_head_dim << " local_kv_head_dim=" << local_kv_head_dim);
-                LOG_INFO("  d_model_=" << d_model_ << " k_v_dim=" << k_v_dim);
-                LOG_INFO("  Expected global Q shape: [" << seq_len << ", " << d_model_ << "]");
-                LOG_INFO("  Expected global K shape: [" << seq_len << ", " << k_v_dim << "]");
-                LOG_INFO("  local_q shape: [" << seq_len << ", " << local_head_dim << "]");
-                LOG_INFO("  local_k shape: [" << seq_len << ", " << local_kv_head_dim << "]");
+                LOG_DEBUG("  n_head_=" << n_head_ << " n_head_kv_=" << n_head_kv_ << " head_dim_=" << head_dim_);
+                LOG_DEBUG("  local_head_dim=" << local_head_dim << " local_kv_head_dim=" << local_kv_head_dim);
+                LOG_DEBUG("  d_model_=" << d_model_ << " k_v_dim=" << k_v_dim);
+                LOG_DEBUG("  Expected global Q shape: [" << seq_len << ", " << d_model_ << "]");
+                LOG_DEBUG("  Expected global K shape: [" << seq_len << ", " << k_v_dim << "]");
+                LOG_DEBUG("  local_q shape: [" << seq_len << ", " << local_head_dim << "]");
+                LOG_DEBUG("  local_k shape: [" << seq_len << ", " << local_kv_head_dim << "]");
             }
 
             // Gather Q, K, and V (post-RoPE) from all ranks
@@ -1713,7 +1713,7 @@ namespace llaminar
                 // DEBUG: Log local_k before gathering (layer 0 only)
                 if (layer_index_ == 0)
                 {
-                    LOG_INFO("[RANK=" << rank << "] Before gather, local_k[t=0, h=0] first 5: "
+                    LOG_DEBUG("[RANK=" << rank << "] Before gather, local_k[t=0, h=0] first 5: "
                                       << local_k->data()[0] << ", " << local_k->data()[1] << ", "
                                       << local_k->data()[2] << ", " << local_k->data()[3] << ", " << local_k->data()[4]);
                 }
@@ -1744,11 +1744,11 @@ namespace llaminar
                 // DEBUG: Log global_k after gathering (layer 0, rank 0 only)
                 if (rank == 0 && layer_index_ == 0)
                 {
-                    LOG_INFO("[RANK=0] After gather, global_k_rope[t=0]:");
-                    LOG_INFO("  offset[0..4] (from rank 0): " << global_k_rope->data()[0] << ", "
+                    LOG_DEBUG("[RANK=0] After gather, global_k_rope[t=0]:");
+                    LOG_DEBUG("  offset[0..4] (from rank 0): " << global_k_rope->data()[0] << ", "
                                                               << global_k_rope->data()[1] << ", " << global_k_rope->data()[2] << ", "
                                                               << global_k_rope->data()[3] << ", " << global_k_rope->data()[4]);
-                    LOG_INFO("  offset[64..68] (from rank 1): " << global_k_rope->data()[64] << ", "
+                    LOG_DEBUG("  offset[64..68] (from rank 1): " << global_k_rope->data()[64] << ", "
                                                                 << global_k_rope->data()[65] << ", " << global_k_rope->data()[66] << ", "
                                                                 << global_k_rope->data()[67] << ", " << global_k_rope->data()[68]);
 
@@ -1758,7 +1758,7 @@ namespace llaminar
                     //        = 3 * 128 + 1 * 64 + 32
                     //        = 384 + 64 + 32 = 480
                     const int failing_offset_in_k = 3 * k_v_dim + 1 * head_dim_ + 32;
-                    LOG_INFO("  CRITICAL CHECK: global_k_rope[token=3, kv_head=1, dim=32] (offset=" << failing_offset_in_k << "): "
+                    LOG_DEBUG("  CRITICAL CHECK: global_k_rope[token=3, kv_head=1, dim=32] (offset=" << failing_offset_in_k << "): "
                                                                                                     << global_k_rope->data()[failing_offset_in_k]);
                 }
 
@@ -1842,9 +1842,9 @@ namespace llaminar
                         const int failing_pos = 992;
                         const int row_size = d_model_ + k_v_dim;
                         const int failing_offset = failing_token * row_size + failing_pos;
-                        LOG_INFO("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
+                        LOG_DEBUG("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
                                                                     << rope_combined->data()[failing_offset]);
-                        LOG_INFO("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
+                        LOG_DEBUG("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
                     }
                 }
 
@@ -1953,11 +1953,11 @@ namespace llaminar
                 if (layer_index_ == 0)
                 {
                     LOG_DEBUG("[RANK=" << rank << "] After transpose to time-major:");
-                    LOG_INFO("  global_k_cache shape: [" << attn_seq_len << ", " << k_v_dim << "]");
-                    LOG_INFO("  global_k_cache[t=0, kv_head=0:1, d=0:5]:");
-                    LOG_INFO("    KV head 0: " << global_k_cache->data()[0] << " " << global_k_cache->data()[1] << " "
+                    LOG_DEBUG("  global_k_cache shape: [" << attn_seq_len << ", " << k_v_dim << "]");
+                    LOG_DEBUG("  global_k_cache[t=0, kv_head=0:1, d=0:5]:");
+                    LOG_DEBUG("    KV head 0: " << global_k_cache->data()[0] << " " << global_k_cache->data()[1] << " "
                                                << global_k_cache->data()[2] << " " << global_k_cache->data()[3] << " " << global_k_cache->data()[4]);
-                    LOG_INFO("    KV head 1: " << global_k_cache->data()[head_dim_] << " " << global_k_cache->data()[head_dim_ + 1] << " "
+                    LOG_DEBUG("    KV head 1: " << global_k_cache->data()[head_dim_] << " " << global_k_cache->data()[head_dim_ + 1] << " "
                                                << global_k_cache->data()[head_dim_ + 2] << " " << global_k_cache->data()[head_dim_ + 3] << " "
                                                << global_k_cache->data()[head_dim_ + 4]);
                 }
@@ -1982,14 +1982,14 @@ namespace llaminar
             if (layer_index_ == 0)
             {
                 LOG_DEBUG("[RANK=" << rank << "] After GQA expansion (using cache):");
-                LOG_INFO("  attn_seq_len=" << attn_seq_len << " (n_past + seq_len)");
-                LOG_INFO("  K_expanded shape: [" << attn_seq_len << ", " << local_head_dim << "]");
-                LOG_INFO("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
+                LOG_DEBUG("  attn_seq_len=" << attn_seq_len << " (n_past + seq_len)");
+                LOG_DEBUG("  K_expanded shape: [" << attn_seq_len << ", " << local_head_dim << "]");
+                LOG_DEBUG("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
                                                  << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
 
                 float k_exp_min = *std::min_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
                 float k_exp_max = *std::max_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
-                LOG_INFO("  K_expanded range: [" << k_exp_min << ", " << k_exp_max << "]");
+                LOG_DEBUG("  K_expanded range: [" << k_exp_min << ", " << k_exp_max << "]");
             }
         }
         else
@@ -2013,52 +2013,52 @@ namespace llaminar
             // DEBUG: Log Q and K before computing scores (layer 0 only)
             if (layer_index_ == 0)
             {
-                LOG_INFO("[RANK=" << rank << "] Before compute_qk_scores for snapshot:");
-                LOG_INFO("  local_q size=" << (local_heads * seq_len * head_dim_)
+                LOG_DEBUG("[RANK=" << rank << "] Before compute_qk_scores for snapshot:");
+                LOG_DEBUG("  local_q size=" << (local_heads * seq_len * head_dim_)
                                            << " shape=[" << seq_len << ", " << (local_heads * head_dim_) << "]");
-                LOG_INFO("  local_k_expanded size=" << (local_heads * attn_seq_len * head_dim_)
+                LOG_DEBUG("  local_k_expanded size=" << (local_heads * attn_seq_len * head_dim_)
                                                     << " shape=[" << attn_seq_len << ", " << (local_heads * head_dim_) << "]");
-                LOG_INFO("  scores shape will be: [" << local_heads << ", " << seq_len << ", " << attn_seq_len << "]");
-                LOG_INFO("  scores total elements: " << scores_size);
+                LOG_DEBUG("  scores shape will be: [" << local_heads << ", " << seq_len << ", " << attn_seq_len << "]");
+                LOG_DEBUG("  scores total elements: " << scores_size);
 
                 // CRITICAL: Verify memory layout expectations
                 LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
-                LOG_INFO("  Expected by compute_qk_scores: Q[token, head, dim] flattened");
-                LOG_INFO("  Index formula: q[i, h, d] = q[(i * heads * head_dim) + (h * head_dim) + d]");
-                LOG_INFO("  For token i=0, head h=0: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = d");
-                LOG_INFO("  For token i=0, head h=1: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (1 * " << head_dim_ << ") + d = " << head_dim_ << " + d");
-                LOG_INFO("  For token i=1, head h=0: offset = (1 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = " << (local_heads * head_dim_) << " + d");
+                LOG_DEBUG("  Expected by compute_qk_scores: Q[token, head, dim] flattened");
+                LOG_DEBUG("  Index formula: q[i, h, d] = q[(i * heads * head_dim) + (h * head_dim) + d]");
+                LOG_DEBUG("  For token i=0, head h=0: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = d");
+                LOG_DEBUG("  For token i=0, head h=1: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (1 * " << head_dim_ << ") + d = " << head_dim_ << " + d");
+                LOG_DEBUG("  For token i=1, head h=0: offset = (1 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = " << (local_heads * head_dim_) << " + d");
 
                 LOG_DEBUG("  Actual Q memory layout after projection:");
-                LOG_INFO("    Q[t=0, h=0, d=0:5]: "
+                LOG_DEBUG("    Q[t=0, h=0, d=0:5]: "
                          << local_q->data()[0] << ", " << local_q->data()[1] << ", "
                          << local_q->data()[2] << ", " << local_q->data()[3] << ", "
                          << local_q->data()[4]);
 
                 int offset_t0_h1 = head_dim_;
-                LOG_INFO("    Q[t=0, h=1, d=0:5]: "
+                LOG_DEBUG("    Q[t=0, h=1, d=0:5]: "
                          << local_q->data()[offset_t0_h1 + 0] << ", " << local_q->data()[offset_t0_h1 + 1] << ", "
                          << local_q->data()[offset_t0_h1 + 2] << ", " << local_q->data()[offset_t0_h1 + 3] << ", "
                          << local_q->data()[offset_t0_h1 + 4]);
 
                 int offset_t1_h0 = local_heads * head_dim_;
-                LOG_INFO("    Q[t=1, h=0, d=0:5]: "
+                LOG_DEBUG("    Q[t=1, h=0, d=0:5]: "
                          << local_q->data()[offset_t1_h0 + 0] << ", " << local_q->data()[offset_t1_h0 + 1] << ", "
                          << local_q->data()[offset_t1_h0 + 2] << ", " << local_q->data()[offset_t1_h0 + 3] << ", "
                          << local_q->data()[offset_t1_h0 + 4]);
 
                 LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] K_expanded tensor layout check:");
-                LOG_INFO("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
+                LOG_DEBUG("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
                                         << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
-                LOG_INFO("    K[t=0, h=0, d=0:5]: "
+                LOG_DEBUG("    K[t=0, h=0, d=0:5]: "
                          << local_k_expanded->data()[0] << ", " << local_k_expanded->data()[1] << ", "
                          << local_k_expanded->data()[2] << ", " << local_k_expanded->data()[3] << ", "
                          << local_k_expanded->data()[4]);
-                LOG_INFO("    K[t=0, h=1, d=0:5]: "
+                LOG_DEBUG("    K[t=0, h=1, d=0:5]: "
                          << local_k_expanded->data()[offset_t0_h1 + 0] << ", " << local_k_expanded->data()[offset_t0_h1 + 1] << ", "
                          << local_k_expanded->data()[offset_t0_h1 + 2] << ", " << local_k_expanded->data()[offset_t0_h1 + 3] << ", "
                          << local_k_expanded->data()[offset_t0_h1 + 4]);
-                LOG_INFO("    K[t=1, h=0, d=0:5]: "
+                LOG_DEBUG("    K[t=1, h=0, d=0:5]: "
                          << local_k_expanded->data()[offset_t1_h0 + 0] << ", " << local_k_expanded->data()[offset_t1_h0 + 1] << ", "
                          << local_k_expanded->data()[offset_t1_h0 + 2] << ", " << local_k_expanded->data()[offset_t1_h0 + 3] << ", "
                          << local_k_expanded->data()[offset_t1_h0 + 4]);
@@ -2070,7 +2070,7 @@ namespace llaminar
                     test_dot += local_q->data()[d] * local_k_expanded->data()[d];
                 }
                 float scale = 1.0f / std::sqrt((float)head_dim_);
-                LOG_INFO("  Expected scores[0,0] = Q[0]·K[0]/sqrt(" << head_dim_ << ") = "
+                LOG_DEBUG("  Expected scores[0,0] = Q[0]·K[0]/sqrt(" << head_dim_ << ") = "
                                                                     << test_dot << " * " << scale << " = " << (test_dot * scale));
             }
 
@@ -2085,8 +2085,8 @@ namespace llaminar
             // DEBUG: Log computed scores (layer 0 only)
             if (layer_index_ == 0)
             {
-                LOG_INFO("[RANK=" << rank << "] After compute_qk_scores:");
-                LOG_INFO("  unmasked_scores[0:5]: " << unmasked_scores[0] << " " << unmasked_scores[1] << " "
+                LOG_DEBUG("[RANK=" << rank << "] After compute_qk_scores:");
+                LOG_DEBUG("  unmasked_scores[0:5]: " << unmasked_scores[0] << " " << unmasked_scores[1] << " "
                                                     << unmasked_scores[2] << " " << unmasked_scores[3] << " " << unmasked_scores[4]);
             }
 
@@ -2115,30 +2115,30 @@ namespace llaminar
                 // DEBUG: Log gathered scores structure (layer 0 only)
                 if (layer_index_ == 0 && rank == 0)
                 {
-                    LOG_INFO("[GATHERED_SCORES_DEBUG] After MPI_Allgatherv:");
-                    LOG_INFO("  global_scores size: " << global_scores.size() << " (expected " << (n_head_ * seq_len * attn_seq_len) << ")");
-                    LOG_INFO("  Will snapshot as [" << (n_head_ * seq_len) << " x " << attn_seq_len << "]");
-                    LOG_INFO("  Rank 0 contributed: " << recvcounts[0] << " elements (heads 0-" << (local_heads - 1) << ")");
-                    LOG_INFO("  Rank 1 contributed: " << recvcounts[1] << " elements (heads " << local_heads << "-" << (n_head_ - 1) << ")");
-                    LOG_INFO("  Rank 0 offset: " << displs[0]);
-                    LOG_INFO("  Rank 1 offset: " << displs[1]);
-                    LOG_INFO("  First 10 elements: ");
+                    LOG_DEBUG("[GATHERED_SCORES_DEBUG] After MPI_Allgatherv:");
+                    LOG_DEBUG("  global_scores size: " << global_scores.size() << " (expected " << (n_head_ * seq_len * attn_seq_len) << ")");
+                    LOG_DEBUG("  Will snapshot as [" << (n_head_ * seq_len) << " x " << attn_seq_len << "]");
+                    LOG_DEBUG("  Rank 0 contributed: " << recvcounts[0] << " elements (heads 0-" << (local_heads - 1) << ")");
+                    LOG_DEBUG("  Rank 1 contributed: " << recvcounts[1] << " elements (heads " << local_heads << "-" << (n_head_ - 1) << ")");
+                    LOG_DEBUG("  Rank 0 offset: " << displs[0]);
+                    LOG_DEBUG("  Rank 1 offset: " << displs[1]);
+                    LOG_DEBUG("  First 10 elements: ");
                     for (int i = 0; i < std::min(10, (int)global_scores.size()); ++i)
                     {
-                        LOG_INFO("    global_scores[" << i << "] = " << global_scores[i]);
+                        LOG_DEBUG("    global_scores[" << i << "] = " << global_scores[i]);
                     }
 
                     // Interpret as 2D: [n_head * seq_len, attn_seq_len]
                     // Row 0 = head 0, token 0 (first attn_seq_len elements)
-                    LOG_INFO("  Row 0 (head 0, token 0): " << global_scores[0] << " " << global_scores[1] << " "
+                    LOG_DEBUG("  Row 0 (head 0, token 0): " << global_scores[0] << " " << global_scores[1] << " "
                                                            << global_scores[2] << " " << global_scores[3] << " " << global_scores[4]);
                     // Row 1 = head 0, token 1
-                    LOG_INFO("  Row 1 (head 0, token 1): " << global_scores[5] << " " << global_scores[6] << " "
+                    LOG_DEBUG("  Row 1 (head 0, token 1): " << global_scores[5] << " " << global_scores[6] << " "
                                                            << global_scores[7] << " " << global_scores[8] << " " << global_scores[9]);
 
                     // Also show what we EXPECT PyTorch to have:
-                    LOG_INFO("  Expected PyTorch row 0 should match our row 0");
-                    LOG_INFO("  Expected PyTorch row 1 should match our row 1");
+                    LOG_DEBUG("  Expected PyTorch row 0 should match our row 0");
+                    LOG_DEBUG("  Expected PyTorch row 1 should match our row 1");
                 }
 
                 if (rank == 0)
@@ -2161,8 +2161,8 @@ namespace llaminar
         // DEBUG: Log masked scores for layer 0
         if (layer_index_ == 0 && rank == 0)
         {
-            LOG_INFO("[MASKED_SCORES_DEBUG] Layer 0, AFTER compute_qk_scores with causal=TRUE:");
-            LOG_INFO("  Head 0, scores[0:6]: " << scores[0] << " " << scores[1] << " "
+            LOG_DEBUG("[MASKED_SCORES_DEBUG] Layer 0, AFTER compute_qk_scores with causal=TRUE:");
+            LOG_DEBUG("  Head 0, scores[0:6]: " << scores[0] << " " << scores[1] << " "
                                                << scores[2] << " " << scores[3] << " " << scores[4] << " " << scores[5]);
         }
 
@@ -2204,9 +2204,9 @@ namespace llaminar
             // DEBUG: Log scores before softmax for layer 0, head 0
             if (layer_index_ == 0 && h == 0 && rank == 0)
             {
-                LOG_INFO("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
-                LOG_INFO("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
-                LOG_INFO("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
+                LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
+                LOG_DEBUG("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
+                LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
                                            << args.scores[2] << " " << args.scores[3] << " "
                                            << args.scores[4] << " " << args.scores[5]);
             }
@@ -2216,14 +2216,14 @@ namespace llaminar
             // DEBUG: Log scores after softmax for layer 0, head 0
             if (layer_index_ == 0 && h == 0 && rank == 0)
             {
-                LOG_INFO("[SOFTMAX_DEBUG] Layer 0, Head 0, AFTER softmax:");
-                LOG_INFO("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
+                LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, AFTER softmax:");
+                LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
                                            << args.scores[2] << " " << args.scores[3] << " "
                                            << args.scores[4] << " " << args.scores[5]);
                 float sum = 0.0f;
                 for (int i = 0; i < attn_seq_len; ++i)
                     sum += args.scores[i];
-                LOG_INFO("  Sum (should be ~1.0): " << sum);
+                LOG_DEBUG("  Sum (should be ~1.0): " << sum);
             }
         }
 
@@ -2515,16 +2515,16 @@ namespace llaminar
 
         if (rank == 0 && layer_index_ == 0)
         {
-            LOG_INFO("[CACHE_RETURN_DEBUG] Before copying to outputs:");
-            LOG_INFO("  local_k_cache shape: [" << local_k_cache->shape()[0] << ", " << local_k_cache->shape()[1] << "]");
-            LOG_INFO("  local_k_cache first 10: "
+            LOG_DEBUG("[CACHE_RETURN_DEBUG] Before copying to outputs:");
+            LOG_DEBUG("  local_k_cache shape: [" << local_k_cache->shape()[0] << ", " << local_k_cache->shape()[1] << "]");
+            LOG_DEBUG("  local_k_cache first 10: "
                      << local_k_cache->data()[0] << " " << local_k_cache->data()[1] << " "
                      << local_k_cache->data()[2] << " " << local_k_cache->data()[3] << " "
                      << local_k_cache->data()[4] << " " << local_k_cache->data()[5] << " "
                      << local_k_cache->data()[6] << " " << local_k_cache->data()[7] << " "
                      << local_k_cache->data()[8] << " " << local_k_cache->data()[9]);
-            LOG_INFO("  outputs[1] shape: [" << outputs[1]->shape()[0] << ", " << outputs[1]->shape()[1] << "]");
-            LOG_INFO("  outputs[1] before copy: "
+            LOG_DEBUG("  outputs[1] shape: [" << outputs[1]->shape()[0] << ", " << outputs[1]->shape()[1] << "]");
+            LOG_DEBUG("  outputs[1] before copy: "
                      << outputs[1]->data()[0] << " " << outputs[1]->data()[1] << " "
                      << outputs[1]->data()[2] << " " << outputs[1]->data()[3] << " "
                      << outputs[1]->data()[4] << " " << outputs[1]->data()[5] << " "
@@ -2540,8 +2540,8 @@ namespace llaminar
 
         if (rank == 0 && layer_index_ == 0)
         {
-            LOG_INFO("[CACHE_RETURN_DEBUG] After copying to outputs:");
-            LOG_INFO("  outputs[1] after copy: "
+            LOG_DEBUG("[CACHE_RETURN_DEBUG] After copying to outputs:");
+            LOG_DEBUG("  outputs[1] after copy: "
                      << outputs[1]->data()[0] << " " << outputs[1]->data()[1] << " "
                      << outputs[1]->data()[2] << " " << outputs[1]->data()[3] << " "
                      << outputs[1]->data()[4] << " " << outputs[1]->data()[5] << " "
