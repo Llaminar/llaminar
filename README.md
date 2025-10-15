@@ -93,10 +93,15 @@ Llaminar includes a dedicated `--benchmark` mode for clean performance measureme
 ### Running Benchmarks
 
 ```bash
-# Basic benchmark with canonical launcher
+# Standard benchmark (both phases with intelligent defaults)
+# Automatically generates ~512 token prompt if -p not provided
+# Default: 128 decode tokens
+./run_llaminar.sh --benchmark -m models/qwen2.5-0.5b-instruct-q8_0.gguf
+
+# Custom prompt and decode length
 ./run_llaminar.sh --benchmark \
   -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
-  -p "Your prompt here" \
+  -p "Your custom prompt here" \
   -n 50
 
 # Direct MPI execution (2 processes)
@@ -107,15 +112,37 @@ mpirun -np 2 --bind-to socket --map-by socket \
   -n 100
 ```
 
+### Phase-Specific Benchmarking
+
+**Prefill-Only** (skip decode, useful for testing large context processing):
+```bash
+./run_llaminar.sh --benchmark -m model.gguf -p "Long prompt..." -n 0
+```
+
+**Decode-Only** (skip prefill, useful for testing autoregressive generation):
+```bash
+./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128
+```
+
+### Benchmark Defaults
+
+- **Prefill**: Automatically generates ~512 token prompt with mixed technical/narrative content if `-p` not provided
+- **Decode**: Default 128 tokens (`-n 128`)
+- **Sampling**: Greedy (argmax) for deterministic results
+- **Logging**: ERROR level only for clean output
+- **Phase Control**: Set `-n 0` for prefill-only or `-p ""` for decode-only
+
 ### Benchmark Output
 
 The benchmark mode provides:
 - **Clean formatted output** with box-drawing characters
 - **Separate metrics** for prefill and decode phases
 - **Tokens/second throughput** for each phase and total
-- **Generated text preview** to verify model functionality
+- **Generated text preview** to verify model functionality (decode only)
 - **Minimal logging** (ERROR level only) for accurate timing
+- **Phase skipping** - Shows "(SKIPPED)" for omitted phases, omits TOTAL when only one phase runs
 
+**Standard Benchmark (both phases):**
 ```
 Tokenizing prompt... done (8 tokens)
 Tokens: [840, 20772, 5662, 6832, 304, 4285, 3793, 13]
@@ -148,6 +175,30 @@ Machine learning is a type of artificial intelligence...
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
+**Prefill-Only (`-n 0`):**
+```
+╔══════════════════════════════════════════════════════════════╗
+║ PREFILL PHASE                                                ║
+║   Tokens:            512 tokens                              ║
+║   Time:         15234.78 ms                                 ║
+║   Throughput:      33.60 tok/s                             ║
+╠══════════════════════════════════════════════════════════════╣
+║ DECODE PHASE                                (SKIPPED)        ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+**Decode-Only (`-p ""`):**
+```
+╔══════════════════════════════════════════════════════════════╗
+║ PREFILL PHASE                                   (SKIPPED)    ║
+╠══════════════════════════════════════════════════════════════╣
+║ DECODE PHASE                                                 ║
+║   Tokens:            128 tokens                              ║
+║   Time:        123456.78 ms                                 ║
+║   Throughput:       1.04 tok/s                             ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
 ### Benchmark Tips
 
 - **Use Release builds** for accurate performance measurement (Debug builds are 5-10x slower)
@@ -155,6 +206,45 @@ Machine learning is a type of artificial intelligence...
 - **Control decode length** with `-n` flag to measure sustained decode performance
 - **Disable instrumentation** - Ensure environment variables like `LLAMINAR_COSMA_VALIDATE_TILE` are unset
 - **Greedy sampling** - Benchmark uses greedy sampling for deterministic, reproducible results
+- **Phase-specific tests** - Use `-n 0` or `-p ""` to isolate prefill or decode performance
+
+## Performance Optimization
+
+### NUMA-Aware Memory Allocation
+
+Llaminar automatically optimizes memory allocation for NUMA (Non-Uniform Memory Access) systems to ensure tensor data is local to the CPU cores that will access it, significantly improving performance for large models.
+
+**Optimized Allocations:**
+- **Model Weights** (ModelLoader): Multi-GB weight tensors use parallel first-touch initialization
+- **K/V Cache** (SimpleTensor): 96MB-4GB cache tensors allocated with NUMA locality
+- **Activation Tensors** (SimpleTensor): Large intermediate activations (≥128KB) use parallel initialization
+
+**Configuration:**
+```bash
+# NUMA optimization enabled by default
+# Disable if needed:
+export LLAMINAR_NUMA_FIRST_TOUCH=0
+
+# Enable diagnostic logging to verify NUMA locality:
+export LLAMINAR_NUMA_VERIFY_LOCALITY=1
+```
+
+**How It Works:**
+- Allocations ≥128KB trigger parallel initialization using OpenMP
+- Each thread initializes its portion of the tensor ("first-touch" policy)
+- Operating system places memory pages on the NUMA node where they're first accessed
+- Ensures data locality for subsequent access by the same threads
+
+**Performance Impact:**
+- Small models (≤1B): +1-3% improvement
+- Large models (7B-13B): +10-40% improvement on multi-socket systems
+- Most significant for K/V cache access patterns during decode
+
+**Implementation Details:**
+- Threshold: 128KB (matches ModelLoader for consistency)
+- Method: Parallel `std::fill` in `SimpleTensor::resize()` and constructor
+- Thread count: Uses `omp_get_max_threads()` (auto-detected from system)
+- Files: `src/tensors/SimpleTensor.h`, `src/ModelLoader.cpp`
 
 ## Development Profiling (Advanced)
 

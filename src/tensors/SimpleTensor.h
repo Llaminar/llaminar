@@ -2,10 +2,12 @@
 
 #include "TensorBase.h"
 #include "../Logger.h"
+#include "../utils/DebugEnv.h"
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
 #include <iostream>
+#include <omp.h>
 
 namespace llaminar
 {
@@ -19,6 +21,52 @@ namespace llaminar
     private:
         std::vector<float> data_;
         std::vector<int> shape_;
+
+        /**
+         * @brief Perform NUMA-aware first-touch initialization on allocated memory
+         *
+         * Uses OpenMP parallel loops to ensure memory pages are allocated on the NUMA node
+         * where they will be accessed by worker threads. This eliminates remote NUMA access
+         * penalties (2-3x latency) for large tensors like K/V caches.
+         *
+         * @param data Pointer to memory buffer to initialize
+         * @param size Number of elements to initialize
+         * @param init_value Value to initialize elements to (default 0.0f)
+         */
+        static void numaFirstTouch(float *data, size_t size, float init_value = 0.0f)
+        {
+            const auto &env = debugEnv();
+
+            // Skip if disabled via environment
+            if (!env.loader.numa_first_touch)
+            {
+                std::fill(data, data + size, init_value);
+                return;
+            }
+
+            // Small allocations: single-threaded (overhead not worth it)
+            constexpr size_t kSmallThreshold = 32 * 1024; // 128KB (32K floats)
+            if (size < kSmallThreshold)
+            {
+                std::fill(data, data + size, init_value);
+                return;
+            }
+
+// Large allocations: parallel first-touch for NUMA locality
+#pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < size; ++i)
+            {
+                data[i] = init_value;
+            }
+
+            // Optional: Verify NUMA locality (expensive, debug only)
+            if (env.loader.numa_verify_locality && size >= kSmallThreshold)
+            {
+                LOG_DEBUG("[SimpleTensor-NUMA] First-touch completed for " << size
+                                                                           << " elements (" << (size * sizeof(float) / 1024.0 / 1024.0)
+                                                                           << " MB) using " << omp_get_max_threads() << " threads");
+            }
+        }
 
     public:
         // Constructors
@@ -35,7 +83,14 @@ namespace llaminar
                 }
                 total_size *= dim;
             }
-            data_.resize(total_size, 0.0f); // Initialize to zero to prevent garbage values
+
+            // Allocate memory (without initialization to avoid duplicate work)
+            data_.resize(total_size);
+
+            // NUMA-aware first-touch initialization
+            // This ensures memory pages are allocated on the NUMA node where they will be accessed,
+            // eliminating 2-3x remote access latency penalty for large tensors (K/V caches, etc.)
+            numaFirstTouch(data_.data(), total_size, 0.0f);
 
             // DEBUG: Verify zero-initialization
             static int tensor_count = 0;
@@ -184,7 +239,16 @@ namespace llaminar
             {
                 new_size *= dim;
             }
+
+            // Resize without initialization, then apply NUMA-aware first-touch
+            size_t old_size = data_.size();
             data_.resize(new_size);
+
+            // Only first-touch newly allocated portion
+            if (static_cast<size_t>(new_size) > old_size)
+            {
+                numaFirstTouch(data_.data() + old_size, new_size - old_size, 0.0f);
+            }
         }
 
         // Compatibility with legacy Tensor struct

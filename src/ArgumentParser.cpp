@@ -190,6 +190,27 @@ bool ArgumentParser::parse(LlaminarParams &params)
         {
             params.benchmark_mode = true;
             params.inference_mode = true; // benchmark implies inference
+
+            // Set default benchmark parameters if not already specified
+            // Default: 512-token prefill, 128-token decode
+            if (params.prompt.empty())
+            {
+                // Generate a prompt that will tokenize to ~512 tokens
+                // Using repetitive text to ensure consistent tokenization
+                params.prompt = "The quick brown fox jumps over the lazy dog. "
+                                "This is a benchmark test to measure inference performance. "
+                                "We need to generate approximately 512 tokens for the prefill phase "
+                                "to properly stress test the model's throughput and latency characteristics. ";
+
+                // Repeat the base text to reach ~512 tokens (each repetition is ~20-25 tokens)
+                std::string base_prompt = params.prompt;
+                for (int i = 0; i < 18; ++i) // 20 repetitions total = ~400-500 tokens
+                {
+                    params.prompt += base_prompt;
+                }
+            }
+
+            // n_predict already defaults to 128 in LlaminarParams, which is correct for decode phase
         }
         else if (arg == "--help" || arg == "-h")
         {

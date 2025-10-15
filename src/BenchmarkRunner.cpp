@@ -30,21 +30,47 @@ namespace llaminar
             std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
             std::cout << "║ Model: " << std::left << std::setw(54) << model_path << "║\n";
             std::cout << "║ Backend: " << std::left << std::setw(52) << backend << "║\n";
-            std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
-            std::cout << "║ PREFILL PHASE                                                ║\n";
-            std::cout << "║   Tokens:       " << std::right << std::setw(8) << prefill_tokens << " tokens                              ║\n";
-            std::cout << "║   Time:         " << std::right << std::setw(9) << std::fixed << std::setprecision(2) << prefill_time_ms << " ms                                 ║\n";
-            std::cout << "║   Throughput:   " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << prefill_tokens_per_sec << " tok/s                             ║\n";
-            std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
-            std::cout << "║ DECODE PHASE                                                 ║\n";
-            std::cout << "║   Tokens:       " << std::right << std::setw(8) << decode_tokens << " tokens                              ║\n";
-            std::cout << "║   Time:         " << std::right << std::setw(9) << std::fixed << std::setprecision(2) << decode_time_ms << " ms                                 ║\n";
-            std::cout << "║   Throughput:   " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << decode_tokens_per_sec << " tok/s                             ║\n";
-            std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
-            std::cout << "║ TOTAL                                                        ║\n";
-            std::cout << "║   Tokens:       " << std::right << std::setw(8) << (prefill_tokens + decode_tokens) << " tokens                              ║\n";
-            std::cout << "║   Time:         " << std::right << std::setw(9) << std::fixed << std::setprecision(2) << total_time_ms << " ms                                 ║\n";
-            std::cout << "║   Throughput:   " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << total_tokens_per_sec << " tok/s                             ║\n";
+
+            // Only show prefill phase if tokens > 0
+            if (prefill_tokens > 0)
+            {
+                std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+                std::cout << "║ PREFILL PHASE                                                ║\n";
+                std::cout << "║   Tokens:       " << std::right << std::setw(8) << prefill_tokens << " tokens                              ║\n";
+                std::cout << "║   Time:         " << std::right << std::setw(9) << std::fixed << std::setprecision(2) << prefill_time_ms << " ms                                 ║\n";
+                std::cout << "║   Throughput:   " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << prefill_tokens_per_sec << " tok/s                             ║\n";
+            }
+            else
+            {
+                std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+                std::cout << "║ PREFILL PHASE                                   (SKIPPED)    ║\n";
+            }
+
+            // Only show decode phase if tokens > 0
+            if (decode_tokens > 0)
+            {
+                std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+                std::cout << "║ DECODE PHASE                                                 ║\n";
+                std::cout << "║   Tokens:       " << std::right << std::setw(8) << decode_tokens << " tokens                              ║\n";
+                std::cout << "║   Time:         " << std::right << std::setw(9) << std::fixed << std::setprecision(2) << decode_time_ms << " ms                                 ║\n";
+                std::cout << "║   Throughput:   " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << decode_tokens_per_sec << " tok/s                             ║\n";
+            }
+            else
+            {
+                std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+                std::cout << "║ DECODE PHASE                                    (SKIPPED)    ║\n";
+            }
+
+            // Show total only if both phases ran
+            if (prefill_tokens > 0 && decode_tokens > 0)
+            {
+                std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+                std::cout << "║ TOTAL                                                        ║\n";
+                std::cout << "║   Tokens:       " << std::right << std::setw(8) << (prefill_tokens + decode_tokens) << " tokens                              ║\n";
+                std::cout << "║   Time:         " << std::right << std::setw(9) << std::fixed << std::setprecision(2) << total_time_ms << " ms                                 ║\n";
+                std::cout << "║   Throughput:   " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << total_tokens_per_sec << " tok/s                             ║\n";
+            }
+
             std::cout << "╚══════════════════════════════════════════════════════════════╝\n";
             std::cout << "\n";
         }
@@ -97,40 +123,70 @@ namespace llaminar
             metrics.prefill_tokens = token_count;
 
             // ============================================
-            // PREFILL PHASE
+            // PREFILL PHASE (skip if token_count == 0)
             // ============================================
-            auto prefill_start = std::chrono::high_resolution_clock::now();
-
-            // Run prefill (all tokens at once)
             StageContext stage_ctx;
-            if (!pipeline.prefill(tokens, weights, stage_ctx))
+
+            if (token_count > 0)
+            {
+                auto prefill_start = std::chrono::high_resolution_clock::now();
+
+                // Run prefill (all tokens at once)
+                if (!pipeline.prefill(tokens, weights, stage_ctx))
+                {
+                    if (rank == 0)
+                    {
+                        std::cerr << "\nPrefill failed!\n";
+                    }
+                    return metrics;
+                }
+
+                auto prefill_end = std::chrono::high_resolution_clock::now();
+                metrics.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
+                metrics.prefill_tokens_per_sec = (metrics.prefill_tokens * 1000.0) / metrics.prefill_time_ms;
+
+                if (rank == 0)
+                {
+                    std::cout << " done (" << std::fixed << std::setprecision(2)
+                              << metrics.prefill_time_ms << " ms, "
+                              << metrics.prefill_tokens_per_sec << " tok/s)\n";
+                    std::cout << "Running decode..." << std::flush;
+                }
+            }
+            else
             {
                 if (rank == 0)
                 {
-                    std::cerr << "\nPrefill failed!\n";
+                    std::cout << " skipped (0 tokens)\n";
+                    std::cout << "Running decode..." << std::flush;
                 }
+            }
+
+            // ============================================
+            // DECODE PHASE (skip if n_predict == 0)
+            // ============================================
+            std::vector<int> generated_tokens;
+            int max_new_tokens = params.n_predict;
+
+            if (max_new_tokens == 0)
+            {
+                if (rank == 0)
+                {
+                    std::cout << " skipped (0 tokens requested)\n";
+                }
+
+                // Finalize metrics
+                metrics.decode_tokens = 0;
+                metrics.decode_time_ms = 0.0;
+                metrics.decode_tokens_per_sec = 0.0;
+                metrics.total_time_ms = metrics.prefill_time_ms;
+                metrics.total_tokens_per_sec = metrics.prefill_tokens_per_sec;
+                metrics.backend = "OpenBLAS";
+
                 return metrics;
             }
 
-            auto prefill_end = std::chrono::high_resolution_clock::now();
-            metrics.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
-            metrics.prefill_tokens_per_sec = (metrics.prefill_tokens * 1000.0) / metrics.prefill_time_ms;
-
-            if (rank == 0)
-            {
-                std::cout << " done (" << std::fixed << std::setprecision(2)
-                          << metrics.prefill_time_ms << " ms, "
-                          << metrics.prefill_tokens_per_sec << " tok/s)\n";
-                std::cout << "Running decode..." << std::flush;
-            }
-
-            // ============================================
-            // DECODE PHASE
-            // ============================================
             auto decode_start = std::chrono::high_resolution_clock::now();
-
-            std::vector<int> generated_tokens;
-            int max_new_tokens = params.n_predict;
 
             // Get EOS token ID
             int32_t eos_token = tokenizer.getSpecialToken("<|endoftext|>");

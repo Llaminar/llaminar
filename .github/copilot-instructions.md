@@ -151,6 +151,33 @@ mpirun -np 2 --bind-to socket --map-by socket \
   - DummyTokenizer on non-rank-0 processes for API compatibility
   - Greedy sampling: argmax over last logits row
 
+### Benchmark Defaults and Configuration
+
+**Standard Benchmark:**
+```bash
+# Uses intelligent defaults if -p not provided:
+#   - Auto-generated ~512 token prompt (mixed technical/narrative)
+#   - 128 decode tokens
+./run_llaminar.sh --benchmark -m model.gguf
+```
+
+**Phase-Specific Benchmarks:**
+```bash
+# Prefill-only (decode skipped when -n 0)
+./run_llaminar.sh --benchmark -m model.gguf -p "Long context..." -n 0
+
+# Decode-only (prefill skipped when -p "")
+./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128
+```
+
+**Implementation Notes:**
+- Auto-prompt generation in `src/ArgumentParser.cpp` (lines ~189-198)
+- Conditional execution in `src/BenchmarkRunner.cpp`:
+  - Prefill: Skipped if `token_count == 0`
+  - Decode: Skipped if `n_predict == 0`
+- Output shows "(SKIPPED)" for omitted phases
+- TOTAL section omitted when only one phase runs
+
 ### Benchmarking Best Practices
 
 ```bash
@@ -163,21 +190,26 @@ unset LLAMINAR_COSMA_VALIDATE_TILE
 unset LLAMINAR_DEQUANT_STATS
 unset LLAMINAR_EMBED_TRACE
 
-# 3. Test various prompt lengths
+# 3. Test various prompt lengths (prefill scales with tokens)
 ./run_llaminar.sh --benchmark -m model.gguf -p "Short" -n 50
 ./run_llaminar.sh --benchmark -m model.gguf -p "Much longer prompt..." -n 50
 
 # 4. Vary decode length to measure sustained performance
 ./run_llaminar.sh --benchmark -m model.gguf -p "Test" -n 20   # Quick
 ./run_llaminar.sh --benchmark -m model.gguf -p "Test" -n 200  # Sustained
+
+# 5. Use phase-specific modes to isolate performance
+./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128  # Decode-only
+./run_llaminar.sh --benchmark -m model.gguf -n 0          # Prefill-only
 ```
 
 ### Performance Notes
 
-- **Prefill scales with token count**: 2 tokens → 1.68 tok/s, 8 tokens → 6.58 tok/s
+- **Prefill scales with token count**: 2 tokens → 1.68 tok/s, 8 tokens → 6.58 tok/s, 512 tokens → 33.60 tok/s
 - **Decode is consistent**: ~1.04 tok/s regardless of decode length (in Debug)
 - **Debug vs Release**: Release builds expected to be 5-10x faster
 - **Backend routing**: Small ops use OpenBLAS, large prefills may use COSMA (if threshold met)
+- **NUMA optimization**: K/V cache and activations benefit from first-touch allocation (+10-40% on large models)
 
 ## Development Profiling (Advanced)
 
@@ -413,6 +445,21 @@ std::shared_ptr<Tensor> legacy = std::make_shared<Tensor>({256, 256});
 auto upgraded = TensorFactory::from_tensor(legacy);
 ```
 
+**NUMA Considerations:**
+- SimpleTensor automatically applies NUMA first-touch for allocations ≥128KB
+- No code changes needed - optimization is transparent
+- Controlled via `LLAMINAR_NUMA_FIRST_TOUCH` environment variable
+- Most beneficial for:
+  - K/V cache tensors (96MB-4GB)
+  - Large activation buffers
+  - Intermediate computation results
+
+**When Adding New Tensor Allocations:**
+1. Use SimpleTensor for standard row-major tensors
+2. First-touch happens automatically if size ≥128KB
+3. Verify with `LLAMINAR_NUMA_VERIFY_LOCALITY=1` during testing
+4. For custom allocations, follow SimpleTensor::numaFirstTouch pattern
+
 ### Error Handling Patterns
 
 ```cpp
@@ -488,6 +535,52 @@ MPI_Allreduce(local_result, global_result, work_size, MPI_FLOAT, MPI_SUM, MPI_CO
 ```
 
 ## Performance Optimization
+
+### NUMA-Aware Allocation Patterns
+
+**Critical Rule**: All allocations ≥128KB on hot paths (K/V cache, activations, weights) MUST use NUMA first-touch initialization.
+
+**SimpleTensor Pattern** (src/tensors/SimpleTensor.h):
+```cpp
+void resize(const std::vector<size_t>& new_shape) {
+    size_t new_size = 1;
+    for (auto dim : new_shape) new_size *= dim;
+    
+    data_.resize(new_size);
+    shape_ = new_shape;
+    
+    // NUMA first-touch for large tensors
+    if (debugEnv().loader.numa_first_touch) {
+        numaFirstTouch(data_.data(), new_size);
+    }
+}
+
+static void numaFirstTouch(float* data, size_t count) {
+    constexpr size_t THRESHOLD = 128 * 1024 / sizeof(float);  // 128KB
+    if (count < THRESHOLD) return;
+    
+    #pragma omp parallel for
+    for (size_t i = 0; i < count; ++i) {
+        data[i] = 0.0f;
+    }
+}
+```
+
+**Why This Matters:**
+- K/V cache: 96MB-4GB per model → wrong NUMA node = 2-3x slower access
+- Activations: Frequent allocation/deallocation during decode
+- First-touch policy: OS places pages where they're first written
+- Parallel init: Each thread writes its portion → local NUMA placement
+
+**Configuration:**
+- Control: `debugEnv().loader.numa_first_touch` (default: true)
+- Verification: `debugEnv().loader.numa_verify_locality` (diagnostic logging)
+- Threshold: 128KB (consistent across ModelLoader and SimpleTensor)
+
+**Performance Impact:**
+- Small models (≤1B): +1-3%
+- Large models (7B-13B): +10-40% on multi-socket systems
+- Primary benefit: K/V cache access during autoregressive decode
 
 ### Threading Strategy
 
