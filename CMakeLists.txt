@@ -1069,6 +1069,13 @@ if(GTEST_FOUND)
     set_tests_properties(MPIEmbeddingKernelExtendedTest PROPERTIES TIMEOUT 120)
     set_tests_properties(MPIEmbeddingKernelExtendedTest PROPERTIES LABELS "embedding;extended")
     
+    # MPI Embedding Batch support test
+    add_executable(test_mpi_embedding_batch tests/test_mpi_embedding_batch.cpp)
+    target_link_libraries(test_mpi_embedding_batch llaminar_core GTest::gtest)
+    add_llaminar_mpi_test(MPIEmbeddingBatchTest 2 test_mpi_embedding_batch)
+    set_tests_properties(MPIEmbeddingBatchTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(MPIEmbeddingBatchTest PROPERTIES LABELS "embedding;batch")
+    
     # MPI Transformer Pipeline test
     add_executable(test_mpi_transformer_pipeline tests/TestMpiTransformerPipeline.cpp)
     target_link_libraries(test_mpi_transformer_pipeline llaminar_core)

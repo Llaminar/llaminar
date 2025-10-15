@@ -15,6 +15,11 @@ namespace llaminar
      * - Each rank handles a subset of the vocabulary entries
      * - Token lookups use MPI_Allgather for distributed access
      * - Embedding table is sharded across ranks to reduce memory usage
+     * 
+     * Batch Support:
+     * - Accepts 1D [seq_len] or 2D [batch, seq_len] token ID tensors
+     * - Outputs [seq_len, embedding_dim] or [batch, seq_len, embedding_dim]
+     * - Processes all tokens in flattened order for efficiency
      */
     class MPIEmbeddingOperator : public MPIKernelBase
     {

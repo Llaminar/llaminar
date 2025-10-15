@@ -407,16 +407,17 @@ namespace llaminar
         // TENSOR DIMENSIONALITY REFERENCE
         // ========================================================================
         // Extract inputs with explicit dimensions:
-        //   token_ids_tensor:    [seq_len]                           - Input token IDs (int32)
+        //   token_ids_tensor:    [seq_len] OR [batch, seq_len]       - Input token IDs (int32)
         //   embedding_table:     [vocab_size, embedding_dim] OR      - Full embedding table, OR
         //                        [embedding_dim, vocab_size] if transposed, OR
         //                        [local_vocab_size, embedding_dim]   - Sharded per-rank portion
         //
         // Outputs:
-        //   output:              [seq_len, embedding_dim]            - Embedded token vectors
+        //   output:              [seq_len, embedding_dim] OR         - Embedded token vectors (1D input)
+        //                        [batch, seq_len, embedding_dim]     - Batched embeddings (2D input)
         //
         // Internal buffers:
-        //   local_output:        [seq_len, embedding_dim]            - Per-rank partial embeddings
+        //   local_output:        Same shape as output                - Per-rank partial embeddings
         //                                                              (zeros for non-owned tokens if sharded)
         // ========================================================================
 
@@ -424,11 +425,23 @@ namespace llaminar
         auto embedding_table = inputs[1];
         auto output = outputs[0];
 
-        size_t seq_len = token_ids_tensor->shape()[0];
+        // Handle both 1D [seq_len] and 2D [batch, seq_len] inputs
+        size_t batch_size = 1;
+        size_t seq_len = 0;
+        if (token_ids_tensor->shape().size() == 1)
+        {
+            seq_len = token_ids_tensor->shape()[0];
+        }
+        else  // 2D [batch, seq_len]
+        {
+            batch_size = token_ids_tensor->shape()[0];
+            seq_len = token_ids_tensor->shape()[1];
+        }
+        size_t total_tokens = batch_size * seq_len;
 
-        // Extract token IDs
-        std::vector<int> token_ids(seq_len);
-        std::copy(token_ids_tensor->data(), token_ids_tensor->data() + seq_len, token_ids.begin());
+        // Extract token IDs (flatten if batched)
+        std::vector<int> token_ids(total_tokens);
+        std::copy(token_ids_tensor->data(), token_ids_tensor->data() + total_tokens, token_ids.begin());
 
         const EmbeddingDebugConfig &debug_config = getEmbeddingDebugConfig();
         const bool debug_enabled = debug_config.enabled;
@@ -444,31 +457,44 @@ namespace llaminar
         LOG_DEBUG("MPIEmbeddingOperator execute: full_table_mode=" << full_table_mode
                                                                  << " transposed=" << transposed
                                                                  << " shape=[" << embedding_table->shape()[0]
-                                                                 << ", " << embedding_table->shape()[1] << "] seq_len=" << seq_len);
+                                                                 << ", " << embedding_table->shape()[1] << "] batch=" << batch_size
+                                                                 << " seq_len=" << seq_len);
 
         // Create local output buffer for this rank's contribution
-        auto local_output = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(embedding_dim_)});
-        std::fill(local_output->data(), local_output->data() + seq_len * embedding_dim_, 0.0f);
+        // Shape matches output: [seq_len, embedding_dim] or [batch, seq_len, embedding_dim]
+        std::vector<int> local_output_shape;
+        if (batch_size > 1)
+        {
+            local_output_shape = {static_cast<int>(batch_size), static_cast<int>(seq_len), static_cast<int>(embedding_dim_)};
+        }
+        else
+        {
+            local_output_shape = {static_cast<int>(seq_len), static_cast<int>(embedding_dim_)};
+        }
+        auto local_output = TensorFactory::create_simple(local_output_shape);
+        std::fill(local_output->data(), local_output->data() + total_tokens * embedding_dim_, 0.0f);
 
         // Local embedding lookup (all tokens if full table, owned tokens if sharded)
+        // Process all tokens (batch_size * seq_len) in flat order
         computeLocalEmbedding(token_ids.data(), embedding_table->data(),
-                              local_output->data(), seq_len, embedding_dim_, full_table_mode, transposed,
+                              local_output->data(), total_tokens, embedding_dim_, full_table_mode, transposed,
                               embedding_table->shape()[0], embedding_table->shape()[1]);
 
         if (debug_enabled)
         {
             logEmbeddingBufferDiagnostics(rank_, "local_pre_gather", local_output->data(),
-                                          seq_len, embedding_dim_, token_ids);
+                                          total_tokens, embedding_dim_, token_ids);
         }
 
         // Gather embeddings (Allreduce for sharded, copy for full table mode)
-        gatherEmbeddings(local_output, output, seq_len, embedding_dim_, full_table_mode);
+        gatherEmbeddings(local_output, output, total_tokens, embedding_dim_, full_table_mode);
 
         // Log embedding output values to verify consistency across ranks
-        if (seq_len > 0)
+        if (total_tokens > 0)
         {
             const float *out_ptr = output->data();
-            LOG_INFO("[EmbedOutput] rank=" << rank_ << " token[0]=" << token_ids[0]
+            LOG_INFO("[EmbedOutput] rank=" << rank_ << " batch=" << batch_size
+                                           << " seq_len=" << seq_len << " token[0]=" << token_ids[0]
                                            << " emb_out[0:10]: ["
                                            << out_ptr[0] << ", " << out_ptr[1] << ", " << out_ptr[2] << ", "
                                            << out_ptr[3] << ", " << out_ptr[4] << ", " << out_ptr[5] << ", "
@@ -479,12 +505,12 @@ namespace llaminar
         if (debug_enabled)
         {
             logEmbeddingBufferDiagnostics(rank_, "global_post_gather", output->data(),
-                                          seq_len, embedding_dim_, token_ids);
+                                          total_tokens, embedding_dim_, token_ids);
 
             if (!full_table_mode)
             {
                 const float owned_diff = computeOwnedTokenMaxAbsDiff(
-                    local_output->data(), output->data(), seq_len, embedding_dim_,
+                    local_output->data(), output->data(), total_tokens, embedding_dim_,
                     token_ids, local_vocab_start_, local_vocab_end_);
                 LOG_TRACE("MPIEmbeddingOperator gather diff rank=" << rank_
                                                                  << " owned_token_max_abs_diff=" << owned_diff);
@@ -514,10 +540,10 @@ namespace llaminar
             return false;
         }
 
-        // Check token_ids is 1D
-        if (token_ids->shape().size() != 1)
+        // Check token_ids is 1D [seq_len] or 2D [batch, seq_len]
+        if (token_ids->shape().size() != 1 && token_ids->shape().size() != 2)
         {
-            LOG_ERROR("MPIEmbeddingOperator: Token IDs must be 1D, got "
+            LOG_ERROR("MPIEmbeddingOperator: Token IDs must be 1D or 2D, got "
                       << token_ids->shape().size() << " dimensions");
             return false;
         }
@@ -554,13 +580,36 @@ namespace llaminar
         LOG_DEBUG("MPIEmbeddingOperator validate: full_table_mode_=" << full_table_mode_ << " transposed_=" << transposed_
                                                                    << " table_shape=[" << r0 << ", " << r1 << "]");
 
-        // Output must be [seq_len, embedding_dim]
-        size_t seq_len = token_ids->shape()[0];
-        if (output->shape().size() != 2 || output->shape()[0] != seq_len || output->shape()[1] != embedding_dim_)
+        // Output validation - handle both 1D and 2D token ID inputs
+        if (token_ids->shape().size() == 1)
         {
-            LOG_ERROR("MPIEmbeddingOperator: Output shape mismatch. Expected [" << seq_len << ", " << embedding_dim_ << "], got ["
-                                                                              << output->shape()[0] << ", " << output->shape()[1] << "]");
-            return false;
+            // 1D input [seq_len] -> 2D output [seq_len, embedding_dim]
+            size_t seq_len = token_ids->shape()[0];
+            if (output->shape().size() != 2 || 
+                output->shape()[0] != seq_len || 
+                output->shape()[1] != embedding_dim_)
+            {
+                LOG_ERROR("MPIEmbeddingOperator: Output shape mismatch for 1D input. Expected [" 
+                          << seq_len << ", " << embedding_dim_ << "], got ["
+                          << output->shape()[0] << ", " << output->shape()[1] << "]");
+                return false;
+            }
+        }
+        else  // 2D input [batch, seq_len]
+        {
+            // 2D input [batch, seq_len] -> 3D output [batch, seq_len, embedding_dim]
+            size_t batch_size = token_ids->shape()[0];
+            size_t seq_len = token_ids->shape()[1];
+            if (output->shape().size() != 3 || 
+                output->shape()[0] != batch_size ||
+                output->shape()[1] != seq_len || 
+                output->shape()[2] != embedding_dim_)
+            {
+                LOG_ERROR("MPIEmbeddingOperator: Output shape mismatch for 2D input. Expected [" 
+                          << batch_size << ", " << seq_len << ", " << embedding_dim_ << "], got ["
+                          << output->shape()[0] << ", " << output->shape()[1] << ", " << output->shape()[2] << "]");
+                return false;
+            }
         }
 
         return true;
