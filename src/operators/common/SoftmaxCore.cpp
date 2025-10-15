@@ -239,7 +239,7 @@ namespace llaminar::kernels
 #if defined(__AVX512F__)
             int c2 = 0;
             const __m512 row_max_ps = _mm512_set1_ps(row_max);
-            const __m512 scale_ps = _mm512_set1_ps(scale);
+            // scale_ps already declared above in first AVX512 block
             for (; c2 + 16 <= cols; c2 += 16)
             {
                 __m512 v = _mm512_loadu_ps(row + c2);

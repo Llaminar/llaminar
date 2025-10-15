@@ -26,6 +26,7 @@
 #include "chat/TokenizerInterface.h"
 #include "chat/ChatInterface.h"
 #include "chat/ResponseGenerator.h"
+#include "BenchmarkRunner.h"
 
 using namespace llaminar;
 
@@ -242,7 +243,55 @@ int main(int argc, char **argv)
             }
         }
 
-        // 6. Chat interface mode (interactive path executed only on rank 0 for I/O)
+        // 6. Benchmark mode - clean performance measurement with minimal logging
+        if (params.benchmark_mode && pipeline && wrapped_weights)
+        {
+            if (rank == 0)
+            {
+                LOG_INFO("Running inference benchmark mode");
+            }
+
+            // Override log level to ERROR for clean benchmark output
+            Logger::getInstance().setLogLevel(LogLevel::ERROR);
+
+            // Create tokenizer (only needed on rank 0 for tokenization and output)
+            std::unique_ptr<chat::TokenizerInterface> tokenizer;
+            if (rank == 0)
+            {
+                tokenizer = chat::createTokenizer(*model_loader);
+                if (!tokenizer || !tokenizer->isReady())
+                {
+                    RETURN_FAIL(1, "Failed to initialize tokenizer for benchmark");
+                }
+
+                // Run benchmark and print results
+                benchmark::BenchmarkMetrics metrics = benchmark::runInferenceBenchmark(*pipeline, *wrapped_weights, *tokenizer, params);
+                metrics.print();
+            }
+            else
+            {
+                // Non-rank-0: Create dummy tokenizer for API compatibility
+                // (tokenize/detokenize won't be called on these ranks)
+                struct DummyTokenizer : public chat::TokenizerInterface
+                {
+                    std::vector<int32_t> tokenize(const std::string &) override { return {}; }
+                    std::string detokenize(const std::vector<int32_t> &) override { return ""; }
+                    std::string applyTemplate(const std::vector<chat::ChatMessage> &, bool) override { return ""; }
+                    bool loadVocabulary(const ModelLoader &) override { return false; }
+                    int32_t getSpecialToken(const std::string &) override { return -1; }
+                    size_t getVocabSize() const override { return 0; }
+                    bool isReady() const override { return true; }
+                    std::string getTokenString(int32_t) override { return ""; }
+                };
+                DummyTokenizer dummy;
+                benchmark::runInferenceBenchmark(*pipeline, *wrapped_weights, dummy, params);
+            }
+
+            finalize();
+            return exit_code;
+        }
+
+        // 7. Chat interface mode (interactive path executed only on rank 0 for I/O)
         if (params.interactive && pipeline && wrapped_weights)
         {
             if (rank == 0)
@@ -279,7 +328,7 @@ int main(int argc, char **argv)
             return exit_code;
         }
 
-        // 7. Non-interactive prompt / eval path
+        // 8. Non-interactive prompt / eval path
         if (pipeline && wrapped_weights && (!params.prompt.empty() || params.eval_only))
         {
             std::shared_ptr<chat::TokenizerInterface> tokenizer_shared;
@@ -345,7 +394,7 @@ int main(int argc, char **argv)
             return exit_code;
         }
 
-        // 8. Standard inference path (no prompt / chat provided)
+        // 9. Standard inference path (no prompt / chat provided)
         else if (model_loader)
         {
             LOG_INFO("Model loaded but no execution mode selected (supply --interactive or --prompt). Nothing executed.");
@@ -355,7 +404,7 @@ int main(int argc, char **argv)
             LOG_INFO("No model loaded; exiting.");
         }
 
-        // 9. Optional validation (stub)
+        // 10. Optional validation (stub)
         if (params.validate_results && rank == 0)
         {
             LOG_INFO("Running result validation (stub)...");

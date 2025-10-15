@@ -51,6 +51,9 @@ struct LlaminarParams
     // Output parameters
     std::string output_json_file = ""; // --output-json <file>: Write logits and tokens to JSON file
 
+    // Benchmark mode
+    bool benchmark_mode = false; // --benchmark : run inference benchmark with timing metrics
+
     // Help/version
     bool show_help = false;
     bool show_version = false;

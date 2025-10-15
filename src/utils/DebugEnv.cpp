@@ -189,6 +189,7 @@ namespace llaminar
         s.dequant.anomalies = flag(std::getenv("LLAMINAR_DEQUANT_ANOMALIES"));
     // Adaptive
     s.adaptive.disable_cosma = flag(std::getenv("ADAPTIVE_DISABLE_COSMA"));
+    s.adaptive.log_threading = flag(std::getenv("LLAMINAR_LOG_THREADING"));
     // Attention
     s.attention.validate_primitives = flag(std::getenv("LLAMINAR_ATTN_PRIMITIVES_VALIDATE"));
     s.attention.validate_output = flag(std::getenv("LLAMINAR_ATTN_OUTPUT_VALIDATE"));
@@ -288,6 +289,11 @@ namespace llaminar
             long long v = std::atoll(scm);
             if(v >= 0) s.loader.shard_cache_max_mb = v; // keep 0 sentinel (disabled)
         }
+        // NUMA-aware allocation (default enabled for multi-socket performance)
+        if(const char* nft = std::getenv("LLAMINAR_NUMA_FIRST_TOUCH")) {
+            if(*nft == '0') s.loader.numa_first_touch = false; // explicitly disabled
+        }
+        s.loader.numa_verify_locality = flag(std::getenv("LLAMINAR_NUMA_VERIFY_LOCALITY"));
 
         // --- Phase 2 parsing additions ---
         // Ablation

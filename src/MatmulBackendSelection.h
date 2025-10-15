@@ -105,7 +105,7 @@ namespace llaminar
             const std::string &operation_label,
             int log_level = 2); // 2 = info level    private:
         // Empirical thresholds (tunable via environment in future)
-        static constexpr size_t TINY_OP_THRESHOLD = 8192;            // Total elements below = single-threaded
+        static constexpr size_t TINY_OP_THRESHOLD = 2048;            // Total elements below = single-threaded (~45x45 matrix)
         static constexpr size_t SMALL_OP_THRESHOLD = 1048576;        // Total elements below = multi-threaded local
         static constexpr size_t PREFILL_COSMA_SEQ_THRESHOLD = 4096;  // Minimum sequence length for COSMA prefill
         static constexpr size_t VOCAB_PROJECTION_THRESHOLD = 100000; // Skip COSMA for huge vocab projections

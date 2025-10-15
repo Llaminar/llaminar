@@ -96,6 +96,115 @@ Always use the canonical launch script for optimal performance:
 ./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
 ```
 
+## Benchmark Mode
+
+### Running Performance Benchmarks
+
+Llaminar provides a dedicated `--benchmark` mode for clean performance measurement:
+
+```bash
+# Recommended: Use canonical launcher
+./run_llaminar.sh --benchmark \
+  -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  -p "Your prompt here" \
+  -n 50
+
+# Direct MPI execution (2 processes)
+mpirun -np 2 --bind-to socket --map-by socket \
+  ./build/llaminar --benchmark \
+  -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  -p "Explain machine learning." \
+  -n 100
+```
+
+### Benchmark Features
+
+- **Separate prefill/decode timing** - Independent measurement of both phases
+- **Clean output** - Minimal logging (ERROR level only) with formatted metrics
+- **Greedy sampling** - Deterministic token selection for reproducible results
+- **MPI-aware** - Handles tokenization on rank 0 with proper broadcast to all ranks
+- **Professional formatting** - Box-drawing characters for clear metric display
+
+### Benchmark Output Metrics
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║ PREFILL PHASE                                                ║
+║   Tokens:              8 tokens                              ║
+║   Time:          1216.49 ms                                 ║
+║   Throughput:       6.58 tok/s                             ║
+╠══════════════════════════════════════════════════════════════╣
+║ DECODE PHASE                                                 ║
+║   Tokens:             50 tokens                              ║
+║   Time:         48095.52 ms                                 ║
+║   Throughput:       1.04 tok/s                             ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### Implementation Details
+
+- **Source**: `src/BenchmarkRunner.{h,cpp}` (~300 lines)
+- **Integration**: `src/Main.cpp` section 6, `src/ArgumentParser.{h,cpp}`
+- **Key patterns**:
+  - Logits fetched via `pipeline.logits(latest_logits)` after prefill/decode
+  - Token broadcast from rank 0 to all ranks via MPI_Bcast
+  - DummyTokenizer on non-rank-0 processes for API compatibility
+  - Greedy sampling: argmax over last logits row
+
+### Benchmarking Best Practices
+
+```bash
+# 1. Use Release builds for accurate timing
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+
+# 2. Disable heavy instrumentation
+unset LLAMINAR_COSMA_VALIDATE_TILE
+unset LLAMINAR_DEQUANT_STATS
+unset LLAMINAR_EMBED_TRACE
+
+# 3. Test various prompt lengths
+./run_llaminar.sh --benchmark -m model.gguf -p "Short" -n 50
+./run_llaminar.sh --benchmark -m model.gguf -p "Much longer prompt..." -n 50
+
+# 4. Vary decode length to measure sustained performance
+./run_llaminar.sh --benchmark -m model.gguf -p "Test" -n 20   # Quick
+./run_llaminar.sh --benchmark -m model.gguf -p "Test" -n 200  # Sustained
+```
+
+### Performance Notes
+
+- **Prefill scales with token count**: 2 tokens → 1.68 tok/s, 8 tokens → 6.58 tok/s
+- **Decode is consistent**: ~1.04 tok/s regardless of decode length (in Debug)
+- **Debug vs Release**: Release builds expected to be 5-10x faster
+- **Backend routing**: Small ops use OpenBLAS, large prefills may use COSMA (if threshold met)
+
+## Development Profiling (Advanced)
+
+### Performance Bench Script for Developers
+
+For detailed parallelization efficiency analysis, use the GTest-based profiling suite:
+
+```bash
+# Run all prefill performance benchmarks
+./run_performance_bench.sh
+
+# Run specific test suites
+./run_performance_bench.sh --filter "OpenBLAS_StrongScaling*"
+./run_performance_bench.sh --filter "COSMA_ModelShapes*"
+```
+
+**Important Distinction:**
+- **`run_llaminar.sh --benchmark`**: Production inference benchmarking with real models
+  - Use this for: End-to-end performance measurement, model comparisons, user-facing benchmarks
+  - Outputs: Clean tok/s metrics for prefill/decode phases
+  
+- **`run_performance_bench.sh`**: Development profiling with GTest suite
+  - Use this for: Analyzing parallelization efficiency, tuning threading strategies, backend selection optimization
+  - Outputs: Detailed GTest metrics with efficiency percentages (>90% excellent, <50% poor)
+
+The performance bench script runs the `test_prefill_performance_bench` executable with identical OpenMP/MPI configuration to the canonical launcher, but provides developer-focused metrics for optimization work.
+
 ### Canonical Environment Variables
 
 ```bash

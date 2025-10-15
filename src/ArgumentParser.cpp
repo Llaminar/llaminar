@@ -186,6 +186,11 @@ bool ArgumentParser::parse(LlaminarParams &params)
             i++;
         }
         // Help and version
+        else if (arg == "--benchmark")
+        {
+            params.benchmark_mode = true;
+            params.inference_mode = true; // benchmark implies inference
+        }
         else if (arg == "--help" || arg == "-h")
         {
             params.show_help = true;
@@ -256,6 +261,9 @@ void ArgumentParser::printUsage() const
     std::cout << "  --load-conversation <f>  Load previous conversation" << std::endl;
     std::cout << "  --stream                 Enable streaming output (default)" << std::endl;
     std::cout << "  --no-stream              Disable streaming output" << std::endl;
+    std::cout << "\nBenchmark Mode:" << std::endl;
+    std::cout << "  --benchmark              Run inference benchmark with performance metrics" << std::endl;
+    std::cout << "                           (minimal logging, shows prefill/decode tok/s)" << std::endl;
     std::cout << "\nSystem Configuration:" << std::endl;
     std::cout << "  --enable-hyperthreading  Use hyperthreaded cores (default: physical cores only)" << std::endl;
     std::cout << "  --ht                     Short form of --enable-hyperthreading" << std::endl;

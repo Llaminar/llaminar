@@ -86,6 +86,95 @@ mpirun -np 2 --bind-to socket --map-by socket \
   ./build/llaminar [arguments]
 ```
 
+## Benchmark Mode
+
+Llaminar includes a dedicated `--benchmark` mode for clean performance measurement with separate prefill and decode phase timing.
+
+### Running Benchmarks
+
+```bash
+# Basic benchmark with canonical launcher
+./run_llaminar.sh --benchmark \
+  -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  -p "Your prompt here" \
+  -n 50
+
+# Direct MPI execution (2 processes)
+mpirun -np 2 --bind-to socket --map-by socket \
+  ./build/llaminar --benchmark \
+  -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  -p "Explain machine learning in simple terms." \
+  -n 100
+```
+
+### Benchmark Output
+
+The benchmark mode provides:
+- **Clean formatted output** with box-drawing characters
+- **Separate metrics** for prefill and decode phases
+- **Tokens/second throughput** for each phase and total
+- **Generated text preview** to verify model functionality
+- **Minimal logging** (ERROR level only) for accurate timing
+
+```
+Tokenizing prompt... done (8 tokens)
+Tokens: [840, 20772, 5662, 6832, 304, 4285, 3793, 13]
+Running prefill... done (1216.49 ms, 6.58 tok/s)
+Running decode... done (48095.52 ms, 1.04 tok/s)
+
+Generated text:
+Machine learning is a type of artificial intelligence...
+
+╔══════════════════════════════════════════════════════════════╗
+║                    INFERENCE BENCHMARK                       ║
+╠══════════════════════════════════════════════════════════════╣
+║ Model: models/qwen2.5-0.5b-instruct-q8_0.gguf              ║
+║ Backend: OpenBLAS                                          ║
+╠══════════════════════════════════════════════════════════════╣
+║ PREFILL PHASE                                                ║
+║   Tokens:              8 tokens                              ║
+║   Time:          1216.49 ms                                 ║
+║   Throughput:       6.58 tok/s                             ║
+╠══════════════════════════════════════════════════════════════╣
+║ DECODE PHASE                                                 ║
+║   Tokens:             50 tokens                              ║
+║   Time:         48095.52 ms                                 ║
+║   Throughput:       1.04 tok/s                             ║
+╠══════════════════════════════════════════════════════════════╣
+║ TOTAL                                                        ║
+║   Tokens:             58 tokens                              ║
+║   Time:         49312.01 ms                                 ║
+║   Throughput:       1.18 tok/s                             ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### Benchmark Tips
+
+- **Use Release builds** for accurate performance measurement (Debug builds are 5-10x slower)
+- **Vary prompt length** to test prefill scaling (prefill throughput improves with more tokens)
+- **Control decode length** with `-n` flag to measure sustained decode performance
+- **Disable instrumentation** - Ensure environment variables like `LLAMINAR_COSMA_VALIDATE_TILE` are unset
+- **Greedy sampling** - Benchmark uses greedy sampling for deterministic, reproducible results
+
+## Development Profiling (Advanced)
+
+For developers analyzing parallelization efficiency and conducting detailed prefill performance studies, Llaminar provides a separate GTest-based profiling suite:
+
+```bash
+# Run prefill performance benchmarks with parallelization analysis
+./run_performance_bench.sh
+
+# Run specific test suites
+./run_performance_bench.sh --filter "OpenBLAS_StrongScaling*"
+./run_performance_bench.sh --filter "COSMA_ModelShapes*"
+```
+
+**Note:** This is distinct from `--benchmark` mode:
+- **`run_llaminar.sh --benchmark`**: Production inference benchmarking with real model execution
+- **`run_performance_bench.sh`**: Development profiling with GTest-based analysis of parallelization efficiency
+
+The performance bench script provides detailed efficiency metrics (>90% excellent, <50% poor) for tuning threading and backend selection strategies.
+
 ## Test Organization
 
 Llaminar has a comprehensive test suite organized into 5 categories for different development workflows:

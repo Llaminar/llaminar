@@ -11,6 +11,8 @@
 #include <mpi.h>
 #include <cblas.h>
 #include <omp.h>
+#include "Logger.h"
+#include "utils/DebugEnv.h"
 
 namespace llaminar
 {
@@ -201,6 +203,13 @@ namespace llaminar
             int old_threads = openblas_get_num_threads();
             openblas_set_num_threads(1);
 
+            const auto &env = debugEnv();
+            if (env.adaptive.log_threading)
+            {
+                LOG_DEBUG("[GEMM-Threading] Single-threaded: " << m << "x" << n << "x" << k
+                                                               << " threads=1 (was " << old_threads << ")");
+            }
+
             CBLAS_TRANSPOSE trans_A = transpose_A ? CblasTrans : CblasNoTrans;
             CBLAS_TRANSPOSE trans_B = transpose_B ? CblasTrans : CblasNoTrans;
 
@@ -223,10 +232,19 @@ namespace llaminar
                                               bool transpose_A, bool transpose_B,
                                               float alpha, float beta)
         {
-            // Use optimal thread count (usually number of cores)
-            int optimal_threads = std::min(omp_get_max_threads(), 8); // Cap at 8 threads
+            // Use all available OpenMP threads (OPENBLAS_NUM_THREADS already set by environment)
+            // Removed hard-coded 8-thread cap to allow full CPU utilization on high-core-count systems
+            int optimal_threads = omp_get_max_threads();
             int old_threads = openblas_get_num_threads();
             openblas_set_num_threads(optimal_threads);
+
+            const auto &env = debugEnv();
+            if (env.adaptive.log_threading)
+            {
+                LOG_DEBUG("[GEMM-Threading] Multi-threaded: " << m << "x" << n << "x" << k
+                                                              << " threads=" << optimal_threads << " omp_max=" << omp_get_max_threads()
+                                                              << " (was " << old_threads << ")");
+            }
 
             CBLAS_TRANSPOSE trans_A = transpose_A ? CblasTrans : CblasNoTrans;
             CBLAS_TRANSPOSE trans_B = transpose_B ? CblasTrans : CblasNoTrans;

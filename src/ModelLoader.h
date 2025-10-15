@@ -925,6 +925,21 @@ private:
     // ========================================================================
 
     /**
+     * @brief Perform NUMA-aware parallel first-touch allocation
+     * @param vec Vector to allocate (must already be resized)
+     * @param threshold Minimum size for parallel allocation (default 32K elements)
+     *
+     * Uses OpenMP to touch memory pages in parallel, ensuring Linux kernel
+     * allocates pages on the NUMA node of each touching thread. This is
+     * critical for multi-socket systems where MPI ranks bind to different
+     * NUMA nodes.
+     *
+     * @note Controlled by LLAMINAR_NUMA_FIRST_TOUCH (default: enabled)
+     * @note No-op if vector size < threshold or OpenMP not available
+     */
+    void numaFirstTouch(std::vector<float> &vec, size_t threshold = 32768);
+
+    /**
      * @brief Read a typed value from file stream
      * @tparam T Value type
      * @param value Output parameter

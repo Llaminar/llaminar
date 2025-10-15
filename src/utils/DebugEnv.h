@@ -118,6 +118,7 @@ namespace llaminar
     struct AdaptiveEnv
     {
         bool disable_cosma = false; // ADAPTIVE_DISABLE_COSMA
+        bool log_threading = false; // LLAMINAR_LOG_THREADING - Log actual thread counts during GEMM operations
     };
 
     struct AttentionEnv
@@ -216,6 +217,8 @@ namespace llaminar
         bool model_compare_gguf = false;    // LLAMINAR_MODEL_COMPARE_GGUF
         bool enum_map_debug = false;        // LLAMINAR_ENUM_MAP_DEBUG
         long long shard_cache_max_mb = 512; // LLAMINAR_SHARD_CACHE_MAX_MB (0 disables)
+        bool numa_first_touch = true;       // LLAMINAR_NUMA_FIRST_TOUCH (default ON for NUMA-aware allocation)
+        bool numa_verify_locality = false;  // LLAMINAR_NUMA_VERIFY_LOCALITY (log warnings if remote memory detected)
     };
 
     // --- Phase 2 additional groups ---

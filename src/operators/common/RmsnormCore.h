@@ -29,7 +29,7 @@ namespace llaminar::kernels
     {
         bool allow_parallel = true;                  // Permit OpenMP parallel loops when heuristics match
         bool force_scalar = false;                   // Force fully scalar (single-thread, no SIMD pragma hints)
-        std::size_t parallel_threshold_elems = 8192; // rows*cols threshold for row parallelism
+        std::size_t parallel_threshold_elems = 2048; // rows*cols threshold for row parallelism (lowered from 8192)
         bool t5_compat_mode = false;                 // Use float32 accumulation for PyTorch T5LayerNorm parity
     };
 

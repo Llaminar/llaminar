@@ -23,8 +23,15 @@ namespace llaminar::kernels
         if (opts.force_scalar || !opts.allow_parallel)
             return false;
         std::size_t elems = rows * cols;
+        // Allow single-row parallelization for large models (parallelize over columns)
+        // Large models (d_model >= 2048) can benefit from column-wise parallelization even in decode
         if (rows <= 1)
-            return false; // decode / single-row path stays single-thread
+        {
+            // For single-row decode, allow column parallelization if d_model is large
+            if (cols < 2048)
+                return false; // Small models stay single-threaded for decode
+            // Large models can parallelize over columns
+        }
 #ifdef _OPENMP
         if (omp_in_parallel())
             return false;

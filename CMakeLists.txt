@@ -27,7 +27,7 @@ endif()
 # Compiler flags
 # Note: Removed -DDEBUG from global flags to prevent COSMA verbose output
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
@@ -134,6 +134,7 @@ add_subdirectory(llama.cpp)
 set(LLAMINAR_CORE_SOURCES
     src/SystemTopology.cpp
     src/ArgumentParser.cpp
+    src/BenchmarkRunner.cpp
     src/JsonExport.cpp
     src/TopologyManager.cpp
     src/MpiKernelBase.cpp
@@ -619,6 +620,52 @@ if(GTEST_FOUND)
     # Minimal standalone MPI probe (no GTest, used to debug hangs prior to test harness)
     add_executable(minimal_mpi_probe tests/MinimalMpiProbe.cpp)
     target_link_libraries(minimal_mpi_probe llaminar_core MPI::MPI_CXX)
+
+    # Prefill Performance Benchmark (MPI/OpenMP parallelization analysis)
+    add_executable(test_prefill_performance_bench tests/test_prefill_performance_bench.cpp)
+    target_link_libraries(test_prefill_performance_bench llaminar_core MPI::MPI_CXX OpenMP::OpenMP_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_prefill_performance_bench GTest::gtest pthread)
+    else()
+        target_include_directories(test_prefill_performance_bench PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_prefill_performance_bench ${GTEST_LIBRARY} pthread)
+    endif()
+    # Multi-rank performance benchmark tests
+    add_test(NAME PrefillPerformanceBench_OpenBLAS_StrongScaling
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
+             --gtest_filter=PrefillPerformanceBench.OpenBLAS_StrongScaling_Prefill)
+    set_tests_properties(PrefillPerformanceBench_OpenBLAS_StrongScaling 
+        PROPERTIES TIMEOUT 180 LABELS "performance;benchmark;openblas" RUN_SERIAL TRUE)
+    
+    add_test(NAME PrefillPerformanceBench_OpenBLAS_ModelShapes
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
+             --gtest_filter=PrefillPerformanceBench.OpenBLAS_ModelShapes)
+    set_tests_properties(PrefillPerformanceBench_OpenBLAS_ModelShapes 
+        PROPERTIES TIMEOUT 240 LABELS "performance;benchmark;openblas" RUN_SERIAL TRUE)
+    
+    add_test(NAME PrefillPerformanceBench_ThreadUtilization
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
+             --gtest_filter=PrefillPerformanceBench.ThreadUtilizationAnalysis)
+    set_tests_properties(PrefillPerformanceBench_ThreadUtilization 
+        PROPERTIES TIMEOUT 180 LABELS "performance;benchmark;threading" RUN_SERIAL TRUE)
+    
+    add_test(NAME PrefillPerformanceBench_COSMA_StrongScaling
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
+             --gtest_filter=PrefillPerformanceBench.COSMA_StrongScaling_Prefill)
+    set_tests_properties(PrefillPerformanceBench_COSMA_StrongScaling 
+        PROPERTIES TIMEOUT 240 LABELS "performance;benchmark;cosma" RUN_SERIAL TRUE)
+    
+    add_test(NAME PrefillPerformanceBench_COSMA_ModelShapes
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
+             --gtest_filter=PrefillPerformanceBench.COSMA_ModelShapes)
+    set_tests_properties(PrefillPerformanceBench_COSMA_ModelShapes 
+        PROPERTIES TIMEOUT 300 LABELS "performance;benchmark;cosma" RUN_SERIAL TRUE)
+    
+    add_test(NAME PrefillPerformanceBench_Comparative
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
+             --gtest_filter=PrefillPerformanceBench.ComparativePerformance)
+    set_tests_properties(PrefillPerformanceBench_Comparative 
+        PROPERTIES TIMEOUT 360 LABELS "performance;benchmark;comparative" RUN_SERIAL TRUE)
 
     # Attention Output Mode Validation Test (regression test for LocalHeads bug)
     # This test ensures that LocalHeads mode correctly throws an error when used with
