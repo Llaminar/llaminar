@@ -218,10 +218,16 @@ namespace llaminar
         
         /**
          * @brief Get batch size (first dimension) - 1 if tensor has no batch dimension
+         * Only 3D+ tensors have a batch dimension. 2D and 1D tensors have batch_size=1.
          */
         size_t batch_size() const
         {
-            return shape_.empty() ? 1 : static_cast<size_t>(shape_[0]);
+            // Only 3D+ tensors have explicit batch dimension
+            if (shape_.size() >= 3)
+            {
+                return static_cast<size_t>(shape_[0]);
+            }
+            return 1;  // 1D and 2D tensors have implicit batch=1
         }
         
         /**
@@ -231,8 +237,15 @@ namespace llaminar
          */
         size_t seq_len() const
         {
-            if (shape_.size() < 2) return 1;
-            return static_cast<size_t>(shape_[1]);
+            if (shape_.size() == 2)
+            {
+                return static_cast<size_t>(shape_[0]);  // [seq_len, d_model]
+            }
+            else if (shape_.size() >= 3)
+            {
+                return static_cast<size_t>(shape_[1]);  // [batch, seq_len, d_model]
+            }
+            return 1;  // 1D tensor or empty
         }
         
         /**
@@ -322,7 +335,7 @@ namespace llaminar
         /**
          * @brief Stack multiple tensors along a new batch dimension
          * @param sequences Vector of tensors to stack
-         * @return Shared pointer to batched tensor
+         * @return Shared pointer to batched tensor, or nullptr if empty
          * 
          * Example: 4× [seq_len=8, d_model=896] -> [batch=4, seq_len=8, d_model=896]
          */
@@ -331,7 +344,7 @@ namespace llaminar
         {
             if (sequences.empty())
             {
-                throw std::invalid_argument("Cannot stack empty sequence vector");
+                return nullptr;  // Return nullptr for empty input
             }
             
             // Verify all sequences have same shape
