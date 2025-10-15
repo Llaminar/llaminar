@@ -34,9 +34,9 @@ Added `LLAMINAR_DEBUG_DECODE_EMBED` environment variable to control this logging
 
 ### Changes Made
 
-#### 1. Added Flag to debug_env.h
+#### 1. Added Flag to DebugEnv.h
 
-**File**: `src/utils/debug_env.h`
+**File**: `src/utils/DebugEnv.h`
 
 ```cpp
 struct PipelineEnv
@@ -185,7 +185,7 @@ export LLAMINAR_DEBUG_DECODE_EMBED=1
 
 ## Files Modified
 
-1. ✅ `src/utils/debug_env.h`
+1. ✅ `src/utils/DebugEnv.h`
    - Added `debug_decode_embed` field to `PipelineEnv` struct
    - Documented with comment
 

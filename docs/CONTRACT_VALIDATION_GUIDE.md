@@ -286,7 +286,7 @@ Potential additions:
 - **Validation Points**: Lines 220-736 (7 stages)
 - **Contract Framework**: `src/kernels/attention/AttentionStageContracts.h`
 - **Validator Utilities**: `src/kernels/attention/AttentionValidator.h`
-- **Environment Config**: `src/utils/debug_env.h` (AttentionEnv struct)
+- **Environment Config**: `src/utils/DebugEnv.h` (AttentionEnv struct)
 - **Tests**: `tests/test_attention_stage_contracts.cpp`
 
 ## Credits

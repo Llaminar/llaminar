@@ -288,41 +288,83 @@ namespace llaminar
         captureSnapshot(PipelineStage::FFN_NORM, layer_idx, ffn_norm_out->data(), seq_len, d_model);
         incrementSnapshotCounter(metrics);
 
-        // === Gate Projection ===
         auto gate_out = createLocalTensor({seq_len, d_ff});
-        if (!executeLinearProjection(
-                ffn_norm_out,
-                weights.w_gate[layer_idx],
-                gate_out,
-                seq_len,
-                d_ff,
-                d_model,
-                /*is_prefill=*/true,
-                "ffn_gate"))
+        auto up_out = createLocalTensor({seq_len, d_ff});
+
+        // FFN fusion path: combine gate+up projections into single matmul
+        const bool use_fusion = debugEnv().pipeline.ffn_fusion_enabled && weights.w_gate_up_fused[layer_idx];
+
+        if (use_fusion)
         {
-            LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " gate projection failed");
-            return false;
+            // Fused gate+up projection
+            auto fused_out = createLocalTensor({seq_len, 2 * d_ff});
+            if (!executeLinearProjection(
+                    ffn_norm_out,
+                    weights.w_gate_up_fused[layer_idx],
+                    fused_out,
+                    seq_len,
+                    2 * d_ff,
+                    d_model,
+                    /*is_prefill=*/true,
+                    "ffn_fused_gate_up"))
+            {
+                LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " fused gate+up projection failed");
+                return false;
+            }
+
+            // Split fused output into gate and up tensors
+            const float *fused_data = fused_out->data();
+            float *gate_data = const_cast<float *>(gate_out->data());
+            float *up_data = const_cast<float *>(up_out->data());
+
+#pragma omp parallel for
+            for (int i = 0; i < seq_len; ++i)
+            {
+                const float *fused_row = fused_data + i * (2 * d_ff);
+                float *gate_row = gate_data + i * d_ff;
+                float *up_row = up_data + i * d_ff;
+
+                std::memcpy(gate_row, fused_row, d_ff * sizeof(float));
+                std::memcpy(up_row, fused_row + d_ff, d_ff * sizeof(float));
+            }
+        }
+        else
+        {
+            // Original separate gate and up projections
+            // === Gate Projection ===
+            if (!executeLinearProjection(
+                    ffn_norm_out,
+                    weights.w_gate[layer_idx],
+                    gate_out,
+                    seq_len,
+                    d_ff,
+                    d_model,
+                    /*is_prefill=*/true,
+                    "ffn_gate"))
+            {
+                LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " gate projection failed");
+                return false;
+            }
+
+            // === Up Projection ===
+            if (!executeLinearProjection(
+                    ffn_norm_out,
+                    weights.w_up[layer_idx],
+                    up_out,
+                    seq_len,
+                    d_ff,
+                    d_model,
+                    /*is_prefill=*/true,
+                    "ffn_up"))
+            {
+                LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " up projection failed");
+                return false;
+            }
         }
 
         // Capture FFN gate snapshot
         captureSnapshot(PipelineStage::FFN_GATE, layer_idx, gate_out->data(), seq_len, d_ff);
         incrementSnapshotCounter(metrics);
-
-        // === Up Projection ===
-        auto up_out = createLocalTensor({seq_len, d_ff});
-        if (!executeLinearProjection(
-                ffn_norm_out,
-                weights.w_up[layer_idx],
-                up_out,
-                seq_len,
-                d_ff,
-                d_model,
-                /*is_prefill=*/true,
-                "ffn_up"))
-        {
-            LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " up projection failed");
-            return false;
-        }
 
         // Capture FFN up snapshot
         captureSnapshot(PipelineStage::FFN_UP, layer_idx, up_out->data(), seq_len, d_ff);

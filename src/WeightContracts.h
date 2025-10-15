@@ -111,8 +111,14 @@ namespace llaminar
                       const TransformerLayerConfig &cfg,
                       int layer_index = -1) const
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             // Default to single-rank validation (MPI size = 1)
             validate_with_mpi(tensor, cfg, 0, 1, layer_index);
+#else
+            (void)tensor;
+            (void)cfg;
+            (void)layer_index;
+#endif
         }
 
         /**
@@ -131,6 +137,7 @@ namespace llaminar
                                int mpi_size,
                                int layer_index = -1) const
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             if (!tensor)
             {
                 throw std::runtime_error("Weight contract validation failed: " + weight_name + " is null");
@@ -199,6 +206,13 @@ namespace llaminar
                 log_msg << ")";
             }
             LOG_DEBUG(log_msg.str());
+#else
+            (void)tensor;
+            (void)cfg;
+            (void)mpi_rank;
+            (void)mpi_size;
+            (void)layer_index;
+#endif
         }
 
         /**
@@ -559,6 +573,7 @@ namespace llaminar
                                       int mpi_rank,
                                       int mpi_size) const
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             LOG_INFO("[WeightContract] Validating " << global_weights.size() << " global weights (rank "
                                                     << mpi_rank << "/" << mpi_size << ")");
 
@@ -588,6 +603,14 @@ namespace llaminar
             }
 
             LOG_INFO("[WeightContract] ✓ Global weights validated: " << validated_count << "/" << global_weights.size());
+#else
+            (void)token_embedding;
+            (void)output_norm;
+            (void)lm_head;
+            (void)cfg;
+            (void)mpi_rank;
+            (void)mpi_size;
+#endif
         }
 
         /**
@@ -626,6 +649,7 @@ namespace llaminar
                                      int mpi_rank,
                                      int mpi_size) const
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             for (const auto &contract : layer_weights)
             {
                 std::shared_ptr<TensorBase> tensor;
@@ -676,6 +700,21 @@ namespace llaminar
                     contract.validate_with_mpi(tensor, cfg, mpi_rank, mpi_size, layer_idx);
                 }
             }
+#else
+            (void)layer_idx;
+            (void)attn_norm;
+            (void)wq;
+            (void)wk;
+            (void)wv;
+            (void)wo;
+            (void)ffn_norm;
+            (void)w_gate;
+            (void)w_up;
+            (void)w_down;
+            (void)cfg;
+            (void)mpi_rank;
+            (void)mpi_size;
+#endif
         }
     };
 

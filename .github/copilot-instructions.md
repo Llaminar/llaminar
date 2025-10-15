@@ -747,7 +747,7 @@ TEST_CASE("MyNewKernel basic functionality") {
 
 All new or refactored code on hot paths (kernels, matmul selection, attention assembly, tensor partition loops) MUST avoid direct `std::getenv` calls. Instead:
 
-1. Add any new environment flag/knob to the structured snapshot in `debug_env.h` inside the appropriate group (or create one).
+1. Add any new environment flag/knob to the structured snapshot in `DebugEnv.h` inside the appropriate group (or create one).
 2. Parse it once in `debug_env.cpp` (lazy static initialization already provided) and expose typed fields.
 3. Consume via `const auto &snap = debugEnv();` then reference `snap.<group>.<field>`.
 
@@ -771,7 +771,7 @@ const auto &env = debugEnv();
 if (env.attention.micro_trace && rank == 0) { ... }
 ```
 
-Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `debug_env.h` rather than mixing unrelated flags.
+Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `DebugEnv.h` rather than mixing unrelated flags.
 
 
 ## Documentation Standards

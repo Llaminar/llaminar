@@ -67,7 +67,7 @@ Created and executed `scripts/fix_camelcase_includes.py` to systematically updat
 
 ### Utilities
 ```cpp
-#include "debug_env.h"           → #include "DebugEnv.h"
+#include "DebugEnv.h"           → #include "DebugEnv.h"
 #include "perf_counters.h"       → #include "PerfCounters.h"
 #include "shard_reduce.h"        → #include "ShardReduce.h"
 ```
@@ -139,7 +139,7 @@ Always use CamelCase for includes:
 #include "model_loader.h"
 #include "kernels/MPILinearKernel.h"
 #include "tensors/tensor_factory.h"
-#include "utils/debug_env.h"
+#include "utils/DebugEnv.h"
 ```
 
 ### Auto-complete Support

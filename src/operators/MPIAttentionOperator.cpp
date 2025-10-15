@@ -79,6 +79,7 @@
 
 #include "MPIAttentionOperator.h"
 #include "../Logger.h"
+#include "../PerformanceTracer.h"
 #include "../tensors/TensorFactory.h"
 #include "../MatmulBackendSelection.h"
 #include "../CosmaPrefillManager.h"
@@ -183,7 +184,7 @@ namespace llaminar
     // Constructor
     // ============================================================================
     MPIAttentionOperator::MPIAttentionOperator(int n_head, int n_head_kv, int head_dim,
-                                           float rope_freq_base, DistributionStrategy strategy)
+                                               float rope_freq_base, DistributionStrategy strategy)
         : n_head_(n_head),
           n_head_kv_(n_head_kv),
           head_dim_(head_dim),
@@ -206,14 +207,14 @@ namespace llaminar
         if (world_size > n_head_)
         {
             LOG_WARN("MPIAttentionOperator: More ranks (" << world_size
-                                                        << ") than Q heads (" << n_head_ << "). "
-                                                        << (world_size - n_head_) << " rank(s) will have no work (local_heads=0).");
+                                                          << ") than Q heads (" << n_head_ << "). "
+                                                          << (world_size - n_head_) << " rank(s) will have no work (local_heads=0).");
         }
         if (world_size > n_head_kv_)
         {
             LOG_WARN("MPIAttentionOperator: More ranks (" << world_size
-                                                        << ") than KV heads (" << n_head_kv_ << "). "
-                                                        << (world_size - n_head_kv_) << " rank(s) will have no KV work (local_kv_heads=0).");
+                                                          << ") than KV heads (" << n_head_kv_ << "). "
+                                                          << (world_size - n_head_kv_) << " rank(s) will have no KV work (local_kv_heads=0).");
         }
     }
 
@@ -743,6 +744,8 @@ namespace llaminar
     // ============================================================================
     WeightSlices MPIAttentionOperator::distributeWeightsByHead(const InputSetupResult &setup)
     {
+        PERF_TRACE_SCOPE_CAT("weight_distribution", "attention");
+
         WeightSlices result;
 
         const int rank = setup.rank;
@@ -1051,6 +1054,8 @@ namespace llaminar
         const InputSetupResult &setup,
         const WeightSlices &weights)
     {
+        PERF_TRACE_SCOPE_CAT("qkv_projections", "attention");
+
         // Extract parameters from setup
         auto input = setup.input;
         int seq_len = setup.seq_len;
@@ -1336,7 +1341,7 @@ namespace llaminar
         GatherResult result;
 
         LOG_DEBUG("[MPIAttentionOperator] Layer " << layer_index_ << ": snapshot_callback_="
-                                                << (snapshot_callback_ ? "SET" : "NULL") << ", world_size=" << world_size);
+                                                  << (snapshot_callback_ ? "SET" : "NULL") << ", world_size=" << world_size);
 
         if (snapshot_callback_ && world_size > 1)
         {
@@ -1488,6 +1493,8 @@ namespace llaminar
         const std::shared_ptr<TensorBase> &k_cache_in,
         const std::shared_ptr<TensorBase> &v_cache_in)
     {
+        PERF_TRACE_SCOPE_CAT("rope_application", "attention");
+
         RoPEResult result;
 
         // Extract parameters from setup
@@ -1915,6 +1922,8 @@ namespace llaminar
         const InputSetupResult &setup,
         const RoPEResult &rope_result)
     {
+        PERF_TRACE_SCOPE_CAT("gqa_expansion", "attention");
+
         // Extract parameters from setup
         int rank = setup.rank;
         int world_size = setup.world_size;
@@ -2138,6 +2147,8 @@ namespace llaminar
         const RoPEResult &rope_result,
         const GQAExpansionResult &gqa_result)
     {
+        PERF_TRACE_SCOPE_CAT("attention_scores", "attention");
+
         // Extract parameters from setup
         int rank = setup.rank;
         int world_size = setup.world_size;
@@ -2230,11 +2241,14 @@ namespace llaminar
 
             // Compute unmasked scores for snapshot
             std::vector<float> unmasked_scores(scores_size);
-            llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
-                                              unmasked_scores.data(),
-                                              seq_len, attn_seq_len, // q_seq_len, k_seq_len
-                                              head_dim_, local_heads,
-                                              false, false); // causal=FALSE for snapshot
+            {
+                PERF_TRACE_SCOPE_CAT("qk_matmul_unmasked", "attention_kernel");
+                llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
+                                                  unmasked_scores.data(),
+                                                  seq_len, attn_seq_len, // q_seq_len, k_seq_len
+                                                  head_dim_, local_heads,
+                                                  false, false); // causal=FALSE for snapshot
+            }
 
             // DEBUG: Log computed scores (layer 0 only)
             if (debugEnv().attention.verbose && layer_index_ == 0)
@@ -2262,9 +2276,12 @@ namespace llaminar
                     offset += recvcounts[r];
                 }
 
-                MPI_Allgatherv(unmasked_scores.data(), sendcount, MPI_FLOAT,
-                               global_scores.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
+                {
+                    PERF_TRACE_SCOPE_CAT("allgatherv_unmasked_scores", "mpi_collective");
+                    MPI_Allgatherv(unmasked_scores.data(), sendcount, MPI_FLOAT,
+                                   global_scores.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
+                                   MPI_COMM_WORLD);
+                }
 
                 // DEBUG: Log gathered scores structure (layer 0 only)
                 if (debugEnv().attention.verbose && layer_index_ == 0 && rank == 0)
@@ -2309,12 +2326,15 @@ namespace llaminar
         }
 
         // Now compute MASKED scores for actual attention (causal masking, scaling, NO softmax)
-        llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
-                                          scores.data(), seq_len, attn_seq_len,
-                                          head_dim_, local_heads,
-                                          true, // causal=TRUE for actual computation
-                                          false // no softmax yet
-        );
+        {
+            PERF_TRACE_SCOPE_CAT("qk_matmul_masked", "attention_kernel");
+            llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
+                                              scores.data(), seq_len, attn_seq_len,
+                                              head_dim_, local_heads,
+                                              true, // causal=TRUE for actual computation
+                                              false // no softmax yet
+            );
+        }
 
         // DEBUG: Log masked scores for layer 0
         if (debugEnv().attention.verbose && layer_index_ == 0 && rank == 0)
@@ -2350,41 +2370,44 @@ namespace llaminar
         // Causal masking with rows=1 would incorrectly mask based on relative position (row 0 -> mask all c > 0).
         const bool use_causal_mask = (seq_len > 1); // Only use causal mask in prefill/batch mode
 
-#pragma omp parallel for if (local_heads > 1) schedule(static)
-        for (int h = 0; h < local_heads; ++h)
         {
-            llaminar::kernels::SoftmaxRowArgs args;
-            args.scores = scores.data() + static_cast<size_t>(h) * seq_len * attn_seq_len;
-            args.rows = seq_len;
-            args.cols = attn_seq_len;
-            args.causal = use_causal_mask; // FIX: Disable for incremental decode
-            args.scale = 1.0f;
-
-            // DEBUG: Log scores before softmax for layer 0, head 0
-            if (debugEnv().attention.verbose && layer_index_ == 0 && h == 0 && rank == 0)
+            PERF_TRACE_SCOPE_CAT("softmax_all_heads", "attention_kernel");
+#pragma omp parallel for if (local_heads > 1) schedule(static)
+            for (int h = 0; h < local_heads; ++h)
             {
-                LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
-                LOG_DEBUG("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
-                LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
-                                            << args.scores[2] << " " << args.scores[3] << " "
-                                            << args.scores[4] << " " << args.scores[5]);
-            }
+                llaminar::kernels::SoftmaxRowArgs args;
+                args.scores = scores.data() + static_cast<size_t>(h) * seq_len * attn_seq_len;
+                args.rows = seq_len;
+                args.cols = attn_seq_len;
+                args.causal = use_causal_mask; // FIX: Disable for incremental decode
+                args.scale = 1.0f;
 
-            llaminar::kernels::softmax_row_major(args);
+                // DEBUG: Log scores before softmax for layer 0, head 0
+                if (debugEnv().attention.verbose && layer_index_ == 0 && h == 0 && rank == 0)
+                {
+                    LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
+                    LOG_DEBUG("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
+                    LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
+                                                << args.scores[2] << " " << args.scores[3] << " "
+                                                << args.scores[4] << " " << args.scores[5]);
+                }
 
-            // DEBUG: Log scores after softmax for layer 0, head 0
-            if (debugEnv().attention.verbose && layer_index_ == 0 && h == 0 && rank == 0)
-            {
-                LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, AFTER softmax:");
-                LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
-                                            << args.scores[2] << " " << args.scores[3] << " "
-                                            << args.scores[4] << " " << args.scores[5]);
-                float sum = 0.0f;
-                for (int i = 0; i < attn_seq_len; ++i)
-                    sum += args.scores[i];
-                LOG_DEBUG("  Sum (should be ~1.0): " << sum);
+                llaminar::kernels::softmax_row_major(args);
+
+                // DEBUG: Log scores after softmax for layer 0, head 0
+                if (debugEnv().attention.verbose && layer_index_ == 0 && h == 0 && rank == 0)
+                {
+                    LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, AFTER softmax:");
+                    LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
+                                                << args.scores[2] << " " << args.scores[3] << " "
+                                                << args.scores[4] << " " << args.scores[5]);
+                    float sum = 0.0f;
+                    for (int i = 0; i < attn_seq_len; ++i)
+                        sum += args.scores[i];
+                    LOG_DEBUG("  Sum (should be ~1.0): " << sum);
+                }
             }
-        }
+        } // end softmax_all_heads trace
 
         // Snapshot scores AFTER softmax
         if (snapshot_callback_)
@@ -2407,9 +2430,12 @@ namespace llaminar
                     offset += recvcounts[r];
                 }
 
-                MPI_Allgatherv(scores.data(), sendcount, MPI_FLOAT,
-                               global_softmax.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
+                {
+                    PERF_TRACE_SCOPE_CAT("allgatherv_softmax_scores", "mpi_collective");
+                    MPI_Allgatherv(scores.data(), sendcount, MPI_FLOAT,
+                                   global_softmax.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
+                                   MPI_COMM_WORLD);
+                }
 
                 if (rank == 0)
                 {
@@ -2473,9 +2499,12 @@ namespace llaminar
         // Apply attention scores to V
         result.local_attended = TensorFactory::create_simple({seq_len, local_head_dim});
 
-        llaminar::attn::apply_scores_to_v(scores.data(), local_v_expanded->data(),
-                                          result.local_attended->data(), seq_len, attn_seq_len,
-                                          head_dim_, local_heads);
+        {
+            PERF_TRACE_SCOPE_CAT("scores_v_matmul", "attention_kernel");
+            llaminar::attn::apply_scores_to_v(scores.data(), local_v_expanded->data(),
+                                              result.local_attended->data(), seq_len, attn_seq_len,
+                                              head_dim_, local_heads);
+        }
 
         // Contract: Validate attended output (scores @ V)
         if (enable_validation && rank == 0)
@@ -2510,14 +2539,17 @@ namespace llaminar
                 auto global_attended = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
 
                 // Gather row-by-row to maintain proper layout (same as Q/K/V)
-                for (int t = 0; t < seq_len; ++t)
                 {
-                    const float *local_attended_row = result.local_attended->data() + t * local_head_dim;
-                    float *global_attended_row = global_attended->data() + t * (n_head_ * head_dim_);
+                    PERF_TRACE_SCOPE_CAT("allgather_attended_rows", "mpi_collective");
+                    for (int t = 0; t < seq_len; ++t)
+                    {
+                        const float *local_attended_row = result.local_attended->data() + t * local_head_dim;
+                        float *global_attended_row = global_attended->data() + t * (n_head_ * head_dim_);
 
-                    MPI_Allgather(local_attended_row, local_head_dim, MPI_FLOAT,
-                                  global_attended_row, local_head_dim, MPI_FLOAT,
-                                  MPI_COMM_WORLD);
+                        MPI_Allgather(local_attended_row, local_head_dim, MPI_FLOAT,
+                                      global_attended_row, local_head_dim, MPI_FLOAT,
+                                      MPI_COMM_WORLD);
+                    }
                 }
 
                 if (rank == 0)
@@ -2548,6 +2580,8 @@ namespace llaminar
         const WeightSlices &weights,
         const AttentionScoresResult &attention_result)
     {
+        PERF_TRACE_SCOPE_CAT("output_projection", "attention");
+
         // Extract parameters from setup
         int rank = setup.rank;
         int world_size = setup.world_size;
@@ -2568,11 +2602,14 @@ namespace llaminar
         result.attention_output = TensorFactory::create_simple(std::vector<int>{seq_len, d_model});
 
         // Output projection: local_attended @ wo^T
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    seq_len, d_model, local_head_dim,
-                    1.0f, local_attended->data(), local_head_dim,
-                    local_wo->data(), local_head_dim,
-                    0.0f, result.attention_output->data(), d_model);
+        {
+            PERF_TRACE_SCOPE_CAT("output_proj_matmul", "attention_kernel");
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq_len, d_model, local_head_dim,
+                        1.0f, local_attended->data(), local_head_dim,
+                        local_wo->data(), local_head_dim,
+                        0.0f, result.attention_output->data(), d_model);
+        }
 
         // Contract: Validate output projection
         if (enable_validation && rank == 0)
@@ -2600,6 +2637,7 @@ namespace llaminar
         // Aggregate across ranks if multi-rank
         if (world_size > 1)
         {
+            PERF_TRACE_SCOPE_CAT("allreduce_output", "mpi_collective");
             MPI_Allreduce(MPI_IN_PLACE, result.attention_output->data(), result.attention_output->size(),
                           MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
         }
@@ -2637,6 +2675,8 @@ namespace llaminar
         const std::vector<std::shared_ptr<TensorBase>> &inputs,
         std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
+        PERF_TRACE_SCOPE_CAT("mpi_attention_execute", "attention");
+
         // DEBUG: Confirm execution
         const int rank = getRank();
         if (debugEnv().attention.verbose && rank == 0)

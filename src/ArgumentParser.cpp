@@ -100,7 +100,18 @@ bool ArgumentParser::parse(LlaminarParams &params)
         else if ((arg == "--prompt" || arg == "-p") && i + 1 < argc_)
         {
             params.prompt = argv_[i + 1];
-            params.inference_mode = true; // Auto-enable inference mode
+            params.prompts.push_back(argv_[i + 1]); // Also add to batch prompts
+            params.inference_mode = true;           // Auto-enable inference mode
+            i++;
+        }
+        else if (arg == "--batch-size" && i + 1 < argc_)
+        {
+            params.batch_size = std::atoi(argv_[i + 1]);
+            if (params.batch_size < 1)
+            {
+                std::cerr << "Error: batch size must be >= 1" << std::endl;
+                return false;
+            }
             i++;
         }
         else if (arg == "--eval")
@@ -267,7 +278,8 @@ void ArgumentParser::printUsage() const
     std::cout << "  --trace                  Same as -vvv" << std::endl;
     std::cout << "\nInference Mode:" << std::endl;
     std::cout << "  -i, --inference          Enable inference mode" << std::endl;
-    std::cout << "  -p, --prompt <text>      Text prompt to process" << std::endl;
+    std::cout << "  -p, --prompt <text>      Text prompt to process (can be specified multiple times for batching)" << std::endl;
+    std::cout << "  --batch-size <n>         Batch size for parallel sequence processing (default: 1)" << std::endl;
     std::cout << "  --eval                   Evaluate prompt and exit (no generation)" << std::endl;
     std::cout << "  --interactive            Interactive chat mode" << std::endl;
     std::cout << "  --ctx-size <size>        Context window size (default: 2048)" << std::endl;

@@ -27,6 +27,7 @@
 #include "chat/ChatInterface.h"
 #include "chat/ResponseGenerator.h"
 #include "BenchmarkRunner.h"
+#include "SequentialBatchBenchmark.h"
 
 using namespace llaminar;
 
@@ -264,14 +265,42 @@ int main(int argc, char **argv)
                     RETURN_FAIL(1, "Failed to initialize tokenizer for benchmark");
                 }
 
-                // Run benchmark and print results
-                benchmark::BenchmarkMetrics metrics = benchmark::runInferenceBenchmark(*pipeline, *wrapped_weights, *tokenizer, params);
-                metrics.print();
+                // Check if batch benchmarking is requested
+                if (params.batch_size > 1)
+                {
+                    // Prepare prompts for batch processing
+                    std::vector<std::string> batch_prompts;
+                    if (params.prompts.size() >= static_cast<size_t>(params.batch_size))
+                    {
+                        // Use first batch_size prompts from prompts vector
+                        batch_prompts.assign(params.prompts.begin(), params.prompts.begin() + params.batch_size);
+                    }
+                    else if (!params.prompt.empty())
+                    {
+                        // Replicate single prompt batch_size times
+                        batch_prompts.resize(params.batch_size, params.prompt);
+                    }
+                    else
+                    {
+                        std::cerr << "Error: No prompts provided for batch benchmark\n";
+                        RETURN_FAIL(1, "Batch benchmark requires prompts");
+                    }
+
+                    // Run sequential batch benchmark
+                    benchmark::SequentialBatchMetrics metrics = benchmark::runSequentialBatch(
+                        *pipeline, *wrapped_weights, *tokenizer, batch_prompts, params.n_predict);
+                    // Metrics already printed by runSequentialBatch
+                }
+                else
+                {
+                    // Single sequence benchmark (original behavior)
+                    benchmark::BenchmarkMetrics metrics = benchmark::runInferenceBenchmark(*pipeline, *wrapped_weights, *tokenizer, params);
+                    metrics.print();
+                }
             }
             else
             {
                 // Non-rank-0: Create dummy tokenizer for API compatibility
-                // (tokenize/detokenize won't be called on these ranks)
                 struct DummyTokenizer : public chat::TokenizerInterface
                 {
                     std::vector<int32_t> tokenize(const std::string &) override { return {}; }
@@ -284,7 +313,16 @@ int main(int argc, char **argv)
                     std::string getTokenString(int32_t) override { return ""; }
                 };
                 DummyTokenizer dummy;
-                benchmark::runInferenceBenchmark(*pipeline, *wrapped_weights, dummy, params);
+
+                if (params.batch_size > 1)
+                {
+                    std::vector<std::string> batch_prompts(params.batch_size, "");
+                    benchmark::runSequentialBatch(*pipeline, *wrapped_weights, dummy, batch_prompts, params.n_predict);
+                }
+                else
+                {
+                    benchmark::runInferenceBenchmark(*pipeline, *wrapped_weights, dummy, params);
+                }
             }
 
             finalize();

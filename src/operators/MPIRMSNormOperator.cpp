@@ -29,6 +29,7 @@
  */
 #include "MPIRMSNormOperator.h"
 #include "../Logger.h"
+#include "../PerformanceTracer.h"
 #include "../DebugUtils.h"
 #include "../utils/DebugEnv.h"
 #include "common/RmsnormCore.h" // centralized RMSNorm primitives
@@ -82,8 +83,10 @@ namespace llaminar
     }
 
     bool MPIRMSNormOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                   std::vector<std::shared_ptr<TensorBase>> &outputs)
+                                     std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
+        PERF_TRACE_SCOPE_CAT("mpi_rmsnorm_execute", "normalization");
+
         if (!validate(inputs, outputs))
         {
             LOG_ERROR("MPIRMSNormOperator validation failed on rank " << getRank());
@@ -169,7 +172,10 @@ namespace llaminar
             // Legacy row distribution path over full hidden size
             local_input = createLocalTensor({static_cast<size_t>(local_seq_len), hidden_size});
             local_output = createLocalTensor({static_cast<size_t>(local_seq_len), hidden_size});
-            distributeInput(global_input, local_input, global_seq_len, hidden_size);
+            {
+                PERF_TRACE_SCOPE_CAT("distribute_input", "norm_kernel");
+                distributeInput(global_input, local_input, global_seq_len, hidden_size);
+            }
         }
 
         // Optional gamma diagnostics / override
@@ -248,17 +254,22 @@ namespace llaminar
         // Compute (shard-aware) RMSNorm
         if (feature_sharded)
         {
+            PERF_TRACE_SCOPE_CAT("rmsnorm_feature_sharded", "norm_kernel");
             // Need per-row global sumsq across feature shards: compute local then Allreduce
             std::vector<double> local_row_sumsq(local_seq_len, 0.0);
             size_t feat_dim = feature_local_dim;
             const float *in_ptr = local_input->data();
             // Use core primitive for per-row sumsq
             {
+                PERF_TRACE_SCOPE_CAT("rmsnorm_row_sumsq", "norm_kernel");
                 kernels::RMSNormExecOptions opts; // default heuristics
                 kernels::rmsnorm_compute_row_sumsq(in_ptr, local_seq_len, feat_dim, local_row_sumsq.data(), opts);
             }
             std::vector<double> global_row_sumsq(local_row_sumsq.size(), 0.0);
-            checkMPIError(PerfAllreduce(local_row_sumsq.data(), global_row_sumsq.data(), (int)local_row_sumsq.size(), MPI_DOUBLE, MPI_SUM, getComm()), "RMSNorm shard row sumsq");
+            {
+                PERF_TRACE_SCOPE_CAT("allreduce_row_sumsq", "mpi_collective");
+                checkMPIError(PerfAllreduce(local_row_sumsq.data(), global_row_sumsq.data(), (int)local_row_sumsq.size(), MPI_DOUBLE, MPI_SUM, getComm()), "RMSNorm shard row sumsq");
+            }
             // Determine global hidden size from shard spec (if available)
             size_t global_hidden = hidden_size;
             if (auto *ss = dynamic_cast<ShardedSimpleTensor *>(global_input.get()))
@@ -274,7 +285,7 @@ namespace llaminar
                 if (r == 0 && getRank() == 0 && debugEnv().rmsnorm.validate_ref)
                 {
                     LOG_INFO("[MPIRMSNormOperator][Diag] r=0 global_row_sumsq=" << global_row_sumsq[r]
-                                                                              << " denom=" << denom << " inv=" << inv);
+                                                                                << " denom=" << denom << " inv=" << inv);
                 }
             }
             // Apply scaling to local slice
@@ -287,6 +298,7 @@ namespace llaminar
             }
             // Use core apply primitive with appropriate GammaMode semantics
             {
+                PERF_TRACE_SCOPE_CAT("rmsnorm_apply_scaling", "norm_kernel");
                 kernels::RMSNormExecOptions opts; // default heuristics
                 kernels::GammaMode mode = weight_sharded ? kernels::GammaMode::SHARDED : kernels::GammaMode::REPLICATED;
                 kernels::rmsnorm_apply(in_ptr, gamma_ptr, inv_scale.data(), local_seq_len, feat_dim, out_ptr, mode, feature_local_offset, opts);
@@ -306,10 +318,14 @@ namespace llaminar
         }
         else
         {
+            PERF_TRACE_SCOPE_CAT("rmsnorm_distributed", "norm_kernel");
             computeDistributedRMSNorm(local_input->data(), gamma_ptr,
                                       local_output->data(), local_seq_len,
                                       hidden_size, global_seq_len);
-            gatherOutput(local_output, global_output, global_seq_len, hidden_size);
+            {
+                PERF_TRACE_SCOPE_CAT("gather_output", "mpi_collective");
+                gatherOutput(local_output, global_output, global_seq_len, hidden_size);
+            }
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -348,7 +364,7 @@ namespace llaminar
     }
 
     bool MPIRMSNormOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                    const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+                                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Basic validation
         if (inputs.size() != 2 || outputs.size() != 1)
@@ -406,7 +422,7 @@ namespace llaminar
                     {
                         allow_replicated_weight = true;
                         LOG_DEBUG("MPIRMSNormOperator: Accepting replicated weight (global_hidden=" << spec.global_dim
-                                                                                                  << ") with local feature slice dim=" << spec.local_dim << " on rank " << getRank());
+                                                                                                    << ") with local feature slice dim=" << spec.local_dim << " on rank " << getRank());
                     }
                 }
             }
@@ -429,8 +445,8 @@ namespace llaminar
     }
 
     void MPIRMSNormOperator::distributeInput(const std::shared_ptr<TensorBase> &global_input,
-                                           std::shared_ptr<TensorBase> &local_input,
-                                           size_t global_seq_len, size_t hidden_size)
+                                             std::shared_ptr<TensorBase> &local_input,
+                                             size_t global_seq_len, size_t hidden_size)
     {
         auto [local_seq_len, seq_offset] = getRowDistribution(global_seq_len);
 
@@ -451,8 +467,8 @@ namespace llaminar
     }
 
     void MPIRMSNormOperator::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
-                                        std::shared_ptr<TensorBase> &global_output,
-                                        size_t global_seq_len, size_t hidden_size)
+                                          std::shared_ptr<TensorBase> &global_output,
+                                          size_t global_seq_len, size_t hidden_size)
     {
         auto [local_seq_len, seq_offset] = getRowDistribution(global_seq_len);
 
@@ -478,8 +494,8 @@ namespace llaminar
     }
 
     void MPIRMSNormOperator::computeDistributedRMSNorm(const float *local_input, const float *weight,
-                                                     float *local_output, size_t local_seq_len,
-                                                     size_t hidden_size, size_t global_seq_len)
+                                                       float *local_output, size_t local_seq_len,
+                                                       size_t hidden_size, size_t global_seq_len)
     {
         // Instrumentation: compute basic stats of local input before normalization (parallelized)
         float local_min = std::numeric_limits<float>::infinity();
@@ -568,7 +584,7 @@ namespace llaminar
         if (getRank() == 0)
         {
             LOG_DEBUG("[MPIRMSNormOperator] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
-                                                               << " rms_first_row=" << rms_global << " mode=T5");
+                                                                  << " rms_first_row=" << rms_global << " mode=T5");
             LOG_DEBUG("[MPIRMSNormOperator] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
 
@@ -612,9 +628,9 @@ namespace llaminar
 
 #ifdef LLAMINAR_ENABLE_RMSNORM_REFERENCE
     void MPIRMSNormOperator::runReferenceValidation(const std::shared_ptr<TensorBase> &global_input,
-                                                  const std::shared_ptr<TensorBase> &weight,
-                                                  const std::shared_ptr<TensorBase> &global_output,
-                                                  const std::vector<int> &trace_rows)
+                                                    const std::shared_ptr<TensorBase> &weight,
+                                                    const std::shared_ptr<TensorBase> &global_output,
+                                                    const std::vector<int> &trace_rows)
     {
         size_t seq_len = static_cast<size_t>(global_input->shape()[0]);
         size_t hidden_size = static_cast<size_t>(global_input->shape()[1]);
@@ -694,11 +710,11 @@ namespace llaminar
         size_t worst_col = hidden_size ? worst_index % hidden_size : 0;
 
         LOG_INFO("[MPIRMSNormOperator][validate] reference diff max_abs=" << max_abs
-                                                                        << " rel_l2=" << rel_l2
-                                                                        << " worst_row=" << worst_row
-                                                                        << " worst_col=" << worst_col
-                                                                        << " actual=" << actual_ptr[worst_index]
-                                                                        << " ref=" << reference[worst_index]);
+                                                                          << " rel_l2=" << rel_l2
+                                                                          << " worst_row=" << worst_row
+                                                                          << " worst_col=" << worst_col
+                                                                          << " actual=" << actual_ptr[worst_index]
+                                                                          << " ref=" << reference[worst_index]);
 
         if (hidden_size > 0)
         {
@@ -733,8 +749,8 @@ namespace llaminar
             ref_preview << "]";
             diff_preview << "]";
             LOG_INFO("[MPIRMSNormOperator][validate] worst_row_preview actual=" << actual_preview.str()
-                                                                              << " ref=" << ref_preview.str()
-                                                                              << " diff=" << diff_preview.str());
+                                                                                << " ref=" << ref_preview.str()
+                                                                                << " diff=" << diff_preview.str());
         }
 
         if (!trace_rows.empty())

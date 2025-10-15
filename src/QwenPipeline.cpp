@@ -55,8 +55,8 @@
 
 #include "QwenPipeline.h"
 #include "QwenPipelineAdapter.h" // For QwenModelWeights
-#include "PrefillDiagnostics.h"   // For baseline comparison and FFN tracing
-#include "PrefillProvider.h"      // For PrefillProviderFactory
+#include "PrefillDiagnostics.h"  // For baseline comparison and FFN tracing
+#include "PrefillProvider.h"     // For PrefillProviderFactory
 #include "KvCacheProvider.h"     // For SimpleKVCacheProvider
 #include "ModelLoader.h"
 #include "WeightContracts.h" // For contract-driven weight loading
@@ -487,7 +487,15 @@ namespace llaminar
         captureIfEnabled(PipelineStage::FFN_NORM, layer_idx, ffn_norm_out);
         auto gate_out = createLocalTensor({seq_len, config_.getLayerConfig().d_ff});
         auto up_out = createLocalTensor({seq_len, config_.getLayerConfig().d_ff});
+
+        // FFN fusion path: combine gate+up projections into single matmul
+        const bool use_fusion = debugEnv().pipeline.ffn_fusion_enabled && weights.w_gate_up_fused[layer_idx];
+
+        if (use_fusion)
         {
+            // Fused gate+up projection: single matmul with 2*d_ff output dimension
+            auto fused_out = createLocalTensor({seq_len, 2 * config_.getLayerConfig().d_ff});
+
             BackendContext bctx;
             bctx.is_prefill = is_prefill_stage_;
             bctx.seq_len = seq_len;
@@ -495,54 +503,108 @@ namespace llaminar
             bctx.n_layers = config_.getLayerConfig().n_layers;
             bctx.world = getSize();
             auto dec = selectAttentionBackend(bctx);
+
             if (dec.use_cosma())
             {
-                // w_gate stored as [d_ff(out), d_model(in)] -> need transpose_B
-                if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_gate[layer_idx]->data(), gate_out->data(), seq_len, config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
+                // Fused weight is [2*d_ff, d_model], needs transpose_B
+                if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_gate_up_fused[layer_idx]->data(), fused_out->data(),
+                                    seq_len, 2 * config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model,
+                                    is_prefill_stage_, false, false, true, 1.0f, 0.0f))
                 {
-                    LOG_ERROR("gate projection failed cosma");
+                    LOG_ERROR("fused gate+up projection failed cosma");
                     return false;
                 }
             }
             else
             {
-                std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_out, weights.w_gate[layer_idx]};
-                std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate_out};
-                if (!executeKernel("linear", gate_inputs, gate_outputs))
+                std::vector<std::shared_ptr<TensorBase>> fused_inputs = {ffn_norm_out, weights.w_gate_up_fused[layer_idx]};
+                std::vector<std::shared_ptr<TensorBase>> fused_outputs = {fused_out};
+                if (!executeKernel("linear", fused_inputs, fused_outputs))
                 {
-                    LOG_ERROR("gate projection failed");
+                    LOG_ERROR("fused gate+up projection failed");
                     return false;
                 }
             }
+
+            // Split fused output into gate and up tensors
+            const float *fused_data = fused_out->data();
+            float *gate_data = const_cast<float *>(gate_out->data());
+            float *up_data = const_cast<float *>(up_out->data());
+            size_t d_ff = config_.getLayerConfig().d_ff;
+
+// Copy first half to gate_out, second half to up_out
+#pragma omp parallel for
+            for (int i = 0; i < seq_len; ++i)
+            {
+                const float *fused_row = fused_data + i * (2 * d_ff);
+                float *gate_row = gate_data + i * d_ff;
+                float *up_row = up_data + i * d_ff;
+
+                std::memcpy(gate_row, fused_row, d_ff * sizeof(float));
+                std::memcpy(up_row, fused_row + d_ff, d_ff * sizeof(float));
+            }
         }
+        else
         {
-            BackendContext bctx;
-            bctx.is_prefill = is_prefill_stage_;
-            bctx.seq_len = seq_len;
-            bctx.d_model = config_.getLayerConfig().d_model;
-            bctx.n_layers = config_.getLayerConfig().n_layers;
-            bctx.world = getSize();
-            auto dec = selectAttentionBackend(bctx);
-            if (dec.use_cosma())
+            // Original separate gate and up projections
             {
-                // w_up stored as [d_ff(out), d_model(in)] -> need transpose_B
-                if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_up[layer_idx]->data(), up_out->data(), seq_len, config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
+                BackendContext bctx;
+                bctx.is_prefill = is_prefill_stage_;
+                bctx.seq_len = seq_len;
+                bctx.d_model = config_.getLayerConfig().d_model;
+                bctx.n_layers = config_.getLayerConfig().n_layers;
+                bctx.world = getSize();
+                auto dec = selectAttentionBackend(bctx);
+                if (dec.use_cosma())
                 {
-                    LOG_ERROR("up projection failed cosma");
-                    return false;
+                    // w_gate stored as [d_ff(out), d_model(in)] -> need transpose_B
+                    if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_gate[layer_idx]->data(), gate_out->data(), seq_len, config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
+                    {
+                        LOG_ERROR("gate projection failed cosma");
+                        return false;
+                    }
+                }
+                else
+                {
+                    std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_out, weights.w_gate[layer_idx]};
+                    std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate_out};
+                    if (!executeKernel("linear", gate_inputs, gate_outputs))
+                    {
+                        LOG_ERROR("gate projection failed");
+                        return false;
+                    }
                 }
             }
-            else
             {
-                std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_out, weights.w_up[layer_idx]};
-                std::vector<std::shared_ptr<TensorBase>> up_outputs = {up_out};
-                if (!executeKernel("linear", up_inputs, up_outputs))
+                BackendContext bctx;
+                bctx.is_prefill = is_prefill_stage_;
+                bctx.seq_len = seq_len;
+                bctx.d_model = config_.getLayerConfig().d_model;
+                bctx.n_layers = config_.getLayerConfig().n_layers;
+                bctx.world = getSize();
+                auto dec = selectAttentionBackend(bctx);
+                if (dec.use_cosma())
                 {
-                    LOG_ERROR("up projection failed");
-                    return false;
+                    // w_up stored as [d_ff(out), d_model(in)] -> need transpose_B
+                    if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_up[layer_idx]->data(), up_out->data(), seq_len, config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
+                    {
+                        LOG_ERROR("up projection failed cosma");
+                        return false;
+                    }
+                }
+                else
+                {
+                    std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_out, weights.w_up[layer_idx]};
+                    std::vector<std::shared_ptr<TensorBase>> up_outputs = {up_out};
+                    if (!executeKernel("linear", up_inputs, up_outputs))
+                    {
+                        LOG_ERROR("up projection failed");
+                        return false;
+                    }
                 }
             }
         }
+
         // Parity capture: FFN gate projection output
         captureIfEnabled(PipelineStage::FFN_GATE, layer_idx, gate_out);
 
@@ -1058,6 +1120,7 @@ namespace llaminar
         weights.w_gate.reserve(config.n_layers);
         weights.w_up.reserve(config.n_layers);
         weights.w_down.reserve(config.n_layers);
+        weights.w_gate_up_fused.reserve(config.n_layers);
 
         LOG_INFO("[WeightLoad] per-layer loading start layers=" << config.n_layers);
 
@@ -1261,6 +1324,56 @@ namespace llaminar
             weights.w_gate.push_back(w_gate);
             weights.w_up.push_back(w_up);
             weights.w_down.push_back(w_down);
+
+            // Create fused gate+up weight for FFN optimization (if fusion enabled)
+            if (debugEnv().pipeline.ffn_fusion_enabled)
+            {
+                // Get dimensions: w_gate and w_up are both [local_d_ff, d_model]
+                const auto &gate_shape = w_gate->shape();
+                const auto &up_shape = w_up->shape();
+
+                if (gate_shape.size() != 2 || up_shape.size() != 2)
+                {
+                    LOG_ERROR("[FFN_FUSION] Unexpected weight shape: gate=" << gate_shape.size() << "D, up=" << up_shape.size() << "D");
+                    throw std::runtime_error("FFN fusion requires 2D weights");
+                }
+
+                size_t local_d_ff = gate_shape[0];
+                size_t d_model = gate_shape[1];
+
+                // Verify up weight has same dimensions
+                if (up_shape[0] != local_d_ff || up_shape[1] != d_model)
+                {
+                    LOG_ERROR("[FFN_FUSION] Shape mismatch: gate=[" << local_d_ff << "," << d_model
+                                                                    << "], up=[" << up_shape[0] << "," << up_shape[1] << "]");
+                    throw std::runtime_error("FFN fusion requires matching gate/up shapes");
+                }
+
+                // Allocate fused weight: [2*local_d_ff, d_model]
+                auto w_fused = TensorFactory::create_simple({static_cast<int>(2 * local_d_ff), static_cast<int>(d_model)});
+                float *fused_data = const_cast<float *>(w_fused->data());
+                const float *gate_data = w_gate->data();
+                const float *up_data = w_up->data();
+
+                // Copy gate weights to first half
+                std::memcpy(fused_data, gate_data, local_d_ff * d_model * sizeof(float));
+
+                // Copy up weights to second half
+                std::memcpy(fused_data + (local_d_ff * d_model), up_data, local_d_ff * d_model * sizeof(float));
+
+                weights.w_gate_up_fused.push_back(w_fused);
+
+                if (mpi_rank == 0 && layer == 0)
+                {
+                    LOG_INFO("[FFN_FUSION] Enabled: fused_shape=[" << (2 * local_d_ff) << "," << d_model
+                                                                   << "], memory_savings=" << (local_d_ff * d_model * sizeof(float) / 1024 / 1024) << "MB per matmul");
+                }
+            }
+            else
+            {
+                // Fusion disabled: push empty placeholder to maintain vector alignment
+                weights.w_gate_up_fused.push_back(nullptr);
+            }
         }
         LOG_INFO("[WeightLoad] per-layer loading complete");
         return weights;

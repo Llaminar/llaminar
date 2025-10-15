@@ -100,6 +100,7 @@ namespace llaminar
         bool incr_cache_trace = false;           // LLAMINAR_PIPELINE_INCR_CACHE_TRACE (log K/V slice stats around incremental writes)
         bool incr_hidden_trace = false;          // LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE (dump final hidden row prior to LM head)
         bool debug_decode_embed = false;         // LLAMINAR_DEBUG_DECODE_EMBED (log embedding details during incremental decode)
+        bool ffn_fusion_enabled = true;          // LLAMINAR_FFN_FUSION (default ON, fuse gate+up projections for performance)
     };
 
     // KV cache policy (dynamic capacity management for incremental decode)
@@ -283,6 +284,16 @@ namespace llaminar
         std::string dump_stats_path;
         bool dump_gemm_snapshots = false;
         std::string dump_gemm_snapshots_path;
+    };
+
+    // Performance tracing (hierarchical hot-path instrumentation)
+    struct PerfTraceEnv
+    {
+        bool trace_enabled = false;          // LLAMINAR_PERF_TRACE
+        std::string trace_detail = "medium"; // LLAMINAR_PERF_TRACE_DETAIL (low/medium/high)
+        std::string trace_filter = "";       // LLAMINAR_PERF_TRACE_FILTER
+        std::string trace_output_file = "";  // LLAMINAR_PERF_TRACE_DUMP
+        bool trace_dump_on_exit = true;      // LLAMINAR_PERF_TRACE_AUTO_DUMP
     };
 
     // Baseline capture/compare for prefill reference snapshots
@@ -508,6 +519,7 @@ namespace llaminar
                 Col
             } mode = Mode::Auto; // LLAMINAR_TP_WO_SIM_MODE=row|col|auto
         } tp_sim;
+        PerfTraceEnv perf; // Performance tracing configuration
     };
 
     // Accessor (lazy init, thread-safe via magic statics)

@@ -18,7 +18,9 @@ struct LlaminarParams
     std::string model_file = "";         // -m, --model
     LogLevel log_level = LogLevel::INFO; // -v, -vv, -vvv
     bool inference_mode = false;         // --inference, -i
-    std::string prompt = "";             // -p, --prompt
+    std::string prompt = "";             // -p, --prompt (legacy single prompt)
+    std::vector<std::string> prompts;    // Multiple prompts for batch processing
+    int32_t batch_size = 1;              // --batch-size (default: 1)
     bool eval_only = false;              // --eval (prompt evaluation only)
     int32_t ctx_size = 2048;             // --ctx-size (renamed from n_ctx)
     int32_t n_predict = 128;             // --predict

@@ -34,6 +34,7 @@
 #include "tensors/TensorFactory.h"
 #include "Logger.h"
 #include "PerformanceTimer.h"
+#include "PerformanceTracer.h"
 #include <chrono>
 #include <cstring>
 
@@ -170,6 +171,7 @@ namespace llaminar
         bool is_prefill,
         const std::string &operation_name)
     {
+        PERF_TRACE_SCOPE_CAT(operation_name.c_str(), "linear_projection");
         // Use MPILinearOperator (wraps OpenBLAS GEMM)
         std::vector<std::shared_ptr<TensorBase>> linear_inputs = {input, weight};
         std::vector<std::shared_ptr<TensorBase>> linear_outputs = {output};
@@ -192,6 +194,7 @@ namespace llaminar
         int seq_len = input->shape()[0];
         int d_model = layer_cfg.d_model;
 
+        PERF_TRACE_SCOPE_CAT("attention_block", "prefill");
         auto t_attn_start = std::chrono::high_resolution_clock::now();
 
         // Perform RMSNorm first (separate operation)

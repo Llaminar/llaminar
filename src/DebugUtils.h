@@ -30,7 +30,9 @@ namespace llaminar
     } while (0)
 #endif
 
-// Tensor validation assertions
+// Tensor validation assertions - disabled in Release builds unless LLAMINAR_ENABLE_VALIDATION is set
+#ifdef LLAMINAR_ENABLE_VALIDATION
+
 #define ASSERT_TENSOR_NOT_NULL(tensor, name) \
     DEBUG_ASSERT(tensor != nullptr, "Tensor " << name << " is null")
 
@@ -77,12 +79,21 @@ namespace llaminar
         DEBUG_ASSERT(has_nonzero, "Tensor " << name << " appears to be all zeros (checked first 100 elements)"); \
     } while (0)
 
-    // Tensor logging utilities
+#else
+// Validation disabled - all assertions compile to no-ops for zero overhead
+#define ASSERT_TENSOR_NOT_NULL(tensor, name) ((void)0)
+#define ASSERT_TENSOR_VALID(tensor, name) ((void)0)
+#define ASSERT_TENSOR_NOT_NAN(tensor, message) ((void)0)
+#define ASSERT_TENSOR_NOT_ALL_ZEROS(tensor, name) ((void)0)
+#endif // LLAMINAR_ENABLE_VALIDATION
+
+    // Tensor logging utilities - compile to no-ops when validation is disabled
     class TensorLogger
     {
     public:
         static void logTensorStats(const std::shared_ptr<TensorBase> &tensor, const std::string &name, const std::string &stage = "")
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             if (!tensor)
             {
                 LOG_TRACE("[" << stage << "] Tensor " << name << " is NULL");
@@ -158,6 +169,12 @@ namespace llaminar
                           << " size=" << size << " values=[" << values_str << "]");
             LOG_TRACE("[" << stage << "] " << name << " stats: min=" << min_val << " max=" << max_val
                           << " mean=" << mean << " zeros=" << zero_count << " NaN=" << nan_count << " Inf=" << inf_count);
+#else
+            // No-op when validation is disabled
+            (void)tensor;
+            (void)name;
+            (void)stage;
+#endif
         }
 
         static void logMatMulOperation(const std::shared_ptr<TensorBase> &input,
@@ -165,10 +182,17 @@ namespace llaminar
                                        const std::shared_ptr<TensorBase> &output,
                                        const std::string &operation_name)
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             LOG_TRACE("=== MatMul Operation: " << operation_name << " ===");
             logTensorStats(input, "input", operation_name);
             logTensorStats(weight, "weight", operation_name);
             logTensorStats(output, "output", operation_name);
+#else
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)operation_name;
+#endif
         }
 
         static void logNormalizationOperation(const std::shared_ptr<TensorBase> &input,
@@ -176,10 +200,17 @@ namespace llaminar
                                               const std::shared_ptr<TensorBase> &output,
                                               const std::string &operation_name)
         {
+#ifdef LLAMINAR_ENABLE_VALIDATION
             LOG_INFO("=== Normalization Operation: " << operation_name << " ===");
             logTensorStats(input, "input", operation_name);
             logTensorStats(weight, "norm_weight", operation_name);
             logTensorStats(output, "output", operation_name);
+#else
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)operation_name;
+#endif
         }
     };
 

@@ -24,6 +24,27 @@ if(LLAMINAR_ENABLE_RMSNORM_REFERENCE)
     add_compile_definitions(LLAMINAR_ENABLE_RMSNORM_REFERENCE)
 endif()
 
+# Option: enable tensor validation, contracts, and health checks
+# Defaults to ON in Debug, OFF in Release for maximum performance
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT DEFINED LLAMINAR_ENABLE_VALIDATION)
+    option(LLAMINAR_ENABLE_VALIDATION "Enable tensor validation, contracts, and health checks" OFF)
+else()
+    option(LLAMINAR_ENABLE_VALIDATION "Enable tensor validation, contracts, and health checks" ON)
+endif()
+if(LLAMINAR_ENABLE_VALIDATION)
+    add_compile_definitions(LLAMINAR_ENABLE_VALIDATION)
+    message(STATUS "Tensor validation and contracts enabled")
+else()
+    message(STATUS "Tensor validation and contracts disabled for maximum performance")
+endif()
+
+# Option: enable performance tracing framework (zero-overhead when disabled)
+option(LLAMINAR_ENABLE_PERF_TRACE "Enable hierarchical performance tracing" ON)
+if(LLAMINAR_ENABLE_PERF_TRACE)
+    add_compile_definitions(LLAMINAR_ENABLE_PERF_TRACE)
+    message(STATUS "Performance tracing enabled (use LLAMINAR_PERF_TRACE=1 to activate)")
+endif()
+
 # Compiler flags
 # Note: Removed -DDEBUG from global flags to prevent COSMA verbose output
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
@@ -135,11 +156,13 @@ set(LLAMINAR_CORE_SOURCES
     src/SystemTopology.cpp
     src/ArgumentParser.cpp
     src/BenchmarkRunner.cpp
+    src/SequentialBatchBenchmark.cpp
     src/JsonExport.cpp
     src/TopologyManager.cpp
     src/MpiKernelBase.cpp
     src/CosmaPrefillManager.cpp
     src/utils/DebugEnv.cpp
+    src/PerformanceTracer.cpp
     src/operators/MPILinearOperator.cpp
     src/operators/MPIRMSNormOperator.cpp
     src/operators/MPIAttentionOperator.cpp

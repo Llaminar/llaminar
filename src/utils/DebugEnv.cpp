@@ -181,6 +181,11 @@ namespace llaminar
     s.pipeline.incr_cache_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_CACHE_TRACE"));
     s.pipeline.incr_hidden_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE"));
     s.pipeline.debug_decode_embed = flag(std::getenv("LLAMINAR_DEBUG_DECODE_EMBED"));
+    // FFN fusion: default ON, can disable with LLAMINAR_FFN_FUSION=0
+    {
+        const char *ffn_fusion_env = std::getenv("LLAMINAR_FFN_FUSION");
+        s.pipeline.ffn_fusion_enabled = ffn_fusion_env ? (std::atoi(ffn_fusion_env) != 0) : true;
+    }
     // KV cache
     s.kv_cache.dynamic_init = flag(std::getenv("LLAMINAR_KV_DYNAMIC_INIT"));
     if(const char* gfac = std::getenv("LLAMINAR_KV_GROWTH_FACTOR")) { int v=std::atoi(gfac); if(v>=1 && v<=16) s.kv_cache.growth_factor = v; }
@@ -426,6 +431,24 @@ namespace llaminar
     if(std::getenv("LLAMINAR_TP_MLP_VALIDATE")) s.mlp_tp.validate = true;
     if(std::getenv("LLAMINAR_TP_MLP_FORCE_COLUMN")) s.mlp_tp.force_column = true;
     if(std::getenv("LLAMINAR_TP_MLP_FORCE_ROW")) s.mlp_tp.force_row = true;
+    
+    // Performance tracing
+    if(std::getenv("LLAMINAR_PERF_TRACE")) s.perf.trace_enabled = true;
+    if(const char* td = std::getenv("LLAMINAR_PERF_TRACE_DETAIL")) {
+        std::string detail(td);
+        for(char &c: detail) c = (char)std::tolower(c);
+        s.perf.trace_detail = detail;
+    }
+    if(const char* tf = std::getenv("LLAMINAR_PERF_TRACE_FILTER")) {
+        if(*tf) s.perf.trace_filter = tf;
+    }
+    if(const char* to = std::getenv("LLAMINAR_PERF_TRACE_DUMP")) {
+        if(*to) s.perf.trace_output_file = to;
+    }
+    if(const char* ad = std::getenv("LLAMINAR_PERF_TRACE_AUTO_DUMP")) {
+        if(*ad == '0') s.perf.trace_dump_on_exit = false;
+    }
+    
     return s; }());
         }
         return *g_snapshot;

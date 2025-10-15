@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 namespace llaminar
 {
@@ -38,6 +39,11 @@ namespace llaminar
         std::string getKernelType() const override { return "MPILinear"; }
         size_t getExpectedInputCount() const override { return 2; } // input + weight (bias optional)
         size_t getExpectedOutputCount() const override { return 1; }
+
+        // Weight distribution cache: maps global weight pointer to distributed local weight
+        // This eliminates redundant memcpy operations across multiple forward passes
+        std::unordered_map<const float *, std::shared_ptr<TensorBase>> weight_cache_;
+        std::unordered_map<const float *, std::shared_ptr<TensorBase>> bias_cache_;
 
         /**
          * @brief Distribute weight matrix across MPI processes

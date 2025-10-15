@@ -47,6 +47,7 @@ namespace llaminar
             std::vector<std::shared_ptr<TensorBase>> w_gate;
             std::vector<std::shared_ptr<TensorBase>> w_up;
             std::vector<std::shared_ptr<TensorBase>> w_down;
+            std::vector<std::shared_ptr<TensorBase>> w_gate_up_fused; // Fused gate+up weights [2*d_ff, d_model] for FFN optimization
             std::shared_ptr<TensorBase> output_norm_weight;
             std::shared_ptr<TensorBase> lm_head;
         };

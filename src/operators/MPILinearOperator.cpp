@@ -32,6 +32,7 @@
  */
 #include "MPILinearOperator.h"
 #include "../Logger.h"
+#include "../PerformanceTracer.h"
 #include "../DebugUtils.h"
 #include "../AdaptiveMatmul.h"
 #include "../utils/DebugEnv.h"
@@ -49,8 +50,10 @@ namespace llaminar
     }
 
     bool MPILinearOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                  std::vector<std::shared_ptr<TensorBase>> &outputs)
+                                    std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
+        PERF_TRACE_SCOPE_CAT("mpi_linear_execute", "linear");
+
         if (!validate(inputs, outputs))
         {
             LOG_ERROR("MPILinearOperator validation failed on rank " << getRank());
@@ -90,19 +93,56 @@ namespace llaminar
         // Calculate local distribution
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
 
-        // Create local tensors - weight is [local_out_dim, in_dim]
-        auto local_weight = createLocalTensor({static_cast<size_t>(local_output_size), input_size});
+        // Check weight cache before distributing
+        const float *weight_key = global_weight->data();
+        std::shared_ptr<TensorBase> local_weight;
+
+        auto weight_cache_it = weight_cache_.find(weight_key);
+        if (weight_cache_it != weight_cache_.end())
+        {
+            // Cache hit: reuse previously distributed weight
+            PERF_TRACE_SCOPE_CAT("weight_cache_hit", "linear_kernel");
+            local_weight = weight_cache_it->second;
+        }
+        else
+        {
+            // Cache miss: distribute and cache the weight
+            PERF_TRACE_SCOPE_CAT("weight_cache_miss", "linear_kernel");
+            local_weight = createLocalTensor({static_cast<size_t>(local_output_size), input_size});
+            {
+                PERF_TRACE_SCOPE_CAT("distribute_weight", "linear_kernel");
+                distributeWeight(global_weight, local_weight, output_size);
+            }
+            weight_cache_[weight_key] = local_weight;
+        }
+
+        // Create local output tensor
         auto local_output = createLocalTensor({seq_len, static_cast<size_t>(local_output_size)});
 
-        // Distribute weight matrix
-        distributeWeight(global_weight, local_weight, output_size);
-
-        // Handle optional bias
+        // Handle optional bias with caching
         std::shared_ptr<TensorBase> local_bias = nullptr;
         if (inputs.size() >= 3 && inputs[2])
         {
-            local_bias = createLocalTensor({static_cast<size_t>(local_output_size)});
-            distributeBias(inputs[2], local_bias, output_size);
+            const float *bias_key = inputs[2]->data();
+            auto bias_cache_it = bias_cache_.find(bias_key);
+
+            if (bias_cache_it != bias_cache_.end())
+            {
+                // Cache hit: reuse previously distributed bias
+                PERF_TRACE_SCOPE_CAT("bias_cache_hit", "linear_kernel");
+                local_bias = bias_cache_it->second;
+            }
+            else
+            {
+                // Cache miss: distribute and cache the bias
+                PERF_TRACE_SCOPE_CAT("bias_cache_miss", "linear_kernel");
+                local_bias = createLocalTensor({static_cast<size_t>(local_output_size)});
+                {
+                    PERF_TRACE_SCOPE_CAT("distribute_bias", "linear_kernel");
+                    distributeBias(inputs[2], local_bias, output_size);
+                }
+                bias_cache_[bias_key] = local_bias;
+            }
         }
 
         // Ensure input is available on all processes (broadcast if needed)
@@ -129,16 +169,20 @@ namespace llaminar
 
         // Use adaptive matrix multiplication
         auto start = std::chrono::high_resolution_clock::now();
-        // Matrix multiplication: output = input @ weight^T
-        // Weight is [local_out_dim, in_dim], so we transpose it during matmul
-        bool matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
-                                             seq_len_int, d_out, d_model,
-                                             /*is_prefill*/ false,
-                                             /*distributed_partition*/ true,
-                                             /*transpose_A*/ false,
-                                             /*transpose_B*/ true, // CRITICAL: Transpose weight per PyTorch/GGUF convention
-                                             /*alpha*/ 1.0f,
-                                             /*beta*/ 0.0f);
+        bool matmul_success;
+        {
+            PERF_TRACE_SCOPE_CAT("linear_matmul", "linear_kernel");
+            // Matrix multiplication: output = input @ weight^T
+            // Weight is [local_out_dim, in_dim], so we transpose it during matmul
+            matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
+                                            seq_len_int, d_out, d_model,
+                                            /*is_prefill*/ false,
+                                            /*distributed_partition*/ true,
+                                            /*transpose_A*/ false,
+                                            /*transpose_B*/ true, // CRITICAL: Transpose weight per PyTorch/GGUF convention
+                                            /*alpha*/ 1.0f,
+                                            /*beta*/ 0.0f);
+        }
         auto end = std::chrono::high_resolution_clock::now();
 
         if (!matmul_success)
@@ -154,11 +198,15 @@ namespace llaminar
         // Add bias if provided
         if (local_bias)
         {
+            PERF_TRACE_SCOPE_CAT("add_bias", "linear_kernel");
             addBiasLocal(local_output->data(), local_bias->data(), seq_len, local_output_size);
         }
 
         // Gather results from all processes
-        gatherOutput(local_output, global_output, seq_len, output_size);
+        {
+            PERF_TRACE_SCOPE_CAT("gather_output", "mpi_collective");
+            gatherOutput(local_output, global_output, seq_len, output_size);
+        }
 
         if (linear_diag && getRank() == 0)
         {
@@ -176,7 +224,7 @@ namespace llaminar
     }
 
     bool MPILinearOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                   const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+                                     const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Basic validation similar to LinearKernel
         if (inputs.size() < 2 || inputs.size() > 3 || outputs.size() != 1)
@@ -193,8 +241,8 @@ namespace llaminar
         if (!input || !weight || !output)
         {
             LOG_ERROR("MPILinearOperator: Null tensor provided - input: " << (input ? "valid" : "null")
-                                                                        << ", weight: " << (weight ? "valid" : "null")
-                                                                        << ", output: " << (output ? "valid" : "null"));
+                                                                          << ", weight: " << (weight ? "valid" : "null")
+                                                                          << ", output: " << (output ? "valid" : "null"));
             return false;
         }
 
@@ -216,8 +264,8 @@ namespace llaminar
         if (input->shape()[1] != weight->shape()[1])
         {
             LOG_ERROR("MPILinearOperator: Input size " << input->shape()[1]
-                                                     << " doesn't match weight input size " << weight->shape()[1]
-                                                     << " (weight shape=[" << weight->shape()[0] << ", " << weight->shape()[1] << "])");
+                                                       << " doesn't match weight input size " << weight->shape()[1]
+                                                       << " (weight shape=[" << weight->shape()[0] << ", " << weight->shape()[1] << "])");
             return false;
         }
 
@@ -228,7 +276,7 @@ namespace llaminar
             output->shape()[1] != weight->shape()[0]) // Changed from weight->shape()[1]
         {
             LOG_ERROR("MPILinearOperator: Output shape mismatch - expected [" << input->shape()[0]
-                                                                            << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
+                                                                              << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
             return false;
         }
 
@@ -247,9 +295,11 @@ namespace llaminar
     }
 
     void MPILinearOperator::distributeWeight(const std::shared_ptr<TensorBase> &global_weight,
-                                           std::shared_ptr<TensorBase> &local_weight,
-                                           size_t output_size)
+                                             std::shared_ptr<TensorBase> &local_weight,
+                                             size_t output_size)
     {
+        PERF_TRACE_SCOPE_CAT("distribute_weight_internal", "linear_kernel");
+
         // New convention: weight is [output_size, input_size]
         size_t input_size = global_weight->shape()[1];
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
@@ -269,76 +319,159 @@ namespace llaminar
         const float *src_start = global_data + output_offset * input_size;
 
         // Single contiguous memcpy is optimal for row-major slicing
-        std::memcpy(local_data, src_start, elements_to_copy * sizeof(float));
+        {
+            PERF_TRACE_SCOPE_CAT("weight_memcpy", "linear_kernel");
+            std::memcpy(local_data, src_start, elements_to_copy * sizeof(float));
+        }
 
         LOG_DEBUG("Distributed weight matrix: local size [" << local_output_size << ", " << input_size
                                                             << "], offset " << output_offset << " on rank " << getRank());
     }
 
     void MPILinearOperator::distributeBias(const std::shared_ptr<TensorBase> &global_bias,
-                                         std::shared_ptr<TensorBase> &local_bias,
-                                         size_t output_size)
+                                           std::shared_ptr<TensorBase> &local_bias,
+                                           size_t output_size)
     {
+        PERF_TRACE_SCOPE_CAT("distribute_bias_internal", "linear_kernel");
+
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
 
         // Extract local portion of bias vector
         const float *global_data = global_bias->data();
         float *local_data = local_bias->data();
 
-        std::memcpy(local_data, global_data + output_offset, local_output_size * sizeof(float));
+        {
+            PERF_TRACE_SCOPE_CAT("bias_memcpy", "linear_kernel");
+            std::memcpy(local_data, global_data + output_offset, local_output_size * sizeof(float));
+        }
 
         LOG_DEBUG("Distributed bias vector: local size " << local_output_size
                                                          << ", offset " << output_offset << " on rank " << getRank());
     }
 
     void MPILinearOperator::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
-                                       std::shared_ptr<TensorBase> &global_output,
-                                       size_t seq_len,
-                                       size_t output_size)
+                                         std::shared_ptr<TensorBase> &global_output,
+                                         size_t seq_len,
+                                         size_t output_size)
     {
-        // Gather all local outputs to form the complete global output
-        // Use MPI_Allgatherv to handle variable local sizes per rank
+        PERF_TRACE_SCOPE_CAT("gather_output_internal", "linear_kernel");
+
+        // OPTIMIZED: Single MPI_Allgatherv instead of per-row loop
+        // Strategy: Pack all local data, single gather, unpack into strided global output
 
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
-        // Precompute counts/offsets once; previous implementation recomputed per row.
+
+        // Compute recv_counts and recv_offsets for packed data (all ranks contribute seq_len * local_size elements)
         std::vector<int> recv_counts(getSize());
         std::vector<int> recv_offsets(getSize());
-        for (int rank = 0; rank < getSize(); ++rank)
+        std::vector<size_t> rank_local_sizes(getSize());
+        std::vector<size_t> rank_offsets(getSize());
+
         {
-            auto [rank_local_size, rank_offset] = getRowDistribution(output_size, rank);
-            recv_counts[rank] = static_cast<int>(rank_local_size);
-            recv_offsets[rank] = static_cast<int>(rank_offset);
+            PERF_TRACE_SCOPE_CAT("gather_setup_metadata", "linear_kernel");
+            size_t packed_offset = 0;
+            for (int rank = 0; rank < getSize(); ++rank)
+            {
+                auto [rank_local_size, rank_col_offset] = getRowDistribution(output_size, rank);
+                rank_local_sizes[rank] = rank_local_size;
+                rank_offsets[rank] = rank_col_offset;
+
+                // Each rank sends seq_len * rank_local_size elements (contiguous in local buffer)
+                recv_counts[rank] = static_cast<int>(seq_len * rank_local_size);
+                recv_offsets[rank] = static_cast<int>(packed_offset);
+                packed_offset += seq_len * rank_local_size;
+            }
         }
 
-        // Row-wise Allgatherv (cannot trivially collapse into single collective without packing
-        // because column blocks for each rank are strided in row-major layout). Future optimization:
-        // pack local_output into an interleaved buffer (seq-major) with one Allgatherv using a
-        // custom MPI datatype for the column block.
-        for (size_t seq_idx = 0; seq_idx < seq_len; ++seq_idx)
+        // Allocate packed buffer for gathered data
+        std::vector<float> packed_global(seq_len * output_size);
+
+        // Single Allgatherv: Gather all packed local data
         {
-            const float *local_row = local_output->data() + seq_idx * local_output_size;
-            float *global_row = global_output->data() + seq_idx * output_size;
-            checkMPIError(MPI_Allgatherv(local_row, static_cast<int>(local_output_size), MPI_FLOAT,
-                                         global_row, recv_counts.data(), recv_offsets.data(), MPI_FLOAT,
+            PERF_TRACE_SCOPE_CAT("allgatherv_single_collective", "mpi_collective");
+            const float *local_data = local_output->data(); // Already contiguous [seq_len, local_output_size]
+            int send_count = static_cast<int>(seq_len * local_output_size);
+
+            checkMPIError(MPI_Allgatherv(local_data, send_count, MPI_FLOAT,
+                                         packed_global.data(), recv_counts.data(), recv_offsets.data(), MPI_FLOAT,
                                          getComm()),
-                          "MPI_Allgatherv in gatherOutput");
+                          "MPI_Allgatherv in gatherOutput (optimized)");
         }
 
-        LOG_DEBUG("Gathered output: [" << seq_len << ", " << output_size << "] on rank " << getRank());
+        // Unpack: Interleave columns from each rank into global output
+        {
+            PERF_TRACE_SCOPE_CAT("unpack_interleaved_columns", "linear_kernel");
+            float *global_data = global_output->data();
+
+            // Optimize for common case: 2 ranks (can unroll inner loop)
+            if (getSize() == 2)
+            {
+                // Two-rank fast path: unroll the rank loop
+                size_t size0 = rank_local_sizes[0];
+                size_t size1 = rank_local_sizes[1];
+                size_t offset0 = rank_offsets[0];
+                size_t offset1 = rank_offsets[1];
+                int recv_off0 = recv_offsets[0];
+                int recv_off1 = recv_offsets[1];
+
+#pragma omp parallel for schedule(static)
+                for (size_t row = 0; row < seq_len; ++row)
+                {
+                    float *global_row = global_data + row * output_size;
+                    const float *src0 = packed_global.data() + recv_off0 + row * size0;
+                    const float *src1 = packed_global.data() + recv_off1 + row * size1;
+
+                    std::memcpy(global_row + offset0, src0, size0 * sizeof(float));
+                    std::memcpy(global_row + offset1, src1, size1 * sizeof(float));
+                }
+            }
+            else
+            {
+// General multi-rank path
+#pragma omp parallel for schedule(static)
+                for (size_t row = 0; row < seq_len; ++row)
+                {
+                    float *global_row = global_data + row * output_size;
+
+                    // Copy column blocks from each rank into the global row
+                    for (int rank = 0; rank < getSize(); ++rank)
+                    {
+                        size_t rank_local_size = rank_local_sizes[rank];
+                        size_t rank_col_offset = rank_offsets[rank];
+
+                        // Source: packed_global at [recv_offsets[rank] + row * rank_local_size]
+                        const float *src = packed_global.data() + recv_offsets[rank] + row * rank_local_size;
+
+                        // Destination: global_row at column offset rank_col_offset
+                        float *dst = global_row + rank_col_offset;
+
+                        // Copy rank's column block for this row
+                        std::memcpy(dst, src, rank_local_size * sizeof(float));
+                    }
+                }
+            }
+        }
+
+        LOG_DEBUG("Gathered output (optimized): [" << seq_len << ", " << output_size << "] on rank " << getRank());
     }
 
     void MPILinearOperator::addBiasLocal(float *output, const float *bias,
-                                       size_t seq_len, size_t local_output_size)
+                                         size_t seq_len, size_t local_output_size)
     {
+        PERF_TRACE_SCOPE_CAT("add_bias_internal", "linear_kernel");
+
         // Add bias to each sequence position: output[i, j] += bias[j]
         auto omp_start = std::chrono::high_resolution_clock::now();
-#pragma omp parallel for
-        for (size_t i = 0; i < seq_len; ++i)
         {
-#pragma omp simd
-            for (size_t j = 0; j < local_output_size; ++j)
+            PERF_TRACE_SCOPE_CAT("bias_omp_parallel_loop", "linear_kernel");
+#pragma omp parallel for
+            for (size_t i = 0; i < seq_len; ++i)
             {
-                output[i * local_output_size + j] += bias[j];
+#pragma omp simd
+                for (size_t j = 0; j < local_output_size; ++j)
+                {
+                    output[i * local_output_size + j] += bias[j];
+                }
             }
         }
         auto omp_end = std::chrono::high_resolution_clock::now();

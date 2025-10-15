@@ -3093,11 +3093,11 @@ if (env.attention.micro_trace && rank == 0) {
 **Mandatory Rules**:
 1. **No Hot-Path getenv**: All environment variables parsed once at initialization
 2. **Typed Fields**: Boolean, integer, and string fields with proper defaults
-3. **Single Registry**: All flags documented in `debug_env.h`
+3. **Single Registry**: All flags documented in `DebugEnv.h`
 4. **Lazy Initialization**: Snapshot created on first `debugEnv()` call
 
 **Migration Guidance**:
-- New flags MUST be added to appropriate group in `debug_env.h`
+- New flags MUST be added to appropriate group in `DebugEnv.h`
 - Existing raw `std::getenv` calls should be migrated on file touch
 - Experimental flags staged in snapshot early to prevent drift
 

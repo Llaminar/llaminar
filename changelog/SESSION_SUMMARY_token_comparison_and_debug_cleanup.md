@@ -119,7 +119,7 @@ if (getRank() == 0) {
 **Solution**: Added environment variable control
 
 **Changes Made**:
-1. **debug_env.h**: Added `debug_decode_embed` flag to `PipelineEnv`
+1. **DebugEnv.h**: Added `debug_decode_embed` flag to `PipelineEnv`
 2. **debug_env.cpp**: Added `LLAMINAR_DEBUG_DECODE_EMBED` parsing
 3. **qwen_pipeline.cpp**: Conditional logging:
    ```cpp
