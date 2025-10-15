@@ -215,6 +215,53 @@ namespace llaminar
         const std::vector<int> &get_shape() const { return shape_; }
 
         // Utility methods
+        
+        /**
+         * @brief Get batch size (first dimension) - 1 if tensor has no batch dimension
+         */
+        size_t batch_size() const
+        {
+            return shape_.empty() ? 1 : static_cast<size_t>(shape_[0]);
+        }
+        
+        /**
+         * @brief Get sequence length dimension
+         * For 2D tensors: [seq_len, d_model] -> seq_len
+         * For 3D tensors: [batch, seq_len, d_model] -> seq_len
+         */
+        size_t seq_len() const
+        {
+            if (shape_.size() < 2) return 1;
+            return static_cast<size_t>(shape_[1]);
+        }
+        
+        /**
+         * @brief Reshape tensor to new shape (returns new tensor)
+         * @param new_shape New tensor shape
+         * @return Shared pointer to new tensor with reshaped data
+         */
+        std::shared_ptr<SimpleTensor> reshape_copy(const std::vector<int> &new_shape) const
+        {
+            int new_size = 1;
+            for (int dim : new_shape)
+            {
+                new_size *= dim;
+            }
+
+            if (new_size != size())
+            {
+                throw std::invalid_argument("Cannot reshape tensor: size mismatch");
+            }
+
+            auto result = std::make_shared<SimpleTensor>();
+            result->shape_ = new_shape;
+            result->data_ = data_;  // Copy data
+            return result;
+        }
+        
+        /**
+         * @brief Reshape tensor in-place
+         */
         void reshape(const std::vector<int> &new_shape)
         {
             int new_size = 1;
@@ -229,6 +276,98 @@ namespace llaminar
             }
 
             shape_ = new_shape;
+        }
+        
+        /**
+         * @brief Extract a single sequence from a batched tensor
+         * @param batch_idx Index of the batch to extract
+         * @return Shared pointer to tensor containing just that batch element
+         * 
+         * Example: [batch=4, seq_len=8, d_model=896] -> [seq_len=8, d_model=896]
+         */
+        std::shared_ptr<SimpleTensor> slice_batch(size_t batch_idx) const
+        {
+            if (shape_.empty())
+            {
+                throw std::invalid_argument("Cannot slice batch from scalar tensor");
+            }
+            
+            size_t batch_dim = static_cast<size_t>(shape_[0]);
+            if (batch_idx >= batch_dim)
+            {
+                throw std::out_of_range("Batch index out of range");
+            }
+            
+            // Calculate size of one batch element
+            size_t batch_elem_size = 1;
+            std::vector<int> new_shape;
+            for (size_t i = 1; i < shape_.size(); ++i)
+            {
+                new_shape.push_back(shape_[i]);
+                batch_elem_size *= shape_[i];
+            }
+            
+            // Create new tensor with sliced data
+            auto result = std::make_shared<SimpleTensor>();
+            result->shape_ = new_shape;
+            result->data_.resize(batch_elem_size);
+            
+            // Copy data for this batch index
+            const float* src = data_.data() + batch_idx * batch_elem_size;
+            std::copy(src, src + batch_elem_size, result->data_.begin());
+            
+            return result;
+        }
+        
+        /**
+         * @brief Stack multiple tensors along a new batch dimension
+         * @param sequences Vector of tensors to stack
+         * @return Shared pointer to batched tensor
+         * 
+         * Example: 4× [seq_len=8, d_model=896] -> [batch=4, seq_len=8, d_model=896]
+         */
+        static std::shared_ptr<SimpleTensor> stack_batch(
+            const std::vector<std::shared_ptr<SimpleTensor>>& sequences)
+        {
+            if (sequences.empty())
+            {
+                throw std::invalid_argument("Cannot stack empty sequence vector");
+            }
+            
+            // Verify all sequences have same shape
+            const auto& ref_shape = sequences[0]->shape_;
+            for (size_t i = 1; i < sequences.size(); ++i)
+            {
+                if (sequences[i]->shape_ != ref_shape)
+                {
+                    throw std::invalid_argument("All sequences must have same shape for stacking");
+                }
+            }
+            
+            // Create new shape with batch dimension
+            std::vector<int> new_shape;
+            new_shape.push_back(static_cast<int>(sequences.size()));  // batch dimension
+            new_shape.insert(new_shape.end(), ref_shape.begin(), ref_shape.end());
+            
+            // Calculate sizes
+            size_t batch_size = sequences.size();
+            size_t elem_size = sequences[0]->data_.size();
+            size_t total_size = batch_size * elem_size;
+            
+            // Create result tensor
+            auto result = std::make_shared<SimpleTensor>();
+            result->shape_ = new_shape;
+            result->data_.resize(total_size);
+            
+            // Copy data from each sequence
+            for (size_t b = 0; b < batch_size; ++b)
+            {
+                float* dst = result->data_.data() + b * elem_size;
+                const float* src = sequences[b]->data_.data();
+                std::copy(src, src + elem_size, dst);
+            }
+            
+            return result;
         }
 
         void resize(const std::vector<int> &new_shape)

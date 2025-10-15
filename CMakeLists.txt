@@ -157,6 +157,7 @@ set(LLAMINAR_CORE_SOURCES
     src/ArgumentParser.cpp
     src/BenchmarkRunner.cpp
     src/SequentialBatchBenchmark.cpp
+    src/BatchPaddingUtils.cpp
     src/JsonExport.cpp
     src/TopologyManager.cpp
     src/MpiKernelBase.cpp
