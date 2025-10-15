@@ -465,6 +465,11 @@ add_executable(test_numa tests/TestNuma.cpp)
 target_link_libraries(test_numa llaminar_core)
 add_test_with_debug_logging(NumaTest COMMAND test_numa)
 
+# Batch padding utilities test
+add_executable(test_batch_padding tests/test_batch_padding.cpp)
+target_link_libraries(test_batch_padding llaminar_core GTest::gtest GTest::gtest_main)
+add_test_with_debug_logging(BatchPaddingTest COMMAND test_batch_padding)
+
 add_executable(test_contract_loading tests/TestContractLoading.cpp)
 target_link_libraries(test_contract_loading llaminar_core)
 add_test_with_debug_logging(ContractLoadingTest COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} ./test_contract_loading ${MPIEXEC_POSTFLAGS})
