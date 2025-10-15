@@ -214,6 +214,14 @@ namespace llaminar
      * - No MatMulBackendSelector class involved - direct backend branching in matmul_with_bias()
      * - All backends respect proper matrix orientation contracts (no silent transpositions)
      *
+     * Batch Processing Support:
+     * - Accepts both 2D [seq_len, d_model] and 3D [batch, seq_len, d_model] inputs
+     * - Batch dimension is flattened: [batch, seq, d_model] → [batch*seq, d_model]
+     * - All pipeline stages process flattened batch*seq_len as unified sequence
+     * - Output shape matches input dimensionality (2D → 2D, 3D → 3D)
+     * - Backward compatible: Existing 2D inputs produce 2D outputs as before
+     * - Note: Current implementation processes flattened batch (no per-batch padding masks yet)
+     *
      * @note Output Contract (Fully Replicated):
      * The operator returns a FULLY REPLICATED attention output across all ranks. The output tensor
      * is identical on all processes after MPI_Allreduce (MPI_SUM) in the projectAndGatherOutput stage.

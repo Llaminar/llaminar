@@ -273,9 +273,9 @@ namespace llaminar
         }
 
         auto input = inputs[0];
-        if (input->shape().size() != 2)
+        if (input->shape().size() != 2 && input->shape().size() != 3)
         {
-            LOG_ERROR("MPIAttentionOperator: Input must be 2D [seq_len, d_model], got shape size "
+            LOG_ERROR("MPIAttentionOperator: Input must be 2D [seq_len, d_model] or 3D [batch, seq_len, d_model], got shape size "
                       << input->shape().size());
             return false;
         }
@@ -472,8 +472,15 @@ namespace llaminar
         result.k_cache_in = inputs[8];
         result.v_cache_in = inputs[9];
 
-        result.seq_len = static_cast<int>(result.input->shape()[0]);
-        result.d_model = static_cast<int>(result.input->shape()[1]);
+        // Extract dimensions - support both 2D [seq_len, d_model] and 3D [batch, seq_len, d_model]
+        bool is_batched = (result.input->shape().size() == 3);
+        int batch_size = is_batched ? result.input->shape()[0] : 1;
+        int seq_len_per_batch = is_batched ? result.input->shape()[1] : result.input->shape()[0];
+        int d_model_dim = is_batched ? result.input->shape()[2] : result.input->shape()[1];
+        
+        // For batched inputs, treat as [batch*seq_len, d_model] (flatten batch dimension)
+        result.seq_len = batch_size * seq_len_per_batch;
+        result.d_model = d_model_dim;
 
         // DEBUG: Trace bias flow from input extraction
         if (debugEnv().attention.verbose && layer_index_ == 0)
@@ -2800,10 +2807,22 @@ namespace llaminar
         auto output_result = projectAndGatherOutput(setup, weights, attention_result);
         auto local_output = output_result.attention_output;
 
-        // Copy to output tensor
+        // Copy to output tensor (handle both 2D and 3D based on input shape)
         if (outputs.empty())
         {
-            outputs.push_back(TensorFactory::create_simple({seq_len, d_model}));
+            // Create output with same dimensionality as input
+            if (input->shape().size() == 3)
+            {
+                // Batched: restore [batch, seq_len, d_model] shape
+                int batch_size = input->shape()[0];
+                int seq_len_per_batch = input->shape()[1];
+                outputs.push_back(TensorFactory::create_simple({batch_size, seq_len_per_batch, d_model}));
+            }
+            else
+            {
+                // Non-batched: [seq_len, d_model]
+                outputs.push_back(TensorFactory::create_simple({seq_len, d_model}));
+            }
             outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
             outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
         }
@@ -2826,7 +2845,7 @@ namespace llaminar
             }
         }
 
-        // outputs[0] = attention output
+        // outputs[0] = attention output (shape matches input dimensionality)
         memcpy(outputs[0]->data(), local_output->data(), seq_len * d_model * sizeof(float));
 
         // outputs[1] = updated K cache (local portion for this rank's KV heads)
