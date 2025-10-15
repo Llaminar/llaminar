@@ -554,6 +554,13 @@ if(GTEST_FOUND)
     set_tests_properties(MPILinearBatchTest PROPERTIES TIMEOUT 60)
     set_tests_properties(MPILinearBatchTest PROPERTIES LABELS "linear;batch")
 
+    # MPI RMSNorm Batch support test
+    add_executable(test_mpi_rmsnorm_batch tests/test_mpi_rmsnorm_batch.cpp)
+    target_link_libraries(test_mpi_rmsnorm_batch llaminar_core GTest::gtest)
+    add_llaminar_mpi_test(MPIRMSNormBatchTest 2 test_mpi_rmsnorm_batch)
+    set_tests_properties(MPIRMSNormBatchTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(MPIRMSNormBatchTest PROPERTIES LABELS "rmsnorm;batch;normalization")
+
     # Minimal MPI finalize probe test (diagnostic for finalize hang)
     add_executable(test_mpi_finalize_probe tests/TestMpiFinalizeProbe.cpp)
     target_link_libraries(test_mpi_finalize_probe llaminar_core)
