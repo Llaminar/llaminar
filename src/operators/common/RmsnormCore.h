@@ -30,6 +30,7 @@ namespace llaminar::kernels
         bool allow_parallel = true;                  // Permit OpenMP parallel loops when heuristics match
         bool force_scalar = false;                   // Force fully scalar (single-thread, no SIMD pragma hints)
         std::size_t parallel_threshold_elems = 8192; // rows*cols threshold for row parallelism
+        bool t5_compat_mode = false;                 // Use float32 accumulation for PyTorch T5LayerNorm parity
     };
 
     enum class GammaMode

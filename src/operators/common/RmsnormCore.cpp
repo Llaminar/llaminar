@@ -40,6 +40,27 @@ namespace llaminar::kernels
     {
         if (!src || !row_sumsq || rows == 0 || cols == 0)
             return;
+
+        // T5 compatibility mode: use float32 accumulation to match PyTorch T5LayerNorm exactly
+        if (opts.t5_compat_mode)
+        {
+            bool parallel = want_parallel(rows, cols, opts);
+#pragma omp parallel for if (parallel)
+            for (long long r = 0; r < (long long)rows; ++r)
+            {
+                const float *row = src + (std::size_t)r * cols;
+                float sum_sq = 0.0f;
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    float val = row[c];
+                    sum_sq += val * val;
+                }
+                row_sumsq[r] = (double)sum_sq; // Convert to double for API compatibility
+            }
+            return;
+        }
+
+        // Standard double precision path (existing implementation)
         bool parallel = want_parallel(rows, cols, opts);
 #if defined(__AVX2__) || defined(__AVX512F__)
         const auto &renv_top = llaminar::debugEnv().rmsnorm;
