@@ -95,23 +95,23 @@ namespace llaminar::attn
             const float x_second = head_ptr[idx_second];
 
             // DEBUG: Log first few rotations for position 0 (use printf to bypass logging/OpenMP issues)
-            if (debug && position == 0 && head_idx == 0 && i < 5)
-            {
-                printf("[RoPE_DEBUG] pos=0 head=0 dim_pair=%d inv_freq=%.10f angle=%.10f cos=%.10f sin=%.10f before=[%.6f,%.6f]\n",
-                       i, inv_freq[i], angle, cos_angle, sin_angle, x_first, x_second);
-                fflush(stdout);
-            }
+            // if (debug && position == 0 && head_idx == 0 && i < 5)
+            // {
+            //     printf("[RoPE_DEBUG] pos=0 head=0 dim_pair=%d inv_freq=%.10f angle=%.10f cos=%.10f sin=%.10f before=[%.6f,%.6f]\n",
+            //            i, inv_freq[i], angle, cos_angle, sin_angle, x_first, x_second);
+            //     fflush(stdout);
+            // }
 
             // Apply rotation (rotate_half pattern)
             head_ptr[idx_first] = x_first * cos_angle - x_second * sin_angle;
             head_ptr[idx_second] = x_first * sin_angle + x_second * cos_angle;
 
             // DEBUG: Log after rotation
-            if (debug && position == 0 && head_idx == 0 && i < 5)
-            {
-                printf("[RoPE_DEBUG]   after=[%.6f,%.6f]\n", head_ptr[idx_first], head_ptr[idx_second]);
-                fflush(stdout);
-            }
+            // if (debug && position == 0 && head_idx == 0 && i < 5)
+            // {
+            //     printf("[RoPE_DEBUG]   after=[%.6f,%.6f]\n", head_ptr[idx_first], head_ptr[idx_second]);
+            //     fflush(stdout);
+            // }
         }
     }
 
@@ -131,17 +131,17 @@ namespace llaminar::attn
                                      int head_dim, int n_past,
                                      const std::vector<float> &inv_freq, bool debug = false)
     {
-        printf("[ROPE_TENSOR] seq_len=%d num_heads=%d head_dim=%d n_past=%d debug=%d\n",
-               seq_len, num_heads, head_dim, n_past, (int)debug);
-        fflush(stdout);
+        // printf("[ROPE_TENSOR] seq_len=%d num_heads=%d head_dim=%d n_past=%d debug=%d\n",
+        //        seq_len, num_heads, head_dim, n_past, (int)debug);
+        // fflush(stdout);
 
         const auto &env = llaminar::debugEnv().attention;
 
         // Disable OpenMP if debug mode to ensure printf output appears
         bool use_parallel = !env.prim_force_scalar && !debug;
 
-        printf("[ROPE_TENSOR] About to enter loop, use_parallel=%d\n", (int)use_parallel);
-        fflush(stdout);
+        // printf("[ROPE_TENSOR] About to enter loop, use_parallel=%d\n", (int)use_parallel);
+        // fflush(stdout);
 
 // Parallelize over (token, head) pairs
 // Each iteration is independent, making this perfectly parallelizable
@@ -159,18 +159,18 @@ namespace llaminar::attn
                 // Apply rotation - pass debug for first token, first head only
                 bool debug_this = debug && (t == 0) && (h == 0);
 
-                if (t == 0 && h == 0)
-                {
-                    printf("[ROPE_TENSOR] Processing t=0 h=0, debug_this=%d\n", (int)debug_this);
-                    fflush(stdout);
-                }
+                // if (t == 0 && h == 0)
+                // {
+                //     printf("[ROPE_TENSOR] Processing t=0 h=0, debug_this=%d\n", (int)debug_this);
+                //     fflush(stdout);
+                // }
 
                 apply_rope_to_head(head_ptr, position, inv_freq, head_dim, debug_this, h);
             }
         }
 
-        printf("[ROPE_TENSOR] Loop complete\n");
-        fflush(stdout);
+        // printf("[ROPE_TENSOR] Loop complete\n");
+        // fflush(stdout);
     }
 
     // ============================================================================
@@ -200,8 +200,8 @@ namespace llaminar::attn
     void apply_rope(float *q, float *k, int seq_len, int head_dim,
                     int q_heads, int k_heads, int n_past, float freq_base)
     {
-        fprintf(stderr, "[ROPE_ENTRY] seq_len=%d q_heads=%d k_heads=%d\n", seq_len, q_heads, k_heads);
-        fflush(stderr);
+        // fprintf(stderr, "[ROPE_ENTRY] seq_len=%d q_heads=%d k_heads=%d\n", seq_len, q_heads, k_heads);
+        // fflush(stderr);
 
         const auto &env = llaminar::debugEnv().attention;
 
@@ -239,18 +239,18 @@ namespace llaminar::attn
         const std::vector<float> inv_freq = compute_inv_freq(head_dim, freq_base);
 
         // Log first few inverse frequencies for debugging (before OpenMP region to guarantee output)
-        if (enable_debug)
-        {
-            printf("[RoPE_DEBUG] First 5 inv_freq values:\n");
-            for (int i = 0; i < std::min(5, (int)inv_freq.size()); ++i)
-            {
-                float exponent = (2.0f * i) / head_dim;
-                printf("[RoPE_DEBUG]   inv_freq[%d] = %.10f (from 1e6^%.5f = %.5f)\n",
-                       i, inv_freq[i], exponent, std::pow(freq_base, exponent));
-            }
-            printf("[RoPE_DEBUG] PyTorch expects inv_freq[0]=1.0, inv_freq[1]≈0.9886\n");
-            fflush(stdout);
-        }
+        // if (enable_debug)
+        // {
+        //     printf("[RoPE_DEBUG] First 5 inv_freq values:\n");
+        //     for (int i = 0; i < std::min(5, (int)inv_freq.size()); ++i)
+        //     {
+        //         float exponent = (2.0f * i) / head_dim;
+        //         printf("[RoPE_DEBUG]   inv_freq[%d] = %.10f (from 1e6^%.5f = %.5f)\n",
+        //                i, inv_freq[i], exponent, std::pow(freq_base, exponent));
+        //     }
+        //     printf("[RoPE_DEBUG] PyTorch expects inv_freq[0]=1.0, inv_freq[1]≈0.9886\n");
+        //     fflush(stdout);
+        // }
 
         // Apply RoPE to Q tensor
         apply_rope_to_tensor(q, seq_len, q_heads, head_dim, n_past, inv_freq, enable_debug);

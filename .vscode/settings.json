@@ -119,5 +119,6 @@
     "chat.tools.terminal.autoApprove": {
         "/.*/": true
     },
-    "chat.todoListTool.enabled": true
+    "chat.todoListTool.enabled": true,
+    "markdown.validate.enabled": true
 }

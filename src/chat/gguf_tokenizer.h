@@ -69,7 +69,7 @@ namespace llaminar
             void loadVocabularyTokens(const ModelLoader &model);
             void initializeSpecialTokens(const ModelLoader &model);
             void detectTokenizerType(const std::string &model_name);
-            void initializeBPEProcessor();
+            void initializeBPEProcessor(const ModelLoader &model);
             std::vector<int32_t> tokenizeSimple(const std::string &text);
             std::string detokenizeSimple(const std::vector<int32_t> &tokens);
             std::vector<int32_t> tokenizeBPE(const std::string &text);

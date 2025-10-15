@@ -29,12 +29,14 @@ namespace llaminar
             ~BPEProcessor() = default;
 
             /**
-             * Initialize BPE from vocabulary
+             * Initialize BPE from vocabulary and merge rules
              * @param token_to_id Map from token strings to IDs
              * @param id_to_token Vector of token strings indexed by ID
+             * @param merge_rules Vector of merge rule strings (format: "token1 token2")
              */
             void initialize(const std::unordered_map<std::string, int32_t> &token_to_id,
-                            const std::vector<std::string> &id_to_token);
+                            const std::vector<std::string> &id_to_token,
+                            const std::vector<std::string> &merge_rules);
 
             /**
              * Tokenize text using BPE algorithm
@@ -84,7 +86,13 @@ namespace llaminar
             void initializeByteMapping();
 
             /**
-             * Extract BPE merges from vocabulary
+             * Parse merge rules from GGUF metadata
+             * @param merge_rules Vector of merge rule strings (format: "token1 token2")
+             */
+            void parseMergeRules(const std::vector<std::string> &merge_rules);
+
+            /**
+             * Extract BPE merges from vocabulary (fallback method, less reliable)
              * @param token_to_id Token vocabulary
              */
             void extractBPEMerges(const std::unordered_map<std::string, int32_t> &token_to_id);

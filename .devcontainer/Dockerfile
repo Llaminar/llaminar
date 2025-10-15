@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     util-linux \
     procps \
     passwd \
+    xterm \
     # Build essentials
     build-essential \
     gcc \

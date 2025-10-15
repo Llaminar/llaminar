@@ -32,7 +32,7 @@ namespace llaminar
                 // Initialize BPE processor if using BPE tokenization
                 if (tokenizer_type_ == TokenizerType::BPE)
                 {
-                    initializeBPEProcessor();
+                    initializeBPEProcessor(model);
                 }
 
                 vocab_loaded_ = true;
@@ -376,7 +376,7 @@ namespace llaminar
             return "[INVALID:" + std::to_string(token_id) + "]";
         }
 
-        void GGUFTokenizer::initializeBPEProcessor()
+        void GGUFTokenizer::initializeBPEProcessor(const ModelLoader &model)
         {
             if (!bpe_processor_)
             {
@@ -393,8 +393,33 @@ namespace llaminar
                 token_strings.push_back(token_data.text);
             }
 
-            // Initialize BPE processor with vocabulary
-            bpe_processor_->initialize(token_to_id_, token_strings);
+            // Load actual BPE merge rules from GGUF metadata
+            const auto &gguf_model = model.getModel();
+
+            std::vector<std::string> merge_rules;
+            if (gguf_model.hasMetadata("tokenizer.ggml.merges"))
+            {
+                auto it = gguf_model.metadata.find("tokenizer.ggml.merges");
+                if (it != gguf_model.metadata.end())
+                {
+                    try
+                    {
+                        merge_rules = it->second.asStringArray();
+                        LOG_INFO("Loaded " << merge_rules.size() << " BPE merge rules from GGUF metadata");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("Failed to parse BPE merge rules: " << e.what());
+                    }
+                }
+            }
+            else
+            {
+                LOG_WARN("No BPE merge rules found in GGUF metadata (tokenizer.ggml.merges)");
+            }
+
+            // Initialize BPE processor with vocabulary and merge rules
+            bpe_processor_->initialize(token_to_id_, token_strings, merge_rules);
 
             LOG_INFO("BPE processor initialized for " << tokenizer_model_ << " tokenizer");
         }

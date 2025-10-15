@@ -143,7 +143,6 @@ set(LLAMINAR_CORE_SOURCES
     src/kernels/MPIRMSNormKernel.cpp
     src/kernels/MPIAttentionKernel.cpp
     src/kernels/MPIEmbeddingKernel.cpp
-    src/kernels/MPIMLPKernel.cpp
     src/kernels/MPIResidualKernel.cpp
     src/kernels/MPIRoPEKernel.cpp
     src/kernels/MPISwiGLUKernel.cpp
@@ -646,73 +645,6 @@ if(GTEST_FOUND)
     set_tests_properties(AttentionShardCorrectness_Uneven PROPERTIES TIMEOUT 30 LABELS "attention;parity;sharding")
     add_test(NAME AttentionShardCorrectness_Stress COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_attention_shard_correctness> --heads=12 --head-dim=16 --seq-len=24)
 
-    # --- MLP shard parity tests ---
-    add_executable(test_mlp_shard_correctness tests/test_mlp_shard_correctness.cpp)
-    target_link_libraries(test_mlp_shard_correctness llaminar_core)
-    set_target_properties(test_mlp_shard_correctness PROPERTIES OUTPUT_NAME test_mlp_shard_correctness)
-
-    # MLP tensor-parallel executor parity test (replicated weights, env-driven TP enable)
-    add_executable(test_mlp_tp_correctness tests/test_mlp_tp_correctness.cpp)
-    target_link_libraries(test_mlp_tp_correctness llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_mlp_tp_correctness GTest::gtest GTest::gtest_main)
-    else()
-        if(GTEST_INCLUDE_DIR)
-            target_include_directories(test_mlp_tp_correctness PRIVATE ${GTEST_INCLUDE_DIR})
-        endif()
-        if(GTEST_LIBRARY AND GTEST_MAIN_LIBRARY)
-            target_link_libraries(test_mlp_tp_correctness ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-        endif()
-    endif()
-    # Register individual GTest cases from test_mlp_tp_correctness binary.
-    # Each uses --gtest_filter to isolate the case; global env already drives TP enable.
-    add_test(NAME MLPTPParity_SmallOddDff70
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.SmallOddDff70)
-    set_tests_properties(MLPTPParity_SmallOddDff70 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;ragged")
-    add_test(NAME MLPTPParity_EvenDff64
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.EvenDff64)
-    set_tests_properties(MLPTPParity_EvenDff64 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;balanced")
-    add_test(NAME MLPTPParity_SmallEdgeDff33
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.SmallEdgeDff33)
-    set_tests_properties(MLPTPParity_SmallEdgeDff33 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;edge")
-    add_test(NAME MLPTPParity_RaggedDff65
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.RaggedDff65)
-    set_tests_properties(MLPTPParity_RaggedDff65 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;ragged")
-    add_test(NAME MLPTPParity_LargerEvenDff128
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.LargerEvenDff128)
-    set_tests_properties(MLPTPParity_LargerEvenDff128 PROPERTIES TIMEOUT 60 LABELS "mlp;tp;parity;larger")
-    # Negative test: intentionally induce mismatch (added in source) filtered separately
-    add_test(NAME MLPTPParity_NegativeMismatch
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.NegativeMismatch)
-    set_tests_properties(MLPTPParity_NegativeMismatch PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;negative")
-    # Stress test (added in source) with larger seq_len approaching backend threshold
-    add_test(NAME MLPTPParity_StressLongPrefill
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.StressLongPrefill)
-    set_tests_properties(MLPTPParity_StressLongPrefill PROPERTIES TIMEOUT 90 LABELS "mlp;tp;parity;stress")
-    # 3-way TP variants (must be launched with 3 ranks)
-    add_test(NAME MLPTPParity_TP3_RaggedDff97
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.TP3_RaggedDff97)
-    set_tests_properties(MLPTPParity_TP3_RaggedDff97 PROPERTIES TIMEOUT 50 LABELS "mlp;tp;parity;ragged;tp3")
-    add_test(NAME MLPTPParity_TP3_EvenDff90
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.TP3_EvenDff90)
-    set_tests_properties(MLPTPParity_TP3_EvenDff90 PROPERTIES TIMEOUT 50 LABELS "mlp;tp;parity;balanced;tp3")
-    # 4-way TP variants
-    add_test(NAME MLPTPParity_TP4_EvenDff128
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.TP4_EvenDff128)
-    set_tests_properties(MLPTPParity_TP4_EvenDff128 PROPERTIES TIMEOUT 60 LABELS "mlp;tp;parity;balanced;tp4")
-    add_test(NAME MLPTPParity_TP4_RaggedDff130
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.TP4_RaggedDff130)
-    set_tests_properties(MLPTPParity_TP4_RaggedDff130 PROPERTIES TIMEOUT 60 LABELS "mlp;tp;parity;ragged;tp4")
-    # COSMA-prefill mode trigger (still 2 ranks; threshold lowered via env in test)
-    add_test(NAME MLPTPParity_PrefillCosmaMode
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_correctness> --gtest_filter=MLP_TP_Correctness.PrefillCosmaMode)
-    set_tests_properties(MLPTPParity_PrefillCosmaMode PROPERTIES TIMEOUT 50 LABELS "mlp;tp;parity;prefill;cosma")
-
-    # Matrix driver script (aggregates multiple cases & ranks) - optional umbrella test
-    add_test(NAME MLPTPParity_Matrix
-             COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_mlp_tp_parity_matrix.sh)
-    set_tests_properties(MLPTPParity_Matrix PROPERTIES TIMEOUT 300 LABELS "mlp;tp;parity;matrix")
-
     # Unified TP GEMM parity matrix driver (row + col executor cases)
     add_test(NAME TPGemmCorrectness_Matrix
              COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_tp_gemm_parity_matrix.sh)
@@ -778,20 +710,6 @@ if(GTEST_FOUND)
     add_test(NAME TPGemmCorrectness_BatchColEven_2way
              COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_tp_gemm_correctness> --gtest_filter=TPGemmCorrectness.BatchColEvenSplit_2way)
     set_tests_properties(TPGemmCorrectness_BatchColEven_2way PROPERTIES TIMEOUT 70 LABELS "tp;gemm;parity;col;tp2;batch")
-
-    # Small (even-ish) partition
-    add_test(NAME MLPShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_correctness> --seq-len=5 --d-model=48 --d-ff=64)
-    # Medium uneven d_ff
-    add_test(NAME MLPShardParity_Medium COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_correctness> --seq-len=9 --d-model=64 --d-ff=96)
-    # Stress larger dims (still quick)
-    add_test(NAME MLPShardParity_Stress COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_correctness> --seq-len=16 --d-model=80 --d-ff=128)
-
-    # --- End-to-End shard parity ---
-    add_executable(test_end2end_shard_correctness tests/test_end2end_shard_correctness.cpp)
-    target_link_libraries(test_end2end_shard_correctness llaminar_core)
-    set_target_properties(test_end2end_shard_correctness PROPERTIES OUTPUT_NAME test_end2end_shard_correctness)
-    add_test(NAME End2EndShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_end2end_shard_correctness> --heads=4 --head-dim=8 --seq-len=6 --d-ff=48)
-    add_test(NAME End2EndShardParity_UnevenHeads COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_end2end_shard_correctness> --heads=6 --head-dim=8 --seq-len=5 --d-ff=56)
     set_tests_properties(AttentionShardCorrectness_Stress PROPERTIES TIMEOUT 60 LABELS "attention;parity;sharding;stress")
 
     # Diagnostic path test: force loader sharded-mode + shard diagnostics for a tiny config to exercise verification logic.

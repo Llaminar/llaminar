@@ -92,6 +92,10 @@ namespace llaminar
                     prefilled_ = true;
                 }
 
+                // Buffer for streaming - prevents partial chat markers from being displayed
+                std::string stream_buffer;
+                const size_t max_marker_length = 15; // Length of longest marker like "<|endoftext|>"
+
                 for (int32_t step = 0; step < max_tokens_; ++step)
                 {
                     // Fetch logits produced by prefill (step 0) or previous decode (step>0)
@@ -149,21 +153,87 @@ namespace llaminar
 
                     // Convert token to text if we have a tokenizer
                     std::string token_text;
+
                     if (tokenizer_)
                     {
-                        token_text = tokenizer_->getTokenString(next_token);
+                        // Check if this is a structural special token (EOS/BOS)
+                        int32_t eos_id = tokenizer_->getSpecialToken("eos");
+                        int32_t bos_id = tokenizer_->getSpecialToken("bos");
+
+                        if (next_token == eos_id || next_token == bos_id)
+                        {
+                            // These are actual EOS/BOS - stop generation
+                            LOG_DEBUG("Hit EOS/BOS token, stopping generation");
+                            break;
+                        }
+
+                        // Use detokenization for output (handles Ġ → space, Ċ → newline, etc.)
+                        std::string detokenized = tokenizer_->detokenize({next_token});
+                        token_text = detokenized;
                         response_text += token_text;
+                        stream_buffer += token_text;
+
+                        // Check if response contains chat template end markers
+                        // These are generated as individual tokens: < | im _end | >
+                        size_t marker_pos = response_text.find("<|im_end|>");
+                        if (marker_pos == std::string::npos)
+                        {
+                            marker_pos = response_text.find("<|endoftext|>");
+                        }
+                        if (marker_pos == std::string::npos)
+                        {
+                            marker_pos = response_text.find("<|im_start|>");
+                        }
+
+                        if (marker_pos != std::string::npos)
+                        {
+                            // Found a chat template marker - truncate response and stop
+                            response_text = response_text.substr(0, marker_pos);
+                            // Truncate stream buffer too
+                            if (marker_pos < stream_buffer.length())
+                            {
+                                stream_buffer = stream_buffer.substr(0, marker_pos);
+                            }
+                            else
+                            {
+                                // Marker was in previously streamed content - clear buffer
+                                stream_buffer.clear();
+                            }
+                            LOG_DEBUG("Found chat template marker at position " << marker_pos << ", stopping generation");
+                            // Stream remaining buffer before stopping
+                            if (callback && !stream_buffer.empty())
+                            {
+                                callback(stream_buffer, false);
+                                stream_buffer.clear(); // Clear after streaming to prevent double-flush
+                            }
+                            break;
+                        }
+
+                        // Stream buffer when it's large enough that we can safely output some
+                        // Keep a tail to detect partial markers
+                        if (stream_buffer.length() > max_marker_length)
+                        {
+                            size_t safe_length = stream_buffer.length() - max_marker_length;
+                            std::string safe_part = stream_buffer.substr(0, safe_length);
+
+                            if (callback && !safe_part.empty())
+                            {
+                                callback(safe_part, false);
+                            }
+
+                            // Keep the tail in buffer
+                            stream_buffer = stream_buffer.substr(safe_length);
+                        }
                     }
                     else
                     {
                         token_text = "[" + std::to_string(next_token) + "]";
                         response_text += token_text;
-                    }
-
-                    // Call streaming callback if provided
-                    if (callback)
-                    {
-                        callback(token_text, false);
+                        // No tokenizer means no special tokens to filter
+                        if (callback)
+                        {
+                            callback(token_text, false);
+                        }
                     }
 
                     // Check stop conditions
@@ -174,6 +244,12 @@ namespace llaminar
                     }
 
                     LOG_TRACE("Generated token " << step << ": " << next_token << " -> \"" << token_text << "\"");
+                }
+
+                // Flush any remaining buffered output
+                if (callback && !stream_buffer.empty())
+                {
+                    callback(stream_buffer, false);
                 }
 
                 // Call final callback

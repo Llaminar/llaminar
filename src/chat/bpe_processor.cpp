@@ -10,17 +10,54 @@ namespace llaminar
     namespace chat
     {
         void BPEProcessor::initialize(const std::unordered_map<std::string, int32_t> &token_to_id,
-                                      const std::vector<std::string> &id_to_token)
+                                      const std::vector<std::string> &id_to_token,
+                                      const std::vector<std::string> &merge_rules)
         {
             LOG_DEBUG("Initializing BPE processor with " << token_to_id.size() << " tokens");
 
             // Initialize byte-level mappings
             initializeByteMapping();
 
-            // Extract BPE merges from vocabulary
-            extractBPEMerges(token_to_id);
+            // Parse and load actual merge rules from GGUF
+            if (!merge_rules.empty())
+            {
+                parseMergeRules(merge_rules);
+                LOG_INFO("BPE processor initialized with " << bpe_merges_.size() << " merge rules from GGUF");
+            }
+            else
+            {
+                // Fallback: try to extract merges from vocabulary (unreliable)
+                LOG_WARN("No merge rules provided, attempting to extract from vocabulary (may be incorrect)");
+                extractBPEMerges(token_to_id);
+                LOG_INFO("BPE processor initialized with " << bpe_merges_.size() << " extracted merge rules");
+            }
+        }
 
-            LOG_INFO("BPE processor initialized with " << bpe_merges_.size() << " merge rules");
+        void BPEProcessor::parseMergeRules(const std::vector<std::string> &merge_rules)
+        {
+            bpe_merges_.clear();
+            merge_ranks_.clear();
+
+            int32_t rank = 0;
+            for (const std::string &rule : merge_rules)
+            {
+                // Parse merge rule format: "token1 token2"
+                size_t space_pos = rule.find(' ');
+                if (space_pos == std::string::npos || space_pos == 0 || space_pos == rule.length() - 1)
+                {
+                    LOG_WARN("Invalid merge rule format: '" << rule << "', skipping");
+                    continue;
+                }
+
+                std::string left = rule.substr(0, space_pos);
+                std::string right = rule.substr(space_pos + 1);
+
+                std::pair<std::string, std::string> merge_pair = {left, right};
+                bpe_merges_.push_back(merge_pair);
+                merge_ranks_[merge_pair] = rank++;
+            }
+
+            LOG_DEBUG("Parsed " << bpe_merges_.size() << " merge rules");
         }
 
         std::vector<int32_t> BPEProcessor::tokenize(const std::string &text,
@@ -34,43 +71,135 @@ namespace llaminar
 
             std::vector<int32_t> tokens;
 
-            // Convert text to byte-level representation
-            std::string byte_text = textToBytes(text);
+            // GPT-2 style: Convert spaces to Ġ (U+0120) and then process
+            // The vocabulary has tokens like "Ġis", "Ġthe" with the special space marker
+            std::string preprocessed;
+            preprocessed.reserve(text.length() + 20);
 
-            // Split into words (preserving whitespace information)
-            std::vector<std::string> words = splitIntoWords(byte_text);
-
-            for (const std::string &word : words)
+            bool at_start = true;
+            for (char c : text)
             {
-                if (word.empty())
-                    continue;
-
-                // Convert word to initial character sequence
-                std::vector<std::string> word_tokens;
-                for (size_t i = 0; i < word.length();)
+                if (c == ' ')
                 {
-                    // Handle UTF-8 sequences by taking single bytes in byte-level BPE
-                    word_tokens.push_back(word.substr(i, 1));
-                    ++i;
+                    // Don't add space marker at the very start
+                    // Next non-space character will get the marker
+                    at_start = false;
                 }
-
-                // Apply BPE merges
-                word_tokens = applyBPE(word_tokens);
-
-                // Convert tokens to IDs
-                for (const std::string &token : word_tokens)
+                else
                 {
-                    auto it = token_to_id.find(token);
-                    if (it != token_to_id.end())
+                    if (!at_start)
                     {
-                        tokens.push_back(it->second);
+                        // This character follows a space, prepend Ġ marker
+                        preprocessed += '\xC4'; // UTF-8 encoding of U+0120: 0xC4 0xA0
+                        preprocessed += '\xA0';
+                        at_start = true; // Only add marker once per word
                     }
-                    else if (unk_token_id != -1)
-                    {
-                        tokens.push_back(unk_token_id);
-                    }
-                    // Skip unknown tokens if no UNK token available
+                    preprocessed += c;
                 }
+            }
+
+            // If text started with non-space, no marker needed for first char
+            // This is handled by at_start flag
+
+            // Apply the corrected preprocessing
+            std::string processed_text;
+            if (preprocessed.empty())
+            {
+                processed_text = text;
+            }
+            else
+            {
+                processed_text = preprocessed;
+            }
+
+            // Re-do with simpler logic matching GPT-2
+            processed_text.clear();
+            for (size_t i = 0; i < text.length(); ++i)
+            {
+                if (i > 0 && text[i - 1] == ' ' && text[i] != ' ')
+                {
+                    // Previous char was space, current is not - add Ġ marker
+                    processed_text += '\xC4'; // Ġ in UTF-8: 0xC4 0xA0
+                    processed_text += '\xA0';
+                }
+                if (text[i] != ' ')
+                {
+                    processed_text += text[i];
+                }
+            }
+
+            // Split into individual characters first (byte-level BPE starts from chars)
+            std::vector<std::string> char_tokens;
+            for (size_t i = 0; i < processed_text.length();)
+            {
+                // Handle multi-byte UTF-8 sequences
+                if ((processed_text[i] & 0x80) == 0)
+                {
+                    // Single byte ASCII
+                    char_tokens.push_back(processed_text.substr(i, 1));
+                    i += 1;
+                }
+                else if ((processed_text[i] & 0xE0) == 0xC0)
+                {
+                    // 2-byte UTF-8 (includes Ġ)
+                    if (i + 1 < processed_text.length())
+                    {
+                        char_tokens.push_back(processed_text.substr(i, 2));
+                        i += 2;
+                    }
+                    else
+                    {
+                        char_tokens.push_back(processed_text.substr(i, 1));
+                        i += 1;
+                    }
+                }
+                else if ((processed_text[i] & 0xF0) == 0xE0)
+                {
+                    // 3-byte UTF-8
+                    if (i + 2 < processed_text.length())
+                    {
+                        char_tokens.push_back(processed_text.substr(i, 3));
+                        i += 3;
+                    }
+                    else
+                    {
+                        char_tokens.push_back(processed_text.substr(i, 1));
+                        i += 1;
+                    }
+                }
+                else
+                {
+                    // 4-byte UTF-8 or error
+                    if (i + 3 < processed_text.length() && (processed_text[i] & 0xF8) == 0xF0)
+                    {
+                        char_tokens.push_back(processed_text.substr(i, 4));
+                        i += 4;
+                    }
+                    else
+                    {
+                        char_tokens.push_back(processed_text.substr(i, 1));
+                        i += 1;
+                    }
+                }
+            }
+
+            // Apply BPE merges
+            char_tokens = applyBPE(char_tokens);
+
+            // Convert tokens to IDs
+            for (const std::string &token : char_tokens)
+            {
+                auto it = token_to_id.find(token);
+                if (it != token_to_id.end())
+                {
+                    tokens.push_back(it->second);
+                }
+                else if (unk_token_id != -1)
+                {
+                    LOG_WARN("Unknown token: '" << token << "' (using UNK)");
+                    tokens.push_back(unk_token_id);
+                }
+                // Skip unknown tokens if no UNK token available
             }
 
             return tokens;
@@ -221,6 +350,28 @@ namespace llaminar
 
             for (size_t i = 0; i < byte_text.length();)
             {
+                // Handle GPT-2 style space marker: Ġ (U+0120) → space
+                // UTF-8 encoding: 0xC4 0xA0
+                if (i + 1 < byte_text.length() &&
+                    static_cast<unsigned char>(byte_text[i]) == 0xC4 &&
+                    static_cast<unsigned char>(byte_text[i + 1]) == 0xA0)
+                {
+                    result += ' ';
+                    i += 2;
+                    continue;
+                }
+
+                // Handle newline marker: Ċ (U+010A) → newline
+                // UTF-8 encoding: 0xC4 0x8A
+                if (i + 1 < byte_text.length() &&
+                    static_cast<unsigned char>(byte_text[i]) == 0xC4 &&
+                    static_cast<unsigned char>(byte_text[i + 1]) == 0x8A)
+                {
+                    result += '\n';
+                    i += 2;
+                    continue;
+                }
+
                 // Look for the longest match in char_to_byte mapping
                 bool found = false;
                 for (size_t len = std::min(byte_text.length() - i, size_t(10)); len > 0; --len)
