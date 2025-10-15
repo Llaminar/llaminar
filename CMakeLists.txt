@@ -547,6 +547,13 @@ if(GTEST_FOUND)
     set_tests_properties(LinearOrientationCorrectnessTest PROPERTIES TIMEOUT 30)
     set_tests_properties(LinearOrientationCorrectnessTest PROPERTIES LABELS "linear;parity;kernel")
 
+    # MPI Linear Batch support test
+    add_executable(test_mpi_linear_batch tests/test_mpi_linear_batch.cpp)
+    target_link_libraries(test_mpi_linear_batch llaminar_core GTest::gtest)
+    add_llaminar_mpi_test(MPILinearBatchTest 2 test_mpi_linear_batch)
+    set_tests_properties(MPILinearBatchTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(MPILinearBatchTest PROPERTIES LABELS "linear;batch")
+
     # Minimal MPI finalize probe test (diagnostic for finalize hang)
     add_executable(test_mpi_finalize_probe tests/TestMpiFinalizeProbe.cpp)
     target_link_libraries(test_mpi_finalize_probe llaminar_core)
