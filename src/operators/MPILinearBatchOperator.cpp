@@ -39,7 +39,7 @@
  *  - No concurrent mutation of shared state beyond local temporaries.
  *
  * MPI:
- *  - Uses rank/size from MPIKernelBase; collective communications must remain ordered.
+ *  - Uses rank/size from MPIOperatorBase; collective communications must remain ordered.
  *
  * @author David Sanftenberg
  */
@@ -58,7 +58,7 @@
 namespace llaminar
 {
 
-    MPILinearBatchOperator::MPILinearBatchOperator(MPI_Comm comm) : MPIKernelBase(comm, false)
+    MPILinearBatchOperator::MPILinearBatchOperator(MPI_Comm comm) : MPIOperatorBase(comm, false)
     {
         LOG_DEBUG("MPILinearBatchOperator initialized on rank " << getRank() << " of " << getSize());
     }
@@ -187,6 +187,19 @@ namespace llaminar
             // Matrix multiplication: output = input @ weight^T
             // Weight is [local_out_dim, in_dim], so we transpose it during matmul
             // Input is effectively [batch*seq_len, in_dim]
+
+            // DEBUG: Log ALL parameters to see what we're getting
+            static int call_count = 0;
+            if (getRank() == 0 && call_count < 10)
+            {
+                LOG_ERROR("[MPILinearBatch_CALL_" << call_count << "] rank=0:");
+                LOG_ERROR("  batch=" << batch_size << " seq=" << seq_len << " total_seq=" << total_seq);
+                LOG_ERROR("  d_model(k)=" << d_model << " d_out(n)=" << d_out);
+                LOG_ERROR("  input_size=" << input_size << " output_size(global)=" << output_size
+                                          << " local_output_size=" << local_output_size << " output_offset=" << output_offset);
+                call_count++;
+            }
+
             matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
                                             total_seq, d_out, d_model,
                                             /*is_prefill*/ false,
@@ -289,9 +302,9 @@ namespace llaminar
             output->shape()[2] != weight->shape()[0])
         {
             LOG_ERROR("MPILinearBatchOperator: Output shape mismatch - expected [" << input->shape()[0]
-                                                                                    << ", " << input->shape()[1]
-                                                                                    << ", " << weight->shape()[0]
-                                                                                    << "], got [" << output->shape()[0] << ", " << output->shape()[1] << ", " << output->shape()[2] << "]");
+                                                                                   << ", " << input->shape()[1]
+                                                                                   << ", " << weight->shape()[0]
+                                                                                   << "], got [" << output->shape()[0] << ", " << output->shape()[1] << ", " << output->shape()[2] << "]");
             return false;
         }
 
@@ -365,8 +378,8 @@ namespace llaminar
         for (int r = 0; r < getSize(); ++r)
         {
             auto [rank_local_size, rank_offset] = getRowDistribution(output_size, r);
-            recvcounts_per_pos[r] = rank_local_size;       // Elements per rank for this position
-            displs_per_pos[r] = rank_offset;               // Offset in output dimension
+            recvcounts_per_pos[r] = rank_local_size; // Elements per rank for this position
+            displs_per_pos[r] = rank_offset;         // Offset in output dimension
         }
 
         // Tensor layout is [batch, seq_len, out_dim] in row-major order.
@@ -375,24 +388,24 @@ namespace llaminar
         //
         // Issue: MPI_Allgatherv with a single call would assume contiguous data blocks,
         // but our dimensions are interleaved in memory. Solution: gather each position separately.
-        
+
         size_t total_positions = batch_size * seq_len;
-        
+
         for (size_t pos = 0; pos < total_positions; ++pos)
         {
             // Pointers to this position's data
             const float *local_ptr = local_output->data() + pos * local_output_size;
             float *global_ptr = global_output->data() + pos * output_size;
-            
+
             // Gather dimension chunks from all ranks into the correct position
             MPI_Allgatherv(local_ptr, local_output_size, MPI_FLOAT,
                            global_ptr, recvcounts_per_pos.data(), displs_per_pos.data(),
                            MPI_FLOAT, getComm());
         }
 
-        LOG_DEBUG("Rank " << getRank() << " gathered output: " << total_positions 
-                  << " positions × " << local_output_size << " local dims = " 
-                  << (total_positions * local_output_size) << " total elements");
+        LOG_DEBUG("Rank " << getRank() << " gathered output: " << total_positions
+                          << " positions × " << local_output_size << " local dims = "
+                          << (total_positions * local_output_size) << " total elements");
     }
 
     void MPILinearBatchOperator::addBiasLocal(float *output, const float *bias,

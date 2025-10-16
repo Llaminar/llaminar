@@ -28,12 +28,12 @@ protected:
     }
 };
 
-class TestMPIKernel : public MPIKernelBase
+class TestMPIKernel : public MPIOperatorBase
 {
 public:
-    TestMPIKernel(MPI_Comm comm = MPI_COMM_WORLD) : MPIKernelBase(comm, false) {}
+    TestMPIKernel(MPI_Comm comm = MPI_COMM_WORLD) : MPIOperatorBase(comm, false) {}
 
-    // Implement pure virtual methods from KernelBase
+    // Implement pure virtual methods from OperatorBase
     bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                  std::vector<std::shared_ptr<TensorBase>> &outputs) override
     {
@@ -47,7 +47,7 @@ public:
         return true;
     }
 
-    std::string getKernelType() const override
+    std::string getOperatorType() const override
     {
         return "TestMPIKernel";
     }

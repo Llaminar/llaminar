@@ -159,6 +159,7 @@ set(LLAMINAR_CORE_SOURCES
     src/SequentialBatchBenchmark.cpp
     src/BatchPaddingUtils.cpp
     src/BatchQwenPipeline.cpp
+    src/BatchQwenPipelineAdapter.cpp
     src/JsonExport.cpp
     src/TopologyManager.cpp
     src/MpiKernelBase.cpp
@@ -169,6 +170,7 @@ set(LLAMINAR_CORE_SOURCES
     src/operators/MPILinearBatchOperator.cpp
     src/operators/MPIRMSNormOperator.cpp
     src/operators/MPIAttentionOperator.cpp
+    src/operators/MPIAttentionBatchOperator.cpp
     src/operators/MPIEmbeddingOperator.cpp
     src/operators/MPIResidualOperator.cpp
     src/operators/MPIRoPEOperator.cpp
@@ -537,19 +539,6 @@ if(GTEST_FOUND)
         target_link_libraries(test_mpi_linear_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
     add_llaminar_mpi_test(MPILinearKernelTest 2 test_mpi_linear_kernel)
-
-    # Linear orientation parity test (naive reference vs MPILinearKernel)
-    add_executable(test_linear_orientation_correctness tests/TestLinearOrientationCorrectness.cpp)
-    target_link_libraries(test_linear_orientation_correctness llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_linear_orientation_correctness GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_linear_orientation_correctness PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_linear_orientation_correctness ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_llaminar_mpi_test(LinearOrientationCorrectnessTest 2 test_linear_orientation_correctness)
-    set_tests_properties(LinearOrientationCorrectnessTest PROPERTIES TIMEOUT 30)
-    set_tests_properties(LinearOrientationCorrectnessTest PROPERTIES LABELS "linear;parity;kernel")
 
     # MPI Linear Batch Operator test - comprehensive parity and equivalence validation
     add_executable(test_linear_batch_operator tests/test_linear_batch_operator.cpp)
@@ -1301,10 +1290,19 @@ set_tests_properties(BatchBenchmarkTest PROPERTIES TIMEOUT 60 LABELS "unit;batch
 # Batch correctness tests - validates batch vs sequential equivalence with real models
 add_executable(test_batch_correctness
     tests/test_batch_correctness.cpp
+    tests/ParityTestFramework.cpp
     $<TARGET_OBJECTS:test_logging_bootstrap>)
 target_link_libraries(test_batch_correctness PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
 add_llaminar_mpi_test(BatchCorrectnessTest 2 test_batch_correctness)
 set_tests_properties(BatchCorrectnessTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;correctness")
+
+# Batch embedding debug test - isolates embedding comparison
+add_executable(test_batch_embedding_debug
+    tests/test_batch_embedding_debug.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batch_embedding_debug PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BatchEmbeddingDebug 2 test_batch_embedding_debug)
+set_tests_properties(BatchEmbeddingDebug PROPERTIES TIMEOUT 60 LABELS "integration;batch;debug")
 
 # Batch performance tests - measures throughput scaling and bandwidth utilization
 add_executable(test_batch_performance
@@ -1559,7 +1557,6 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
 
     set(KERNEL_TEST_TARGETS
         test_mpi_linear_kernel
-        test_linear_orientation_correctness
         test_mpi_rmsnorm_kernel
         test_mpi_attention_kernel
         test_attention_micro

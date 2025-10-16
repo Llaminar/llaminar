@@ -21,7 +21,7 @@ namespace llaminar
      * - Maintains backward compatibility: batch=1 produces identical results
      *
      * Formula:
-     *  - swish(x) = x * sigmoid(x)  
+     *  - swish(x) = x * sigmoid(x)
      *  - output = swish(gate) ⊗ up  (element-wise multiplication)
      *
      * Contract:
@@ -34,13 +34,13 @@ namespace llaminar
      *
      * @author David Sanftenberg
      */
-    class MPISwiGLUBatchOperator : public MPIKernelBase
+    class MPISwiGLUBatchOperator : public MPIOperatorBase
     {
     public:
         MPISwiGLUBatchOperator(MPI_Comm comm = MPI_COMM_WORLD);
         ~MPISwiGLUBatchOperator() = default;
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
@@ -48,7 +48,7 @@ namespace llaminar
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
-        std::string getKernelType() const override { return "MPISwiGLUBatch"; }
+        std::string getOperatorType() const override { return "MPISwiGLUBatch"; }
         size_t getExpectedInputCount() const override { return 2; } // gate + up
         size_t getExpectedOutputCount() const override { return 1; }
 

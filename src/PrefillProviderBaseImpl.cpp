@@ -439,7 +439,7 @@ namespace llaminar
         return kernel->execute(inputs, outputs);
     }
 
-    MPIKernelBase *PrefillProviderBaseImpl::getKernel(const std::string &name)
+    MPIOperatorBase *PrefillProviderBaseImpl::getKernel(const std::string &name)
     {
         auto it = kernels_.find(name);
         if (it == kernels_.end())
@@ -451,7 +451,7 @@ namespace llaminar
 
     bool PrefillProviderBaseImpl::registerOperator(
         const std::string &name,
-        std::unique_ptr<MPIKernelBase> kernel)
+        std::unique_ptr<MPIOperatorBase> kernel)
     {
         if (kernels_.find(name) != kernels_.end())
         {

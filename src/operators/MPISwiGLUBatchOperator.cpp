@@ -59,14 +59,14 @@ namespace llaminar
 {
 
     MPISwiGLUBatchOperator::MPISwiGLUBatchOperator(MPI_Comm comm)
-        : MPIKernelBase(comm, false), num_threads_(omp_get_max_threads())
+        : MPIOperatorBase(comm, false), num_threads_(omp_get_max_threads())
     {
         LOG_DEBUG("MPISwiGLUBatchOperator initialized on rank " << getRank()
-                                                               << " with " << num_threads_ << " OpenMP threads");
+                                                                << " with " << num_threads_ << " OpenMP threads");
     }
 
     bool MPISwiGLUBatchOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                        std::vector<std::shared_ptr<TensorBase>> &outputs)
+                                         std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         PERF_TRACE_SCOPE_CAT("mpi_swiglu_batch_execute", "activation");
 
@@ -138,7 +138,7 @@ namespace llaminar
     }
 
     bool MPISwiGLUBatchOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                         const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+                                          const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Basic validation
         if (inputs.size() != 2 || outputs.size() != 1)
@@ -155,8 +155,8 @@ namespace llaminar
         if (!gate || !up || !output)
         {
             LOG_ERROR("MPISwiGLUBatchOperator: Null tensor provided - gate: " << (gate ? "valid" : "null")
-                                                                               << ", up: " << (up ? "valid" : "null")
-                                                                               << ", output: " << (output ? "valid" : "null"));
+                                                                              << ", up: " << (up ? "valid" : "null")
+                                                                              << ", output: " << (output ? "valid" : "null"));
             return false;
         }
 

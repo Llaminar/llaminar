@@ -28,7 +28,8 @@ namespace llaminar
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim)
+            int feature_dim,
+            const std::string &source)
         {
             // Default no-op implementation
             // Tests will provide real implementation via parity_test_framework.cpp
@@ -37,6 +38,7 @@ namespace llaminar
             (void)data;
             (void)seq_len;
             (void)feature_dim;
+            (void)source;
         }
 
         void LlaminarSnapshotHook::capture(
@@ -44,7 +46,8 @@ namespace llaminar
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim)
+            int feature_dim,
+            const std::string &source)
         {
             // Default no-op implementation
             (void)stage_name;
@@ -52,6 +55,7 @@ namespace llaminar
             (void)data;
             (void)seq_len;
             (void)feature_dim;
+            (void)source;
         }
 
         void LlaminarSnapshotHook::set_enabled(bool enabled)

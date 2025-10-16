@@ -15,7 +15,8 @@ namespace llaminar
         int layer_index,
         const float *data,
         int seq_len,
-        int feature_dim)
+        int feature_dim,
+        const std::string &source)
     {
         // Default implementation delegates to the snapshot manager
         // In release builds, this compiles to a no-op
@@ -26,7 +27,7 @@ namespace llaminar
             data,
             seq_len,
             feature_dim,
-            "llaminar");
+            source);
     }
 
     bool AbstractPipeline::isParityEnabled() const

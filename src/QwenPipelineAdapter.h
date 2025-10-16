@@ -112,18 +112,38 @@ namespace llaminar
         const ModelConfig &config() const override { return cfg_; }
         bool prefill(const std::vector<int> &tokens, const IModelWeights &weights, StageContext &ctx) override;
         bool decode(int next_token, const IModelWeights &weights, StageContext &ctx) override;
-        bool prefillBatch(const std::vector<std::vector<int>>& token_batches,
-                         const IModelWeights& weights,
-                         StageContext& ctx,
-                         std::shared_ptr<TensorBase>& out_logits) override;
-        bool decodeBatch(const std::vector<int>& next_tokens,
-                        const IModelWeights& weights,
-                        StageContext& ctx,
-                        std::shared_ptr<TensorBase>& out_logits) override;
+        bool prefillBatch(const std::vector<std::vector<int>> &token_batches,
+                          const IModelWeights &weights,
+                          StageContext &ctx,
+                          std::shared_ptr<TensorBase> &out_logits) override;
+        bool decodeBatch(const std::vector<int> &next_tokens,
+                         const IModelWeights &weights,
+                         StageContext &ctx,
+                         std::shared_ptr<TensorBase> &out_logits) override;
         bool logits(std::shared_ptr<TensorBase> &out_logits) override;
         std::string name() const override { return "QwenPipelineAdapter"; }
         const KVCacheState *kvCacheState() const override;
         bool ensureKVCapacity(int required_tokens) override;
+
+        /**
+         * @brief Forward snapshot capture to wrapped legacy pipeline
+         *
+         * @note This ensures snapshot_source_ from the wrapped QwenPipeline is used
+         */
+        void captureStageSnapshot(
+            PipelineStage stage,
+            int layer_index,
+            const float *data,
+            int seq_len,
+            int feature_dim,
+            const std::string &source = "llaminar") override
+        {
+            if (legacy_)
+            {
+                // Call through AbstractPipeline interface (legacy_ implements AbstractPipeline)
+                static_cast<AbstractPipeline *>(legacy_.get())->captureStageSnapshot(stage, layer_index, data, seq_len, feature_dim, source);
+            }
+        }
 
         /**
          * @brief Load Qwen model weights from file.

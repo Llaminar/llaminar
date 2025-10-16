@@ -37,10 +37,10 @@ namespace llaminar
     };
 
     /**
-     * Base class for MPI-enabled kernels providing common MPI functionality
-     * and distribution utilities for parallel transformer kernel execution.
+     * Base class for MPI-enabled operators providing common MPI functionality
+     * and distribution utilities for parallel transformer operator execution.
      */
-    class MPIKernelBase : public KernelBase
+    class MPIOperatorBase : public OperatorBase
     {
     protected:
         MPIContext mpi_ctx_;   // MPI context (rank, size, comm)
@@ -59,27 +59,27 @@ namespace llaminar
          * @param comm MPI communicator (defaults to MPI_COMM_WORLD)
          * @param init_mpi Whether to initialize MPI if not already initialized
          */
-        explicit MPIKernelBase(MPI_Comm comm = MPI_COMM_WORLD, bool init_mpi = true);
+        explicit MPIOperatorBase(MPI_Comm comm = MPI_COMM_WORLD, bool init_mpi = true);
 
         /**
          * Constructor with MPIContext (preferred for new code)
          * @param ctx MPI context with rank, size, and communicator
          * @param init_mpi Whether to initialize MPI if not already initialized
          */
-        explicit MPIKernelBase(const MPIContext &ctx, bool init_mpi = true);
+        explicit MPIOperatorBase(const MPIContext &ctx, bool init_mpi = true);
 
         /**
          * Destructor - handles MPI cleanup if this class initialized it
          */
-        virtual ~MPIKernelBase();
+        virtual ~MPIOperatorBase();
 
         // Disable copy constructor and assignment
-        MPIKernelBase(const MPIKernelBase &) = delete;
-        MPIKernelBase &operator=(const MPIKernelBase &) = delete;
+        MPIOperatorBase(const MPIOperatorBase &) = delete;
+        MPIOperatorBase &operator=(const MPIOperatorBase &) = delete;
 
         // Allow move operations
-        MPIKernelBase(MPIKernelBase &&other) noexcept;
-        MPIKernelBase &operator=(MPIKernelBase &&other) noexcept;
+        MPIOperatorBase(MPIOperatorBase &&other) noexcept;
+        MPIOperatorBase &operator=(MPIOperatorBase &&other) noexcept;
 
         /**
          * Get MPI context

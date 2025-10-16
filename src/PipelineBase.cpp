@@ -10,19 +10,19 @@
 namespace llaminar
 {
 
-    PipelineBase::PipelineBase() : MPIKernelBase()
+    PipelineBase::PipelineBase() : MPIOperatorBase()
     {
         initializePipeline();
         LOG_DEBUG("PipelineBase initialized on rank " << getRank() << "/" << getSize());
     }
 
-    PipelineBase::PipelineBase(const MPIContext &ctx) : MPIKernelBase(ctx)
+    PipelineBase::PipelineBase(const MPIContext &ctx) : MPIOperatorBase(ctx)
     {
         initializePipeline();
         LOG_DEBUG("PipelineBase initialized from MPIContext: " << mpi_ctx_.toString());
     }
 
-    bool PipelineBase::registerOperator(const std::string &name, std::unique_ptr<MPIKernelBase> kernel)
+    bool PipelineBase::registerOperator(const std::string &name, std::unique_ptr<MPIOperatorBase> kernel)
     {
         if (hasKernel(name))
         {
@@ -44,7 +44,7 @@ namespace llaminar
         return true;
     }
 
-    MPIKernelBase *PipelineBase::getKernel(const std::string &name)
+    MPIOperatorBase *PipelineBase::getKernel(const std::string &name)
     {
         auto it = kernels_.find(name);
         if (it == kernels_.end())
@@ -612,18 +612,43 @@ namespace llaminar
 
         // Extract dimensions
         const auto &shape = tensor->shape();
-        int seq_len = shape.size() >= 1 ? shape[0] : 0;
-        int feature_dim = shape.size() >= 2 ? shape[1] : 1;
+        int seq_len, feature_dim;
 
-        // Handle 1D tensors (feature_dim is the only dimension)
         if (shape.size() == 1)
         {
-            feature_dim = shape[0];
+            // 1D tensor: [features]
             seq_len = 1;
+            feature_dim = shape[0];
+        }
+        else if (shape.size() == 2)
+        {
+            // 2D tensor: [seq_len, features]
+            seq_len = shape[0];
+            feature_dim = shape[1];
+        }
+        else if (shape.size() == 3)
+        {
+            // 3D tensor: [batch, seq_len, features]
+            // Flatten batch*seq_len for snapshot capture
+            seq_len = shape[0] * shape[1];
+            feature_dim = shape[2];
+        }
+        else
+        {
+            LOG_WARN("PipelineBase: Unsupported tensor dimensionality " << shape.size()
+                                                                        << " at stage " << stage_to_string(stage) << " layer " << layer_index);
+            return;
+        }
+
+        // DEBUG: Log snapshot source before capture
+        if (getRank() == 0)
+        {
+            LOG_INFO("PipelineBase::captureIfEnabled[enum]: stage=" << stage_to_string(stage)
+                                                                    << " layer=" << layer_index << " source='" << snapshot_source_ << "' shape=" << shape.size() << "D");
         }
 
         // Delegate to virtual method (can be overridden for custom behavior)
-        captureStageSnapshot(stage, layer_index, tensor->data(), seq_len, feature_dim);
+        captureStageSnapshot(stage, layer_index, tensor->data(), seq_len, feature_dim, snapshot_source_);
     }
 
     void PipelineBase::captureIfEnabled(
@@ -646,10 +671,33 @@ namespace llaminar
 
         // Extract dimensions
         const auto &shape = tensor->shape();
-        int seq_len = shape.size() >= 1 ? shape[0] : 0;
-        int feature_dim = shape.size() >= 2 ? shape[1] : 1;
+        int seq_len, feature_dim;
 
         if (shape.size() == 1)
+        {
+            // 1D tensor: [features]
+            seq_len = 1;
+            feature_dim = shape[0];
+        }
+        else if (shape.size() == 2)
+        {
+            // 2D tensor: [seq_len, features]
+            seq_len = shape[0];
+            feature_dim = shape[1];
+        }
+        else if (shape.size() == 3)
+        {
+            // 3D tensor: [batch, seq_len, features]
+            // Flatten batch*seq_len for snapshot capture
+            seq_len = shape[0] * shape[1];
+            feature_dim = shape[2];
+        }
+        else
+        {
+            LOG_WARN("PipelineBase: Unsupported tensor dimensionality " << shape.size()
+                                                                        << " at custom stage " << stage_name << " layer " << layer_index);
+            return;
+        }
         {
             feature_dim = shape[0];
             seq_len = 1;
@@ -659,7 +707,7 @@ namespace llaminar
         LOG_DEBUG("PipelineBase: Capturing custom stage '" << stage_name
                                                            << "' layer " << layer_index);
         captureStageSnapshot(PipelineStage::CUSTOM, layer_index,
-                             tensor->data(), seq_len, feature_dim);
+                             tensor->data(), seq_len, feature_dim, snapshot_source_);
     }
 
     void PipelineBase::captureStageSnapshot(
@@ -667,10 +715,11 @@ namespace llaminar
         int layer_index,
         const float *data,
         int seq_len,
-        int feature_dim)
+        int feature_dim,
+        const std::string &source)
     {
         // Default implementation delegates to parity framework hook
-        parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim);
+        parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim, source);
     }
 
     bool PipelineBase::isParityEnabled() const

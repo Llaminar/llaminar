@@ -273,7 +273,7 @@ namespace llaminar
      * @see AttentionStageContracts for stage validation contracts
      * @see CosmaPrefillManager for distributed COSMA integration
      */
-    class MPIAttentionOperator : public MPIKernelBase
+    class MPIAttentionOperator : public MPIOperatorBase
     {
     public:
         // Output assembly / distribution mode (scaffolding for hybrid head + TP design)
@@ -311,12 +311,12 @@ namespace llaminar
          * @param strategy Distribution strategy to use
          */
         MPIAttentionOperator(int n_head, int n_head_kv, int head_dim,
-                           float rope_freq_base = 10000.0f,
-                           DistributionStrategy strategy = DistributionStrategy::HEAD_WISE);
+                             float rope_freq_base = 10000.0f,
+                             DistributionStrategy strategy = DistributionStrategy::HEAD_WISE);
 
         ~MPIAttentionOperator() = default;
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
@@ -328,7 +328,7 @@ namespace llaminar
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
-        std::string getKernelType() const override { return "MPIAttention"; }
+        std::string getOperatorType() const override { return "MPIAttention"; }
         size_t getExpectedInputCount() const override { return 10; } // input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache
         size_t getExpectedOutputCount() const override { return 1; }
 

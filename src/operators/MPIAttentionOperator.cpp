@@ -85,6 +85,7 @@
 #include "../CosmaPrefillManager.h"
 #include "common/AttentionPrimitives.h"
 #include "common/SoftmaxCore.h"
+#include "common/TensorHealthCheck.h"
 #include "attention/AttentionStageContracts.h"
 #include "attention/AttentionValidator.h"
 #include "../utils/DebugEnv.h"
@@ -98,87 +99,6 @@
 
 namespace llaminar
 {
-
-    // ============================================================================
-    // Helper: Granular tensor validation (detects NaN, Inf, uninitialized data)
-    // ============================================================================
-    struct TensorHealthCheck
-    {
-        std::string name;
-        int nan_count = 0;
-        int inf_count = 0;
-        int zero_count = 0;
-        int normal_count = 0;
-        float min_val = std::numeric_limits<float>::max();
-        float max_val = std::numeric_limits<float>::lowest();
-        float abs_sum = 0.0f;
-
-        TensorHealthCheck(const std::string &n) : name(n) {}
-
-        void check(const float *data, size_t size)
-        {
-            for (size_t i = 0; i < size; ++i)
-            {
-                float val = data[i];
-                if (std::isnan(val))
-                {
-                    nan_count++;
-                }
-                else if (std::isinf(val))
-                {
-                    inf_count++;
-                }
-                else if (val == 0.0f)
-                {
-                    zero_count++;
-                }
-                else
-                {
-                    normal_count++;
-                    min_val = std::min(min_val, val);
-                    max_val = std::max(max_val, val);
-                    abs_sum += std::abs(val);
-                }
-            }
-        }
-
-        bool is_healthy() const
-        {
-            return nan_count == 0 && inf_count == 0 && normal_count > 0;
-        }
-
-        bool is_uninitialized() const
-        {
-            // Heuristic: if min/max are huge or all zeros, likely uninitialized
-            return (normal_count > 0 && (std::abs(min_val) > 1e10f || std::abs(max_val) > 1e10f)) ||
-                   (normal_count == 0 && zero_count > 0);
-        }
-
-        void log(int rank = -1) const
-        {
-            std::string prefix = (rank >= 0) ? "[Rank " + std::to_string(rank) + "] " : "";
-            if (!is_healthy())
-            {
-                LOG_ERROR(prefix << "UNHEALTHY " << name << ": NaN=" << nan_count
-                                 << " Inf=" << inf_count << " Zero=" << zero_count
-                                 << " Normal=" << normal_count);
-                if (normal_count > 0)
-                {
-                    LOG_ERROR(prefix << "  Range: [" << min_val << ", " << max_val << "], Sum=" << abs_sum);
-                }
-            }
-            else if (is_uninitialized())
-            {
-                LOG_WARN(prefix << "SUSPICIOUS " << name << ": Range [" << min_val << ", " << max_val
-                                << "] suggests uninitialized data");
-            }
-            else
-            {
-                LOG_DEBUG(prefix << "HEALTHY " << name << ": " << normal_count << " values in ["
-                                 << min_val << ", " << max_val << "], sum=" << abs_sum);
-            }
-        }
-    };
 
     // ============================================================================
     // Constructor
@@ -477,7 +397,7 @@ namespace llaminar
         int batch_size = is_batched ? result.input->shape()[0] : 1;
         int seq_len_per_batch = is_batched ? result.input->shape()[1] : result.input->shape()[0];
         int d_model_dim = is_batched ? result.input->shape()[2] : result.input->shape()[1];
-        
+
         // For batched inputs, treat as [batch*seq_len, d_model] (flatten batch dimension)
         result.seq_len = batch_size * seq_len_per_batch;
         result.d_model = d_model_dim;
@@ -1352,6 +1272,7 @@ namespace llaminar
 
         if (snapshot_callback_ && world_size > 1)
         {
+            LOG_INFO("[GATHER_TRACE] Entering multi-rank gather path for layer " << layer_index_);
             // Multi-rank with snapshot callback: gather Q/K/V across all ranks
             // Allocate global tensors
             result.global_q = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
@@ -1397,6 +1318,17 @@ namespace llaminar
                 // Temporary buffer for rank-major layout
                 auto temp_q = TensorFactory::create_simple({seq_len * n_head_ * head_dim_});
 
+                // DEBUG: Log gather parameters
+                if (rank == 0 && layer_index_ == 0)
+                {
+                    LOG_ERROR("[SEQ_GATHER_DEBUG] Q gather parameters:");
+                    LOG_ERROR("  Using MPI_Allgather (not Allgatherv)");
+                    LOG_ERROR("  sendcount=" << (seq_len * local_head_dim) << " per rank");
+                    LOG_ERROR("  Local Q before gather [0:5]: [" << local_q->data()[0] << ", "
+                                                                 << local_q->data()[1] << ", " << local_q->data()[2] << ", "
+                                                                 << local_q->data()[3] << ", " << local_q->data()[4] << "]");
+                }
+
                 // Bulk gather: faster than seq_len MPI calls
                 MPI_Allgather(local_q->data(), seq_len * local_head_dim, MPI_FLOAT,
                               temp_q->data(), seq_len * local_head_dim, MPI_FLOAT,
@@ -1413,6 +1345,21 @@ namespace llaminar
                         float *dst = result.global_q->data() + t * (n_head_ * head_dim_) + r * local_head_dim;
                         std::memcpy(dst, src, local_head_dim * sizeof(float));
                     }
+                }
+
+                // DEBUG: Log gathered result
+                if (rank == 0 && layer_index_ == 0)
+                {
+                    LOG_ERROR("[SEQ_GATHER_DEBUG] After gather and rearrange:");
+                    LOG_ERROR("  Total size: " << result.global_q->size());
+                    LOG_ERROR("  First 10: [" << result.global_q->data()[0] << ", " << result.global_q->data()[1] << ", "
+                                              << result.global_q->data()[2] << ", " << result.global_q->data()[3] << ", "
+                                              << result.global_q->data()[4] << ", " << result.global_q->data()[5] << ", "
+                                              << result.global_q->data()[6] << ", " << result.global_q->data()[7] << ", "
+                                              << result.global_q->data()[8] << ", " << result.global_q->data()[9] << "]");
+                    LOG_ERROR("  At offset 1792 (rank1 start): [" << result.global_q->data()[1792] << ", "
+                                                                  << result.global_q->data()[1793] << ", " << result.global_q->data()[1794] << ", "
+                                                                  << result.global_q->data()[1795] << ", " << result.global_q->data()[1796] << "]");
                 }
 
                 // DEBUG: Log global Q after gather
@@ -1475,20 +1422,24 @@ namespace llaminar
                 // CRITICAL: These are Q/K/V BEFORE RoPE to match PyTorch's Q_PROJECTION stage
                 if (rank == 0)
                 {
+                    LOG_INFO("[CALLBACK_TRACE] About to invoke snapshot_callback_ for Q/K/V projections (layer " << layer_index_ << ")");
                     snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, result.global_q->data(), seq_len, n_head_ * head_dim_);
                     snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, result.global_k->data(), seq_len, n_head_kv_ * head_dim_);
                     snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, result.global_v->data(), seq_len, n_head_kv_ * head_dim_);
                     result.snapshot_performed = true;
+                    LOG_INFO("[CALLBACK_TRACE] Snapshot callbacks invoked successfully for layer " << layer_index_);
                 }
             }
         }
         else if (snapshot_callback_)
         {
             // Single rank: just snapshot the local tensors directly (also before RoPE)
+            LOG_INFO("[CALLBACK_TRACE] Single-rank path: invoking snapshot_callback_ for Q/K/V (layer " << layer_index_ << ")");
             snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, local_q->data(), seq_len, local_head_dim);
             snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_kv_head_dim);
             snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_kv_head_dim);
             result.snapshot_performed = true;
+            LOG_INFO("[CALLBACK_TRACE] Single-rank callbacks invoked successfully for layer " << layer_index_);
         }
 
         return result;
@@ -2768,7 +2719,9 @@ namespace llaminar
         // ========================================================================
         // STEP 4: Gather Q/K/V for snapshotting (BEFORE RoPE!) (REFACTORED)
         // ========================================================================
+        LOG_INFO("[EXECUTE_TRACE] About to call gatherAndSnapshotPreRoPE for layer " << layer_index_);
         auto gather_result = gatherAndSnapshotPreRoPE(setup, projections);
+        LOG_INFO("[EXECUTE_TRACE] Returned from gatherAndSnapshotPreRoPE for layer " << layer_index_);
 
         // ========================================================================
         // STEP 5: Apply RoPE to Q and K (AFTER snapshotting but BEFORE attention!) (REFACTORED)

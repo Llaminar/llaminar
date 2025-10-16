@@ -7,14 +7,17 @@
  */
 
 #include "BatchQwenPipeline.h"
+#include "QwenPipeline.h"
 #include "Logger.h"
 #include "ModelLoader.h"
 #include "tensors/SimpleTensor.h"
 #include "TransformerConfig.h"
 #include "operators/MPILinearBatchOperator.h"
-#include "operators/MPIAttentionOperator.h"
+#include "operators/MPIAttentionBatchOperator.h"
 #include "operators/MPIRMSNormOperator.h"
 #include "operators/MPISwiGLUBatchOperator.h"
+#include "PipelineSnapshotManager.h"
+#include "PipelineStages.h"
 #include <cblas.h>
 #include <algorithm>
 
@@ -27,10 +30,14 @@ namespace llaminar
     BatchQwenPipeline::BatchQwenPipeline(const ModelConfig &config, const MPIContext &ctx)
         : PipelineBase(ctx), config_(config)
     {
+        // Set snapshot source to "batch" to differentiate from sequential pipeline
+        setSnapshotSource("batch");
+        LOG_INFO("[BatchQwenPipeline] Constructor: setSnapshotSource('batch'), current source='" << getSnapshotSource() << "'");
+
         // Register batch-aware operators
         const auto &lc = config_.getLayerConfig();
 
-        registerOperator("attention", std::make_unique<MPIAttentionOperator>(
+        registerOperator("attention", std::make_unique<MPIAttentionBatchOperator>(
                                           lc.n_head, lc.n_head_kv, lc.head_dim, lc.rope_freq_base));
         registerOperator("linear", std::make_unique<MPILinearBatchOperator>());
         registerOperator("rmsnorm", std::make_unique<MPIRMSNormOperator>());
@@ -40,7 +47,7 @@ namespace llaminar
         {
             LOG_INFO("[BatchQwenPipeline] Initialized: d_model=" << lc.d_model
                                                                  << " layers=" << lc.n_layers << " heads=" << lc.n_head
-                                                                 << " (operators registered)");
+                                                                 << " (batch-aware operators registered, snapshot_source=batch)");
         }
     }
 
@@ -102,7 +109,7 @@ namespace llaminar
         if (getRank() == 0)
         {
             LOG_DEBUG("[BatchQwenPipeline] Initialized KV cache: layers=" << n_layers
-                      << " batch=" << current_batch_size_ << " max_seq=" << max_seq << " kv_dim=" << kv_dim);
+                                                                          << " batch=" << current_batch_size_ << " max_seq=" << max_seq << " kv_dim=" << kv_dim);
         }
 
         // Step 1: Prepare padded embedding
@@ -218,7 +225,7 @@ namespace llaminar
         if (getRank() == 0)
         {
             LOG_DEBUG("[BatchQwenPipeline] decodeBatch completed: B=" << B << " -> logits ["
-                      << out_logits->shape()[0] << "," << out_logits->shape()[1] << "]");
+                                                                      << out_logits->shape()[0] << "," << out_logits->shape()[1] << "]");
         }
         return true;
     }
@@ -254,9 +261,10 @@ namespace llaminar
             return {};
         }
 
-        // Load weights using bridge function
+        // Load weights using BATCH-MODE bridge function (REPLICATED weights)
+        // Batch operators handle weight distribution internally, so we need full weights
         auto weights_wrapper = std::make_unique<BatchQwenWeights>();
-        weights_wrapper->inner = loadModelWeights_impl_bridge(*loader, config_.getLayerConfig());
+        weights_wrapper->inner = loadModelWeights_batch_bridge(*loader, config_.getLayerConfig());
 
         if (getRank() == 0)
         {
@@ -341,6 +349,9 @@ namespace llaminar
                                                                  << " (real embeddings populated)");
         }
 
+        // Capture snapshot for parity testing
+        captureIfEnabled(PipelineStage::EMBEDDING, -1, embedded);
+
         return true;
     }
 
@@ -378,11 +389,28 @@ namespace llaminar
                     LOG_ERROR("Layer " << layer << " attention RMSNorm failed");
                     return false;
                 }
+
+                // Capture snapshot
+                if (getRank() == 0)
+                {
+                    LOG_INFO("[BatchQwenPipeline] SNAPSHOT: Capturing ATTENTION_NORM with source='" << getSnapshotSource() << "' for layer " << layer);
+                }
+                captureIfEnabled(PipelineStage::ATTENTION_NORM, layer, attn_norm_out);
             }
 
             // 2. Multi-head attention
             auto attn_out = std::make_shared<SimpleTensor>(hidden->shape());
             {
+                // Set up snapshot callback for attention operator
+                auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
+                if (attn_op)
+                {
+                    attn_op->setLayerIndex(layer);
+                    attn_op->setSnapshotCallback([this](PipelineStage stage, int layer_idx,
+                                                        const std::shared_ptr<TensorBase> &tensor)
+                                                 { this->captureIfEnabled(stage, layer_idx, tensor); });
+                }
+
                 // Prepare KV cache tensors (initially empty for prefill)
                 std::shared_ptr<TensorBase> k_cache_in, v_cache_in;
                 if (!kv_cache_)
@@ -424,6 +452,9 @@ namespace llaminar
                     return false;
                 }
 
+                // Capture snapshot
+                captureIfEnabled(PipelineStage::ATTENTION_OUTPUT, layer, attn_out);
+
                 // TODO: Update KV cache with outputs from attention
                 // For now, cache population deferred to Phase 4 (decode path)
             }
@@ -440,6 +471,9 @@ namespace llaminar
                 {
                     output_data[i] = input_data[i] + attn_data[i];
                 }
+
+                // Capture snapshot
+                captureIfEnabled(PipelineStage::ATTENTION_RESIDUAL, layer, post_attn);
             }
 
             // === FFN Block ===

@@ -314,9 +314,10 @@ namespace llaminar
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim)
+            int feature_dim,
+            const std::string &source)
         {
-            capture(llaminar::stage_to_string(stage), layer_index, data, seq_len, feature_dim);
+            capture(llaminar::stage_to_string(stage), layer_index, data, seq_len, feature_dim, source);
         }
 
         void LlaminarSnapshotHook::capture(
@@ -324,7 +325,8 @@ namespace llaminar
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim)
+            int feature_dim,
+            const std::string &source)
         {
             if (!enabled_ || !data || seq_len <= 0 || feature_dim <= 0)
             {
@@ -337,13 +339,13 @@ namespace llaminar
             meta.layer_index = layer_index;
             meta.seq_len = seq_len;
             meta.feature_dim = feature_dim;
-            meta.source = "llaminar";
+            meta.source = source;
 
             size_t count = static_cast<size_t>(seq_len) * static_cast<size_t>(feature_dim);
             TensorSnapshot snapshot(meta, data, count);
 
             auto &registry = SnapshotRegistry::instance();
-            std::string key = registry.make_key("llaminar", stage_name, layer_index);
+            std::string key = registry.make_key(source, stage_name, layer_index);
             registry.register_snapshot(key, snapshot);
         }
 

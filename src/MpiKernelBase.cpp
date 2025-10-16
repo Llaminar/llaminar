@@ -8,7 +8,7 @@
 namespace llaminar
 {
 
-    MPIKernelBase::MPIKernelBase(MPI_Comm comm, bool init_mpi)
+    MPIOperatorBase::MPIOperatorBase(MPI_Comm comm, bool init_mpi)
         : comm_(comm), rank_(0), size_(1), mpi_initialized_(false)
     {
 
@@ -29,7 +29,7 @@ namespace llaminar
                 LOG_WARN("MPI thread support level " << provided << " is less than required " << required);
             }
 
-            LOG_DEBUG("MPI initialized by MPIKernelBase");
+            LOG_DEBUG("MPI initialized by MPIOperatorBase");
         }
 
         // Get rank and size for the communicator
@@ -39,13 +39,13 @@ namespace llaminar
         // Populate MPIContext
         mpi_ctx_ = MPIContext(rank_, size_, comm_);
 
-        LOG_DEBUG("MPIKernelBase initialized: rank=" << rank_ << ", size=" << size_);
+        LOG_DEBUG("MPIOperatorBase initialized: rank=" << rank_ << ", size=" << size_);
 
         // Call virtual initialization method
         initializeMPI();
     }
 
-    MPIKernelBase::MPIKernelBase(const MPIContext &ctx, bool init_mpi)
+    MPIOperatorBase::MPIOperatorBase(const MPIContext &ctx, bool init_mpi)
         : mpi_ctx_(ctx), comm_(ctx.comm), rank_(ctx.rank), size_(ctx.size), mpi_initialized_(false)
     {
         int provided, required = MPI_THREAD_MULTIPLE;
@@ -65,16 +65,16 @@ namespace llaminar
                 LOG_WARN("MPI thread support level " << provided << " is less than required " << required);
             }
 
-            LOG_DEBUG("MPI initialized by MPIKernelBase with MPIContext");
+            LOG_DEBUG("MPI initialized by MPIOperatorBase with MPIContext");
         }
 
-        LOG_DEBUG("MPIKernelBase initialized from MPIContext: " << mpi_ctx_.toString());
+        LOG_DEBUG("MPIOperatorBase initialized from MPIContext: " << mpi_ctx_.toString());
 
         // Call virtual initialization method
         initializeMPI();
     }
 
-    MPIKernelBase::~MPIKernelBase()
+    MPIOperatorBase::~MPIOperatorBase()
     {
         try
         {
@@ -104,17 +104,17 @@ namespace llaminar
                 if (!mpi_finalized)
                 {
                     MPI_Finalize();
-                    LOG_DEBUG("MPI finalized by MPIKernelBase");
+                    LOG_DEBUG("MPI finalized by MPIOperatorBase");
                 }
             }
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("Exception in MPIKernelBase destructor: " << e.what());
+            LOG_ERROR("Exception in MPIOperatorBase destructor: " << e.what());
         }
     }
 
-    MPIKernelBase::MPIKernelBase(MPIKernelBase &&other) noexcept
+    MPIOperatorBase::MPIOperatorBase(MPIOperatorBase &&other) noexcept
         : comm_(other.comm_), rank_(other.rank_), size_(other.size_),
           mpi_initialized_(other.mpi_initialized_),
           send_buffer_(std::move(other.send_buffer_)),
@@ -125,7 +125,7 @@ namespace llaminar
         other.mpi_initialized_ = false;
     }
 
-    MPIKernelBase &MPIKernelBase::operator=(MPIKernelBase &&other) noexcept
+    MPIOperatorBase &MPIOperatorBase::operator=(MPIOperatorBase &&other) noexcept
     {
         if (this != &other)
         {
@@ -155,7 +155,7 @@ namespace llaminar
         return *this;
     }
 
-    std::pair<int, int> MPIKernelBase::getRowDistribution(int global_size, int rank) const
+    std::pair<int, int> MPIOperatorBase::getRowDistribution(int global_size, int rank) const
     {
         if (rank < 0)
             rank = rank_;
@@ -169,13 +169,13 @@ namespace llaminar
         return {local_size, offset};
     }
 
-    std::pair<int, int> MPIKernelBase::getColDistribution(int global_size, int rank) const
+    std::pair<int, int> MPIOperatorBase::getColDistribution(int global_size, int rank) const
     {
         // Column distribution uses the same logic as row distribution
         return getRowDistribution(global_size, rank);
     }
 
-    std::tuple<int, int, int, int> MPIKernelBase::getBlockDistribution(int rows, int cols, int rank) const
+    std::tuple<int, int, int, int> MPIOperatorBase::getBlockDistribution(int rows, int cols, int rank) const
     {
         if (rank < 0)
             rank = rank_;
@@ -199,7 +199,7 @@ namespace llaminar
         return {local_rows, local_cols, row_offset, col_offset};
     }
 
-    void MPIKernelBase::allGather(const float *send_data, int send_count, std::vector<float> &recv_data) const
+    void MPIOperatorBase::allGather(const float *send_data, int send_count, std::vector<float> &recv_data) const
     {
         int total_count = send_count * size_;
         recv_data.resize(total_count);
@@ -209,32 +209,32 @@ namespace llaminar
                       "MPI_Allgather");
     }
 
-    void MPIKernelBase::allReduceSum(const float *send_data, float *recv_data, int count) const
+    void MPIOperatorBase::allReduceSum(const float *send_data, float *recv_data, int count) const
     {
         checkMPIError(PerfAllreduce(send_data, recv_data, count, MPI_FLOAT, MPI_SUM, comm_),
                       "MPI_Allreduce (SUM)");
     }
 
-    void MPIKernelBase::allReduceMax(const float *send_data, float *recv_data, int count) const
+    void MPIOperatorBase::allReduceMax(const float *send_data, float *recv_data, int count) const
     {
         checkMPIError(PerfAllreduce(send_data, recv_data, count, MPI_FLOAT, MPI_MAX, comm_),
                       "MPI_Allreduce (MAX)");
     }
 
-    void MPIKernelBase::reduceScatter(const float *send_data, float *recv_data, const int *recv_counts) const
+    void MPIOperatorBase::reduceScatter(const float *send_data, float *recv_data, const int *recv_counts) const
     {
         checkMPIError(MPI_Reduce_scatter(send_data, recv_data, recv_counts, MPI_FLOAT, MPI_SUM, comm_),
                       "MPI_Reduce_scatter");
     }
 
-    void MPIKernelBase::broadcast(float *data, int count, int root) const
+    void MPIOperatorBase::broadcast(float *data, int count, int root) const
     {
         checkMPIError(MPI_Bcast(data, count, MPI_FLOAT, root, comm_),
                       "MPI_Bcast");
     }
 
-    void MPIKernelBase::allGatherStart(const float *send_data, int send_count,
-                                       std::vector<float> &recv_data, MPI_Request *request) const
+    void MPIOperatorBase::allGatherStart(const float *send_data, int send_count,
+                                         std::vector<float> &recv_data, MPI_Request *request) const
     {
         int total_count = send_count * size_;
         recv_data.resize(total_count);
@@ -244,12 +244,12 @@ namespace llaminar
                       "MPI_Iallgather");
     }
 
-    void MPIKernelBase::waitCompletion(MPI_Request *request) const
+    void MPIOperatorBase::waitCompletion(MPI_Request *request) const
     {
         checkMPIError(MPI_Wait(request, MPI_STATUS_IGNORE), "MPI_Wait");
     }
 
-    void MPIKernelBase::checkMPIError(int error_code, const std::string &operation_name) const
+    void MPIOperatorBase::checkMPIError(int error_code, const std::string &operation_name) const
     {
         if (error_code != MPI_SUCCESS)
         {
@@ -266,12 +266,12 @@ namespace llaminar
         }
     }
 
-    void MPIKernelBase::synchronize() const
+    void MPIOperatorBase::synchronize() const
     {
         checkMPIError(MPI_Barrier(comm_), "MPI_Barrier");
     }
 
-    std::shared_ptr<TensorBase> MPIKernelBase::createLocalTensor(const std::vector<size_t> &shape) const
+    std::shared_ptr<TensorBase> MPIOperatorBase::createLocalTensor(const std::vector<size_t> &shape) const
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());
@@ -290,7 +290,7 @@ namespace llaminar
         }
     }
 
-    std::shared_ptr<TensorBase> MPIKernelBase::createBroadcastTensor(const std::vector<size_t> &shape) const
+    std::shared_ptr<TensorBase> MPIOperatorBase::createBroadcastTensor(const std::vector<size_t> &shape) const
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());
@@ -300,9 +300,9 @@ namespace llaminar
         return TensorFactory::create_simple(int_shape);
     }
 
-    std::shared_ptr<TensorBase> MPIKernelBase::createDistributedTensor(const std::vector<size_t> &shape,
-                                                                       const std::string &label,
-                                                                       int m, int n, int k) const
+    std::shared_ptr<TensorBase> MPIOperatorBase::createDistributedTensor(const std::vector<size_t> &shape,
+                                                                         const std::string &label,
+                                                                         int m, int n, int k) const
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());

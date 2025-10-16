@@ -32,7 +32,7 @@ namespace llaminar
      * - Centralized MPI communication patterns
      * - NUMA-aware tensor allocation
      */
-    class PipelineBase : public MPIKernelBase
+    class PipelineBase : public MPIOperatorBase
     {
     public:
         /**
@@ -75,14 +75,14 @@ namespace llaminar
          * @param kernel Kernel instance to register
          * @return true if registration successful, false if name already exists
          */
-        bool registerOperator(const std::string &name, std::unique_ptr<MPIKernelBase> kernel);
+        bool registerOperator(const std::string &name, std::unique_ptr<MPIOperatorBase> kernel);
 
         /**
          * @brief Get registered kernel by name
          * @param name Kernel name to retrieve
          * @return Pointer to kernel, or nullptr if not found
          */
-        MPIKernelBase *getKernel(const std::string &name);
+        MPIOperatorBase *getKernel(const std::string &name);
 
         /**
          * @brief Check if kernel is registered
@@ -296,6 +296,7 @@ namespace llaminar
          * @param data Tensor data pointer
          * @param seq_len Sequence length
          * @param feature_dim Feature dimension
+         * @param source Source identifier (default: "llaminar")
          *
          * @note This is virtual so derived classes that inherit from both
          *       PipelineBase and AbstractPipeline can provide one implementation
@@ -305,7 +306,8 @@ namespace llaminar
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim);
+            int feature_dim,
+            const std::string &source = "llaminar");
 
         /**
          * @brief Check if parity testing is enabled
@@ -319,14 +321,31 @@ namespace llaminar
          */
         virtual bool isParityEnabled() const;
 
+        /**
+         * @brief Set the snapshot source identifier for this pipeline
+         * @param source Source identifier (e.g., "llaminar", "batch", "pytorch")
+         */
+        void setSnapshotSource(const std::string &source) { snapshot_source_ = source; }
+
+        /**
+         * @brief Get the snapshot source identifier
+         * @return Current snapshot source
+         */
+        const std::string &getSnapshotSource() const { return snapshot_source_; }
+
     private:
         // Kernel registry
-        std::unordered_map<std::string, std::unique_ptr<MPIKernelBase>> kernels_;
+        std::unordered_map<std::string, std::unique_ptr<MPIOperatorBase>> kernels_;
 
         // Performance tracking
         std::unordered_map<std::string, double> kernel_execution_times_;
         std::unordered_map<std::string, size_t> kernel_execution_counts_;
 
+    protected:
+        // Snapshot configuration (protected so derived classes can access)
+        std::string snapshot_source_ = "llaminar"; // Default source for snapshots
+
+    private:
         /**
          * @brief Initialize pipeline-specific configurations
          */

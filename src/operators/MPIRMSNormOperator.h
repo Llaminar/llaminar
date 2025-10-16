@@ -34,7 +34,7 @@ namespace llaminar
      * - Reshapes output back to [batch, seq_len, hidden_size]
      * - Backward compatible: 2D inputs produce 2D outputs
      */
-    class MPIRMSNormOperator : public MPIKernelBase
+    class MPIRMSNormOperator : public MPIOperatorBase
     {
     public:
         enum class DistributionStrategy
@@ -45,14 +45,14 @@ namespace llaminar
 
         MPIRMSNormOperator(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
-        std::string getKernelType() const override { return "MPIRMSNorm"; }
+        std::string getOperatorType() const override { return "MPIRMSNorm"; }
         size_t getExpectedInputCount() const override { return 2; }
         size_t getExpectedOutputCount() const override { return 1; }
 

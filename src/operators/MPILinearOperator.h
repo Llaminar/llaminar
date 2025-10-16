@@ -22,13 +22,13 @@ namespace llaminar
      * - Bias vector: Row-wise distribution matching weight matrix distribution
      * - Output tensor: Row-wise distribution, gathered to all processes at the end
      */
-    class MPILinearOperator : public MPIKernelBase
+    class MPILinearOperator : public MPIOperatorBase
     {
     public:
         MPILinearOperator(MPI_Comm comm = MPI_COMM_WORLD);
         ~MPILinearOperator() = default;
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
@@ -36,7 +36,7 @@ namespace llaminar
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
-        std::string getKernelType() const override { return "MPILinear"; }
+        std::string getOperatorType() const override { return "MPILinear"; }
         size_t getExpectedInputCount() const override { return 2; } // input + weight (bias optional)
         size_t getExpectedOutputCount() const override { return 1; }
 

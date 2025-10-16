@@ -324,4 +324,86 @@ namespace llaminar
             true); // allow_broadcast
     }
 
+    /**
+     * @brief Validate batch attention Q/K/V projection dimensions to prevent double-distribution bug
+     *
+     * CRITICAL CONTRACT: MPIAttentionBatchOperator already distributes heads across MPI ranks.
+     * The Q/K/V projections MUST use local-only matmul (distributed_partition=false) to avoid
+     * double-distributing the output dimensions.
+     *
+     * @param batch_size Batch size (B)
+     * @param seq_len Sequence length (T)
+     * @param d_model Model dimension (input features)
+     * @param n_heads_local Number of attention heads assigned to this MPI rank
+     * @param head_dim Dimension per head
+     * @param input_tensor Input activation tensor [B, T, d_model]
+     * @param weight_local Local weight tensor [n_heads_local * head_dim, d_model]
+     * @param output_local Output tensor [B, T, n_heads_local * head_dim]
+     * @param projection_name Name of projection ("Q", "K", or "V") for error messages
+     *
+     * @throws std::runtime_error if dimensions are incorrect or suggest double-distribution
+     */
+    inline void validateBatchAttentionProjection(
+        int batch_size,
+        int seq_len,
+        int d_model,
+        int n_heads_local,
+        int head_dim,
+        const std::shared_ptr<TensorBase> &input_tensor,
+        const std::shared_ptr<TensorBase> &weight_local,
+        const std::shared_ptr<TensorBase> &output_local,
+        const std::string &projection_name)
+    {
+        // Expected dimensions
+        int expected_local_out_dim = n_heads_local * head_dim;
+
+        // Validate input: [B, T, d_model]
+        TensorContract input_contract(
+            projection_name + "_input",
+            ShapeSpec{{batch_size, seq_len, d_model}, {"B", "T", "d_model"}},
+            TensorLayout::RowMajor,
+            TensorSemantic::Activation);
+        input_contract.validate(input_tensor);
+
+        // Validate local weight: [n_heads_local * head_dim, d_model]
+        // CRITICAL: This must be the FULL local head dimension, not further partitioned!
+        TensorContract weight_contract(
+            projection_name + "_weight_local",
+            ShapeSpec{{expected_local_out_dim, d_model}, {"n_heads_local*head_dim", "d_model"}},
+            TensorLayout::RowMajor,
+            TensorSemantic::Weight);
+        weight_contract.validate(weight_local);
+
+        // Validate output: [B, T, n_heads_local * head_dim]
+        // CRITICAL: Output must have FULL local head dimensions!
+        // If output_dim < expected_local_out_dim, we have a double-distribution bug!
+        TensorContract output_contract(
+            projection_name + "_output_local",
+            ShapeSpec{{batch_size, seq_len, expected_local_out_dim}, {"B", "T", "n_heads_local*head_dim"}},
+            TensorLayout::RowMajor,
+            TensorSemantic::Activation);
+        output_contract.validate(output_local);
+
+        // Additional runtime check for double-distribution bug
+        const auto &output_shape = output_local->shape();
+        int actual_out_dim = output_shape[2];
+
+        if (actual_out_dim != expected_local_out_dim)
+        {
+            std::ostringstream oss;
+            oss << "DOUBLE-DISTRIBUTION BUG DETECTED in " << projection_name << " projection!\n"
+                << "  Expected output dim: " << expected_local_out_dim << " (n_heads_local=" << n_heads_local
+                << " * head_dim=" << head_dim << ")\n"
+                << "  Actual output dim: " << actual_out_dim << "\n"
+                << "  This suggests the projection was further MPI-distributed!\n"
+                << "  FIX: Use adaptiveMatMul with distributed_partition=false, NOT MPILinearBatchOperator!";
+            throw std::runtime_error(oss.str());
+        }
+
+        LOG_TRACE("Batch attention " << projection_name << " projection contract validated: "
+                                     << "input=[" << batch_size << "," << seq_len << "," << d_model << "] "
+                                     << "weight=[" << expected_local_out_dim << "," << d_model << "] "
+                                     << "output=[" << batch_size << "," << seq_len << "," << actual_out_dim << "]");
+    }
+
 } // namespace llaminar

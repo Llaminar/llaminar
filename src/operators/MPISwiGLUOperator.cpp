@@ -43,15 +43,15 @@ namespace llaminar
 {
 
     MPISwiGLUOperator::MPISwiGLUOperator(DistributionStrategy strategy)
-        : MPIKernelBase(), strategy_(strategy), num_threads_(omp_get_max_threads())
+        : MPIOperatorBase(), strategy_(strategy), num_threads_(omp_get_max_threads())
     {
         LOG_DEBUG("MPISwiGLUOperator initialized on rank " << getRank() << "/" << getSize()
-                                                         << " with strategy: " << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "FEATURE_WISE")
-                                                         << ", OpenMP threads: " << num_threads_);
+                                                           << " with strategy: " << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "FEATURE_WISE")
+                                                           << ", OpenMP threads: " << num_threads_);
     }
 
     bool MPISwiGLUOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                  std::vector<std::shared_ptr<TensorBase>> &outputs)
+                                    std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         PERF_SCOPED_TIMER("MPISwiGLUOperator::execute");
 
@@ -79,12 +79,12 @@ namespace llaminar
         const bool replicated_inputs = !gate_distributed && !up_distributed && !output_distributed;
 
         LOG_DEBUG("MPISwiGLUOperator tensor types: gate=" << gate_tensor->type_name()
-                                                        << " up=" << up_tensor->type_name()
-                                                        << " output=" << output_tensor->type_name()
-                                                        << " distributed_flags=(" << (gate_distributed ? "D" : "R")
-                                                        << "," << (up_distributed ? "D" : "R")
-                                                        << "," << (output_distributed ? "D" : "R")
-                                                        << ") replicated=" << (replicated_inputs ? "true" : "false"));
+                                                          << " up=" << up_tensor->type_name()
+                                                          << " output=" << output_tensor->type_name()
+                                                          << " distributed_flags=(" << (gate_distributed ? "D" : "R")
+                                                          << "," << (up_distributed ? "D" : "R")
+                                                          << "," << (output_distributed ? "D" : "R")
+                                                          << ") replicated=" << (replicated_inputs ? "true" : "false"));
 
         const float *gate_data = gate_tensor->data();
         const float *up_data = up_tensor->data();
@@ -112,7 +112,7 @@ namespace llaminar
             if (rank_cached == 0)
             {
                 LOG_INFO("MPISwiGLUOperator SwiGLU algorithm: " << (legacy_algo ? "legacy(gate * silu(up))" : "standard(silu(gate) * up)")
-                                                              << (validation_enabled ? " (validation enabled)" : ""));
+                                                                << (validation_enabled ? " (validation enabled)" : ""));
             }
             algo_initialized = true;
         }
@@ -157,14 +157,14 @@ namespace llaminar
         TensorLogger::logTensorStats(output_tensor, "swiglu_output");
 
         LOG_DEBUG("MPISwiGLUOperator executed: " << seq_len << "x" << d_ff
-                                               << " in " << std::fixed << std::setprecision(2) << execution_time
-                                               << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
+                                                 << " in " << std::fixed << std::setprecision(2) << execution_time
+                                                 << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
 
         return true;
     }
 
     bool MPISwiGLUOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                   const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+                                     const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Check input count
         if (inputs.size() != 2)
@@ -284,11 +284,11 @@ namespace llaminar
         }
 
         LOG_DEBUG("MPISwiGLUOperator: Rank " << rank << " processing elements ["
-                                           << start_idx << ", " << end_idx << ") of " << total_elements);
+                                             << start_idx << ", " << end_idx << ") of " << total_elements);
     }
 
     void MPISwiGLUOperator::executeSequenceWise(const float *gate_data, const float *up_data, float *output_data,
-                                              int seq_len, int d_ff, bool replicated_inputs)
+                                                int seq_len, int d_ff, bool replicated_inputs)
     {
         // Distribute sequence positions across MPI ranks
         size_t total_positions = seq_len;
@@ -387,7 +387,7 @@ namespace llaminar
     }
 
     void MPISwiGLUOperator::executeFeatureWise(const float *gate_data, const float *up_data, float *output_data,
-                                             int seq_len, int d_ff, bool replicated_inputs)
+                                               int seq_len, int d_ff, bool replicated_inputs)
     {
         // Distribute feature dimensions across MPI ranks
         size_t total_features = d_ff;

@@ -118,9 +118,10 @@ namespace llaminar
         }
 
         // Use the parity framework's snapshot hook (static methods)
+        // CRITICAL: Pass the source parameter to differentiate batch vs sequential
         if (parity::LlaminarSnapshotHook::is_enabled())
         {
-            parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim);
+            parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim, source);
         }
     }
 

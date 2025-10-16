@@ -69,7 +69,7 @@ TEST_F(MPILinearOperatorTest, BasicFunctionality)
 
     // Create input tensors
     auto input = createTensor({seq_len, input_size});
-    auto weight = createTensor({input_size, output_size});
+    auto weight = createTensor({output_size, input_size});
     auto bias = createTensor({output_size});
     auto output = createTensor({seq_len, output_size});
 
@@ -108,7 +108,7 @@ TEST_F(MPILinearOperatorTest, WithoutBias)
 
     // Create input tensors (without bias)
     auto input = createTensor({seq_len, input_size});
-    auto weight = createTensor({input_size, output_size});
+    auto weight = createTensor({output_size, input_size});
     auto output = createTensor({seq_len, output_size});
 
     // Fill with test data
@@ -131,7 +131,7 @@ TEST_F(MPILinearOperatorTest, ValidationTests)
     size_t output_size = 4;
 
     auto input = createTensor({seq_len, input_size});
-    auto weight = createTensor({input_size, output_size});
+    auto weight = createTensor({output_size, input_size});
     auto output = createTensor({seq_len, output_size});
 
     // Test valid case with execute (since validate is private)

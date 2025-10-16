@@ -36,7 +36,7 @@ namespace llaminar
      * Expected outputs:
      * - rotated_output: [seq_len, n_heads, head_dim] - position-encoded tensor
      */
-    class MPIRoPEOperator : public MPIKernelBase
+    class MPIRoPEOperator : public MPIOperatorBase
     {
     public:
         enum class DistributionStrategy
@@ -53,7 +53,7 @@ namespace llaminar
          * @param strategy Distribution strategy for MPI parallelization
          */
         MPIRoPEOperator(int max_seq_len, int head_dim, float theta = 10000.0f,
-                      DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
+                        DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
         /**
          * @brief Destructor
@@ -91,7 +91,7 @@ namespace llaminar
          * @brief Get the kernel type name for debugging/logging
          * @return String identifying the kernel type
          */
-        std::string getKernelType() const override { return "MPIRoPE"; }
+        std::string getOperatorType() const override { return "MPIRoPE"; }
 
         /**
          * @brief Get expected number of input tensors

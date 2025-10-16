@@ -41,6 +41,7 @@ namespace llaminar
              * @param data Pointer to tensor data
              * @param seq_len Sequence length
              * @param feature_dim Feature dimension
+             * @param source Source identifier (default: "llaminar")
              *
              * This is a no-op unless:
              * 1. Linked with parity test framework
@@ -51,17 +52,25 @@ namespace llaminar
                 int layer_index,
                 const float *data,
                 int seq_len,
-                int feature_dim);
+                int feature_dim,
+                const std::string &source = "llaminar");
 
             /**
              * @brief Capture with custom stage name
+             * @param stage_name Custom stage name
+             * @param layer_index Layer index (-1 for non-layer stages)
+             * @param data Pointer to tensor data
+             * @param seq_len Sequence length
+             * @param feature_dim Feature dimension
+             * @param source Source identifier (default: "llaminar")
              */
             static void capture(
                 const std::string &stage_name,
                 int layer_index,
                 const float *data,
                 int seq_len,
-                int feature_dim);
+                int feature_dim,
+                const std::string &source = "llaminar");
 
             /**
              * @brief Enable/disable snapshot capture
