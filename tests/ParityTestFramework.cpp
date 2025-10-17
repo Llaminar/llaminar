@@ -335,7 +335,7 @@ namespace llaminar
             }
             if (!data || seq_len <= 0 || feature_dim <= 0)
             {
-                LOG_DEBUG("[PARITY_HOOK_DEBUG] LlaminarSnapshotHook::capture() invalid params: data=" << (void*)data << " seq_len=" << seq_len << " feature_dim=" << feature_dim);
+                LOG_DEBUG("[PARITY_HOOK_DEBUG] LlaminarSnapshotHook::capture() invalid params: data=" << (void *)data << " seq_len=" << seq_len << " feature_dim=" << feature_dim);
                 return;
             }
 

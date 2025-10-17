@@ -583,7 +583,7 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
         std::vector<StageInfo> stages = {
             // Input embedding
             {"EMBEDDING", -1},
-            
+
             // Attention block (layer 0)
             {"ATTENTION_NORM", 0},
             {"Q_PROJECTION", 0},
@@ -593,7 +593,7 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
             {"ATTENTION_CONTEXT", 0},
             {"ATTENTION_OUTPUT", 0},
             {"ATTENTION_RESIDUAL", 0},
-            
+
             // FFN block (layer 0)
             {"FFN_NORM", 0},
             {"FFN_GATE", 0},
@@ -601,11 +601,10 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
             {"FFN_SWIGLU", 0},
             {"FFN_DOWN", 0},
             {"FFN_RESIDUAL", 0},
-            
+
             // Output processing (after all layers)
             {"FINAL_NORM", -1},
-            {"LM_HEAD", -1}
-        };
+            {"LM_HEAD", -1}};
 
         ComparisonTolerance tolerance(1e-4f, 1e-4);
 
@@ -621,7 +620,7 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
                 // Final stages accumulate numerical errors from all previous operations
                 stage_tolerance = ComparisonTolerance(3e-4f, 1e-3);
             }
-            
+
             // Build keys using registry's make_key() for consistent formatting
             // Sequential uses "OpenBLAS" (from PrefillProvider.name())
             std::string seq_key = registry.make_key("OpenBLAS", stage.name, stage.layer);
@@ -652,16 +651,15 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
                 // Extract last token from sequential to match batch
                 size_t vocab_size = batch_snap.data.size(); // batch_size=1, so this is vocab_size
                 size_t seq_len = seq_snap.data.size() / vocab_size;
-                
+
                 if (seq_snap.data.size() % vocab_size == 0 && seq_len > 0)
                 {
                     // Extract last token's logits
                     seq_snap_for_compare.data.assign(
                         seq_snap.data.begin() + (seq_len - 1) * vocab_size,
-                        seq_snap.data.end()
-                    );
-                    
-                    std::cout << "ℹ LM_HEAD: Extracted last token from sequential [" 
+                        seq_snap.data.end());
+
+                    std::cout << "ℹ LM_HEAD: Extracted last token from sequential ["
                               << seq_len << ", " << vocab_size << "] -> [1, " << vocab_size << "]\n";
                 }
             }

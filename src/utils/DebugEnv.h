@@ -378,17 +378,17 @@ namespace llaminar
 
     struct PerformanceEnv
     {
-        bool enable = false;              // LLAMINAR_PERF_ENABLE
-        bool log_each_matmul = false;     // LLAMINAR_PERF_LOG_EACH_MATMUL
-        int log_rank = 0;                 // LLAMINAR_PERF_LOG_RANK (only rank prints per-op)
-        bool layer_mlp = false;           // LLAMINAR_PERF_LAYER_MLP (emit per-MLP layer timing breakdown)
-        bool layer_verbose = false;       // LLAMINAR_PERF_LAYER_VERBOSE (include gather/parity & extra fields)
-        bool layer_attention = false;     // LLAMINAR_PERF_LAYER_ATTENTION (emit per-Attention layer timing)
-        bool trace_enabled = false;       // LLAMINAR_PERF_TRACE_ENABLED (enable performance tracing)
-        std::string trace_filter;         // LLAMINAR_PERF_TRACE_FILTER (filter events by name)
-        std::string trace_detail;         // LLAMINAR_PERF_TRACE_DETAIL ("low"|"medium"|"high")
-        bool trace_dump_on_exit = false;  // LLAMINAR_PERF_TRACE_DUMP_ON_EXIT (dump trace on destructor)
-        std::string trace_output_file;    // LLAMINAR_PERF_TRACE_OUTPUT_FILE (output filename)
+        bool enable = false;             // LLAMINAR_PERF_ENABLE
+        bool log_each_matmul = false;    // LLAMINAR_PERF_LOG_EACH_MATMUL
+        int log_rank = 0;                // LLAMINAR_PERF_LOG_RANK (only rank prints per-op)
+        bool layer_mlp = false;          // LLAMINAR_PERF_LAYER_MLP (emit per-MLP layer timing breakdown)
+        bool layer_verbose = false;      // LLAMINAR_PERF_LAYER_VERBOSE (include gather/parity & extra fields)
+        bool layer_attention = false;    // LLAMINAR_PERF_LAYER_ATTENTION (emit per-Attention layer timing)
+        bool trace_enabled = false;      // LLAMINAR_PERF_TRACE_ENABLED (enable performance tracing)
+        std::string trace_filter;        // LLAMINAR_PERF_TRACE_FILTER (filter events by name)
+        std::string trace_detail;        // LLAMINAR_PERF_TRACE_DETAIL ("low"|"medium"|"high")
+        bool trace_dump_on_exit = false; // LLAMINAR_PERF_TRACE_DUMP_ON_EXIT (dump trace on destructor)
+        std::string trace_output_file;   // LLAMINAR_PERF_TRACE_OUTPUT_FILE (output filename)
     };
 
     // ---------------------------------------------------------------------

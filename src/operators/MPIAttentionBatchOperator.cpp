@@ -274,7 +274,7 @@ namespace llaminar
         // Step 1: Q, K, V projections using direct adaptiveMatMul
         // ========================================================================
         auto t_qkv_start = std::chrono::high_resolution_clock::now();
-        
+
         // CRITICAL: Heads are ALREADY distributed across MPI ranks in this operator.
         // We must NOT use MPILinearBatchOperator which would double-distribute.
         // Each rank computes its local head subset WITHOUT further MPI partitioning.
@@ -780,7 +780,7 @@ namespace llaminar
         // Step 2: Reshape to [B, n_heads_local, T, head_dim] and apply RoPE
         // ========================================================================
         auto t_rope_start = std::chrono::high_resolution_clock::now();
-        
+
         // Q: [B, T, n_heads_local * head_dim] -> [B, n_heads_local, T, head_dim]
         // This is a logical reshape, we'll work with the data in-place
 
@@ -1007,7 +1007,7 @@ namespace llaminar
         // Step 2.5: Expand K and V for GQA (Grouped Query Attention)
         // ========================================================================
         auto t_gqa_start = std::chrono::high_resolution_clock::now();
-        
+
         // IMPORTANT: This must be OUTSIDE the snapshot_callback block!
         // If n_kv_heads < n_heads, replicate KV heads to match Q head count
         // E.g., Qwen: 2 KV heads → 14 Q heads, group_size=7
@@ -1217,7 +1217,7 @@ namespace llaminar
         // Step 6: Output projection preparation
         // ========================================================================
         auto t_output_prep_start = std::chrono::high_resolution_clock::now();
-        
+
         // attn_output_local is already in [B, T, n_heads_local * head_dim] format - no reshape needed!
         auto attn_concat_local = attn_output_local; // Just alias, no copy needed
 
@@ -1512,14 +1512,16 @@ namespace llaminar
 
     void MPIAttentionBatchOperator::printPerformanceBreakdown() const
     {
-        if (getRank() != 0) return; // Only print on rank 0
-        
-        double total_ms = total_qkv_proj_ms_ + total_rope_ms_ + total_gqa_expand_ms_ + 
-                         total_scores_ms_ + total_softmax_ms_ + total_context_ms_ +
-                         total_output_prep_ms_ + total_output_proj_ms_ + total_mpi_reduce_ms_;
-        
-        if (total_ms < 0.001) return; // Skip if no timing data
-        
+        if (getRank() != 0)
+            return; // Only print on rank 0
+
+        double total_ms = total_qkv_proj_ms_ + total_rope_ms_ + total_gqa_expand_ms_ +
+                          total_scores_ms_ + total_softmax_ms_ + total_context_ms_ +
+                          total_output_prep_ms_ + total_output_proj_ms_ + total_mpi_reduce_ms_;
+
+        if (total_ms < 0.001)
+            return; // Skip if no timing data
+
         std::cout << "\n[ATTN_BREAKDOWN] Attention Operator Performance:\n";
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "  Q/K/V Proj:     " << std::setw(8) << total_qkv_proj_ms_ << " ms (" << std::setw(5) << (100.0 * total_qkv_proj_ms_ / total_ms) << "%)\n";

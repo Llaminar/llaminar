@@ -381,13 +381,13 @@ namespace llaminar
         const int B = hidden->shape()[0];
         const int T = hidden->shape()[1];
         const int D = hidden->shape()[2];
-        
+
         if (!attn_norm_buffer_ || attn_norm_buffer_->shape()[0] != B || attn_norm_buffer_->shape()[1] != T)
         {
             if (getRank() == 0)
             {
-                LOG_DEBUG("[BatchQwenPipeline] Allocating reusable buffers: B=" << B << " T=" << T 
-                         << " D=" << D << " d_ff=" << d_ff);
+                LOG_DEBUG("[BatchQwenPipeline] Allocating reusable buffers: B=" << B << " T=" << T
+                                                                                << " D=" << D << " d_ff=" << d_ff);
             }
             attn_norm_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
             attn_out_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
@@ -651,12 +651,12 @@ namespace llaminar
         if (getRank() == 0)
         {
             LOG_DEBUG("[BatchQwenPipeline] runBatchedLayers: all " << n_layers << " layers complete");
-            
+
             // Print performance breakdown
             double total_ms = total_attn_norm_ms + total_attention_ms + total_attn_residual_ms +
-                            total_ffn_norm_ms + total_gate_ms + total_up_ms + 
-                            total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
-            
+                              total_ffn_norm_ms + total_gate_ms + total_up_ms +
+                              total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
+
             std::cout << "\n[PERF_BREAKDOWN] Batch=" << B << " SeqLen=" << T << " Total=" << total_ms << "ms\n";
             std::cout << "  Attn Norm:      " << std::setw(8) << std::fixed << std::setprecision(2) << total_attn_norm_ms << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * total_attn_norm_ms / total_ms) << "%)\n";
             std::cout << "  Attention:      " << std::setw(8) << total_attention_ms << " ms (" << std::setw(5) << (100.0 * total_attention_ms / total_ms) << "%)\n";
@@ -668,9 +668,9 @@ namespace llaminar
             std::cout << "  FFN Down:       " << std::setw(8) << total_down_ms << " ms (" << std::setw(5) << (100.0 * total_down_ms / total_ms) << "%)\n";
             std::cout << "  FFN Residual:   " << std::setw(8) << total_ffn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_residual_ms / total_ms) << "%)\n";
             std::cout << std::flush;
-            
+
             // Print detailed attention breakdown
-            auto* attn_op = dynamic_cast<MPIAttentionBatchOperator*>(getKernel("attention"));
+            auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
             if (attn_op)
             {
                 attn_op->printPerformanceBreakdown();
@@ -701,19 +701,18 @@ namespace llaminar
         // === Apply Final RMSNorm ===
         // This was missing! Sequential pipeline applies output_norm before LM head
         auto normed_hidden = std::make_shared<SimpleTensor>(h_shape);
-        
+
         std::vector<std::shared_ptr<TensorBase>> norm_inputs = {
             hidden,
-            weights.output_norm()
-        };
+            weights.output_norm()};
         std::vector<std::shared_ptr<TensorBase>> norm_outputs = {normed_hidden};
-        
+
         if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
         {
             LOG_ERROR("projectOutput: Final RMSNorm failed");
             return false;
         }
-        
+
         // Capture FINAL_NORM snapshot (after final normalization, before LM head)
         captureIfEnabled(PipelineStage::FINAL_NORM, -1, normed_hidden);
 
