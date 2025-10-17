@@ -119,6 +119,7 @@ namespace llaminar
     struct AdaptiveEnv
     {
         bool disable_cosma = false; // ADAPTIVE_DISABLE_COSMA
+        bool log_threading = false; // LLAMINAR_ADAPTIVE_LOG_THREADING
     };
 
     struct AttentionEnv

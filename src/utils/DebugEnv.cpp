@@ -193,6 +193,7 @@ namespace llaminar
         s.dequant.anomalies = flag(std::getenv("LLAMINAR_DEQUANT_ANOMALIES"));
     // Adaptive
     s.adaptive.disable_cosma = flag(std::getenv("ADAPTIVE_DISABLE_COSMA"));
+    s.adaptive.log_threading = flag(std::getenv("LLAMINAR_ADAPTIVE_LOG_THREADING"));
     // Attention
     s.attention.validate_primitives = flag(std::getenv("LLAMINAR_ATTN_PRIMITIVES_VALIDATE"));
     s.attention.validate_output = flag(std::getenv("LLAMINAR_ATTN_OUTPUT_VALIDATE"));
@@ -474,6 +475,11 @@ namespace llaminar
                 s.cosma.max_resident_mb = to_ll(std::getenv("LLAMINAR_COSMA_MAX_RESIDENT_MB"), 2048);
                 s.cosma.disable = flag(std::getenv("LLAMINAR_COSMA_DISABLE"));
                 s.cosma.force = flag(std::getenv("LLAMINAR_COSMA_FORCE"));
+                // Attention (refresh subset)
+                if(const char* ce = std::getenv("LLAMINAR_ATTN_CAPTURE_ENABLED")) {
+                    if(*ce == '1' || std::string(ce) == "true" || std::string(ce) == "TRUE") s.attention.capture_enabled = true;
+                    else s.attention.capture_enabled = false;
+                }
                 // Distribution
                 // Softmax (refresh subset)
                 s.softmax.force_scalar = flag(std::getenv("LLAMINAR_SOFTMAX_FORCE_SCALAR"));

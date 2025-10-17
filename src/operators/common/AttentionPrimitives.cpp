@@ -1089,13 +1089,9 @@ namespace llaminar::attn
                            int head_offset, int total_q_heads,
                            bool gathered_rank_major, int kv_head_offset_for_rank)
     {
-        // Disable gather/rearrange unless snapshot capture is enabled
-        const auto &env = llaminar::debugEnv().attention;
-        if (!env.capture_enabled)
-        {
-            // In perf mode, skip all-gather and rearrange (no snapshot overhead)
-            return;
-        }
+        // CRITICAL FIX: GQA expansion is ALWAYS needed for correctness!
+        // The capture_enabled flag should only gate snapshot captures, not functional operations.
+        // Removing the early return that was causing attention to use uninitialized K/V buffers.
 
         // Each KV head serves a group of consecutive Q heads
         // For Qwen: 14 Q heads, 2 KV heads → group_size = 14/2 = 7
