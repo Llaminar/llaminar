@@ -1,20 +1,26 @@
-#!/bin/bash
-# Batch Performance Benchmark Runner
-# Runs batch processing benchmarks with optimal MPI/OpenMP configuration
+#!/usr/bin/env bash
+# Batch performance benchmark runner with optimal MPI/OpenMP settings
 
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
-BENCH_EXEC="${BUILD_DIR}/test_batch_performance"
+set -e  # Exit on error
 
 # Colors for output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+BUILD_DIR="${SCRIPT_DIR}/build_release"
+BENCH_EXEC="${BUILD_DIR}/test_batch_performance"
+
+# Check if benchmark executable exists
+if [ ! -f "$BENCH_EXEC" ]; then
+    echo -e "${RED}Error: Benchmark executable not found at $BENCH_EXEC${NC}"
+    echo "Please build the Release version first:"
+    echo "  cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release"
+    echo "  cmake --build build_release --target test_batch_performance --parallel"
+    exit 1
+fi
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║   Batch Processing Performance Benchmark                  ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
@@ -56,13 +62,13 @@ detect_cpu_topology
 
 # CRITICAL: Check if this is a Release build
 echo -e "${GREEN}Build Configuration:${NC}"
-if [ -f "build/CMakeCache.txt" ]; then
-    BUILD_TYPE=$(grep "CMAKE_BUILD_TYPE:STRING" build/CMakeCache.txt | cut -d= -f2)
+if [ -f "build_release/CMakeCache.txt" ]; then
+    BUILD_TYPE=$(grep "CMAKE_BUILD_TYPE:STRING" build_release/CMakeCache.txt | cut -d= -f2)
     echo "  Build type: $BUILD_TYPE"
     if [ "$BUILD_TYPE" != "Release" ]; then
         echo -e "${RED}  ⚠ WARNING: Performance benchmarks require Release build!${NC}"
         echo -e "${RED}  ⚠ Debug builds are 5-10x slower - results will be misleading${NC}"
-        echo -e "${RED}  ⚠ Reconfigure with: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release${NC}"
+        echo -e "${RED}  ⚠ Reconfigure with: cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release${NC}"
         echo ""
         read -p "Continue with Debug build anyway? (y/N) " -n 1 -r
         echo
@@ -119,12 +125,22 @@ echo ""
 
 # Parse command line arguments
 TEST_FILTER=""
+BATCH_FILTER=""
+SEQ_LEN_FILTER=""
 SHOW_HELP=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --filter)
             TEST_FILTER="$2"
+            shift 2
+            ;;
+        --batch)
+            BATCH_FILTER="$2"
+            shift 2
+            ;;
+        --seq-len)
+            SEQ_LEN_FILTER="$2"
             shift 2
             ;;
         --help|-h)
@@ -144,26 +160,48 @@ if [ $SHOW_HELP -eq 1 ]; then
     echo ""
     echo "Options:"
     echo "  --filter <pattern>    Run only tests matching pattern"
+    echo "  --batch <sizes>       Test only specific batch sizes (comma-separated)"
+    echo "  --seq-len <lengths>   Test only specific sequence lengths (comma-separated)"
     echo "  --help, -h            Show this help message"
     echo ""
     echo "Available test suites:"
     echo "  BatchPerformanceTest.PrefillThroughputScaling"
+    echo "  BatchPerformanceTest.PrefillThroughputScalingLongSequences"
     echo "  BatchPerformanceTest.DecodeThroughputScaling"
     echo "  BatchPerformanceTest.MemoryBandwidthAnalysis"
     echo ""
     echo "Examples:"
-    echo "  $0                                    # Run all benchmarks"
-    echo "  $0 --filter '*Prefill*'               # Run only prefill scaling"
-    echo "  $0 --filter '*Decode*'                # Run only decode scaling"
-    echo "  $0 --filter '*Bandwidth*'             # Run memory bandwidth analysis"
+    echo "  $0                                          # Run all benchmarks"
+    echo "  $0 --filter '*Prefill*'                     # Run only prefill scaling"
+    echo "  $0 --filter '*LongSequences'                # Run long sequence tests"
+    echo "  $0 --filter '*LongSequences' --batch 32 --seq-len 512"
+    echo "                                              # Test only batch=32, seq_len=512"
+    echo "  $0 --batch 1,4,32 --seq-len 256,512         # Test specific combinations"
+    echo ""
+    echo "Environment Variables (for fine-grained control):"
+    echo "  BATCH_SIZE_FILTER=1,32    Same as --batch"
+    echo "  SEQ_LEN_FILTER=512        Same as --seq-len"
     exit 0
 fi
 
-# Build filter argument
+# Build filter argument and set environment variables
 FILTER_ARG=""
 if [ -n "$TEST_FILTER" ]; then
     FILTER_ARG="--gtest_filter=$TEST_FILTER"
     echo -e "${YELLOW}Running filtered tests: $TEST_FILTER${NC}"
+fi
+
+if [ -n "$BATCH_FILTER" ]; then
+    export BATCH_SIZE_FILTER="$BATCH_FILTER"
+    echo -e "${YELLOW}Filtered batch sizes: $BATCH_FILTER${NC}"
+fi
+
+if [ -n "$SEQ_LEN_FILTER" ]; then
+    export SEQ_LEN_FILTER="$SEQ_LEN_FILTER"
+    echo -e "${YELLOW}Filtered sequence lengths: $SEQ_LEN_FILTER${NC}"
+fi
+
+if [ -n "$FILTER_ARG" ] || [ -n "$BATCH_FILTER" ] || [ -n "$SEQ_LEN_FILTER" ]; then
     echo ""
 fi
 
@@ -194,6 +232,8 @@ mpirun -np $SOCKETS \
     -x OMPI_MCA_btl_vader_single_copy_mechanism \
     -x OMPI_MCA_btl_openib_allow_ib \
     -x ADAPTIVE_DISABLE_COSMA \
+    -x BATCH_SIZE_FILTER \
+    -x SEQ_LEN_FILTER \
     "$BENCH_EXEC" $FILTER_ARG
 
 RESULT=$?

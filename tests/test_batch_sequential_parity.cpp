@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 #include "AbstractPipeline.h"
 #include "ModelLoader.h"
-#include "MPIContext.h"
+#include "MpiContext.h"
 #include "Logger.h"
 #include "PipelineSnapshotManager.h"
 #include "PipelineStages.h"

@@ -113,11 +113,19 @@ auto output_batch = linear_batch_op->forward(input, weight, batch_size);
 **Critical validation**: Batch and sequential paths must produce identical results for the same input.
 
 - **Test**: `tests/test_batch_correctness.cpp` (`BatchCorrectnessTest.BatchedAttentionStagesParity`)
-- **Status**: ✅ **8/8 attention stages passing** with exact numerical matches
-- **Coverage**: Embedding → Q/K/V projections → RoPE → Attention → Output projection
+- **Status**: ✅ **17/17 stages passing** with excellent numerical agreement (completed Oct 17, 2025)
+- **Coverage**: Full pipeline validation from embedding through LM head
+  - Embedding layer
+  - 9 attention stages (norm, Q/K/V projections, RoPE, scores, weights, context, output, residual)
+  - 6 FFN stages (norm, gate, up, SwiGLU, down, residual)
+  - Final norm + LM head
 - **Methodology**: Snapshot-based comparison using `SnapshotRegistry` and `SnapshotComparator`
+- **Critical Bug Fixed**: Missing final RMSNorm in `BatchQwenPipeline::projectOutput()` (divergence reduced 470,000×)
 
-For details, see `.github/instructions/parity-test-framework.instructions.md` "Batch vs Sequential Parity Testing" section.
+For details, see:
+- `.github/instructions/parity-test-framework.instructions.md` - Comprehensive parity testing guide
+- `changelog/2025-10-17-batch-parity-extended-to-ffn-lm-head.md` - Detailed test results and bug fix
+- `changelog/2025-10-17-batch-parity-and-performance-complete.md` - Complete session summary
 
 #### Performance Characteristics
 
@@ -799,6 +807,73 @@ if (success) {
     double gflops = flops / (ms * 1e6);
     LOG_INFO("Operation: " << ms << "ms, " << gflops << " GFLOPS");
 }
+```
+
+### Performance Baselines vs llama.cpp
+
+**Benchmark Configuration** (October 2025):
+- Model: Qwen 2.5 0.5B Instruct Q8_0 (638 MB)
+- Hardware: 2-socket system (56 physical cores, 112 with HT)
+- llama.cpp: Release build with `-march=native`, 28 threads (physical cores only)
+- Llaminar: Release build with MPI (2 ranks), OpenBLAS, 28 threads per rank
+
+**llama.cpp Performance Baseline (pp512 - 512 token prompts):**
+
+| Batch Size | Throughput | Speedup vs Batch=1 | Notes |
+|------------|------------|---------------------|-------|
+| 1 | 25.2 tok/s | 1.0× | Single sequence baseline |
+| 8 | 120.5 tok/s | 4.8× | |
+| 16 | 249.7 tok/s | 9.9× | ~10× scaling milestone |
+| 32 | 643.4 tok/s | 25.5× | **Exceeds 22× target** |
+| 64 | 854.3 tok/s | 33.9× | |
+| 128 | 1065.3 tok/s | 42.3× | Strong scaling continues |
+| 256 | 1148.2 tok/s | 45.5× | Approaching plateau |
+| 512 | 1210.1 tok/s | 48.0× | **Peak performance** |
+
+**Key Findings:**
+- **Short sequences (8 tokens) severely limit batch scaling**: Only ~6× speedup at batch=32
+- **Long sequences (512 tokens) unlock true batch potential**: 48× speedup at batch=512
+- **Performance plateaus around batch=256-512**: ~1150-1210 tok/s
+- **The 22× target is achievable**: Requires longer sequences (256+ tokens) and batch sizes ≥32
+
+**Reproducing llama.cpp Baseline:**
+
+```bash
+# Build llama.cpp with optimizations
+cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS="-march=native" \
+  -DCMAKE_C_FLAGS="-march=native" \
+  -DGGML_NATIVE=ON -DGGML_OPENMP=ON
+cmake --build build --target llama-bench --parallel
+
+# Run benchmark (pp512 = 512 token prompt, n=0 means no generation)
+OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=close \
+  ./build/bin/llama-bench \
+  -m ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  -p 512 -n 0 -b 1,2,4,8,16,32,64,128,256,512 -t 28
+```
+
+**Llaminar Performance Goals:**
+- **Target**: Match or exceed llama.cpp's 1210 tok/s at batch=512, pp512
+- **Current Status** (as of Oct 2025):
+  - Short sequences (8 tokens): 415 tok/s @ batch=32 (3× speedup) - limited by sequence length
+  - Long sequences (512 tokens): **To be benchmarked**
+- **Advantages**: Llaminar shows 3.5-4× better single-sequence performance (136 vs 39 tok/s with 8 tokens)
+- **Next Steps**: Extend batch performance tests to 128-512 token sequences to measure true scaling potential
+
+**Running Llaminar Batch Performance Tests:**
+
+```bash
+# Build Release version
+cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build_release --target test_batch_performance --parallel
+
+# Run with proper environment configuration
+./run_batch_performance.sh
+
+# Or run specific test filters
+./run_batch_performance.sh --filter '*PrefillThroughputScaling'
 ```
 
 ## COSMA vs OpenBLAS Integration

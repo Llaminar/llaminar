@@ -100,7 +100,7 @@ namespace llaminar
         bool incr_cache_trace = false;           // LLAMINAR_PIPELINE_INCR_CACHE_TRACE (log K/V slice stats around incremental writes)
         bool incr_hidden_trace = false;          // LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE (dump final hidden row prior to LM head)
         bool debug_decode_embed = false;         // LLAMINAR_DEBUG_DECODE_EMBED (log embedding details during incremental decode)
-        bool ffn_fusion_enabled = true;          // LLAMINAR_FFN_FUSION (default ON, fuse gate+up projections for performance)
+        bool ffn_fusion_enabled = true;          // LLAMINAR_PIPELINE_FFN_FUSION_ENABLED (enable fused gate+up projection, default: true)
     };
 
     // KV cache policy (dynamic capacity management for incremental decode)
@@ -119,7 +119,6 @@ namespace llaminar
     struct AdaptiveEnv
     {
         bool disable_cosma = false; // ADAPTIVE_DISABLE_COSMA
-        bool log_threading = false; // LLAMINAR_LOG_THREADING - Log actual thread counts during GEMM operations
     };
 
     struct AttentionEnv
@@ -218,8 +217,8 @@ namespace llaminar
         bool model_compare_gguf = false;    // LLAMINAR_MODEL_COMPARE_GGUF
         bool enum_map_debug = false;        // LLAMINAR_ENUM_MAP_DEBUG
         long long shard_cache_max_mb = 512; // LLAMINAR_SHARD_CACHE_MAX_MB (0 disables)
-        bool numa_first_touch = true;       // LLAMINAR_NUMA_FIRST_TOUCH (default ON for NUMA-aware allocation)
-        bool numa_verify_locality = false;  // LLAMINAR_NUMA_VERIFY_LOCALITY (log warnings if remote memory detected)
+        bool numa_first_touch = true;       // LLAMINAR_NUMA_FIRST_TOUCH (default: enabled)
+        bool numa_verify_locality = false;  // LLAMINAR_NUMA_VERIFY_LOCALITY (optional verification)
     };
 
     // --- Phase 2 additional groups ---
@@ -284,16 +283,6 @@ namespace llaminar
         std::string dump_stats_path;
         bool dump_gemm_snapshots = false;
         std::string dump_gemm_snapshots_path;
-    };
-
-    // Performance tracing (hierarchical hot-path instrumentation)
-    struct PerfTraceEnv
-    {
-        bool trace_enabled = false;          // LLAMINAR_PERF_TRACE
-        std::string trace_detail = "medium"; // LLAMINAR_PERF_TRACE_DETAIL (low/medium/high)
-        std::string trace_filter = "";       // LLAMINAR_PERF_TRACE_FILTER
-        std::string trace_output_file = "";  // LLAMINAR_PERF_TRACE_DUMP
-        bool trace_dump_on_exit = true;      // LLAMINAR_PERF_TRACE_AUTO_DUMP
     };
 
     // Baseline capture/compare for prefill reference snapshots
@@ -389,12 +378,17 @@ namespace llaminar
 
     struct PerformanceEnv
     {
-        bool enable = false;          // LLAMINAR_PERF_ENABLE
-        bool log_each_matmul = false; // LLAMINAR_PERF_LOG_EACH_MATMUL
-        int log_rank = 0;             // LLAMINAR_PERF_LOG_RANK (only rank prints per-op)
-        bool layer_mlp = false;       // LLAMINAR_PERF_LAYER_MLP (emit per-MLP layer timing breakdown)
-        bool layer_verbose = false;   // LLAMINAR_PERF_LAYER_VERBOSE (include gather/parity & extra fields)
-        bool layer_attention = false; // LLAMINAR_PERF_LAYER_ATTENTION (emit per-Attention layer timing)
+        bool enable = false;              // LLAMINAR_PERF_ENABLE
+        bool log_each_matmul = false;     // LLAMINAR_PERF_LOG_EACH_MATMUL
+        int log_rank = 0;                 // LLAMINAR_PERF_LOG_RANK (only rank prints per-op)
+        bool layer_mlp = false;           // LLAMINAR_PERF_LAYER_MLP (emit per-MLP layer timing breakdown)
+        bool layer_verbose = false;       // LLAMINAR_PERF_LAYER_VERBOSE (include gather/parity & extra fields)
+        bool layer_attention = false;     // LLAMINAR_PERF_LAYER_ATTENTION (emit per-Attention layer timing)
+        bool trace_enabled = false;       // LLAMINAR_PERF_TRACE_ENABLED (enable performance tracing)
+        std::string trace_filter;         // LLAMINAR_PERF_TRACE_FILTER (filter events by name)
+        std::string trace_detail;         // LLAMINAR_PERF_TRACE_DETAIL ("low"|"medium"|"high")
+        bool trace_dump_on_exit = false;  // LLAMINAR_PERF_TRACE_DUMP_ON_EXIT (dump trace on destructor)
+        std::string trace_output_file;    // LLAMINAR_PERF_TRACE_OUTPUT_FILE (output filename)
     };
 
     // ---------------------------------------------------------------------
@@ -519,7 +513,6 @@ namespace llaminar
                 Col
             } mode = Mode::Auto; // LLAMINAR_TP_WO_SIM_MODE=row|col|auto
         } tp_sim;
-        PerfTraceEnv perf; // Performance tracing configuration
     };
 
     // Accessor (lazy init, thread-safe via magic statics)

@@ -1284,9 +1284,9 @@ namespace llaminar
                 if (rank == 0 && layer_index_ == 0)
                 {
                     LOG_DEBUG("[SEQ_GATHER_DEBUG] Q gather parameters:");
-                    LOG_ERROR("  Using MPI_Allgather (not Allgatherv)");
-                    LOG_ERROR("  sendcount=" << (seq_len * local_head_dim) << " per rank");
-                    LOG_ERROR("  Local Q before gather [0:5]: [" << local_q->data()[0] << ", "
+                    LOG_DEBUG("  Using MPI_Allgather (not Allgatherv)");
+                    LOG_DEBUG("  sendcount=" << (seq_len * local_head_dim) << " per rank");
+                    LOG_DEBUG("  Local Q before gather [0:5]: [" << local_q->data()[0] << ", "
                                                                  << local_q->data()[1] << ", " << local_q->data()[2] << ", "
                                                                  << local_q->data()[3] << ", " << local_q->data()[4] << "]");
                 }
@@ -1313,13 +1313,13 @@ namespace llaminar
                 if (rank == 0 && layer_index_ == 0)
                 {
                     LOG_DEBUG("[SEQ_GATHER_DEBUG] After gather and rearrange:");
-                    LOG_ERROR("  Total size: " << result.global_q->size());
-                    LOG_ERROR("  First 10: [" << result.global_q->data()[0] << ", " << result.global_q->data()[1] << ", "
+                    LOG_DEBUG("  Total size: " << result.global_q->size());
+                    LOG_DEBUG("  First 10: [" << result.global_q->data()[0] << ", " << result.global_q->data()[1] << ", "
                                               << result.global_q->data()[2] << ", " << result.global_q->data()[3] << ", "
                                               << result.global_q->data()[4] << ", " << result.global_q->data()[5] << ", "
                                               << result.global_q->data()[6] << ", " << result.global_q->data()[7] << ", "
                                               << result.global_q->data()[8] << ", " << result.global_q->data()[9] << "]");
-                    LOG_ERROR("  At offset 1792 (rank1 start): [" << result.global_q->data()[1792] << ", "
+                    LOG_DEBUG("  At offset 1792 (rank1 start): [" << result.global_q->data()[1792] << ", "
                                                                   << result.global_q->data()[1793] << ", " << result.global_q->data()[1794] << ", "
                                                                   << result.global_q->data()[1795] << ", " << result.global_q->data()[1796] << "]");
                 }
@@ -2570,7 +2570,7 @@ namespace llaminar
                 sum_sq += result.attention_output->data()[i] * result.attention_output->data()[i];
             }
             float l2_norm = std::sqrt(sum_sq / result.attention_output->size());
-            LOG_ERROR("[MAGNITUDE_TRACE_SEQ] Rank0 Layer0 Sequential Attention Output: L2_norm=" << l2_norm << " size=" << result.attention_output->size());
+            LOG_DEBUG("[MAGNITUDE_TRACE_SEQ] Rank0 Layer0 Sequential Attention Output: L2_norm=" << l2_norm << " size=" << result.attention_output->size());
         }
 
         // Snapshot final attention output (after output projection and MPI reduction)

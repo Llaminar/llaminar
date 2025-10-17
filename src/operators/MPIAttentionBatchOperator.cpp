@@ -19,6 +19,9 @@
 #include <cmath>
 #include <algorithm>
 #include <mpi.h>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
 
 namespace llaminar
 {
@@ -54,8 +57,6 @@ namespace llaminar
         {
             n_kv_heads_local_++;
         }
-
-        // RoPE frequencies are computed on-demand by AttentionPrimitives::apply_rope_batched
 
         if (rank == 0)
         {
@@ -269,7 +270,11 @@ namespace llaminar
                                                                           << "] wo=[" << wo_rows << "," << wo_cols << "]");
         }
 
+        // ========================================================================
         // Step 1: Q, K, V projections using direct adaptiveMatMul
+        // ========================================================================
+        auto t_qkv_start = std::chrono::high_resolution_clock::now();
+        
         // CRITICAL: Heads are ALREADY distributed across MPI ranks in this operator.
         // We must NOT use MPILinearBatchOperator which would double-distribute.
         // Each rank computes its local head subset WITHOUT further MPI partitioning.
@@ -768,7 +773,14 @@ namespace llaminar
             snapshot_callback_(PipelineStage::V_PROJECTION, current_layer_idx_, v_snapshot);
         }
 
+        auto t_qkv_end = std::chrono::high_resolution_clock::now();
+        total_qkv_proj_ms_ += std::chrono::duration<double, std::milli>(t_qkv_end - t_qkv_start).count();
+
+        // ========================================================================
         // Step 2: Reshape to [B, n_heads_local, T, head_dim] and apply RoPE
+        // ========================================================================
+        auto t_rope_start = std::chrono::high_resolution_clock::now();
+        
         // Q: [B, T, n_heads_local * head_dim] -> [B, n_heads_local, T, head_dim]
         // This is a logical reshape, we'll work with the data in-place
 
@@ -988,7 +1000,14 @@ namespace llaminar
             snapshot_callback_(PipelineStage::ROPE_APPLICATION, current_layer_idx_, rope_snapshot);
         }
 
+        auto t_rope_end = std::chrono::high_resolution_clock::now();
+        total_rope_ms_ += std::chrono::duration<double, std::milli>(t_rope_end - t_rope_start).count();
+
+        // ========================================================================
         // Step 2.5: Expand K and V for GQA (Grouped Query Attention)
+        // ========================================================================
+        auto t_gqa_start = std::chrono::high_resolution_clock::now();
+        
         // IMPORTANT: This must be OUTSIDE the snapshot_callback block!
         // If n_kv_heads < n_heads, replicate KV heads to match Q head count
         // E.g., Qwen: 2 KV heads → 14 Q heads, group_size=7
@@ -1053,7 +1072,13 @@ namespace llaminar
             }
         }
 
+        auto t_gqa_end = std::chrono::high_resolution_clock::now();
+        total_gqa_expand_ms_ += std::chrono::duration<double, std::milli>(t_gqa_end - t_gqa_start).count();
+
+        // ========================================================================
         // Step 3: Compute attention scores with per-batch causal masking
+        // ========================================================================
+        auto t_scores_start = std::chrono::high_resolution_clock::now();
         // scores: [B, n_heads_local, T, T]
         int scores_size = B * n_heads_local_ * T * T;
         std::vector<float> scores(scores_size);
@@ -1065,8 +1090,17 @@ namespace llaminar
             B,
             T);
 
+        auto t_scores_end = std::chrono::high_resolution_clock::now();
+        total_scores_ms_ += std::chrono::duration<double, std::milli>(t_scores_end - t_scores_start).count();
+
+        // ========================================================================
         // Step 4: Apply causal mask and softmax per-batch
+        // ========================================================================
+        auto t_softmax_start = std::chrono::high_resolution_clock::now();
         applyCausalMaskAndSoftmax(scores.data(), B, T);
+
+        auto t_softmax_end = std::chrono::high_resolution_clock::now();
+        total_softmax_ms_ += std::chrono::duration<double, std::milli>(t_softmax_end - t_softmax_start).count();
 
         // DEBUG: Check scores after softmax on all ranks at layer 0
         if (current_layer_idx_ == 0)
@@ -1083,7 +1117,10 @@ namespace llaminar
             LOG_DEBUG("[SOFTMAX_CHECK] Rank " << getRank() << " After softmax: min=" << min_val << " max=" << max_val << " nan_count=" << nan_count);
         }
 
+        // ========================================================================
         // Step 5: Compute attention output: scores @ V
+        // ========================================================================
+        auto t_context_start = std::chrono::high_resolution_clock::now();
         // CRITICAL: Primitive outputs [B, T, n_heads_local * head_dim], NOT [B, n_heads_local, T, head_dim]!
         auto attn_output_local = std::make_shared<SimpleTensor>(
             std::vector<int>{B, T, n_heads_local_ * head_dim_});
@@ -1173,11 +1210,24 @@ namespace llaminar
             snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, current_layer_idx_, context_snapshot);
         }
 
+        auto t_context_end = std::chrono::high_resolution_clock::now();
+        total_context_ms_ += std::chrono::duration<double, std::milli>(t_context_end - t_context_start).count();
+
+        // ========================================================================
         // Step 6: Output projection preparation
+        // ========================================================================
+        auto t_output_prep_start = std::chrono::high_resolution_clock::now();
+        
         // attn_output_local is already in [B, T, n_heads_local * head_dim] format - no reshape needed!
         auto attn_concat_local = attn_output_local; // Just alias, no copy needed
 
+        auto t_output_prep_end = std::chrono::high_resolution_clock::now();
+        total_output_prep_ms_ += std::chrono::duration<double, std::milli>(t_output_prep_end - t_output_prep_start).count();
+
+        // ========================================================================
         // Step 7: Output projection with distributed computation
+        // ========================================================================
+        auto t_outproj_start = std::chrono::high_resolution_clock::now();
         // Each rank computes partial output: [B*T, n_heads_local*head_dim] @ [n_heads_local*head_dim, D]^T
         // Then MPI_Allreduce sums across ranks to get final [B*T, D] output
 
@@ -1285,12 +1335,21 @@ namespace llaminar
             }
         }
 
+        auto t_outproj_end = std::chrono::high_resolution_clock::now();
+        total_output_proj_ms_ += std::chrono::duration<double, std::milli>(t_outproj_end - t_outproj_start).count();
+
+        // ========================================================================
         // Step 8: MPI_Allreduce to sum partial outputs across ranks
+        // ========================================================================
+        auto t_reduce_start = std::chrono::high_resolution_clock::now();
         if (getSize() > 1)
         {
             MPI_Allreduce(MPI_IN_PLACE, output->data(), output->size(),
                           MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
         }
+
+        auto t_reduce_end = std::chrono::high_resolution_clock::now();
+        total_mpi_reduce_ms_ += std::chrono::duration<double, std::milli>(t_reduce_end - t_reduce_start).count();
 
         if (current_layer_idx_ == 0) // Log for all ranks on layer 0
         {
@@ -1305,7 +1364,7 @@ namespace llaminar
                 sum_sq += output->data()[i] * output->data()[i];
             }
             float l2_norm = std::sqrt(sum_sq / output->size());
-            LOG_ERROR("[MAGNITUDE_TRACE] Rank " << getRank() << " Layer0 Attention Output: L2_norm=" << l2_norm << " size=" << output->size());
+            LOG_DEBUG("[MAGNITUDE_TRACE] Rank " << getRank() << " Layer0 Attention Output: L2_norm=" << l2_norm << " size=" << output->size());
         }
 
         if (rank == 0)
@@ -1322,7 +1381,7 @@ namespace llaminar
         int batch_size,
         int seq_len)
     {
-        // Apply RoPE to Q and K tensors using proven AttentionPrimitives implementation
+        // Apply RoPE to Q and K tensors using shared AttentionPrimitives implementation
         // Q: [B, T, n_heads_local * head_dim]
         // K: [B, T, n_kv_heads_local * head_dim]
 
@@ -1339,7 +1398,7 @@ namespace llaminar
             LOG_DEBUG("  n_past=" << n_past << " rope_freq_base_=" << rope_freq_base_);
         }
 
-        // Use proven RoPE implementation from AttentionPrimitives
+        // Use shared RoPE implementation from AttentionPrimitives
         // This ensures consistency with sequential operator and eliminates code duplication
         llaminar::attn::apply_rope_batched(
             q, k,
@@ -1449,6 +1508,44 @@ namespace llaminar
         llaminar::attn::apply_scores_to_v_batched(
             scores, v, output,
             batch_size, seq_len, head_dim_, n_heads_local_);
+    }
+
+    void MPIAttentionBatchOperator::printPerformanceBreakdown() const
+    {
+        if (getRank() != 0) return; // Only print on rank 0
+        
+        double total_ms = total_qkv_proj_ms_ + total_rope_ms_ + total_gqa_expand_ms_ + 
+                         total_scores_ms_ + total_softmax_ms_ + total_context_ms_ +
+                         total_output_prep_ms_ + total_output_proj_ms_ + total_mpi_reduce_ms_;
+        
+        if (total_ms < 0.001) return; // Skip if no timing data
+        
+        std::cout << "\n[ATTN_BREAKDOWN] Attention Operator Performance:\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "  Q/K/V Proj:     " << std::setw(8) << total_qkv_proj_ms_ << " ms (" << std::setw(5) << (100.0 * total_qkv_proj_ms_ / total_ms) << "%)\n";
+        std::cout << "  RoPE:           " << std::setw(8) << total_rope_ms_ << " ms (" << std::setw(5) << (100.0 * total_rope_ms_ / total_ms) << "%)\n";
+        std::cout << "  GQA Expand:     " << std::setw(8) << total_gqa_expand_ms_ << " ms (" << std::setw(5) << (100.0 * total_gqa_expand_ms_ / total_ms) << "%)\n";
+        std::cout << "  Attn Scores:    " << std::setw(8) << total_scores_ms_ << " ms (" << std::setw(5) << (100.0 * total_scores_ms_ / total_ms) << "%)\n";
+        std::cout << "  Softmax:        " << std::setw(8) << total_softmax_ms_ << " ms (" << std::setw(5) << (100.0 * total_softmax_ms_ / total_ms) << "%)\n";
+        std::cout << "  Context (S@V):  " << std::setw(8) << total_context_ms_ << " ms (" << std::setw(5) << (100.0 * total_context_ms_ / total_ms) << "%)\n";
+        std::cout << "  Output Prep:    " << std::setw(8) << total_output_prep_ms_ << " ms (" << std::setw(5) << (100.0 * total_output_prep_ms_ / total_ms) << "%)\n";
+        std::cout << "  Output Proj:    " << std::setw(8) << total_output_proj_ms_ << " ms (" << std::setw(5) << (100.0 * total_output_proj_ms_ / total_ms) << "%)\n";
+        std::cout << "  MPI Reduce:     " << std::setw(8) << total_mpi_reduce_ms_ << " ms (" << std::setw(5) << (100.0 * total_mpi_reduce_ms_ / total_ms) << "%)\n";
+        std::cout << "  TOTAL:          " << std::setw(8) << total_ms << " ms\n";
+        std::cout << std::flush;
+    }
+
+    void MPIAttentionBatchOperator::resetPerformanceCounters()
+    {
+        total_qkv_proj_ms_ = 0.0;
+        total_rope_ms_ = 0.0;
+        total_gqa_expand_ms_ = 0.0;
+        total_scores_ms_ = 0.0;
+        total_softmax_ms_ = 0.0;
+        total_context_ms_ = 0.0;
+        total_output_prep_ms_ = 0.0;
+        total_output_proj_ms_ = 0.0;
+        total_mpi_reduce_ms_ = 0.0;
     }
 
 } // namespace llaminar

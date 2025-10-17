@@ -1697,7 +1697,7 @@ namespace llaminar
                 sum_sq += output->data()[i] * output->data()[i];
             }
             float l2_norm = std::sqrt(sum_sq / output->size());
-            LOG_ERROR("[MAGNITUDE_TRACE_SEQ] Rank0 FINAL LOGITS (sequential): L2_norm=" << l2_norm << " size=" << output->size()
+            LOG_DEBUG("[MAGNITUDE_TRACE_SEQ] Rank0 FINAL LOGITS (sequential): L2_norm=" << l2_norm << " size=" << output->size()
                                                                                         << " first_5=[" << output->data()[0] << "," << output->data()[1] << ","
                                                                                         << output->data()[2] << "," << output->data()[3] << "," << output->data()[4] << "]");
         }
@@ -1802,9 +1802,9 @@ namespace llaminar
 
             if (rank == 0 && l == 0 && (recreated_k || recreated_v))
             {
-                LOG_WARN("[CACHE_INIT_DEBUG] Layer 0: Recreated cache tensors! This will WIPE existing cache data!");
-                LOG_WARN("  k_cache recreated: " << (recreated_k ? "YES" : "no"));
-                LOG_WARN("  v_cache recreated: " << (recreated_v ? "YES" : "no"));
+                LOG_DEBUG("[CACHE_INIT_DEBUG] Layer 0: Recreated cache tensors! This will WIPE existing cache data!");
+                LOG_DEBUG("  k_cache recreated: " << (recreated_k ? "YES" : "no"));
+                LOG_DEBUG("  v_cache recreated: " << (recreated_v ? "YES" : "no"));
             }
         }
         kv_cache_state_.capacity_tokens = seq_len;
@@ -2207,14 +2207,14 @@ namespace llaminar
         std::shared_ptr<TensorBase> output;
         PrefillMetrics metrics;
 
-        std::cerr << "!!!!! [QwenPipeline] ABOUT TO CALL provider->execute, seq_len=" << tokens.size() << std::endl
-                  << std::flush;
+        // DEBUG: Uncomment for detailed provider execution tracing
+        // std::cerr << "!!!!! [QwenPipeline] ABOUT TO CALL provider->execute, seq_len=" << tokens.size() << std::endl << std::flush;
 
         bool success = provider->execute(tokens, weights_iface, output, ctx, metrics,
                                          use_kv_cache_ ? &cache_provider : nullptr);
 
-        std::cerr << "!!!!! [QwenPipeline] RETURNED FROM provider->execute, success=" << success << std::endl
-                  << std::flush;
+        // DEBUG: Uncomment for detailed provider execution tracing
+        // std::cerr << "!!!!! [QwenPipeline] RETURNED FROM provider->execute, success=" << success << std::endl << std::flush;
 
         if (!success)
         {

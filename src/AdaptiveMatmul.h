@@ -654,14 +654,14 @@ namespace llaminar
                 // DEBUG: Log cblas parameters for Q/K/V projections (BOTH ranks for comparison)
                 if (m == 4 && k == 896 && n == 448)
                 {
-                    LOG_ERROR("[!!!ADAPTIVE_CBLAS!!!] rank " << mpi_rank_ << " Q/K/V projection:");
-                    LOG_ERROR("  m=" << m << " n=" << n << " k=" << k);
-                    LOG_ERROR("  transpose_A=" << transpose_A << " transpose_B=" << transpose_B);
-                    LOG_ERROR("  trans_A=" << (trans_A == CblasTrans ? "Trans" : "NoTrans")
+                    LOG_DEBUG("[!!!ADAPTIVE_CBLAS!!!] rank " << mpi_rank_ << " Q/K/V projection:");
+                    LOG_DEBUG("  m=" << m << " n=" << n << " k=" << k);
+                    LOG_DEBUG("  transpose_A=" << transpose_A << " transpose_B=" << transpose_B);
+                    LOG_DEBUG("  trans_A=" << (trans_A == CblasTrans ? "Trans" : "NoTrans")
                                            << " trans_B=" << (trans_B == CblasTrans ? "Trans" : "NoTrans"));
-                    LOG_ERROR("  lda=" << lda << " ldb=" << ldb << " ldc=" << ldc);
-                    LOG_ERROR("  A[0:5]: [" << A[0] << ", " << A[1] << ", " << A[2] << ", " << A[3] << ", " << A[4] << "]");
-                    LOG_ERROR("  B[0:5]: [" << B[0] << ", " << B[1] << ", " << B[2] << ", " << B[3] << ", " << B[4] << "]");
+                    LOG_DEBUG("  lda=" << lda << " ldb=" << ldb << " ldc=" << ldc);
+                    LOG_DEBUG("  A[0:5]: [" << A[0] << ", " << A[1] << ", " << A[2] << ", " << A[3] << ", " << A[4] << "]");
+                    LOG_DEBUG("  B[0:5]: [" << B[0] << ", " << B[1] << ", " << B[2] << ", " << B[3] << ", " << B[4] << "]");
                 }
 
                 cblas_sgemm(CblasRowMajor, trans_A, trans_B,
@@ -673,7 +673,7 @@ namespace llaminar
                 // DEBUG: Log output
                 if (m == 4 && k == 896 && n == 448)
                 {
-                    LOG_ERROR("  C[0:10]: [" << C[0] << ", " << C[1] << ", " << C[2] << ", " << C[3] << ", "
+                    LOG_DEBUG("  C[0:10]: [" << C[0] << ", " << C[1] << ", " << C[2] << ", " << C[3] << ", "
                                              << C[4] << ", " << C[5] << ", " << C[6] << ", " << C[7] << ", " << C[8] << ", " << C[9] << "]");
                 }
                 auto t1 = std::chrono::high_resolution_clock::now();

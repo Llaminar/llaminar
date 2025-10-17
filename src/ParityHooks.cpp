@@ -20,10 +20,11 @@ namespace llaminar
 {
     namespace parity
     {
-        // Static member initialization
-        bool LlaminarSnapshotHook::enabled_ = false;
+        // Static member initialization - marked weak so tests can override
+        // Tests provide strong definition in ParityTestFramework.cpp
+        __attribute__((weak)) bool LlaminarSnapshotHook::enabled_ = false;
 
-        void LlaminarSnapshotHook::capture(
+        __attribute__((weak)) void LlaminarSnapshotHook::capture(
             PipelineStage stage,
             int layer_index,
             const float *data,
@@ -41,7 +42,7 @@ namespace llaminar
             (void)source;
         }
 
-        void LlaminarSnapshotHook::capture(
+        __attribute__((weak)) void LlaminarSnapshotHook::capture(
             const std::string &stage_name,
             int layer_index,
             const float *data,
@@ -58,12 +59,12 @@ namespace llaminar
             (void)source;
         }
 
-        void LlaminarSnapshotHook::set_enabled(bool enabled)
+        __attribute__((weak)) void LlaminarSnapshotHook::set_enabled(bool enabled)
         {
             enabled_ = enabled;
         }
 
-        bool LlaminarSnapshotHook::is_enabled()
+        __attribute__((weak)) bool LlaminarSnapshotHook::is_enabled()
         {
             // Check environment variable on first call
             static bool env_checked = false;

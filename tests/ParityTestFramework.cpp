@@ -328,10 +328,18 @@ namespace llaminar
             int feature_dim,
             const std::string &source)
         {
-            if (!enabled_ || !data || seq_len <= 0 || feature_dim <= 0)
+            if (!enabled_)
             {
+                LOG_DEBUG("[PARITY_HOOK_DEBUG] LlaminarSnapshotHook::capture() called but enabled_=false, skipping");
                 return;
             }
+            if (!data || seq_len <= 0 || feature_dim <= 0)
+            {
+                LOG_DEBUG("[PARITY_HOOK_DEBUG] LlaminarSnapshotHook::capture() invalid params: data=" << (void*)data << " seq_len=" << seq_len << " feature_dim=" << feature_dim);
+                return;
+            }
+
+            LOG_DEBUG("[PARITY_HOOK_DEBUG] Capturing snapshot: stage=" << stage_name << " layer=" << layer_index << " source=" << source);
 
             SnapshotMetadata meta;
             meta.stage_name = stage_name;
@@ -347,6 +355,7 @@ namespace llaminar
             auto &registry = SnapshotRegistry::instance();
             std::string key = registry.make_key(source, stage_name, layer_index);
             registry.register_snapshot(key, snapshot);
+            LOG_DEBUG("[PARITY_HOOK_DEBUG] Registered snapshot with key: " << key);
         }
 
         void LlaminarSnapshotHook::set_enabled(bool enabled)

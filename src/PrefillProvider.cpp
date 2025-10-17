@@ -39,7 +39,7 @@ namespace llaminar
                 data,
                 seq_len,
                 feature_dim,
-                name()); // Use provider name as source identifier
+                "llaminar"); // Use "llaminar" as source for parity tests
         }
 #endif
     }

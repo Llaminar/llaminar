@@ -1304,16 +1304,18 @@ add_executable(test_batch_correctness
     $<TARGET_OBJECTS:test_logging_bootstrap>)
 target_link_libraries(test_batch_correctness PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
 add_llaminar_mpi_test(BatchCorrectnessTest 2 test_batch_correctness)
-set_tests_properties(BatchCorrectnessTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;correctness")
+set_tests_properties(BatchCorrectnessTest PROPERTIES TIMEOUT 600 LABELS "integration;batch;correctness")  # 10 minutes - these tests load models multiple times
 
-# Batch vs Sequential parity test with pipeline snapshots - captures all intermediate stages
-add_executable(test_batch_sequential_parity
-    tests/test_batch_sequential_parity.cpp
-    tests/ParityTestFramework.cpp
-    $<TARGET_OBJECTS:test_logging_bootstrap>)
-target_link_libraries(test_batch_sequential_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-add_llaminar_mpi_test(BatchSequentialParityTest 2 test_batch_sequential_parity)
-set_tests_properties(BatchSequentialParityTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;parity;snapshots")
+# Batch vs Sequential parity test with pipeline snapshots - DISABLED (incomplete implementation)
+# TODO: This test was started but never finished - API doesn't match PipelineSnapshotManager
+# Use test_batch_correctness.cpp instead which has working batch parity tests
+# add_executable(test_batch_sequential_parity
+#     tests/test_batch_sequential_parity.cpp
+#     tests/ParityTestFramework.cpp
+#     $<TARGET_OBJECTS:test_logging_bootstrap>)
+# target_link_libraries(test_batch_sequential_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+# add_llaminar_mpi_test(BatchSequentialParityTest 2 test_batch_sequential_parity)
+# set_tests_properties(BatchSequentialParityTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;parity;snapshots")
 
 # Batch embedding debug test - isolates embedding comparison
 add_executable(test_batch_embedding_debug

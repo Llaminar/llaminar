@@ -573,7 +573,7 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
         seq_snapshot_count = seq_keys.size();
         batch_snapshot_count = batch_keys.size();
 
-        // Define stages to compare (layer 0 for initial debugging)
+        // Define stages to compare (layer 0 for comprehensive validation)
         struct StageInfo
         {
             std::string name;
@@ -581,14 +581,31 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
         };
 
         std::vector<StageInfo> stages = {
+            // Input embedding
             {"EMBEDDING", -1},
+            
+            // Attention block (layer 0)
             {"ATTENTION_NORM", 0},
             {"Q_PROJECTION", 0},
             {"K_PROJECTION", 0},
             {"V_PROJECTION", 0},
             {"ROPE_APPLICATION", 0},
             {"ATTENTION_CONTEXT", 0},
-            {"ATTENTION_OUTPUT", 0}};
+            {"ATTENTION_OUTPUT", 0},
+            {"ATTENTION_RESIDUAL", 0},
+            
+            // FFN block (layer 0)
+            {"FFN_NORM", 0},
+            {"FFN_GATE", 0},
+            {"FFN_UP", 0},
+            {"FFN_SWIGLU", 0},
+            {"FFN_DOWN", 0},
+            {"FFN_RESIDUAL", 0},
+            
+            // Output processing (after all layers)
+            {"FINAL_NORM", -1},
+            {"LM_HEAD", -1}
+        };
 
         ComparisonTolerance tolerance(1e-4f, 1e-4);
 
@@ -597,6 +614,14 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
 
         for (const auto &stage : stages)
         {
+            // Use slightly relaxed tolerance for final stages that accumulate errors
+            ComparisonTolerance stage_tolerance = tolerance;
+            if (stage.name == "FINAL_NORM" || stage.name == "LM_HEAD")
+            {
+                // Final stages accumulate numerical errors from all previous operations
+                stage_tolerance = ComparisonTolerance(3e-4f, 1e-3);
+            }
+            
             // Build keys using registry's make_key() for consistent formatting
             // Sequential uses "OpenBLAS" (from PrefillProvider.name())
             std::string seq_key = registry.make_key("OpenBLAS", stage.name, stage.layer);
@@ -619,18 +644,30 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
                 continue;
             }
 
-            // Debug: Check snapshot sizes
-            if (seq_snap.data.size() != batch_snap.data.size())
+            // Special handling for LM_HEAD: sequential captures all tokens, batch captures only last
+            TensorSnapshot seq_snap_for_compare = seq_snap;
+            if (stage.name == "LM_HEAD" && seq_snap.data.size() != batch_snap.data.size())
             {
-                std::cout << "⚠ SIZE MISMATCH for " << stage.name;
-                if (stage.layer >= 0)
-                    std::cout << " layer " << stage.layer;
-                std::cout << ": seq=" << seq_snap.data.size()
-                          << " batch=" << batch_snap.data.size() << "\n";
+                // Sequential has [seq_len, vocab], batch has [batch_size, vocab]
+                // Extract last token from sequential to match batch
+                size_t vocab_size = batch_snap.data.size(); // batch_size=1, so this is vocab_size
+                size_t seq_len = seq_snap.data.size() / vocab_size;
+                
+                if (seq_snap.data.size() % vocab_size == 0 && seq_len > 0)
+                {
+                    // Extract last token's logits
+                    seq_snap_for_compare.data.assign(
+                        seq_snap.data.begin() + (seq_len - 1) * vocab_size,
+                        seq_snap.data.end()
+                    );
+                    
+                    std::cout << "ℹ LM_HEAD: Extracted last token from sequential [" 
+                              << seq_len << ", " << vocab_size << "] -> [1, " << vocab_size << "]\n";
+                }
             }
 
             // Compare
-            auto result = SnapshotComparator::compare(seq_snap, batch_snap, tolerance);
+            auto result = SnapshotComparator::compare(seq_snap_for_compare, batch_snap, stage_tolerance);
 
             if (result.passed())
             {

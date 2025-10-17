@@ -20,6 +20,8 @@
 #include "PipelineStages.h"
 #include <cblas.h>
 #include <algorithm>
+#include <iomanip>
+#include <iostream>
 
 namespace llaminar
 {
@@ -374,34 +376,64 @@ namespace llaminar
                                                                << hidden->shape()[0] << "," << hidden->shape()[1] << "," << hidden->shape()[2] << "]");
         }
 
+        // Allocate reusable buffers once (amortized across all layers)
+        // This eliminates 168 allocations per forward pass (8 per layer × 24 layers)
+        const int B = hidden->shape()[0];
+        const int T = hidden->shape()[1];
+        const int D = hidden->shape()[2];
+        
+        if (!attn_norm_buffer_ || attn_norm_buffer_->shape()[0] != B || attn_norm_buffer_->shape()[1] != T)
+        {
+            if (getRank() == 0)
+            {
+                LOG_DEBUG("[BatchQwenPipeline] Allocating reusable buffers: B=" << B << " T=" << T 
+                         << " D=" << D << " d_ff=" << d_ff);
+            }
+            attn_norm_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
+            attn_out_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
+            post_attn_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
+            ffn_norm_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
+            gate_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
+            up_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
+            swiglu_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
+            ffn_out_buffer_ = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
+        }
+
+        // Performance profiling accumulators
+        double total_attn_norm_ms = 0.0, total_attention_ms = 0.0, total_attn_residual_ms = 0.0;
+        double total_ffn_norm_ms = 0.0, total_gate_ms = 0.0, total_up_ms = 0.0;
+        double total_swiglu_ms = 0.0, total_down_ms = 0.0, total_ffn_residual_ms = 0.0;
+
         for (int layer = 0; layer < n_layers; ++layer)
         {
             auto layer_input = hidden;
 
             // === Attention Block ===
-            // 1. RMSNorm before attention
-            auto attn_norm_out = std::make_shared<SimpleTensor>(hidden->shape());
+            // 1. RMSNorm before attention (reuse buffer)
             {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 std::vector<std::shared_ptr<TensorBase>> norm_inputs = {layer_input, weights.attn_norm(layer)};
-                std::vector<std::shared_ptr<TensorBase>> norm_outputs = {attn_norm_out};
+                std::vector<std::shared_ptr<TensorBase>> norm_outputs = {attn_norm_buffer_};
 
                 if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " attention RMSNorm failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_attn_norm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
                 // Capture snapshot
                 if (getRank() == 0)
                 {
                     LOG_INFO("[BatchQwenPipeline] SNAPSHOT: Capturing ATTENTION_NORM with source='" << getSnapshotSource() << "' for layer " << layer);
                 }
-                captureIfEnabled(PipelineStage::ATTENTION_NORM, layer, attn_norm_out);
+                captureIfEnabled(PipelineStage::ATTENTION_NORM, layer, attn_norm_buffer_);
             }
 
-            // 2. Multi-head attention
-            auto attn_out = std::make_shared<SimpleTensor>(hidden->shape());
+            // 2. Multi-head attention (reuse buffer)
             {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 // Set up snapshot callback for attention operator
                 auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
                 if (attn_op)
@@ -433,7 +465,7 @@ namespace llaminar
                 v_cache_in = std::make_shared<SimpleTensor>(std::vector<int>{0}); // Empty
 
                 std::vector<std::shared_ptr<TensorBase>> attn_inputs = {
-                    attn_norm_out,     // input
+                    attn_norm_buffer_, // input (reused buffer)
                     weights.wq(layer), // wq
                     weights.wk(layer), // wk
                     weights.wv(layer), // wv
@@ -445,52 +477,58 @@ namespace llaminar
                     v_cache_in         // v_cache
                 };
 
-                std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
+                std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out_buffer_};
 
                 if (!executeKernel("attention", attn_inputs, attn_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " attention failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_attention_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
                 // Capture snapshot
-                captureIfEnabled(PipelineStage::ATTENTION_OUTPUT, layer, attn_out);
+                captureIfEnabled(PipelineStage::ATTENTION_OUTPUT, layer, attn_out_buffer_);
 
                 // TODO: Update KV cache with outputs from attention
                 // For now, cache population deferred to Phase 4 (decode path)
             }
 
-            // 3. Residual connection
-            auto post_attn = std::make_shared<SimpleTensor>(hidden->shape());
+            // 3. Residual connection (reuse buffer)
             {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 const float *input_data = layer_input->data();
-                const float *attn_data = attn_out->data();
-                float *output_data = post_attn->data();
+                const float *attn_data = attn_out_buffer_->data();
+                float *output_data = post_attn_buffer_->data();
                 size_t total_elements = hidden->size();
 
                 for (size_t i = 0; i < total_elements; ++i)
                 {
                     output_data[i] = input_data[i] + attn_data[i];
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_attn_residual_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
                 // Capture snapshot
-                captureIfEnabled(PipelineStage::ATTENTION_RESIDUAL, layer, post_attn);
+                captureIfEnabled(PipelineStage::ATTENTION_RESIDUAL, layer, post_attn_buffer_);
             }
 
             // === FFN Block ===
-            // 4. RMSNorm before FFN
-            auto ffn_norm_out = std::make_shared<SimpleTensor>(hidden->shape());
+            // 4. RMSNorm before FFN (reuse buffer)
             {
-                std::vector<std::shared_ptr<TensorBase>> norm_inputs = {post_attn, weights.ffn_norm(layer)};
-                std::vector<std::shared_ptr<TensorBase>> norm_outputs = {ffn_norm_out};
+                auto t0 = std::chrono::high_resolution_clock::now();
+                std::vector<std::shared_ptr<TensorBase>> norm_inputs = {post_attn_buffer_, weights.ffn_norm(layer)};
+                std::vector<std::shared_ptr<TensorBase>> norm_outputs = {ffn_norm_buffer_};
 
                 if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " FFN RMSNorm failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_ffn_norm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
-            captureIfEnabled(PipelineStage::FFN_NORM, layer, ffn_norm_out);
+            captureIfEnabled(PipelineStage::FFN_NORM, layer, ffn_norm_buffer_);
 
             // 5. FFN projections (gate, up, down with SwiGLU)
             // Batch operators handle 3D [B, T, D] tensors natively - no flatten needed
@@ -498,77 +536,87 @@ namespace llaminar
             int T = hidden->shape()[1];
             int D = d_model;
 
-            // Gate projection [B, T, D] -> [B, T, d_ff]
-            auto gate = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
+            // Gate projection [B, T, D] -> [B, T, d_ff] (reuse buffer)
             {
-                std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_out, weights.w_gate(layer)};
-                std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate};
+                auto t0 = std::chrono::high_resolution_clock::now();
+                std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_buffer_, weights.w_gate(layer)};
+                std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate_buffer_};
 
                 if (!executeKernel("linear", gate_inputs, gate_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " gate projection failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_gate_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
-            captureIfEnabled(PipelineStage::FFN_GATE, layer, gate);
+            captureIfEnabled(PipelineStage::FFN_GATE, layer, gate_buffer_);
 
-            // Up projection [B, T, D] -> [B, T, d_ff]
-            auto up = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
+            // Up projection [B, T, D] -> [B, T, d_ff] (reuse buffer)
             {
-                std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_out, weights.w_up(layer)};
-                std::vector<std::shared_ptr<TensorBase>> up_outputs = {up};
+                auto t0 = std::chrono::high_resolution_clock::now();
+                std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_buffer_, weights.w_up(layer)};
+                std::vector<std::shared_ptr<TensorBase>> up_outputs = {up_buffer_};
 
                 if (!executeKernel("linear", up_inputs, up_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " up projection failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_up_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
-            captureIfEnabled(PipelineStage::FFN_UP, layer, up);
+            captureIfEnabled(PipelineStage::FFN_UP, layer, up_buffer_);
 
-            // SwiGLU activation [B, T, d_ff]: gate * silu(up)
-            auto swiglu = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
+            // SwiGLU activation [B, T, d_ff]: gate * silu(up) (reuse buffer)
+
             {
-                std::vector<std::shared_ptr<TensorBase>> swiglu_inputs = {gate, up};
-                std::vector<std::shared_ptr<TensorBase>> swiglu_outputs = {swiglu};
+                auto t0 = std::chrono::high_resolution_clock::now();
+                std::vector<std::shared_ptr<TensorBase>> swiglu_inputs = {gate_buffer_, up_buffer_};
+                std::vector<std::shared_ptr<TensorBase>> swiglu_outputs = {swiglu_buffer_};
 
                 if (!executeKernel("swiglu", swiglu_inputs, swiglu_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " SwiGLU failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_swiglu_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
-            captureIfEnabled(PipelineStage::FFN_SWIGLU, layer, swiglu);
+            captureIfEnabled(PipelineStage::FFN_SWIGLU, layer, swiglu_buffer_);
 
-            // Down projection [B, T, d_ff] -> [B, T, D]
-            auto ffn_out = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
+            // Down projection [B, T, d_ff] -> [B, T, D] (reuse buffer)
             {
-                std::vector<std::shared_ptr<TensorBase>> down_inputs = {swiglu, weights.w_down(layer)};
-                std::vector<std::shared_ptr<TensorBase>> down_outputs = {ffn_out};
+                auto t0 = std::chrono::high_resolution_clock::now();
+                std::vector<std::shared_ptr<TensorBase>> down_inputs = {swiglu_buffer_, weights.w_down(layer)};
+                std::vector<std::shared_ptr<TensorBase>> down_outputs = {ffn_out_buffer_};
 
                 if (!executeKernel("linear", down_inputs, down_outputs))
                 {
                     LOG_ERROR("Layer " << layer << " down projection failed");
                     return false;
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_down_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
                 if (layer == 0 && getRank() == 0)
                 {
                     float sum_sq = 0.0f;
-                    for (size_t i = 0; i < ffn_out->size(); ++i)
+                    for (size_t i = 0; i < ffn_out_buffer_->size(); ++i)
                     {
-                        sum_sq += ffn_out->data()[i] * ffn_out->data()[i];
+                        sum_sq += ffn_out_buffer_->data()[i] * ffn_out_buffer_->data()[i];
                     }
-                    float l2_norm = std::sqrt(sum_sq / ffn_out->size());
-                    LOG_ERROR("[MAGNITUDE_TRACE] Rank0 Layer0 FFN Down Output: L2_norm=" << l2_norm << " size=" << ffn_out->size());
+                    float l2_norm = std::sqrt(sum_sq / ffn_out_buffer_->size());
+                    LOG_DEBUG("[MAGNITUDE_TRACE] Rank0 Layer0 FFN Down Output: L2_norm=" << l2_norm << " size=" << ffn_out_buffer_->size());
                 }
             }
-            captureIfEnabled(PipelineStage::FFN_DOWN, layer, ffn_out);
+            captureIfEnabled(PipelineStage::FFN_DOWN, layer, ffn_out_buffer_);
 
             // 6. Final residual connection
             {
-                const float *post_attn_data = post_attn->data();
-                const float *ffn_data = ffn_out->data();
+                auto t0 = std::chrono::high_resolution_clock::now();
+                const float *post_attn_data = post_attn_buffer_->data();
+                const float *ffn_data = ffn_out_buffer_->data();
                 float *output_data = hidden->data();
                 size_t total_elements = hidden->size();
 
@@ -580,7 +628,7 @@ namespace llaminar
                         attn_sum_sq += post_attn_data[i] * post_attn_data[i];
                         ffn_sum_sq += ffn_data[i] * ffn_data[i];
                     }
-                    LOG_ERROR("[MAGNITUDE_TRACE] Rank0 Layer0 Before Final Residual: attn_L2="
+                    LOG_DEBUG("[MAGNITUDE_TRACE] Rank0 Layer0 Before Final Residual: attn_L2="
                               << std::sqrt(attn_sum_sq / total_elements)
                               << " ffn_L2=" << std::sqrt(ffn_sum_sq / total_elements));
                 }
@@ -589,6 +637,8 @@ namespace llaminar
                 {
                     output_data[i] = post_attn_data[i] + ffn_data[i];
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                total_ffn_residual_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
             captureIfEnabled(PipelineStage::FFN_RESIDUAL, layer, hidden);
 
@@ -601,6 +651,31 @@ namespace llaminar
         if (getRank() == 0)
         {
             LOG_DEBUG("[BatchQwenPipeline] runBatchedLayers: all " << n_layers << " layers complete");
+            
+            // Print performance breakdown
+            double total_ms = total_attn_norm_ms + total_attention_ms + total_attn_residual_ms +
+                            total_ffn_norm_ms + total_gate_ms + total_up_ms + 
+                            total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
+            
+            std::cout << "\n[PERF_BREAKDOWN] Batch=" << B << " SeqLen=" << T << " Total=" << total_ms << "ms\n";
+            std::cout << "  Attn Norm:      " << std::setw(8) << std::fixed << std::setprecision(2) << total_attn_norm_ms << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * total_attn_norm_ms / total_ms) << "%)\n";
+            std::cout << "  Attention:      " << std::setw(8) << total_attention_ms << " ms (" << std::setw(5) << (100.0 * total_attention_ms / total_ms) << "%)\n";
+            std::cout << "  Attn Residual:  " << std::setw(8) << total_attn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_attn_residual_ms / total_ms) << "%)\n";
+            std::cout << "  FFN Norm:       " << std::setw(8) << total_ffn_norm_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_norm_ms / total_ms) << "%)\n";
+            std::cout << "  FFN Gate:       " << std::setw(8) << total_gate_ms << " ms (" << std::setw(5) << (100.0 * total_gate_ms / total_ms) << "%)\n";
+            std::cout << "  FFN Up:         " << std::setw(8) << total_up_ms << " ms (" << std::setw(5) << (100.0 * total_up_ms / total_ms) << "%)\n";
+            std::cout << "  FFN SwiGLU:     " << std::setw(8) << total_swiglu_ms << " ms (" << std::setw(5) << (100.0 * total_swiglu_ms / total_ms) << "%)\n";
+            std::cout << "  FFN Down:       " << std::setw(8) << total_down_ms << " ms (" << std::setw(5) << (100.0 * total_down_ms / total_ms) << "%)\n";
+            std::cout << "  FFN Residual:   " << std::setw(8) << total_ffn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_residual_ms / total_ms) << "%)\n";
+            std::cout << std::flush;
+            
+            // Print detailed attention breakdown
+            auto* attn_op = dynamic_cast<MPIAttentionBatchOperator*>(getKernel("attention"));
+            if (attn_op)
+            {
+                attn_op->printPerformanceBreakdown();
+                attn_op->resetPerformanceCounters();
+            }
         }
 
         return true;
@@ -623,14 +698,28 @@ namespace llaminar
         int D = h_shape[2];
         int vocab = config_.getLayerConfig().vocab_size;
 
-        // Capture FINAL_NORM snapshot (hidden state before LM head extraction)
-        // Note: BatchQwenPipeline doesn't have explicit final norm operator,
-        // but this captures the transformer output which matches sequential's FINAL_NORM output
-        captureIfEnabled(PipelineStage::FINAL_NORM, -1, hidden);
+        // === Apply Final RMSNorm ===
+        // This was missing! Sequential pipeline applies output_norm before LM head
+        auto normed_hidden = std::make_shared<SimpleTensor>(h_shape);
+        
+        std::vector<std::shared_ptr<TensorBase>> norm_inputs = {
+            hidden,
+            weights.output_norm()
+        };
+        std::vector<std::shared_ptr<TensorBase>> norm_outputs = {normed_hidden};
+        
+        if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
+        {
+            LOG_ERROR("projectOutput: Final RMSNorm failed");
+            return false;
+        }
+        
+        // Capture FINAL_NORM snapshot (after final normalization, before LM head)
+        captureIfEnabled(PipelineStage::FINAL_NORM, -1, normed_hidden);
 
-        // Gather last tokens: [B, D]
+        // Gather last tokens: [B, D] from normalized hidden states
         auto last_hidden = std::make_shared<SimpleTensor>(std::vector<int>{B, D});
-        const float *h_data = hidden->data();
+        const float *h_data = normed_hidden->data();
         float *lh_data = last_hidden->data();
 
         for (int b = 0; b < B; ++b)
@@ -687,7 +776,7 @@ namespace llaminar
                 sum_sq += logits_out->data()[i] * logits_out->data()[i];
             }
             float l2_norm = std::sqrt(sum_sq / logits_out->size());
-            LOG_ERROR("[MAGNITUDE_TRACE] Rank0 FINAL LOGITS (batch): L2_norm=" << l2_norm << " size=" << logits_out->size()
+            LOG_DEBUG("[MAGNITUDE_TRACE] Rank0 FINAL LOGITS (batch): L2_norm=" << l2_norm << " size=" << logits_out->size()
                                                                                << " first_5=[" << logits_out->data()[0] << "," << logits_out->data()[1] << ","
                                                                                << logits_out->data()[2] << "," << logits_out->data()[3] << "," << logits_out->data()[4] << "]");
 

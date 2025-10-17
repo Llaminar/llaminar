@@ -159,6 +159,16 @@ namespace llaminar
 
         // Last computed logits (batched view). Shape: [B, vocab]
         std::shared_ptr<TensorBase> last_logits_{};
+
+        // Reusable buffers for batched operations (allocated once, reused across layers)
+        std::shared_ptr<TensorBase> attn_norm_buffer_;   // [B, T, D]
+        std::shared_ptr<TensorBase> attn_out_buffer_;    // [B, T, D]
+        std::shared_ptr<TensorBase> post_attn_buffer_;   // [B, T, D]
+        std::shared_ptr<TensorBase> ffn_norm_buffer_;    // [B, T, D]
+        std::shared_ptr<TensorBase> gate_buffer_;        // [B, T, d_ff]
+        std::shared_ptr<TensorBase> up_buffer_;          // [B, T, d_ff]
+        std::shared_ptr<TensorBase> swiglu_buffer_;      // [B, T, d_ff]
+        std::shared_ptr<TensorBase> ffn_out_buffer_;     // [B, T, D]
     };
 
 } // namespace llaminar

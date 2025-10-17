@@ -103,6 +103,16 @@ namespace llaminar
             current_layer_idx_ = layer_idx;
         }
 
+        /**
+         * @brief Print performance breakdown (called by batch pipeline)
+         */
+        void printPerformanceBreakdown() const;
+
+        /**
+         * @brief Reset performance counters
+         */
+        void resetPerformanceCounters();
+
     private:
         /**
          * @brief Apply RoPE to Q and K tensors
@@ -178,6 +188,17 @@ namespace llaminar
         // Snapshot capture callback (for parity testing)
         std::function<void(PipelineStage, int, const std::shared_ptr<TensorBase> &)> snapshot_callback_;
         int current_layer_idx_ = -1; // Current layer index for snapshot capture
+
+        // Performance profiling accumulators (public for batch pipeline access)
+        double total_qkv_proj_ms_ = 0.0;
+        double total_rope_ms_ = 0.0;
+        double total_gqa_expand_ms_ = 0.0;
+        double total_scores_ms_ = 0.0;
+        double total_softmax_ms_ = 0.0;
+        double total_context_ms_ = 0.0;
+        double total_output_prep_ms_ = 0.0;
+        double total_output_proj_ms_ = 0.0;
+        double total_mpi_reduce_ms_ = 0.0;
     };
 
 } // namespace llaminar
