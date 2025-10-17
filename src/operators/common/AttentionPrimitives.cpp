@@ -1,3 +1,4 @@
+#include "utils/DebugEnv.h"
 /**
  * @file AttentionPrimitives.cpp
  * @brief Refactored attention primitives with clean scalar + OpenMP implementation
@@ -24,10 +25,18 @@
 #include <omp.h>
 #endif
 
+// SIMD intrinsics
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include "utils/DebugEnv.h"
 #include "operators/common/AttentionPrimitives.h"
 #include "operators/common/SoftmaxCore.h"
 #include "Logger.h"
+#include "AdaptiveMatmul.h"
 
 namespace llaminar::attn
 {
@@ -225,13 +234,13 @@ namespace llaminar::attn
 
         if (call_count < 3)
         {
-            LOG_INFO("[RoPE] call=" << call_count
-                                    << " seq_len=" << seq_len
-                                    << " head_dim=" << head_dim
-                                    << " q_heads=" << q_heads
-                                    << " k_heads=" << k_heads
-                                    << " n_past=" << n_past
-                                    << " freq_base=" << freq_base);
+            LOG_DEBUG("[RoPE] call=" << call_count
+                                     << " seq_len=" << seq_len
+                                     << " head_dim=" << head_dim
+                                     << " q_heads=" << q_heads
+                                     << " k_heads=" << k_heads
+                                     << " n_past=" << n_past
+                                     << " freq_base=" << freq_base);
             call_count++;
         }
 
@@ -336,6 +345,296 @@ namespace llaminar::attn
         return scores + (size_t)h * seq_len * seq_len + (size_t)i * seq_len;
     }
 
+#if defined(__AVX512F__)
+    // AVX512 horizontal max reduction
+    static inline float hmax512(__m512 v)
+    {
+        __m256 lo = _mm512_castps512_ps256(v);
+        __m256 hi = _mm512_extractf32x8_ps(v, 1);
+        __m256 m = _mm256_max_ps(lo, hi);
+        __m128 lo128 = _mm256_castps256_ps128(m);
+        __m128 hi128 = _mm256_extractf128_ps(m, 1);
+        __m128 m128 = _mm_max_ps(lo128, hi128);
+        __m128 shuf = _mm_movehdup_ps(m128);
+        m128 = _mm_max_ps(m128, shuf);
+        shuf = _mm_movehl_ps(shuf, m128);
+        m128 = _mm_max_ps(m128, shuf);
+        return _mm_cvtss_f32(m128);
+    }
+
+    // AVX512 horizontal sum reduction
+    static inline float hsum512(__m512 v)
+    {
+        __m256 lo = _mm512_castps512_ps256(v);
+        __m256 hi = _mm512_extractf32x8_ps(v, 1);
+        __m256 sum = _mm256_add_ps(lo, hi);
+        __m128 lo128 = _mm256_castps256_ps128(sum);
+        __m128 hi128 = _mm256_extractf128_ps(sum, 1);
+        __m128 sum128 = _mm_add_ps(lo128, hi128);
+        __m128 shuf = _mm_movehdup_ps(sum128);
+        sum128 = _mm_add_ps(sum128, shuf);
+        shuf = _mm_movehl_ps(shuf, sum128);
+        sum128 = _mm_add_ps(sum128, shuf);
+        return _mm_cvtss_f32(sum128);
+    }
+
+    // Fast exp approximation for AVX512
+    static inline __m512 fast_exp512(__m512 x)
+    {
+        const __m512 max_clip = _mm512_set1_ps(10.0f);
+        const __m512 min_clip = _mm512_set1_ps(-20.0f);
+        x = _mm512_max_ps(min_clip, _mm512_min_ps(max_clip, x));
+        const __m512 inv_ln2 = _mm512_set1_ps(1.4426950408889634f);
+        __m512 xf = _mm512_mul_ps(x, inv_ln2);
+        __m512 fx = _mm512_floor_ps(xf);
+        __m512 fpart = _mm512_sub_ps(xf, fx);
+        const __m512 c1 = _mm512_set1_ps(0.99999994f);
+        const __m512 c2 = _mm512_set1_ps(0.69314718f);
+        const __m512 c3 = _mm512_set1_ps(0.24022651f);
+        const __m512 c4 = _mm512_set1_ps(0.05550411f);
+        const __m512 c5 = _mm512_set1_ps(0.00961813f);
+        __m512 p = c5;
+        p = _mm512_fmadd_ps(p, fpart, c4);
+        p = _mm512_fmadd_ps(p, fpart, c3);
+        p = _mm512_fmadd_ps(p, fpart, c2);
+        p = _mm512_fmadd_ps(p, fpart, c1);
+        __m512i ipart = _mm512_cvttps_epi32(fx);
+        ipart = _mm512_add_epi32(ipart, _mm512_set1_epi32(127));
+        ipart = _mm512_slli_epi32(ipart, 23);
+        __m512 two_ip = _mm512_castsi512_ps(ipart);
+        return _mm512_mul_ps(two_ip, p);
+    }
+#endif
+
+#if defined(__AVX2__)
+    // AVX2 horizontal max reduction
+    static inline float hmax256(__m256 v)
+    {
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 m = _mm_max_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(m);
+        m = _mm_max_ps(m, shuf);
+        shuf = _mm_movehl_ps(shuf, m);
+        m = _mm_max_ps(m, shuf);
+        return _mm_cvtss_f32(m);
+    }
+
+    // AVX2 horizontal sum reduction
+    static inline float hsum256(__m256 v)
+    {
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 sum = _mm_add_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(sum);
+        sum = _mm_add_ps(sum, shuf);
+        shuf = _mm_movehl_ps(shuf, sum);
+        sum = _mm_add_ps(sum, shuf);
+        return _mm_cvtss_f32(sum);
+    }
+
+    // Fast exp approximation for AVX2
+    static inline __m256 fast_exp256(__m256 x)
+    {
+        const __m256 max_clip = _mm256_set1_ps(10.0f);
+        const __m256 min_clip = _mm256_set1_ps(-20.0f);
+        x = _mm256_max_ps(min_clip, _mm256_min_ps(max_clip, x));
+        const __m256 inv_ln2 = _mm256_set1_ps(1.4426950408889634f);
+        __m256 xf = _mm256_mul_ps(x, inv_ln2);
+        __m256 fx = _mm256_floor_ps(xf);
+        __m256 fpart = _mm256_sub_ps(xf, fx);
+        const __m256 c1 = _mm256_set1_ps(0.99999994f);
+        const __m256 c2 = _mm256_set1_ps(0.69314718f);
+        const __m256 c3 = _mm256_set1_ps(0.24022651f);
+        const __m256 c4 = _mm256_set1_ps(0.05550411f);
+        const __m256 c5 = _mm256_set1_ps(0.00961813f);
+        __m256 p = c5;
+        p = _mm256_fmadd_ps(p, fpart, c4);
+        p = _mm256_fmadd_ps(p, fpart, c3);
+        p = _mm256_fmadd_ps(p, fpart, c2);
+        p = _mm256_fmadd_ps(p, fpart, c1);
+        __m256i ipart = _mm256_cvttps_epi32(fx);
+        ipart = _mm256_add_epi32(ipart, _mm256_set1_epi32(127));
+        ipart = _mm256_slli_epi32(ipart, 23);
+        __m256 two_ip = _mm256_castsi256_ps(ipart);
+        return _mm256_mul_ps(two_ip, p);
+    }
+#endif
+
+    /**
+     * @brief Vectorized fused softmax with causal masking (AVX512/AVX2)
+     *
+     * SIMD-optimized single-pass softmax that combines:
+     * - Causal masking (no materialized -inf)
+     * - Horizontal max finding (AVX reductions)
+     * - Fast exp approximation (polynomial)
+     * - Vectorized normalization
+     *
+     * @param scores Score matrix [heads, q_seq_len, k_seq_len]
+     * @param heads Number of attention heads
+     * @param q_seq_len Query sequence length
+     * @param k_seq_len Key/Value sequence length
+     * @param causal Whether to apply causal masking
+     */
+    static void fused_softmax_with_causal_mask(float *scores, int heads, int q_seq_len, int k_seq_len, bool causal)
+    {
+        const auto &env = llaminar::debugEnv().attention;
+
+#pragma omp parallel for collapse(2) if (!env.prim_force_scalar && heads * q_seq_len > 8)
+        for (int h = 0; h < heads; ++h)
+        {
+            for (int i = 0; i < q_seq_len; ++i)
+            {
+                float *row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
+
+                // Calculate absolute query position for causal masking
+                int abs_q_pos = (k_seq_len - q_seq_len) + i;
+
+                // Determine effective row length (respect causal mask)
+                int effective_len = causal ? (abs_q_pos + 1) : k_seq_len;
+
+                // Pass 1: Find max (vectorized)
+                float row_max = -std::numeric_limits<float>::infinity();
+                int j = 0;
+
+#if defined(__AVX512F__)
+                // AVX512: Process 16 floats at a time
+                if (effective_len >= 16)
+                {
+                    __m512 vmax = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+                    for (; j + 16 <= effective_len; j += 16)
+                    {
+                        __m512 v = _mm512_loadu_ps(row + j);
+                        vmax = _mm512_max_ps(vmax, v);
+                    }
+                    row_max = hmax512(vmax);
+                }
+#elif defined(__AVX2__)
+                // AVX2: Process 8 floats at a time
+                if (effective_len >= 8)
+                {
+                    __m256 vmax = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+                    for (; j + 8 <= effective_len; j += 8)
+                    {
+                        __m256 v = _mm256_loadu_ps(row + j);
+                        vmax = _mm256_max_ps(vmax, v);
+                    }
+                    row_max = hmax256(vmax);
+                }
+#endif
+                // Scalar tail for remaining elements
+                for (; j < effective_len; ++j)
+                {
+                    row_max = std::max(row_max, row[j]);
+                }
+
+                // Pass 2: Compute exp and sum (vectorized)
+                double row_sum = 0.0;
+                j = 0;
+
+#if defined(__AVX512F__)
+                // AVX512: Process 16 floats at a time
+                if (effective_len >= 16)
+                {
+                    const __m512 vmax = _mm512_set1_ps(row_max);
+                    __m512 vsum = _mm512_setzero_ps();
+
+                    for (; j + 16 <= effective_len; j += 16)
+                    {
+                        __m512 v = _mm512_loadu_ps(row + j);
+                        v = _mm512_sub_ps(v, vmax);
+                        __m512 vexp = fast_exp512(v);
+                        _mm512_storeu_ps(row + j, vexp);
+                        vsum = _mm512_add_ps(vsum, vexp);
+                    }
+                    row_sum = hsum512(vsum);
+                }
+#elif defined(__AVX2__)
+                // AVX2: Process 8 floats at a time
+                if (effective_len >= 8)
+                {
+                    const __m256 vmax = _mm256_set1_ps(row_max);
+                    __m256 vsum = _mm256_setzero_ps();
+
+                    for (; j + 8 <= effective_len; j += 8)
+                    {
+                        __m256 v = _mm256_loadu_ps(row + j);
+                        v = _mm256_sub_ps(v, vmax);
+                        __m256 vexp = fast_exp256(v);
+                        _mm256_storeu_ps(row + j, vexp);
+                        vsum = _mm256_add_ps(vsum, vexp);
+                    }
+                    row_sum = hsum256(vsum);
+                }
+#endif
+                // Scalar tail
+                for (; j < effective_len; ++j)
+                {
+                    row[j] = std::exp(row[j] - row_max);
+                    row_sum += row[j];
+                }
+
+                // Pass 3: Normalize (vectorized)
+                const float inv_sum = (row_sum > 0.0) ? (1.0f / static_cast<float>(row_sum)) : 0.0f;
+                j = 0;
+
+#if defined(__AVX512F__)
+                // AVX512: Normalize 16 floats at a time
+                if (effective_len >= 16)
+                {
+                    const __m512 vinv = _mm512_set1_ps(inv_sum);
+                    for (; j + 16 <= effective_len; j += 16)
+                    {
+                        __m512 v = _mm512_loadu_ps(row + j);
+                        v = _mm512_mul_ps(v, vinv);
+                        _mm512_storeu_ps(row + j, v);
+                    }
+                }
+#elif defined(__AVX2__)
+                // AVX2: Normalize 8 floats at a time
+                if (effective_len >= 8)
+                {
+                    const __m256 vinv = _mm256_set1_ps(inv_sum);
+                    for (; j + 8 <= effective_len; j += 8)
+                    {
+                        __m256 v = _mm256_loadu_ps(row + j);
+                        v = _mm256_mul_ps(v, vinv);
+                        _mm256_storeu_ps(row + j, v);
+                    }
+                }
+#endif
+                // Scalar tail
+                for (; j < effective_len; ++j)
+                {
+                    row[j] *= inv_sum;
+                }
+
+                // Pass 4: Zero out causal-masked positions (vectorized)
+                j = effective_len;
+#if defined(__AVX512F__)
+                // AVX512: Zero 16 floats at a time
+                const __m512 vzero512 = _mm512_setzero_ps();
+                for (; j + 16 <= k_seq_len; j += 16)
+                {
+                    _mm512_storeu_ps(row + j, vzero512);
+                }
+#elif defined(__AVX2__)
+                // AVX2: Zero 8 floats at a time
+                const __m256 vzero256 = _mm256_setzero_ps();
+                for (; j + 8 <= k_seq_len; j += 8)
+                {
+                    _mm256_storeu_ps(row + j, vzero256);
+                }
+#endif
+                // Scalar tail
+                for (; j < k_seq_len; ++j)
+                {
+                    row[j] = 0.0f;
+                }
+            }
+        }
+    }
+
     // ============================================================================
     // PUBLIC API - QK Scores
     // ============================================================================
@@ -345,6 +644,8 @@ namespace llaminar::attn
      *
      * Computes attention scores = (Q @ K^T) * scale, where scale = 1/sqrt(head_dim)
      * Optionally applies causal masking and softmax.
+     *
+     * Uses adaptiveMatMul for optimized computation (OpenBLAS/COSMA backend).
      *
      * @param q Query tensor [seq_len, heads, head_dim]
      * @param k Key tensor [seq_len, heads, head_dim]
@@ -366,80 +667,168 @@ namespace llaminar::attn
         static bool first_call = true;
         if (first_call && causal)
         {
-            LOG_INFO("[compute_qk_scores DEBUG] First causal call:");
-            LOG_INFO("  q_seq_len=" << q_seq_len << ", k_seq_len=" << k_seq_len
-                                    << ", head_dim=" << head_dim << ", heads=" << heads);
+            LOG_DEBUG("[compute_qk_scores DEBUG] First causal call:");
+            LOG_DEBUG("  q_seq_len=" << q_seq_len << ", k_seq_len=" << k_seq_len
+                                     << ", head_dim=" << head_dim << ", heads=" << heads);
             first_call = false;
         }
 
-// Parallelize over (head, query_position) pairs
-#pragma omp parallel for collapse(2) if (!env.prim_force_scalar)
+        // Process each head independently using optimized matmul
+        // For each head h: scores[h] = (Q[h] @ K[h]^T) * scale
+        //   Q[h]: [q_seq_len, head_dim]
+        //   K[h]: [k_seq_len, head_dim]
+        //   scores[h]: [q_seq_len, k_seq_len]
+
+        // Always use GEMM path for optimal performance
+        // Strategy: Reshape Q/K from [seq_len, heads, head_dim] to [heads, seq_len, head_dim]
+        // Then compute all heads with better cache locality
+
+        // Allocate contiguous buffers for all heads: [heads, seq_len, head_dim]
+        std::vector<float> q_reordered(heads * q_seq_len * head_dim);
+        std::vector<float> k_reordered(heads * k_seq_len * head_dim);
+
+// Reorder Q: [seq_len, heads, head_dim] -> [heads, seq_len, head_dim]
+#pragma omp parallel for collapse(2) if (heads * q_seq_len > 256)
         for (int h = 0; h < heads; ++h)
         {
             for (int i = 0; i < q_seq_len; ++i)
             {
-                float *score_row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
-                const float *qi = q + (size_t)i * heads * head_dim + (size_t)h * head_dim;
+                const float *q_src = q + (size_t)i * heads * head_dim + (size_t)h * head_dim;
+                float *q_dst = q_reordered.data() + (size_t)h * q_seq_len * head_dim + (size_t)i * head_dim;
+                std::memcpy(q_dst, q_src, head_dim * sizeof(float));
+            }
+        }
 
-                // Calculate absolute query position for causal masking
-                // For prefill: k_seq_len == q_seq_len, so abs_q_pos = i (identity)
-                // For decode: k_seq_len = n_past + q_seq_len, query starts at n_past
-                int abs_q_pos = (k_seq_len - q_seq_len) + i;
+// Reorder K: [seq_len, heads, head_dim] -> [heads, seq_len, head_dim]
+#pragma omp parallel for collapse(2) if (heads * k_seq_len > 256)
+        for (int h = 0; h < heads; ++h)
+        {
+            for (int j = 0; j < k_seq_len; ++j)
+            {
+                const float *k_src = k + (size_t)j * heads * head_dim + (size_t)h * head_dim;
+                float *k_dst = k_reordered.data() + (size_t)h * k_seq_len * head_dim + (size_t)j * head_dim;
+                std::memcpy(k_dst, k_src, head_dim * sizeof(float));
+            }
+        }
 
-                // Compute dot product with each key position
-                for (int j = 0; j < k_seq_len; ++j)
+        // Compute Q @ K^T for all heads using batched approach
+        // Process heads in parallel to maximize throughput
+        bool is_prefill = (q_seq_len == k_seq_len);
+        bool all_success = true;
+
+#pragma omp parallel for if (heads > 2)
+        for (int h = 0; h < heads; ++h)
+        {
+            const float *q_head = q_reordered.data() + (size_t)h * q_seq_len * head_dim;
+            const float *k_head = k_reordered.data() + (size_t)h * k_seq_len * head_dim;
+            float *score_head = scores + (size_t)h * q_seq_len * k_seq_len;
+
+            // Compute Q_h @ K_h^T * scale for this head
+            bool matmul_success = llaminar::adaptiveMatMul(
+                q_head,     // A: [q_seq_len, head_dim]
+                k_head,     // B: [k_seq_len, head_dim]
+                score_head, // C: [q_seq_len, k_seq_len]
+                q_seq_len,  // m
+                k_seq_len,  // n
+                head_dim,   // k
+                is_prefill, // is_prefill hint
+                false,      // distributed_partition (attention scores are local)
+                false,      // transpose_A
+                true,       // transpose_B (K^T)
+                scale,      // alpha (apply scale directly)
+                0.0f        // beta (overwrite output)
+            );
+
+            if (!matmul_success)
+            {
+#pragma omp critical
                 {
-                    // Apply causal mask: can't attend to future tokens
-                    // Compare key position j with absolute query position
-                    if (causal && j > abs_q_pos)
+                    LOG_ERROR("[compute_qk_scores] adaptiveMatMul failed for head " << h);
+                    all_success = false;
+                }
+            }
+        }
+
+        if (!all_success)
+        {
+            return;
+        }
+
+        // Apply causal masking if needed (post-process all heads)
+        if (causal)
+        {
+#pragma omp parallel for collapse(2) if (heads * q_seq_len > 256)
+            for (int h = 0; h < heads; ++h)
+            {
+                for (int i = 0; i < q_seq_len; ++i)
+                {
+                    // Calculate absolute query position for causal masking
+                    // For prefill: k_seq_len == q_seq_len, so abs_q_pos = i
+                    // For decode: k_seq_len = n_past + q_seq_len, query starts at n_past
+                    int abs_q_pos = (k_seq_len - q_seq_len) + i;
+
+                    float *score_row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
+                    for (int j = 0; j < k_seq_len; ++j)
                     {
-                        // DEBUG: Log first few masks
-                        if (h == 0 && i == 0 && j <= 7)
+                        if (j > abs_q_pos)
                         {
-                            LOG_INFO("[CAUSAL_MASK] h=" << h << ", i=" << i << ", abs_q_pos=" << abs_q_pos
-                                                        << ", j=" << j << " -> MASKED (j > abs_q_pos)");
+                            // DEBUG: Log first few masks
+                            if (h == 0 && i == 0 && j <= 7)
+                            {
+                                LOG_DEBUG("[CAUSAL_MASK] h=" << h << ", i=" << i << ", abs_q_pos=" << abs_q_pos
+                                                             << ", j=" << j << " -> MASKED (j > abs_q_pos)");
+                            }
+                            score_row[j] = -std::numeric_limits<float>::infinity();
                         }
-                        score_row[j] = -std::numeric_limits<float>::infinity();
-                        continue;
+                        else if (h == 0 && i == 0 && j <= 7)
+                        {
+                            // DEBUG: Log first few scores
+                            LOG_DEBUG("[SCORE_COMPUTE] h=" << h << ", i=" << i << ", abs_q_pos=" << abs_q_pos
+                                                           << ", j=" << j << " -> score=" << score_row[j]);
+                        }
                     }
-
-                    // Compute Q[i] @ K[j]^T
-                    const float *kj = k + (size_t)j * heads * head_dim + (size_t)h * head_dim;
-
-                    // DEBUG: Log Q and K vectors for first decode token
-                    if (h == 0 && i == 0 && j <= 5 && k_seq_len == 6 && q_seq_len == 1)
+                }
+            }
+        }
+        else
+        {
+            // DEBUG: Log first few scores for non-causal case
+            if (heads > 0 && q_seq_len > 0)
+            {
+                const float *score_head = scores; // First head
+                for (int i = 0; i < std::min(1, q_seq_len); ++i)
+                {
+                    const float *score_row = score_head + i * k_seq_len;
+                    for (int j = 0; j < std::min(8, k_seq_len); ++j)
                     {
-                        LOG_INFO("[Q_VECTOR] h=" << h << ", i=" << i << ", first 10 dims: "
-                                                 << qi[0] << " " << qi[1] << " " << qi[2] << " " << qi[3] << " "
-                                                 << qi[4] << " " << qi[5] << " " << qi[6] << " " << qi[7] << " "
-                                                 << qi[8] << " " << qi[9]);
-                        LOG_INFO("[K_VECTOR] h=" << h << ", j=" << j << ", first 10 dims: "
-                                                 << kj[0] << " " << kj[1] << " " << kj[2] << " " << kj[3] << " "
-                                                 << kj[4] << " " << kj[5] << " " << kj[6] << " " << kj[7] << " "
-                                                 << kj[8] << " " << kj[9]);
-                    }
-
-                    float dot = 0.0f;
-
-                    for (int d = 0; d < head_dim; ++d)
-                    {
-                        dot += qi[d] * kj[d];
-                    }
-
-                    score_row[j] = dot * scale;
-
-                    // DEBUG: Log first few scores
-                    if (h == 0 && i == 0 && j <= 7)
-                    {
-                        LOG_INFO("[SCORE_COMPUTE] h=" << h << ", i=" << i << ", abs_q_pos=" << abs_q_pos
-                                                      << ", j=" << j << " -> score=" << score_row[j]);
+                        LOG_DEBUG("[SCORE_COMPUTE] h=0, i=" << i << ", j=" << j
+                                                            << " -> score=" << score_row[j]);
                     }
                 }
             }
         }
 
-        // Note: apply_softmax parameter is deprecated - softmax is always applied separately
-        (void)apply_softmax;
+        // Apply softmax if requested
+        if (apply_softmax)
+        {
+            if (causal)
+            {
+                // Use fused kernel for causal masking + softmax
+                // The fused kernel eliminates the materialized -inf values and does softmax in one pass
+                fused_softmax_with_causal_mask(scores, heads, q_seq_len, k_seq_len, causal);
+            }
+            else
+            {
+                // Use standard softmax for non-causal attention
+                llaminar::kernels::SoftmaxRowArgs softmax_args;
+                softmax_args.scores = scores;
+                softmax_args.rows = heads * q_seq_len;
+                softmax_args.cols = k_seq_len;
+                softmax_args.causal = false; // Already masked above
+                softmax_args.scale = 1.0f;   // Scale already applied
+                llaminar::kernels::softmax_row_major(softmax_args);
+            }
+        }
     }
 
     // ============================================================================
@@ -460,31 +849,82 @@ namespace llaminar::attn
     void apply_scores_to_v(const float *scores, const float *v, float *out,
                            int q_seq_len, int k_seq_len, int head_dim, int heads)
     {
-        const auto &env = llaminar::debugEnv().attention;
+        // Always use GEMM path for optimal performance
+        // Reorder V to [heads, k_seq_len, head_dim] for efficient GEMM
+        std::vector<float> v_reordered(heads * k_seq_len * head_dim);
 
-        // Initialize output to zero
-        std::fill(out, out + (size_t)q_seq_len * heads * head_dim, 0.0f);
-
-// Parallelize over (head, output_position) pairs
-#pragma omp parallel for collapse(2) if (!env.prim_force_scalar)
+// Reorder V: [k_seq_len, heads, head_dim] -> [heads, k_seq_len, head_dim]
+#pragma omp parallel for collapse(2) if (heads * k_seq_len > 256)
         for (int h = 0; h < heads; ++h)
         {
-            for (int i = 0; i < q_seq_len; ++i)
+            for (int j = 0; j < k_seq_len; ++j)
             {
-                float *out_ptr = out + (size_t)i * heads * head_dim + (size_t)h * head_dim;
-                const float *score_row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
+                const float *v_src = v + (size_t)j * heads * head_dim + (size_t)h * head_dim;
+                float *v_dst = v_reordered.data() + (size_t)h * k_seq_len * head_dim + (size_t)j * head_dim;
+                std::memcpy(v_dst, v_src, head_dim * sizeof(float));
+            }
+        }
 
-                // Weighted sum: out[i] = sum_j scores[i,j] * V[j]
-                for (int j = 0; j < k_seq_len; ++j)
+        // Allocate temporary output in [heads, q_seq_len, head_dim] layout
+        std::vector<float> out_reordered(heads * q_seq_len * head_dim);
+
+        // Compute scores[h] @ V[h] for all heads in parallel
+        // scores[h]: [q_seq_len, k_seq_len]
+        // V[h]: [k_seq_len, head_dim]
+        // out[h]: [q_seq_len, head_dim]
+        bool all_success = true;
+
+#pragma omp parallel for if (heads > 2)
+        for (int h = 0; h < heads; ++h)
+        {
+            const float *score_head = scores + (size_t)h * q_seq_len * k_seq_len;
+            const float *v_head = v_reordered.data() + (size_t)h * k_seq_len * head_dim;
+            float *out_head = out_reordered.data() + (size_t)h * q_seq_len * head_dim;
+
+            // out[h] = scores[h] @ V[h]
+            // C = A @ B where:
+            //   A = scores[h]: [q_seq_len, k_seq_len]
+            //   B = V[h]: [k_seq_len, head_dim]
+            //   C = out[h]: [q_seq_len, head_dim]
+            bool matmul_success = llaminar::adaptiveMatMul(
+                score_head,               // A: [q_seq_len, k_seq_len]
+                v_head,                   // B: [k_seq_len, head_dim]
+                out_head,                 // C: [q_seq_len, head_dim]
+                q_seq_len,                // m
+                head_dim,                 // n
+                k_seq_len,                // k
+                (q_seq_len == k_seq_len), // is_prefill hint
+                false,                    // distributed_partition
+                false,                    // transpose_A
+                false,                    // transpose_B
+                1.0f,                     // alpha
+                0.0f                      // beta
+            );
+
+            if (!matmul_success)
+            {
+#pragma omp critical
                 {
-                    const float weight = score_row[j];
-                    const float *vj = v + (size_t)j * heads * head_dim + (size_t)h * head_dim;
-
-                    for (int d = 0; d < head_dim; ++d)
-                    {
-                        out_ptr[d] += weight * vj[d];
-                    }
+                    LOG_ERROR("[apply_scores_to_v] adaptiveMatMul failed for head " << h);
+                    all_success = false;
                 }
+            }
+        }
+
+        if (!all_success)
+        {
+            return;
+        }
+
+// Reorder output back: [heads, q_seq_len, head_dim] -> [q_seq_len, heads, head_dim]
+#pragma omp parallel for collapse(2) if (heads * q_seq_len > 256)
+        for (int i = 0; i < q_seq_len; ++i)
+        {
+            for (int h = 0; h < heads; ++h)
+            {
+                const float *out_src = out_reordered.data() + (size_t)h * q_seq_len * head_dim + (size_t)i * head_dim;
+                float *out_dst = out + (size_t)i * heads * head_dim + (size_t)h * head_dim;
+                std::memcpy(out_dst, out_src, head_dim * sizeof(float));
             }
         }
     }
@@ -624,6 +1064,17 @@ namespace llaminar::attn
             // Standard path: materialize scores
             std::vector<float> scores((size_t)heads * seq_len * seq_len);
             compute_qk_scores(q, k, scores.data(), seq_len, seq_len, head_dim, heads, causal, false);
+
+            // Apply softmax to convert scores to probabilities
+            // Note: causal masking already applied in compute_qk_scores (masked positions are -inf)
+            llaminar::kernels::SoftmaxRowArgs softmax_args;
+            softmax_args.scores = scores.data();
+            softmax_args.rows = heads * seq_len;
+            softmax_args.cols = seq_len;
+            softmax_args.causal = false; // Already masked in compute_qk_scores
+            softmax_args.scale = 1.0f;   // Scale already applied in compute_qk_scores
+            llaminar::kernels::softmax_row_major(softmax_args);
+
             apply_scores_to_v(scores.data(), v, out, seq_len, seq_len, head_dim, heads);
         }
     }
@@ -638,6 +1089,14 @@ namespace llaminar::attn
                            int head_offset, int total_q_heads,
                            bool gathered_rank_major, int kv_head_offset_for_rank)
     {
+        // Disable gather/rearrange unless snapshot capture is enabled
+        const auto &env = llaminar::debugEnv().attention;
+        if (!env.capture_enabled)
+        {
+            // In perf mode, skip all-gather and rearrange (no snapshot overhead)
+            return;
+        }
+
         // Each KV head serves a group of consecutive Q heads
         // For Qwen: 14 Q heads, 2 KV heads → group_size = 14/2 = 7
         //   Q heads [0-6] → KV head 0
@@ -748,7 +1207,15 @@ namespace llaminar::attn
                            float *k_expanded, float *v_expanded,
                            int seq_len, int kv_head_dim, int total_head_dim)
     {
-// Simple copy when dimensions match (MHA case)
+        // Disable gather/rearrange unless snapshot capture is enabled
+        const auto &env = llaminar::debugEnv().attention;
+        if (!env.capture_enabled)
+        {
+            // In perf mode, skip all-gather and rearrange (no snapshot overhead)
+            return;
+        }
+
+        // Simple copy when dimensions match (MHA case)
 #pragma omp parallel for schedule(static)
         for (int t = 0; t < seq_len; ++t)
         {
@@ -833,18 +1300,22 @@ namespace llaminar::attn
         const int k_stride_batch = seq_len * heads * head_dim;
         const int scores_stride_batch = heads * seq_len * seq_len;
 
+// Batch-first parallelism: each thread processes a full batch element
+// This improves cache locality by keeping all data for one batch in thread-local cache
+#pragma omp parallel for schedule(static) if (batch_size > 1)
         for (int b = 0; b < batch_size; ++b)
         {
             const float *q_batch = q + b * q_stride_batch;
             const float *k_batch = k + b * k_stride_batch;
             float *scores_batch = scores + b * scores_stride_batch;
 
-            // Delegate to proven single-batch implementation
+            // Delegate to proven single-batch implementation with fused softmax
             // It expects: Q, K: [seq_len, heads * head_dim]
             //            scores: [heads, seq_len, seq_len]
+            // apply_softmax=true enables our vectorized fused kernel
             compute_qk_scores(q_batch, k_batch, scores_batch,
                               seq_len, seq_len, head_dim, heads,
-                              causal, false);
+                              causal, true); // Enable fused vectorized softmax
         }
     }
 
@@ -860,6 +1331,9 @@ namespace llaminar::attn
         const int v_stride_batch = seq_len * heads * head_dim;
         const int out_stride_batch = seq_len * heads * head_dim;
 
+// Batch-first parallelism: each thread processes a full batch element
+// This improves cache locality and reduces thread contention
+#pragma omp parallel for schedule(static) if (batch_size > 1)
         for (int b = 0; b < batch_size; ++b)
         {
             const float *scores_batch = scores + b * scores_stride_batch;

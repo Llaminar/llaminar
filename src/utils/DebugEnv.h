@@ -126,6 +126,7 @@ namespace llaminar
         bool validate_primitives = false; // LLAMINAR_ATTN_PRIMITIVES_VALIDATE
         bool validate_output = false;     // LLAMINAR_ATTN_OUTPUT_VALIDATE
         bool use_primitives = true;       // LLAMINAR_ATTN_USE_PRIMITIVES (toggle new centralized primitive path)
+        bool capture_enabled = false;     // LLAMINAR_ATTN_CAPTURE_ENABLED (disable Q/K/V snapshots for benchmark mode; opt-in)
         // Newly centralized flags
         std::string output_mode;           // LLAMINAR_ATTN_OUTPUT_MODE
         bool output_mode_forced = false;   // presence of mode env

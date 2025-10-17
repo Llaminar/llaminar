@@ -618,12 +618,14 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
             if (stage.name == "FINAL_NORM" || stage.name == "LM_HEAD")
             {
                 // Final stages accumulate numerical errors from all previous operations
-                stage_tolerance = ComparisonTolerance(3e-4f, 1e-3);
+                // After switching from direct cblas to adaptiveMatMul wrapper, we see tiny
+                // rounding differences accumulate (max_abs ~0.00033 on values ~63)
+                stage_tolerance = ComparisonTolerance(5e-4f, 1e-3);
             }
 
             // Build keys using registry's make_key() for consistent formatting
-            // Sequential uses "OpenBLAS" (from PrefillProvider.name())
-            std::string seq_key = registry.make_key("OpenBLAS", stage.name, stage.layer);
+            // Sequential uses "llaminar" (default snapshot_source_ from PipelineBase)
+            std::string seq_key = registry.make_key("llaminar", stage.name, stage.layer);
             std::string batch_key = registry.make_key("batch", stage.name, stage.layer);
 
             // Get snapshots

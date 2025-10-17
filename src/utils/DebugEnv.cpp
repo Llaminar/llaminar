@@ -200,6 +200,11 @@ namespace llaminar
         // empty string => treat as true; explicit 0 disables
         if(*up == '0') s.attention.use_primitives = false; else s.attention.use_primitives = true;
     }
+    // Capture control: default disabled, must be explicitly enabled for snapshots
+    if(const char* ce = std::getenv("LLAMINAR_ATTN_CAPTURE_ENABLED")) {
+        if(*ce == '1' || std::string(ce) == "true" || std::string(ce) == "TRUE") s.attention.capture_enabled = true;
+        else s.attention.capture_enabled = false;
+    }
     if(const char* om = std::getenv("LLAMINAR_ATTN_OUTPUT_MODE")) { if(*om){ s.attention.output_mode_forced=true; s.attention.output_mode = om; }}
     if(const char* gt = std::getenv("LLAMINAR_ATTN_GATHER_THRESHOLD")) { s.attention.gather_threshold = std::atoi(gt); }
     s.attention.force_scalar = flag(std::getenv("LLAMINAR_ATTN_FORCE_SCALAR"));

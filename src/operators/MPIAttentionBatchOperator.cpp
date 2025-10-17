@@ -1305,14 +1305,28 @@ namespace llaminar
         }
 
         // Compute partial output: [M, K] @ [N, K]^T = [M, N]
-        // Note: wo_local is [N, K] stored row-major, so we use CblasTrans
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    M, N, K,
-                    1.0f,
-                    attn_concat_local->data(), K,
-                    wo_local->data(), K,
-                    0.0f,
-                    output->data(), N);
+        // Note: wo_local is [N, K] stored row-major, so we use transpose_B=true
+        bool is_prefill = (B * T == T); // Simple heuristic: batch_size * seq_len == seq_len means single sequence
+        bool success = adaptiveMatMul(
+            attn_concat_local->data(), // A: [M, K] = [B*T, local_out_cols]
+            wo_local->data(),          // B: [N, K] = [D, local_out_cols]
+            output->data(),            // C: [M, N] = [B*T, D]
+            M,                         // m = B*T
+            N,                         // n = D
+            K,                         // k = local_out_cols
+            is_prefill,                // is_prefill hint
+            false,                     // distributed_partition (weights already sliced)
+            false,                     // transpose_A
+            true,                      // transpose_B (wo_local is [N,K] row-major)
+            1.0f,                      // alpha
+            0.0f                       // beta
+        );
+
+        if (!success)
+        {
+            LOG_ERROR("adaptiveMatMul failed for output projection on rank " << getRank());
+            return false;
+        }
 
         if (current_layer_idx_ == 0) // Log for all ranks on layer 0
         {
@@ -1454,35 +1468,25 @@ namespace llaminar
         int batch_size,
         int seq_len)
     {
-        // Apply softmax using proven SoftmaxCore implementation
+        // Softmax is now applied by compute_qk_scores_batched using the vectorized fused kernel
         // scores: [B, n_heads_local, T, T]
-        // Note: causal masking already applied by compute_qk_scores_batched
+        // Note: causal masking AND softmax already applied by compute_qk_scores_batched
+
+        // This function is now a no-op - kept for API compatibility
+        // The fused kernel in compute_qk_scores_batched handles:
+        //   1. Q @ K^T computation (GEMM)
+        //   2. Scaling by 1/sqrt(head_dim)
+        //   3. Causal masking
+        //   4. Vectorized softmax (AVX2/AVX512)
 
         if (getRank() == 0 && current_layer_idx_ == 0)
         {
-            LOG_DEBUG("[SOFTMAX_DEBUG] Delegating to llaminar::kernels::softmax_row_major:");
+            LOG_DEBUG("[SOFTMAX_DEBUG] Softmax already applied by vectorized fused kernel in compute_qk_scores_batched");
             LOG_DEBUG("  batch_size=" << batch_size << " seq_len=" << seq_len);
             LOG_DEBUG("  n_heads_local_=" << n_heads_local_);
         }
 
-        // Apply softmax to each head in each batch
-        for (int b = 0; b < batch_size; ++b)
-        {
-            for (int h = 0; h < n_heads_local_; ++h)
-            {
-                float *scores_head = scores + (b * n_heads_local_ + h) * seq_len * seq_len;
-
-                // Use proven softmax implementation
-                llaminar::kernels::SoftmaxRowArgs args;
-                args.scores = scores_head;
-                args.rows = seq_len;
-                args.cols = seq_len;
-                args.causal = false; // Causal masking already applied in compute_qk_scores
-                args.scale = 1.0f;
-
-                llaminar::kernels::softmax_row_major(args);
-            }
-        }
+        // No-op: softmax already applied
     }
 
     void MPIAttentionBatchOperator::computeAttentionOutput(
