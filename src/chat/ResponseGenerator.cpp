@@ -167,10 +167,18 @@ namespace llaminar
                             break;
                         }
 
-                        // Use detokenization for output (handles Ġ → space, Ċ → newline, etc.)
-                        std::string detokenized = tokenizer_->detokenize({next_token});
-                        token_text = detokenized;
-                        response_text += token_text;
+                        // Detokenize all generated tokens together for proper BPE handling
+                        // This ensures multi-byte UTF-8 sequences are correctly decoded
+                        response_text = tokenizer_->detokenize(generated_tokens);
+
+                        // Calculate new token text by comparing with previous response
+                        static std::string previous_response;
+                        if (step == 0)
+                        {
+                            previous_response.clear();
+                        }
+                        token_text = response_text.substr(previous_response.length());
+                        previous_response = response_text;
                         stream_buffer += token_text;
 
                         // Check if response contains chat template end markers

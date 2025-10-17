@@ -461,6 +461,10 @@ add_executable(test_basic tests/TestBasic.cpp)
 target_link_libraries(test_basic llaminar_core GTest::gtest GTest::gtest_main)
 add_test_with_debug_logging(BasicTest COMMAND test_basic)
 
+add_executable(test_detokenization tests/test_detokenization.cpp)
+target_link_libraries(test_detokenization llaminar_core GTest::gtest GTest::gtest_main)
+add_llaminar_mpi_test(DetokenizationTest 1 test_detokenization)
+
 add_executable(test_pipeline_factory tests/TestPipelineFactory.cpp)
 target_link_libraries(test_pipeline_factory llaminar_core GTest::gtest GTest::gtest_main)
 add_test_with_debug_logging(PipelineFactoryTest COMMAND test_pipeline_factory)
