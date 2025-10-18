@@ -238,6 +238,8 @@ namespace llaminar
         if(const char* rt = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD")) { int v=std::atoi(rt); if(v>0) s.attention.prim_rope_recurrence_threshold = v; }
         if(flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE"))) s.attention.prim_rope_disable_recurrence = true;
         s.attention.prim_rope_trace = flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_TRACE"));
+        s.attention.prim_rope_experimental = flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_EXPERIMENTAL"));
+        if(const char* tt = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_TABLE_THRESHOLD")) { int v=std::atoi(tt); if(v>0) s.attention.prim_rope_table_threshold = v; }
     }
     // Embedding
     s.embedding.trace = flag(std::getenv("LLAMINAR_EMBED_TRACE"));

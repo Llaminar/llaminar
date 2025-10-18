@@ -155,6 +155,8 @@ namespace llaminar
         int prim_rope_recurrence_threshold = 300000; // LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD (elements = heads*seq_len*head_dim). Tuned from empirical sweep: recurrence under-performs below ~300k elems, wins at 640x8x64 (327,680) but is noisy at 896.
         bool prim_rope_disable_recurrence = false;   // LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE (force old per-pos trig path)
         bool prim_rope_trace = false;                // LLAMINAR_ATTN_PRIM_ROPE_TRACE (emit instrumentation for RoPE path selection)
+        bool prim_rope_experimental = false;         // LLAMINAR_ATTN_PRIM_ROPE_EXPERIMENTAL (enable new experimental RoPE path)
+        int prim_rope_table_threshold = 8192;        // LLAMINAR_ATTN_PRIM_ROPE_TABLE_THRESHOLD (min elements=seq_len*head_dim/2 to precompute full sin/cos tables)
     };
 
     struct EmbeddingEnv

@@ -214,6 +214,12 @@ namespace llaminar::attn
 
         const auto &env = llaminar::debugEnv().attention;
 
+        // Dispatch to experimental path if enabled
+        if(env.prim_rope_experimental){
+            apply_rope_experimental(q,k,seq_len,head_dim,q_heads,k_heads,n_past,freq_base);
+            return;
+        }
+
         // Validation
         if (head_dim % 2 != 0)
         {
@@ -280,6 +286,125 @@ namespace llaminar::attn
             LOG_DEBUG("[RoPE] After rotation, last token first head K[0:4]="
                       << k[k_offset] << "," << k[k_offset + 1] << ","
                       << k[k_offset + 2] << "," << k[k_offset + 3]);
+        }
+    }
+
+    // =========================================================================
+    // EXPERIMENTAL RoPE IMPLEMENTATION
+    //   Goals:
+    //   - Cache inv_freq globally (per head_dim,freq_base)
+    //   - Precompute sin/cos tables for requested (seq_len + n_past) window when large enough
+    //   - Provide recurrence fast path for decode (seq_len==1)
+    //   - Keep logically isolated for A/B testing (no side effects to legacy path)
+    // =========================================================================
+
+    namespace {
+        struct RopeCacheKey { int head_dim; float freq_base; bool operator==(const RopeCacheKey& o) const { return head_dim==o.head_dim && freq_base==o.freq_base; } };
+        struct RopeCacheKeyHash { size_t operator()(const RopeCacheKey& k) const { return std::hash<int>()(k.head_dim) ^ (std::hash<int>()(std::lround(k.freq_base*1000.f))<<1); } };
+        struct InvFreqCacheEntry { std::vector<float> inv_freq; };
+        static std::unordered_map<RopeCacheKey, InvFreqCacheEntry, RopeCacheKeyHash> g_inv_freq_cache;
+        static std::mutex g_inv_freq_mutex;
+
+        const std::vector<float>& get_inv_freq_cached(int head_dim, float freq_base){
+            RopeCacheKey key{head_dim,freq_base};
+            {
+                std::lock_guard<std::mutex> lg(g_inv_freq_mutex);
+                auto it = g_inv_freq_cache.find(key);
+                if(it!=g_inv_freq_cache.end()) return it->second.inv_freq;
+                InvFreqCacheEntry e; e.inv_freq.reserve(head_dim/2);
+                const int half=head_dim/2;
+                // faster exp form vs pow
+                float log_base = std::log(freq_base);
+                for(int i=0;i<half;++i){
+                    float exponent = (2.f * i)/head_dim; // (2i)/d
+                    e.inv_freq.push_back(std::exp(-log_base * exponent));
+                }
+                auto ins = g_inv_freq_cache.emplace(key,std::move(e));
+                return ins.first->second.inv_freq;
+            }
+        }
+
+        struct PhaseTable {
+            int max_pos = 0; // exclusive
+            std::vector<float> cos_tbl; // [max_pos * half]
+            std::vector<float> sin_tbl; // [max_pos * half]
+        };
+
+        // Simple per (head_dim,freq_base) phase table optional cache
+        static std::unordered_map<RopeCacheKey, PhaseTable, RopeCacheKeyHash> g_phase_table_cache;
+
+        const PhaseTable* ensure_phase_table(int head_dim, float freq_base, int upto_pos, const std::vector<float>& inv_freq){
+            RopeCacheKey key{head_dim,freq_base};
+            std::lock_guard<std::mutex> lg(g_inv_freq_mutex); // reuse same mutex for simplicity
+            auto &tbl = g_phase_table_cache[key];
+            int half = head_dim/2;
+            if(upto_pos <= tbl.max_pos) return &tbl;
+            int new_max = std::max(upto_pos, std::max(2*tbl.max_pos, 16));
+            tbl.cos_tbl.resize((size_t)new_max * half);
+            tbl.sin_tbl.resize((size_t)new_max * half);
+            for(int p=tbl.max_pos; p<new_max; ++p){
+                for(int i=0;i<half;++i){
+                    float angle = p * inv_freq[i];
+                    float s,c; s=std::sin(angle); c=std::cos(angle);
+                    tbl.cos_tbl[(size_t)p*half + i] = c;
+                    tbl.sin_tbl[(size_t)p*half + i] = s;
+                }
+            }
+            tbl.max_pos = new_max;
+            return &tbl;
+        }
+    } // anon
+
+    void apply_rope_experimental(float *q, float *k, int seq_len, int head_dim,
+                                 int q_heads, int k_heads, int n_past, float freq_base){
+        const auto &env = llaminar::debugEnv().attention;
+        if(head_dim %2 !=0) { LOG_ERROR("[RoPE-EXP] head_dim must be even"); return; }
+        if(seq_len<=0) return;
+        const int half = head_dim/2;
+        const auto &inv_freq = get_inv_freq_cached(head_dim,freq_base);
+
+        bool use_table = (seq_len * half) >= env.prim_rope_table_threshold;
+        const PhaseTable* phase_table = nullptr;
+        if(use_table){
+            phase_table = ensure_phase_table(head_dim,freq_base, n_past + seq_len, inv_freq);
+        }
+
+        auto rotate_tensor = [&](float* tensor, int heads){
+            // layout: [seq_len, heads, head_dim]
+            size_t head_stride = head_dim;
+            size_t heads_stride = (size_t)heads * head_dim;
+            #pragma omp parallel for collapse(2) if(heads*seq_len > 4 && !env.prim_force_scalar)
+            for(int t=0;t<seq_len;++t){
+                for(int h=0;h<heads;++h){
+                    float* base = tensor + (size_t)t*heads*head_dim + (size_t)h*head_dim;
+                    int pos = n_past + t;
+                    for(int i=0;i<half;++i){
+                        float c,s;
+                        if(phase_table){
+                            c = phase_table->cos_tbl[(size_t)pos*half + i];
+                            s = phase_table->sin_tbl[(size_t)pos*half + i];
+                        } else {
+                            float angle = pos * inv_freq[i];
+                            if(env.prim_rope_fused_sincos){
+                                c = std::cos(angle); s = std::sin(angle); // kept separate for portability
+                            } else {
+                                c = std::cos(angle); s = std::sin(angle);
+                            }
+                        }
+                        float x0 = base[i];
+                        float x1 = base[i+half];
+                        base[i]      = x0 * c - x1 * s;
+                        base[i+half] = x0 * s + x1 * c;
+                    }
+                }
+            }
+        };
+
+        rotate_tensor(q,q_heads);
+        rotate_tensor(k,k_heads);
+
+        if(env.prim_rope_trace && env.prim_rope_experimental && seq_len>0){
+            LOG_INFO("[RoPE-EXP] applied experimental path seq_len="<<seq_len<<" q_heads="<<q_heads<<" k_heads="<<k_heads<<" table="<<(use_table?"yes":"no"));
         }
     }
 
