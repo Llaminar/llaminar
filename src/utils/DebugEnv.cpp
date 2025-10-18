@@ -226,18 +226,12 @@ namespace llaminar
     if(const char* frt = std::getenv("LLAMINAR_ATTN_PRIM_FUSED_RECOMPUTE_THRESHOLD")) { int v=std::atoi(frt); if(v>0) s.attention.prim_fused_recompute_threshold = v; }
     s.attention.prim_force_fused = flag(std::getenv("LLAMINAR_ATTN_PRIM_FORCE_FUSED"));
     s.attention.prim_disable_fused = flag(std::getenv("LLAMINAR_ATTN_PRIM_DISABLE_FUSED"));
+    // Consolidated RoPE: only persistence toggles retained (optional debug)
     {
-        const char* rv = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_VECTORIZE");
-        if(rv && *rv=='0') s.attention.prim_rope_vectorize = false; // default true
-    }
-    {
-        const char* rfs = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_FUSED_SINCOS");
-        if(rfs && *rfs=='0') s.attention.prim_rope_fused_sincos = false; // default true
-    }
-    {
-        if(const char* rt = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD")) { int v=std::atoi(rt); if(v>0) s.attention.prim_rope_recurrence_threshold = v; }
-        if(flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE"))) s.attention.prim_rope_disable_recurrence = true;
-        s.attention.prim_rope_trace = flag(std::getenv("LLAMINAR_ATTN_PRIM_ROPE_TRACE"));
+        const char* ps = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_PERSIST_STATE");
+        if(ps){ if(*ps=='0') s.attention.prim_rope_persist_decode_state = false; else s.attention.prim_rope_persist_decode_state = true; }
+        const char* td = std::getenv("LLAMINAR_ATTN_PRIM_ROPE_TLS_DISABLE");
+        if(td){ if(*td=='1' || *td=='t' || *td=='T') s.attention.prim_rope_tls_disable = true; else if(*td=='0') s.attention.prim_rope_tls_disable = false; }
     }
     // Embedding
     s.embedding.trace = flag(std::getenv("LLAMINAR_EMBED_TRACE"));

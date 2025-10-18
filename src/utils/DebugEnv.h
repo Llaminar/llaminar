@@ -150,11 +150,10 @@ namespace llaminar
         int prim_fused_recompute_threshold = 0;      // LLAMINAR_ATTN_PRIM_FUSED_RECOMPUTE_THRESHOLD (seq_len threshold to use fused two-pass path)
         bool prim_force_fused = false;               // LLAMINAR_ATTN_PRIM_FORCE_FUSED
         bool prim_disable_fused = false;             // LLAMINAR_ATTN_PRIM_DISABLE_FUSED
-        bool prim_rope_vectorize = true;             // LLAMINAR_ATTN_PRIM_ROPE_VECTORIZE (disable for debugging)
-        bool prim_rope_fused_sincos = true;          // LLAMINAR_ATTN_PRIM_ROPE_FUSED_SINCOS (gate libmvec sincosf usage)
-        int prim_rope_recurrence_threshold = 300000; // LLAMINAR_ATTN_PRIM_ROPE_RECURRENCE_THRESHOLD (elements = heads*seq_len*head_dim). Tuned from empirical sweep: recurrence under-performs below ~300k elems, wins at 640x8x64 (327,680) but is noisy at 896.
-        bool prim_rope_disable_recurrence = false;   // LLAMINAR_ATTN_PRIM_ROPE_DISABLE_RECURRENCE (force old per-pos trig path)
-        bool prim_rope_trace = false;                // LLAMINAR_ATTN_PRIM_ROPE_TRACE (emit instrumentation for RoPE path selection)
+    // RoPE optimization flags have been consolidated (Oct 2025 refactor). We retain only
+    // persistence TLS toggle for potential debug; all other paths are unconditional now.
+    bool prim_rope_persist_decode_state = true;   // (was LLAMINAR_ATTN_PRIM_ROPE_PERSIST_STATE)
+    bool prim_rope_tls_disable = false;           // (was LLAMINAR_ATTN_PRIM_ROPE_TLS_DISABLE)
     };
 
     struct EmbeddingEnv

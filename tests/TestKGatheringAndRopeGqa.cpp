@@ -235,45 +235,29 @@ namespace
 
             bool all_correct = true;
 
-            for (int kv_head = 0; kv_head < k_heads; ++kv_head)
-            {
+            // Implementation note: llaminar currently uses split-half pairing
+            // (real[0:half], imag[0:half]) with pair i mapped to (i, i+half), not adjacent (2i,2i+1).
+            int half = head_dim / 2;
+            for (int kv_head = 0; kv_head < k_heads; ++kv_head) {
                 LOG_INFO("[ROPE_GQA_TEST] Checking KV-head " << kv_head);
-
-                for (int pos = 0; pos < seq_len; ++pos)
-                {
-                    for (int pair = 0; pair < head_dim / 2; ++pair)
-                    {
-                        // Calculate expected theta for this dimension pair
-                        // CRITICAL: Should use kv_head as index, NOT q_head indices
-                        float theta = 1.0f / std::pow(static_cast<float>(freq_base),
-                                                      (2.0f * pair) / head_dim);
-
-                        // Calculate angle for this position
+                for (int pos = 0; pos < seq_len; ++pos) {
+                    for (int i = 0; i < half; ++i) {
+                        float theta = 1.0f / std::pow(static_cast<float>(freq_base), (2.0f * i) / head_dim);
                         float angle = (pos + n_past) * theta;
-                        float cos_val = std::cos(angle);
-                        float sin_val = std::sin(angle);
-
-                        // Get original values
+                        float c = std::cos(angle);
+                        float s = std::sin(angle);
                         int base_idx = pos * (k_heads * head_dim) + kv_head * head_dim;
-                        float x_orig = k_original[base_idx + 2 * pair];
-                        float y_orig = k_original[base_idx + 2 * pair + 1];
-
-                        // Expected rotated values: [x*cos - y*sin, x*sin + y*cos]
-                        float expected_x = x_orig * cos_val - y_orig * sin_val;
-                        float expected_y = x_orig * sin_val + y_orig * cos_val;
-
-                        // Actual values after RoPE
-                        float actual_x = k->data()[base_idx + 2 * pair];
-                        float actual_y = k->data()[base_idx + 2 * pair + 1];
-
-                        // Compare with tolerance
+                        float x_orig = k_original[base_idx + i];
+                        float y_orig = k_original[base_idx + i + half];
+                        float expected_x = x_orig * c - y_orig * s;
+                        float expected_y = x_orig * s + y_orig * c;
+                        float actual_x = k->data()[base_idx + i];
+                        float actual_y = k->data()[base_idx + i + half];
                         float tol = 1e-4f;
-                        if (std::abs(actual_x - expected_x) > tol ||
-                            std::abs(actual_y - expected_y) > tol)
-                        {
-                            LOG_ERROR("KV-head " << kv_head << ", pos " << pos << ", pair " << pair
-                                                 << ": expected (" << expected_x << ", " << expected_y
-                                                 << "), got (" << actual_x << ", " << actual_y << ")");
+                        if (std::abs(actual_x - expected_x) > tol || std::abs(actual_y - expected_y) > tol) {
+                            LOG_ERROR("KV-head " << kv_head << ", pos " << pos << ", pair " << i
+                                      << ": expected (" << expected_x << ", " << expected_y
+                                      << "), got (" << actual_x << ", " << actual_y << ")");
                             all_correct = false;
                         }
                     }

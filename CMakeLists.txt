@@ -303,6 +303,27 @@ target_link_libraries(llaminar llaminar_core)
 add_executable(adaptive_demo src/AdaptiveDemo.cpp)
 target_link_libraries(adaptive_demo llaminar_core)
 
+# RoPE micro-benchmark
+add_executable(rope_benchmark src/RopeBenchmark.cpp)
+target_link_libraries(rope_benchmark PRIVATE llaminar_core)
+
+# Rope dump utility
+add_executable(rope_dump src/tools/rope_dump.cpp)
+target_link_libraries(rope_dump PRIVATE llaminar_core)
+
+# ---------------------------------------------------------------------------
+# PyTorch RoPE parity test (lightweight): uses rope_dump + rope_parity_check.py
+# ---------------------------------------------------------------------------
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME RoPEParityQuick
+                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/rope_parity_check.py
+                                        --seq 5 --q-heads 6 --k-heads 2 --head-dim 32 --n-past 7 --freq-base 10000
+                                        --tol-rel 2e-6 --tol-abs 1e-5
+                     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(RoPEParityQuick PROPERTIES TIMEOUT 30)
+endif()
+
 # Production adaptive architecture demonstration
 add_executable(production_demo src/ProductionDemo.cpp)
 target_link_libraries(production_demo llaminar_core)
@@ -370,6 +391,18 @@ endif()
 
 # RMSNorm core parity regression test
 if(GTEST_FOUND)
+    add_executable(test_rope_persistent
+        tests/test_rope_persistent.cpp
+        src/utils/DebugEnv.cpp
+    )
+    target_link_libraries(test_rope_persistent
+        PRIVATE
+            llaminar_core
+            GTest::gtest
+            GTest::gtest_main
+    )
+    add_test_with_debug_logging(RopePersistentState COMMAND test_rope_persistent)
+
     add_executable(test_rmsnorm_core_correctness
         tests/TestRmsnormCoreCorrectness.cpp
         src/utils/DebugEnv.cpp
@@ -1653,22 +1686,59 @@ endif()
 # with higher precedence.
 # ---------------------------------------------------------------------------
 get_property(_ALL_LLAMINAR_TESTS DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY TESTS)
+
+# Detect sockets and physical cores per socket (best effort) to derive an OpenMP thread count
+# Mirrors run_llaminar.sh logic but performed once at configure time. If detection fails we fall
+# back to OMP_NUM_THREADS=1 to remain safe on constrained CI systems.
+set(_LL_DETECT_SCRIPT "grep '^physical id' /proc/cpuinfo | awk '{print \$NF}' | sort -u | wc -l")
+execute_process(COMMAND bash -c "${_LL_DETECT_SCRIPT}" OUTPUT_VARIABLE _LL_SOCKETS OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+set(_LL_DETECT_CORES_SCRIPT "awk '/^processor/ {proc=\$NF} /^physical id/ {p=\$NF} /^core id/ {c=\$NF; print p":"c}' /proc/cpuinfo | sort -u | wc -l")
+execute_process(COMMAND bash -c "${_LL_DETECT_CORES_SCRIPT}" OUTPUT_VARIABLE _LL_UNIQUE_PHYS_CORES OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(_LL_SOCKETS MATCHES "^[0-9]+$" AND _LL_UNIQUE_PHYS_CORES MATCHES "^[0-9]+$" AND NOT _LL_SOCKETS STREQUAL "0")
+    math(EXPR _LL_CORES_PER_SOCKET "${_LL_UNIQUE_PHYS_CORES} / ${_LL_SOCKETS}")
+else()
+    set(_LL_CORES_PER_SOCKET 1)
+endif()
+if(_LL_CORES_PER_SOCKET LESS 1)
+    set(_LL_CORES_PER_SOCKET 1)
+endif()
+message(STATUS "CTest global env injection: sockets=${_LL_SOCKETS} phys_cores=${_LL_UNIQUE_PHYS_CORES} cores_per_socket=${_LL_CORES_PER_SOCKET}")
+
+# Canonical threading & MPI tuning variables (subset) we want every test to inherit unless
+# explicitly overridden. These mimic run_llaminar.sh defaults.
+set(_LL_CANONICAL_ENV_VARS
+    "LLAMINAR_OMP_USE_PHYSICAL=1"
+    "LLAMINAR_BIND_PER_SOCKET=1"
+    "OMP_NUM_THREADS=${_LL_CORES_PER_SOCKET}"
+    "OMP_PLACES=sockets"
+    "OMP_PROC_BIND=close"
+    "OMP_DYNAMIC=false"
+    "OMP_NESTED=false"
+    "KMP_AFFINITY=granularity=fine,compact,1,0"
+    "KMP_BLOCKTIME=0"
+    "OMPI_MCA_mpi_leave_pinned=1"
+    "OMPI_MCA_btl_vader_single_copy_mechanism=none"
+)
+
 if(_ALL_LLAMINAR_TESTS)
     foreach(_t IN LISTS _ALL_LLAMINAR_TESTS)
         get_test_property(${_t} ENVIRONMENT _CURRENT_ENV)
-        if(_CURRENT_ENV)
-            string(FIND "${_CURRENT_ENV}" "LLAMINAR_OMP_USE_PHYSICAL" _have_phys)
-            if(_have_phys EQUAL -1)
-                set(_CURRENT_ENV "${_CURRENT_ENV};LLAMINAR_OMP_USE_PHYSICAL=1")
-            endif()
-            string(FIND "${_CURRENT_ENV}" "LLAMINAR_BIND_PER_SOCKET" _have_bind)
-            if(_have_bind EQUAL -1)
-                set(_CURRENT_ENV "${_CURRENT_ENV};LLAMINAR_BIND_PER_SOCKET=1")
-            endif()
-            set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${_CURRENT_ENV}")
-        else()
-            set_tests_properties(${_t} PROPERTIES ENVIRONMENT "LLAMINAR_OMP_USE_PHYSICAL=1;LLAMINAR_BIND_PER_SOCKET=1")
+        # Initialize empty environment string if none present yet.
+        if(NOT _CURRENT_ENV)
+            set(_CURRENT_ENV "")
         endif()
+        foreach(_kv IN LISTS _LL_CANONICAL_ENV_VARS)
+            # Only append if not already present (idempotent, preserves user overrides).
+            string(FIND "${_CURRENT_ENV}" "${_kv}" _ll_found)
+            if(_ll_found EQUAL -1)
+                if(_CURRENT_ENV STREQUAL "")
+                    set(_CURRENT_ENV "${_kv}")
+                else()
+                    set(_CURRENT_ENV "${_CURRENT_ENV};${_kv}")
+                endif()
+            endif()
+        endforeach()
+        set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${_CURRENT_ENV}")
     endforeach()
 endif()
 

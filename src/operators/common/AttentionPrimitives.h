@@ -28,6 +28,12 @@ namespace llaminar::attn
 {
 
     void apply_rope(float *q, float *k, int seq_len, int head_dim, int q_heads, int k_heads, int n_past, float freq_base);
+        // Experimental A/B implementation (gated by LLAMINAR_ATTN_PRIM_ROPE_EXPERIMENTAL)
+        void apply_rope_experimental(float *q, float *k, int seq_len, int head_dim,
+                                     int q_heads, int k_heads, int n_past, float freq_base);
+    // Internal legacy implementation (for explicit A/B in micro-benchmarks)
+    void apply_rope(float *q, float *k, int seq_len, int head_dim,
+            int q_heads, int k_heads, int n_past, float freq_base);
 
     /**
      * @brief Apply RoPE to batched Q and K tensors
