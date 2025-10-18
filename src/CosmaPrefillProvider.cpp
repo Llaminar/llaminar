@@ -69,7 +69,7 @@ namespace llaminar
                     captureSnapshot(stage, layer_idx, data, seq_len, feature_dim);
                 });
 
-            if (!registerKernel("attention", std::move(attention_kernel)))
+            if (!registerOperator("attention", std::move(attention_kernel)))
             {
                 throw std::runtime_error("COSMAPrefillProvider: Failed to register attention kernel");
             }
@@ -79,7 +79,7 @@ namespace llaminar
         {
             auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(
                 MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
-            if (!registerKernel("swiglu", std::move(swiglu_kernel)))
+            if (!registerOperator("swiglu", std::move(swiglu_kernel)))
             {
                 throw std::runtime_error("COSMAPrefillProvider: Failed to register swiglu kernel");
             }
@@ -89,7 +89,7 @@ namespace llaminar
         {
             auto residual_kernel = std::make_unique<MPIResidualOperator>(
                 MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
-            if (!registerKernel("residual", std::move(residual_kernel)))
+            if (!registerOperator("residual", std::move(residual_kernel)))
             {
                 throw std::runtime_error("COSMAPrefillProvider: Failed to register residual kernel");
             }
@@ -100,7 +100,7 @@ namespace llaminar
             auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(
                 MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
             rmsnorm_kernel->setEpsilon(layer_cfg.eps);
-            if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
+            if (!registerOperator("rmsnorm", std::move(rmsnorm_kernel)))
             {
                 throw std::runtime_error("COSMAPrefillProvider: Failed to register rmsnorm kernel");
             }

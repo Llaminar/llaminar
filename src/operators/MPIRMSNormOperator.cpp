@@ -127,10 +127,16 @@ namespace llaminar
         // Additional epsilon logging
         LOG_DEBUG("[MPIRMSNormOperator] Using epsilon=" << epsilon_);
 
-        // Extract dimensions
-        size_t global_seq_len = static_cast<size_t>(global_input->shape()[0]);
-        size_t hidden_size = static_cast<size_t>(global_input->shape()[1]); // local view (full if not sharded)
-        size_t global_hidden_dim_reported = hidden_size;                    // full hidden size when sharded
+        // Extract dimensions (support both 2D and 3D inputs)
+        bool is_batched = (global_input->shape().size() == 3);
+        size_t batch_size = is_batched ? global_input->shape()[0] : 1;
+        size_t seq_len_per_batch = is_batched ? global_input->shape()[1] : global_input->shape()[0];
+        size_t hidden_size = is_batched ? global_input->shape()[2] : global_input->shape()[1];
+        size_t total_rows = batch_size * seq_len_per_batch; // Total number of rows to process
+        
+        // For batched inputs, treat as [batch*seq_len, hidden_size] for computation
+        size_t global_seq_len = total_rows;
+        size_t global_hidden_dim_reported = hidden_size; // local view (full if not sharded)
 
         // Shard-aware feature-slice detection (head/hidden sharding along feature dimension)
         bool feature_sharded = false;
@@ -384,10 +390,10 @@ namespace llaminar
             return false;
         }
 
-        // Check input is 2D [seq_len, hidden_size]
-        if (input->shape().size() != 2)
+        // Check input is 2D [seq_len, hidden_size] OR 3D [batch, seq_len, hidden_size]
+        if (input->shape().size() != 2 && input->shape().size() != 3)
         {
-            LOG_ERROR("MPIRMSNormOperator: Input must be 2D [seq_len, hidden_size], got "
+            LOG_ERROR("MPIRMSNormOperator: Input must be 2D [seq_len, hidden_size] or 3D [batch, seq_len, hidden_size], got "
                       << input->shape().size() << "D");
             return false;
         }
@@ -400,16 +406,19 @@ namespace llaminar
             return false;
         }
 
-        // Check output is 2D [seq_len, hidden_size]
-        if (output->shape().size() != 2)
+        // Check output dimensionality matches input
+        if (output->shape().size() != input->shape().size())
         {
-            LOG_ERROR("MPIRMSNormOperator: Output must be 2D [seq_len, hidden_size], got "
-                      << output->shape().size() << "D");
+            LOG_ERROR("MPIRMSNormOperator: Output must match input dimensionality, got input "
+                      << input->shape().size() << "D and output " << output->shape().size() << "D");
             return false;
         }
 
+        // Extract hidden_size based on input dimensionality
+        size_t hidden_size = (input->shape().size() == 2) ? input->shape()[1] : input->shape()[2];
+
         // Check dimension compatibility (allow sharded input + replicated weight scenario)
-        if (input->shape()[1] != weight->shape()[0])
+        if (hidden_size != (size_t)weight->shape()[0])
         {
             bool allow_replicated_weight = false;
             if (auto *sharded_in = dynamic_cast<ShardedSimpleTensor *>(input.get()))
@@ -418,7 +427,7 @@ namespace llaminar
                 if (spec.is_sharded() && (spec.axis == ShardSpec::Axis::Hidden || spec.axis == ShardSpec::Axis::Heads))
                 {
                     // Local slice dim vs global dim (weight may be replicated full vector)
-                    if ((size_t)spec.local_dim == (size_t)input->shape()[1] && (size_t)spec.global_dim == (size_t)weight->shape()[0])
+                    if ((size_t)spec.local_dim == hidden_size && (size_t)spec.global_dim == (size_t)weight->shape()[0])
                     {
                         allow_replicated_weight = true;
                         LOG_DEBUG("MPIRMSNormOperator: Accepting replicated weight (global_hidden=" << spec.global_dim
@@ -429,13 +438,29 @@ namespace llaminar
             if (!allow_replicated_weight)
             {
                 LOG_ERROR("MPIRMSNormOperator: Dimension mismatch between input hidden_size ("
-                          << input->shape()[1] << ") and weight (" << weight->shape()[0] << ")");
+                          << hidden_size << ") and weight (" << weight->shape()[0] << ")");
                 return false;
             }
         }
 
         // Check input and output have same shape
-        if (input->shape()[0] != output->shape()[0] || input->shape()[1] != output->shape()[1])
+        bool shapes_match = true;
+        if (input->shape().size() != output->shape().size())
+        {
+            shapes_match = false;
+        }
+        else
+        {
+            for (size_t i = 0; i < input->shape().size(); ++i)
+            {
+                if (input->shape()[i] != output->shape()[i])
+                {
+                    shapes_match = false;
+                    break;
+                }
+            }
+        }
+        if (!shapes_match)
         {
             LOG_ERROR("MPIRMSNormOperator: Input and output shape mismatch");
             return false;

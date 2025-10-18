@@ -40,7 +40,7 @@ namespace llaminar
 {
 
     MPIRoPEOperator::MPIRoPEOperator(int max_seq_len, int head_dim, float theta, DistributionStrategy strategy)
-        : MPIKernelBase(), max_seq_len_(max_seq_len), head_dim_(head_dim), theta_(theta),
+        : MPIOperatorBase(), max_seq_len_(max_seq_len), head_dim_(head_dim), theta_(theta),
           strategy_(strategy), num_threads_(omp_get_max_threads())
     {
         if (head_dim_ % 2 != 0)
@@ -52,14 +52,14 @@ namespace llaminar
         precomputeFrequencyTables();
 
         LOG_DEBUG("MPIRoPEOperator initialized on rank " << getRank() << "/" << getSize()
-                                                       << " with max_seq_len: " << max_seq_len_ << ", head_dim: " << head_dim_
-                                                       << ", theta: " << theta_ << ", strategy: "
-                                                       << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "HEAD_WISE")
-                                                       << ", OpenMP threads: " << num_threads_);
+                                                         << " with max_seq_len: " << max_seq_len_ << ", head_dim: " << head_dim_
+                                                         << ", theta: " << theta_ << ", strategy: "
+                                                         << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "HEAD_WISE")
+                                                         << ", OpenMP threads: " << num_threads_);
     }
 
     bool MPIRoPEOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                std::vector<std::shared_ptr<TensorBase>> &outputs)
+                                  std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         PERF_SCOPED_TIMER("MPIRoPEOperator::execute");
 
@@ -81,14 +81,14 @@ namespace llaminar
         if (actual_head_dim != head_dim_)
         {
             LOG_ERROR("MPIRoPEOperator: Head dimension mismatch - expected: " << head_dim_
-                                                                            << ", got: " << actual_head_dim);
+                                                                              << ", got: " << actual_head_dim);
             return false;
         }
 
         if (seq_len > max_seq_len_)
         {
             LOG_WARN("MPIRoPEOperator: Sequence length " << seq_len
-                                                       << " exceeds max_seq_len " << max_seq_len_ << ", updating tables");
+                                                         << " exceeds max_seq_len " << max_seq_len_ << ", updating tables");
             updateMaxSeqLen(seq_len);
         }
 
@@ -230,14 +230,14 @@ namespace llaminar
         TensorLogger::logTensorStats(output_tensor, "rope_output");
 
         LOG_DEBUG("MPIRoPEOperator executed: " << seq_len << "x" << n_heads << "x" << head_dim_
-                                             << " in " << std::fixed << std::setprecision(2) << execution_time
-                                             << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
+                                               << " in " << std::fixed << std::setprecision(2) << execution_time
+                                               << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
 
         return true;
     }
 
     bool MPIRoPEOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                 const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+                                   const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Check input count
         if (inputs.size() != 2)
@@ -339,7 +339,7 @@ namespace llaminar
         max_seq_len_ = max_seq_len;
         precomputeFrequencyTables();
         LOG_DEBUG("MPIRoPEOperator: Updated max_seq_len to " << max_seq_len_
-                                                           << ", recomputed frequency tables");
+                                                             << ", recomputed frequency tables");
     }
 
     void MPIRoPEOperator::precomputeFrequencyTables()
@@ -406,11 +406,11 @@ namespace llaminar
         }
 
         LOG_DEBUG("MPIRoPEOperator: Rank " << rank << " processing elements ["
-                                         << start_idx << ", " << end_idx << ") of " << total_elements);
+                                           << start_idx << ", " << end_idx << ") of " << total_elements);
     }
 
     void MPIRoPEOperator::executeSequenceWise(const float *input_data, const int *position_ids, float *output_data,
-                                            int seq_len, int n_heads, int head_dim)
+                                              int seq_len, int n_heads, int head_dim)
     {
         // Distribute sequence positions across MPI ranks
         size_t total_positions = seq_len;
@@ -440,7 +440,7 @@ namespace llaminar
     }
 
     void MPIRoPEOperator::executeHeadWise(const float *input_data, const int *position_ids, float *output_data,
-                                        int seq_len, int n_heads, int head_dim)
+                                          int seq_len, int n_heads, int head_dim)
     {
         // Distribute attention heads across MPI ranks
         size_t total_heads = n_heads;

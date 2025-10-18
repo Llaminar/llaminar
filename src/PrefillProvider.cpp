@@ -31,7 +31,8 @@ namespace llaminar
 #else
         // Debug build: delegate to PipelineSnapshotManager
         // Only rank 0 typically captures to avoid duplication in MPI runs
-        if (mpi_ctx_.rank == 0)
+        // Check if snapshot capture is enabled (can be disabled for benchmarks)
+        if (mpi_ctx_.rank == 0 && debugEnv().attention.capture_enabled)
         {
             PipelineSnapshotManager::instance().capture(
                 stage,
@@ -39,7 +40,7 @@ namespace llaminar
                 data,
                 seq_len,
                 feature_dim,
-                name()); // Use provider name as source identifier
+                "llaminar"); // Use "llaminar" as source for parity tests
         }
 #endif
     }

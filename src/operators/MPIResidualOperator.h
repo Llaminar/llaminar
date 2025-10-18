@@ -31,7 +31,7 @@ namespace llaminar
      * Expected outputs:
      * - output: [seq_len, hidden_size] - sum of input and residual
      */
-    class MPIResidualOperator : public MPIKernelBase
+    class MPIResidualOperator : public MPIOperatorBase
     {
     public:
         enum class DistributionStrategy
@@ -82,7 +82,7 @@ namespace llaminar
          * @brief Get the kernel type name for debugging/logging
          * @return String identifying the kernel type
          */
-        std::string getKernelType() const override { return "MPIResidual"; }
+        std::string getOperatorType() const override { return "MPIResidual"; }
 
         /**
          * @brief Get expected number of input tensors

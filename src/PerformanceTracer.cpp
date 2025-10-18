@@ -35,23 +35,23 @@ namespace llaminar
             // Read configuration from environment
             const auto &env = debugEnv();
 
-            if (env.perf.trace_enabled)
+            if (env.performance.trace_enabled)
             {
                 enabled_ = true;
                 LOG_INFO("Performance tracing ENABLED");
 
-                if (!env.perf.trace_filter.empty())
+                if (!env.performance.trace_filter.empty())
                 {
-                    filter_ = env.perf.trace_filter;
+                    filter_ = env.performance.trace_filter;
                     LOG_INFO("Performance trace filter: '" << filter_ << "'");
                 }
 
                 // Parse detail level
-                if (env.perf.trace_detail == "high")
+                if (env.performance.trace_detail == "high")
                 {
                     detail_level_ = DetailLevel::HIGH;
                 }
-                else if (env.perf.trace_detail == "low")
+                else if (env.performance.trace_detail == "low")
                 {
                     detail_level_ = DetailLevel::LOW;
                 }
@@ -60,17 +60,17 @@ namespace llaminar
                     detail_level_ = DetailLevel::MEDIUM;
                 }
 
-                LOG_INFO("Performance trace detail level: " << env.perf.trace_detail);
+                LOG_INFO("Performance trace detail level: " << env.performance.trace_detail);
             }
         }
 
         PerformanceTracer::~PerformanceTracer()
         {
-            if (enabled_ && debugEnv().perf.trace_dump_on_exit)
+            if (enabled_ && debugEnv().performance.trace_dump_on_exit)
             {
-                const std::string filename = debugEnv().perf.trace_output_file.empty()
+                const std::string filename = debugEnv().performance.trace_output_file.empty()
                                                  ? "llaminar_trace.json"
-                                                 : debugEnv().perf.trace_output_file;
+                                                 : debugEnv().performance.trace_output_file;
 
                 dumpResults(filename);
                 printSummary(detail_level_ == DetailLevel::HIGH);

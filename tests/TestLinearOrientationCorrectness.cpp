@@ -80,7 +80,7 @@ TEST_F(LinearOrientationTestFixture, ParitySmallShapes)
     for (auto c : cases)
     {
         auto input = make_simple({c.M, c.K});
-        auto weight = make_simple({c.K, c.N});
+        auto weight = make_simple({c.N, c.K});
         auto bias = make_simple({c.N});
         auto output = make_simple({c.M, c.N});
 
@@ -93,7 +93,8 @@ TEST_F(LinearOrientationTestFixture, ParitySmallShapes)
         ASSERT_TRUE(kernel.execute(inputs, outputs));
 
         // Reference matmul + bias (single-process notion)
-        auto ref = testref::matmul_row_major(input->data(), weight->data(), c.M, c.K, c.N);
+        // Weight is [N,K] so use transposed version
+        auto ref = testref::matmul_with_transposed_b(input->data(), weight->data(), c.M, c.K, c.N);
         for (int m = 0; m < c.M; ++m)
         {
             for (int n = 0; n < c.N; ++n)
@@ -126,7 +127,7 @@ TEST_F(LinearOrientationTestFixture, RandomizedBatched)
         int K = 4 + (iter * 3) % 16; // vary
         int N = 2 + (iter * 5) % 20; // vary
         auto input = make_simple({M, K});
-        auto weight = make_simple({K, N});
+        auto weight = make_simple({N, K});
         auto bias = make_simple({N});
         auto output = make_simple({M, N});
 
@@ -142,7 +143,8 @@ TEST_F(LinearOrientationTestFixture, RandomizedBatched)
         std::vector<std::shared_ptr<TensorBase>> outputs = {output};
         ASSERT_TRUE(kernel.execute(inputs, outputs));
 
-        auto ref = testref::matmul_row_major(input->data(), weight->data(), M, K, N);
+        // Weight is [N,K] so use transposed version
+        auto ref = testref::matmul_with_transposed_b(input->data(), weight->data(), M, K, N);
         for (int m = 0; m < M; ++m)
             for (int n = 0; n < N; ++n)
                 ref[m * N + n] += bias->data()[n];

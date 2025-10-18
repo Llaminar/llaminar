@@ -8,18 +8,18 @@
 namespace llaminar
 {
     /**
-     * @brief Base interface for all computational kernels
+     * @brief Base interface for all computational operators
      *
-     * This interface provides a common API for all kernels to enable
+     * This interface provides a common API for all operators to enable
      * polymorphic execution within the compute graph framework.
      */
-    class KernelBase
+    class OperatorBase
     {
     public:
-        virtual ~KernelBase() = default;
+        virtual ~OperatorBase() = default;
 
         /**
-         * @brief Execute the kernel computation
+         * @brief Execute the operator computation
          * @param inputs Vector of input tensors
          * @param outputs Vector of output tensors (should be pre-allocated)
          * @return true if execution succeeded, false otherwise
@@ -37,20 +37,20 @@ namespace llaminar
                               const std::vector<std::shared_ptr<TensorBase>> &outputs) const = 0;
 
         /**
-         * @brief Get the kernel type name for debugging/logging
-         * @return String identifying the kernel type
+         * @brief Get the operator type name for debugging/logging
+         * @return String identifying the operator type
          */
-        virtual std::string getKernelType() const = 0;
+        virtual std::string getOperatorType() const = 0;
 
         /**
          * @brief Get expected number of input tensors
-         * @return Number of input tensors this kernel expects
+         * @return Number of input tensors this operator expects
          */
         virtual size_t getExpectedInputCount() const = 0;
 
         /**
          * @brief Get expected number of output tensors
-         * @return Number of output tensors this kernel produces
+         * @return Number of output tensors this operator produces
          */
         virtual size_t getExpectedOutputCount() const = 0;
     };

@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "cmake: configure",
+            "label": "cmake: configure (debug)",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -13,7 +13,10 @@
                 "-G",
                 "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Debug",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DCMAKE_CXX_FLAGS_DEBUG=-g -O0 --coverage -fprofile-abs-path",
+                "-DCMAKE_C_FLAGS_DEBUG=-g -O0 --coverage -fprofile-abs-path",
+                "-DCMAKE_EXE_LINKER_FLAGS_DEBUG=--coverage"
             ],
             "group": "build",
             "presentation": {
@@ -25,150 +28,15 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure CMake project with debug settings"
+            "detail": "Configure CMake project with Debug settings (includes coverage)"
         },
         {
-            "label": "cmake: build",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build",
-                "--config",
-                "Debug",
-                "--parallel"
-            ],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "problemMatcher": [],
-            "detail": "Build the CMake project",
-            "dependsOn": "cmake: configure"
-        },
-        {
-            "label": "cmake: clean",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build",
-                "--target",
-                "clean"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Clean the CMake build"
-        },
-        {
-            "label": "cmake: rebuild",
-            "type": "shell",
-            "command": "echo",
-            "args": [
-                "Running clean and build..."
-            ],
-            "group": "build",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "cmake: clean",
-                "cmake: build"
-            ],
-            "detail": "Clean and rebuild the CMake project"
-        },
-        {
-            "label": "cmake: build core",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build",
-                "--target",
-                "llaminar_core",
-                "--parallel"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "problemMatcher": [],
-            "dependsOn": "cmake: configure",
-            "detail": "Build only the llaminar core library"
-        },
-        {
-            "label": "cmake: build COSMA",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build",
-                "--target",
-                "cosma",
-                "--parallel"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "problemMatcher": [],
-            "dependsOn": "cmake: configure",
-            "detail": "Build only the COSMA library"
-        },
-        {
-            "label": "cmake: build main",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build",
-                "--target",
-                "llaminar",
-                "--parallel"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "problemMatcher": [],
-            "dependsOn": "cmake: configure",
-            "detail": "Build only the llaminar executable"
-        },
-        {
-            "label": "cmake: configure Release",
+            "label": "cmake: configure (release)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "-B",
-                "${workspaceFolder}/build",
+                "${workspaceFolder}/build_release",
                 "-S",
                 "${workspaceFolder}",
                 "-G",
@@ -193,12 +61,39 @@
             "detail": "Configure CMake project with optimized Release settings"
         },
         {
-            "label": "cmake: build Release",
+            "label": "cmake: build (debug)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
                 "${workspaceFolder}/build",
+                "--config",
+                "Debug",
+                "--parallel"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "dependsOn": "cmake: configure (debug)",
+            "detail": "Build CMake project in Debug mode"
+        },
+        {
+            "label": "cmake: build (release)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_release",
                 "--config",
                 "Release",
                 "--parallel"
@@ -213,130 +108,20 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Build the CMake project in Release mode",
-            "dependsOn": "cmake: configure Release"
+            "dependsOn": "cmake: configure (release)",
+            "detail": "Build CMake project in Release mode"
         },
         {
-            "label": "test: run ctest",
+            "label": "cmake: clean (debug)",
             "type": "shell",
-            "command": "ctest",
+            "command": "cmake",
             "args": [
-                "--test-dir",
+                "--build",
                 "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--parallel"
+                "--target",
+                "clean"
             ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build",
-            "detail": "Run all CTest tests with parallel execution (Note: Some tests currently fail due to numerical precision and validation issues)"
-        },
-        {
-            "label": "test: run ctest verbose",
-            "type": "shell",
-            "command": "ctest",
-            "args": [
-                "--test-dir",
-                "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--verbose",
-                "--parallel"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build",
-            "detail": "Run all CTest tests with verbose output"
-        },
-        {
-            "label": "test: show test status",
-            "type": "shell",
-            "command": "bash",
-            "args": [
-                "-c",
-                "echo '=== TEST STATUS SUMMARY ===' && cd ${workspaceFolder} && ctest --test-dir build --output-on-failure --parallel | tail -20"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build",
-            "detail": "Show summary of test pass/fail status"
-        },
-        {
-            "label": "test: fast core",
-            "type": "process",
-            "command": "ctest",
-            "args": [
-                "--test-dir",
-                "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--stop-on-failure",
-                "-R",
-                "^(BasicTest|NumaTest|AttentionGoldenTest|GraphTest|MPILinearKernelTest)$"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build",
-            "detail": "Run a fast core subset of stable tests"
-        },
-        {
-            "label": "mpi: run (2 processes)",
-            "type": "shell",
-            "command": "mpirun",
-            "args": [
-                "-np",
-                "2",
-                "${workspaceFolder}/build/${input:targetName}"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build",
-            "detail": "Run MPI application for Llaminar with 2 processes (2 NUMA nodes)"
-        },
-        {
-            "label": "test: run MPI tests",
-            "type": "shell",
-            "command": "ctest",
-            "args": [
-                "--verbose",
-                "--test-dir",
-                "${workspaceFolder}/build"
-            ],
-            "group": "test",
-            "dependsOn": "cmake: build",
+            "group": "build",
             "presentation": {
                 "echo": true,
                 "reveal": "always",
@@ -345,53 +130,31 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "problemMatcher": [],
-            "detail": "Run the MPI functionality tests via CTest"
+            "detail": "Clean Debug build artifacts"
         },
         {
-            "label": "mpi: run (4 processes)",
+            "label": "cmake: clean (release)",
             "type": "shell",
-            "command": "mpirun",
+            "command": "cmake",
             "args": [
-                "-np",
-                "4",
-                "${workspaceFolder}/build/${input:targetName}"
+                "--build",
+                "${workspaceFolder}/build_release",
+                "--target",
+                "clean"
             ],
-            "group": "test",
+            "group": "build",
             "presentation": {
                 "echo": true,
                 "reveal": "always",
-                "focus": true,
+                "focus": false,
                 "panel": "shared",
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build",
-            "detail": "Run MPI application with 4 processes"
+            "detail": "Clean Release build artifacts"
         },
         {
-            "label": "mpi: run llaminar (2 processes)",
-            "type": "shell",
-            "command": "mpirun",
-            "args": [
-                "-np",
-                "2",
-                "${workspaceFolder}/build/llaminar"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build main",
-            "detail": "Run llaminar with 2 MPI processes"
-        },
-        {
-            "label": "test: smoke (fast core tests)",
+            "label": "test: smoke tests",
             "type": "shell",
             "command": "ctest",
             "args": [
@@ -411,11 +174,35 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build",
-            "detail": "Run quick smoke tests (~5s total, 14 tests) - core functionality validation"
+            "dependsOn": "cmake: build (debug)",
+            "detail": "Run quick smoke tests (~5s, 14 tests) - core functionality validation"
         },
         {
-            "label": "test: unit (all unit tests)",
+            "label": "test: parity tests",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--verbose",
+                "-R",
+                "(ParityFrameworkTest|AbstractPipelineParity)"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build (debug)",
+            "detail": "Run parity tests - PyTorch and llama.cpp comparisons (~4min)"
+        },
+        {
+            "label": "test: unit tests",
             "type": "shell",
             "command": "ctest",
             "args": [
@@ -424,7 +211,7 @@
                 "--output-on-failure",
                 "--parallel",
                 "-E",
-                "(Integration|ParityFramework|Incremental|Qwen|Prefill|.*Stress.*)"
+                "(Integration|ParityFrameworkTest|Incremental|Qwen|Prefill|.*Stress.*)"
             ],
             "group": "test",
             "presentation": {
@@ -435,21 +222,13 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build",
-            "detail": "Run all unit tests, no heavy integration (<5min)"
+            "dependsOn": "cmake: build (debug)",
+            "detail": "Run all unit tests - no heavy integration (~2m30s)"
         },
         {
-            "label": "test: parity integration",
+            "label": "bench: run performance benchmarks",
             "type": "shell",
-            "command": "ctest",
-            "args": [
-                "--test-dir",
-                "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--verbose",
-                "-R",
-                "(ParityFramework|AbstractPipelineParity)"
-            ],
+            "command": "${workspaceFolder}/run_performance_bench.sh",
             "group": "test",
             "presentation": {
                 "echo": true,
@@ -459,21 +238,13 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build",
-            "detail": "Run only ParityFramework tests - llama.cpp and PyTorch comparisons (~2min)"
+            "dependsOn": "cmake: build (release)",
+            "detail": "Run performance benchmarks (requires Release build)"
         },
         {
-            "label": "test: integration (heavy tests)",
+            "label": "gcov: show coverage metrics",
             "type": "shell",
-            "command": "ctest",
-            "args": [
-                "--test-dir",
-                "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--verbose",
-                "-R",
-                "(Integration|Incremental|Qwen|Prefill|End2End|KVCache)"
-            ],
+            "command": "${workspaceFolder}/.vscode/show-coverage.sh",
             "group": "test",
             "presentation": {
                 "echo": true,
@@ -483,38 +254,28 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build",
-            "detail": "Run integration tests with model loading (<10min)"
+            "detail": "Display coverage metrics summary from gcov"
         },
         {
-            "label": "test: full suite",
+            "label": "gcov: reset coverage data",
             "type": "shell",
-            "command": "ctest",
+            "command": "find",
             "args": [
-                "--test-dir",
                 "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--parallel"
+                "-name",
+                "*.gcda",
+                "-delete"
             ],
             "group": "test",
             "presentation": {
                 "echo": true,
                 "reveal": "always",
-                "focus": true,
+                "focus": false,
                 "panel": "shared",
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build",
-            "detail": "Run complete test suite - all ~120 tests (<15min)"
-        }
-    ],
-    "inputs": [
-        {
-            "id": "targetName",
-            "description": "Target executable name",
-            "default": "llaminar",
-            "type": "promptString"
+            "detail": "Delete all .gcda coverage data files to start fresh"
         }
     ]
 }

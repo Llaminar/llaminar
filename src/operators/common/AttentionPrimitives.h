@@ -28,6 +28,21 @@ namespace llaminar::attn
 {
 
     void apply_rope(float *q, float *k, int seq_len, int head_dim, int q_heads, int k_heads, int n_past, float freq_base);
+
+    /**
+     * @brief Apply RoPE to batched Q and K tensors
+     * @param q Query tensor [batch_size, seq_len, q_heads * head_dim]
+     * @param k Key tensor [batch_size, seq_len, k_heads * head_dim]
+     * @param batch_size Number of sequences in batch
+     * @param seq_len Sequence length per batch element
+     * @param head_dim Dimension per head
+     * @param q_heads Number of query heads
+     * @param k_heads Number of key heads (may differ for GQA)
+     * @param n_past Number of tokens already processed
+     * @param freq_base Base frequency for RoPE
+     */
+    void apply_rope_batched(float *q, float *k, int batch_size, int seq_len, int head_dim,
+                            int q_heads, int k_heads, int n_past, float freq_base);
     /**
      * @brief Compute attention scores Q @ K^T (with optional causal masking)
      * @param q Query tensor [q_seq_len, heads * head_dim]
@@ -46,6 +61,33 @@ namespace llaminar::attn
     void apply_scores_to_v(const float *scores, const float *v, float *out,
                            int q_seq_len, int k_seq_len, int head_dim, int heads);
     void fused_attention(const float *q, const float *k, const float *v, float *out, int seq_len, int head_dim, int heads, bool causal);
+
+    /**
+     * @brief Compute attention scores for batched inputs
+     * @param q Query tensor [batch_size, seq_len, heads * head_dim]
+     * @param k Key tensor [batch_size, seq_len, heads * head_dim]
+     * @param scores Output scores [batch_size, heads, seq_len, seq_len]
+     * @param batch_size Number of sequences in batch
+     * @param seq_len Sequence length
+     * @param head_dim Dimension per head
+     * @param heads Number of heads
+     * @param causal Apply causal masking
+     */
+    void compute_qk_scores_batched(const float *q, const float *k, float *scores,
+                                   int batch_size, int seq_len, int head_dim, int heads, bool causal);
+
+    /**
+     * @brief Apply attention scores to values for batched inputs
+     * @param scores Attention scores [batch_size, heads, seq_len, seq_len]
+     * @param v Value tensor [batch_size, seq_len, heads * head_dim]
+     * @param out Output tensor [batch_size, heads, seq_len, head_dim]
+     * @param batch_size Number of sequences in batch
+     * @param seq_len Sequence length
+     * @param head_dim Dimension per head
+     * @param heads Number of heads
+     */
+    void apply_scores_to_v_batched(const float *scores, const float *v, float *out,
+                                   int batch_size, int seq_len, int head_dim, int heads);
 
     /**
      * @brief Expand KV heads for Grouped Query Attention (GQA)

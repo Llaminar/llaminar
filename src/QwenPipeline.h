@@ -85,7 +85,7 @@ namespace llaminar
 
         std::string getName() const { return "QwenPipeline"; }
         std::string name() const override { return "QwenPipeline"; }
-        std::string getKernelType() const override { return "QwenPipeline"; }
+        std::string getOperatorType() const override { return "QwenPipeline"; }
         size_t getExpectedInputCount() const override { return 1; }
         size_t getExpectedOutputCount() const override { return 1; }
 
@@ -96,6 +96,28 @@ namespace llaminar
         bool decode(int next_token,
                     const IModelWeights &weights,
                     StageContext &ctx) override;
+
+        // Batch processing methods
+        bool prefillBatch(const std::vector<std::vector<int>> &token_batches,
+                          const IModelWeights &weights,
+                          StageContext &ctx,
+                          std::shared_ptr<TensorBase> &out_logits) override;
+        bool decodeBatch(const std::vector<int> &next_tokens,
+                         const IModelWeights &weights,
+                         StageContext &ctx,
+                         std::shared_ptr<TensorBase> &out_logits) override;
+
+        /**
+         * @brief Initialize or resize batch state for given batch size
+         * @param batch_size Number of sequences in batch
+         */
+        void ensureBatchState(int batch_size);
+
+        /**
+         * @brief Clear all batch state
+         */
+        void clearBatchState();
+
         bool logits(std::shared_ptr<TensorBase> &out_logits) override;
         const KVCacheState *kvCacheState() const override;
         bool ensureKVCapacity(int required_tokens) override;
@@ -300,9 +322,14 @@ namespace llaminar
     private:
         ModelConfig config_;
         bool use_kv_cache_;
-        int n_past_;
+        int n_past_; // Single-sequence position (legacy)
         bool is_prefill_stage_{true};
         bool kv_cache_dynamic_init_{false};
+
+        // Batch state tracking (Phase 3.3)
+        std::vector<int> n_past_batch_;                                       // Position per sequence in batch
+        std::vector<std::vector<std::shared_ptr<TensorBase>>> k_cache_batch_; // K cache per sequence
+        std::vector<std::vector<std::shared_ptr<TensorBase>>> v_cache_batch_; // V cache per sequence
         struct InternalKVState
         {
             int capacity_tokens = 0;
@@ -346,7 +373,20 @@ namespace llaminar
      * @note This is an implementation detail used by pipeline adapters.
      *       External code should use AbstractPipeline::loadWeights() instead.
      */
+    /**
+     * @brief Bridge function to load weights using the new contract system
+     * @note This function is used by both QwenPipeline and adapters
+     */
     QwenPipeline::ModelWeights loadModelWeights_impl_bridge(
+        ModelLoader &loader,
+        const QwenPipeline::LayerConfig &config);
+
+    /**
+     * @brief Bridge function to load weights for BATCH mode (REPLICATED weights)
+     * @note Batch operators handle weight distribution internally, so all weights
+     *       must be loaded as REPLICATED (full copy) instead of MPI-sliced.
+     */
+    QwenPipeline::ModelWeights loadModelWeights_batch_bridge(
         ModelLoader &loader,
         const QwenPipeline::LayerConfig &config);
 

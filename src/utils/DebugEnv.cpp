@@ -181,10 +181,9 @@ namespace llaminar
     s.pipeline.incr_cache_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_CACHE_TRACE"));
     s.pipeline.incr_hidden_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE"));
     s.pipeline.debug_decode_embed = flag(std::getenv("LLAMINAR_DEBUG_DECODE_EMBED"));
-    // FFN fusion: default ON, can disable with LLAMINAR_FFN_FUSION=0
-    {
-        const char *ffn_fusion_env = std::getenv("LLAMINAR_FFN_FUSION");
-        s.pipeline.ffn_fusion_enabled = ffn_fusion_env ? (std::atoi(ffn_fusion_env) != 0) : true;
+    // FFN fusion (default: enabled)
+    if(const char* ffn = std::getenv("LLAMINAR_PIPELINE_FFN_FUSION_ENABLED")) {
+        if(*ffn == '0') s.pipeline.ffn_fusion_enabled = false;
     }
     // KV cache
     s.kv_cache.dynamic_init = flag(std::getenv("LLAMINAR_KV_DYNAMIC_INIT"));
@@ -194,13 +193,18 @@ namespace llaminar
         s.dequant.anomalies = flag(std::getenv("LLAMINAR_DEQUANT_ANOMALIES"));
     // Adaptive
     s.adaptive.disable_cosma = flag(std::getenv("ADAPTIVE_DISABLE_COSMA"));
-    s.adaptive.log_threading = flag(std::getenv("LLAMINAR_LOG_THREADING"));
+    s.adaptive.log_threading = flag(std::getenv("LLAMINAR_ADAPTIVE_LOG_THREADING"));
     // Attention
     s.attention.validate_primitives = flag(std::getenv("LLAMINAR_ATTN_PRIMITIVES_VALIDATE"));
     s.attention.validate_output = flag(std::getenv("LLAMINAR_ATTN_OUTPUT_VALIDATE"));
     if(const char* up = std::getenv("LLAMINAR_ATTN_USE_PRIMITIVES")) {
         // empty string => treat as true; explicit 0 disables
         if(*up == '0') s.attention.use_primitives = false; else s.attention.use_primitives = true;
+    }
+    // Capture control: default disabled, must be explicitly enabled for snapshots
+    if(const char* ce = std::getenv("LLAMINAR_ATTN_CAPTURE_ENABLED")) {
+        if(*ce == '1' || std::string(ce) == "true" || std::string(ce) == "TRUE") s.attention.capture_enabled = true;
+        else s.attention.capture_enabled = false;
     }
     if(const char* om = std::getenv("LLAMINAR_ATTN_OUTPUT_MODE")) { if(*om){ s.attention.output_mode_forced=true; s.attention.output_mode = om; }}
     if(const char* gt = std::getenv("LLAMINAR_ATTN_GATHER_THRESHOLD")) { s.attention.gather_threshold = std::atoi(gt); }
@@ -294,9 +298,9 @@ namespace llaminar
             long long v = std::atoll(scm);
             if(v >= 0) s.loader.shard_cache_max_mb = v; // keep 0 sentinel (disabled)
         }
-        // NUMA-aware allocation (default enabled for multi-socket performance)
+        // NUMA first-touch (default: enabled)
         if(const char* nft = std::getenv("LLAMINAR_NUMA_FIRST_TOUCH")) {
-            if(*nft == '0') s.loader.numa_first_touch = false; // explicitly disabled
+            if(*nft == '0') s.loader.numa_first_touch = false;
         }
         s.loader.numa_verify_locality = flag(std::getenv("LLAMINAR_NUMA_VERIFY_LOCALITY"));
 
@@ -365,6 +369,11 @@ namespace llaminar
     s.performance.layer_mlp = flag(std::getenv("LLAMINAR_PERF_LAYER_MLP"));
     s.performance.layer_verbose = flag(std::getenv("LLAMINAR_PERF_LAYER_VERBOSE"));
     s.performance.layer_attention = flag(std::getenv("LLAMINAR_PERF_LAYER_ATTENTION"));
+    s.performance.trace_enabled = flag(std::getenv("LLAMINAR_PERF_TRACE_ENABLED"));
+    if(const char* tf = std::getenv("LLAMINAR_PERF_TRACE_FILTER")) if(*tf) s.performance.trace_filter = tf;
+    if(const char* td = std::getenv("LLAMINAR_PERF_TRACE_DETAIL")) if(*td) s.performance.trace_detail = td;
+    s.performance.trace_dump_on_exit = flag(std::getenv("LLAMINAR_PERF_TRACE_DUMP_ON_EXIT"));
+    if(const char* to = std::getenv("LLAMINAR_PERF_TRACE_OUTPUT_FILE")) if(*to) s.performance.trace_output_file = to;
     if(const char* fr = std::getenv("LLAMINAR_RMS_FORENSICS_FUSED")) if(*fr) s.rms_fused.forensics = true;
     if(const char* rr2 = std::getenv("LLAMINAR_RMS_FUSED_ROWS")) if(*rr2){ int v=std::atoi(rr2); if(v>0) s.rms_fused.rows_preview = v; }
     if(const char* cc2 = std::getenv("LLAMINAR_RMS_FUSED_COLS")) if(*cc2){ int v=std::atoi(cc2); if(v>0) s.rms_fused.cols_preview = v; }
@@ -431,24 +440,6 @@ namespace llaminar
     if(std::getenv("LLAMINAR_TP_MLP_VALIDATE")) s.mlp_tp.validate = true;
     if(std::getenv("LLAMINAR_TP_MLP_FORCE_COLUMN")) s.mlp_tp.force_column = true;
     if(std::getenv("LLAMINAR_TP_MLP_FORCE_ROW")) s.mlp_tp.force_row = true;
-    
-    // Performance tracing
-    if(std::getenv("LLAMINAR_PERF_TRACE")) s.perf.trace_enabled = true;
-    if(const char* td = std::getenv("LLAMINAR_PERF_TRACE_DETAIL")) {
-        std::string detail(td);
-        for(char &c: detail) c = (char)std::tolower(c);
-        s.perf.trace_detail = detail;
-    }
-    if(const char* tf = std::getenv("LLAMINAR_PERF_TRACE_FILTER")) {
-        if(*tf) s.perf.trace_filter = tf;
-    }
-    if(const char* to = std::getenv("LLAMINAR_PERF_TRACE_DUMP")) {
-        if(*to) s.perf.trace_output_file = to;
-    }
-    if(const char* ad = std::getenv("LLAMINAR_PERF_TRACE_AUTO_DUMP")) {
-        if(*ad == '0') s.perf.trace_dump_on_exit = false;
-    }
-    
     return s; }());
         }
         return *g_snapshot;
@@ -484,6 +475,11 @@ namespace llaminar
                 s.cosma.max_resident_mb = to_ll(std::getenv("LLAMINAR_COSMA_MAX_RESIDENT_MB"), 2048);
                 s.cosma.disable = flag(std::getenv("LLAMINAR_COSMA_DISABLE"));
                 s.cosma.force = flag(std::getenv("LLAMINAR_COSMA_FORCE"));
+                // Attention (refresh subset)
+                if(const char* ce = std::getenv("LLAMINAR_ATTN_CAPTURE_ENABLED")) {
+                    if(*ce == '1' || std::string(ce) == "true" || std::string(ce) == "TRUE") s.attention.capture_enabled = true;
+                    else s.attention.capture_enabled = false;
+                }
                 // Distribution
                 // Softmax (refresh subset)
                 s.softmax.force_scalar = flag(std::getenv("LLAMINAR_SOFTMAX_FORCE_SCALAR"));

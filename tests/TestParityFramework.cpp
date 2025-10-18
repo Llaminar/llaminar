@@ -1336,6 +1336,8 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
     // Enable snapshot capture for Llaminar
     // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+    setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
+    debugEnvRefresh();                               // Refresh debug environment to pick up LLAMINAR_ATTN_CAPTURE_ENABLED
     LlaminarSnapshotHook::set_enabled(true);
     PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
@@ -1638,7 +1640,6 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
 
     // Force COSMA path (lower threshold to ensure COSMA is used for 100-token sequence)
     setenv("LLAMINAR_COSMA_PREFILL_THRESHOLD", "50", 1);
-    debugEnvRefresh(); // Refresh debug environment snapshot to pick up new threshold
 
     // Load PyTorch snapshots (rank 0 only)
     PyTorchSnapshotLoader pytorch_loader(snapshot_dir);
@@ -1646,6 +1647,8 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
     // Enable snapshot capture for Llaminar
     // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+    setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
+    debugEnvRefresh();                               // Refresh debug environment to pick up LLAMINAR_ATTN_CAPTURE_ENABLED
     LlaminarSnapshotHook::set_enabled(true);
     PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
@@ -2339,6 +2342,8 @@ TEST(ParityFramework, TrueIncrementalDecodeVsPyTorch)
 
     // Enable snapshot capture
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+    setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
+    debugEnvRefresh();                               // Refresh debug environment to pick up LLAMINAR_ATTN_CAPTURE_ENABLED
     LlaminarSnapshotHook::set_enabled(true);
     PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
 

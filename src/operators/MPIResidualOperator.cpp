@@ -39,15 +39,15 @@ namespace llaminar
 {
 
     MPIResidualOperator::MPIResidualOperator(DistributionStrategy strategy)
-        : MPIKernelBase(), strategy_(strategy), num_threads_(omp_get_max_threads()), broadcasting_enabled_(false)
+        : MPIOperatorBase(), strategy_(strategy), num_threads_(omp_get_max_threads()), broadcasting_enabled_(false)
     {
         LOG_DEBUG("MPIResidualOperator initialized on rank " << getRank() << "/" << getSize()
-                                                           << " with strategy: " << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "ELEMENT_WISE")
-                                                           << ", OpenMP threads: " << num_threads_);
+                                                             << " with strategy: " << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "ELEMENT_WISE")
+                                                             << ", OpenMP threads: " << num_threads_);
     }
 
     bool MPIResidualOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                    std::vector<std::shared_ptr<TensorBase>> &outputs)
+                                      std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         PERF_SCOPED_TIMER("MPIResidualOperator::execute");
 
@@ -99,12 +99,12 @@ namespace llaminar
         const bool replicated_inputs = !input_distributed && !residual_distributed && !output_distributed;
 
         LOG_DEBUG("MPIResidualOperator tensor types: input=" << input_tensor->type_name()
-                                                           << " residual=" << residual_tensor->type_name()
-                                                           << " output=" << output_tensor->type_name()
-                                                           << " distributed_flags=(" << (input_distributed ? "D" : "R")
-                                                           << "," << (residual_distributed ? "D" : "R")
-                                                           << "," << (output_distributed ? "D" : "R")
-                                                           << ") replicated=" << (replicated_inputs ? "true" : "false"));
+                                                             << " residual=" << residual_tensor->type_name()
+                                                             << " output=" << output_tensor->type_name()
+                                                             << " distributed_flags=(" << (input_distributed ? "D" : "R")
+                                                             << "," << (residual_distributed ? "D" : "R")
+                                                             << "," << (output_distributed ? "D" : "R")
+                                                             << ") replicated=" << (replicated_inputs ? "true" : "false"));
 
         const float *input_data = input_tensor->data();
         const float *residual_data = residual_tensor->data();
@@ -150,14 +150,14 @@ namespace llaminar
         TensorLogger::logTensorStats(output_tensor, "residual_output");
 
         LOG_DEBUG("MPIResidualOperator executed: " << seq_len << "x" << hidden_size
-                                                 << " in " << std::fixed << std::setprecision(2) << execution_time
-                                                 << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
+                                                   << " in " << std::fixed << std::setprecision(2) << execution_time
+                                                   << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
 
         return true;
     }
 
     bool MPIResidualOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                     const std::vector<std::shared_ptr<TensorBase>> &outputs) const
+                                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Check input count
         if (inputs.size() != 2)
@@ -290,11 +290,11 @@ namespace llaminar
         }
 
         LOG_DEBUG("MPIResidualOperator: Rank " << rank << " processing elements ["
-                                             << start_idx << ", " << end_idx << ") of " << total_elements);
+                                               << start_idx << ", " << end_idx << ") of " << total_elements);
     }
 
     void MPIResidualOperator::executeSequenceWise(const float *input_data, const float *residual_data, float *output_data,
-                                                int seq_len, int hidden_size, bool replicated)
+                                                  int seq_len, int hidden_size, bool replicated)
     {
         // Distribute sequence positions across MPI ranks
         size_t total_positions = seq_len;
@@ -329,7 +329,7 @@ namespace llaminar
     }
 
     void MPIResidualOperator::executeElementWise(const float *input_data, const float *residual_data, float *output_data,
-                                               size_t total_elements, bool replicated)
+                                                 size_t total_elements, bool replicated)
     {
         // Distribute all elements across MPI ranks
         size_t start_idx, end_idx;
@@ -356,7 +356,7 @@ namespace llaminar
     }
 
     bool MPIResidualOperator::areShapesCompatible(const std::vector<int> &input_shape,
-                                                const std::vector<int> &residual_shape) const
+                                                  const std::vector<int> &residual_shape) const
     {
         // Check for exact match
         if (input_shape.size() != residual_shape.size())
@@ -376,8 +376,8 @@ namespace llaminar
     }
 
     void MPIResidualOperator::executeBroadcast(const float *input_data, const float *residual_data, float *output_data,
-                                             const std::vector<int> &input_shape,
-                                             const std::vector<int> &residual_shape)
+                                               const std::vector<int> &input_shape,
+                                               const std::vector<int> &residual_shape)
     {
         // Simple broadcasting implementation for common cases
         // This can be extended for more complex broadcasting rules as needed

@@ -43,7 +43,7 @@ namespace mpi_slicing
             return cfg.n_head_kv;
         if (expr == "head_dim")
             return cfg.head_dim;
-        if (expr == "d_ff")
+        if (expr == "d_ff" || expr == "intermediate_size") // intermediate_size is alias for d_ff
             return cfg.d_ff;
         if (expr == "vocab_size")
             return cfg.vocab_size;

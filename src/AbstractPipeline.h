@@ -30,6 +30,7 @@ namespace llaminar
     {
         InferenceStage stage{InferenceStage::Prefill};
         int seq_len = 0;     // current prompt / token window length
+        int batch_size = 1;  // number of sequences in batch (1 for single sequence)
         int generated = 0;   // number of tokens already generated (decode context)
         int kv_capacity = 0; // total allocated KV slots (per layer) if available
         int kv_used = 0;     // populated KV token rows
@@ -71,6 +72,8 @@ namespace llaminar
          */
         virtual const ModelConfig &config() const = 0;
 
+        // === Single-Sequence Methods (Original Interface) ===
+
         virtual bool prefill(const std::vector<int> &tokens,
                              const IModelWeights &weights,
                              StageContext &ctx) = 0;
@@ -79,6 +82,80 @@ namespace llaminar
                             StageContext &ctx) = 0;
         virtual bool logits(std::shared_ptr<TensorBase> &out_logits) = 0; // obtain last computed logits
         virtual std::string name() const = 0;
+
+        // === Batch Processing Methods (Parallel Batching) ===
+
+        /**
+         * @brief Process multiple sequences in parallel (prefill phase)
+         *
+         * @param token_batches Vector of token sequences, one per sequence in batch
+         * @param weights Model weights
+         * @param ctx Stage context (will be updated with aggregate stats)
+         * @param out_logits Output logits tensor [batch, max_seq_len, vocab_size]
+         * @return true if successful, false otherwise
+         *
+         * Default implementation: not supported (returns false)
+         */
+        virtual bool prefillBatch(
+            const std::vector<std::vector<int>> &token_batches,
+            const IModelWeights &weights,
+            StageContext &ctx,
+            std::shared_ptr<TensorBase> &out_logits)
+        {
+            (void)token_batches;
+            (void)weights;
+            (void)ctx;
+            (void)out_logits;
+            return false; // Not implemented by default
+        }
+
+        /**
+         * @brief Generate next token for multiple sequences in parallel (decode phase)
+         *
+         * @param next_tokens Next token for each sequence [batch_size]
+         * @param weights Model weights
+         * @param ctx Stage context
+         * @param out_logits Output logits tensor [batch, vocab_size]
+         * @return true if successful, false otherwise
+         *
+         * Default implementation: not supported (returns false)
+         */
+        virtual bool decodeBatch(
+            const std::vector<int> &next_tokens,
+            const IModelWeights &weights,
+            StageContext &ctx,
+            std::shared_ptr<TensorBase> &out_logits)
+        {
+            (void)next_tokens;
+            (void)weights;
+            (void)ctx;
+            (void)out_logits;
+            return false; // Not implemented by default
+        }
+
+        /**
+         * @brief Reset pipeline for batch processing
+         *
+         * @param batch_size Number of sequences in batch
+         *
+         * Allocates/initializes state for processing batch_size sequences simultaneously.
+         * Default implementation: no-op (single-sequence pipelines ignore this)
+         */
+        virtual void resetBatch(size_t batch_size)
+        {
+            (void)batch_size;
+            // No-op by default
+        }
+
+        /**
+         * @brief Get current batch size
+         *
+         * @return Current batch size (1 for single-sequence pipelines)
+         */
+        virtual size_t currentBatchSize() const
+        {
+            return 1; // Single-sequence by default
+        }
 
         /**
          * @brief Load model weights from file path.
@@ -121,7 +198,8 @@ namespace llaminar
             int layer_index,
             const float *data,
             int seq_len,
-            int feature_dim);
+            int feature_dim,
+            const std::string &source = "llaminar");
 
         /**
          * @brief Check if parity testing/snapshot capture is enabled

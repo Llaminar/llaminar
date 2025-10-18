@@ -217,7 +217,8 @@ namespace llaminar
         int feature_dim = tensor->shape()[1];
 
         // Delegate to AbstractPipeline base class method which calls PipelineSnapshotManager
-        AbstractPipeline::captureStageSnapshot(stage, layer_idx, tensor->data(), seq_len, feature_dim);
+        // Use snapshot_source_ from PipelineBase to differentiate batch vs sequential
+        AbstractPipeline::captureStageSnapshot(stage, layer_idx, tensor->data(), seq_len, feature_dim, snapshot_source_);
     }
 
     bool QwenPipeline::executeTransformerLayer(int layer_idx,
@@ -781,12 +782,12 @@ namespace llaminar
     {
         {
             auto embedding_kernel = std::make_unique<MPIEmbeddingOperator>(config_.getLayerConfig().vocab_size, config_.getLayerConfig().d_model);
-            if (!registerKernel("embedding", std::move(embedding_kernel)))
+            if (!registerOperator("embedding", std::move(embedding_kernel)))
                 throw std::runtime_error("Failed to register Embedding kernel");
         }
         auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
         rmsnorm_kernel->setEpsilon(config_.getLayerConfig().eps);
-        if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
+        if (!registerOperator("rmsnorm", std::move(rmsnorm_kernel)))
             throw std::runtime_error("Failed to register RMSNorm operator");
 
         auto attention_kernel = std::make_unique<MPIAttentionOperator>(config_.getLayerConfig().n_head, config_.getLayerConfig().n_head_kv, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base);
@@ -816,25 +817,25 @@ namespace llaminar
 
         // Wire up snapshot callback for intermediate attention stages (Q/K/V proj, RoPE, scores, etc.)
         attention_kernel->setSnapshotCallback([this](PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)
-                                              { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim); });
+                                              { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim, snapshot_source_); });
 
-        if (!registerKernel("attention", std::move(attention_kernel)))
+        if (!registerOperator("attention", std::move(attention_kernel)))
             throw std::runtime_error("Failed to register Attention operator");
 
         auto linear_kernel = std::make_unique<MPILinearOperator>();
-        if (!registerKernel("linear", std::move(linear_kernel)))
+        if (!registerOperator("linear", std::move(linear_kernel)))
             throw std::runtime_error("Failed to register Linear kernel");
 
         auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
-        if (!registerKernel("swiglu", std::move(swiglu_kernel)))
+        if (!registerOperator("swiglu", std::move(swiglu_kernel)))
             throw std::runtime_error("Failed to register SwiGLU kernel");
 
         auto rope_kernel = std::make_unique<MPIRoPEOperator>(config_.getLayerConfig().max_seq_len, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base, MPIRoPEOperator::DistributionStrategy::SEQUENCE_WISE);
-        if (!registerKernel("rope", std::move(rope_kernel)))
+        if (!registerOperator("rope", std::move(rope_kernel)))
             throw std::runtime_error("Failed to register RoPE kernel");
 
         auto residual_kernel = std::make_unique<MPIResidualOperator>(MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
-        if (!registerKernel("residual", std::move(residual_kernel)))
+        if (!registerOperator("residual", std::move(residual_kernel)))
             throw std::runtime_error("Failed to register Residual kernel");
 
         LOG_DEBUG("QwenPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
@@ -958,6 +959,135 @@ namespace llaminar
 // Out-of-line full weight loader implementation.
 namespace llaminar
 {
+    QwenPipeline::ModelWeights loadModelWeights_batch_bridge(
+        ModelLoader &loader,
+        const QwenPipeline::LayerConfig &config)
+    {
+        QwenPipeline::ModelWeights weights;
+        LOG_INFO("[WeightLoad:BATCH] begin vocab=" << config.vocab_size << " d_model=" << config.d_model << " layers=" << config.n_layers);
+
+        // Load token embedding (REPLICATED)
+        weights.token_embedding = loader.loadTensor("token_embd.weight");
+        if (!weights.token_embedding)
+            throw std::runtime_error("Failed to load token_embd.weight");
+
+        // Load output norm (REPLICATED)
+        weights.output_norm_weight = loader.loadTensor("output_norm.weight");
+        if (!weights.output_norm_weight)
+            throw std::runtime_error("Failed to load output_norm.weight");
+
+        // Load lm_head (REPLICATED)
+        weights.lm_head = loader.loadTensor("output.weight");
+        if (!weights.lm_head)
+        {
+            LOG_WARN("[WeightLoad:BATCH] output.weight not found, using tied embeddings");
+            weights.lm_head = weights.token_embedding;
+        }
+
+        // Pre-allocate layer weights
+        weights.attn_norm_weight.reserve(config.n_layers);
+        weights.wq.reserve(config.n_layers);
+        weights.wk.reserve(config.n_layers);
+        weights.wv.reserve(config.n_layers);
+        weights.wo.reserve(config.n_layers);
+        weights.bq.reserve(config.n_layers);
+        weights.bk.reserve(config.n_layers);
+        weights.bv.reserve(config.n_layers);
+        weights.ffn_norm_weight.reserve(config.n_layers);
+        weights.w_gate.reserve(config.n_layers);
+        weights.w_up.reserve(config.n_layers);
+        weights.w_down.reserve(config.n_layers);
+
+        LOG_INFO("[WeightLoad:BATCH] Loading " << config.n_layers << " layers with REPLICATED weights (batch mode)");
+
+        // Get batch-mode contracts (all REPLICATED)
+        auto contracts = llaminar::getBatchQwenWeightContracts();
+
+        int mpi_rank = 0, mpi_size = 1;
+#ifdef LLAMINAR_HAVE_MPI
+        int mpi_initialized = 0;
+        MPI_Initialized(&mpi_initialized);
+        if (mpi_initialized)
+        {
+            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+        }
+#endif
+
+        // Contract indices
+        const int IDX_ATTN_NORM = 0;
+        const int IDX_Q = 1;
+        const int IDX_K = 2;
+        const int IDX_V = 3;
+        const int IDX_O = 4;
+        const int IDX_FFN_NORM = 5;
+        const int IDX_W_GATE = 6;
+        const int IDX_W_UP = 7;
+        const int IDX_W_DOWN = 8;
+
+        for (int layer = 0; layer < config.n_layers; ++layer)
+        {
+            std::string prefix = "blk." + std::to_string(layer) + ".";
+
+            // Load all tensors as REPLICATED (full copy on every rank)
+            auto attn_norm = contracts.layer_weights[IDX_ATTN_NORM].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wq = contracts.layer_weights[IDX_Q].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wk = contracts.layer_weights[IDX_K].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wv = contracts.layer_weights[IDX_V].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wo = contracts.layer_weights[IDX_O].load(
+                loader, config, mpi_rank, mpi_size, layer);
+
+            // Load biases (REPLICATED - batch operators handle distribution)
+            auto bq = loader.loadTensor(prefix + "attn_q.bias");
+            auto bk = loader.loadTensor(prefix + "attn_k.bias");
+            auto bv = loader.loadTensor(prefix + "attn_v.bias");
+
+            auto ffn_norm = contracts.layer_weights[IDX_FFN_NORM].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto w_gate = contracts.layer_weights[IDX_W_GATE].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto w_up = contracts.layer_weights[IDX_W_UP].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto w_down = contracts.layer_weights[IDX_W_DOWN].load(
+                loader, config, mpi_rank, mpi_size, layer);
+
+            // Store weights
+            weights.attn_norm_weight.push_back(attn_norm);
+            weights.wq.push_back(wq);
+            weights.wk.push_back(wk);
+            weights.wv.push_back(wv);
+            weights.wo.push_back(wo);
+            weights.bq.push_back(bq ? bq : std::make_shared<SimpleTensor>(std::vector<int>{1}));
+            weights.bk.push_back(bk ? bk : std::make_shared<SimpleTensor>(std::vector<int>{1}));
+            weights.bv.push_back(bv ? bv : std::make_shared<SimpleTensor>(std::vector<int>{1}));
+            weights.ffn_norm_weight.push_back(ffn_norm);
+            weights.w_gate.push_back(w_gate);
+            weights.w_up.push_back(w_up);
+            weights.w_down.push_back(w_down);
+            weights.w_gate_up_fused.push_back(nullptr); // Not used in batch mode
+
+            if (mpi_rank == 0 && layer == 0)
+            {
+                LOG_INFO("[WeightLoad:BATCH] Layer 0 weight shapes:");
+                LOG_INFO("  wq: [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
+                LOG_INFO("  wk: [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
+                LOG_INFO("  wv: [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
+                LOG_INFO("  wo: [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
+            }
+        }
+
+        if (mpi_rank == 0)
+        {
+            LOG_INFO("[WeightLoad:BATCH] Successfully loaded all " << config.n_layers << " layers");
+        }
+
+        return weights;
+    }
+
     QwenPipeline::ModelWeights loadModelWeights_impl_bridge(
         ModelLoader &loader,
         const QwenPipeline::LayerConfig &config)
@@ -978,9 +1108,15 @@ namespace llaminar
 
         // Log first few embedding values to verify consistency across ranks
         {
+            // Note: This is a free function, so we query MPI directly
             int mpi_rank = 0;
 #ifdef LLAMINAR_HAVE_MPI
-            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            int mpi_initialized = 0;
+            MPI_Initialized(&mpi_initialized);
+            if (mpi_initialized)
+            {
+                MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            }
 #endif
             const float *emb_ptr = weights.token_embedding->data();
             LOG_INFO("[WeightLoad] rank=" << mpi_rank
@@ -1553,6 +1689,19 @@ namespace llaminar
         }
         last_logits_ = output; // cache
 
+        if (getRank() == 0)
+        {
+            float sum_sq = 0.0f;
+            for (size_t i = 0; i < output->size(); ++i)
+            {
+                sum_sq += output->data()[i] * output->data()[i];
+            }
+            float l2_norm = std::sqrt(sum_sq / output->size());
+            LOG_DEBUG("[MAGNITUDE_TRACE_SEQ] Rank0 FINAL LOGITS (sequential): L2_norm=" << l2_norm << " size=" << output->size()
+                                                                                        << " first_5=[" << output->data()[0] << "," << output->data()[1] << ","
+                                                                                        << output->data()[2] << "," << output->data()[3] << "," << output->data()[4] << "]");
+        }
+
         // Parity capture: LM head output (final logits)
         captureIfEnabled(PipelineStage::LM_HEAD, -1, output);
 
@@ -1653,9 +1802,9 @@ namespace llaminar
 
             if (rank == 0 && l == 0 && (recreated_k || recreated_v))
             {
-                LOG_WARN("[CACHE_INIT_DEBUG] Layer 0: Recreated cache tensors! This will WIPE existing cache data!");
-                LOG_WARN("  k_cache recreated: " << (recreated_k ? "YES" : "no"));
-                LOG_WARN("  v_cache recreated: " << (recreated_v ? "YES" : "no"));
+                LOG_DEBUG("[CACHE_INIT_DEBUG] Layer 0: Recreated cache tensors! This will WIPE existing cache data!");
+                LOG_DEBUG("  k_cache recreated: " << (recreated_k ? "YES" : "no"));
+                LOG_DEBUG("  v_cache recreated: " << (recreated_v ? "YES" : "no"));
             }
         }
         kv_cache_state_.capacity_tokens = seq_len;
@@ -2057,8 +2206,15 @@ namespace llaminar
         // Execute prefill via provider (with cache capture if enabled)
         std::shared_ptr<TensorBase> output;
         PrefillMetrics metrics;
+
+        // DEBUG: Uncomment for detailed provider execution tracing
+        // std::cerr << "!!!!! [QwenPipeline] ABOUT TO CALL provider->execute, seq_len=" << tokens.size() << std::endl << std::flush;
+
         bool success = provider->execute(tokens, weights_iface, output, ctx, metrics,
                                          use_kv_cache_ ? &cache_provider : nullptr);
+
+        // DEBUG: Uncomment for detailed provider execution tracing
+        // std::cerr << "!!!!! [QwenPipeline] RETURNED FROM provider->execute, success=" << success << std::endl << std::flush;
 
         if (!success)
         {
@@ -2640,5 +2796,56 @@ namespace llaminar
         return true;
     }
 } // namespace llaminar
+
+// === Batch Interface Stubs (redirect to sequential) ===
+namespace llaminar
+{
+    bool QwenPipeline::prefillBatch(const std::vector<std::vector<int>> &token_batches,
+                                    const IModelWeights &weights,
+                                    StageContext &ctx,
+                                    std::shared_ptr<TensorBase> &out_logits)
+    {
+        // Sequential fallback: process each sequence independently
+        if (token_batches.empty())
+            return false;
+
+        // For now, just process first sequence (full implementation would loop)
+        StageContext temp_ctx;
+        bool success = prefill(token_batches[0], weights, temp_ctx);
+        if (success)
+        {
+            return logits(out_logits);
+        }
+        return false;
+    }
+
+    bool QwenPipeline::decodeBatch(const std::vector<int> &next_tokens,
+                                   const IModelWeights &weights,
+                                   StageContext &ctx,
+                                   std::shared_ptr<TensorBase> &out_logits)
+    {
+        // Sequential fallback: process only first token
+        if (next_tokens.empty())
+            return false;
+
+        StageContext temp_ctx;
+        bool success = decode(next_tokens[0], weights, temp_ctx);
+        if (success)
+        {
+            return logits(out_logits);
+        }
+        return false;
+    }
+
+    void QwenPipeline::ensureBatchState(int batch_size)
+    {
+        // Stub for now - sequential pipeline doesn't need batch state
+    }
+
+    void QwenPipeline::clearBatchState()
+    {
+        // Stub
+    }
+}
 
 // === Section 6: Weight Loading Bridge removed (handled fully inline via bridge decl in header) ===

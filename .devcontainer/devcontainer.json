@@ -23,7 +23,8 @@
                 "redhat.vscode-yaml",
                 "ms-vscode.vscode-json",
                 "bradlc.vscode-tailwindcss",
-                "esbenp.prettier-vscode"
+                "esbenp.prettier-vscode",
+                "jacqueslucke.gcov-viewer"
             ],
             "settings": {
                 "cmake.configureOnOpen": true,
@@ -58,7 +59,10 @@
                 ],
                 "python.linting.enabled": true,
                 "python.linting.pylintEnabled": true,
-                "python.formatting.provider": "black"
+                "python.formatting.provider": "black",
+                "gcovViewer.buildDirectories": [
+                    "${workspaceFolder}/build"
+                ]
             }
         }
     },

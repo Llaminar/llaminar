@@ -36,6 +36,7 @@
 #include "../DebugUtils.h"
 #include "../AdaptiveMatmul.h"
 #include "../utils/DebugEnv.h"
+#include "attention/AttentionStageContracts.h"
 #include <algorithm>
 #include <cstring>
 #include <chrono>
@@ -44,7 +45,7 @@
 namespace llaminar
 {
 
-    MPILinearOperator::MPILinearOperator(MPI_Comm comm) : MPIKernelBase(comm, false)
+    MPILinearOperator::MPILinearOperator(MPI_Comm comm) : MPIOperatorBase(comm, false)
     {
         LOG_DEBUG("MPILinearOperator initialized on rank " << getRank() << " of " << getSize());
     }
@@ -226,7 +227,7 @@ namespace llaminar
     bool MPILinearOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
-        // Basic validation similar to LinearKernel
+        // Count check
         if (inputs.size() < 2 || inputs.size() > 3 || outputs.size() != 1)
         {
             LOG_ERROR("MPILinearOperator: Expected 2-3 inputs and 1 output, got "
@@ -234,64 +235,73 @@ namespace llaminar
             return false;
         }
 
+        // Extract dimensions from inputs for contract specification
         auto input = inputs[0];
         auto weight = inputs[1];
         auto output = outputs[0];
 
         if (!input || !weight || !output)
         {
-            LOG_ERROR("MPILinearOperator: Null tensor provided - input: " << (input ? "valid" : "null")
-                                                                          << ", weight: " << (weight ? "valid" : "null")
-                                                                          << ", output: " << (output ? "valid" : "null"));
+            LOG_ERROR("MPILinearOperator: Null tensor provided");
             return false;
         }
 
-        // Check input is 2D [seq_len, input_size]
-        if (input->shape().size() != 2)
+        // Early dimension check before building contracts
+        if (input->shape().size() != 2 || weight->shape().size() != 2)
         {
-            LOG_ERROR("MPILinearOperator: Input must be 2D, got " << input->shape().size() << " dimensions");
+            LOG_ERROR("MPILinearOperator: Input and weight must be 2D tensors");
             return false;
         }
 
-        // Check weight is 2D [output_size, input_size] per new convention
-        if (weight->shape().size() != 2)
+        const int seq_len = input->shape()[0];
+        const int in_dim = input->shape()[1];
+        const int out_dim = weight->shape()[0];
+        const int weight_in_dim = weight->shape()[1];
+
+        // Build input contract
+        StageContract input_contract("MPILinearOperator::validate");
+        input_contract.inputs = {
+            TensorContract("input",
+                           ShapeSpec({seq_len, in_dim}, {"seq_len", "in_dim"}),
+                           TensorLayout::RowMajor,
+                           TensorSemantic::Activation),
+            TensorContract("weight",
+                           ShapeSpec({out_dim, in_dim}, {"out_dim", "in_dim"}),
+                           TensorLayout::RowMajor,
+                           TensorSemantic::Weight)};
+
+        // Add optional bias contract
+        if (inputs.size() == 3)
         {
-            LOG_ERROR("MPILinearOperator: Weight must be 2D, got " << weight->shape().size() << " dimensions");
+            input_contract.inputs.push_back(
+                TensorContract("bias",
+                               ShapeSpec({out_dim}, {"out_dim"}),
+                               TensorLayout::RowMajor,
+                               TensorSemantic::Weight,
+                               true,  // optional
+                               false) // no broadcast
+            );
+        }
+
+        // Build output contract
+        input_contract.outputs = {
+            TensorContract("output",
+                           ShapeSpec({seq_len, out_dim}, {"seq_len", "out_dim"}),
+                           TensorLayout::RowMajor,
+                           TensorSemantic::Activation)};
+
+        // Validate using contracts
+        try
+        {
+            input_contract.validate_inputs(inputs);
+            input_contract.validate_outputs(outputs);
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("MPILinearOperator contract violation: " << e.what());
             return false;
         }
-
-        // Check dimensions match: input[1] (in_dim) should match weight[1] (in_dim)
-        if (input->shape()[1] != weight->shape()[1])
-        {
-            LOG_ERROR("MPILinearOperator: Input size " << input->shape()[1]
-                                                       << " doesn't match weight input size " << weight->shape()[1]
-                                                       << " (weight shape=[" << weight->shape()[0] << ", " << weight->shape()[1] << "])");
-            return false;
-        }
-
-        // Check output is 2D [seq_len, output_size]
-        // output[1] should match weight[0] (out_dim)
-        if (output->shape().size() != 2 ||
-            output->shape()[0] != input->shape()[0] ||
-            output->shape()[1] != weight->shape()[0]) // Changed from weight->shape()[1]
-        {
-            LOG_ERROR("MPILinearOperator: Output shape mismatch - expected [" << input->shape()[0]
-                                                                              << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
-            return false;
-        }
-
-        // Check optional bias
-        if (inputs.size() == 3 && inputs[2])
-        {
-            auto bias = inputs[2];
-            if (bias->shape().size() != 1 || bias->shape()[0] != weight->shape()[1])
-            {
-                LOG_ERROR("MPILinearOperator: Bias shape mismatch");
-                return false;
-            }
-        }
-
-        return true;
     }
 
     void MPILinearOperator::distributeWeight(const std::shared_ptr<TensorBase> &global_weight,

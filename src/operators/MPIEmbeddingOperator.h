@@ -15,18 +15,23 @@ namespace llaminar
      * - Each rank handles a subset of the vocabulary entries
      * - Token lookups use MPI_Allgather for distributed access
      * - Embedding table is sharded across ranks to reduce memory usage
+     *
+     * Batch Support:
+     * - Accepts 1D [seq_len] or 2D [batch, seq_len] token ID tensors
+     * - Outputs [seq_len, embedding_dim] or [batch, seq_len, embedding_dim]
+     * - Processes all tokens in flattened order for efficiency
      */
-    class MPIEmbeddingOperator : public MPIKernelBase
+    class MPIEmbeddingOperator : public MPIOperatorBase
     {
     public:
         MPIEmbeddingOperator(size_t vocab_size, size_t embedding_dim);
         ~MPIEmbeddingOperator() = default;
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
-        std::string getKernelType() const override { return "MPIEmbedding"; }
+        std::string getOperatorType() const override { return "MPIEmbedding"; }
         size_t getExpectedInputCount() const override { return 2; }
         size_t getExpectedOutputCount() const override { return 1; }
 

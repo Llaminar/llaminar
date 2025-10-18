@@ -29,6 +29,8 @@ namespace llaminar
         PrefillMetrics &metrics,
         KVCacheProvider *cache_provider)
     {
+        // DEBUG: Uncomment for detailed provider execution tracing
+        // std::cerr << "!!!!! ENTERING PrefillProviderBaseImpl::execute" << std::endl << std::flush;
         PERF_SCOPED_TIMER("PrefillProviderBaseImpl::execute");
 
         // Reset metrics (backend name set by derived class)
@@ -48,6 +50,9 @@ namespace llaminar
         int d_model = layer_cfg.d_model;
         int n_layers = layer_cfg.n_layers;
         int vocab_size = layer_cfg.vocab_size;
+
+        // DEBUG: Uncomment for detailed provider execution tracing
+        // std::cerr << "[PROVIDER_EXEC_TRACE] Rank" << mpiContext().rank << " PrefillProviderBaseImpl::execute START: seq_len=" << seq_len << std::endl;
 
         // Update context
         ctx.seq_len = seq_len;
@@ -143,6 +148,17 @@ namespace llaminar
         // Capture LM head snapshot
         captureSnapshot(PipelineStage::LM_HEAD, -1, logits->data(), seq_len, vocab_size);
         incrementSnapshotCounter(metrics);
+
+        float sum_sq = 0.0f;
+        for (size_t i = 0; i < logits->size(); ++i)
+        {
+            sum_sq += logits->data()[i] * logits->data()[i];
+        }
+        float l2_norm = std::sqrt(sum_sq / logits->size());
+        // DEBUG: Uncomment for detailed magnitude tracing
+        // std::cerr << "[MAGNITUDE_TRACE_SEQ] Rank" << mpiContext().rank << " FINAL LOGITS (sequential): L2_norm=" << l2_norm << " size=" << logits->size()
+        //           << " first_5=[" << logits->data()[0] << "," << logits->data()[1] << ","
+        //           << logits->data()[2] << "," << logits->data()[3] << "," << logits->data()[4] << "]" << std::endl;
 
         // Set output
         output = logits;
@@ -408,6 +424,17 @@ namespace llaminar
                               .count() /
                           1000.0;
 
+        // [DEBUG] Log FFN down output magnitude (commented out for clean benchmark output)
+        // if (layer_idx == 0 && mpiContext().rank == 0)
+        // {
+        //     double sum_sq = 0.0;
+        //     size_t count = seq_len * d_model;
+        //     for (size_t i = 0; i < count; ++i)
+        //         sum_sq += output->data()[i] * output->data()[i];
+        //     double l2_norm = std::sqrt(sum_sq / count);
+        //     std::cerr << "[MAGNITUDE_TRACE_SEQ] Layer0 FFN Down Output: L2_norm=" << l2_norm << " size=" << count << std::endl;
+        // }
+
         // Capture FFN down snapshot
         captureSnapshot(PipelineStage::FFN_DOWN, layer_idx, output->data(), seq_len, d_model);
         incrementSnapshotCounter(metrics);
@@ -439,7 +466,7 @@ namespace llaminar
         return kernel->execute(inputs, outputs);
     }
 
-    MPIKernelBase *PrefillProviderBaseImpl::getKernel(const std::string &name)
+    MPIOperatorBase *PrefillProviderBaseImpl::getKernel(const std::string &name)
     {
         auto it = kernels_.find(name);
         if (it == kernels_.end())
@@ -449,9 +476,9 @@ namespace llaminar
         return it->second.get();
     }
 
-    bool PrefillProviderBaseImpl::registerKernel(
+    bool PrefillProviderBaseImpl::registerOperator(
         const std::string &name,
-        std::unique_ptr<MPIKernelBase> kernel)
+        std::unique_ptr<MPIOperatorBase> kernel)
     {
         if (kernels_.find(name) != kernels_.end())
         {

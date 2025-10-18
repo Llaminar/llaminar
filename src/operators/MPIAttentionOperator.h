@@ -214,6 +214,14 @@ namespace llaminar
      * - No MatMulBackendSelector class involved - direct backend branching in matmul_with_bias()
      * - All backends respect proper matrix orientation contracts (no silent transpositions)
      *
+     * Batch Processing Support:
+     * - Accepts both 2D [seq_len, d_model] and 3D [batch, seq_len, d_model] inputs
+     * - Batch dimension is flattened: [batch, seq, d_model] → [batch*seq, d_model]
+     * - All pipeline stages process flattened batch*seq_len as unified sequence
+     * - Output shape matches input dimensionality (2D → 2D, 3D → 3D)
+     * - Backward compatible: Existing 2D inputs produce 2D outputs as before
+     * - Note: Current implementation processes flattened batch (no per-batch padding masks yet)
+     *
      * @note Output Contract (Fully Replicated):
      * The operator returns a FULLY REPLICATED attention output across all ranks. The output tensor
      * is identical on all processes after MPI_Allreduce (MPI_SUM) in the projectAndGatherOutput stage.
@@ -265,7 +273,7 @@ namespace llaminar
      * @see AttentionStageContracts for stage validation contracts
      * @see CosmaPrefillManager for distributed COSMA integration
      */
-    class MPIAttentionOperator : public MPIKernelBase
+    class MPIAttentionOperator : public MPIOperatorBase
     {
     public:
         // Output assembly / distribution mode (scaffolding for hybrid head + TP design)
@@ -303,12 +311,12 @@ namespace llaminar
          * @param strategy Distribution strategy to use
          */
         MPIAttentionOperator(int n_head, int n_head_kv, int head_dim,
-                           float rope_freq_base = 10000.0f,
-                           DistributionStrategy strategy = DistributionStrategy::HEAD_WISE);
+                             float rope_freq_base = 10000.0f,
+                             DistributionStrategy strategy = DistributionStrategy::HEAD_WISE);
 
         ~MPIAttentionOperator() = default;
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
@@ -320,7 +328,7 @@ namespace llaminar
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
-        std::string getKernelType() const override { return "MPIAttention"; }
+        std::string getOperatorType() const override { return "MPIAttention"; }
         size_t getExpectedInputCount() const override { return 10; } // input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache
         size_t getExpectedOutputCount() const override { return 1; }
 

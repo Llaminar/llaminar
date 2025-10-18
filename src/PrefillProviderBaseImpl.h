@@ -288,7 +288,7 @@ namespace llaminar
          * @param name Kernel name
          * @return Pointer to kernel, or nullptr if not found
          */
-        MPIKernelBase *getKernel(const std::string &name);
+        MPIOperatorBase *getKernel(const std::string &name);
 
         /**
          * @brief Register a kernel
@@ -297,14 +297,14 @@ namespace llaminar
          * @param kernel Kernel instance (ownership transferred)
          * @return true if successful, false if already registered
          */
-        bool registerKernel(const std::string &name, std::unique_ptr<MPIKernelBase> kernel);
+        bool registerOperator(const std::string &name, std::unique_ptr<MPIOperatorBase> kernel);
 
         // ========================================================================
         // Member variables
         // ========================================================================
 
         /// Registered kernels (shared: rmsnorm, swiglu, residual; backend-specific: others)
-        std::unordered_map<std::string, std::unique_ptr<MPIKernelBase>> kernels_;
+        std::unordered_map<std::string, std::unique_ptr<MPIOperatorBase>> kernels_;
 
         /// Number of tokens processed so far (for incremental decode position tracking)
         int n_past_;

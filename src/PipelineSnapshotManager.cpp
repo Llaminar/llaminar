@@ -114,13 +114,20 @@ namespace llaminar
     {
         if (!impl_->enabled)
         {
+            LOG_DEBUG("[SNAPSHOT_DEBUG] PipelineSnapshotManager::capture() called but impl_->enabled=false, skipping");
             return;
         }
 
         // Use the parity framework's snapshot hook (static methods)
+        // CRITICAL: Pass the source parameter to differentiate batch vs sequential
         if (parity::LlaminarSnapshotHook::is_enabled())
         {
-            parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim);
+            LOG_DEBUG("[SNAPSHOT_DEBUG] Calling LlaminarSnapshotHook::capture for stage=" << static_cast<int>(stage) << " layer=" << layer_index);
+            parity::LlaminarSnapshotHook::capture(stage, layer_index, data, seq_len, feature_dim, source);
+        }
+        else
+        {
+            LOG_DEBUG("[SNAPSHOT_DEBUG] LlaminarSnapshotHook::is_enabled() returned false, skipping");
         }
     }
 

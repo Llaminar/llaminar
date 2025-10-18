@@ -31,7 +31,7 @@ namespace llaminar
      * Expected outputs:
      * - swiglu_result: [seq_len, d_ff] - SwiGLU activation result
      */
-    class MPISwiGLUOperator : public MPIKernelBase
+    class MPISwiGLUOperator : public MPIOperatorBase
     {
     public:
         enum class DistributionStrategy
@@ -82,7 +82,7 @@ namespace llaminar
          * @brief Get the kernel type name for debugging/logging
          * @return String identifying the kernel type
          */
-        std::string getKernelType() const override { return "MPISwiGLU"; }
+        std::string getOperatorType() const override { return "MPISwiGLU"; }
 
         /**
          * @brief Get expected number of input tensors

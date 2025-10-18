@@ -50,6 +50,45 @@ namespace llaminar
         };
 
         /**
+         * @brief Performance metrics from a batch benchmark run
+         */
+        struct BatchBenchmarkMetrics
+        {
+            // Batch configuration
+            int batch_size = 0;
+            int sequences_completed = 0;
+
+            // Prefill metrics (aggregate across batch)
+            int prefill_tokens_total = 0;        // Sum of all sequences' prefill tokens
+            double prefill_time_ms = 0.0;        // Wall time for prefillBatch()
+            double prefill_throughput = 0.0;     // Total tokens/sec across batch
+            double prefill_latency_per_token = 0.0; // Average ms per token
+
+            // Decode metrics (aggregate across batch)
+            int decode_tokens_total = 0;         // batch_size × decode_steps
+            double decode_time_ms = 0.0;         // Wall time for all decodeBatch() calls
+            double decode_throughput = 0.0;      // Total tokens/sec across batch
+            double decode_latency_per_token = 0.0; // Average ms per token
+
+            // Total metrics
+            double total_time_ms = 0.0;
+            double total_throughput = 0.0;       // (prefill + decode tokens) / total time
+
+            // Performance analysis
+            double memory_bandwidth_gbps = 0.0;  // Estimated memory bandwidth utilization
+            double efficiency_percent = 0.0;     // Actual vs theoretical max bandwidth
+
+            // Model info
+            std::string model_path;
+            std::string backend;
+
+            /**
+             * @brief Print batch benchmark results in a clean format
+             */
+            void print() const;
+        };
+
+        /**
          * @brief Run inference benchmark with minimal logging
          *
          * This function runs a single inference pass with the given prompt,
@@ -66,6 +105,28 @@ namespace llaminar
             const QwenModelWeights &weights,
             chat::TokenizerInterface &tokenizer,
             const LlaminarParams &params);
+
+        /**
+         * @brief Run batch inference benchmark
+         *
+         * This function runs batch inference with multiple sequences in parallel,
+         * measuring aggregate throughput and per-token latency.
+         *
+         * @param pipeline The model pipeline to use
+         * @param weights The model weights
+         * @param tokenizer The tokenizer interface
+         * @param params The runtime parameters
+         * @param batch_size Number of sequences to process in parallel
+         * @param model_size_bytes Approximate model size for bandwidth calculation (0 = auto-estimate)
+         * @return BatchBenchmarkMetrics containing performance data
+         */
+        BatchBenchmarkMetrics runBatchBenchmark(
+            AbstractPipeline &pipeline,
+            const QwenModelWeights &weights,
+            chat::TokenizerInterface &tokenizer,
+            const LlaminarParams &params,
+            int batch_size,
+            size_t model_size_bytes = 0);
 
     } // namespace benchmark
 } // namespace llaminar

@@ -15,19 +15,26 @@ namespace llaminar
      * - Each process handles a subset of sequence positions
      * - Global RMS statistics are computed via MPI communication
      * - Supports both sequence-wise and feature-wise distribution patterns
+     * - Supports batch processing for parallel inference
      *
      * Distribution strategies:
      * 1. SEQUENCE_WISE: Distribute sequence positions across processes
      * 2. FEATURE_WISE: Distribute hidden dimensions across processes (future)
      *
-     * Expected inputs:
-     * - input: [seq_len, hidden_size] - distributed input tensor
+     * Expected inputs (batch support):
+     * - input: [seq_len, hidden_size] OR [batch, seq_len, hidden_size] - distributed input tensor
      * - weight: [hidden_size] - scale parameters (replicated on all processes)
      *
-     * Expected outputs:
-     * - output: [seq_len, hidden_size] - distributed normalized output tensor
+     * Expected outputs (batch support):
+     * - output: [seq_len, hidden_size] OR [batch, seq_len, hidden_size] - distributed normalized output
+     *
+     * Batch processing:
+     * - Flattens [batch, seq_len, hidden_size] → [batch*seq_len, hidden_size] for computation
+     * - Applies per-row normalization across all batch*seq_len rows
+     * - Reshapes output back to [batch, seq_len, hidden_size]
+     * - Backward compatible: 2D inputs produce 2D outputs
      */
-    class MPIRMSNormOperator : public MPIKernelBase
+    class MPIRMSNormOperator : public MPIOperatorBase
     {
     public:
         enum class DistributionStrategy
@@ -38,14 +45,14 @@ namespace llaminar
 
         MPIRMSNormOperator(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
-        // KernelBase interface implementation
+        // OperatorBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
-        std::string getKernelType() const override { return "MPIRMSNorm"; }
+        std::string getOperatorType() const override { return "MPIRMSNorm"; }
         size_t getExpectedInputCount() const override { return 2; }
         size_t getExpectedOutputCount() const override { return 1; }
 

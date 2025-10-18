@@ -16,7 +16,7 @@ namespace
 {
 
     // Global MPI environment (single-rank version) to ensure MPI is initialized once for the
-    // lifetime of this test binary. Without this, the first MPIKernelBase instance that called
+    // lifetime of this test binary. Without this, the first MPIOperatorBase instance that called
     // MPI_Init_thread would also call MPI_Finalize in its destructor, leaving subsequent tests
     // unable to call MPI routines (and triggering MPI_Comm_rank after finalize errors).
     struct MPIGlobalEnvironment : public ::testing::Environment
@@ -121,7 +121,7 @@ namespace
 
 TEST(IncrementalGenerationTest, PrefillThenDecodeIncrementsState)
 {
-    // Ensure MPI is initialized before constructing any MPIKernelBase-derived kernels
+    // Ensure MPI is initialized before constructing any MPIOperatorBase-derived kernels
     int mpi_inited = 0;
     MPI_Initialized(&mpi_inited);
     if (!mpi_inited)

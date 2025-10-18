@@ -70,7 +70,8 @@
         "memory_resource": "cpp",
         "stop_token": "cpp",
         "cmath": "cpp",
-        "iosfwd": "cpp"
+        "iosfwd": "cpp",
+        "iostream": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,

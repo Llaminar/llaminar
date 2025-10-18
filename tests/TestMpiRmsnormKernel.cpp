@@ -35,7 +35,7 @@ protected:
 
     void TearDown() override
     {
-        // MPI finalization is handled by MPIKernelBase destructor
+        // MPI finalization is handled by MPIOperatorBase destructor
     }
 
     void fillRandomData(std::shared_ptr<TensorBase> &tensor, float min_val = -1.0f, float max_val = 1.0f)

@@ -429,7 +429,7 @@ namespace llaminar
                 return cfg.head_dim;
             if (expr == "n_head_kv")
                 return cfg.n_head_kv;
-            if (expr == "d_ff")
+            if (expr == "d_ff" || expr == "intermediate_size") // intermediate_size is alias for d_ff
                 return cfg.d_ff;
             if (expr == "vocab_size")
                 return cfg.vocab_size;
@@ -767,6 +767,83 @@ namespace llaminar
      * - FFN gate/up: [d_ff, d_model] → [local_d_ff, d_model] when sliced
      * - FFN down: [d_model, d_ff] → [d_model, local_d_ff] when sliced
      */
+    /**
+     * @brief Get weight contracts for batch-mode Qwen pipeline
+     *
+     * Batch operators (MPIAttentionBatchOperator, etc.) handle weight distribution
+     * internally at runtime. They expect FULL (REPLICATED) weights, not pre-sliced.
+     *
+     * This differs from getQwenWeightContracts() which returns ROW_SLICED/COL_SLICED
+     * contracts for the sequential pipeline where operators expect pre-sliced weights.
+     */
+    inline ModelWeightContracts getBatchQwenWeightContracts()
+    {
+        using ST = WeightSliceType;
+        ModelWeightContracts contracts;
+
+        // Global weights - same as sequential mode
+        contracts.global_weights = {
+            WeightShapeContract("token_embedding", {"vocab_size", "d_model"},
+                                "Token embedding lookup table",
+                                false, ST::REPLICATED, "",
+                                {"vocab_size", "d_model"}, false),
+            WeightShapeContract("output_norm", {"d_model"},
+                                "Final RMS norm before lm_head",
+                                false, ST::REPLICATED, "",
+                                {"d_model"}, false),
+            WeightShapeContract("lm_head", {"vocab_size", "d_model"},
+                                "Output projection to vocabulary (GGUF: [vocab, d_model])",
+                                false, ST::REPLICATED, "",
+                                {"vocab_size", "d_model"}, false)};
+
+        // Per-layer weights - ALL REPLICATED for batch mode!
+        // Batch operators handle runtime distribution themselves
+        contracts.layer_weights = {
+            WeightShapeContract("blk.{layer}.attn_norm.weight", {"d_model"},
+                                "Attention input RMS norm",
+                                false, ST::REPLICATED, "",
+                                {"d_model"}, false),
+
+            // Attention Q/K/V/O: REPLICATED (batch operators do runtime slicing)
+            WeightShapeContract("blk.{layer}.attn_q.weight", {"n_head*head_dim", "d_model"},
+                                "Query projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "n_head*head_dim"}, false),
+            WeightShapeContract("blk.{layer}.attn_k.weight", {"n_head_kv*head_dim", "d_model"},
+                                "Key projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "n_head_kv*head_dim"}, false),
+            WeightShapeContract("blk.{layer}.attn_v.weight", {"n_head_kv*head_dim", "d_model"},
+                                "Value projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "n_head_kv*head_dim"}, false),
+            WeightShapeContract("blk.{layer}.attn_output.weight", {"d_model", "n_head*head_dim"},
+                                "Output projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"n_head*head_dim", "d_model"}, false),
+
+            WeightShapeContract("blk.{layer}.ffn_norm.weight", {"d_model"},
+                                "FFN input RMS norm",
+                                false, ST::REPLICATED, "",
+                                {"d_model"}, false),
+
+            // FFN weights: REPLICATED (batch operators handle distribution)
+            WeightShapeContract("blk.{layer}.ffn_gate.weight", {"intermediate_size", "d_model"},
+                                "FFN gate projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "intermediate_size"}, false),
+            WeightShapeContract("blk.{layer}.ffn_up.weight", {"intermediate_size", "d_model"},
+                                "FFN up projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "intermediate_size"}, false),
+            WeightShapeContract("blk.{layer}.ffn_down.weight", {"d_model", "intermediate_size"},
+                                "FFN down projection (REPLICATED for batch mode)",
+                                false, ST::REPLICATED, "",
+                                {"intermediate_size", "d_model"}, false)};
+
+        return contracts;
+    }
+
     inline ModelWeightContracts getQwenWeightContracts()
     {
         using ST = WeightSliceType;
