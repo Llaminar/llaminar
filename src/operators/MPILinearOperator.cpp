@@ -36,6 +36,10 @@
 #include "../DebugUtils.h"
 #include "../AdaptiveMatmul.h"
 #include "../utils/DebugEnv.h"
+#include "QuantSlabCache.h"
+#include "../tensors/TensorFactory.h"
+#include "../tensors/BF16Tensor.h"
+#include "../tensors/Q8_0Tensor.h" // For Q8_0 streaming decode
 #include "attention/AttentionStageContracts.h"
 #include <algorithm>
 #include <cstring>
@@ -70,9 +74,13 @@ namespace llaminar
         ASSERT_TENSOR_VALID(global_weight, "Linear weight");
         ASSERT_TENSOR_VALID(global_output, "Linear output");
 
-        // Check for NaN in inputs before computation
+        // Check for NaN in inputs before computation (skip direct NaN scan for quantized weights: raw bytes not FP32)
         ASSERT_TENSOR_NOT_NAN(input, "Linear input");
-        ASSERT_TENSOR_NOT_NAN(global_weight, "Linear weight");
+        // Skip NaN check for Q8_0Tensor (doesn't support data() - raw bytes not FP32)
+        if (global_weight->native_type() != TensorDataType::QUANTIZED && global_weight->data())
+        {
+            ASSERT_TENSOR_NOT_NAN(global_weight, "Linear weight");
+        }
 
         // Log detailed tensor information
         TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearOperator");
@@ -83,6 +91,13 @@ namespace llaminar
         // Weight is [out_dim, in_dim] per new convention
         size_t output_size = global_weight->shape()[0];
         size_t weight_in_dim = global_weight->shape()[1];
+
+        // Early return for empty tensors (e.g., rank with no tokens)
+        if (seq_len == 0 || input_size == 0 || output_size == 0)
+        {
+            LOG_DEBUG("MPILinearOperator: Empty tensor detected (seq_len=" << seq_len << ", input_size=" << input_size << ", output_size=" << output_size << "), skipping computation on rank " << getRank());
+            return true; // Success - nothing to compute
+        }
 
         // Validate dimension compatibility
         if (weight_in_dim != input_size)
@@ -95,7 +110,18 @@ namespace llaminar
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
 
         // Check weight cache before distributing
-        const float *weight_key = global_weight->data();
+        // For Q8_0Tensor, use tensor pointer as key (data() not supported)
+        // For regular tensors, use data pointer as key
+        const float *weight_key = nullptr;
+        if (global_weight->native_type() != TensorDataType::QUANTIZED)
+        {
+            weight_key = global_weight->data();
+        }
+        else
+        {
+            // Use tensor pointer as key for quantized tensors
+            weight_key = reinterpret_cast<const float *>(global_weight.get());
+        }
         std::shared_ptr<TensorBase> local_weight;
 
         auto weight_cache_it = weight_cache_.find(weight_key);
@@ -149,11 +175,155 @@ namespace llaminar
         // Ensure input is available on all processes (broadcast if needed)
         // For simplicity, assuming input is already replicated across processes
 
+        // === Q8_0 STREAMING DECODE PATH (Week 2) ===
+        // Check if weight is Q8_0Tensor and use streaming decode
+        auto q8_weight = std::dynamic_pointer_cast<Q8_0Tensor>(global_weight);
+        if (q8_weight)
+        {
+            PERF_TRACE_SCOPE_CAT("q8_0_decode_and_matmul", "linear_kernel");
+
+            LOG_DEBUG("MPILinear: Using Q8_0 streaming decode path on rank " << getRank()
+                                                                             << " (local_output_size=" << local_output_size << ", input_size=" << input_size << ")");
+
+            // Allocate temporary buffer for local weight slice (released after forward)
+            std::vector<float> decoded_weight(local_output_size * input_size);
+
+            // Decode local rows [output_offset, output_offset + local_output_size)
+            {
+                PERF_TRACE_SCOPE_CAT("q8_0_decode_rows", "q8_0");
+                auto decode_start = std::chrono::high_resolution_clock::now();
+
+                // Decode row-by-row (could parallelize with OpenMP if needed)
+                for (size_t local_row = 0; local_row < static_cast<size_t>(local_output_size); local_row++)
+                {
+                    size_t global_row = output_offset + local_row;
+                    q8_weight->decodeRow(global_row, decoded_weight.data() + local_row * input_size);
+                }
+
+                auto decode_end = std::chrono::high_resolution_clock::now();
+                double decode_ms = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count() / 1000.0;
+                LOG_DEBUG("MPILinear: Q8_0 decode " << local_output_size << " rows in " << decode_ms << "ms on rank " << getRank());
+            }
+
+            // Perform matmul with decoded weights
+            {
+                PERF_TRACE_SCOPE_CAT("q8_0_matmul", "linear_kernel");
+                auto matmul_start = std::chrono::high_resolution_clock::now();
+
+                // Matrix multiplication: output = input @ weight^T
+                // Weight is [local_out_dim, in_dim], so we transpose it during matmul
+                bool matmul_success = adaptiveMatMul(
+                    input->data(), decoded_weight.data(), local_output->data(),
+                    static_cast<int>(seq_len), static_cast<int>(local_output_size), static_cast<int>(input_size),
+                    /*is_prefill*/ false,
+                    /*distributed_partition*/ true,
+                    /*transpose_A*/ false,
+                    /*transpose_B*/ true, // Weight is [local_out, in], need transpose
+                    /*alpha*/ 1.0f,
+                    /*beta*/ 0.0f);
+
+                auto matmul_end = std::chrono::high_resolution_clock::now();
+                double matmul_ms = std::chrono::duration_cast<std::chrono::microseconds>(matmul_end - matmul_start).count() / 1000.0;
+                LOG_DEBUG("MPILinear: Q8_0 matmul " << matmul_ms << "ms on rank " << getRank());
+
+                if (!matmul_success)
+                {
+                    LOG_ERROR("Q8_0 adaptive matmul failed on rank " << getRank());
+                    return false;
+                }
+            }
+
+            // Add bias if provided
+            if (local_bias)
+            {
+                PERF_TRACE_SCOPE_CAT("add_bias", "linear_kernel");
+                addBiasLocal(local_output->data(), local_bias->data(), seq_len, local_output_size);
+            }
+
+            // Gather results from all processes
+            {
+                PERF_TRACE_SCOPE_CAT("gather_output", "mpi_collective");
+                gatherOutput(local_output, global_output, seq_len, output_size);
+            }
+
+            // Validate output
+            ASSERT_TENSOR_NOT_NAN(global_output, "Linear output after Q8_0 computation");
+            TensorLogger::logTensorStats(global_output, "Linear Q8_0_output", "MPILinearOperator_Q8_0");
+
+            LOG_DEBUG("MPILinear: Q8_0 path complete on rank " << getRank());
+            return true;
+        }
+
         // Perform local computation using COSMA
         // Matrix multiplication: local_output = input * local_weight
         // Use adaptive matrix multiplication for optimal performance
         const float *input_data = input->data();
         const float *weight_data = local_weight->data();
+
+        // === Quantized slab path ===
+        bool use_slab = debugEnv().quant.slab_enable && debugEnv().quant_slab.enable;
+        const auto *quant_tensor = dynamic_cast<QuantizedTensor *>(global_weight.get());
+        if (use_slab && quant_tensor)
+        {
+            // Decode slab for this rank's local output slice (rows = local_output_size, cols = input_size logically after transpose)
+            // Weight shape is [out_dim, in_dim]; our local rows span [output_offset, output_offset + local_output_size)
+            size_t output_offset;
+            size_t local_output_size_tmp;
+            std::tie(local_output_size_tmp, output_offset) = getRowDistribution(output_size);
+            (void)local_output_size_tmp;          // already have local_output_size
+            size_t col_start = output_offset;     // columns in transposed view correspond to output rows pre-transpose
+            size_t col_count = local_output_size; // span for this rank
+            QuantSlab slab;
+            bool reused = QuantSlabCache::instance().getOrDecode(*quant_tensor, col_start, col_count, slab, /*reuse_allowed*/ true);
+            if (debugEnv().quant.slab_stats && getRank() == 0)
+            {
+                LOG_INFO("[QuantSlab] rank=" << getRank() << " reused=" << (reused ? 1 : 0) << " k=" << slab.k << " n=" << slab.n);
+            }
+
+            // Try direct BF16 GEMM path first (requires LLAMINAR_QUANT_BF16_GEMM=1)
+            // Slab stored as (k x n_local) row-major; B is already in correct orientation (transpose_B=false).
+            bool ok = adaptiveMatMulBF16(input_data, slab.data.data(), local_output->data(),
+                                         (int)seq_len, (int)local_output_size, (int)input_size,
+                                         /*alpha*/ 1.0f, /*beta*/ 0.0f,
+                                         /*is_prefill*/ false,
+                                         /*distributed_partition*/ true,
+                                         /*transpose_B*/ false);
+
+            // Fallback to BF16→FP32 expansion if BF16 GEMM disabled or failed
+            if (!ok)
+            {
+                if (debugEnv().quant.slab_stats && getRank() == 0)
+                {
+                    LOG_DEBUG("[QuantSlab] BF16 GEMM unavailable, falling back to FP32 expansion");
+                }
+
+                // Expand BF16 slab to FP32 then let existing adaptive path handle backend selection.
+                std::vector<float> slab_fp32(slab.k * slab.n);
+#ifdef _OPENMP
+                size_t total = slab_fp32.size();
+#pragma omp parallel for if (total > 32768) schedule(static)
+                for (size_t idx = 0; idx < total; ++idx)
+                    slab_fp32[idx] = (float)slab.data[idx];
+#else
+                for (size_t idx = 0; idx < slab_fp32.size(); ++idx)
+                    slab_fp32[idx] = (float)slab.data[idx];
+#endif
+                // Perform matmul immediately using expanded weights
+                ok = adaptiveMatMul(input_data, slab_fp32.data(), local_output->data(),
+                                    (int)seq_len, (int)local_output_size, (int)input_size,
+                                    /*is_prefill*/ false,
+                                    /*distributed_partition*/ true,
+                                    /*transpose_A*/ false,
+                                    /*transpose_B*/ false,
+                                    /*alpha*/ 1.0f,
+                                    /*beta*/ 0.0f);
+                if (!ok)
+                {
+                    LOG_ERROR("BF16 expanded adaptive matmul failed on rank " << getRank());
+                }
+            }
+            return ok;
+        }
         float *output_data = local_output->data();
 
         int seq_len_int = static_cast<int>(seq_len);
@@ -180,7 +350,7 @@ namespace llaminar
                                             /*is_prefill*/ false,
                                             /*distributed_partition*/ true,
                                             /*transpose_A*/ false,
-                                            /*transpose_B*/ true, // CRITICAL: Transpose weight per PyTorch/GGUF convention
+                                            /*transpose_B*/ true,
                                             /*alpha*/ 1.0f,
                                             /*beta*/ 0.0f);
         }
@@ -313,6 +483,38 @@ namespace llaminar
         // New convention: weight is [output_size, input_size]
         size_t input_size = global_weight->shape()[1];
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
+
+        // Check if weight is quantized - need to decode first
+        if (global_weight->native_type() == TensorDataType::QUANTIZED)
+        {
+            std::cerr << "[DISTRIBUTE_Q8_0] Weight is Q8_0, decoding to FP32 first" << std::endl;
+
+            // Cast to Q8_0Tensor to access decodeRow
+            auto q8_weight = std::dynamic_pointer_cast<Q8_0Tensor>(global_weight);
+            if (!q8_weight)
+            {
+                LOG_ERROR("Weight is quantized but not Q8_0Tensor!");
+                return;
+            }
+
+            // Decode Q8_0 to FP32 buffer
+            std::vector<float> decoded_weight(output_size * input_size);
+            for (size_t row = 0; row < output_size; ++row)
+            {
+                q8_weight->decodeRow(row, decoded_weight.data() + row * input_size);
+            }
+
+            // Now extract local portion from decoded buffer
+            float *local_data = local_weight->data();
+            const size_t elements_to_copy = local_output_size * input_size;
+            const float *src_start = decoded_weight.data() + output_offset * input_size;
+
+            std::memcpy(local_data, src_start, elements_to_copy * sizeof(float));
+
+            LOG_DEBUG("Distributed Q8_0 weight matrix: local size [" << local_output_size << ", " << input_size
+                                                                     << "], offset " << output_offset << " on rank " << getRank());
+            return;
+        }
 
         // Extract local portion of weight matrix
         // Global weight: [output_size, input_size] - row-major storage
@@ -496,7 +698,15 @@ namespace llaminar
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());
-        // Use TensorFactory to create a modern tensor
+
+        // Phase 5: BF16 activation storage
+        const auto &env = debugEnv();
+        if (env.quant.output_bf16)
+        {
+            return TensorFactory::create_bf16(int_shape);
+        }
+
+        // Default: FP32 storage
         return TensorFactory::create_simple(int_shape);
     }
 

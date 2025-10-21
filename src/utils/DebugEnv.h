@@ -91,6 +91,7 @@ namespace llaminar
         bool layerwise_stats = false;            // LLAMINAR_PIPELINE_LAYERWISE_STATS
         bool enable_abstract_pipeline = false;   // LLAMINAR_ENABLE_ABSTRACT_PIPELINE (feature flag for new AbstractPipeline scaffolding)
         bool disable_incremental_decode = false; // LLAMINAR_DISABLE_INCREMENTAL_DECODE (forces replay decode path)
+        bool batch_decode_replay = false;        // LLAMINAR_BATCH_DECODE_REPLAY (batch decode replays full context each step)
         bool layer_token_diff = false;           // LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF (capture last-token row per layer for diff diagnostics)
         bool layer_token_diff_verbose = false;   // LLAMINAR_PIPELINE_LAYER_TOKEN_DIFF_VERBOSE (log each capture row)
         bool attn_ref_compare = false;           // LLAMINAR_DEBUG_ATTENTION_REF (run reference full attention for incremental token)
@@ -101,6 +102,8 @@ namespace llaminar
         bool incr_hidden_trace = false;          // LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE (dump final hidden row prior to LM head)
         bool debug_decode_embed = false;         // LLAMINAR_DEBUG_DECODE_EMBED (log embedding details during incremental decode)
         bool ffn_fusion_enabled = true;          // LLAMINAR_PIPELINE_FFN_FUSION_ENABLED (enable fused gate+up projection, default: true)
+        bool decode_stage_snapshots = false;     // LLAMINAR_DECODE_STAGE_SNAPSHOTS (capture per-layer functional stage snapshots during decode steps)
+        bool decode_snapshot_verbose = false;    // LLAMINAR_DECODE_STAGE_SNAPSHOTS_VERBOSE (log capture key details)
     };
 
     // KV cache policy (dynamic capacity management for incremental decode)
@@ -145,15 +148,15 @@ namespace llaminar
         bool tp_force_splitter = false;    // LLAMINAR_ATTN_TP_FORCE_SPLITTER
         bool internal_diff = false;        // LLAMINAR_ATTN_INTERNAL_DIFF (capture internal per-stage last-token rows for parity forensics)
         // Primitive optimization knobs
-        int prim_parallel_elems_threshold = 32768;   // LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS (heads*seq_len*seq_len or heads*seq_len*D)
-        bool prim_force_scalar = false;              // LLAMINAR_ATTN_PRIM_FORCE_SCALAR
-        int prim_fused_recompute_threshold = 0;      // LLAMINAR_ATTN_PRIM_FUSED_RECOMPUTE_THRESHOLD (seq_len threshold to use fused two-pass path)
-        bool prim_force_fused = false;               // LLAMINAR_ATTN_PRIM_FORCE_FUSED
-        bool prim_disable_fused = false;             // LLAMINAR_ATTN_PRIM_DISABLE_FUSED
-    // RoPE optimization flags have been consolidated (Oct 2025 refactor). We retain only
-    // persistence TLS toggle for potential debug; all other paths are unconditional now.
-    bool prim_rope_persist_decode_state = true;   // (was LLAMINAR_ATTN_PRIM_ROPE_PERSIST_STATE)
-    bool prim_rope_tls_disable = false;           // (was LLAMINAR_ATTN_PRIM_ROPE_TLS_DISABLE)
+        int prim_parallel_elems_threshold = 32768; // LLAMINAR_ATTN_PRIM_PARALLEL_ELEMS (heads*seq_len*seq_len or heads*seq_len*D)
+        bool prim_force_scalar = false;            // LLAMINAR_ATTN_PRIM_FORCE_SCALAR
+        int prim_fused_recompute_threshold = 0;    // LLAMINAR_ATTN_PRIM_FUSED_RECOMPUTE_THRESHOLD (seq_len threshold to use fused two-pass path)
+        bool prim_force_fused = false;             // LLAMINAR_ATTN_PRIM_FORCE_FUSED
+        bool prim_disable_fused = false;           // LLAMINAR_ATTN_PRIM_DISABLE_FUSED
+        // RoPE optimization flags have been consolidated (Oct 2025 refactor). We retain only
+        // persistence TLS toggle for potential debug; all other paths are unconditional now.
+        bool prim_rope_persist_decode_state = true; // (was LLAMINAR_ATTN_PRIM_ROPE_PERSIST_STATE)
+        bool prim_rope_tls_disable = false;         // (was LLAMINAR_ATTN_PRIM_ROPE_TLS_DISABLE)
     };
 
     struct EmbeddingEnv
@@ -496,6 +499,44 @@ namespace llaminar
         MLPTPEnv mlp_tp;                    // MLP tensor parallel execution controls
         KVCacheEnv kv_cache;                // KV cache dynamic capacity controls
         SoftmaxEnv softmax;                 // softmax core execution tuning
+        struct QuantSlabEnv
+        {
+            bool enable = false;        // LLAMINAR_QUANT_SLAB_ENABLE (redundant with quant.slab_enable; kept for future decoupling)
+            bool fp16_storage = true;   // LLAMINAR_QUANT_SLAB_FP16 (0 => force FP32 slabs)
+            long long capacity_mb = 64; // LLAMINAR_QUANT_SLAB_CAP_MB (LRU capacity)
+            bool stats = false;         // LLAMINAR_QUANT_SLAB_STATS (enable hit/miss counters)
+        } quant_slab;                   // Slab decode/cache controls
+        struct QuantEnv
+        {
+            bool enable = false;             // LLAMINAR_QUANT_ENABLE : master gate for quantized execution paths
+            bool load_quantized = false;     // LLAMINAR_LOAD_QUANTIZED : ModelLoader returns QuantizedTensor instead of FP32
+            bool verify_blocks = false;      // LLAMINAR_QUANT_VERIFY_BLOCKS : block-by-block decode spot checks
+            bool force_fp32_weights = false; // LLAMINAR_FORCE_FP32_WEIGHTS : override quant even if enabled
+            bool accum_fp32 = true;          // LLAMINAR_QUANT_ACCUM_FP32 : keep FP32 accumulators
+            bool output_fp16 = false;        // LLAMINAR_QUANT_OUTPUT_FP16 : write FP16 output activations
+            bool fp16_weight_matmul = false; // LLAMINAR_FP16_WEIGHT_MATMUL_ENABLE : enable FP16 weight aware matmul path
+            int debug_preview_blocks = 0;    // LLAMINAR_QUANT_DEBUG_PREVIEW : number of blocks to preview decode
+            int tile_cache_capacity = 8;     // LLAMINAR_QUANT_TILE_CACHE : [DEPRECATED - no longer used] previously controlled LRU cache size
+            bool slab_enable = false;        // LLAMINAR_QUANT_SLAB_ENABLE : enable slab decode + cache path
+            bool fused_enable = false;       // LLAMINAR_QUANT_FUSED_ENABLE : legacy fused kernel (default false)
+            bool slab_fp16_override = true;  // derived from LLAMINAR_QUANT_SLAB_FP16 (0 => false)
+            long long slab_capacity_mb = 0;  // if >0 overrides quant_slab.capacity_mb
+            bool slab_stats = false;         // LLAMINAR_QUANT_SLAB_STATS mirror for hot-path access
+            bool bf16_gemm = false;          // LLAMINAR_QUANT_BF16_GEMM : enable BF16×BF16→FP32 GEMM via cblas_sbgemm/MKL (default off)
+            bool bf16_prefer_mkl = false;    // DEPRECATED: MKL is now default when HAVE_MKL defined. Set LLAMINAR_QUANT_BF16_PREFER_MKL=0 to force OpenBLAS.
+
+            // Phase 5: BF16 Activation Storage
+            bool output_bf16 = false;          // LLAMINAR_QUANT_OUTPUT_BF16 : store activations in BF16 for 2× memory reduction
+            bool force_fp32_softmax = true;    // LLAMINAR_FORCE_FP32_SOFTMAX : force softmax in FP32 (default: true for stability)
+            bool force_fp32_rmsnorm = true;    // LLAMINAR_FORCE_FP32_RMSNORM : force RMSNorm in FP32 (default: true for stability)
+            bool force_fp32_logits = true;     // LLAMINAR_FORCE_FP32_LOGITS : force final logits in FP32 (default: true for sampling)
+            bool allow_bf16_softmax = false;   // LLAMINAR_ALLOW_BF16_SOFTMAX : allow BF16 softmax (experimental, risky)
+            bool allow_bf16_rmsnorm = false;   // LLAMINAR_ALLOW_BF16_RMSNORM : allow BF16 RMSNorm (experimental, risky)
+            bool force_fp32_bf16_gemm = false; // LLAMINAR_FORCE_FP32_BF16_GEMM : disable BF16 GEMM, expand to FP32 (debugging)
+
+            // Phase 5+: KV Cache BF16 Storage
+            bool kv_bf16 = false; // LLAMINAR_KV_BF16 : store KV cache in BF16 for 2× memory reduction (Phase 5+)
+        } quant;                  // Quantization feature flags (Phase 2)
         struct ThreadingEnv
         {                                 // Global OpenMP / threading policy
             bool use_physical = false;    // LLAMINAR_OMP_USE_PHYSICAL (if set => restrict to physical cores per rank)
@@ -518,6 +559,18 @@ namespace llaminar
 
     // Accessor (lazy init, thread-safe via magic statics)
     const DebugEnvSnapshot &debugEnv();
+
+    /**
+     * @brief Refresh the cached DebugEnv snapshot so subsequent calls to debugEnv() re-parse
+     *        environment variables. Primarily intended for tests that set env vars after
+     *        earlier library initialization (the snapshot is normally created lazily once).
+     *
+     * Usage pattern in tests:
+     *   setenv("LLAMINAR_DECODE_STAGE_SNAPSHOTS", "1", 1);
+     *   refreshDebugEnv(); // discard old snapshot
+     *   (void)debugEnv();  // force reparse under new environment
+     */
+    void refreshDebugEnv();
     // Utility to format a concise multi-line summary of active debug env groups
     // Implemented in debug_env.cpp
     std::vector<std::string> formatDebugEnvSummary(const DebugEnvSnapshot &s);

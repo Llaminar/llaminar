@@ -11,6 +11,29 @@
 
 #pragma once
 
+// Include MKL backend if available (BEFORE OpenBLAS to avoid header conflicts)
+#ifdef HAVE_MKL
+#include "backends/MKLBackend.h"
+#endif
+
+// Include OpenBLAS cblas.h AFTER MKL headers (if both present)
+// OpenBLAS common.h defines FLOAT/DOUBLE macros that conflict with MPI/OpenMP
+#include <cblas.h>
+
+// Undefine OpenBLAS internal macros that conflict with MPI
+#ifdef FLOAT
+#undef FLOAT
+#endif
+#ifdef DOUBLE
+#undef DOUBLE
+#endif
+#ifdef COMPLEX
+#undef COMPLEX
+#endif
+#ifdef COMPLEX16
+#undef COMPLEX16
+#endif
+
 #include <memory>
 #include <map>
 #include <limits>
@@ -19,9 +42,10 @@
 #include <cstring>
 #include <string>
 #include <cctype>
-#include <cblas.h>
 #include "tensors/TensorFactory.h"
 #include "Logger.h"
+#include "utils/BFloat16.h"
+#include "utils/CpuFeatures.h"
 #include <mpi.h>
 #include <cosma/cinterface.hpp>
 #include <cosma/multiply.hpp>
@@ -280,6 +304,244 @@ namespace llaminar
 
         // Accessor for tests
         MatMulBackend last_backend() const { return last_backend_; }
+
+        /**
+         * @brief BF16×BF16→FP32 matrix multiplication using OpenBLAS cblas_sbgemm
+         *
+         * @param A Input matrix A (m×k) in FP32 - will be converted to BF16 internally
+         * @param B_bf16 Weight matrix B (k×n) in BF16 format
+         * @param C Output matrix C (m×n) in FP32
+         * @param m Number of rows in A and C
+         * @param n Number of columns in B and C
+         * @param k Number of columns in A and rows in B
+         * @param transpose_B Whether B is transposed (currently only transpose_B=true supported for weights)
+         * @param alpha Scalar alpha (default 1.0)
+         * @param beta Scalar beta (default 0.0)
+         * @return true on success, false on failure
+         *
+         * @note OpenBLAS sbgemm performs BF16×BF16 multiply with FP32 accumulation.
+         *       Input A is converted from FP32→BF16 before computation.
+         *       This exploits 2× bandwidth reduction for weights while preserving accuracy.
+         */
+        bool multiplyBF16(const float *A, const bfloat16 *B_bf16, float *C,
+                          int m, int n, int k,
+                          bool transpose_B = true,
+                          float alpha = 1.0f, float beta = 0.0f)
+        {
+            // Check if BF16 GEMM is enabled
+            if (!debugEnv().quant.bf16_gemm)
+            {
+                if (mpi_rank_ == 0)
+                {
+                    LOG_DEBUG("BF16 GEMM disabled (LLAMINAR_QUANT_BF16_GEMM=0), falling back to FP32 expansion");
+                }
+                return false; // Caller should fallback to FP32 expansion
+            }
+
+#ifdef HAVE_MKL
+            // Intel MKL is the default BF16 backend when compiled in (no CPU feature requirements)
+            // Only skip MKL if explicitly disabled via LLAMINAR_QUANT_BF16_PREFER_MKL=0
+            bool use_mkl = true;
+            if (const char *prefer_env = std::getenv("LLAMINAR_QUANT_BF16_PREFER_MKL"))
+            {
+                std::string val(prefer_env);
+                if (val == "0" || val == "false" || val == "off")
+                {
+                    use_mkl = false;
+                    if (mpi_rank_ == 0)
+                    {
+                        LOG_DEBUG("MKL explicitly disabled via LLAMINAR_QUANT_BF16_PREFER_MKL=0");
+                    }
+                }
+            }
+
+            if (use_mkl)
+            {
+                if (mpi_rank_ == 0)
+                {
+                    LOG_DEBUG("Using MKL BF16 GEMM (default): m=" << m << " n=" << n << " k=" << k);
+                }
+
+                bool mkl_ok = mkl_multiply_bf16(
+                    A, B_bf16, C, m, n, k,
+                    alpha, beta,
+                    false,       // transpose_A (always false for activations)
+                    transpose_B, // transpose_B (weights)
+                    false        // validate_inputs (debug only)
+                );
+
+                if (mkl_ok)
+                {
+                    if (mpi_rank_ == 0)
+                    {
+                        LOG_DEBUG("MKL BF16 GEMM succeeded");
+                    }
+                    return true;
+                }
+
+                // MKL failed, log warning and try OpenBLAS fallback
+                if (mpi_rank_ == 0)
+                {
+                    LOG_WARN("MKL BF16 GEMM failed, falling back to OpenBLAS");
+                }
+            }
+#endif
+
+            // OpenBLAS fallback path
+            // NOTE: Original defensive check removed after verifying OpenBLAS v0.3.26
+            //       BF16 emulation works correctly on Cascade Lake (Oct 20, 2025)
+            // Previous code checked: if (!can_use_native_bf16_gemm()) { return false; }
+            // Test results: cblas_sbgemm works without NaN on all matrix sizes
+            // See: changelog/2025-10-20-openblas-bf16-bug-investigation.md
+
+            // Optionally warn if using software emulation (informational only)
+            if (mpi_rank_ == 0 && !can_use_native_bf16_gemm())
+            {
+                static bool logged_once = false;
+                if (!logged_once)
+                {
+                    LOG_INFO("CPU lacks AVX512_BF16 - using OpenBLAS software BF16 emulation (verified working in v0.3.26)");
+                    logged_once = true;
+                }
+            }
+
+            if (mpi_rank_ == 0)
+            {
+                LOG_DEBUG("AdaptiveMatMul::multiplyBF16 m=" << m << " n=" << n << " k=" << k
+                                                            << " transpose_B=" << transpose_B);
+            }
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            try
+            {
+                // Convert input A from FP32 to BF16
+                // Use raw uint16_t buffer for OpenBLAS compatibility (avoids struct casting issues)
+                std::vector<uint16_t> A_bf16_raw((size_t)m * (size_t)k);
+
+#ifdef _OPENMP
+                size_t total = (size_t)m * (size_t)k;
+#pragma omp parallel for if (total > 32768) schedule(static)
+                for (size_t idx = 0; idx < total; ++idx)
+                {
+                    A_bf16_raw[idx] = bfloat16::from_float(A[idx]).data;
+                }
+#else
+                for (size_t idx = 0; idx < (size_t)m * (size_t)k; ++idx)
+                {
+                    A_bf16_raw[idx] = bfloat16::from_float(A[idx]).data;
+                }
+#endif
+
+                // Also convert B_bf16 to raw uint16_t buffer
+                size_t B_size = transpose_B ? ((size_t)n * (size_t)k) : ((size_t)k * (size_t)n);
+                std::vector<uint16_t> B_bf16_raw(B_size);
+#ifdef _OPENMP
+#pragma omp parallel for if (B_size > 32768) schedule(static)
+                for (size_t idx = 0; idx < B_size; ++idx)
+                {
+                    B_bf16_raw[idx] = B_bf16[idx].data;
+                }
+#else
+                for (size_t idx = 0; idx < B_size; ++idx)
+                {
+                    B_bf16_raw[idx] = B_bf16[idx].data;
+                }
+#endif
+
+                // Adaptive threading (same logic as multiply_openblas)
+                static int env_threads = []()
+                {
+                    int t = llaminar::debugEnv().cosma.forced_openblas_threads;
+                    return t > 0 ? t : -1;
+                }();
+                int threads = 1;
+                if (env_threads > 0)
+                {
+                    threads = env_threads;
+                }
+                else
+                {
+                    long double work = static_cast<long double>(m) * n * k;
+                    if (work >= 25000000.0L)
+                    {
+#ifdef _OPENMP
+                        int max_t = omp_get_max_threads();
+                        int ranks = mpi_size_ > 0 ? mpi_size_ : 1;
+                        threads = std::max(1, max_t / ranks);
+#else
+                        threads = 4;
+#endif
+                    }
+                }
+                openblas_set_num_threads(threads);
+
+                // Call cblas_sbgemm
+                // Note: OpenBLAS bfloat16 is uint16_t, our bfloat16 is a struct with uint16_t data member
+                // Cast via reinterpret_cast to match OpenBLAS signature
+
+                CBLAS_TRANSPOSE trans_B = transpose_B ? CblasTrans : CblasNoTrans;
+                int lda = k;                   // A is row-major (m×k)
+                int ldb = transpose_B ? n : k; // B is (k×n) with transpose
+                int ldc = n;                   // C is row-major (m×n)
+
+                if (mpi_rank_ == 0)
+                {
+                    LOG_DEBUG("cblas_sbgemm params: m=" << m << " n=" << n << " k=" << k
+                                                        << " transpose_B=" << transpose_B << " trans_B=" << (trans_B == CblasTrans ? "Trans" : "NoTrans")
+                                                        << " lda=" << lda << " ldb=" << ldb << " ldc=" << ldc
+                                                        << " A_size=" << A_bf16_raw.size() << " B_size=" << B_bf16_raw.size());
+
+                    // Validate inputs don't contain NaN/Inf in BF16 form
+                    bool a_valid = true, b_valid = true;
+                    for (size_t i = 0; i < std::min((size_t)10, A_bf16_raw.size()); ++i)
+                    {
+                        uint16_t val = A_bf16_raw[i];
+                        if ((val & 0x7FFF) == 0x7F80)
+                        { // NaN/Inf check for BF16
+                            a_valid = false;
+                            break;
+                        }
+                    }
+                    for (size_t i = 0; i < std::min((size_t)10, B_bf16_raw.size()); ++i)
+                    {
+                        uint16_t val = B_bf16_raw[i];
+                        if ((val & 0x7FFF) == 0x7F80)
+                        { // NaN/Inf check for BF16
+                            b_valid = false;
+                            break;
+                        }
+                    }
+                    LOG_DEBUG("Input validation: A_valid=" << a_valid << " B_valid=" << b_valid);
+                }
+
+                // OpenBLAS sbgemm: BF16×BF16→FP32
+                // Use raw uint16_t buffers (no struct casting needed)
+                cblas_sbgemm(CblasRowMajor, CblasNoTrans, trans_B,
+                             m, n, k,
+                             alpha, reinterpret_cast<const ::bfloat16 *>(A_bf16_raw.data()), lda,
+                             reinterpret_cast<const ::bfloat16 *>(B_bf16_raw.data()), ldb,
+                             beta, C, ldc);
+
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+
+                if (mpi_rank_ == 0)
+                {
+                    LOG_DEBUG("BF16 GEMM completed in " << ms << "ms");
+                }
+
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::MULTI_THREADED_OPENBLAS, false);
+                return true;
+            }
+            catch (const std::exception &e)
+            {
+                if (mpi_rank_ == 0)
+                {
+                    LOG_ERROR("BF16 GEMM failed: " << e.what() << ", falling back to FP32");
+                }
+                return false;
+            }
+        }
 
         // Batched multiply: multiple A_i * shared B -> C_i. Always uses OpenBLAS (loop) for now.
         // Each A_i: (m_i x k), shared B: (k x n), C_i: (m_i x n). Intended for grouped projections (e.g., Q/K/V when laid out separately).
@@ -603,6 +865,13 @@ namespace llaminar
                                bool transpose_A, bool transpose_B,
                                float alpha, float beta)
         {
+            // Early return for empty tensors (e.g., rank with no tokens to process)
+            if (m == 0 || n == 0 || k == 0)
+            {
+                LOG_DEBUG("[OPENBLAS_SKIP] Empty tensor: m=" << m << " n=" << n << " k=" << k << ", skipping computation on rank " << mpi_rank_);
+                return true; // Success - nothing to compute
+            }
+
             // DEBUG: Entry logging
             LOG_INFO("[OPENBLAS_ENTRY] rank=" << mpi_rank_ << " m=" << m << " n=" << n << " k=" << k
                                               << " transpose_A=" << transpose_A << " transpose_B=" << transpose_B);
@@ -711,6 +980,61 @@ namespace llaminar
                                 alpha, beta,
                                 is_prefill,
                                 distributed_partition);
+    }
+
+    // FP16 weight convenience: expand FP16 weights to FP32 then call adaptiveMatMul.
+    // Slab holds row-major (k x n) so no transpose needed.
+    inline bool adaptiveMatMulFp16WeightsExpand(const float *A, const _Float16 *B_half, float *C,
+                                                int m, int n, int k,
+                                                float alpha = 1.0f, float beta = 0.0f,
+                                                bool is_prefill = false,
+                                                bool distributed_partition = false)
+    {
+        // Allocate FP32 buffer for weights; parallelize conversion for large slabs.
+        std::vector<float> B_fp32((size_t)k * (size_t)n);
+#ifdef _OPENMP
+        size_t total = (size_t)k * (size_t)n;
+#pragma omp parallel for if (total > 32768) schedule(static)
+        for (size_t idx = 0; idx < total; ++idx)
+        {
+            B_fp32[idx] = (float)B_half[idx];
+        }
+#else
+        for (size_t idx = 0; idx < (size_t)k * (size_t)n; ++idx)
+            B_fp32[idx] = (float)B_half[idx];
+#endif
+        return adaptiveMatMul(A, B_fp32.data(), C, m, n, k, is_prefill, distributed_partition,
+                              /*transpose_A*/ false, /*transpose_B*/ false, alpha, beta);
+    }
+
+    /**
+     * @brief BF16 weight GEMM: BF16×BF16→FP32 using OpenBLAS cblas_sbgemm
+     *
+     * @param A Input activations (m×k) in FP32 - converted to BF16 internally
+     * @param B_bf16 Weight matrix (k×n) in BF16 format (from slab cache)
+     * @param C Output matrix (m×n) in FP32
+     * @param m Number of rows in A and C
+     * @param n Number of columns in B and C
+     * @param k Number of columns in A and rows in B
+     * @param alpha Scalar multiplier (default 1.0)
+     * @param beta Scalar for C (default 0.0)
+     * @param is_prefill Whether this is prefill (for logging)
+     * @param distributed_partition Whether weights are already partitioned (for logging)
+     * @param transpose_B Whether B needs transpose (default true for weight format)
+     * @return true on success, false if BF16 disabled (caller should fallback)
+     *
+     * @note Requires LLAMINAR_QUANT_BF16_GEMM=1 environment variable
+     * @note Only OpenBLAS backend supported currently (COSMA/MKL fallback to FP32)
+     */
+    inline bool adaptiveMatMulBF16(const float *A, const bfloat16 *B_bf16, float *C,
+                                   int m, int n, int k,
+                                   float alpha = 1.0f, float beta = 0.0f,
+                                   bool is_prefill = false,
+                                   bool distributed_partition = false,
+                                   bool transpose_B = true)
+    {
+        static AdaptiveMatMulManager manager;
+        return manager.multiplyBF16(A, B_bf16, C, m, n, k, transpose_B, alpha, beta);
     }
 
     inline bool adaptive_matmul(const float *A, const float *B, float *C,

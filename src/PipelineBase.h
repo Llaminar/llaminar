@@ -111,7 +111,7 @@ namespace llaminar
          * @param shape Tensor shape
          * @return Shared pointer to local tensor
          */
-        std::shared_ptr<TensorBase> createLocalTensor(const std::vector<int> &shape);
+        std::shared_ptr<TensorBase> createLocalTensor(const std::vector<int> &shape, bool use_bf16 = false);
 
         /**
          * @brief Create tensor optimized for distributed computation
@@ -344,6 +344,10 @@ namespace llaminar
     protected:
         // Snapshot configuration (protected so derived classes can access)
         std::string snapshot_source_ = "llaminar"; // Default source for snapshots
+        int current_decode_step_ = -1;             // Active decode step index (-1 when not decoding or unspecified)
+    public:
+        void setDecodeStep(int step) { current_decode_step_ = step; }
+        int currentDecodeStep() const { return current_decode_step_; }
 
     private:
         /**

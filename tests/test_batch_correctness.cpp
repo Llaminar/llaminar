@@ -184,25 +184,29 @@ TEST_F(BatchCorrectnessTest, PrefillBatchVsSequential)
     }
 
     // ============================================
-    // Run sequential execution
+    // Run sequential execution (reuse weights to avoid duplicate heavy loads)
     // ============================================
     std::vector<std::vector<float>> sequential_results(batch_size);
     std::vector<std::vector<int>> sequences = {seq1, seq2};
 
+    // Load weights once using a temporary pipeline instance
+    auto seq_weights_loader = PipelineFactory::instance().create(sequential_config);
+    ASSERT_NE(seq_weights_loader, nullptr);
+    auto shared_seq_weights = seq_weights_loader->loadWeights(model_path);
+    ASSERT_NE(shared_seq_weights, nullptr);
+    // Optionally release loader pipeline early to free its buffers
+    seq_weights_loader.reset();
+
     for (int seq = 0; seq < batch_size; ++seq)
     {
         if (rank == 0)
-            std::cout << "Running sequential prefill for sequence " << seq << "...\n";
+            std::cout << "Running sequential prefill for sequence " << seq << " (reusing weights)...\n";
 
         auto seq_pipeline = PipelineFactory::instance().create(sequential_config);
         ASSERT_NE(seq_pipeline, nullptr);
 
-        auto seq_weights = seq_pipeline->loadWeights(model_path);
-        ASSERT_NE(seq_weights, nullptr);
-
         StageContext seq_ctx;
-
-        ASSERT_TRUE(seq_pipeline->prefill(sequences[seq], *seq_weights, seq_ctx));
+        ASSERT_TRUE(seq_pipeline->prefill(sequences[seq], *shared_seq_weights, seq_ctx));
 
         std::shared_ptr<TensorBase> seq_logits;
         ASSERT_TRUE(seq_pipeline->logits(seq_logits));
@@ -212,7 +216,6 @@ TEST_F(BatchCorrectnessTest, PrefillBatchVsSequential)
         ASSERT_EQ(seq_shape.size(), 2);
         ASSERT_EQ(seq_shape[1], vocab_size);
 
-        // Get last row (final token's logits)
         int rows = seq_shape[0];
         const float *seq_data = seq_logits->data();
         sequential_results[seq].assign(
@@ -268,6 +271,39 @@ TEST_F(BatchCorrectnessTest, PrefillBatchVsSequential)
 /**
  * @brief Test: Batch decode produces same results as sequential decode
  */
+// Helper: Extract single sequence from batch snapshot
+static parity::TensorSnapshot extractSequenceFromBatch(
+    const parity::TensorSnapshot &batch_snap,
+    int seq_idx,
+    int padded_seq_len,
+    int batch_size)
+{
+    // Batch snapshot has shape [batch_size * padded_seq_len, feature_dim]
+    // Extract rows [seq_idx * padded_seq_len, (seq_idx+1) * padded_seq_len)
+    int feature_dim = batch_snap.metadata.feature_dim;
+    int total_rows = batch_snap.metadata.seq_len;
+
+    if (total_rows != batch_size * padded_seq_len)
+    {
+        throw std::runtime_error("Batch snapshot shape mismatch: expected " +
+                                 std::to_string(batch_size * padded_seq_len) + " rows, got " +
+                                 std::to_string(total_rows));
+    }
+
+    parity::TensorSnapshot seq_snap;
+    seq_snap.metadata = batch_snap.metadata;
+    seq_snap.metadata.seq_len = padded_seq_len;
+    seq_snap.metadata.source = batch_snap.metadata.source + "_seq" + std::to_string(seq_idx);
+
+    size_t seq_size = static_cast<size_t>(padded_seq_len) * feature_dim;
+    seq_snap.data.resize(seq_size);
+
+    const float *src = batch_snap.data.data() + seq_idx * padded_seq_len * feature_dim;
+    std::copy(src, src + seq_size, seq_snap.data.begin());
+
+    return seq_snap;
+}
+
 TEST_F(BatchCorrectnessTest, DecodeBatchVsSequential)
 {
     auto rank = MPIContext::capture().rank;
@@ -282,6 +318,31 @@ TEST_F(BatchCorrectnessTest, DecodeBatchVsSequential)
         std::cout << "\n=== Testing Decode: Batch vs Sequential ===\n";
         std::cout << "Batch size: " << batch_size << "\n";
         std::cout << "Decode steps: " << decode_steps << "\n";
+    }
+
+    // Force comparable semantics on ALL ranks: disable sequential incremental decode and enable batch replay
+    setenv("LLAMINAR_DISABLE_INCREMENTAL_DECODE", "1", 1);
+    setenv("LLAMINAR_BATCH_DECODE_REPLAY", "1", 1);
+    setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);                 // ensure snapshots if needed
+    setenv("LLAMINAR_DECODE_STAGE_SNAPSHOTS", "1", 1);         // capture per-layer decode stage snapshots
+    setenv("LLAMINAR_DECODE_STAGE_SNAPSHOTS_VERBOSE", "1", 1); // emit verbose decode snapshot logging
+    if (rank == 0)
+        std::cout << "[TEST_ENV] (all ranks) Set LLAMINAR_DISABLE_INCREMENTAL_DECODE=1 LLAMINAR_BATCH_DECODE_REPLAY=1" << std::endl;
+
+    // Force a refresh of the debug environment snapshot since tests set env vars dynamically
+    refreshDebugEnv();
+    (void)debugEnv(); // rebuild under new environment
+
+    // Explicitly (re)enable snapshot systems in case singleton instantiated before env vars
+    PipelineSnapshotManager::instance().setEnabled(true);
+    parity::LlaminarSnapshotHook::set_enabled(true);
+    PipelineSnapshotManager::instance().clear();
+    parity::SnapshotRegistry::instance().clear();
+    if (rank == 0)
+    {
+        std::cout << "[SNAPSHOT_INIT] Enabled snapshot capture for decode parity test.\n";
+        std::cout << "  PipelineSnapshotManager::isEnabled()=" << PipelineSnapshotManager::instance().isEnabled() << "\n";
+        std::cout << "  LlaminarSnapshotHook::is_enabled()=" << parity::LlaminarSnapshotHook::is_enabled() << "\n";
     }
 
     // ============================================
@@ -387,6 +448,168 @@ TEST_F(BatchCorrectnessTest, DecodeBatchVsSequential)
     // ============================================
     if (rank == 0)
         std::cout << "Comparing decode results...\n";
+
+    // --- Diagnostic: Stage-level snapshot parity for first decode step (step 0) ---
+    // We compare batch replay vs sequential replay snapshots captured with decode step suffix _dec0
+    if (rank == 0)
+    {
+        using namespace parity;
+        auto &registry = SnapshotRegistry::instance();
+        // Enumerate available keys with decode step 0 suffix for debugging
+        {
+            std::cout << "\n[DECODE_STAGE_PARITY] Registry keys containing 'dec0' before stage comparisons:" << std::endl;
+            // There is no direct API to iterate keys; hack: attempt common stage keys
+            PipelineStage probe_stages[] = {PipelineStage::EMBEDDING, PipelineStage::ATTENTION_NORM, PipelineStage::Q_PROJECTION,
+                                            PipelineStage::K_PROJECTION, PipelineStage::V_PROJECTION, PipelineStage::ROPE_APPLICATION,
+                                            PipelineStage::ATTENTION_CONTEXT, PipelineStage::ATTENTION_OUTPUT, PipelineStage::FINAL_NORM, PipelineStage::LM_HEAD};
+            for (auto ps : probe_stages)
+            {
+                std::string bk = registry.make_key("batch_dec0", ps, ps == PipelineStage::EMBEDDING || ps == PipelineStage::FINAL_NORM || ps == PipelineStage::LM_HEAD ? -1 : 0);
+                std::string sk = registry.make_key("llaminar_dec0", ps, ps == PipelineStage::EMBEDDING || ps == PipelineStage::FINAL_NORM || ps == PipelineStage::LM_HEAD ? -1 : 0);
+                parity::TensorSnapshot tmp;
+                bool have_b = registry.get_snapshot(bk, tmp);
+                bool have_s = registry.get_snapshot(sk, tmp);
+                std::cout << "  key_batch=" << bk << " present=" << have_b << " key_seq=" << sk << " present=" << have_s << std::endl;
+            }
+        }
+        // Batch processes 2 sequences padded to 5 tokens each (seq1=3→5, seq2=4→5)
+        // Sequential processes them one at a time: seq1 prefill (3) + decode (1) = 4 tokens
+        //                                          seq2 prefill (4) + decode (1) = 5 tokens
+        const int max_seq_len = 5;                         // Padded length in batch
+        const std::vector<int> original_seq_lens = {3, 4}; // seq1, seq2 prefill lengths
+        const std::vector<int> decode0_lens = {4, 5};      // After 1 decode token added
+
+        // We'll compare batch sequence 1 (seq2) against the last sequential pipeline created (also seq2)
+        // because the test creates sequential pipelines in order: seq=0 (seq1), seq=1 (seq2)
+        const int compare_seq_idx = 1; // seq2
+
+        auto compare_stage = [&](PipelineStage stage, int layer, const std::string &label)
+        {
+            std::string batch_key = registry.make_key("batch_dec0", stage, layer);
+            std::string seq_key = registry.make_key("llaminar_dec0", stage, layer);
+            TensorSnapshot batch_full, seq_snap;
+            bool have_batch = registry.get_snapshot(batch_key, batch_full);
+            bool have_seq = registry.get_snapshot(seq_key, seq_snap);
+            if (!have_batch || !have_seq)
+            {
+                std::cout << "[DECODE_STAGE_PARITY] Missing snapshot(s) for " << label
+                          << " batch_key=" << batch_key << " present=" << have_batch
+                          << " seq_key=" << seq_key << " present=" << have_seq << "\n";
+                return;
+            }
+
+            // DEBUG: Print raw batch snapshot before extraction
+            if (label == "ROPE_APPLICATION_L0" && rank == 0)
+            {
+                std::cout << "[ROPE_DEBUG_TEST] Raw batch_full snapshot:\n";
+                std::cout << "  seq_len=" << batch_full.metadata.seq_len
+                          << " feature_dim=" << batch_full.metadata.feature_dim << "\n";
+                std::cout << "  First 8 values: [";
+                for (int i = 0; i < std::min<size_t>(8, batch_full.data.size()); ++i)
+                {
+                    std::cout << batch_full.data[i] << (i + 1 < std::min<size_t>(8, batch_full.data.size()) ? "," : "");
+                }
+                std::cout << "]\n";
+                std::cout << "  Offset 5120 (seq2 start if 2 seqs × 5 tokens × 1024 dims / 2): [";
+                for (int i = 0; i < 8 && (5120 + i) < batch_full.data.size(); ++i)
+                {
+                    std::cout << batch_full.data[5120 + i] << (i + 1 < 8 ? "," : "");
+                }
+                std::cout << "]\n";
+            }
+
+            // Extract the compare_seq_idx sequence from batch snapshot
+            TensorSnapshot batch_seq;
+            try
+            {
+                batch_seq = extractSequenceFromBatch(batch_full, compare_seq_idx, max_seq_len, batch_size);
+            }
+            catch (const std::exception &e)
+            {
+                std::cout << "[DECODE_STAGE_PARITY] Failed to extract sequence " << compare_seq_idx
+                          << " from batch snapshot: " << e.what() << "\n";
+                return;
+            }
+
+            // Now compare: batch_seq should have shape [max_seq_len, feature_dim]
+            //              seq_snap should have shape [decode0_lens[compare_seq_idx], feature_dim]
+            // We'll compare only the valid (non-padded) portion
+            int valid_len = decode0_lens[compare_seq_idx]; // 5 for seq2
+            if (batch_seq.metadata.seq_len < valid_len)
+            {
+                std::cout << "[DECODE_STAGE_PARITY] Batch sequence too short for " << label
+                          << " batch_len=" << batch_seq.metadata.seq_len << " valid_len=" << valid_len << "\n";
+                return;
+            }
+            if (seq_snap.metadata.seq_len != valid_len)
+            {
+                std::cout << "[DECODE_STAGE_PARITY] Sequential length mismatch for " << label
+                          << " expected=" << valid_len << " got=" << seq_snap.metadata.seq_len << "\n";
+                return;
+            }
+            if (batch_seq.metadata.feature_dim != seq_snap.metadata.feature_dim)
+            {
+                std::cout << "[DECODE_STAGE_PARITY] Feature dim mismatch for " << label
+                          << " batch=" << batch_seq.metadata.feature_dim
+                          << " seq=" << seq_snap.metadata.feature_dim << "\n";
+                return;
+            }
+            // Compare only valid portion (non-padded rows)
+            int feature_dim = seq_snap.metadata.feature_dim;
+            size_t total = static_cast<size_t>(valid_len) * feature_dim;
+            size_t mismatches = 0;
+            float max_diff = 0.0f;
+            double sum_sq_batch = 0.0;
+            double sum_sq_seq = 0.0;
+
+            for (int row = 0; row < valid_len; ++row)
+            {
+                for (int col = 0; col < feature_dim; ++col)
+                {
+                    size_t idx = row * feature_dim + col;
+                    float batch_val = batch_seq.data[idx];
+                    float seq_val = seq_snap.data[idx];
+                    float diff = std::fabs(batch_val - seq_val);
+                    if (diff > 1e-4f)
+                    {
+                        ++mismatches;
+                        if (diff > max_diff)
+                            max_diff = diff;
+                    }
+                    sum_sq_batch += batch_val * batch_val;
+                    sum_sq_seq += seq_val * seq_val;
+                }
+            }
+
+            double l2_batch = std::sqrt(sum_sq_batch / total);
+            double l2_seq = std::sqrt(sum_sq_seq / total);
+            std::cout << "[DECODE_STAGE_PARITY] " << label << " seq" << compare_seq_idx << " step0: "
+                      << "mismatches=" << mismatches << "/" << total
+                      << " max_diff=" << max_diff
+                      << " L2_batch=" << l2_batch << " L2_seq=" << l2_seq;
+
+            // Preview first 8 values
+            std::cout << " first8_batch=[";
+            for (int i = 0; i < std::min<size_t>(8, total); ++i)
+            {
+                std::cout << batch_seq.data[i] << (i + 1 < std::min<size_t>(8, total) ? "," : "");
+            }
+            std::cout << "] first8_seq=[";
+            for (int i = 0; i < std::min<size_t>(8, total); ++i)
+            {
+                std::cout << seq_snap.data[i] << (i + 1 < std::min<size_t>(8, total) ? "," : "");
+            }
+            std::cout << "]\n";
+        };
+        std::cout << "\n=== Decode Step 0 Stage Parity Diagnostics ===\n";
+        compare_stage(PipelineStage::EMBEDDING, -1, "EMBEDDING");
+        compare_stage(PipelineStage::ATTENTION_NORM, 0, "ATTENTION_NORM_L0");
+        compare_stage(PipelineStage::Q_PROJECTION, 0, "Q_PROJECTION_L0");
+        compare_stage(PipelineStage::K_PROJECTION, 0, "K_PROJECTION_L0");
+        compare_stage(PipelineStage::V_PROJECTION, 0, "V_PROJECTION_L0");
+        compare_stage(PipelineStage::ROPE_APPLICATION, 0, "ROPE_APPLICATION_L0");
+        compare_stage(PipelineStage::ATTENTION_CONTEXT, 0, "ATTENTION_CONTEXT_L0");
+    }
 
     for (int step = 0; step < decode_steps; ++step)
     {
@@ -535,8 +758,8 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
         std::vector<std::string> seq_keys, batch_keys;
         for (const auto &key : all_keys)
         {
-            // Sequential pipeline uses "OpenBLAS" as source (from PrefillProvider.name())
-            if (key.find("OpenBLAS_") == 0)
+            // Accept both legacy provider source ("OpenBLAS_") and unified pipeline source ("llaminar_")
+            if (key.find("OpenBLAS_") == 0 || key.find("llaminar_") == 0)
                 seq_keys.push_back(key);
             else if (key.find("batch_") == 0)
                 batch_keys.push_back(key);
@@ -564,12 +787,16 @@ TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
         }
         std::cout << "\n";
 
-        // Expected snapshot count calculation:
-        // Per pipeline: EMBEDDING (1) + 24 layers × (ATTENTION_NORM, Q/K/V_PROJECTION,
+        // Expected snapshot count calculation (functional baseline, excluding optional internal attention diagnostics):
+        // Per pipeline: EMBEDDING (1) + 24 layers × 14 functional stages + FINAL_NORM + LM_HEAD
+        // Functional per-layer stages: ATTENTION_NORM, Q_PROJECTION, K_PROJECTION, V_PROJECTION,
         // ROPE_APPLICATION, ATTENTION_CONTEXT, ATTENTION_OUTPUT, ATTENTION_RESIDUAL,
-        // FFN_NORM, FFN_GATE, FFN_UP, FFN_SWIGLU, FFN_DOWN, FFN_RESIDUAL) + FINAL_NORM + LM_HEAD
-        // = 1 + 24×12 + 2 = 291 snapshots per pipeline
-        const int expected_per_pipeline = 291;
+        // FFN_NORM, FFN_GATE, FFN_UP, FFN_SWIGLU, FFN_DOWN, FFN_RESIDUAL
+        // = 1 + 24×14 + 2 = 339 snapshots per pipeline
+        const int expected_per_pipeline = 339;
+        // NOTE: Internal stages ATTENTION_SCORES and ATTENTION_SOFTMAX are gated behind
+        // LLAMINAR_ATTN_INTERNAL_DIFF (debugEnv().attention.internal_diff). When enabled,
+        // sequential snapshot count will increase by 24×2 = 48 (and batch if attention operator also captures).
         seq_snapshot_count = seq_keys.size();
         batch_snapshot_count = batch_keys.size();
 

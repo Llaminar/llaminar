@@ -8,6 +8,7 @@
 #include "BenchmarkRunner.h"
 #include "Logger.h"
 #include "MpiContext.h"
+#include "MemoryTracker.h"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -24,12 +25,19 @@ namespace llaminar
             if (rank != 0)
                 return; // Only rank 0 prints
 
+            // Capture memory usage at end of benchmark
+            double memory_mb = MemoryTracker::getResidentMemoryMB();
+
             std::cout << "\n";
             std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
             std::cout << "║                    INFERENCE BENCHMARK                       ║\n";
             std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
             std::cout << "║ Model: " << std::left << std::setw(54) << model_path << "║\n";
             std::cout << "║ Backend: " << std::left << std::setw(52) << backend << "║\n";
+            if (memory_mb > 0)
+            {
+                std::cout << "║ Memory Usage: " << std::right << std::setw(8) << std::fixed << std::setprecision(2) << memory_mb << " MB                                  ║\n";
+            }
 
             // Only show prefill phase if tokens > 0
             if (prefill_tokens > 0)
@@ -379,23 +387,23 @@ namespace llaminar
 
             // Generate or use prompts for batch
             std::vector<std::vector<int>> token_batches;
-            
+
             if (rank == 0)
             {
                 std::cout << "Preparing batch of " << batch_size << " sequences...\n";
-                
+
                 // For now, use the same prompt for all sequences
                 // TODO: Support varied prompts via parameters
                 std::vector<int> base_tokens = tokenizer.tokenize(params.prompt);
-                
+
                 std::cout << "Base prompt tokenized: " << base_tokens.size() << " tokens\n";
-                
+
                 for (int i = 0; i < batch_size; ++i)
                 {
                     token_batches.push_back(base_tokens);
                 }
-                
-                std::cout << "Batch prepared: " << batch_size << " sequences × " 
+
+                std::cout << "Batch prepared: " << batch_size << " sequences × "
                           << base_tokens.size() << " tokens\n";
                 std::cout << "Running prefillBatch..." << std::flush;
             }
@@ -445,7 +453,7 @@ namespace llaminar
                 }
 
                 auto prefill_end = std::chrono::high_resolution_clock::now();
-                
+
                 metrics.prefill_tokens_total = batch_size * tokens_per_seq;
                 metrics.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
                 metrics.prefill_throughput = (metrics.prefill_tokens_total * 1000.0) / metrics.prefill_time_ms;
@@ -471,12 +479,12 @@ namespace llaminar
                 {
                     std::cout << " skipped (0 tokens requested)\n";
                 }
-                
+
                 metrics.sequences_completed = batch_size;
                 metrics.total_time_ms = metrics.prefill_time_ms;
                 metrics.total_throughput = metrics.prefill_throughput;
                 metrics.backend = "OpenBLAS";
-                
+
                 return metrics;
             }
 
@@ -510,7 +518,7 @@ namespace llaminar
 
                 // Greedy sampling for each sequence (rank 0 only)
                 std::vector<int> next_tokens(batch_size, 0);
-                
+
                 if (rank == 0)
                 {
                     const auto &shape = decode_logits->shape();
@@ -555,7 +563,7 @@ namespace llaminar
 
                 // Broadcast next tokens to all ranks
                 MPI_Bcast(next_tokens.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
-                
+
                 // Broadcast finished flags
                 std::vector<int> finished_flags(batch_size);
                 if (rank == 0)
@@ -566,7 +574,7 @@ namespace llaminar
                     }
                 }
                 MPI_Bcast(finished_flags.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
-                
+
                 if (rank != 0)
                 {
                     for (int i = 0; i < batch_size; ++i)
@@ -576,7 +584,8 @@ namespace llaminar
                     active_sequences = 0;
                     for (int i = 0; i < batch_size; ++i)
                     {
-                        if (!seq_finished[i]) active_sequences++;
+                        if (!seq_finished[i])
+                            active_sequences++;
                     }
                 }
 
@@ -592,7 +601,7 @@ namespace llaminar
             }
 
             auto decode_end = std::chrono::high_resolution_clock::now();
-            
+
             // Calculate decode metrics
             int total_decode_tokens = 0;
             if (rank == 0)
@@ -606,7 +615,7 @@ namespace llaminar
 
             metrics.decode_tokens_total = total_decode_tokens;
             metrics.decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
-            
+
             if (metrics.decode_tokens_total > 0)
             {
                 metrics.decode_throughput = (metrics.decode_tokens_total * 1000.0) / metrics.decode_time_ms;

@@ -203,7 +203,7 @@ bool ArgumentParser::parse(LlaminarParams &params)
             params.inference_mode = true; // benchmark implies inference
 
             // Set default benchmark parameters if not already specified
-            // Default: 512-token prefill, 128-token decode
+            // Default: ~512-token prefill, 128-token decode
             if (params.prompt.empty())
             {
                 // Generate a prompt that will tokenize to ~512 tokens
@@ -213,9 +213,9 @@ bool ArgumentParser::parse(LlaminarParams &params)
                                 "We need to generate approximately 512 tokens for the prefill phase "
                                 "to properly stress test the model's throughput and latency characteristics. ";
 
-                // Repeat the base text to reach ~512 tokens (each repetition is ~20-25 tokens)
+                // Repeat the base text to reach ~512 tokens (each repetition is ~40-45 tokens)
                 std::string base_prompt = params.prompt;
-                for (int i = 0; i < 18; ++i) // 20 repetitions total = ~400-500 tokens
+                for (int i = 0; i < 10; ++i) // 11 repetitions total = ~450-500 tokens
                 {
                     params.prompt += base_prompt;
                 }
@@ -297,6 +297,9 @@ void ArgumentParser::printUsage() const
     std::cout << "\nBenchmark Mode:" << std::endl;
     std::cout << "  --benchmark              Run inference benchmark with performance metrics" << std::endl;
     std::cout << "                           (minimal logging, shows prefill/decode tok/s)" << std::endl;
+    std::cout << "                           Respects -p (prompt) and -n (decode tokens)" << std::endl;
+    std::cout << "                           Use -n 0 for prefill-only, -p \"\" for decode-only" << std::endl;
+    std::cout << "                           If no -p provided, generates ~512 token prompt" << std::endl;
     std::cout << "\nSystem Configuration:" << std::endl;
     std::cout << "  --enable-hyperthreading  Use hyperthreaded cores (default: physical cores only)" << std::endl;
     std::cout << "  --ht                     Short form of --enable-hyperthreading" << std::endl;

@@ -29,10 +29,14 @@ namespace llaminar
         (void)seq_len;
         (void)feature_dim;
 #else
-        // Debug build: delegate to PipelineSnapshotManager
-        // Only rank 0 typically captures to avoid duplication in MPI runs
-        // Check if snapshot capture is enabled (can be disabled for benchmarks)
-        if (mpi_ctx_.rank == 0 && debugEnv().attention.capture_enabled)
+        // Debug build: delegate to PipelineSnapshotManager parity flag.
+        // PRIOR BEHAVIOR: We gated captures on debugEnv().attention.capture_enabled (LLAMINAR_ATTN_CAPTURE_ENABLED)
+        // which is intended for selective attention micro tracing and can be disabled during benchmarks.
+        // PROBLEM: Batch correctness & parity tests enable LLAMINAR_PARITY_CAPTURE=1 but do NOT set the attention
+        // capture flag, causing sequential prefill path (provider-based) to skip all snapshots -> missing 'llaminar_*'.
+        // FIX: Honor PipelineSnapshotManager::isEnabled() (driven by LLAMINAR_PARITY_CAPTURE) so sequential and batch
+        // pipelines use a unified enabling mechanism. We still restrict to rank 0 to avoid redundancy.
+        if (mpi_ctx_.rank == 0 && PipelineSnapshotManager::instance().isEnabled())
         {
             PipelineSnapshotManager::instance().capture(
                 stage,
@@ -40,7 +44,7 @@ namespace llaminar
                 data,
                 seq_len,
                 feature_dim,
-                "llaminar"); // Use "llaminar" as source for parity tests
+                "llaminar"); // Source distinguishes sequential vs batch
         }
 #endif
     }

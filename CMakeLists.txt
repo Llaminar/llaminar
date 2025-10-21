@@ -52,9 +52,11 @@ endif()
 #   -O0: no optimizations (required for accurate coverage)
 #   --coverage: enables gcov instrumentation (equivalent to -fprofile-arcs -ftest-coverage)
 #   -fprofile-abs-path: use absolute paths in .gcno files (helps gcov viewer match files)
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 --coverage -fprofile-abs-path")
-set(CMAKE_C_FLAGS_DEBUG "-g -O0 --coverage -fprofile-abs-path")
+#   -march=native: use CPU-specific optimizations (Cascade Lake in this case)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 --coverage -fprofile-abs-path -march=native")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 --coverage -fprofile-abs-path -march=native")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
 
 # Linker flags for coverage (Debug only)
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "--coverage")
@@ -87,12 +89,101 @@ if(NOT GTest_FOUND)
     endif()
 endif()
 
-# Find BLAS/CBLAS for linear algebra operations
-find_package(BLAS REQUIRED)
-find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas)
-if(NOT CBLAS_INCLUDE_DIR)
-    message(WARNING "CBLAS header not found - using fallback")
-    set(CBLAS_INCLUDE_DIR "")
+# Build OpenBLAS from source submodule (with BF16 support)
+message(STATUS "Configuring OpenBLAS submodule...")
+option(USE_SYSTEM_BLAS "Use system BLAS instead of building OpenBLAS submodule" OFF)
+option(USE_MKL "Use Intel MKL for BLAS operations (enables BF16 GEMM)" OFF)
+
+# Intel MKL Backend (optional, provides cblas_gemm_bf16bf16f32)
+if(USE_MKL)
+    # Set MKL configuration before find_package
+    set(MKL_LINK dynamic)  # Use dynamic linking (smaller binaries)
+    set(MKL_THREADING gnu_thread)  # Use GNU OpenMP (GCC compatible)
+    set(MKL_INTERFACE lp64)  # 32-bit integers (standard BLAS)
+    set(MKL_ARCH intel64)  # x86_64 architecture
+    
+    # Add MKL path if not in standard location
+    if(EXISTS "/opt/intel/oneapi/mkl/latest")
+        list(APPEND CMAKE_PREFIX_PATH "/opt/intel/oneapi/mkl/latest")
+    endif()
+    
+    find_package(MKL CONFIG REQUIRED)
+    
+    if(MKL_FOUND)
+        add_compile_definitions(HAVE_MKL)
+        message(STATUS "Intel MKL found: ${MKL_ROOT}")
+        message(STATUS "  MKL version: ${MKL_VERSION}")
+        message(STATUS "  MKL include: ${MKL_INCLUDE}")
+        message(STATUS "  MKL libraries: ${MKL_LIBRARIES}")
+        
+        # Store MKL variables for later use
+        set(MKL_INCLUDE_DIRS ${MKL_INCLUDE})
+        
+        # Still build OpenBLAS for FP32 fallback paths
+        if(NOT USE_SYSTEM_BLAS)
+            message(STATUS "Building OpenBLAS alongside MKL for FP32 fallback support")
+        endif()
+    else()
+        message(FATAL_ERROR "Intel MKL requested (USE_MKL=ON) but not found. Install with: sudo apt install intel-oneapi-mkl-devel")
+    endif()
+endif()
+
+if(USE_SYSTEM_BLAS)
+    # Find system BLAS/CBLAS for linear algebra operations
+    find_package(BLAS REQUIRED)
+    find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas)
+    if(NOT CBLAS_INCLUDE_DIR)
+        message(WARNING "CBLAS header not found - using fallback")
+        set(CBLAS_INCLUDE_DIR "")
+    endif()
+    set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
+    message(STATUS "Using system BLAS: ${BLAS_LIBRARIES}")
+else()
+    # Build OpenBLAS from submodule
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static OpenBLAS" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "Disable OpenBLAS tests" FORCE)
+    set(BUILD_WITHOUT_LAPACK ON CACHE BOOL "Build without LAPACK" FORCE)
+    set(DYNAMIC_ARCH OFF CACHE BOOL "Disable dynamic architecture selection for faster builds" FORCE)
+    set(USE_THREAD ON CACHE BOOL "Enable threading in OpenBLAS" FORCE)
+    set(USE_OPENMP ON CACHE BOOL "Use OpenMP in OpenBLAS" FORCE)
+    set(NUM_THREADS 128 CACHE STRING "Maximum number of threads" FORCE)
+    
+    # Enable BF16 support (requires AVX512_BF16 or ARM BF16 extensions)
+    # This is safe - OpenBLAS will detect at runtime and use fallback if not available
+    set(BUILD_BFLOAT16 ON CACHE BOOL "Enable BF16 support in OpenBLAS" FORCE)
+    
+    # Use -march=native for optimal CPU-specific optimizations
+    set(TARGET "GENERIC" CACHE STRING "OpenBLAS target architecture" FORCE)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native" CACHE STRING "C flags for OpenBLAS" FORCE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native" CACHE STRING "CXX flags for OpenBLAS" FORCE)
+    
+    # Save current flags and use simpler flags for OpenBLAS build (no coverage)
+    set(SAVED_CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    set(SAVED_CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    set(SAVED_CMAKE_EXE_LINKER_FLAGS_DEBUG "${CMAKE_EXE_LINKER_FLAGS_DEBUG}")
+    
+    set(CMAKE_C_FLAGS_DEBUG "-g -O2")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O2")
+    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "")
+    
+    add_subdirectory(external/OpenBLAS EXCLUDE_FROM_ALL)
+    
+    # Restore flags
+    set(CMAKE_C_FLAGS_DEBUG "${SAVED_CMAKE_C_FLAGS_DEBUG}")
+    set(CMAKE_CXX_FLAGS_DEBUG "${SAVED_CMAKE_CXX_FLAGS_DEBUG}")
+    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${SAVED_CMAKE_EXE_LINKER_FLAGS_DEBUG}")
+    
+    # Set variables for COSMA and llaminar_core
+    # OpenBLAS needs both source headers and generated headers from build directory
+    set(CBLAS_INCLUDE_DIR 
+        ${CMAKE_SOURCE_DIR}/external/OpenBLAS
+        ${CMAKE_BINARY_DIR}/external/OpenBLAS
+    )
+    set(OPENBLAS_LIBRARIES openblas)
+    set(BLAS_LIBRARIES openblas)
+    
+    message(STATUS "Building OpenBLAS from submodule with BF16 support")
+    message(STATUS "OpenBLAS include: ${CBLAS_INCLUDE_DIR}")
 endif()
 
 # Check for NUMA support
@@ -133,7 +224,19 @@ endif()
 
 # Configure COSMA submodule
 message(STATUS "Configuring COSMA submodule...")
-set(COSMA_BLAS "OPENBLAS" CACHE STRING "BLAS backend for COSMA")
+# Use CUSTOM BLAS backend to link against our built OpenBLAS
+# Note: We patched COSMA/cmake/FindBlas.cmake to add "CUSTOM" to the vendor list
+set(COSMA_BLAS "CUSTOM" CACHE STRING "Use custom BLAS backend for COSMA" FORCE)
+if(NOT USE_SYSTEM_BLAS)
+    # Point COSMA to our built OpenBLAS
+    set(COSMA_BLAS_LINK_LIBRARIES openblas CACHE STRING "OpenBLAS library target" FORCE)
+    # Include both source and build directories for OpenBLAS headers
+    set(COSMA_BLAS_INCLUDE_DIRS 
+        "${CMAKE_SOURCE_DIR}/external/OpenBLAS;${CMAKE_BINARY_DIR}/external/OpenBLAS" 
+        CACHE STRING "OpenBLAS include directories" FORCE)
+else()
+    set(COSMA_BLAS_LINK_LIBRARIES ${BLAS_LIBRARIES} CACHE STRING "System BLAS libraries" FORCE)
+endif()
 set(COSMA_SCALAPACK "OFF" CACHE BOOL "Disable ScaLAPACK for COSMA")
 set(COSMA_WITH_TESTS OFF CACHE BOOL "Build COSMA tests")
 set(COSMA_WITH_APPS OFF CACHE BOOL "Build COSMA applications")  
@@ -142,7 +245,16 @@ set(COSMA_WITH_INSTALL OFF CACHE BOOL "Install COSMA")
 set(COSMA_WITH_PROFILING OFF CACHE BOOL "Enable COSMA profiling")
 set(COSMA_WITH_NCCL OFF CACHE BOOL "Disable NCCL for COSMA")
 set(COSMA_WITH_GPU OFF CACHE BOOL "Disable GPU for COSMA")
+
+# Ensure COSMA is built with -march=native for optimal performance
+# These flags are inherited from parent project's CMAKE_C_FLAGS and CMAKE_CXX_FLAGS
+# which already include -march=native
 add_subdirectory(COSMA)
+
+# COSMA depends on OpenBLAS when using custom BLAS backend
+if(NOT USE_SYSTEM_BLAS)
+    add_dependencies(cosma openblas_static)
+endif()
 
 message(STATUS "Configuring llama.cpp submodule...")
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable llama.cpp tests" FORCE)
@@ -175,6 +287,7 @@ set(LLAMINAR_CORE_SOURCES
     src/MpiKernelBase.cpp
     src/CosmaPrefillManager.cpp
     src/utils/DebugEnv.cpp
+    src/utils/CpuFeatures.cpp
     src/PerformanceTracer.cpp
     src/operators/MPILinearOperator.cpp
     src/operators/MPILinearBatchOperator.cpp
@@ -186,6 +299,9 @@ set(LLAMINAR_CORE_SOURCES
     src/operators/MPIRoPEOperator.cpp
     src/operators/MPISwiGLUOperator.cpp
     src/operators/MPISwiGLUBatchOperator.cpp
+    src/operators/QuantLinearKernel.cpp
+    src/operators/QuantLinearInstrumentation.cpp
+    src/operators/QuantSlabCache.cpp
     src/operators/attention/AttentionValidator.cpp
     src/operators/common/AttentionPrimitives.cpp
     src/operators/common/RmsnormCore.cpp
@@ -206,6 +322,7 @@ set(LLAMINAR_CORE_SOURCES
     src/CosmaPrefillProvider.cpp
     src/QwenPipelineAdapter.cpp
     src/LlamaPipelineAdapter.cpp
+    src/tensors/TensorBase.cpp
     src/tensors/SimpleTensor.cpp
     src/tensors/CosmaTensor.cpp
     src/tensors/TensorFactory.cpp
@@ -221,10 +338,14 @@ set(LLAMINAR_CORE_SOURCES
     src/backends/PrefillBackend.cpp
     src/backends/InferenceBackend.h
     src/backends/InferenceBackend.cpp
+    src/backends/BF16Backend.h
+    src/backends/BF16Backend.cpp
     # Adaptive architecture components
     src/AdaptiveMatmul.h
     src/MatmulBackendSelection.h
     src/AdaptiveTransformerPipeline.h
+    # MKL backend (conditional - only compiled if USE_MKL=ON)
+    $<$<BOOL:${USE_MKL}>:src/backends/MKLBackend.cpp>
     # Chat interface components
     src/chat/GgufTokenizer.cpp
     src/chat/BpeProcessor.cpp
@@ -248,7 +369,7 @@ target_link_libraries(llaminar_core
     OpenMP::OpenMP_CXX
     cosma
     ggml
-    ${BLAS_LIBRARIES}
+    ${OPENBLAS_LIBRARIES}
 )
 
 # Optional GNU libmvec (vector math) for accelerated transcendentals (e.g., RoPE sin/cos)
@@ -295,9 +416,28 @@ target_include_directories(llaminar_core PUBLIC
     ${CMAKE_SOURCE_DIR}/llama.cpp/ggml
 )
 
+# Add Intel MKL if enabled (AFTER OpenBLAS includes to avoid header conflicts)
+if(USE_MKL)
+    target_include_directories(llaminar_core SYSTEM PRIVATE ${MKL_INCLUDE_DIRS})
+    target_link_libraries(llaminar_core PRIVATE $<LINK_ONLY:MKL::MKL>)
+    message(STATUS "Linked llaminar_core with Intel MKL")
+endif()
+
 # Main executable
 add_executable(llaminar src/Main.cpp)
 target_link_libraries(llaminar llaminar_core)
+
+# BF16 basic test (minimal isolate test)
+add_executable(test_bf16_basic test_bf16_basic.cpp)
+target_link_libraries(test_bf16_basic llaminar_core)
+
+# BF16 MPI test
+add_executable(test_bf16_mpi test_bf16_mpi.cpp)
+target_link_libraries(test_bf16_mpi llaminar_core)
+
+# BF16 large MPI test (with NUMA first-touch)
+add_executable(test_bf16_large_mpi test_bf16_large_mpi.cpp)
+target_link_libraries(test_bf16_large_mpi llaminar_core)
 
 # Adaptive architecture demonstration
 add_executable(adaptive_demo src/AdaptiveDemo.cpp)
@@ -607,6 +747,13 @@ if(GTEST_FOUND)
     add_llaminar_mpi_test(MPIRMSNormBatchTest 2 test_mpi_rmsnorm_batch)
     set_tests_properties(MPIRMSNormBatchTest PROPERTIES TIMEOUT 60)
     set_tests_properties(MPIRMSNormBatchTest PROPERTIES LABELS "rmsnorm;batch;normalization")
+
+    # BF16 Tensor Creation test - verifies BF16 activation storage works correctly
+    add_executable(test_bf16_tensor_creation tests/test_bf16_tensor_creation.cpp)
+    target_link_libraries(test_bf16_tensor_creation llaminar_core GTest::gtest GTest::gtest_main)
+    add_test_with_debug_logging(BF16TensorCreationTest COMMAND test_bf16_tensor_creation)
+    set_tests_properties(BF16TensorCreationTest PROPERTIES TIMEOUT 30)
+    set_tests_properties(BF16TensorCreationTest PROPERTIES LABELS "bf16;tensor;memory")
 
     # MPI Attention Batch support test
     add_executable(test_mpi_attention_batch tests/test_mpi_attention_batch.cpp)
@@ -1343,6 +1490,60 @@ target_link_libraries(test_batch_correctness PRIVATE llaminar_core GTest::gtest_
 add_llaminar_mpi_test(BatchCorrectnessTest 2 test_batch_correctness)
 set_tests_properties(BatchCorrectnessTest PROPERTIES TIMEOUT 600 LABELS "integration;batch;correctness")  # 10 minutes - these tests load models multiple times
 
+# BF16 GEMM parity tests - validates BF16 path vs FP32 expansion reference
+add_executable(test_bf16_gemm_parity
+    tests/TestBF16GemmParity.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_gemm_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BF16GemmParityTest 2 test_bf16_gemm_parity)
+set_tests_properties(BF16GemmParityTest PROPERTIES TIMEOUT 120 LABELS "unit;bf16;parity;quantization")
+
+# Minimal OpenBLAS BF16 test - isolates cblas_sbgemm behavior
+add_executable(test_bf16_openblas_minimal
+    tests/TestBF16OpenBLASMinimal.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_openblas_minimal PRIVATE llaminar_core GTest::gtest_main openblas_static)
+add_test(NAME BF16OpenBLASMinimalTest COMMAND test_bf16_openblas_minimal)
+set_tests_properties(BF16OpenBLASMinimalTest PROPERTIES TIMEOUT 10 LABELS "unit;bf16;openblas")
+
+# Direct OpenBLAS BF16 test - bypasses CPU feature check to verify bug exists
+add_executable(test_openblas_bf16_direct
+    tests/test_openblas_bf16_direct.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_openblas_bf16_direct PRIVATE llaminar_core GTest::gtest_main openblas_static)
+add_test(NAME OpenBLASBF16DirectTest COMMAND test_openblas_bf16_direct)
+set_tests_properties(OpenBLASBF16DirectTest PROPERTIES TIMEOUT 60 LABELS "debug;bf16;openblas;bug-verification")
+
+# BF16 conversion tests - Phase 3: validates FP32 ↔ BF16 conversion precision
+add_executable(test_bf16_conversion
+    tests/TestBF16Conversion.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_conversion PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BF16ConversionTest 2 test_bf16_conversion)
+set_tests_properties(BF16ConversionTest PROPERTIES TIMEOUT 10 LABELS "unit;bf16;conversion")
+
+# MKL BF16 GEMM tests - validates Intel MKL backend (only built if USE_MKL=ON)
+if(USE_MKL)
+    add_executable(test_mkl_bf16
+        tests/test_mkl_bf16.cpp
+        $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_mkl_bf16 PRIVATE llaminar_core GTest::gtest_main)
+    add_test(NAME MKLBackendTest COMMAND test_mkl_bf16)
+    set_tests_properties(MKLBackendTest PROPERTIES 
+        TIMEOUT 120 
+        LABELS "unit;bf16;mkl;backend"
+        ENVIRONMENT "LLAMINAR_QUANT_BF16_PREFER_MKL=1")
+    message(STATUS "Added MKL BF16 backend tests")
+endif()
+
+# CPU feature detection test - validates runtime CPU capability detection
+add_executable(test_cpu_features
+    tests/TestCpuFeatures.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_cpu_features PRIVATE llaminar_core GTest::gtest_main)
+add_test(NAME CpuFeaturesTest COMMAND test_cpu_features)
+set_tests_properties(CpuFeaturesTest PROPERTIES TIMEOUT 5 LABELS "unit;cpu;features")
+
 # Batch vs Sequential parity test with pipeline snapshots - DISABLED (incomplete implementation)
 # TODO: This test was started but never finished - API doesn't match PipelineSnapshotManager
 # Use test_batch_correctness.cpp instead which has working batch parity tests
@@ -1370,6 +1571,14 @@ target_link_libraries(test_batch_performance PRIVATE llaminar_core GTest::gtest_
 add_llaminar_mpi_test(BatchPerformanceTest 2 test_batch_performance)
 set_tests_properties(BatchPerformanceTest PROPERTIES TIMEOUT 300 LABELS "integration;batch;performance")
 
+# BF16 backend tests - validates BF16 GEMM correctness and backend selection
+add_executable(test_bf16_backend
+    tests/test_bf16_backend.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_backend PRIVATE llaminar_core GTest::gtest_main)
+add_test(NAME BF16BackendTest COMMAND test_bf16_backend)
+set_tests_properties(BF16BackendTest PROPERTIES TIMEOUT 60 LABELS "unit;bf16")
+
 # Batch tensor operations tests - Day 2: SimpleTensor batch dimension support
 add_executable(test_batch_tensor_operations
     tests/test_batch_tensor_operations.cpp
@@ -1377,6 +1586,49 @@ add_executable(test_batch_tensor_operations
 target_link_libraries(test_batch_tensor_operations PRIVATE llaminar_core GTest::gtest_main)
 add_test(NAME BatchTensorOperationsTest COMMAND test_batch_tensor_operations)
 set_tests_properties(BatchTensorOperationsTest PROPERTIES TIMEOUT 30 LABELS "unit;batch;tensor;day2")
+
+# BF16 tensor tests - Phase 5: BF16 activation storage
+add_executable(test_bf16_tensor
+    tests/test_bf16_tensor.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_tensor PRIVATE llaminar_core GTest::gtest_main)
+add_test(NAME BF16TensorTest COMMAND test_bf16_tensor)
+set_tests_properties(BF16TensorTest PROPERTIES TIMEOUT 30 LABELS "unit;bf16;tensor;phase5")
+
+# BF16 activation storage integration test - Phase 5
+add_executable(test_bf16_activation_storage
+    tests/test_bf16_activation_storage.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_activation_storage PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BF16ActivationStorageTest 2 test_bf16_activation_storage)
+
+# BF16 operator coverage test - Phase 5: Verify all operators respect BF16 flags
+add_executable(test_bf16_operator_coverage
+    tests/test_bf16_operator_coverage.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_operator_coverage PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BF16OperatorCoverageTest 2 test_bf16_operator_coverage)
+
+# BF16 end-to-end pipeline test - Phase 5: Stub version (flag validation)
+add_executable(test_bf16_pipeline_e2e
+    tests/test_bf16_pipeline_e2e_stub.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_pipeline_e2e PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BF16PipelineE2EStubTest 2 test_bf16_pipeline_e2e)
+
+# BF16 full E2E pipeline tests - Phase 5: Complete pipeline validation
+add_executable(test_bf16_pipeline_e2e_full
+    tests/test_bf16_pipeline_e2e_full.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_bf16_pipeline_e2e_full PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BF16PipelineE2ETest 2 test_bf16_pipeline_e2e_full)
+
+# BF16 KV cache tests - Phase 5+: KV cache BF16 storage for 2× memory reduction
+add_executable(test_kv_cache_bf16
+    tests/test_kv_cache_bf16.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_kv_cache_bf16 PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(KVCacheBF16Test 2 test_kv_cache_bf16)
 
 # Batched KV cache tests - Day 3: Per-sequence cache management
 add_executable(test_batched_kv_cache
@@ -1542,6 +1794,12 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     endif()
     set_tests_properties(ModelLoaderGoldenTest PROPERTIES TIMEOUT 60)
 
+    # Phase 2 quantized loader path gating test
+    add_executable(test_model_loader_quantized_path tests/TestModelLoaderQuantizedPath.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_model_loader_quantized_path PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME ModelLoaderQuantizedPathTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_model_loader_quantized_path)
+    set_tests_properties(ModelLoaderQuantizedPathTest PROPERTIES TIMEOUT 20)
+
 
     # Quant / Dequant parity tests (single-rank deterministic)
     add_executable(test_quant_dequant_correctness tests/TestQuantDequantCorrectness.cpp)
@@ -1552,6 +1810,68 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     add_executable(test_model_loader_quant_shard_regression tests/TestModelLoaderQuantShardRegression.cpp)
     target_link_libraries(test_model_loader_quant_shard_regression llaminar_core GTest::gtest GTest::gtest_main)
     add_test(NAME ModelLoaderQuantShardRegression COMMAND test_model_loader_quant_shard_regression)
+
+    # Quantized tensor block/tile decode tests
+    add_executable(test_quantized_tensor_decode tests/TestQuantizedTensorDecode.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_quantized_tensor_decode PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME QuantizedTensorDecodeTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_quantized_tensor_decode)
+    set_tests_properties(QuantizedTensorDecodeTest PROPERTIES TIMEOUT 10)
+    add_executable(test_quantized_tensor_decode_k tests/TestQuantizedTensorDecodeK.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_quantized_tensor_decode_k PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME QuantizedTensorDecodeKTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_quantized_tensor_decode_k)
+    set_tests_properties(QuantizedTensorDecodeKTest PROPERTIES TIMEOUT 10)
+
+    # New typed tensor hierarchy tests
+    add_executable(test_q8_0_tensor tests/test_q8_0_tensor.cpp)
+    target_link_libraries(test_q8_0_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q8_0TensorTest COMMAND test_q8_0_tensor)
+    set_tests_properties(Q8_0TensorTest PROPERTIES TIMEOUT 30)
+
+    # Q8_0Tensor ModelLoader integration test
+    add_executable(test_q8_0_modelloader tests/test_q8_0_modelloader.cpp)
+    target_link_libraries(test_q8_0_modelloader PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q8_0ModelLoaderTest COMMAND test_q8_0_modelloader)
+    set_tests_properties(Q8_0ModelLoaderTest PROPERTIES TIMEOUT 60)
+
+    # Q8_0Tensor full model validation test (Week 1 Day 4-5)
+    add_executable(test_q8_0_full_model tests/test_q8_0_full_model.cpp)
+    target_link_libraries(test_q8_0_full_model PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q8_0FullModelTest COMMAND test_q8_0_full_model)
+    set_tests_properties(Q8_0FullModelTest PROPERTIES TIMEOUT 120)
+
+    # Q8_0Tensor selective quantization test suite (Week 2 Step 1)
+    add_executable(test_q8_0_selective_quantization tests/test_q8_0_selective_quantization.cpp)
+    target_link_libraries(test_q8_0_selective_quantization PRIVATE llaminar_core GTest::gtest MPI::MPI_CXX)
+    add_test(NAME Q8_0SelectiveQuantizationTest COMMAND mpirun -np 2 test_q8_0_selective_quantization)
+    set_tests_properties(Q8_0SelectiveQuantizationTest PROPERTIES TIMEOUT 120)
+
+    # Fused quant linear kernel prototype test
+    add_executable(test_quant_linear_fused tests/test_quant_linear_fused.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_quant_linear_fused PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME QuantLinearFusedPrototypeTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_quant_linear_fused)
+    set_tests_properties(QuantLinearFusedPrototypeTest PROPERTIES TIMEOUT 10)
+
+    # Parameterized multi-format fused parity tests
+    add_executable(test_quant_linear_fused_param tests/test_quant_linear_fused_param.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_quant_linear_fused_param PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    # Executable ends up at top-level build dir (not in tests/), mirror pattern used for other tests
+    if (EXISTS ${CMAKE_BINARY_DIR}/tests/test_quant_linear_fused_param)
+        add_test(NAME QuantLinearFusedParamParity COMMAND ${CMAKE_BINARY_DIR}/tests/test_quant_linear_fused_param)
+    else()
+        add_test(NAME QuantLinearFusedParamParity COMMAND ${CMAKE_BINARY_DIR}/test_quant_linear_fused_param)
+    endif()
+    set_tests_properties(QuantLinearFusedParamParity PROPERTIES TIMEOUT 25)
+
+    # Quant decode micro-benchmark DISABLED - decodeTileFP16() method removed (used wrong _Float16 type)
+    # BF16 decode performance is measured via slab allocator benchmarks and end-to-end inference tests
+    # add_executable(bench_quant_decode tests/bench_quant_decode.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    # target_link_libraries(bench_quant_decode PRIVATE llaminar_core GTest::gtest)
+    # add_test(NAME QuantDecodeBench COMMAND bench_quant_decode)
+    # set_tests_properties(QuantDecodeBench PROPERTIES LABELS Bench TIMEOUT 20)
+
+    # Fused vs unfused quant linear benchmark (non-test utility)
+    add_executable(bench_quant_linear_fused tests/bench_quant_linear_fused.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(bench_quant_linear_fused PRIVATE llaminar_core)
     add_executable(test_quant_shard_cache_stats tests/TestQuantShardCacheStats.cpp)
     target_link_libraries(test_quant_shard_cache_stats llaminar_core GTest::gtest GTest::gtest_main)
     add_test(NAME QuantShardCacheStatsTest COMMAND test_quant_shard_cache_stats)

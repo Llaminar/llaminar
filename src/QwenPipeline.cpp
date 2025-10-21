@@ -75,6 +75,8 @@
 #include "AdaptiveMatmul.h"
 #include "BackendSelector.h"
 #include "MatmulBackendSelection.h"
+#include "ParityHooks.h" // Added: direct access to LlaminarSnapshotHook
+using namespace llaminar::parity;
 using llaminar::BackendContext;
 using llaminar::BackendDecision;
 using llaminar::MatMulBackendDecision;
@@ -172,6 +174,17 @@ namespace llaminar
 
     // (logFFNRowPreviewIfEnabled and isFFNShardTracingEnabledFor moved to PrefillDiagnostics.h/.cpp)
 
+    inline std::string QwenPipeline::getEffectiveSnapshotSource() const
+    {
+        std::string effective_source = snapshot_source_;
+        const auto &env = debugEnv();
+        if (env.pipeline.decode_stage_snapshots && current_decode_step_ >= 0)
+        {
+            effective_source += "_dec" + std::to_string(current_decode_step_);
+        }
+        return effective_source;
+    }
+
     /**
      * @brief Helper to capture pipeline stage snapshots for parity testing
      *
@@ -190,9 +203,12 @@ namespace llaminar
         int layer_idx,
         const std::shared_ptr<TensorBase> &tensor)
     {
-        // Early exit if parity capture not enabled (no-op in release builds)
-        if (!AbstractPipeline::isParityEnabled())
+        // Use unified parity hook gating (avoids mismatch with PipelineSnapshotManager enable state)
+        if (!LlaminarSnapshotHook::is_enabled())
+        {
+            LOG_DEBUG("[SEQ_SNAPSHOT] Parity hook disabled - skip stage=" << (int)stage << " layer=" << layer_idx);
             return;
+        }
 
         // Only rank 0 captures to avoid redundant multi-rank snapshots
         if (getRank() != 0)
@@ -216,9 +232,23 @@ namespace llaminar
         int seq_len = tensor->shape()[0];
         int feature_dim = tensor->shape()[1];
 
-        // Delegate to AbstractPipeline base class method which calls PipelineSnapshotManager
-        // Use snapshot_source_ from PipelineBase to differentiate batch vs sequential
-        AbstractPipeline::captureStageSnapshot(stage, layer_idx, tensor->data(), seq_len, feature_dim, snapshot_source_);
+        // Get effective source with decode step suffix if applicable
+        std::string effective_source = getEffectiveSnapshotSource();
+
+        const auto &env = debugEnv();
+        if (getRank() == 0 && env.pipeline.decode_snapshot_verbose)
+        {
+            LOG_DEBUG("[SEQ_SNAPSHOT_DEBUG] stage=" << (int)stage
+                                                    << " layer=" << layer_idx
+                                                    << " decode_step=" << current_decode_step_
+                                                    << " source='" << effective_source << "'");
+        }
+
+        // Directly invoke parity snapshot hook (bypasses PipelineSnapshotManager gating discrepancies)
+        LOG_DEBUG("[SEQ_SNAPSHOT] Capturing stage=" << (int)stage << " layer=" << layer_idx
+                                                    << " source='" << effective_source << "' seq_len=" << seq_len
+                                                    << " feature_dim=" << feature_dim);
+        LlaminarSnapshotHook::capture(stage, layer_idx, tensor->data(), seq_len, feature_dim, effective_source);
     }
 
     bool QwenPipeline::executeTransformerLayer(int layer_idx,
@@ -556,7 +586,15 @@ namespace llaminar
                 bctx.n_layers = config_.getLayerConfig().n_layers;
                 bctx.world = getSize();
                 auto dec = selectAttentionBackend(bctx);
-                if (dec.use_cosma())
+
+                // Check if weight is quantized - if so, must use operator path
+                bool w_gate_quantized = weights.w_gate[layer_idx]->native_type() == TensorDataType::QUANTIZED;
+
+                std::cerr << "[FFN_GATE_PATH] layer=" << layer_idx
+                          << " use_cosma=" << dec.use_cosma()
+                          << " w_gate_quantized=" << w_gate_quantized << std::endl;
+
+                if (dec.use_cosma() && !w_gate_quantized)
                 {
                     // w_gate stored as [d_ff(out), d_model(in)] -> need transpose_B
                     if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_gate[layer_idx]->data(), gate_out->data(), seq_len, config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
@@ -567,6 +605,11 @@ namespace llaminar
                 }
                 else
                 {
+                    // Use operator path (supports Q8_0)
+                    if (w_gate_quantized)
+                    {
+                        std::cerr << "[Q8_0_PATH] FFN gate projection: using operator path for Q8_0 weight" << std::endl;
+                    }
                     std::vector<std::shared_ptr<TensorBase>> gate_inputs = {ffn_norm_out, weights.w_gate[layer_idx]};
                     std::vector<std::shared_ptr<TensorBase>> gate_outputs = {gate_out};
                     if (!executeKernel("linear", gate_inputs, gate_outputs))
@@ -584,7 +627,11 @@ namespace llaminar
                 bctx.n_layers = config_.getLayerConfig().n_layers;
                 bctx.world = getSize();
                 auto dec = selectAttentionBackend(bctx);
-                if (dec.use_cosma())
+
+                // Check if weight is quantized - if so, must use operator path
+                bool w_up_quantized = weights.w_up[layer_idx]->native_type() == TensorDataType::QUANTIZED;
+
+                if (dec.use_cosma() && !w_up_quantized)
                 {
                     // w_up stored as [d_ff(out), d_model(in)] -> need transpose_B
                     if (!adaptiveMatMul(ffn_norm_out->data(), weights.w_up[layer_idx]->data(), up_out->data(), seq_len, config_.getLayerConfig().d_ff, config_.getLayerConfig().d_model, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
@@ -595,6 +642,11 @@ namespace llaminar
                 }
                 else
                 {
+                    // Use operator path (supports Q8_0)
+                    if (w_up_quantized)
+                    {
+                        std::cerr << "[Q8_0_PATH] FFN up projection: using operator path for Q8_0 weight" << std::endl;
+                    }
                     std::vector<std::shared_ptr<TensorBase>> up_inputs = {ffn_norm_out, weights.w_up[layer_idx]};
                     std::vector<std::shared_ptr<TensorBase>> up_outputs = {up_out};
                     if (!executeKernel("linear", up_inputs, up_outputs))
@@ -632,7 +684,11 @@ namespace llaminar
             bctx.n_layers = config_.getLayerConfig().n_layers;
             bctx.world = getSize();
             auto dec = selectAttentionBackend(bctx);
-            if (dec.use_cosma())
+
+            // Check if weight is quantized - if so, must use operator path
+            bool w_down_quantized = weights.w_down[layer_idx]->native_type() == TensorDataType::QUANTIZED;
+
+            if (dec.use_cosma() && !w_down_quantized)
             {
                 // w_down stored as [d_model(out), d_ff(in)] -> need transpose_B
                 if (!adaptiveMatMul(swiglu_out->data(), weights.w_down[layer_idx]->data(), ffn_out->data(), seq_len, config_.getLayerConfig().d_model, config_.getLayerConfig().d_ff, is_prefill_stage_, false, false, true, 1.0f, 0.0f))
@@ -643,6 +699,11 @@ namespace llaminar
             }
             else
             {
+                // Use operator path (supports Q8_0)
+                if (w_down_quantized)
+                {
+                    std::cerr << "[Q8_0_PATH] FFN down projection: using operator path for Q8_0 weight" << std::endl;
+                }
                 std::vector<std::shared_ptr<TensorBase>> down_inputs = {swiglu_out, weights.w_down[layer_idx]};
                 std::vector<std::shared_ptr<TensorBase>> down_outputs = {ffn_out};
                 if (!executeKernel("linear", down_inputs, down_outputs))
@@ -723,6 +784,8 @@ namespace llaminar
           total_embedding_time_(0.0), total_attention_time_(0.0), total_linear_time_(0.0),
           total_norm_time_(0.0), total_activation_time_(0.0), total_communication_time_(0.0)
     {
+        // Ensure canonical snapshot source for sequential pipeline
+        setSnapshotSource("llaminar");
         initializeKernels();
         kv_cache_dynamic_init_ = debugEnv().kv_cache.dynamic_init;
         if (getRank() == 0)
@@ -753,6 +816,7 @@ namespace llaminar
           total_embedding_time_(0.0), total_attention_time_(0.0), total_linear_time_(0.0),
           total_norm_time_(0.0), total_activation_time_(0.0), total_communication_time_(0.0)
     {
+        setSnapshotSource("llaminar");
         initializeKernels();
         kv_cache_dynamic_init_ = debugEnv().kv_cache.dynamic_init;
         if (getRank() == 0)
@@ -816,8 +880,9 @@ namespace llaminar
         attention_kernel->setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection);
 
         // Wire up snapshot callback for intermediate attention stages (Q/K/V proj, RoPE, scores, etc.)
+        // CRITICAL: Use getEffectiveSnapshotSource() to include decode step suffix when in decode replay mode
         attention_kernel->setSnapshotCallback([this](PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)
-                                              { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim, snapshot_source_); });
+                                              { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim, getEffectiveSnapshotSource()); });
 
         if (!registerOperator("attention", std::move(attention_kernel)))
             throw std::runtime_error("Failed to register Attention operator");
@@ -1098,6 +1163,8 @@ namespace llaminar
         // === Token Embedding ===
         // Load vocabulary embedding matrix (vocab_size x d_model)
         weights.token_embedding = loader.loadTensor("token_embd.weight");
+        std::cerr << "[WEIGHT_TYPE_CHECK] token_embd.weight type=" << weights.token_embedding->type_name()
+                  << " native_type=" << static_cast<int>(weights.token_embedding->native_type()) << std::endl;
 
         // Log embedding shape for verification
         const auto emb_shape = weights.token_embedding->shape();
@@ -1107,6 +1174,8 @@ namespace llaminar
         }
 
         // Log first few embedding values to verify consistency across ranks
+        // Skip for quantized tensors (they don't support data() access)
+        if (weights.token_embedding->native_type() != TensorDataType::QUANTIZED)
         {
             // Note: This is a free function, so we query MPI directly
             int mpi_rank = 0;
@@ -1134,8 +1203,14 @@ namespace llaminar
                                           << token1_emb[6] << ", " << token1_emb[7] << ", " << token1_emb[8] << ", "
                                           << token1_emb[9] << "]");
         }
+        else
+        {
+            LOG_INFO("[WeightLoad] token_embd is quantized (Q8_0), skipping data() diagnostics");
+        }
 
         // Lightweight anomaly detection on sample of embedding values
+        // Skip for quantized tensors
+        if (weights.token_embedding->native_type() != TensorDataType::QUANTIZED)
         {
             const float *ptr = weights.token_embedding->data();
             size_t total = (size_t)weights.token_embedding->size();
@@ -1171,20 +1246,24 @@ namespace llaminar
         }
 
         // Debug override: force unit gamma (disable normalization scaling)
-        if (debugEnv().output_norm.force_unit || debugEnv().output_norm.force_unit_all)
+        // Skip for quantized tensors (data() not supported)
+        if (weights.output_norm_weight->native_type() != TensorDataType::QUANTIZED)
         {
-            float *g = const_cast<float *>(weights.output_norm_weight->data());
-            for (int i = 0; i < weights.output_norm_weight->size(); ++i)
-                g[i] = 1.0f;
-            LOG_WARN("[WeightLoad] Forced output_norm to unit gamma");
-        }
-        // Debug override: clamp gamma to reasonable range
-        else if (debugEnv().output_norm.clamp)
-        {
-            float *g = const_cast<float *>(weights.output_norm_weight->data());
-            for (int i = 0; i < weights.output_norm_weight->size(); ++i)
-                g[i] = std::clamp(g[i], 0.0f, 4.0f);
-            LOG_WARN("[WeightLoad] Clamped output_norm gamma range [0,4]");
+            if (debugEnv().output_norm.force_unit || debugEnv().output_norm.force_unit_all)
+            {
+                float *g = const_cast<float *>(weights.output_norm_weight->data());
+                for (int i = 0; i < weights.output_norm_weight->size(); ++i)
+                    g[i] = 1.0f;
+                LOG_WARN("[WeightLoad] Forced output_norm to unit gamma");
+            }
+            // Debug override: clamp gamma to reasonable range
+            else if (debugEnv().output_norm.clamp)
+            {
+                float *g = const_cast<float *>(weights.output_norm_weight->data());
+                for (int i = 0; i < weights.output_norm_weight->size(); ++i)
+                    g[i] = std::clamp(g[i], 0.0f, 4.0f);
+                LOG_WARN("[WeightLoad] Clamped output_norm gamma range [0,4]");
+            }
         }
 
         // === LM Head (Language Model Output Projection) ===
@@ -1462,7 +1541,12 @@ namespace llaminar
             weights.w_down.push_back(w_down);
 
             // Create fused gate+up weight for FFN optimization (if fusion enabled)
-            if (debugEnv().pipeline.ffn_fusion_enabled)
+            // Skip fusion for Q8_0 weights (they'll use streaming decode instead)
+            bool can_fuse = debugEnv().pipeline.ffn_fusion_enabled &&
+                            w_gate->native_type() != TensorDataType::QUANTIZED &&
+                            w_up->native_type() != TensorDataType::QUANTIZED;
+
+            if (can_fuse)
             {
                 // Get dimensions: w_gate and w_up are both [local_d_ff, d_model]
                 const auto &gate_shape = w_gate->shape();
@@ -1609,6 +1693,13 @@ namespace llaminar
         }
 
         // Parity capture: embedding output
+        // Debug log to verify decode step state at first capture point
+        if (getRank() == 0)
+        {
+            LOG_DEBUG("[SEQ_EMBED_CAPTURE] decode_step=" << current_decode_step_
+                                                         << " flag=" << (debugEnv().pipeline.decode_stage_snapshots ? "1" : "0")
+                                                         << " source=" << snapshot_source_);
+        }
         captureIfEnabled(PipelineStage::EMBEDDING, -1, embedded_output);
 
         // Optional row trace
@@ -1626,8 +1717,7 @@ namespace llaminar
             handle_prefill_stage_snapshot(getRank(), "embedding_output", embedded_output->data(), (size_t)embedded_output->size(), config_.getLayerConfig().d_model, 5e-4, capture_baseline, compare_baseline);
         }
 
-        // Parity capture: embedding output
-        captureIfEnabled(PipelineStage::EMBEDDING, -1, embedded_output);
+        // (Deduplicated) Second embedding snapshot removed to enforce single capture per stage.
 
         return true;
     }
@@ -1784,6 +1874,10 @@ namespace llaminar
 
         k_cache_.resize(config_.getLayerConfig().n_layers);
         v_cache_.resize(config_.getLayerConfig().n_layers);
+
+        // Check if BF16 KV cache is enabled for memory savings (Phase 5+)
+        bool use_bf16_cache = debugEnv().quant.kv_bf16;
+
         for (int l = 0; l < config_.getLayerConfig().n_layers; ++l)
         {
             bool recreated_k = false;
@@ -1791,12 +1885,12 @@ namespace llaminar
 
             if (!k_cache_[l] || k_cache_[l]->shape()[0] < seq_len)
             {
-                k_cache_[l] = createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim});
+                k_cache_[l] = createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim}, use_bf16_cache);
                 recreated_k = true;
             }
             if (!v_cache_[l] || v_cache_[l]->shape()[0] < seq_len)
             {
-                v_cache_[l] = createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim});
+                v_cache_[l] = createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim}, use_bf16_cache);
                 recreated_v = true;
             }
 
@@ -1805,6 +1899,10 @@ namespace llaminar
                 LOG_DEBUG("[CACHE_INIT_DEBUG] Layer 0: Recreated cache tensors! This will WIPE existing cache data!");
                 LOG_DEBUG("  k_cache recreated: " << (recreated_k ? "YES" : "no"));
                 LOG_DEBUG("  v_cache recreated: " << (recreated_v ? "YES" : "no"));
+                if (use_bf16_cache)
+                {
+                    LOG_INFO("[KV_CACHE_BF16] Enabled: Using BF16 storage for KV cache (2× memory reduction)");
+                }
             }
         }
         kv_cache_state_.capacity_tokens = seq_len;
@@ -1850,6 +1948,35 @@ namespace llaminar
     {
         PERF_SCOPED_TIMER("QwenPipeline::execute");
         start_time_ = std::chrono::high_resolution_clock::now();
+
+        // CRITICAL: Preserve decode step context when execute() is called from decode() replay fallback.
+        // The decode() method sets current_decode_step_ before calling incrementalDecodeToken or execute().
+        // We must not reset it here, as all captures need the _decN suffix for parity testing.
+        int saved_decode_step = current_decode_step_;
+        bool in_decode_replay = (saved_decode_step >= 0 && debugEnv().pipeline.decode_stage_snapshots);
+
+        // CRITICAL: In replay mode, we're processing the FULL cumulative sequence from scratch,
+        // so RoPE positions should be [0, 1, 2, ..., seq_len-1] with n_past=0 (no offset).
+        // Without this reset, n_past retains the value from after prefill (e.g., n_past=3),
+        // which incorrectly offsets all RoPE positions by +3, breaking parity with batch replay.
+        if (in_decode_replay && debugEnv().pipeline.disable_incremental_decode)
+        {
+            if (getRank() == 0 && saved_decode_step == 0)
+            {
+                LOG_INFO("[SEQ_REPLAY_NPAST_RESET] Resetting n_past from " << n_past_ << " to 0 for replay mode");
+            }
+            n_past_ = 0;
+        }
+
+        if (getRank() == 0)
+        {
+            LOG_DEBUG("[SEQ_EXECUTE] decode_step=" << saved_decode_step
+                                                   << " in_replay=" << in_decode_replay
+                                                   << " tokens=" << token_ids.size()
+                                                   << " n_past=" << n_past_
+                                                   << " decode_flag=" << (debugEnv().pipeline.decode_stage_snapshots ? "1" : "0"));
+        }
+
         if (!validate(weights))
         {
             LOG_ERROR("QwenPipeline: Weight validation failed");
@@ -2172,7 +2299,29 @@ namespace llaminar
                                const IModelWeights &weights_iface,
                                StageContext &ctx)
     {
+        // CRITICAL: When decode() falls back to execute()->prefill(), preserve decode step.
+        // Only reset decode step if we're truly in a fresh prefill (not a decode replay).
+        int saved_decode_step = current_decode_step_;
+        bool in_decode_replay = (saved_decode_step >= 0 && debugEnv().pipeline.decode_stage_snapshots);
+
+        if (getRank() == 0)
+        {
+            LOG_DEBUG("[SEQ_PREFILL] decode_step=" << saved_decode_step
+                                                   << " in_replay=" << in_decode_replay);
+        }
+
         setStagePrefill();
+
+        // Restore decode step if we're in decode replay mode
+        if (in_decode_replay)
+        {
+            current_decode_step_ = saved_decode_step;
+            if (getRank() == 0)
+            {
+                LOG_INFO("[SEQ_PREFILL_REPLAY] Restored decode_step=" << saved_decode_step);
+            }
+        }
+
         current_tokens_ = tokens;
         const auto *w = dynamic_cast<const QwenModelWeights *>(&weights_iface);
         if (!w)
@@ -2272,6 +2421,17 @@ namespace llaminar
         if (use_kv_cache_)
         {
             n_past_ = (int)tokens.size();
+            kv_cache_state_.used_tokens = n_past_; // Update tracking state
+        }
+        // Record initial prefill length for subsequent decode step indexing if not already set
+        if (initial_prefill_length_ == 0)
+        {
+            initial_prefill_length_ = (int)tokens.size();
+            generated_steps_ = 0; // reset decode step counter
+            if (getRank() == 0 && debugEnv().pipeline.decode_snapshot_verbose)
+            {
+                LOG_INFO("[SEQ_PREFILL_CONTEXT] initial_prefill_length=" << initial_prefill_length_);
+            }
         }
 
         // Update stage context
@@ -2288,6 +2448,13 @@ namespace llaminar
                               const IModelWeights &weights_iface,
                               StageContext &ctx)
     {
+        if (getRank() == 0)
+        {
+            LOG_DEBUG("[SEQ_DECODE_ENTRY] token=" << next_token
+                                                  << " generated_steps=" << generated_steps_
+                                                  << " decode_flag=" << (debugEnv().pipeline.decode_stage_snapshots ? "1" : "0"));
+        }
+
         const auto *w = dynamic_cast<const QwenModelWeights *>(&weights_iface);
         if (!w)
         {
@@ -2296,6 +2463,16 @@ namespace llaminar
         }
         setStageDecode();
         std::shared_ptr<TensorBase> one_logits;
+        // Initialize decode step index BEFORE any token work so embedding snapshot is suffixed
+        if (debugEnv().pipeline.decode_stage_snapshots)
+        {
+            setDecodeStep(generated_steps_); // 0-based step numbering
+            if (getRank() == 0)
+            {
+                LOG_INFO("[SEQ_DECODE_STEP_SET] step=" << generated_steps_ << " n_past_=" << n_past_);
+            }
+        }
+
         bool used_incremental = incrementalDecodeToken(next_token, w->inner, one_logits);
         if (!used_incremental)
         {
@@ -2319,6 +2496,12 @@ namespace llaminar
         kv_snapshot_.growth_events = getKVCacheGrowthEvents();
         ctx.kv_capacity = kv_snapshot_.capacity_tokens;
         ctx.kv_used = kv_snapshot_.used_tokens;
+        // Advance decode step counter for next invocation
+        generated_steps_++;
+        if (debugEnv().pipeline.decode_stage_snapshots && getRank() == 0 && debugEnv().pipeline.decode_snapshot_verbose)
+        {
+            LOG_INFO("[SEQ_DECODE_STEP_COMPLETE] next_step=" << generated_steps_ << " (current suffix was dec" << currentDecodeStep() << ")");
+        }
         return true;
     }
 
@@ -2346,6 +2529,8 @@ namespace llaminar
                                               const ModelWeights &weights,
                                               std::shared_ptr<TensorBase> &output_logits)
     {
+        std::cerr << "[INCR_DECODE_ENTRY] incrementalDecodeToken called, token_id=" << token_id << std::endl;
+
         // === Stage 1: Environment + guard checks ===
         const auto &env = debugEnv();
         if (getRank() == 0)
@@ -2382,6 +2567,20 @@ namespace llaminar
             LOG_ERROR("incrementalDecodeToken: missing token embedding");
             return false;
         }
+
+        // Skip incremental decode for Q8_0 weights (use operator path with streaming decode instead)
+        if (!weights.wq.empty() && weights.wq[0]->native_type() == TensorDataType::QUANTIZED)
+        {
+            std::cerr << "[Q8_0_SKIP_INCR] Skipping incrementalDecodeToken for Q8_0 weights, type="
+                      << weights.wq[0]->type_name() << std::endl;
+            return false;
+        }
+        else if (getRank() == 0 && !weights.wq.empty())
+        {
+            LOG_INFO("[IncrDecodeWeightCheck] wq[0]_native_type=" << static_cast<int>(weights.wq[0]->native_type())
+                                                                  << " type_name=" << weights.wq[0]->type_name());
+        }
+
         // Capacity (position == n_past_)
         if (!ensureKVCapacity(n_past_ + 1))
         {

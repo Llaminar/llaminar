@@ -680,15 +680,18 @@ namespace llaminar
                               MPI_COMM_WORLD);
 
                 // Rearrange from rank-major to row-interleaved
-                // temp_q layout: [rank0: t0,t1,t2,... | rank1: t0,t1,t2,... | ...]
-                // q_snapshot layout: [t0: r0,r1,... | t1: r0,r1,... | ...]
-                for (int t = 0; t < T; ++t)
+                // temp_q layout: [rank0: b0_t0,b0_t1,...,b1_t0,b1_t1,... | rank1: b0_t0,b0_t1,...,b1_t0,b1_t1,... | ...]
+                // q_snapshot layout: [b0_t0: r0,r1,... | b0_t1: r0,r1,... | b1_t0: r0,r1,... | ...]
+                for (int b = 0; b < B; ++b)
                 {
-                    for (int r = 0; r < size; ++r)
+                    for (int t = 0; t < T; ++t)
                     {
-                        const float *src = temp_q->data() + r * q_local_size + t * n_heads_local_ * head_dim_;
-                        float *dst = q_snapshot->data() + t * n_heads_ * head_dim_ + r * n_heads_local_ * head_dim_;
-                        std::memcpy(dst, src, n_heads_local_ * head_dim_ * sizeof(float));
+                        for (int r = 0; r < size; ++r)
+                        {
+                            const float *src = temp_q->data() + r * q_local_size + (b * T + t) * n_heads_local_ * head_dim_;
+                            float *dst = q_snapshot->data() + (b * T + t) * n_heads_ * head_dim_ + r * n_heads_local_ * head_dim_;
+                            std::memcpy(dst, src, n_heads_local_ * head_dim_ * sizeof(float));
+                        }
                     }
                 }
 
@@ -726,14 +729,17 @@ namespace llaminar
                               temp_k->data(), k_local_size, MPI_FLOAT,
                               MPI_COMM_WORLD);
 
-                // Rearrange from rank-major to row-interleaved
-                for (int t = 0; t < T; ++t)
+                // Rearrange from rank-major to row-interleaved (accounting for batch dimension)
+                for (int b = 0; b < B; ++b)
                 {
-                    for (int r = 0; r < size; ++r)
+                    for (int t = 0; t < T; ++t)
                     {
-                        const float *src = temp_k->data() + r * k_local_size + t * n_kv_heads_local_ * head_dim_;
-                        float *dst = k_snapshot->data() + t * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
-                        std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                        for (int r = 0; r < size; ++r)
+                        {
+                            const float *src = temp_k->data() + r * k_local_size + (b * T + t) * n_kv_heads_local_ * head_dim_;
+                            float *dst = k_snapshot->data() + (b * T + t) * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
+                            std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                        }
                     }
                 }
             }
@@ -755,14 +761,17 @@ namespace llaminar
                               temp_v->data(), v_local_size, MPI_FLOAT,
                               MPI_COMM_WORLD);
 
-                // Rearrange from rank-major to row-interleaved
-                for (int t = 0; t < T; ++t)
+                // Rearrange from rank-major to row-interleaved (accounting for batch dimension)
+                for (int b = 0; b < B; ++b)
                 {
-                    for (int r = 0; r < size; ++r)
+                    for (int t = 0; t < T; ++t)
                     {
-                        const float *src = temp_v->data() + r * v_local_size + t * n_kv_heads_local_ * head_dim_;
-                        float *dst = v_snapshot->data() + t * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
-                        std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                        for (int r = 0; r < size; ++r)
+                        {
+                            const float *src = temp_v->data() + r * v_local_size + (b * T + t) * n_kv_heads_local_ * head_dim_;
+                            float *dst = v_snapshot->data() + (b * T + t) * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
+                            std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                        }
                     }
                 }
             }
@@ -796,12 +805,15 @@ namespace llaminar
 
         applyRoPE(q_local->data(), k_local->data(), B, T);
 
-        // DEBUG: Check Q/K after RoPE
+        // DEBUG: Check Q/K after RoPE for both sequences
         if (rank == 0 && current_layer_idx_ == 0)
         {
             LOG_DEBUG("[ROPE_DEBUG] AFTER RoPE application:");
-            LOG_DEBUG("  Q_local[0:5]: [" << q_local->data()[0] << ", " << q_local->data()[1] << ", "
-                                          << q_local->data()[2] << ", " << q_local->data()[3] << ", " << q_local->data()[4] << "]");
+            LOG_DEBUG("  Q_local seq0_tok0 [0:3]: [" << q_local->data()[0] << ", " << q_local->data()[1] << ", " << q_local->data()[2] << "]");
+            // For B=2, T=5, n_heads_local=7, head_dim=64: seq1 starts at offset T*n_heads_local*head_dim = 5*7*64 = 2240
+            int seq1_offset = T * n_heads_local_ * head_dim_;
+            LOG_DEBUG("  Q_local seq1_tok0 [offset " << seq1_offset << "]: [" << q_local->data()[seq1_offset] << ", "
+                                                     << q_local->data()[seq1_offset + 1] << ", " << q_local->data()[seq1_offset + 2] << "]");
             LOG_DEBUG("  K_local[0:5]: [" << k_local->data()[0] << ", " << k_local->data()[1] << ", "
                                           << k_local->data()[2] << ", " << k_local->data()[3] << ", " << k_local->data()[4] << "]");
 
@@ -855,14 +867,17 @@ namespace llaminar
                     LOG_DEBUG("  Rank1 start (offset 1792): [" << temp_q->data()[1792] << ", " << temp_q->data()[1793] << ", " << temp_q->data()[1794] << "]");
                 }
 
-                // Rearrange from rank-major to row-interleaved
-                for (int t = 0; t < T; ++t)
+                // Rearrange from rank-major to row-interleaved (accounting for batch dimension)
+                for (int b = 0; b < B; ++b)
                 {
-                    for (int r = 0; r < size; ++r)
+                    for (int t = 0; t < T; ++t)
                     {
-                        const float *src = temp_q->data() + r * q_local_size + t * n_heads_local_ * head_dim_;
-                        float *dst = q_global->data() + t * n_heads_ * head_dim_ + r * n_heads_local_ * head_dim_;
-                        std::memcpy(dst, src, n_heads_local_ * head_dim_ * sizeof(float));
+                        for (int r = 0; r < size; ++r)
+                        {
+                            const float *src = temp_q->data() + r * q_local_size + (b * T + t) * n_heads_local_ * head_dim_;
+                            float *dst = q_global->data() + (b * T + t) * n_heads_ * head_dim_ + r * n_heads_local_ * head_dim_;
+                            std::memcpy(dst, src, n_heads_local_ * head_dim_ * sizeof(float));
+                        }
                     }
                 }
 
@@ -907,14 +922,17 @@ namespace llaminar
                     LOG_DEBUG("  Rank1 start (offset " << k_local_size << "): [" << temp_k->data()[k_local_size] << ", " << temp_k->data()[k_local_size + 1] << ", " << temp_k->data()[k_local_size + 2] << "]");
                 }
 
-                // Rearrange from rank-major to row-interleaved
-                for (int t = 0; t < T; ++t)
+                // Rearrange from rank-major to row-interleaved (accounting for batch dimension)
+                for (int b = 0; b < B; ++b)
                 {
-                    for (int r = 0; r < size; ++r)
+                    for (int t = 0; t < T; ++t)
                     {
-                        const float *src = temp_k->data() + r * k_local_size + t * n_kv_heads_local_ * head_dim_;
-                        float *dst = k_global->data() + t * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
-                        std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                        for (int r = 0; r < size; ++r)
+                        {
+                            const float *src = temp_k->data() + r * k_local_size + (b * T + t) * n_kv_heads_local_ * head_dim_;
+                            float *dst = k_global->data() + (b * T + t) * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
+                            std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                        }
                     }
                 }
 
@@ -964,10 +982,10 @@ namespace llaminar
                     const float *k_src = k_global->data() + k_offset;
                     float *dst = rope_data + dst_offset;
 
-                    // DEBUG: Log first token concatenation
-                    if (rank == 0 && current_layer_idx_ == 0 && b == 0 && t == 0)
+                    // DEBUG: Log first token concatenation for both sequences
+                    if (rank == 0 && current_layer_idx_ == 0 && t == 0)
                     {
-                        LOG_DEBUG("[ROPE_CONCAT_DEBUG] Token t=0:");
+                        LOG_DEBUG("[ROPE_CONCAT_DEBUG] Seq b=" << b << " Token t=0:");
                         LOG_DEBUG("  q_offset=" << q_offset << " k_offset=" << k_offset << " dst_offset=" << dst_offset);
                         LOG_DEBUG("  q_src[0:3]: [" << q_src[0] << ", " << q_src[1] << ", " << q_src[2] << "]");
                         LOG_DEBUG("  k_src[0:3]: [" << k_src[0] << ", " << k_src[1] << ", " << k_src[2] << "]");
@@ -976,10 +994,10 @@ namespace llaminar
                     std::copy(q_src, q_src + q_features_global, dst);
                     std::copy(k_src, k_src + k_features_global, dst + q_features_global);
 
-                    // DEBUG: Verify after copy
-                    if (rank == 0 && current_layer_idx_ == 0 && b == 0 && t == 0)
+                    // DEBUG: Verify after copy for both sequences
+                    if (rank == 0 && current_layer_idx_ == 0 && t == 0)
                     {
-                        LOG_DEBUG("[ROPE_CONCAT_DEBUG] After copy:");
+                        LOG_DEBUG("[ROPE_CONCAT_DEBUG] After copy seq b=" << b << ":");
                         LOG_DEBUG("  dst[0:3] (Q): [" << dst[0] << ", " << dst[1] << ", " << dst[2] << "]");
                         LOG_DEBUG("  dst[896:899] (K): [" << dst[896] << ", " << dst[897] << ", " << dst[898] << "]");
                     }
@@ -1399,9 +1417,6 @@ namespace llaminar
         // Q: [B, T, n_heads_local * head_dim]
         // K: [B, T, n_kv_heads_local * head_dim]
 
-        // Batch operator is for prefill mode, so n_past = 0
-        const int n_past = 0;
-
         // DEBUG: Log RoPE parameters
         if (getRank() == 0 && current_layer_idx_ == 0)
         {
@@ -1409,7 +1424,7 @@ namespace llaminar
             LOG_DEBUG("  batch_size=" << batch_size << " seq_len=" << seq_len);
             LOG_DEBUG("  n_heads_local_=" << n_heads_local_ << " n_kv_heads_local_=" << n_kv_heads_local_);
             LOG_DEBUG("  head_dim_=" << head_dim_);
-            LOG_DEBUG("  n_past=" << n_past << " rope_freq_base_=" << rope_freq_base_);
+            LOG_DEBUG("  n_past=" << n_past_ << " rope_freq_base_=" << rope_freq_base_);
         }
 
         // Use shared RoPE implementation from AttentionPrimitives
@@ -1418,7 +1433,7 @@ namespace llaminar
             q, k,
             batch_size, seq_len, head_dim_,
             n_heads_local_, n_kv_heads_local_,
-            n_past, rope_freq_base_);
+            n_past_, rope_freq_base_);
 
         // DEBUG: Log first few values after RoPE
         if (getRank() == 0 && current_layer_idx_ == 0 && batch_size > 0 && seq_len > 0)

@@ -17,10 +17,10 @@ This document provides comprehensive guidelines for working with the Llaminar LL
 
 Llaminar is a high-performance, distributed LLM inference engine built on:
 - **Multi-Architecture Pipeline System**: Factory-based extensible architecture for Qwen, LLaMA, and future models
-- **Centralized Backend Selection**: Single decision point via MatMulBackendSelector for OpenBLAS vs COSMA
+- **Centralized Backend Selection**: Single decision point via MatMulBackendSelector for OpenBLAS, COSMA, and Intel MKL
 - **Hybrid Tensor System**: Zero-copy COSMA optimization with backward compatibility
 - **MPI Distribution**: Multi-node inference with NUMA-aware deployment
-- **Adaptive Backends**: OpenBLAS for small operations, COSMA for large-scale distributed computing
+- **Adaptive Backends**: OpenBLAS (baseline), COSMA (distributed), Intel MKL (BF16 acceleration)
 - **Comprehensive Observability**: Structured environment snapshot, performance counters, validation framework
 
 ### Pipeline Architecture
@@ -50,7 +50,7 @@ All transformer operations are implemented as MPI-aware operators in `src/operat
 Each operator handles:
 - Tensor partition specifications (which dimensions are sharded vs replicated)
 - MPI collective operations (Allreduce, broadcast, gather)
-- Backend selection (OpenBLAS vs COSMA for large operations)
+- Backend selection (OpenBLAS, COSMA, or Intel MKL based on operation characteristics)
 - NUMA-aware memory allocation
 
 ### Batch Processing Architecture
@@ -165,8 +165,10 @@ For details, see:
 - `src/LlamaPipelineAdapter.{h,cpp}`: LLaMA adapter (prototype)
 
 **Backend and Execution:**
-- `src/MatmulBackendSelection.{h,cpp}`: Centralized backend decision logic (OpenBLAS vs COSMA)
+- `src/MatmulBackendSelection.{h,cpp}`: Centralized backend decision logic (OpenBLAS, COSMA, Intel MKL)
 - `src/BackendSelector.{h,cpp}`: Backend selection infrastructure
+- `src/AdaptiveMatmul.{h,cpp}`: Adaptive matrix multiplication with BF16 quantization support
+- `src/backends/MKLBackend.{h,cpp}`: Intel MKL BF16 GEMM backend (optional, enabled with -DUSE_MKL=ON)
 - `src/CosmaPrefillManager.{h,cpp}`: COSMA distributed prefill coordination
 - `src/CosmaPrefillProvider.{h,cpp}`: COSMA-specific prefill implementation
 - `src/OpenblasPrefillProvider.{h,cpp}`: OpenBLAS prefill implementation
@@ -206,6 +208,14 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
   -DCOSMA_SCALAPACK=CUSTOM \
   -DCOSMA_SCALAPACK_LINK_LIBRARIES=/usr/lib/x86_64-linux-gnu/libscalapack-openmpi.so
 cmake --build build --parallel
+
+# Intel MKL-enabled build (BF16 support)
+cmake -B build_mkl -S . -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/opt/intel/oneapi/mkl/latest" \
+  -DUSE_MKL=ON \
+  -DCOSMA_WITH_PROFILING=OFF \
+  -DBUILD_SHARED_LIBS=OFF
+cmake --build build_mkl --parallel
 ```
 
 ### Available Build Targets
@@ -241,12 +251,15 @@ The project includes predefined VS Code tasks:
 Always use the canonical launch script for optimal performance:
 
 ```bash
-# Canonical way to run Llaminar
+# Canonical way to run Llaminar (RELEASE mode)
 ./run_llaminar.sh [arguments]
 
-# Examples
+# DEBUG mode version (for smoke testing new features with debug logging etc):
+./run_llaminar_debug.sh [arguments]
+
+# Examples (RELEASE mode builds)
 ./run_llaminar.sh -v --print-topology
-./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v # [any other arguments...]
 ```
 
 ## Benchmark Mode
@@ -256,18 +269,11 @@ Always use the canonical launch script for optimal performance:
 Llaminar provides a dedicated `--benchmark` mode for clean performance measurement:
 
 ```bash
-# Recommended: Use canonical launcher
+# Recommended: Use canonical launcher (RELEASE mode)
 ./run_llaminar.sh --benchmark \
   -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
   -p "Your prompt here" \
   -n 50
-
-# Direct MPI execution (2 processes)
-mpirun -np 2 --bind-to socket --map-by socket \
-  ./build/llaminar --benchmark \
-  -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
-  -p "Explain machine learning." \
-  -n 100
 ```
 
 ### Benchmark Features
@@ -466,7 +472,7 @@ ctest --test-dir build --output-on-failure --verbose \
   -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -150
 
 # Parity Integration (220s) with a GTEST filter to target only PyTorch parity tests in the suite:
-GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
+GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.MKLPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
 
 # Integration Tests (3m0s)
 ctest --test-dir build --output-on-failure --verbose \
@@ -932,6 +938,30 @@ bool execute_with_fallback(const TensorInputs& inputs) {
     // Fallback to reliable OpenBLAS
     return execute_openblas_path(inputs);
 }
+
+// BF16 quantized path with MKL default (OpenBLAS verified working)
+bool execute_bf16_matmul(const float* A, const bfloat16_t* B, float* C, int m, int n, int k) {
+    #ifdef HAVE_MKL
+        // Try Intel MKL cblas_sbgemm (default when MKL available - hardware accelerated on Ice Lake+)
+        try {
+            return MKLBackend::multiply_bf16(A, B, C, m, n, k);
+        } catch (const std::exception& e) {
+            LOG_WARN("MKL BF16 failed: " << e.what() << ", trying OpenBLAS");
+        }
+    #endif
+    
+    // Fallback to OpenBLAS BF16 (verified working in v0.3.26 - software emulation reliable)
+    if (debugEnv().quant.bf16_prefer_mkl == 0) {
+        try {
+            return OpenBLASBackend::multiply_bf16(A, B, C, m, n, k);
+        } catch (const std::exception& e) {
+            LOG_WARN("OpenBLAS BF16 failed: " << e.what() << ", expanding to FP32");
+        }
+    }
+    
+    // Final fallback: FP32 expansion (rarely needed - both backends work)
+    return multiply_fp32_fallback(A, B, C, m, n, k);
+}
 ```
 
 ## Parity Testing Framework
@@ -1000,6 +1030,7 @@ if (registry.get_snapshot(key, snapshot)) {
 **Tests:**
 - `COSMAPrefillVsPyTorch`: COSMA backend vs PyTorch (prefill phase)
 - `OpenBLASPrefillVsPyTorch`: OpenBLAS backend vs PyTorch (prefill phase)
+- `MKLPrefillVsPyTorch`: Intel MKL BF16 backend vs PyTorch (prefill phase)
 - `TrueIncrementalDecodeVsPyTorch`: Incremental decode vs PyTorch (autoregressive)
 
 **Status**: ✅ All passing with <0.1% relative error
@@ -1191,6 +1222,12 @@ Use these to control verbosity, backend selection, and validation when working o
 |----------|-------------|----------------------|---------------|
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
 | `LLAMINAR_DEQUANT_ANOMALIES` | Emits warnings for anomalous Q6_K (and future) values (NaN/Inf/huge). | Disabled unless set. | Dequant safety diagnostics |
+| `LLAMINAR_QUANT_OUTPUT_BF16` | Enable BF16 activation storage (Phase 5). | 0 (off) | Activation memory optimization |
+| `LLAMINAR_FORCE_FP32_RMSNORM` | Force FP32 for RMSNorm (safety-first). | 1 (on, force FP32) | Numerical stability |
+| `LLAMINAR_ALLOW_BF16_RMSNORM` | Allow BF16 RMSNorm (experimental). | 0 (off) | Numerical stability |
+| `LLAMINAR_FORCE_FP32_SOFTMAX` | Force FP32 for Softmax. | 1 (on, force FP32) | Numerical stability |
+| `LLAMINAR_ALLOW_BF16_SOFTMAX` | Allow BF16 Softmax (experimental). | 0 (off) | Numerical stability |
+| `LLAMINAR_FORCE_FP32_LOGITS` | Force FP32 for logits output. | 1 (on, force FP32) | Output precision |
 | `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Sequence length threshold to switch to COSMA prefill path. | 4096 | Prefill path gating |
 | `ADAPTIVE_DISABLE_COSMA` | Force all operations down OpenBLAS/adaptive local path. | Unset (COSMA enabled when threshold met) | Backend selection override |
 | `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft memory budget for COSMA working set; fallback if exceeded. | 2048 | Memory safety / preflight |
@@ -1205,6 +1242,17 @@ Use these to control verbosity, backend selection, and validation when working o
 # Rich dequant + anomaly diagnostics
 export LLAMINAR_DEQUANT_STATS=1
 export LLAMINAR_DEQUANT_ANOMALIES=1
+
+# Enable BF16 activation storage (Phase 5)
+export LLAMINAR_QUANT_OUTPUT_BF16=1
+export LLAMINAR_FORCE_FP32_RMSNORM=0     # Must explicitly disable force flag
+export LLAMINAR_ALLOW_BF16_RMSNORM=1     # Then enable BF16 support
+
+# NOTE: FORCE_FP32 and ALLOW_BF16 flags are INDEPENDENT (not mutually exclusive)
+# To enable BF16 for an operation, you must:
+#   1. Set ALLOW_BF16_<operation>=1
+#   2. Set FORCE_FP32_<operation>=0
+# Both conditions must be true for BF16 to be used.
 
 # Force baseline path (skip COSMA) for A/B perf comparison
 export ADAPTIVE_DISABLE_COSMA=1
@@ -1340,7 +1388,8 @@ Disable heavy validation & trace logging prior to performance measurement to ens
 - **`.github/instructions/llaminar-architecture.instructions.md`**: Architecture deep dive
 
 **Performance and Benchmarking:**
-- `./run_llaminar.sh`: Canonical launcher with optimal MPI/OpenMP settings
+- `./run_llaminar.sh`: Canonical launcher with optimal MPI/OpenMP settings (RELEASE mode: `build_release/`)
+- `./run_llaminar_debug.sh`: Debug version of the above launcher (DEBUG mode: `build/`)
 - `./run_batch_performance.sh`: Batch vs sequential performance comparison
 - `./run_pytorch_parity_test.sh`: PyTorch parity testing with metrics
 - `./run_performance_demo.sh`: Production-style adaptive matmul demo
@@ -1388,6 +1437,7 @@ When we write documentation and changelogs at the end of our work runs:
 - ✅ Sequential Qwen inference (0.5B-72B)
 - ✅ Multi-rank MPI distribution
 - ✅ OpenBLAS backend (all sizes)
+- ✅ Intel MKL backend (BF16 quantized inference)
 - ✅ COSMA backend (large prefill ≥8K tokens)
 - ✅ NUMA-aware memory allocation
 - ✅ PyTorch parity tests (prefill + decode)

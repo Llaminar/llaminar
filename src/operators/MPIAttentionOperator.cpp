@@ -1006,9 +1006,9 @@ namespace llaminar
 
         // Allocate output tensors for Q, K, V projections
         QKVProjectionResult result;
-        result.local_q = TensorFactory::create_simple({seq_len, local_head_dim});
-        result.local_k = TensorFactory::create_simple({seq_len, local_kv_head_dim});
-        result.local_v = TensorFactory::create_simple({seq_len, local_kv_head_dim});
+        result.local_q = createLocalSimpleTensor({static_cast<size_t>(seq_len), static_cast<size_t>(local_head_dim)});
+        result.local_k = createLocalSimpleTensor({static_cast<size_t>(seq_len), static_cast<size_t>(local_kv_head_dim)});
+        result.local_v = createLocalSimpleTensor({static_cast<size_t>(seq_len), static_cast<size_t>(local_kv_head_dim)});
 
         // DEBUG: Log input and weight stats before Q projection
         if (debugEnv().attention.verbose && layer_index_ == 0)
@@ -2232,16 +2232,22 @@ namespace llaminar
                     LOG_DEBUG("  Expected PyTorch row 1 should match our row 1");
                 }
 
-                if (rank == 0)
+                if (rank == 0 && debugEnv().attention.internal_diff)
                 {
+                    // Optional internal diagnostics capture: unmasked QK^T scores BEFORE causal masking/softmax
+                    // Only enabled when LLAMINAR_ATTN_INTERNAL_DIFF is set to avoid inflating snapshot counts
                     snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, global_scores.data(),
                                        n_head_ * seq_len, attn_seq_len); // rows, cols
                 }
             }
             else
             {
-                snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, unmasked_scores.data(),
-                                   local_heads * seq_len, attn_seq_len); // rows, cols
+                if (debugEnv().attention.internal_diff)
+                {
+                    // Local (single-rank) variant internal capture
+                    snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, unmasked_scores.data(),
+                                       local_heads * seq_len, attn_seq_len); // rows, cols
+                }
             }
         }
 
@@ -2357,16 +2363,20 @@ namespace llaminar
                                    MPI_COMM_WORLD);
                 }
 
-                if (rank == 0)
+                if (rank == 0 && debugEnv().attention.internal_diff)
                 {
+                    // Optional internal diagnostics capture: attention probabilities AFTER softmax (pre-context)
                     snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, global_softmax.data(),
                                        n_head_ * seq_len, attn_seq_len);
                 }
             }
             else
             {
-                snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.data(),
-                                   local_heads * seq_len, attn_seq_len);
+                if (debugEnv().attention.internal_diff)
+                {
+                    snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.data(),
+                                       local_heads * seq_len, attn_seq_len);
+                }
             }
         }
 
@@ -2800,5 +2810,22 @@ namespace llaminar
         }
 
         return true;
+    }
+
+    std::shared_ptr<TensorBase> MPIAttentionOperator::createLocalSimpleTensor(const std::vector<size_t> &shape) const
+    {
+        // Convert size_t vector to int vector for TensorFactory
+        std::vector<int> int_shape(shape.begin(), shape.end());
+
+        // Phase 5: BF16 activation storage
+        // Note: Attention activations can use BF16, but softmax should stay FP32 for stability
+        const auto &env = debugEnv();
+        if (env.quant.output_bf16)
+        {
+            return TensorFactory::create_bf16(int_shape);
+        }
+
+        // Default: FP32 storage
+        return TensorFactory::create_simple(int_shape);
     }
 } // namespace llaminar

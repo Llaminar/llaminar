@@ -1,12 +1,14 @@
 #pragma once
 
 #include "TensorBase.h"
+#include "../utils/BFloat16.h"
 #include <cosma/matrix.hpp>
 #include <cosma/strategy.hpp>
 #include <cosma/context.hpp>
 #include <mpi.h>
 #include <memory>
 #include <stdexcept>
+#include <cstring>
 
 namespace llaminar
 {
@@ -217,6 +219,56 @@ namespace llaminar
             }
         }
 
+        // ========== Pull-Through Cache Interface ==========
+
+        TensorDataType native_type() const override { return TensorDataType::FP32; }
+
+        size_t element_count() const override { return static_cast<size_t>(size()); }
+
+    protected:
+        /**
+         * @brief Fast path for FP32 access (returns direct COSMA pointer)
+         * Called by TensorBase::data_fp32() - zero overhead for native type!
+         */
+        const float *data_native_fp32() const override
+        {
+            return cosma_matrix_ ? cosma_matrix_->matrix_pointer() : nullptr;
+        }
+
+        /**
+         * @brief Decode FP32 to FP32 (trivial copy)
+         * Called by TensorBase::data_fp32() via QuantSlabCache (rare - usually fast path used).
+         */
+        void decode_to_fp32(float *dst) const override
+        {
+            const float *src = data_native_fp32();
+            if (src)
+            {
+                std::memcpy(dst, src, element_count() * sizeof(float));
+            }
+        }
+
+        /**
+         * @brief Decode FP32 to BF16 (conversion)
+         * Called by TensorBase::data_bf16() via QuantSlabCache when BF16 needed.
+         */
+        void decode_to_bf16(void *dst) const override
+        {
+            const float *src = data_native_fp32();
+            if (!src)
+                return;
+
+            bfloat16 *bf16_dst = static_cast<bfloat16 *>(dst);
+            size_t count = element_count();
+
+#pragma omp parallel for if (count > 10000)
+            for (size_t i = 0; i < count; ++i)
+            {
+                bf16_dst[i] = bfloat16::from_float(src[i]);
+            }
+        }
+
+    public:
         // COSMA-specific methods for zero-copy operations
         cosma::CosmaMatrix<float> &cosma_matrix()
         {

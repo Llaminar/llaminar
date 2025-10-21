@@ -104,6 +104,24 @@ namespace llaminar
         }
 
         /**
+         * @brief Set sequence position for RoPE (number of past tokens)
+         * @param n_past Number of tokens already processed (for position embedding)
+         */
+        void setSequencePosition(int n_past)
+        {
+            n_past_ = n_past;
+        }
+
+        /**
+         * @brief Get current sequence position
+         * @return Number of past tokens
+         */
+        int getSequencePosition() const
+        {
+            return n_past_;
+        }
+
+        /**
          * @brief Print performance breakdown (called by batch pipeline)
          */
         void printPerformanceBreakdown() const;
@@ -184,6 +202,9 @@ namespace llaminar
         int n_heads_local_;    // Heads assigned to this rank
         int n_kv_heads_local_; // KV heads assigned to this rank
         int head_offset_;      // Starting head index for this rank
+
+        // Sequence position tracking (for RoPE)
+        int n_past_ = 0; // Number of past tokens for position embedding
 
         // Snapshot capture callback (for parity testing)
         std::function<void(PipelineStage, int, const std::shared_ptr<TensorBase> &)> snapshot_callback_;

@@ -1327,6 +1327,10 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
 
     // Disable COSMA to ensure OpenBLAS path
     setenv("ADAPTIVE_DISABLE_COSMA", "1", 1);
+
+    // Enable internal attention snapshots (ATTENTION_SCORES, ATTENTION_SOFTMAX)
+    setenv("LLAMINAR_ATTN_INTERNAL_DIFF", "1", 1);
+
     CosmaPrefillManager &manager = CosmaPrefillManager::instance();
     manager.set_force_cosma(false);
 
@@ -1337,7 +1341,7 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
     // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
     setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
-    debugEnvRefresh();                               // Refresh debug environment to pick up LLAMINAR_ATTN_CAPTURE_ENABLED
+    debugEnvRefresh();                               // Refresh debug environment to pick up ALL flags
     LlaminarSnapshotHook::set_enabled(true);
     PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
@@ -1555,7 +1559,7 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
         // Overall test assertions
         EXPECT_EQ(failed, 0) << "OpenBLAS diverged from PyTorch at: " << first_divergence;
         EXPECT_GT(passed, 0) << "No successful parity comparisons";
-        EXPECT_LT(missing, passed + failed) << "Too many missing snapshots";
+        EXPECT_EQ(missing, 0) << "Missing snapshots detected - all stages must be captured for complete validation";
     }
 
     // Clean up
@@ -1641,6 +1645,9 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
     // Force COSMA path (lower threshold to ensure COSMA is used for 100-token sequence)
     setenv("LLAMINAR_COSMA_PREFILL_THRESHOLD", "50", 1);
 
+    // Enable internal attention snapshots (ATTENTION_SCORES, ATTENTION_SOFTMAX)
+    setenv("LLAMINAR_ATTN_INTERNAL_DIFF", "1", 1);
+
     // Load PyTorch snapshots (rank 0 only)
     PyTorchSnapshotLoader pytorch_loader(snapshot_dir);
 
@@ -1648,7 +1655,7 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
     // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
     setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
-    debugEnvRefresh();                               // Refresh debug environment to pick up LLAMINAR_ATTN_CAPTURE_ENABLED
+    debugEnvRefresh();                               // Refresh debug environment to pick up ALL flags
     LlaminarSnapshotHook::set_enabled(true);
     PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
@@ -1718,8 +1725,313 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
         // Overall test assertions
         EXPECT_EQ(failed, 0) << "COSMA diverged from PyTorch at: " << first_divergence;
         EXPECT_GT(passed, 0) << "No successful parity comparisons";
-        EXPECT_LT(missing, passed + failed) << "Too many missing snapshots";
+        EXPECT_EQ(missing, 0) << "Missing snapshots detected - all stages must be captured for complete validation";
     }
+
+    // Clean up COSMA-specific environment variables
+    unsetenv("LLAMINAR_COSMA_PREFILL_THRESHOLD");
+    unsetenv("LLAMINAR_ATTN_INTERNAL_DIFF");
+}
+
+/**
+ * @brief Test MKL BF16 prefill path against PyTorch ground truth
+ *
+ * This test validates that the Intel MKL BF16 backend produces correct results
+ * by comparing against PyTorch reference snapshots. The MKL backend is used for
+ * BF16 quantized models on CPUs without native AVX512_BF16 instructions.
+ *
+ * Prerequisites: Same as OpenBLASPrefillVsPyTorch
+ *
+ * Test Configuration:
+ * - Environment: LLAMINAR_QUANT_BF16_PREFER_MKL=1, LLAMINAR_QUANT_BF16_GEMM=1
+ * - Backend: Intel MKL cblas_sbgemm for BF16×BF16→FP32 GEMM
+ * - Sequence: Small (5 tokens) to match OpenBLAS test
+ * - Model: Q8_0 quantized (uses BF16 intermediate computations)
+ *
+ * Run test:
+ *    mpirun -np 2 ./build/test_parity_framework \
+ *      --gtest_filter="*MKLPrefillVsPyTorch*"
+ */
+TEST(ParityFramework, MKLPrefillVsPyTorch)
+{
+    int world = 1;
+    int rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    // Find model file (rank 0 checks, broadcasts decision and path)
+    std::string model_path;
+    int model_not_found = 0;
+
+    if (rank == 0)
+    {
+        model_path = find_test_model();
+        model_not_found = model_path.empty() ? 1 : 0;
+    }
+
+    MPI_Bcast(&model_not_found, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (model_not_found)
+    {
+        GTEST_FAIL() << "No test model found in models/ directory - cannot run parity tests without a model";
+    }
+
+    broadcast_string(model_path, 0, MPI_COMM_WORLD);
+
+    // Define test token sequence (same as OpenBLAS test for consistency)
+    std::vector<int> token_ids = {1, 2, 3, 4, 5}; // Small sequence for direct comparison
+
+    // Set up snapshot directory
+    std::string snapshot_dir = "/tmp/pytorch_snapshots_mkl";
+
+    if (rank == 0)
+    {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "MKL BF16 Prefill vs PyTorch Validation" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "[MKL_PYTORCH] Model: " << model_path << std::endl;
+        std::cout << "[MKL_PYTORCH] Token sequence: ";
+        for (size_t i = 0; i < token_ids.size(); ++i)
+        {
+            std::cout << token_ids[i];
+            if (i < token_ids.size() - 1)
+                std::cout << ",";
+        }
+        std::cout << " (" << token_ids.size() << " tokens)" << std::endl;
+
+        // Clean up old snapshots to ensure fresh generation
+        std::string cleanup_cmd = "rm -rf " + snapshot_dir;
+        system(cleanup_cmd.c_str());
+    }
+
+    // Synchronize after cleanup
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Generate PyTorch reference snapshots with variance analysis (always fresh)
+    // This runs PyTorch 3 times to measure variance and generate dynamic thresholds
+    if (!generate_pytorch_snapshots(model_path, token_ids, snapshot_dir, rank,
+                                    /*num_runs=*/3, /*safety_margin=*/5.0f))
+    {
+        GTEST_FAIL() << "Failed to generate PyTorch reference snapshots with variance analysis";
+    }
+
+    // Load dynamic thresholds (ALL RANKS - needed for comparison)
+    DynamicThresholdLoader threshold_loader;
+    std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
+    threshold_loader.load(threshold_path);
+
+    // Enable MKL BF16 backend
+    // CRITICAL: These environment variables control MKL backend selection
+    setenv("LLAMINAR_QUANT_BF16_GEMM", "1", 1);       // Enable BF16 GEMM path
+    setenv("LLAMINAR_QUANT_BF16_PREFER_MKL", "1", 1); // Prefer MKL over OpenBLAS
+
+    // Disable COSMA to ensure local computation (not distributed)
+    setenv("ADAPTIVE_DISABLE_COSMA", "1", 1);
+
+    // Enable internal attention snapshots (ATTENTION_SCORES, ATTENTION_SOFTMAX)
+    setenv("LLAMINAR_ATTN_INTERNAL_DIFF", "1", 1);
+    CosmaPrefillManager &manager = CosmaPrefillManager::instance();
+    manager.set_force_cosma(false);
+
+    // Load PyTorch snapshots (rank 0 only)
+    PyTorchSnapshotLoader pytorch_loader(snapshot_dir);
+
+    // Enable snapshot capture for Llaminar
+    // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
+    setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+    setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
+    debugEnvRefresh();                               // Refresh debug environment to pick up ALL flags
+    LlaminarSnapshotHook::set_enabled(true);
+    PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
+    SnapshotRegistry &registry = SnapshotRegistry::instance();
+    registry.clear();
+
+    // Register Qwen pipeline with factory
+    registerQwenPipeline();
+
+    // Create pipeline using new API
+    ModelLoader loader;
+    ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load GGUF model: " << model_path;
+    TransformerLayerConfig base_config = loader.createLayerConfig();
+    ModelConfig model_cfg(base_config, "qwen");
+
+    // Get number of layers for comprehensive comparison
+    int n_layers = base_config.n_layers;
+
+    // Create pipeline via factory
+    auto pipeline = PipelineFactory::instance().create(model_cfg);
+    ASSERT_NE(pipeline, nullptr) << "Failed to create Qwen pipeline";
+
+    // Load weights using new API
+    auto weights = pipeline->loadWeights(model_path);
+    ASSERT_NE(weights, nullptr) << "Failed to load weights";
+
+    // ========== WEIGHT AND EMBEDDING VERIFICATION ==========
+    if (rank == 0)
+    {
+        std::cout << "\n"
+                  << std::string(80, '=') << std::endl;
+        std::cout << "WEIGHT VERIFICATION" << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+    }
+
+    MPIContext mpi_ctx = MPIContext::capture();
+
+    // Extract raw weights from IModelWeights interface
+    auto *qwen_weights_iface = dynamic_cast<QwenModelWeights *>(weights.get());
+    ASSERT_NE(qwen_weights_iface, nullptr) << "Failed to cast to QwenModelWeights";
+
+    const QwenPipeline::ModelWeights &raw_weights = qwen_weights_iface->inner;
+
+    // Verify embedding table
+    if (rank == 0)
+    {
+        std::cout << "\n[EMBEDDING_VERIFY] Verifying embedding table..." << std::endl;
+
+        std::string embedding_path = snapshot_dir + "/weights/token_embd.weight.npy";
+        if (std::filesystem::exists(embedding_path))
+        {
+            NpyArray pytorch_emb;
+            NpzLoader::load_npy(embedding_path, pytorch_emb);
+
+            std::cout << "[EMBEDDING_VERIFY] PyTorch embedding shape: ("
+                      << pytorch_emb.shape[0] << ", " << pytorch_emb.shape[1] << ")" << std::endl;
+
+            const auto &llaminar_emb_tensor = raw_weights.token_embedding;
+            auto *simple_emb = dynamic_cast<SimpleTensor *>(llaminar_emb_tensor.get());
+            ASSERT_NE(simple_emb, nullptr) << "Failed to cast embedding to SimpleTensor";
+
+            auto llaminar_shape = simple_emb->shape();
+            const std::vector<float> &llaminar_emb = simple_emb->get_data();
+
+            std::cout << "[EMBEDDING_VERIFY] Llaminar embedding shape: ("
+                      << simple_emb->shape()[0] << ", " << simple_emb->shape()[1] << ")" << std::endl;
+
+            // Compare shapes
+            ASSERT_EQ(pytorch_emb.shape[0], simple_emb->shape()[0])
+                << "Embedding vocab size mismatch";
+            ASSERT_EQ(pytorch_emb.shape[1], simple_emb->shape()[1])
+                << "Embedding dimension mismatch";
+
+            // Compute max absolute difference
+            float max_abs_diff = 0.0f;
+            for (size_t i = 0; i < pytorch_emb.data.size(); ++i)
+            {
+                float diff = std::abs(pytorch_emb.data[i] - llaminar_emb[i]);
+                max_abs_diff = std::max(max_abs_diff, diff);
+            }
+
+            // Compute rel_l2
+            double pytorch_norm_sq = 0.0;
+            double diff_norm_sq = 0.0;
+            for (size_t i = 0; i < pytorch_emb.data.size(); ++i)
+            {
+                pytorch_norm_sq += pytorch_emb.data[i] * pytorch_emb.data[i];
+                float diff = pytorch_emb.data[i] - llaminar_emb[i];
+                diff_norm_sq += diff * diff;
+            }
+            float rel_l2 = std::sqrt(diff_norm_sq / pytorch_norm_sq);
+
+            std::cout << "\n✓ Embedding table verified successfully!" << std::endl;
+            std::cout << "  Max absolute diff: " << max_abs_diff << std::endl;
+            std::cout << "  Relative L2: " << rel_l2 << std::endl;
+
+            // Assert tolerances
+            ASSERT_LT(max_abs_diff, 1e-5f)
+                << "Embedding max absolute difference exceeds tolerance";
+            ASSERT_LT(rel_l2, 1e-4f)
+                << "Embedding relative L2 exceeds tolerance";
+        }
+        else
+        {
+            std::cout << "  ⚠ PyTorch embedding snapshot not found: " << embedding_path << std::endl;
+            std::cout << "  Skipping embedding verification" << std::endl;
+        }
+    }
+
+    // Verify layer weights (verbose mode)
+    bool weights_verified = verifyModelWeights(
+        raw_weights, mpi_ctx, base_config,
+        snapshot_dir + "/weights",
+        /*verbose=*/true // Enable detailed per-layer logging
+    );
+
+    if (rank == 0)
+    {
+        if (weights_verified)
+        {
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "✓ WEIGHT VERIFICATION PASSED" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "All weights match PyTorch reference (including embeddings)" << std::endl;
+            std::cout << std::string(80, '=') << std::endl
+                      << std::endl;
+        }
+        else
+        {
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "⚠ WEIGHT VERIFICATION INCOMPLETE" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "Some weight snapshots missing - continuing with available weights" << std::endl;
+            std::cout << std::string(80, '=') << std::endl
+                      << std::endl;
+        }
+    }
+
+    if (rank == 0)
+    {
+        std::cout << "[MKL_PYTORCH] Running MKL BF16 prefill pipeline..." << std::endl;
+    }
+
+    // Execute prefill with new API
+    StageContext ctx;
+    ctx.stage = InferenceStage::Prefill;
+    ctx.seq_len = static_cast<int>(token_ids.size());
+
+    ASSERT_TRUE(pipeline->prefill(token_ids, *weights, ctx)) << "Prefill failed";
+
+    // Get logits
+    std::shared_ptr<TensorBase> logits_tensor;
+    ASSERT_TRUE(pipeline->logits(logits_tensor)) << "Failed to get logits";
+    ASSERT_NE(logits_tensor, nullptr) << "Logits tensor is null";
+
+    // Comprehensive stage-by-stage comparison
+    int passed = 0;
+    int failed = 0;
+    int missing = 0;
+    std::string first_divergence;
+
+    bool all_passed = compare_all_stages_vs_pytorch(
+        pytorch_loader,
+        registry,
+        n_layers,
+        rank,
+        "MKL_PYTORCH",
+        threshold_loader, // Pass dynamic threshold loader
+        passed,
+        failed,
+        missing,
+        first_divergence,
+        model_cfg.getLayerConfig());
+
+    if (rank == 0)
+    {
+        std::cout << "========================================\n"
+                  << std::endl;
+
+        // Overall test assertions
+        EXPECT_EQ(failed, 0) << "MKL diverged from PyTorch at: " << first_divergence;
+        EXPECT_GT(passed, 0) << "No successful parity comparisons";
+        EXPECT_EQ(missing, 0) << "Missing snapshots detected - all stages must be captured for complete validation";
+    }
+
+    // Clean up MKL-specific environment variables
+    unsetenv("LLAMINAR_QUANT_BF16_GEMM");
+    unsetenv("LLAMINAR_QUANT_BF16_PREFER_MKL");
+    unsetenv("ADAPTIVE_DISABLE_COSMA");
+    unsetenv("LLAMINAR_ATTN_INTERNAL_DIFF");
 }
 
 /**
@@ -2097,8 +2409,10 @@ TEST(ParityFramework, TrueIncrementalDecodeVsPyTorch)
 
     // Enable snapshot capture
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
-    setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1); // Enable PrefillProvider snapshot capture
-    debugEnvRefresh();                               // Refresh debug environment to pick up LLAMINAR_ATTN_CAPTURE_ENABLED
+    setenv("LLAMINAR_ATTN_CAPTURE_ENABLED", "1", 1);   // Enable PrefillProvider snapshot capture
+    setenv("LLAMINAR_DECODE_STAGE_SNAPSHOTS", "1", 1); // Enable decode stage snapshot capture (for incremental decode)
+    setenv("LLAMINAR_ATTN_INTERNAL_DIFF", "1", 1);     // Enable internal attention stage snapshots (e.g., ATTENTION_SOFTMAX)
+    debugEnvRefresh();                                 // Refresh debug environment to pick up snapshot flags
     LlaminarSnapshotHook::set_enabled(true);
     PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
 

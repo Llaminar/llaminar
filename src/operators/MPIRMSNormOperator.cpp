@@ -133,7 +133,7 @@ namespace llaminar
         size_t seq_len_per_batch = is_batched ? global_input->shape()[1] : global_input->shape()[0];
         size_t hidden_size = is_batched ? global_input->shape()[2] : global_input->shape()[1];
         size_t total_rows = batch_size * seq_len_per_batch; // Total number of rows to process
-        
+
         // For batched inputs, treat as [batch*seq_len, hidden_size] for computation
         size_t global_seq_len = total_rows;
         size_t global_hidden_dim_reported = hidden_size; // local view (full if not sharded)
@@ -647,7 +647,17 @@ namespace llaminar
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());
-        // Use TensorFactory to create a modern tensor
+
+        // Phase 5: BF16 activation storage
+        // Note: RMSNorm typically requires FP32 for numerical stability
+        // Only use BF16 output if explicitly allowed via LLAMINAR_ALLOW_BF16_RMSNORM
+        const auto &env = debugEnv();
+        if (env.quant.output_bf16 && env.quant.allow_bf16_rmsnorm)
+        {
+            return TensorFactory::create_bf16(int_shape);
+        }
+
+        // Default: FP32 storage (force_fp32_rmsnorm is true by default)
         return TensorFactory::create_simple(int_shape);
     }
 

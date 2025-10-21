@@ -78,6 +78,12 @@ namespace llaminar
         void setStageDecode() { is_prefill_stage_ = false; }
         bool isPrefillStage() const { return is_prefill_stage_; }
 
+        // Set decode step for snapshot suffix generation (used by adapter during replay fallback)
+        void setDecodeStep(int step) { current_decode_step_ = step; }
+
+        // Get effective snapshot source with decode step suffix if applicable
+        std::string getEffectiveSnapshotSource() const;
+
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs) override;
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
@@ -318,6 +324,10 @@ namespace llaminar
         void initializeKVCache(int seq_len);
         std::vector<std::shared_ptr<TensorBase>> createIntermediateTensors(int seq_len);
         bool ensureKVCapacityInternal(int required_tokens);
+
+        // Decode parity bookkeeping
+        int initial_prefill_length_ = 0; // number of tokens established during prefill (context length)
+        int generated_steps_ = 0;        // number of decode steps executed since prefill (increments after each decode)
 
     private:
         ModelConfig config_;

@@ -1,6 +1,6 @@
 # Llaminar LLM Inference Engine - Architecture Documentation
 
-*Last Updated: October 12, 2025*
+*Last Updated: October 20, 2025*
 
 ## Overview
 
@@ -28,6 +28,24 @@ Llaminar is a high-performance, MPI-first LLM inference engine focused on low‑
 - **100% PyTorch parity** (387/387 tests passing with e-05 to e-06 precision)
 - **Runtime backend injection** via `setCosmaManager()` for COSMA vs OpenBLAS switching
 - **Systematic transpose fixes** across all weight projections (attention, FFN, LM_HEAD)
+
+🎉 **OpenBLAS BF16 Emulation Verified** ✨ *NEW OCTOBER 20, 2025*
+- **Investigation Complete**: OpenBLAS v0.3.26 `cblas_sbgemm` verified working on Cascade Lake CPUs
+- **Original Bug Report**: January 2025 report claimed NaN outputs - **NOT REPRODUCED** in October testing
+- **Comprehensive Testing**: All matrix sizes pass (2×2, 64×64, 64×896×896) with no NaN or numerical errors
+- **CPU Feature Check Removed**: Defensive fallback to FP32 eliminated after verification
+- **Production Status**: OpenBLAS BF16 emulation now trusted on all CPUs (software emulation works)
+- **Test Suite**: 4/4 BF16 tests passing, end-to-end inference successful (1.22 tok/s decode)
+- See: `changelog/2025-10-20-openblas-bf16-bug-investigation.md`, `changelog/2025-10-20-openblas-bf16-cpu-check-removed.md`
+
+🎉 **Intel MKL BF16 Backend Integration** ✨ *OCTOBER 20, 2025*
+- **Production-Quality BF16 GEMM**: Intel MKL `cblas_sbgemm` as default BF16 backend when `HAVE_MKL` defined
+- **Performance Optimization**: Hardware acceleration on Ice Lake+ (AVX512_BF16), graceful software fallback otherwise
+- **100% PyTorch Parity**: 387/387 tests passing with < 1e-4 relative L2 error
+- **Graceful Fallback Chain**: MKL → OpenBLAS (verified working) → FP32 expansion with automatic degradation
+- **2× Memory Savings**: BF16 storage vs FP32 with same exponent range (bfloat16 format)
+- **Build Configuration**: Optional `-DUSE_MKL=ON` flag, links against Intel oneAPI MKL
+- See: `src/backends/MKLBackend.{h,cpp}`, `src/AdaptiveMatmul.{h,cpp}`, `changelog/2025-10-20-mkl-default-backend.md`
 
 ### Core Architecture Pillars
 
@@ -4140,27 +4158,71 @@ This architecture provides a solid foundation for high-performance, distributed 
 
 ## Backend Abstraction Layer (Prefill & Inference)
 
-To prepare for future GPU offload while retaining the current CPU-only implementation, Llaminar now includes lightweight backend abstraction interfaces that wrap all latency / throughput sensitive GEMMs inside attention and MLP kernels.
+Llaminar supports three matrix multiplication backends for different operation profiles: **OpenBLAS** (baseline CPU BLAS), **COSMA** (distributed MPI), and **Intel MKL** (BF16 hardware acceleration).
 
 ### Goals
-1. Decouple kernel call sites from concrete matmul implementation details (OpenBLAS vs COSMA vs future GPU libraries)
-2. Preserve existing adaptive CPU heuristics (single-thread / multi-thread / distributed) without duplication
+1. Decouple kernel call sites from concrete matmul implementation details (OpenBLAS vs COSMA vs Intel MKL vs future GPU)
+2. Preserve existing adaptive CPU heuristics (single-thread / multi-thread / distributed / quantized) without duplication
 3. Provide zero-cost indirection today (simple inline / single virtual hop) with fast fallback to existing `adaptive_matmul`
 4. Centralize prefill-vs-inference path decisions for consistent logging and experimentation
+5. Enable BF16 quantization with production-quality GEMM (Intel MKL default, OpenBLAS fallback)
+
+### Supported Backends (October 2025)
+
+| Backend | Optimal Use Case | Availability | Status |
+|---------|------------------|--------------|--------|
+| **OpenBLAS** | Decode, small/medium prefill (<4K tokens) | Always available | ✅ Production |
+| **COSMA** | Large prefill (≥4K tokens), multi-rank MPI | Requires world_size > 1 | ✅ Production |
+| **Intel MKL** | BF16 quantized inference (2× memory savings) | Optional (`-DUSE_MKL=ON`) | ✅ Production (Oct 20, 2025) |
+| **GPU** (future) | Large batch, multi-GPU inference | Not yet implemented | 🔄 Planned |
+
+### Intel MKL BF16 Backend ✨ *OCTOBER 20, 2025*
+
+**Motivation**: Provide production-quality BF16 GEMM with hardware acceleration on modern CPUs (Ice Lake+) and robust software fallback. Intel MKL offers optimized `cblas_sbgemm` implementation with better performance characteristics than generic OpenBLAS on supported hardware.
+
+**Note**: Earlier concerns about OpenBLAS BF16 emulation were resolved in October 2025 - OpenBLAS v0.3.26 verified working correctly on Cascade Lake without NaN issues. MKL remains valuable for hardware-accelerated paths and performance optimization.
+
+**Key Features**:
+- **Default BF16 Backend**: When `HAVE_MKL` defined and `LLAMINAR_QUANT_BF16_GEMM=1`, Intel MKL is tried first
+- **100% Parity**: 387/387 tests passing vs PyTorch (< 1e-4 relative L2 error)
+- **Graceful Fallback**: MKL → OpenBLAS → FP32 expansion (automatic degradation)
+- **2× Memory Savings**: bfloat16 storage (16-bit) vs FP32 (32-bit) with same exponent range
+- **Hardware Acceleration**: AVX512_BF16 on Ice Lake, Sapphire Rapids (when available)
+
+**Implementation**:
+- `src/backends/MKLBackend.{h,cpp}`: Intel MKL cblas_sbgemm wrapper
+- `src/AdaptiveMatmul.h` `multiplyBF16()`: Backend selection logic (lines ~315-380)
+- `LLAMINAR_QUANT_BF16_PREFER_MKL`: **DEPRECATED** - MKL now default (set =0 to force OpenBLAS)
+
+**Build Configuration**:
+```bash
+cmake -B build_mkl -S . -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/opt/intel/oneapi/mkl/latest" \
+  -DUSE_MKL=ON
+cmake --build build_mkl --parallel
+```
+
+**Runtime Activation**:
+```bash
+export LLAMINAR_QUANT_BF16_GEMM=1  # Enable BF16 path (MKL becomes default)
+./run_llaminar.sh -m model.gguf -v
+```
 
 ### Components
-**Current Architecture**: `src/prefill_provider.{h,cpp}`, `src/openblas_prefill_provider.{h,cpp}`, `src/cosma_prefill_provider.{h,cpp}`
+**Current Architecture**: `src/prefill_provider.{h,cpp}`, `src/openblas_prefill_provider.{h,cpp}`, `src/cosma_prefill_provider.{h,cpp}`, `src/backends/MKLBackend.{h,cpp}`
 
 | Element | Description |
 |---------|-------------|
 | `PrefillProvider` | Abstract base class for prefill execution strategies |
 | `OpenBLASPrefillProvider` | CPU-based prefill using OpenBLAS (baseline, optimal for <4K tokens) |
 | `COSMAPrefillProvider` | Distributed prefill using COSMA (optimal for ≥4K tokens, multi-rank) |
+| `MKLBackend` | Intel MKL BF16 GEMM backend (cblas_sbgemm, default when HAVE_MKL defined) |
+| `AdaptiveMatmul` | Backend selection and fallback logic (FP32, BF16 quantized paths) |
 | `PrefillProviderFactory` | Automatic provider selection based on sequence length and MPI context |
 | `PrefillMetrics` | Comprehensive instrumentation (timing, FLOPS, snapshots) |
 | `GpuPrefillProvider` (future) | GPU-accelerated prefill with device memory management |
 
-**Decode Path**: Currently uses local OpenBLAS in `QwenPipeline::decode()` for latency optimization. Future work may extract decode provider abstraction.
+**Decode Path**: Currently uses local OpenBLAS in `QwenPipeline::decode()` for latency optimization. BF16 quantized decode may use Intel MKL when `LLAMINAR_QUANT_BF16_GEMM=1`. Future work may extract decode provider abstraction.
 
 ### Invocation Pattern (from QwenPipeline)
 ```cpp
@@ -4174,11 +4236,22 @@ if (success) {
     ctx.backend_stats.prefill_backend = metrics.backend_name;
     ctx.backend_stats.prefill_gflops = metrics.gflops();
 }
+
+// BF16 quantized path (via AdaptiveMatmul::multiplyBF16)
+if (debugEnv().quant.bf16_gemm && weight_is_bf16) {
+    #ifdef HAVE_MKL
+        success = MKLBackend::multiply_bf16(act, weight_bf16, output, m, n, k);
+    #else
+        success = OpenBLASBackend::multiply_bf16(act, weight_bf16, output, m, n, k);
+    #endif
+    // Automatic FP32 fallback if both fail
+}
 ```
 
 Provider selection logic:
-1. **Environment Override**: `ADAPTIVE_DISABLE_COSMA=1` → OpenBLAS
-2. **Debug Forcing**: `LLAMINAR_COSMA_FORCE_DIRECT=1` → COSMA
+1. **BF16 Quantized Path**: `LLAMINAR_QUANT_BF16_GEMM=1` + `HAVE_MKL` → Intel MKL (default)
+2. **Environment Override**: `ADAPTIVE_DISABLE_COSMA=1` → OpenBLAS
+3. **Debug Forcing**: `LLAMINAR_COSMA_FORCE_DIRECT=1` → COSMA
 3. **Sequence Length**: `seq_len >= threshold` (default 4096) + multi-rank → COSMA
 4. **Default**: OpenBLAS for small sequences or single-rank
 

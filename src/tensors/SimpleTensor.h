@@ -3,10 +3,12 @@
 #include "TensorBase.h"
 #include "../Logger.h"
 #include "../utils/DebugEnv.h"
+#include "../utils/BFloat16.h"
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
 #include <iostream>
+#include <cstring>
 #include <omp.h>
 
 namespace llaminar
@@ -201,12 +203,53 @@ namespace llaminar
             }
             else
             {
-                // Generic copy using data pointer
-                const float *other_data = other.data();
-                std::copy(other_data, other_data + size(), data_.begin());
+                // Generic copy using data() accessor
+                const float *src = other.data();
+                std::copy(src, src + size(), data_.data());
             }
         }
 
+        // ===========================
+        // Pull-Through Cache Interface (NEW)
+        // ===========================
+
+        TensorDataType native_type() const override
+        {
+            return TensorDataType::FP32;
+        }
+
+        size_t element_count() const override
+        {
+            return static_cast<size_t>(data_.size());
+        }
+
+    protected:
+        // Fast path: SimpleTensor is natively FP32, return direct pointer
+        const float *data_native_fp32() const override
+        {
+            return data_.data();
+        }
+
+        // Decode methods (required by TensorBase)
+        void decode_to_fp32(float *dst) const override
+        {
+            // Already FP32, just copy
+            std::memcpy(dst, data_.data(), data_.size() * sizeof(float));
+        }
+
+        void decode_to_bf16(void *dst) const override
+        {
+            // Convert FP32 → BF16
+            bfloat16 *bf16_dst = static_cast<bfloat16 *>(dst);
+
+#pragma omp parallel for if (data_.size() > 10000)
+            for (size_t i = 0; i < data_.size(); ++i)
+            {
+                bf16_dst[i] = bfloat16::from_float(data_[i]);
+            }
+        }
+
+    public:
         // Direct access to underlying data for compatibility
         std::vector<float> &get_data() { return data_; }
         const std::vector<float> &get_data() const { return data_; }
@@ -215,7 +258,7 @@ namespace llaminar
         const std::vector<int> &get_shape() const { return shape_; }
 
         // Utility methods
-        
+
         /**
          * @brief Get batch size (first dimension) - 1 if tensor has no batch dimension
          * Only 3D+ tensors have a batch dimension. 2D and 1D tensors have batch_size=1.
@@ -227,9 +270,9 @@ namespace llaminar
             {
                 return static_cast<size_t>(shape_[0]);
             }
-            return 1;  // 1D and 2D tensors have implicit batch=1
+            return 1; // 1D and 2D tensors have implicit batch=1
         }
-        
+
         /**
          * @brief Get sequence length dimension
          * For 2D tensors: [seq_len, d_model] -> seq_len
@@ -239,15 +282,15 @@ namespace llaminar
         {
             if (shape_.size() == 2)
             {
-                return static_cast<size_t>(shape_[0]);  // [seq_len, d_model]
+                return static_cast<size_t>(shape_[0]); // [seq_len, d_model]
             }
             else if (shape_.size() >= 3)
             {
-                return static_cast<size_t>(shape_[1]);  // [batch, seq_len, d_model]
+                return static_cast<size_t>(shape_[1]); // [batch, seq_len, d_model]
             }
-            return 1;  // 1D tensor or empty
+            return 1; // 1D tensor or empty
         }
-        
+
         /**
          * @brief Reshape tensor to new shape (returns new tensor)
          * @param new_shape New tensor shape
@@ -268,10 +311,10 @@ namespace llaminar
 
             auto result = std::make_shared<SimpleTensor>();
             result->shape_ = new_shape;
-            result->data_ = data_;  // Copy data
+            result->data_ = data_; // Copy data
             return result;
         }
-        
+
         /**
          * @brief Reshape tensor in-place
          */
@@ -290,12 +333,12 @@ namespace llaminar
 
             shape_ = new_shape;
         }
-        
+
         /**
          * @brief Extract a single sequence from a batched tensor
          * @param batch_idx Index of the batch to extract
          * @return Shared pointer to tensor containing just that batch element
-         * 
+         *
          * Example: [batch=4, seq_len=8, d_model=896] -> [seq_len=8, d_model=896]
          */
         std::shared_ptr<SimpleTensor> slice_batch(size_t batch_idx) const
@@ -304,13 +347,13 @@ namespace llaminar
             {
                 throw std::invalid_argument("Cannot slice batch from scalar tensor");
             }
-            
+
             size_t batch_dim = static_cast<size_t>(shape_[0]);
             if (batch_idx >= batch_dim)
             {
                 throw std::out_of_range("Batch index out of range");
             }
-            
+
             // Calculate size of one batch element
             size_t batch_elem_size = 1;
             std::vector<int> new_shape;
@@ -319,36 +362,36 @@ namespace llaminar
                 new_shape.push_back(shape_[i]);
                 batch_elem_size *= shape_[i];
             }
-            
+
             // Create new tensor with sliced data
             auto result = std::make_shared<SimpleTensor>();
             result->shape_ = new_shape;
             result->data_.resize(batch_elem_size);
-            
+
             // Copy data for this batch index
-            const float* src = data_.data() + batch_idx * batch_elem_size;
+            const float *src = data_.data() + batch_idx * batch_elem_size;
             std::copy(src, src + batch_elem_size, result->data_.begin());
-            
+
             return result;
         }
-        
+
         /**
          * @brief Stack multiple tensors along a new batch dimension
          * @param sequences Vector of tensors to stack
          * @return Shared pointer to batched tensor, or nullptr if empty
-         * 
+         *
          * Example: 4× [seq_len=8, d_model=896] -> [batch=4, seq_len=8, d_model=896]
          */
         static std::shared_ptr<SimpleTensor> stack_batch(
-            const std::vector<std::shared_ptr<SimpleTensor>>& sequences)
+            const std::vector<std::shared_ptr<SimpleTensor>> &sequences)
         {
             if (sequences.empty())
             {
-                return nullptr;  // Return nullptr for empty input
+                return nullptr; // Return nullptr for empty input
             }
-            
+
             // Verify all sequences have same shape
-            const auto& ref_shape = sequences[0]->shape_;
+            const auto &ref_shape = sequences[0]->shape_;
             for (size_t i = 1; i < sequences.size(); ++i)
             {
                 if (sequences[i]->shape_ != ref_shape)
@@ -356,30 +399,30 @@ namespace llaminar
                     throw std::invalid_argument("All sequences must have same shape for stacking");
                 }
             }
-            
+
             // Create new shape with batch dimension
             std::vector<int> new_shape;
-            new_shape.push_back(static_cast<int>(sequences.size()));  // batch dimension
+            new_shape.push_back(static_cast<int>(sequences.size())); // batch dimension
             new_shape.insert(new_shape.end(), ref_shape.begin(), ref_shape.end());
-            
+
             // Calculate sizes
             size_t batch_size = sequences.size();
             size_t elem_size = sequences[0]->data_.size();
             size_t total_size = batch_size * elem_size;
-            
+
             // Create result tensor
             auto result = std::make_shared<SimpleTensor>();
             result->shape_ = new_shape;
             result->data_.resize(total_size);
-            
+
             // Copy data from each sequence
             for (size_t b = 0; b < batch_size; ++b)
             {
-                float* dst = result->data_.data() + b * elem_size;
-                const float* src = sequences[b]->data_.data();
+                float *dst = result->data_.data() + b * elem_size;
+                const float *src = sequences[b]->data_.data();
                 std::copy(src, src + elem_size, dst);
             }
-            
+
             return result;
         }
 

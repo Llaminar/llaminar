@@ -3,11 +3,29 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <functional>
 
 namespace llaminar
 {
     // Forward declaration
     struct Tensor;
+
+    // Forward declarations for cache
+    class QuantSlabCache;
+    enum class CachedDataType : uint8_t;
+
+    /**
+     * @brief Native data type of a tensor
+     *
+     * Used for fast-path optimization in pull-through cache.
+     */
+    enum class TensorDataType
+    {
+        FP32,      ///< 32-bit float (SimpleTensor)
+        BF16,      ///< 16-bit bfloat16 (BF16Tensor)
+        QUANTIZED, ///< Quantized format (QuantizedTensor)
+        OTHER      ///< Other/custom formats
+    };
 
     /**
      * Abstract base class for all tensor types in the llaminar system.
@@ -27,6 +45,49 @@ namespace llaminar
         // Data access - returns pointer to the local data portion
         virtual float *data() = 0;
         virtual const float *data() const = 0;
+
+        // ===========================
+        // Pull-Through Cache Interface (NEW)
+        // ===========================
+
+        /**
+         * @brief Get FP32 data pointer (may decode via cache)
+         *
+         * This method implements the pull-through cache pattern:
+         * - If tensor is natively FP32: returns direct pointer (fast path)
+         * - Otherwise: checks shared cache, decodes if miss, returns cached pointer
+         *
+         * The returned pointer is valid until the cache evicts it (typically
+         * safe within the same forward pass).
+         *
+         * @return const float* Pointer to FP32 data
+         */
+        virtual const float *data_fp32() const;
+
+        /**
+         * @brief Get BF16 data pointer (may decode via cache)
+         *
+         * Similar to data_fp32() but for bfloat16 format.
+         *
+         * @return const bfloat16* Pointer to BF16 data
+         */
+        virtual const void *data_bf16() const; // void* to avoid bfloat16 include here
+
+        /**
+         * @brief Get native data type of this tensor
+         *
+         * Used for fast-path optimization (avoid cache lookup for native type).
+         *
+         * @return TensorDataType Native storage format
+         */
+        virtual TensorDataType native_type() const = 0;
+
+        /**
+         * @brief Get total number of elements in tensor
+         *
+         * @return size_t Element count
+         */
+        virtual size_t element_count() const = 0;
 
         // Tensor type identification
         virtual std::string type_name() const = 0;
@@ -74,6 +135,47 @@ namespace llaminar
         {
             return shape() == other.shape();
         }
+
+    protected:
+        // ===========================
+        // Decode Hooks for Subclasses
+        // ===========================
+
+        /**
+         * @brief Fast-path accessor for native FP32 tensors
+         *
+         * Override this in SimpleTensor to return direct pointer.
+         * Default returns nullptr (triggers cache path).
+         */
+        virtual const float *data_native_fp32() const { return nullptr; }
+
+        /**
+         * @brief Fast-path accessor for native BF16 tensors
+         *
+         * Override this in BF16Tensor to return direct pointer.
+         * Default returns nullptr (triggers cache path).
+         */
+        virtual const void *data_native_bf16() const { return nullptr; }
+
+        /**
+         * @brief Decode entire tensor to FP32
+         *
+         * Called on cache miss when data_fp32() requested.
+         * Must fill dst with element_count() floats.
+         *
+         * @param dst Destination buffer (pre-allocated)
+         */
+        virtual void decode_to_fp32(float *dst) const = 0;
+
+        /**
+         * @brief Decode entire tensor to BF16
+         *
+         * Called on cache miss when data_bf16() requested.
+         * Must fill dst with element_count() bfloat16 values.
+         *
+         * @param dst Destination buffer (pre-allocated)
+         */
+        virtual void decode_to_bf16(void *dst) const = 0; // void* to avoid bfloat16 include
     };
 
     // Forward declaration - full definition in TensorFactory.h
