@@ -43,6 +43,7 @@
 #include <string>
 #include <cctype>
 #include "tensors/TensorFactory.h"
+#include "QuantizedGemm.h"
 #include "Logger.h"
 #include "utils/BFloat16.h"
 #include "utils/CpuFeatures.h"
@@ -125,6 +126,10 @@ namespace llaminar
         mutable std::map<std::string, OperationStats> backend_stats_;
         // Track last backend used (for test introspection)
         mutable MatMulBackend last_backend_ = MatMulBackend::MULTI_THREADED_OPENBLAS;
+
+        // GEMM strategy cache: maps TensorBase* to cached ITensorGemm instance
+        // Avoids repeated heap allocation and virtual calls for same tensor
+        mutable std::map<const TensorBase *, std::unique_ptr<ITensorGemm>> gemm_cache_;
 
     public:
         AdaptiveMatMulManager()
@@ -304,6 +309,12 @@ namespace llaminar
 
         // Accessor for tests
         MatMulBackend last_backend() const { return last_backend_; }
+
+        // Accessor for GEMM cache (allows free function to cache strategies)
+        std::map<const TensorBase *, std::unique_ptr<ITensorGemm>> &getGemmCache() const
+        {
+            return gemm_cache_;
+        }
 
         /**
          * @brief BF16×BF16→FP32 matrix multiplication using OpenBLAS cblas_sbgemm
@@ -576,15 +587,19 @@ namespace llaminar
             if (mpi_rank_ != 0)
                 return;
 
-            LOG_INFO("\n=== Adaptive Backend Performance Summary ===");
-            for (const auto &[backend, stats] : backend_stats_)
+            if (llaminar::debugEnv().performance.enable)
             {
-                LOG_INFO(backend << ":");
-                LOG_INFO("  Operations: " << stats.count);
-                LOG_INFO("  Avg time: " << stats.average() << " ms");
-                LOG_INFO("  Min time: " << stats.min_time_ms << " ms");
-                LOG_INFO("  Max time: " << stats.max_time_ms << " ms");
-                LOG_INFO("  Total time: " << stats.total_time_ms << " ms");
+                LOG_INFO("\n=== Adaptive Backend Performance Summary ===");
+
+                for (const auto &[backend, stats] : backend_stats_)
+                {
+                    LOG_INFO(backend << ":");
+                    LOG_INFO("  Operations: " << stats.count);
+                    LOG_INFO("  Avg time: " << stats.average() << " ms");
+                    LOG_INFO("  Min time: " << stats.min_time_ms << " ms");
+                    LOG_INFO("  Max time: " << stats.max_time_ms << " ms");
+                    LOG_INFO("  Total time: " << stats.total_time_ms << " ms");
+                }
             }
         }
 
@@ -868,13 +883,13 @@ namespace llaminar
             // Early return for empty tensors (e.g., rank with no tokens to process)
             if (m == 0 || n == 0 || k == 0)
             {
-                LOG_DEBUG("[OPENBLAS_SKIP] Empty tensor: m=" << m << " n=" << n << " k=" << k << ", skipping computation on rank " << mpi_rank_);
+                LOG_TRACE("[OPENBLAS_SKIP] Empty tensor: m=" << m << " n=" << n << " k=" << k << ", skipping computation on rank " << mpi_rank_);
                 return true; // Success - nothing to compute
             }
 
             // DEBUG: Entry logging
-            LOG_INFO("[OPENBLAS_ENTRY] rank=" << mpi_rank_ << " m=" << m << " n=" << n << " k=" << k
-                                              << " transpose_A=" << transpose_A << " transpose_B=" << transpose_B);
+            LOG_TRACE("[OPENBLAS_ENTRY] rank=" << mpi_rank_ << " m=" << m << " n=" << n << " k=" << k
+                                               << " transpose_A=" << transpose_A << " transpose_B=" << transpose_B);
 
             auto t0 = std::chrono::high_resolution_clock::now();
             try
@@ -980,6 +995,85 @@ namespace llaminar
                                 alpha, beta,
                                 is_prefill,
                                 distributed_partition);
+    }
+
+    /**
+     * @brief Adaptive matrix multiplication with optional fused quantized GEMM
+     *
+     * This overload accepts a TensorBase* for the weight matrix and automatically
+     * uses fused quantized GEMM if available, falling back to full decode + BLAS.
+     *
+     * @param A Input activation matrix [m, k] (FP32)
+     * @param B_tensor Weight tensor (may be quantized)
+     * @param C Output matrix [m, n] (FP32)
+     * @param m Number of rows in A and C
+     * @param n Number of columns in C (rows in B before transpose)
+     * @param k Number of columns in A (columns in B)
+     * @param is_prefill Whether this is a prefill operation
+     * @param distributed_partition Whether weight is distributed across ranks
+     * @param transpose_A Whether to transpose A
+     * @param transpose_B Whether to transpose B (most common: true for [n,k] weights)
+     * @param alpha Scaling factor for A @ B
+     * @param beta Scaling factor for existing C
+     *
+     * @return true if operation succeeded, false otherwise
+     */
+    inline bool adaptiveMatMul(const float *A, const TensorBase *B_tensor, float *C,
+                               int m, int n, int k,
+                               bool is_prefill = false,
+                               bool distributed_partition = false,
+                               bool transpose_A = false,
+                               bool transpose_B = false,
+                               float alpha = 1.0f,
+                               float beta = 0.0f)
+    {
+        if (!B_tensor)
+        {
+            LOG_ERROR("adaptiveMatMul: null B_tensor provided");
+            return false;
+        }
+
+        // Try fused quantized GEMM path with caching
+        static AdaptiveMatMulManager manager;
+        auto &cache = manager.getGemmCache();
+
+        // Check cache first
+        auto it = cache.find(B_tensor);
+        ITensorGemm *gemm = nullptr;
+
+        if (it != cache.end())
+        {
+            gemm = it->second.get();
+        }
+        else
+        {
+            // Cache miss: create and store
+            ITensorGemm *gemm_raw = B_tensor->createGemmRaw();
+            if (gemm_raw)
+            {
+                cache[B_tensor] = std::unique_ptr<ITensorGemm>(gemm_raw);
+                gemm = gemm_raw;
+            }
+        }
+
+        if (gemm && gemm->supports(m, n, k))
+        {
+            LOG_DEBUG("Using tensor-specific GEMM: " << gemm->name());
+            return gemm->multiply(A, C, m, n, k, transpose_B, alpha, beta);
+        }
+
+        // Fallback: full decode + BLAS
+        const float *B = B_tensor->data();
+        if (!B)
+        {
+            LOG_ERROR("adaptiveMatMul: B_tensor->data() returned null");
+            return false;
+        }
+
+        return adaptiveMatMul(A, B, C, m, n, k,
+                              is_prefill, distributed_partition,
+                              transpose_A, transpose_B,
+                              alpha, beta);
     }
 
     // FP16 weight convenience: expand FP16 weights to FP32 then call adaptiveMatMul.

@@ -241,6 +241,14 @@ namespace llaminar
         // Dequant
         s.dequant.stats = flag(std::getenv("LLAMINAR_DEQUANT_STATS"));
         s.dequant.anomalies = flag(std::getenv("LLAMINAR_DEQUANT_ANOMALIES"));
+        // IQ4 experimental decode flags
+        s.dequant.iq4_microkernel = flag(std::getenv("LLAMINAR_IQ4_MICROKERNEL"));
+        if (const char *dd = std::getenv("LLAMINAR_IQ4_DIRECT_DECODE"))
+        {
+            // default true; explicit 0 disables
+            if (*dd == '0')
+                s.dequant.iq4_direct_decode = false;
+        }
         // Quantization (Phase 2)
         s.quant.enable = flag(std::getenv("LLAMINAR_QUANT_ENABLE"));
         s.quant.load_quantized = flag(std::getenv("LLAMINAR_LOAD_QUANTIZED"));

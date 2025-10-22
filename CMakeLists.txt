@@ -290,6 +290,7 @@ set(LLAMINAR_CORE_SOURCES
     src/utils/CpuFeatures.cpp
     src/PerformanceTracer.cpp
     src/operators/MPILinearOperator.cpp
+    src/operators/MPILinearOperator_v2.cpp
     src/operators/MPILinearBatchOperator.cpp
     src/operators/MPIRMSNormOperator.cpp
     src/operators/MPIAttentionOperator.cpp
@@ -467,6 +468,18 @@ endif()
 # Production adaptive architecture demonstration
 add_executable(production_demo src/ProductionDemo.cpp)
 target_link_libraries(production_demo llaminar_core)
+
+# Int8 activation VNNI test
+add_executable(test_int8_vnni test_int8_vnni.cpp)
+target_link_libraries(test_int8_vnni llaminar_core)
+
+# BF16 activation test
+add_executable(test_bf16_gemm test_bf16_gemm.cpp)
+target_link_libraries(test_bf16_gemm llaminar_core)
+
+# BF16 performance scaling test
+add_executable(test_bf16_scaling test_bf16_scaling.cpp)
+target_link_libraries(test_bf16_scaling llaminar_core)
 
 # Tensor-parallel output projection micro-benchmark
 # add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
@@ -667,6 +680,11 @@ add_test_with_debug_logging(BatchPaddingTest COMMAND test_batch_padding)
 add_executable(test_tensor_batch_ops tests/test_tensor_batch_ops.cpp)
 target_link_libraries(test_tensor_batch_ops llaminar_core GTest::gtest GTest::gtest_main)
 add_test_with_debug_logging(TensorBatchOpsTest COMMAND test_tensor_batch_ops)
+
+# FP32Tensor and ITensorGemm interface test
+add_executable(test_fp32tensor tests/test_fp32tensor.cpp)
+target_link_libraries(test_fp32tensor llaminar_core GTest::gtest GTest::gtest_main)
+add_test_with_debug_logging(FP32TensorTest COMMAND test_fp32tensor)
 
 add_executable(test_contract_loading tests/TestContractLoading.cpp)
 target_link_libraries(test_contract_loading llaminar_core)
@@ -1827,6 +1845,112 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     add_test(NAME Q8_0TensorTest COMMAND test_q8_0_tensor)
     set_tests_properties(Q8_0TensorTest PROPERTIES TIMEOUT 30)
 
+    # Q4_0Tensor tests (Week 3)
+    add_executable(test_q4_0_tensor tests/test_q4_0_tensor.cpp)
+    target_link_libraries(test_q4_0_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q4_0TensorTest COMMAND test_q4_0_tensor)
+    set_tests_properties(Q4_0TensorTest PROPERTIES TIMEOUT 30)
+
+    # Q6_KTensor tests (Week 3)
+    add_executable(test_q6_k_tensor tests/test_q6_k_tensor.cpp)
+    target_link_libraries(test_q6_k_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q6_KTensorTest COMMAND test_q6_k_tensor)
+    set_tests_properties(Q6_KTensorTest PROPERTIES TIMEOUT 30)
+
+    # Q5_KTensor tests
+    add_executable(test_q5_k_tensor tests/test_q5_k_tensor.cpp)
+    target_link_libraries(test_q5_k_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q5_KTensorTest COMMAND test_q5_k_tensor)
+    set_tests_properties(Q5_KTensorTest PROPERTIES TIMEOUT 30)
+
+    # Q3_KTensor tests
+    add_executable(test_q3_k_tensor tests/test_q3_k_tensor.cpp)
+    target_link_libraries(test_q3_k_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q3_KTensorTest COMMAND test_q3_k_tensor)
+
+    # Q2_K tensor tests
+    add_executable(test_q2_k_tensor tests/test_q2_k_tensor.cpp)
+    target_link_libraries(test_q2_k_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q2_KTensorTest COMMAND test_q2_k_tensor)
+    set_tests_properties(Q3_KTensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ2_XXSTensor tests
+    add_executable(test_iq2_xxs_tensor tests/test_iq2_xxs_tensor.cpp)
+    target_link_libraries(test_iq2_xxs_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ2_XXSTensorTest COMMAND test_iq2_xxs_tensor)
+    set_tests_properties(IQ2_XXSTensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ2_XSTensor tests
+    add_executable(test_iq2_xs_tensor tests/test_iq2_xs_tensor.cpp)
+    target_link_libraries(test_iq2_xs_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ2_XSTensorTest COMMAND test_iq2_xs_tensor)
+    set_tests_properties(IQ2_XSTensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ2_STensor tests
+    add_executable(test_iq2_s_tensor tests/test_iq2_s_tensor.cpp)
+    target_link_libraries(test_iq2_s_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ2_STensorTest COMMAND test_iq2_s_tensor)
+    set_tests_properties(IQ2_STensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ2 Family Decode Benchmark
+    add_executable(benchmark_iq2_decode tests/benchmark_iq2_decode.cpp)
+    target_link_libraries(benchmark_iq2_decode PRIVATE llaminar_core GTest::gtest GTest::gtest_main OpenMP::OpenMP_CXX)
+    # Not added as a CTest - run manually for performance testing
+
+    # IQ3_XXSTensor tests
+    add_executable(test_iq3_xxs_tensor tests/test_iq3_xxs_tensor.cpp)
+    target_link_libraries(test_iq3_xxs_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ3_XXSTensorTest COMMAND test_iq3_xxs_tensor)
+    set_tests_properties(IQ3_XXSTensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ3_STensor tests
+    add_executable(test_iq3_s_tensor tests/test_iq3_s_tensor.cpp)
+    target_link_libraries(test_iq3_s_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ3_STensorTest COMMAND test_iq3_s_tensor)
+    set_tests_properties(IQ3_STensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ1_STensor tests
+    add_executable(test_iq1_s_tensor tests/test_iq1_s_tensor.cpp)
+    target_link_libraries(test_iq1_s_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ1_STensorTest COMMAND test_iq1_s_tensor)
+    set_tests_properties(IQ1_STensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ1_MTensor tests
+    add_executable(test_iq1_m_tensor tests/test_iq1_m_tensor.cpp)
+    target_link_libraries(test_iq1_m_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ1_MTensorTest COMMAND test_iq1_m_tensor)
+    set_tests_properties(IQ1_MTensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ4_NLTensor tests
+    add_executable(test_iq4_nl_tensor tests/test_iq4_nl_tensor_simple.cpp)
+    target_link_libraries(test_iq4_nl_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ4_NLTensorTest COMMAND test_iq4_nl_tensor)
+    set_tests_properties(IQ4_NLTensorTest PROPERTIES TIMEOUT 30)
+
+    # IQ4_NL microkernel correctness regression tests
+    add_executable(test_iq4_nl_microkernel tests/test_iq4_nl_microkernel.cpp)
+    target_link_libraries(test_iq4_nl_microkernel PRIVATE llaminar_core GTest::gtest GTest::gtest_main OpenMP::OpenMP_CXX)
+    add_test(NAME IQ4_NLMicrokernelTest COMMAND test_iq4_nl_microkernel)
+    set_tests_properties(IQ4_NLMicrokernelTest PROPERTIES TIMEOUT 60)
+
+    # IQ4_NL fused GEMM performance tests
+    add_executable(test_iq4_fused_gemm_performance tests/test_iq4_fused_gemm_performance.cpp)
+    target_link_libraries(test_iq4_fused_gemm_performance PRIVATE llaminar_core GTest::gtest GTest::gtest_main OpenMP::OpenMP_CXX)
+    add_test(NAME IQ4FusedGemmPerformance COMMAND test_iq4_fused_gemm_performance)
+    set_tests_properties(IQ4FusedGemmPerformance PROPERTIES TIMEOUT 120)
+
+    # IQ4_XSTensor tests
+    add_executable(test_iq4_xs_tensor tests/test_iq4_xs_tensor_simple.cpp)
+    target_link_libraries(test_iq4_xs_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME IQ4_XSTensorTest COMMAND test_iq4_xs_tensor)
+    set_tests_properties(IQ4_XSTensorTest PROPERTIES TIMEOUT 30)
+
+    # Q4_1Tensor tests
+    add_executable(test_q4_1_tensor tests/test_q4_1_tensor.cpp)
+    target_link_libraries(test_q4_1_tensor PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
+    add_test(NAME Q4_1TensorTest COMMAND test_q4_1_tensor)
+    set_tests_properties(Q4_1TensorTest PROPERTIES TIMEOUT 30)
+
     # Q8_0Tensor ModelLoader integration test
     add_executable(test_q8_0_modelloader tests/test_q8_0_modelloader.cpp)
     target_link_libraries(test_q8_0_modelloader PRIVATE llaminar_core GTest::gtest GTest::gtest_main)
@@ -1844,6 +1968,28 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     target_link_libraries(test_q8_0_selective_quantization PRIVATE llaminar_core GTest::gtest MPI::MPI_CXX)
     add_test(NAME Q8_0SelectiveQuantizationTest COMMAND mpirun -np 2 test_q8_0_selective_quantization)
     set_tests_properties(Q8_0SelectiveQuantizationTest PROPERTIES TIMEOUT 120)
+
+    # Q8_0 streaming decode focused validation tests (Week 2 Step 2)
+    add_executable(test_mpi_linear_q8_0 tests/test_mpi_linear_q8_0.cpp)
+    target_link_libraries(test_mpi_linear_q8_0 PRIVATE llaminar_core GTest::gtest MPI::MPI_CXX)
+    add_test(NAME MPILinearQ8_0Test COMMAND mpirun -np 2 test_mpi_linear_q8_0)
+    set_tests_properties(MPILinearQ8_0Test PROPERTIES TIMEOUT 180)
+
+    # MPILinearOperator_v2 integration tests with IQ4_NL quantized weights
+add_executable(test_mpilinearoperator_v2_integration tests/test_mpilinearoperator_v2_integration.cpp)
+target_link_libraries(test_mpilinearoperator_v2_integration PRIVATE llaminar_core GTest::gtest MPI::MPI_CXX)
+add_test(NAME MPILinearOperatorV2IntegrationTest COMMAND mpirun -np 2 test_mpilinearoperator_v2_integration)
+set_tests_properties(MPILinearOperatorV2IntegrationTest PROPERTIES TIMEOUT 120)
+
+# MPILinearOperator_v2 IQ4_NL Integration Test
+add_executable(test_mpilinearoperator_v2_iq4nl tests/test_mpilinearoperator_v2_iq4nl.cpp)
+target_link_libraries(test_mpilinearoperator_v2_iq4nl PRIVATE llaminar_core GTest::gtest MPI::MPI_CXX)
+add_test(NAME MPILinearOperatorV2IQ4NLTest COMMAND mpirun -np 2 test_mpilinearoperator_v2_iq4nl)
+set_tests_properties(MPILinearOperatorV2IQ4NLTest PROPERTIES TIMEOUT 180)
+
+# IQ4_NL GEMM Performance Benchmark
+add_executable(benchmark_iq4nl_gemm tests/benchmark_iq4nl_gemm.cpp)
+target_link_libraries(benchmark_iq4nl_gemm PRIVATE llaminar_core MPI::MPI_CXX)
 
     # Fused quant linear kernel prototype test
     add_executable(test_quant_linear_fused tests/test_quant_linear_fused.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -2079,8 +2225,31 @@ message(STATUS "COSMA BLAS backend: ${COSMA_BLAS}")
 message(STATUS "COSMA ScaLAPACK backend: ${COSMA_SCALAPACK}")
 message(STATUS "===============================")
 
-# Test dequantization verification tool (TODO: create test_dequant_verify.cpp)
-# add_executable(test_dequant_verify test_dequant_verify.cpp)
-# target_link_libraries(test_dequant_verify PRIVATE ggml)
-# target_include_directories(test_dequant_verify PRIVATE ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include)
+# ==============================================================================
+# IQ4 Dequantization Tests vs llama.cpp (Accuracy + Performance)
+# ==============================================================================
+
+if(GTEST_FOUND)
+    add_executable(test_iq4_vs_llamacpp tests/test_iq4_vs_llamacpp.cpp)
+    target_link_libraries(test_iq4_vs_llamacpp PRIVATE
+        llaminar_core
+        ggml
+        ${GTEST_LIBRARIES}
+        ${GTEST_MAIN_LIBRARY}
+        OpenMP::OpenMP_CXX
+    )
+    target_include_directories(test_iq4_vs_llamacpp PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
+        ${GTEST_INCLUDE_DIR}
+    )
+    add_test(NAME IQ4VsLlamaCpp COMMAND test_iq4_vs_llamacpp)
+    set_tests_properties(IQ4VsLlamaCpp PROPERTIES
+        LABELS "accuracy;performance;quantization;iq4"
+        TIMEOUT 180
+    )
+    
+    message(STATUS "IQ4 vs llama.cpp accuracy and performance tests enabled")
+endif()
 

@@ -139,7 +139,7 @@ For details, see:
 - ✅ Memory-constrained environments
 - ✅ Variable-length sequences with large variance
 
-**Benchmark script:**
+**Benchmark scripts:**
 ```bash
 # Compare batch vs sequential performance
 ./run_batch_performance.sh
@@ -148,6 +148,13 @@ For details, see:
 # - Throughput improvement (tokens/sec)
 # - Memory overhead
 # - Scaling with batch size
+
+# Run any benchmark with optimal MPI/OpenMP settings
+./run_benchmark.sh <benchmark_executable> [args...]
+
+# Examples:
+./run_benchmark.sh benchmark_iq4nl_gemm
+./run_benchmark.sh test_batch_performance --gtest_filter='*.Scaling'
 ```
 
 ### Key Architecture Components
@@ -341,8 +348,8 @@ Llaminar provides a dedicated `--benchmark` mode for clean performance measureme
 
 ```bash
 # 1. Use Release builds for accurate timing
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build_release --parallel
 
 # 2. Disable heavy instrumentation
 unset LLAMINAR_COSMA_VALIDATE_TILE
@@ -360,6 +367,10 @@ unset LLAMINAR_EMBED_TRACE
 # 5. Use phase-specific modes to isolate performance
 ./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128  # Decode-only
 ./run_llaminar.sh --benchmark -m model.gguf -n 0          # Prefill-only
+
+# 6. For component benchmarks, use the generic benchmark runner
+./run_benchmark.sh benchmark_iq4nl_gemm         # IQ4_NL GEMM performance
+./run_benchmark.sh test_batch_performance       # Batch scaling tests
 ```
 
 ### Performance Notes
@@ -399,6 +410,58 @@ Llaminar includes several specialized performance testing scripts:
 - **`run_batch_performance.sh`**: Compares batch and sequential execution performance
   - Validates throughput improvements from batching
   - Measures memory overhead and scaling characteristics
+
+### Generic Benchmark Runner
+
+For component-level performance benchmarking, use the **generic benchmark runner** which provides canonical MPI/OpenMP configuration for any benchmark executable:
+
+```bash
+# Run any benchmark with optimal settings (auto-detects in build_release/)
+./run_benchmark.sh benchmark_iq4nl_gemm
+
+# With full path
+./run_benchmark.sh ./build_release/test_performance
+
+# Pass arguments (GTest filters, etc)
+./run_benchmark.sh test_batch_performance --gtest_filter='*.ThroughputScaling'
+
+# Override MPI/OpenMP settings if needed
+LLAMINAR_MPI_PROCS=4 ./run_benchmark.sh my_benchmark
+OMP_NUM_THREADS=16 ./run_benchmark.sh my_benchmark
+```
+
+**Features:**
+- **Automatic path detection**: Searches `build_release/` and `build/` directories
+- **Topology auto-detection**: Detects sockets, cores, hyperthreading
+- **Canonical settings**: Same MPI/OpenMP configuration as `run_llaminar.sh`
+- **Argument forwarding**: Passes all extra arguments to the benchmark
+- **Environment overrides**: Customize via `LLAMINAR_MPI_PROCS`, `OMP_NUM_THREADS`
+
+**Convenience Wrappers:**
+```bash
+# Specialized wrapper for IQ4_NL GEMM benchmark
+./run_iq4nl_benchmark.sh  # Delegates to run_benchmark.sh
+
+# These are equivalent:
+./run_iq4nl_benchmark.sh
+./run_benchmark.sh benchmark_iq4nl_gemm
+```
+
+**Creating New Benchmarks:**
+```bash
+# 1. Create benchmark source (e.g., tests/benchmark_my_feature.cpp)
+# 2. Add to CMakeLists.txt
+add_executable(benchmark_my_feature tests/benchmark_my_feature.cpp)
+target_link_libraries(benchmark_my_feature llaminar_core)
+
+# 3. Build it
+cmake --build build_release --target benchmark_my_feature --parallel
+
+# 4. Run with optimal settings
+./run_benchmark.sh benchmark_my_feature
+```
+
+**See also:** `BENCHMARK_RUNNER_GUIDE.md` for comprehensive documentation including usage examples, configuration details, and troubleshooting.
 
 ### Canonical Environment Variables
 

@@ -39,6 +39,7 @@
 
 // Include typed tensor headers
 #include "tensors/Q8_0Tensor.h"
+#include "tensors/IQ4_NLTensor.h"
 
 // Include upstream gguf API for offset comparison diagnostics
 extern "C"
@@ -803,6 +804,24 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
                     catch (const std::exception &e)
                     {
                         LOG_ERROR("Failed to create Q8_0Tensor for '" << tensor_name << "': " << e.what());
+                        // Fall through to FP32 fallback
+                        typed_tensor = nullptr;
+                    }
+                    break;
+
+                case GGUFTensorType::IQ4_NL:
+                    // IQ4_NL: Use typed IQ4_NLTensor (4.5 bits/value, ~4.3× compression)
+                    try
+                    {
+                        typed_tensor = std::make_shared<llaminar::IQ4_NLTensor>(shape2d, raw);
+                        LOG_INFO("Loaded IQ4_NL tensor '" << tensor_name << "' shape=["
+                                                          << shape2d[0] << "x" << shape2d[1] << "] role="
+                                                          << llaminar::weightRoleToString(role) << " compressed_size="
+                                                          << raw.size() << " bytes");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("Failed to create IQ4_NLTensor for '" << tensor_name << "': " << e.what());
                         // Fall through to FP32 fallback
                         typed_tensor = nullptr;
                     }

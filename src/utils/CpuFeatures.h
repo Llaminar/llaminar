@@ -77,6 +77,18 @@ namespace llaminar
         bool has_amx_bf16() const { return amx_bf16_; }
 
         /**
+         * @brief Get L1 data cache size in bytes
+         *
+         * Detected via CPUID leaf 0x04 (Intel) or sysconf (fallback).
+         * Returns 32KB default if detection fails.
+         *
+         * Typical values:
+         *   - Intel Cascade Lake/Ice Lake: 32KB-48KB per core
+         *   - AMD Zen 3/4: 32KB per core
+         */
+        size_t l1_cache_size() const { return l1_cache_size_; }
+
+        /**
          * @brief Get human-readable CPU feature summary
          */
         std::string summary() const;
@@ -92,6 +104,7 @@ namespace llaminar
         bool f16c_ = false;
         bool avx512f_ = false;
         bool amx_bf16_ = false;
+        size_t l1_cache_size_ = 32768; // Default 32KB
     };
 
     /**

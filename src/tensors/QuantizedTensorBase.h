@@ -22,13 +22,25 @@ namespace llaminar
      */
     enum class QuantType : uint8_t
     {
+        Q2_K, ///< 2-bit K-quant (256 elements per block)
+        Q3_K, ///< 3-bit K-quant (256 elements per block)
         Q4_0, ///< 4-bit uniform quantization (32 elements per block)
+        Q4_1, ///< 4-bit quantization with scale + min (32 elements per block)
         Q4_K, ///< 4-bit K-quant (256 elements per block)
         Q5_0, ///< 5-bit uniform quantization (32 elements per block)
         Q5_K, ///< 5-bit K-quant (256 elements per block)
         Q6_K, ///< 6-bit K-quant (256 elements per block)
         Q8_0, ///< 8-bit uniform quantization (32 elements per block)
         Q8_K, ///< 8-bit K-quant (256 elements per block)
+        IQ1_S,   ///< 1.5625-bit importance quantization (256 elements per block)
+        IQ1_M,   ///< 1.75-bit importance quantization (256 elements per block)
+        IQ2_XXS, ///< 2.0625-bit importance quantization (256 elements per block)
+        IQ2_XS,  ///< 2.3125-bit importance quantization (256 elements per block)
+        IQ2_S,   ///< 2.5625-bit importance quantization (256 elements per block)
+        IQ3_XXS, ///< 3.0625-bit importance quantization (256 elements per block)
+        IQ3_S,   ///< 3.4375-bit importance quantization (256 elements per block)
+        IQ4_NL,  ///< 4.5-bit non-linear quantization (32 elements per block)
+        IQ4_XS,  ///< 4.25-bit extra small quantization (256 elements per block)
     };
 
     /**
@@ -232,8 +244,14 @@ namespace llaminar
         {
             switch (type)
             {
+            case QuantType::Q2_K:
+                return "Q2_K";
+            case QuantType::Q3_K:
+                return "Q3_K";
             case QuantType::Q4_0:
                 return "Q4_0";
+            case QuantType::Q4_1:
+                return "Q4_1";
             case QuantType::Q4_K:
                 return "Q4_K";
             case QuantType::Q5_0:
@@ -246,6 +264,12 @@ namespace llaminar
                 return "Q8_0";
             case QuantType::Q8_K:
                 return "Q8_K";
+            case QuantType::IQ2_XXS:
+                return "IQ2_XXS";
+            case QuantType::IQ2_XS:
+                return "IQ2_XS";
+            case QuantType::IQ2_S:
+                return "IQ2_S";
             default:
                 return "UNKNOWN";
             }

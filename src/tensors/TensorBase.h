@@ -9,6 +9,7 @@ namespace llaminar
 {
     // Forward declaration
     struct Tensor;
+    class ITensorGemm; // Forward declaration is fine here
 
     // Forward declarations for cache
     class QuantSlabCache;
@@ -101,7 +102,27 @@ namespace llaminar
         virtual std::shared_ptr<TensorBase> copy() const = 0;
         virtual void copy_from(const TensorBase &other) = 0;
 
-        // Shape utilities
+        /**
+         * @brief Factory method for tensor-specific GEMM implementation (raw pointer).
+         *
+         * Returns a raw pointer to a GEMM implementation, or nullptr if the tensor
+         * does not provide an optimized GEMM.
+         *
+         * The caller takes ownership of the returned pointer.
+         *
+         * @return ITensorGemm pointer (caller takes ownership), or nullptr if not supported
+         *
+         * @example
+         *   ITensorGemm* gemm_raw = weight_tensor->createGemmRaw();
+         *   if (gemm_raw) {
+         *       std::unique_ptr<ITensorGemm> gemm(gemm_raw);
+         *       gemm->multiply(A, C, m, n, k);
+         *   }
+         */
+        virtual ITensorGemm *createGemmRaw() const
+        {
+            return nullptr; // Default: no optimized GEMM
+        } // Shape utilities
         int total_elements() const
         {
             int total = 1;

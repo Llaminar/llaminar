@@ -71,7 +71,16 @@ namespace llaminar
 
         // === COMPREHENSIVE TENSOR VALIDATION ===
         ASSERT_TENSOR_VALID(input, "Linear input");
-        ASSERT_TENSOR_VALID(global_weight, "Linear weight");
+        // Skip data() validation for Q8_0 weights (use native_type check instead)
+        if (global_weight->native_type() != TensorDataType::QUANTIZED)
+        {
+            ASSERT_TENSOR_VALID(global_weight, "Linear weight");
+        }
+        else
+        {
+            // For quantized tensors, just check non-null
+            ASSERT_TENSOR_NOT_NULL(global_weight, "Linear weight (Q8_0)");
+        }
         ASSERT_TENSOR_VALID(global_output, "Linear output");
 
         // Check for NaN in inputs before computation (skip direct NaN scan for quantized weights: raw bytes not FP32)
@@ -83,7 +92,8 @@ namespace llaminar
         }
 
         // Log detailed tensor information
-        TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearOperator");
+        // COMMENTED OUT - May call data() on Q8_0
+        // TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearOperator");
 
         // Extract dimensions
         size_t seq_len = input->shape()[0];
@@ -109,41 +119,7 @@ namespace llaminar
         // Calculate local distribution
         auto [local_output_size, output_offset] = getRowDistribution(output_size);
 
-        // Check weight cache before distributing
-        // For Q8_0Tensor, use tensor pointer as key (data() not supported)
-        // For regular tensors, use data pointer as key
-        const float *weight_key = nullptr;
-        if (global_weight->native_type() != TensorDataType::QUANTIZED)
-        {
-            weight_key = global_weight->data();
-        }
-        else
-        {
-            // Use tensor pointer as key for quantized tensors
-            weight_key = reinterpret_cast<const float *>(global_weight.get());
-        }
-        std::shared_ptr<TensorBase> local_weight;
-
-        auto weight_cache_it = weight_cache_.find(weight_key);
-        if (weight_cache_it != weight_cache_.end())
-        {
-            // Cache hit: reuse previously distributed weight
-            PERF_TRACE_SCOPE_CAT("weight_cache_hit", "linear_kernel");
-            local_weight = weight_cache_it->second;
-        }
-        else
-        {
-            // Cache miss: distribute and cache the weight
-            PERF_TRACE_SCOPE_CAT("weight_cache_miss", "linear_kernel");
-            local_weight = createLocalTensor({static_cast<size_t>(local_output_size), input_size});
-            {
-                PERF_TRACE_SCOPE_CAT("distribute_weight", "linear_kernel");
-                distributeWeight(global_weight, local_weight, output_size);
-            }
-            weight_cache_[weight_key] = local_weight;
-        }
-
-        // Create local output tensor
+        // Create local output tensor (needed for all paths)
         auto local_output = createLocalTensor({seq_len, static_cast<size_t>(local_output_size)});
 
         // Handle optional bias with caching
@@ -172,11 +148,8 @@ namespace llaminar
             }
         }
 
-        // Ensure input is available on all processes (broadcast if needed)
-        // For simplicity, assuming input is already replicated across processes
-
         // === Q8_0 STREAMING DECODE PATH (Week 2) ===
-        // Check if weight is Q8_0Tensor and use streaming decode
+        // Check if weight is Q8_0Tensor FIRST - bypass weight distribution for streaming decode
         auto q8_weight = std::dynamic_pointer_cast<Q8_0Tensor>(global_weight);
         if (q8_weight)
         {
@@ -252,6 +225,41 @@ namespace llaminar
 
             LOG_DEBUG("MPILinear: Q8_0 path complete on rank " << getRank());
             return true;
+        }
+
+        // === NON-Q8_0 PATH: Distribute weights (regular FP32 or quantized slab) ===
+        // Check weight cache before distributing
+        // For Q8_0Tensor, use tensor pointer as key (data() not supported)
+        // For regular tensors, use data pointer as key
+        const float *weight_key = nullptr;
+        if (global_weight->native_type() != TensorDataType::QUANTIZED)
+        {
+            weight_key = global_weight->data();
+        }
+        else
+        {
+            // Use tensor pointer as key for quantized tensors
+            weight_key = reinterpret_cast<const float *>(global_weight.get());
+        }
+        std::shared_ptr<TensorBase> local_weight;
+
+        auto weight_cache_it = weight_cache_.find(weight_key);
+        if (weight_cache_it != weight_cache_.end())
+        {
+            // Cache hit: reuse previously distributed weight
+            PERF_TRACE_SCOPE_CAT("weight_cache_hit", "linear_kernel");
+            local_weight = weight_cache_it->second;
+        }
+        else
+        {
+            // Cache miss: distribute and cache the weight
+            PERF_TRACE_SCOPE_CAT("weight_cache_miss", "linear_kernel");
+            local_weight = createLocalTensor({static_cast<size_t>(local_output_size), input_size});
+            {
+                PERF_TRACE_SCOPE_CAT("distribute_weight", "linear_kernel");
+                distributeWeight(global_weight, local_weight, output_size);
+            }
+            weight_cache_[weight_key] = local_weight;
         }
 
         // Perform local computation using COSMA
@@ -345,7 +353,8 @@ namespace llaminar
             PERF_TRACE_SCOPE_CAT("linear_matmul", "linear_kernel");
             // Matrix multiplication: output = input @ weight^T
             // Weight is [local_out_dim, in_dim], so we transpose it during matmul
-            matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
+            // Use new TensorBase* overload for potential fused quantized GEMM
+            matmul_success = adaptiveMatMul(input_data, local_weight.get(), output_data,
                                             seq_len_int, d_out, d_model,
                                             /*is_prefill*/ false,
                                             /*distributed_partition*/ true,

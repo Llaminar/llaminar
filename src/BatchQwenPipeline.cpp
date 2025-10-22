@@ -756,29 +756,32 @@ namespace llaminar
         {
             LOG_DEBUG("[BatchQwenPipeline] runBatchedLayers: all " << n_layers << " layers complete");
 
-            // Print performance breakdown
-            double total_ms = total_attn_norm_ms + total_attention_ms + total_attn_residual_ms +
-                              total_ffn_norm_ms + total_gate_ms + total_up_ms +
-                              total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
-
-            std::cout << "\n[PERF_BREAKDOWN] Batch=" << B << " SeqLen=" << T << " Total=" << total_ms << "ms\n";
-            std::cout << "  Attn Norm:      " << std::setw(8) << std::fixed << std::setprecision(2) << total_attn_norm_ms << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * total_attn_norm_ms / total_ms) << "%)\n";
-            std::cout << "  Attention:      " << std::setw(8) << total_attention_ms << " ms (" << std::setw(5) << (100.0 * total_attention_ms / total_ms) << "%)\n";
-            std::cout << "  Attn Residual:  " << std::setw(8) << total_attn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_attn_residual_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Norm:       " << std::setw(8) << total_ffn_norm_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_norm_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Gate:       " << std::setw(8) << total_gate_ms << " ms (" << std::setw(5) << (100.0 * total_gate_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Up:         " << std::setw(8) << total_up_ms << " ms (" << std::setw(5) << (100.0 * total_up_ms / total_ms) << "%)\n";
-            std::cout << "  FFN SwiGLU:     " << std::setw(8) << total_swiglu_ms << " ms (" << std::setw(5) << (100.0 * total_swiglu_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Down:       " << std::setw(8) << total_down_ms << " ms (" << std::setw(5) << (100.0 * total_down_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Residual:   " << std::setw(8) << total_ffn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_residual_ms / total_ms) << "%)\n";
-            std::cout << std::flush;
-
-            // Print detailed attention breakdown
-            auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
-            if (attn_op)
+            if (debugEnv().performance.enable)
             {
-                attn_op->printPerformanceBreakdown();
-                attn_op->resetPerformanceCounters();
+                // Print performance breakdown
+                double total_ms = total_attn_norm_ms + total_attention_ms + total_attn_residual_ms +
+                                total_ffn_norm_ms + total_gate_ms + total_up_ms +
+                                total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
+
+                std::cout << "\n[PERF_BREAKDOWN] Batch=" << B << " SeqLen=" << T << " Total=" << total_ms << "ms\n";
+                std::cout << "  Attn Norm:      " << std::setw(8) << std::fixed << std::setprecision(2) << total_attn_norm_ms << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * total_attn_norm_ms / total_ms) << "%)\n";
+                std::cout << "  Attention:      " << std::setw(8) << total_attention_ms << " ms (" << std::setw(5) << (100.0 * total_attention_ms / total_ms) << "%)\n";
+                std::cout << "  Attn Residual:  " << std::setw(8) << total_attn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_attn_residual_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Norm:       " << std::setw(8) << total_ffn_norm_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_norm_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Gate:       " << std::setw(8) << total_gate_ms << " ms (" << std::setw(5) << (100.0 * total_gate_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Up:         " << std::setw(8) << total_up_ms << " ms (" << std::setw(5) << (100.0 * total_up_ms / total_ms) << "%)\n";
+                std::cout << "  FFN SwiGLU:     " << std::setw(8) << total_swiglu_ms << " ms (" << std::setw(5) << (100.0 * total_swiglu_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Down:       " << std::setw(8) << total_down_ms << " ms (" << std::setw(5) << (100.0 * total_down_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Residual:   " << std::setw(8) << total_ffn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_residual_ms / total_ms) << "%)\n";
+                std::cout << std::flush;
+
+                // Print detailed attention breakdown
+                auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
+                if (attn_op)
+                {
+                    attn_op->printPerformanceBreakdown();
+                    attn_op->resetPerformanceCounters();
+                }
             }
         }
 

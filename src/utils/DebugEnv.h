@@ -115,8 +115,10 @@ namespace llaminar
 
     struct DequantEnv
     {
-        bool stats = false;     // LLAMINAR_DEQUANT_STATS
-        bool anomalies = false; // LLAMINAR_DEQUANT_ANOMALIES
+        bool stats = false;            // LLAMINAR_DEQUANT_STATS
+        bool anomalies = false;        // LLAMINAR_DEQUANT_ANOMALIES
+        bool iq4_microkernel = false;  // LLAMINAR_IQ4_MICROKERNEL (enable experimental multi-block IQ4 decode path)
+        bool iq4_direct_decode = true; // LLAMINAR_IQ4_DIRECT_DECODE (use direct nibble expansion instead of helper buffer; can disable for A/B)
     };
 
     struct AdaptiveEnv

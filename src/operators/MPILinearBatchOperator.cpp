@@ -236,7 +236,8 @@ namespace llaminar
                 call_count++;
             }
 
-            matmul_success = adaptiveMatMul(input_data, weight_data, output_data,
+            // Use new TensorBase* overload for potential fused quantized GEMM
+            matmul_success = adaptiveMatMul(input_data, local_weight.get(), output_data,
                                             total_seq, d_out, d_model,
                                             /*is_prefill*/ false,
                                             /*distributed_partition*/ true,

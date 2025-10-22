@@ -3,6 +3,7 @@
 #include "TensorFactory.h" // For QuantBlockDescriptor
 #include "QuantizedTensorBase.h"
 #include "../utils/BFloat16.h"
+#include "../utils/SIMDHelpers.h"
 #include <cstring>
 #include <algorithm>
 
@@ -123,6 +124,7 @@ namespace llaminar
             // Decode entire tensor
             int rows = shape_[0];
             int cols = shape_[1];
+            #pragma omp parallel for if(rows > 4)
             for (int row = 0; row < rows; ++row)
             {
                 decodeRow(row, dst + row * cols);
@@ -134,9 +136,11 @@ namespace llaminar
             // Decode entire tensor to BF16
             int rows = shape_[0];
             int cols = shape_[1];
+            bfloat16 *bf16_dst = static_cast<bfloat16 *>(dst);
+            #pragma omp parallel for if(rows > 4)
             for (int row = 0; row < rows; ++row)
             {
-                decodeRowToBF16(row, static_cast<uint8_t *>(dst) + row * cols * sizeof(bfloat16));
+                decodeRowToBF16(row, bf16_dst + row * cols);
             }
         }
 
@@ -152,19 +156,134 @@ namespace llaminar
 
         // ===== Streaming Decode =====
 
-        void decodeRow(size_t row_idx, float *buffer) const override
+#ifdef __AVX512F__
+        // AVX-512 optimized decode (16 elements at a time)
+        void decodeRow_avx512(size_t row_idx, float *buffer) const
         {
             if (row_idx >= static_cast<size_t>(shape_[0]))
             {
-                throw std::out_of_range(
-                    "Q8_0Tensor::decodeRow: row_idx " + std::to_string(row_idx) +
-                    " out of bounds (rows=" + std::to_string(shape_[0]) + ")");
+                throw std::out_of_range("Q8_0Tensor: Row index out of bounds in decodeRow_avx512");
+            }
+            
+            int cols = shape_[1];
+            size_t element_offset = row_idx * cols;
+            int col = 0;
+
+            // Process complete blocks (32 elements = 2 AVX-512 vectors)
+            for (; col + 31 < cols; col += 32)
+            {
+                size_t elem_idx = element_offset + col;
+                size_t block_idx = elem_idx / BLOCK_SIZE;
+
+                // Check if entire 32-element span is within one block
+                if ((elem_idx % BLOCK_SIZE) == 0)
+                {
+                    const Q8_0Block *block = get_block(block_idx);
+                    float scale = simd::fp16_to_fp32(block->scale_bits);
+
+                    // Convert first 16 elements using SIMD helper
+                    simd::convert_i8_to_f32_scaled_avx512(block->values, scale, buffer + col);
+                    
+                    // Convert second 16 elements
+                    simd::convert_i8_to_f32_scaled_avx512(block->values + 16, scale, buffer + col + 16);
+                }
+                else
+                {
+                    // Span crosses block boundary - use scalar fallback
+                    for (int i = 0; i < 32; i++)
+                    {
+                        size_t idx = elem_idx + i;
+                        size_t blk_idx = idx / BLOCK_SIZE;
+                        size_t in_blk_idx = idx % BLOCK_SIZE;
+                        const Q8_0Block *block = get_block(blk_idx);
+                        float scale = fp16_to_fp32(block->scale_bits);
+                        buffer[col + i] = scale * static_cast<float>(block->values[in_blk_idx]);
+                    }
+                }
             }
 
+            // Handle remaining elements with scalar code
+            for (; col < cols; col++)
+            {
+                size_t elem_idx = element_offset + col;
+                size_t block_idx = elem_idx / BLOCK_SIZE;
+                size_t in_block_idx = elem_idx % BLOCK_SIZE;
+                const Q8_0Block *block = get_block(block_idx);
+                float scale = fp16_to_fp32(block->scale_bits);
+                buffer[col] = scale * static_cast<float>(block->values[in_block_idx]);
+            }
+        }
+#endif
+
+#ifdef __AVX2__
+        // AVX2 optimized decode (8 elements at a time)
+        void decodeRow_avx2(size_t row_idx, float *buffer) const
+        {
+            if (row_idx >= static_cast<size_t>(shape_[0]))
+            {
+                throw std::out_of_range("Q8_0Tensor: Row index out of bounds in decodeRow_avx2");
+            }
+            
+            int cols = shape_[1];
+            size_t element_offset = row_idx * cols;
+            int col = 0;
+
+            // Process 8 elements at a time
+            for (; col + 7 < cols; col += 8)
+            {
+                size_t elem_idx = element_offset + col;
+                size_t block_idx = elem_idx / BLOCK_SIZE;
+                size_t in_block_idx = elem_idx % BLOCK_SIZE;
+
+                // Check if 8 elements are within same block
+                if ((elem_idx + 7) / BLOCK_SIZE == block_idx)
+                {
+                    const Q8_0Block *block = get_block(block_idx);
+                    float scale = simd::fp16_to_fp32(block->scale_bits);
+
+                    // Convert 8 elements using SIMD helper
+                    simd::convert_i8_to_f32_scaled_avx2(block->values + in_block_idx, scale, buffer + col);
+                }
+                else
+                {
+                    // Span crosses block boundary - use scalar fallback
+                    for (int i = 0; i < 8; i++)
+                    {
+                        size_t idx = elem_idx + i;
+                        size_t blk_idx = idx / BLOCK_SIZE;
+                        size_t in_blk_idx = idx % BLOCK_SIZE;
+                        const Q8_0Block *block = get_block(blk_idx);
+                        float scale = fp16_to_fp32(block->scale_bits);
+                        buffer[col + i] = scale * static_cast<float>(block->values[in_blk_idx]);
+                    }
+                }
+            }
+
+            // Handle remaining elements
+            for (; col < cols; col++)
+            {
+                size_t elem_idx = element_offset + col;
+                size_t block_idx = elem_idx / BLOCK_SIZE;
+                size_t in_block_idx = elem_idx % BLOCK_SIZE;
+                const Q8_0Block *block = get_block(block_idx);
+                float scale = simd::fp16_to_fp32(block->scale_bits);
+                buffer[col] = scale * static_cast<float>(block->values[in_block_idx]);
+            }
+        }
+#endif
+
+        // Scalar fallback (always available)
+        void decodeRow_scalar(size_t row_idx, float *buffer) const
+        {
+            if (row_idx >= static_cast<size_t>(shape_[0]))
+            {
+                throw std::out_of_range("Q8_0Tensor: Row index out of bounds in decodeRow_scalar");
+            }
+            
             int cols = shape_[1];
             size_t element_offset = row_idx * cols;
 
-            // Decode blocks covering this row
+#pragma omp simd
             for (int col = 0; col < cols; col++)
             {
                 size_t elem_idx = element_offset + col;
@@ -172,11 +291,29 @@ namespace llaminar
                 size_t in_block_idx = elem_idx % BLOCK_SIZE;
 
                 const Q8_0Block *block = get_block(block_idx);
-
-                // Q8_0 decode: scale * quantized_value
                 float scale = fp16_to_fp32(block->scale_bits);
                 buffer[col] = scale * static_cast<float>(block->values[in_block_idx]);
             }
+        }
+
+        void decodeRow(size_t row, float *output) const override
+        {
+            size_t cols = shape_[1];
+#ifdef __AVX512F__
+            if (simd::cpu_supports_avx512() && cols >= 32)
+            {
+                decodeRow_avx512(row, output);
+                return;
+            }
+#endif
+#ifdef __AVX2__
+            if (simd::cpu_supports_avx2() && cols >= 8)
+            {
+                decodeRow_avx2(row, output);
+                return;
+            }
+#endif
+            decodeRow_scalar(row, output);
         }
 
         void decodeRowToBF16(size_t row_idx, void *buffer) const override
@@ -191,6 +328,7 @@ namespace llaminar
             int cols = shape_[1];
             size_t element_offset = row_idx * cols;
 
+            #pragma omp simd
             for (int col = 0; col < cols; col++)
             {
                 size_t elem_idx = element_offset + col;
@@ -211,6 +349,7 @@ namespace llaminar
                 throw std::out_of_range("Q8_0Tensor::decodeSpan: span out of bounds");
             }
 
+            #pragma omp simd
             for (size_t i = 0; i < count; i++)
             {
                 size_t elem_idx = offset + i;
@@ -241,6 +380,38 @@ namespace llaminar
 
     private:
         static constexpr int BLOCK_SIZE = 32; // Q8_0 has 32 elements per block
+
+        // Runtime CPU feature detection (cached)
+        static bool cpu_supports_avx512()
+        {
+            static int result = -1;
+            if (result == -1)
+            {
+#ifdef __AVX512F__
+                result = __builtin_cpu_supports("avx512f") &&
+                                 __builtin_cpu_supports("avx512bw")
+                             ? 1
+                             : 0;
+#else
+                result = 0;
+#endif
+            }
+            return result == 1;
+        }
+
+        static bool cpu_supports_avx2()
+        {
+            static int result = -1;
+            if (result == -1)
+            {
+#ifdef __AVX2__
+                result = __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+                result = 0;
+#endif
+            }
+            return result == 1;
+        }
 
         /**
          * @brief Q8_0 block structure (34 bytes)

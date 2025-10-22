@@ -6,6 +6,10 @@
 #include <intrin.h>
 #endif
 
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
 namespace llaminar
 {
 
@@ -94,6 +98,51 @@ namespace llaminar
         {
             LOG_WARN("CPU has AVX512 but not AVX512_BF16 - BF16 GEMM will use slower emulation or FP32 fallback");
         }
+
+        // Detect L1 data cache size
+        l1_cache_size_ = 32768; // Default 32KB
+
+#if defined(__x86_64__) || defined(__i386__)
+        // Try Intel-style cache detection (CPUID leaf 0x04)
+        if (max_level >= 4)
+        {
+            for (unsigned int i = 0; i < 32; ++i) // Max 32 cache levels
+            {
+                cpuid_impl(4, i, &eax, &ebx, &ecx, &edx);
+                unsigned int cache_type = eax & 0x1F;
+                if (cache_type == 0)
+                    break; // No more caches
+
+                // Cache type: 1=Data, 2=Instruction, 3=Unified
+                unsigned int cache_level = (eax >> 5) & 0x7;
+                if ((cache_type == 1 || cache_type == 3) && cache_level == 1)
+                {
+                    // L1 data or unified cache found
+                    // Size = (Ways + 1) × (Partitions + 1) × (LineSize + 1) × (Sets + 1)
+                    unsigned int ways = ((ebx >> 22) & 0x3FF) + 1;
+                    unsigned int partitions = ((ebx >> 12) & 0x3FF) + 1;
+                    unsigned int line_size = (ebx & 0xFFF) + 1;
+                    unsigned int sets = ecx + 1;
+                    l1_cache_size_ = ways * partitions * line_size * sets;
+                    break;
+                }
+            }
+        }
+
+        // Fallback: Try sysconf on Linux
+#ifdef _SC_LEVEL1_DCACHE_SIZE
+        if (l1_cache_size_ == 32768)
+        {
+            long cache_size = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+            if (cache_size > 0)
+            {
+                l1_cache_size_ = static_cast<size_t>(cache_size);
+            }
+        }
+#endif
+#endif
+
+        LOG_INFO("L1 data cache size: " << (l1_cache_size_ / 1024) << " KB");
     }
 
     std::string CpuFeatures::summary() const

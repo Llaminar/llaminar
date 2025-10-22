@@ -15,6 +15,17 @@ STABLE_MODELS=(
   "qwen2.5-0.5b-instruct-q4_k_m.gguf"
 )
 
+# Large 7B models for IQ format testing (downloaded separately with specific URLs)
+# These require LLAMINAR_FETCH_7B_IQ_MODELS=1 to enable due to size (~1-3GB each)
+LARGE_7B_IQ_MODELS=(
+  "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ3_M.gguf"
+  "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ3_XS.gguf"
+  "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ3_S.gguf"
+  "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ4_NL.gguf"
+  "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ4_XS.gguf"
+  "https://huggingface.co/unsloth/Qwen2.5-Omni-7B-GGUF/resolve/main/Qwen2.5-Omni-7B-BF16.gguf"
+)
+
 # Experimental / legacy variants that produced 404s during CI runs.
 # Enable by setting LLAMINAR_FETCH_EXPERIMENTAL=1 to probe for them.
 EXPERIMENTAL_MODELS=(
@@ -118,6 +129,42 @@ if [[ -n "${LLAMINAR_FETCH_FP32:-}" ]]; then
       have_any=1
     else
       echo "[fetch_test_models][ERROR] Failed to download FP32 $fname" >&2
+      rm -f "$MODEL_DIR/$fname.part"
+      missing+=("$fname")
+    fi
+  done
+fi
+
+# Optional large 7B IQ models for comprehensive IQ format testing.
+# Gated to avoid CI timeouts / large bandwidth by default (1-3GB each).
+if [[ -n "${LLAMINAR_FETCH_7B_IQ_MODELS:-}" ]]; then
+  echo "[fetch_test_models] LLAMINAR_FETCH_7B_IQ_MODELS set – attempting 7B IQ model fetch" >&2
+  for url in "${LARGE_7B_IQ_MODELS[@]}"; do
+    fname=$(basename "$url")
+    if [[ -s "$MODEL_DIR/$fname" ]]; then
+      echo "[fetch_test_models] Found existing 7B IQ model $fname (skip)"
+      skipped_existing+=("$fname")
+      continue
+    fi
+    if [[ -n "${LLAMINAR_SKIP_MODEL_DOWNLOAD:-}" ]]; then
+      echo "[fetch_test_models] Skipping 7B IQ download for $fname due to LLAMINAR_SKIP_MODEL_DOWNLOAD"
+      continue
+    fi
+    attempted+=("$fname")
+    if ! preflight_check "$url"; then
+      echo "[fetch_test_models][WARN] 7B IQ preflight failed (404?) $fname" >&2
+      missing+=("$fname")
+      continue
+    fi
+    echo "[fetch_test_models] Downloading 7B IQ model $fname from $url (this may take several minutes)" >&2
+    if curl -L --fail --retry 3 --retry-delay 3 -o "$MODEL_DIR/$fname.part" "$url" 2>&1; then
+      mv "$MODEL_DIR/$fname.part" "$MODEL_DIR/$fname"
+      size=$(du -h "$MODEL_DIR/$fname" | cut -f1)
+      echo "[fetch_test_models] Downloaded 7B IQ model $fname ($size)" >&2
+      downloaded+=("$fname:$size")
+      have_any=1
+    else
+      echo "[fetch_test_models][ERROR] Failed to download 7B IQ model $fname" >&2
       rm -f "$MODEL_DIR/$fname.part"
       missing+=("$fname")
     fi
