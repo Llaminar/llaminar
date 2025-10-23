@@ -183,6 +183,18 @@ add_v2_test(V2_Unit_IQ4_NLTensor
     LABELS "V2;Unit;IQ4_NL;GEMM"
 )
 
+# Test: PipelineFactory
+add_executable(v2_test_pipeline_factory unit/pipelines/Test__PipelineFactory.cpp)
+target_link_libraries(v2_test_pipeline_factory 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PipelineFactory 
+    COMMAND v2_test_pipeline_factory
+    LABELS "V2;Unit;Pipeline;Factory"
+)
+
 # Placeholder for additional unit test executables (to be added)
 # Example:
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)

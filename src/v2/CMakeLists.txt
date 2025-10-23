@@ -12,6 +12,7 @@ add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
     loaders/ModelLoader.cpp
     pipelines/PipelineBase.cpp
+    pipelines/PipelineFactory.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp

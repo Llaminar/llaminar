@@ -25,6 +25,14 @@ namespace llaminar2
 {
 
     /**
+     * @brief Ensure Qwen2 pipeline is registered with factory
+     * 
+     * This function can be called to force registration if needed.
+     * Registration also happens automatically via static constructor.
+     */
+    void ensureQwen2Registration();
+
+    /**
      * @brief Qwen 2.x transformer pipeline
      *
      * Architecture-specific implementation for Qwen 2.0/2.5 models.

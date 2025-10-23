@@ -12,6 +12,7 @@
  */
 
 #include "Qwen2Pipeline.h"
+#include "../PipelineFactory.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
 #include <iostream>
@@ -22,6 +23,47 @@
 
 namespace llaminar2
 {
+
+    // =============================================================================
+    // Factory Registration
+    // =============================================================================
+
+    /**
+     * @brief Creator function for Qwen2Pipeline
+     */
+    static std::unique_ptr<PipelineBase> createQwen2(
+        const std::string &model_path,
+        std::shared_ptr<MPIContext> mpi_ctx,
+        int device_idx)
+    {
+        return std::make_unique<Qwen2Pipeline>(model_path, mpi_ctx, device_idx);
+    }
+
+    /**
+     * @brief Register Qwen2Pipeline with factory
+     * 
+     * Made public so tests can force registration if needed
+     */
+    void ensureQwen2Registration()
+    {
+        static bool registered = false;
+        if (!registered) {
+            PipelineFactory::instance().registerCreator("qwen2", &createQwen2);
+            registered = true;
+        }
+    }
+
+    /**
+     * @brief Automatic registration at startup
+     */
+    __attribute__((constructor)) static void initQwen2()
+    {
+        ensureQwen2Registration();
+    }
+
+    // =============================================================================
+    // Pipeline Implementation
+    // =============================================================================
 
     Qwen2Pipeline::Qwen2Pipeline(const std::string &model_path,
                                  std::shared_ptr<MPIContext> mpi_ctx,
