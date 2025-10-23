@@ -13,6 +13,7 @@
 
 #include "Qwen2Pipeline.h"
 #include "../../loaders/ModelLoader.h"
+#include "../../tensors/TensorFactory.h"
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -58,8 +59,18 @@ namespace llaminar2
     {
         std::cout << "[Qwen2Pipeline] Loading weights from: " << model_path << "\n";
 
+        // Create TensorFactory for NUMA-aware allocation (if MPI context available)
+        std::unique_ptr<TensorFactory> factory;
+        if (mpi_ctx_) {
+            factory = std::make_unique<TensorFactory>(*mpi_ctx_);
+            std::cout << "[Qwen2Pipeline] Using TensorFactory with NUMA node " 
+                      << factory->getNumaNode() << " for rank " << mpi_ctx_->rank() << "\n";
+        } else {
+            std::cout << "[Qwen2Pipeline] No MPI context, using default tensor allocation\n";
+        }
+
         // Load GGUF model file
-        ModelLoader loader;
+        ModelLoader loader(factory.get());
         if (!loader.loadModel(model_path))
         {
             std::cerr << "[Qwen2Pipeline] Failed to load GGUF model: " << model_path << std::endl;

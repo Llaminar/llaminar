@@ -6,6 +6,7 @@
 
 #include "ModelLoader.h"
 #include "../tensors/Tensors.h"
+#include "../tensors/TensorFactory.h"
 #include <cstring>
 #include <iostream>
 
@@ -95,6 +96,8 @@ namespace llaminar2
         case GGUFTensorType::F32:
             return 4;
         case GGUFTensorType::F16:
+            return 2;
+        case GGUFTensorType::BF16:
             return 2;
         case GGUFTensorType::Q4_0:
             return 18;
@@ -205,7 +208,8 @@ namespace llaminar2
     // GGUF LOADER
     // =============================================================================
 
-    ModelLoader::ModelLoader() : loaded_(false) {}
+    ModelLoader::ModelLoader(TensorFactory* factory)
+        : factory_(factory), loaded_(false) {}
 
     bool ModelLoader::loadModel(const std::string &file_path)
     {
@@ -326,80 +330,159 @@ namespace llaminar2
         {
         case GGUFTensorType::F32:
             // FP32: Copy raw bytes as float array
-            tensor = std::make_shared<FP32Tensor>(shape);
-            std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+            if (factory_) {
+                auto fp32_tensor = factory_->createFP32(shape);
+                std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                tensor = std::move(fp32_tensor);
+            } else {
+                tensor = std::make_shared<FP32Tensor>(shape);
+                std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+            }
             break;
 
         case GGUFTensorType::F16:
-            // TODO: Implement FP16Tensor (convert to FP32 for now)
-            std::cerr << "[ModelLoader] F16 not yet implemented for tensor: " << tensor_name << std::endl;
-            return nullptr;
+            // FP16: Raw data is already in FP16 format (uint16_t)
+            if (factory_) {
+                // Convert raw bytes to uint16_t vector
+                std::vector<uint16_t> fp16_data(raw.size() / 2);
+                std::memcpy(fp16_data.data(), raw.data(), raw.size());
+                tensor = factory_->createFP16(shape, fp16_data);
+            } else {
+                std::vector<uint16_t> fp16_data(raw.size() / 2);
+                std::memcpy(fp16_data.data(), raw.data(), raw.size());
+                tensor = std::make_shared<FP16Tensor>(shape, fp16_data);
+            }
+            break;
 
         // IQ formats (4-bit, 2-bit, 3-bit, 1-bit non-linear quantization)
         case GGUFTensorType::IQ4_NL:
-            tensor = std::make_shared<IQ4_NLTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ4_NL, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ4_NLTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ4_XS:
-            tensor = std::make_shared<IQ4_XSTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ4_XS, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ4_XSTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ2_XXS:
-            tensor = std::make_shared<IQ2_XXSTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ2_XXS, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ2_XXSTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ2_XS:
-            tensor = std::make_shared<IQ2_XSTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ2_XS, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ2_XSTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ3_XXS:
-            tensor = std::make_shared<IQ3_XXSTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ3_XXS, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ3_XXSTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ2_S:
-            tensor = std::make_shared<IQ2_STensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ2_S, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ2_STensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ3_S:
-            tensor = std::make_shared<IQ3_STensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ3_S, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ3_STensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ1_S:
-            tensor = std::make_shared<IQ1_STensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ1_S, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ1_STensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::IQ1_M:
-            tensor = std::make_shared<IQ1_MTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::IQ1_M, shape, raw);
+            } else {
+                tensor = std::make_shared<IQ1_MTensor>(shape, raw);
+            }
             break;
 
         // Simple quantization formats (8-bit, 4-bit)
         case GGUFTensorType::Q8_0:
-            tensor = std::make_shared<Q8_0Tensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q8_0, shape, raw);
+            } else {
+                tensor = std::make_shared<Q8_0Tensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::Q4_0:
-            tensor = std::make_shared<Q4_0Tensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q4_0, shape, raw);
+            } else {
+                tensor = std::make_shared<Q4_0Tensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::Q4_1:
-            tensor = std::make_shared<Q4_1Tensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q4_1, shape, raw);
+            } else {
+                tensor = std::make_shared<Q4_1Tensor>(shape, raw);
+            }
             break;
 
         // K-quant formats (6-bit, 5-bit, 3-bit, 2-bit with hierarchical scales)
         case GGUFTensorType::Q6_K:
-            tensor = std::make_shared<Q6_KTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q6_K, shape, raw);
+            } else {
+                tensor = std::make_shared<Q6_KTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::Q5_K:
-            tensor = std::make_shared<Q5_KTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q5_K, shape, raw);
+            } else {
+                tensor = std::make_shared<Q5_KTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::Q3_K:
-            tensor = std::make_shared<Q3_KTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q3_K, shape, raw);
+            } else {
+                tensor = std::make_shared<Q3_KTensor>(shape, raw);
+            }
             break;
 
         case GGUFTensorType::Q2_K:
-            tensor = std::make_shared<Q2_KTensor>(shape, raw);
+            if (factory_) {
+                tensor = factory_->createQuantized(TensorType::Q2_K, shape, raw);
+            } else {
+                tensor = std::make_shared<Q2_KTensor>(shape, raw);
+            }
             break;
 
         default:
@@ -707,6 +790,10 @@ namespace llaminar2
                 tensor.size_bytes = n_elems * 4;
             }
             else if (tensor.type == GGUFTensorType::F16)
+            {
+                tensor.size_bytes = n_elems * 2;
+            }
+            else if (tensor.type == GGUFTensorType::BF16)
             {
                 tensor.size_bytes = n_elems * 2;
             }

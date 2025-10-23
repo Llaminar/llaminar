@@ -35,6 +35,7 @@ namespace llaminar2 {
 
 // Forward declarations
 class TensorBase;
+class TensorFactory;
 
 // =============================================================================
 // GGUF TYPE DEFINITIONS
@@ -78,6 +79,7 @@ enum class GGUFTensorType : uint32_t {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
+    BF16 = 30,
     Q4_1 = 3,
     Q5_0 = 6,
     Q5_1 = 7,
@@ -175,7 +177,11 @@ struct GGUFModel {
  */
 class ModelLoader {
 public:
-    ModelLoader();
+    /**
+     * @brief Construct ModelLoader with optional TensorFactory
+     * @param factory TensorFactory for NUMA-aware tensor creation (optional)
+     */
+    explicit ModelLoader(TensorFactory* factory = nullptr);
     ~ModelLoader() = default;
 
     /**
@@ -207,6 +213,9 @@ public:
     std::shared_ptr<TensorBase> loadTensor(const std::string& tensor_name, int device_idx = 0);
 
 private:
+    // Tensor factory (optional, for NUMA-aware allocation)
+    TensorFactory* factory_;
+
     // Parsing helpers
     bool parseHeader();
     bool parseMetadata();
