@@ -473,6 +473,70 @@ TEST_F(Test__IQ4_NLTensor, GEMM_NumericalStability)
     }
 }
 
+/**
+ * @brief Test decode_to_bf16 method
+ * 
+ * Verifies that decoding to BF16 produces reasonable results and can be
+ * converted back to FP32 without major precision loss.
+ */
+TEST_F(Test__IQ4_NLTensor, DecodeToBF16)
+{
+    // Create a small IQ4_NL tensor (2×64 = 128 elements = 4 blocks)
+    std::vector<size_t> shape = {2, 64};
+    size_t blocks_per_row = 2;  // 64 / 32 = 2 blocks per row
+    size_t total_blocks = 2 * 2; // 2 rows × 2 blocks
+    std::vector<uint8_t> raw_data(total_blocks * 18); // 18 bytes per IQ4_NL block
+
+    // Initialize blocks with test data
+    IQ4_NLBlock *blocks = reinterpret_cast<IQ4_NLBlock *>(raw_data.data());
+    for (size_t i = 0; i < total_blocks; ++i)
+    {
+        blocks[i].d = fp32_to_fp16(1.0f); // Scale = 1.0
+        for (int j = 0; j < 16; ++j)
+        {
+            blocks[i].qs[j] = (i * 16 + j) % 256; // Varying indices
+        }
+    }
+
+    auto tensor = std::make_unique<IQ4_NLTensor>(shape, raw_data);
+
+    // Decode to FP32 (ground truth)
+    std::vector<float> decoded_fp32(2 * 64);
+    tensor->decode_to_fp32(decoded_fp32.data());
+
+    // Decode to BF16
+    std::vector<uint16_t> decoded_bf16(2 * 64);
+    tensor->decode_to_bf16(decoded_bf16.data());
+
+    // Convert BF16 back to FP32 for comparison
+    std::vector<float> bf16_as_fp32(2 * 64);
+    for (size_t i = 0; i < 2 * 64; ++i)
+    {
+        // BF16->FP32: left shift by 16 bits
+        uint32_t fp32_bits = static_cast<uint32_t>(decoded_bf16[i]) << 16;
+        std::memcpy(&bf16_as_fp32[i], &fp32_bits, sizeof(float));
+    }
+
+    // Compare: BF16 should be close to FP32 (within BF16 precision)
+    // BF16 has 7 mantissa bits vs FP32's 23, so expect ~3 decimal digits of precision
+    float max_rel_error = 0.0f;
+    for (size_t i = 0; i < 2 * 64; ++i)
+    {
+        float fp32_val = decoded_fp32[i];
+        float bf16_val = bf16_as_fp32[i];
+
+        if (std::abs(fp32_val) > 1e-6f)
+        {
+            float rel_error = std::abs(fp32_val - bf16_val) / std::abs(fp32_val);
+            max_rel_error = std::max(max_rel_error, rel_error);
+        }
+    }
+
+    // BF16 should preserve ~3 decimal digits (2^-7 ≈ 0.008 = 0.8% worst case)
+    // Use 1% as tolerance to account for quantization + BF16 truncation
+    EXPECT_LT(max_rel_error, 0.01f) << "BF16 precision loss too high: " << max_rel_error;
+}
+
 // =============================================================================
 // MAIN
 // =============================================================================

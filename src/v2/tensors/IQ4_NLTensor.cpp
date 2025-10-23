@@ -175,6 +175,43 @@ namespace llaminar2
         }
     }
 
+    void IQ4_NLTensor::decode_to_bf16(uint16_t *dst) const
+    {
+        const size_t rows = shape_[0];
+        const size_t cols = shape_[1];
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const size_t blocks_per_row = (cols + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+
+        // Decode to FP32 first, then convert to BF16
+        // This is efficient since FP32->BF16 is just a truncation with rounding
+#pragma omp parallel for schedule(static) if (rows > 4)
+        for (size_t row = 0; row < rows; ++row)
+        {
+            const size_t row_block_base = row * blocks_per_row;
+            uint16_t *row_out = dst + row * cols;
+
+            // Decode blocks for this row
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const size_t global_block_index = row_block_base + b;
+                size_t block_start_col = b * IQ4_NLBlock::BLOCK_SIZE;
+                size_t elements_in_block = std::min(
+                    IQ4_NLBlock::BLOCK_SIZE,
+                    cols - block_start_col);
+
+                // Decode block to FP32 temporary buffer
+                float temp_fp32[IQ4_NLBlock::BLOCK_SIZE];
+                decodeBlock(blocks[global_block_index], temp_fp32);
+
+                // Convert FP32 to BF16
+                for (size_t i = 0; i < elements_in_block; ++i)
+                {
+                    row_out[block_start_col + i] = simd::fp32_to_bf16(temp_fp32[i]);
+                }
+            }
+        }
+    }
+
     void IQ4_NLTensor::decodeRow(size_t row_idx, float *buffer) const
     {
         // Use per-row block layout: each row has blocks_per_row contiguous blocks

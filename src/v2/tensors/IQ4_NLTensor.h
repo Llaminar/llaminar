@@ -230,8 +230,7 @@ namespace llaminar2
             }
         }
 
-        // decode_to_bf16() - Commented out (bfloat16 type not yet defined in v2)
-        // Will be re-enabled when BF16 support is added to v2
+        // decode_to_bf16() - Implementation in IQ4_NLTensor.cpp
 
         // copy() - Commented out (TensorBase interface not used in v2)
         // IQ4_NLTensor is value-semantic, use copy constructor if needed

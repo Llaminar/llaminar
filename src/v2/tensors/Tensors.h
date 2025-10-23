@@ -456,6 +456,7 @@ namespace llaminar2
 
         // Decode API
         void decode_to_fp32(float *dst) const;
+        void decode_to_bf16(uint16_t *dst) const;
         void decodeRow(size_t row_idx, float *buffer) const;
         void decodeSpan(size_t offset, size_t count, float *buffer) const;
 
