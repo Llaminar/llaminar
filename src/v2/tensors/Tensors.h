@@ -108,6 +108,27 @@ namespace llaminar2
     };
     static_assert(sizeof(Q3_KBlock) == 110, "Q3_KBlock must be 110 bytes");
 
+    /** @brief Q4_K block: 4-bit K-quant (256 elements per super-block, 144 bytes) */
+    struct Q4_KBlock
+    {
+        uint16_t d;         ///< FP16 super-block scale
+        uint16_t dmin;      ///< FP16 super-block min scale
+        uint8_t scales[12]; ///< 12 6-bit scales packed
+        uint8_t qs[128];    ///< Lower 4 bits of 4-bit values
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(Q4_KBlock) == 144, "Q4_KBlock must be 144 bytes");
+
+    /** @brief Q8_K block: 8-bit K-quant (256 elements per super-block, 288 bytes) */
+    /** @brief Q8_K block: 8-bit K-quant super-block (256 elements, 288 bytes) */
+    struct Q8_KBlock
+    {
+        int8_t qs[256];    ///< 8-bit quantized values
+        int16_t bsums[16]; ///< Block sums for fast dot products
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(Q8_KBlock) == 288, "Q8_KBlock must be 288 bytes");
+
     /** @brief IQ4_XS block: 4-bit extra-small IQ (32 elements per block, 18 bytes) */
     struct IQ4_XSBlock
     {
@@ -204,6 +225,8 @@ namespace llaminar2
         Q2_K,    // 2-bit K-quant
         Q5_K,    // 5-bit K-quant
         Q3_K,    // 3-bit K-quant
+        Q4_K,    // 4-bit K-quant
+        Q8_K,    // 8-bit K-quant
         IQ2_XXS, // 2-bit extra-extra-small IQ
         IQ2_XS,  // 2-bit extra-small IQ
         IQ3_XXS, // 3-bit extra-extra-small IQ
@@ -784,6 +807,86 @@ namespace llaminar2
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         static void decodeBlock(const Q3_KBlock &block, float *output);
+    };
+
+    /**
+     * @brief Q4_K tensor (4-bit K-quant super-block)
+     */
+    class Q4_KTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q4_KTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q4_K; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q4_KBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q4_KBlock &block, float *output);
+    };
+
+    /**
+     * @brief Q8_K tensor (8-bit K-quant super-block)
+     */
+    class Q8_KTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q8_KTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q8_K; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q8_KBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q8_KBlock &block, float *output);
     };
 
     // ===== IQ Tensors =====

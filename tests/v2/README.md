@@ -2,6 +2,30 @@
 
 This directory contains the test suite for Llaminar V2 architecture.
 
+## Test File Naming Conventions
+
+**IMPORTANT**: V2 tests follow a specific naming convention:
+
+- **Format**: `Test__ClassName.cpp` where `ClassName` is the **class under test**
+- **Test Suite**: Must match the filename: `TEST(Test__ClassName, TestName)`
+- **Examples**:
+  - Testing `ModelLoader` class:
+    - File: `Test__ModelLoader.cpp`
+    - Suite: `TEST(Test__ModelLoader, LoadsGGUFHeader) { ... }`
+  - Testing `Qwen2Pipeline` class:
+    - File: `Test__Qwen2Pipeline.cpp`
+    - Suite: `TEST(Test__Qwen2Pipeline, InitializesLayers) { ... }`
+  - Testing `FP32Tensor` class:
+    - File: `Test__FP32Tensor.cpp`
+    - Suite: `TEST(Test__FP32Tensor, FP32Creation) { ... }`
+
+**Why This Convention?**
+- **Clear association**: Test file name directly indicates which class is being tested
+- **Easy navigation**: Search for `Test__ClassName` to find tests for any class
+- **Consistent naming**: Test suite matches file name (both use `Test__ClassName`)
+- **Matches V2 style**: CamelCase aligns with V2's naming conventions
+- **Distinguishes from V1**: V1 tests use snake_case (e.g., `test_batch_correctness.cpp`)
+
 ## Test Organization
 
 Tests are organized into four categories:
@@ -11,7 +35,7 @@ Tests are organized into four categories:
 - **Scope**: Tensors, kernels, utilities
 - **Requirements**: No model loading, no MPI (or single-rank MPI only)
 - **Runtime**: < 1 second per test
-- **Example**: `test_tensor_basics.cpp`
+- **Example**: `Test__FP32Tensor.cpp`
 
 ### 2. **Integration Tests** (`integration/`)
 - **Purpose**: Medium-complexity tests involving multiple components
@@ -194,17 +218,17 @@ This configuration ensures:
 Place your test in the appropriate subdirectory:
 
 ```bash
-# Unit test
-tests/v2/unit/test_my_feature.cpp
+# Unit test (use CamelCase: Test__ClassName.cpp)
+tests/v2/unit/Test__MyFeature.cpp
 
 # Integration test
-tests/v2/integration/test_my_integration.cpp
+tests/v2/integration/Test__MyIntegration.cpp
 
 # E2E test
-tests/v2/e2e/test_my_workflow.cpp
+tests/v2/e2e/Test__MyWorkflow.cpp
 
 # PyTorch parity test
-tests/v2/pytorch_parity/test_my_parity.cpp
+tests/v2/pytorch_parity/Test__MyParity.cpp
 ```
 
 ### 2. Write Test Using GTest

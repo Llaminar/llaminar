@@ -22,11 +22,13 @@ add_library(llaminar2_core STATIC
     tensors/Q8_0Tensor.cpp
     tensors/Q4_0Tensor.cpp
     tensors/Q4_1Tensor.cpp
-    # K-quant formats (Q6_K, Q2_K, Q5_K, Q3_K)
+    # K-quant formats (Q6_K, Q2_K, Q5_K, Q3_K, Q4_K, Q8_K)
     tensors/Q6_KTensor.cpp
     tensors/Q2_KTensor.cpp
     tensors/Q5_KTensor.cpp
     tensors/Q3_KTensor.cpp
+    tensors/Q4_KTensor.cpp
+    tensors/Q8_KTensor.cpp
     # IQ formats (IQ4_XS, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S, IQ3_S, IQ1_S, IQ1_M)
     tensors/IQ4_XSTensor.cpp
     tensors/IQ2_XXSTensor.cpp

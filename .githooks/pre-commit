@@ -1,0 +1,86 @@
+#!/bin/bash
+# Pre-commit hook template for Llaminar project
+# 
+# Installation:
+#   cp .githooks/pre-commit .git/hooks/pre-commit
+#   chmod +x .git/hooks/pre-commit
+#
+# This hook runs unit tests before allowing a commit.
+# Override with: git commit --no-verify
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${YELLOW}Running pre-commit unit tests...${NC}"
+echo ""
+
+# Determine which build directory to use
+if [ -d "build_v2_coverage" ]; then
+    BUILD_DIR="build_v2_coverage"
+elif [ -d "build_v2" ]; then
+    BUILD_DIR="build_v2"
+elif [ -d "build" ]; then
+    BUILD_DIR="build"
+else
+    echo -e "${RED}❌ No build directory found. Please build the project first.${NC}"
+    echo -e "${YELLOW}Hint: Run 'cmake -B build_v2 -S src/v2' and 'cmake --build build_v2'${NC}"
+    exit 1
+fi
+
+# Find all test executables
+TEST_EXECUTABLES=(
+    "$BUILD_DIR/tests/v2/v2_test_model_loader"
+    # Add more test executables here as they are created
+    # "$BUILD_DIR/tests/v2/v2_test_other"
+)
+
+FAILED_TESTS=()
+PASSED_TESTS=()
+
+# Run each test executable
+for TEST_EXEC in "${TEST_EXECUTABLES[@]}"; do
+    if [ -f "$TEST_EXEC" ]; then
+        TEST_NAME=$(basename "$TEST_EXEC")
+        echo -e "${YELLOW}Running ${TEST_NAME}...${NC}"
+        
+        # Run test and check exit code
+        set +e
+        $TEST_EXEC > /dev/null 2>&1
+        EXIT_CODE=$?
+        set -e
+        
+        if [ $EXIT_CODE -eq 0 ]; then
+            # All tests passed
+            echo -e "${GREEN}✓ ${TEST_NAME}: All tests passed${NC}"
+            PASSED_TESTS+=("$TEST_NAME")
+        else
+            # Some tests failed
+            echo -e "${RED}✗ ${TEST_NAME}: Some tests failed (exit code: $EXIT_CODE)${NC}"
+            FAILED_TESTS+=("$TEST_NAME")
+        fi
+        echo ""
+    fi
+done
+
+# Summary
+echo "================================================"
+if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
+    echo -e "${GREEN}✅ All unit tests passed!${NC}"
+    echo -e "${GREEN}Proceeding with commit...${NC}"
+    exit 0
+else
+    echo -e "${RED}❌ Some tests failed:${NC}"
+    for TEST in "${FAILED_TESTS[@]}"; do
+        echo -e "   ${RED}• ${TEST}${NC}"
+    done
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi

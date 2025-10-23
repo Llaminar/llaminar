@@ -569,7 +569,23 @@ mpirun -np 2 --bind-to socket --map-by socket \
 
 ## Testing Guidelines (V1)
 
-**Note**: This section describes V1 testing infrastructure. V2 testing is minimal and under development.
+**Note**: This section describes V1 testing infrastructure. V2 testing infrastructure is documented separately below.
+
+### V2 Testing Conventions
+
+**Test File Naming** (V2 only):
+- Test files MUST use CamelCase format: `Test__ClassName.cpp`
+- `ClassName` is the **class under test** (the class being tested)
+- The test suite name in the file MUST match: `TEST(Test__ClassName, ...)`
+- Examples:
+  - Testing `ModelLoader` class → File: `Test__ModelLoader.cpp`, Suite: `Test__ModelLoader`
+  - Testing `Qwen2Pipeline` class → File: `Test__Qwen2Pipeline.cpp`, Suite: `Test__Qwen2Pipeline`
+  - Testing `FP32Tensor` class → File: `Test__FP32Tensor.cpp`, Suite: `Test__FP32Tensor`
+- The double underscore `__` separates "Test" prefix from the class name
+- This convention applies ONLY to `tests/v2/` directory
+- V1 tests in `tests/` continue using snake_case (e.g., `test_batch_correctness.cpp`)
+
+**Rationale**: Clear association between test and the specific class being tested, matches V2's CamelCase conventions.
 
 ### Test Organization
 

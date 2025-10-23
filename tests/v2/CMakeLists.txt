@@ -142,12 +142,13 @@ endfunction()
 # =============================================================================
 # Fast, isolated tests for individual components (tensors, kernels, etc.)
 # No model loading, no MPI (or single-rank MPI only)
+# Naming convention: Test files use CamelCase format Test__ClassName.cpp
 
 # Find GTest (should be available from parent CMake)
 find_package(GTest REQUIRED)
 
-# Test: Tensor Basics
-add_executable(v2_test_tensor_basics unit/test_tensor_basics.cpp)
+# Test: FP32Tensor class
+add_executable(v2_test_tensor_basics unit/Test__FP32Tensor.cpp)
 target_link_libraries(v2_test_tensor_basics 
     llaminar2_core 
     GTest::gtest
@@ -156,6 +157,30 @@ target_link_libraries(v2_test_tensor_basics
 add_v2_test(V2_Unit_TensorBasics 
     COMMAND v2_test_tensor_basics
     LABELS "V2;Unit;Tensor"
+)
+
+# Test: ModelLoader
+add_executable(v2_test_model_loader unit/Test__ModelLoader.cpp)
+target_link_libraries(v2_test_model_loader 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ModelLoader 
+    COMMAND v2_test_model_loader
+    LABELS "V2;Unit;ModelLoader"
+)
+
+# Test: IQ4_NL Tensor GEMM
+add_executable(v2_test_iq4nl_tensor unit/Test__IQ4_NLTensor.cpp)
+target_link_libraries(v2_test_iq4nl_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ4_NLTensor 
+    COMMAND v2_test_iq4nl_tensor
+    LABELS "V2;Unit;IQ4_NL;GEMM"
 )
 
 # Placeholder for additional unit test executables (to be added)

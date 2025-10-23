@@ -117,6 +117,12 @@ namespace llaminar2
         case TensorType::Q3_K:
             return std::make_unique<Q3_KTensor>(shape, raw_data);
 
+        case TensorType::Q4_K:
+            return std::make_unique<Q4_KTensor>(shape, raw_data);
+
+        case TensorType::Q8_K:
+            return std::make_unique<Q8_KTensor>(shape, raw_data);
+
         case TensorType::IQ4_XS:
             return std::make_unique<IQ4_XSTensor>(shape, raw_data);
 

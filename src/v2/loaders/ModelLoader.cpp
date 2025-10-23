@@ -360,6 +360,23 @@ namespace llaminar2
             }
             break;
 
+        case GGUFTensorType::BF16:
+            // BF16: Raw data is in BF16 format (uint16_t, different from FP16)
+            if (factory_)
+            {
+                // Convert raw bytes to uint16_t vector
+                std::vector<uint16_t> bf16_data(raw.size() / 2);
+                std::memcpy(bf16_data.data(), raw.data(), raw.size());
+                tensor = factory_->createBF16(shape, bf16_data);
+            }
+            else
+            {
+                std::vector<uint16_t> bf16_data(raw.size() / 2);
+                std::memcpy(bf16_data.data(), raw.data(), raw.size());
+                tensor = std::make_shared<BF16Tensor>(shape, bf16_data);
+            }
+            break;
+
         // IQ formats (4-bit, 2-bit, 3-bit, 1-bit non-linear quantization)
         case GGUFTensorType::IQ4_NL:
             if (factory_)
@@ -536,6 +553,28 @@ namespace llaminar2
             else
             {
                 tensor = std::make_shared<Q2_KTensor>(shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q4_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_K, shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_KTensor>(shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q8_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q8_K, shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q8_KTensor>(shape, raw);
             }
             break;
 

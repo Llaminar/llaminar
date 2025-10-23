@@ -68,7 +68,7 @@
 #include <algorithm>
 
 // V2 utilities (minimal portable implementations)
-#include "QuantTypes.h"
+// #include "QuantTypes.h"  // Not needed
 #include "TensorKernels.h"
 #include "FP16Utils.h"
 #include "../utils/CPUFeatures.h"
@@ -401,6 +401,12 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Create fused quantized GEMM implementation
+         */
+        std::unique_ptr<ITensorGemm> createGemm();
+        ITensorGemm *createGemmRaw();
+
     private:
         std::vector<size_t> shape_;     ///< Tensor dimensions (2D: [rows, cols])
         std::vector<uint8_t> raw_data_; ///< Raw quantized data (IQ4_NL blocks)
@@ -665,30 +671,6 @@ namespace llaminar2
          *
          * This enables adaptiveMatMul to use fused dequant+GEMM path instead of
          * full decode + BLAS.
-         */
-        /** @brief Factory: create fused GEMM implementation (unique_ptr wrapper). */
-        std::unique_ptr<ITensorGemm> createGemm() const;
-
-        /**
-         * @brief Create fused quantized GEMM implementation for this tensor
-         *
-         * @return ITensorGemm pointer (caller takes ownership), or nullptr if not supported
-         *
-         * This enables adaptiveMatMul to use fused dequant+GEMM path instead of
-         * full decode + BLAS.
-         */
-        /** @brief Factory (raw pointer variant) – ownership transfers to caller. */
-        ITensorGemm *createGemmRaw() const;
-
-        // decodeRowToBF16() - Commented out (bfloat16 type not yet defined in v2)
-        // This method will be re-enabled when a proper bfloat16 type is added to v2
-        /*
-        void decodeRowToBF16(size_t row_idx, bfloat16 *buffer) const
-        {
-            int cols = shape_[1];
-            std::vector<float> temp(cols);
-            decodeRow(row_idx, temp.data());
-
             for (int i = 0; i < cols; ++i)
             {
                 buffer[i] = bfloat16(temp[i]);
@@ -1339,9 +1321,6 @@ namespace llaminar2
             return true;
         }
 
-    private:
-        const IQ4_NLTensor *tensor_;
-
         /**
          * @brief Repack BF16 to spaced FP32 format for direct loading
          *
@@ -1700,7 +1679,7 @@ namespace llaminar2
     };
 
     // Implementation of createGemmRaw() method
-    inline ITensorGemm *IQ4_NLTensor::createGemmRaw() const
+    inline ITensorGemm *IQ4_NLTensor::createGemmRaw()
     {
         return new IQ4_NLQuantizedGemm(this);
     }
