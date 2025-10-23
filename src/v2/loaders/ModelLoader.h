@@ -31,217 +31,225 @@
 #include <string>
 #include <vector>
 
-namespace llaminar2 {
+namespace llaminar2
+{
 
-// Forward declarations
-class TensorBase;
-class TensorFactory;
+    // Forward declarations
+    class TensorBase;
+    class TensorFactory;
 
-// =============================================================================
-// GGUF TYPE DEFINITIONS
-// =============================================================================
+    // =============================================================================
+    // GGUF TYPE DEFINITIONS
+    // =============================================================================
 
-/**
- * @brief GGUF metadata value types
- */
-enum class GGUFValueType : uint32_t {
-    UINT8 = 0,
-    INT8 = 1,
-    UINT16 = 2,
-    INT16 = 3,
-    UINT32 = 4,
-    INT32 = 5,
-    FLOAT32 = 6,
-    BOOL = 7,
-    STRING = 8,
-    ARRAY = 9,
-    UINT64 = 10,
-    INT64 = 11,
-    FLOAT64 = 12
-};
-
-/**
- * @brief GGUF tensor types (quantization formats)
- *
- * V2 supports subset of V1 formats (common formats only):
- *  - F32: Unquantized 32-bit float (baseline)
- *  - F16: Half precision 16-bit float (2× compression)
- *  - Q4_0: 4-bit quantization (8× compression)
- *  - Q6_K: 6-bit K-quant (5.3× compression)
- *  - Q8_0: 8-bit quantization (4× compression)
- *  - IQ4_NL: 4-bit importance-weighted quantization
- *
- * Also defined but not yet implemented (will log warning on load):
- *  - Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q8_K
- *  - IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M
- */
-enum class GGUFTensorType : uint32_t {
-    F32 = 0,
-    F16 = 1,
-    Q4_0 = 2,
-    BF16 = 30,
-    Q4_1 = 3,
-    Q5_0 = 6,
-    Q5_1 = 7,
-    Q8_0 = 8,
-    Q2_K = 10,
-    Q3_K = 11,
-    Q4_K = 12,
-    Q5_K = 13,
-    Q6_K = 14,
-    Q8_K = 15,
-    IQ2_XXS = 16,
-    IQ2_XS = 17,
-    IQ3_XXS = 18,
-    IQ1_S = 19,
-    IQ4_NL = 20,
-    IQ3_S = 21,
-    IQ2_S = 22,
-    IQ4_XS = 23,
-    IQ1_M = 29
-};
-
-/**
- * @brief GGUF metadata value (variant type)
- */
-struct GGUFValue {
-    GGUFValueType type;
-    std::vector<uint8_t> data;
-
-    // Typed accessors
-    uint32_t asUInt32() const;
-    uint64_t asUInt64() const;
-    float asFloat32() const;
-    std::string asString() const;
-};
-
-/**
- * @brief GGUF tensor metadata
- */
-struct GGUFTensorInfo {
-    std::string name;
-    std::vector<uint64_t> dimensions;
-    GGUFTensorType type;
-    uint64_t offset;         // Byte offset from data_offset (NOT file start!)
-    uint64_t size_bytes;     // Total size in bytes
-
-    // Helper methods
-    bool isQuantized() const;
-    size_t getTypeSize() const;   // Bytes per block
-    size_t getBlockSize() const;  // Elements per block
-};
-
-/**
- * @brief Parsed GGUF model metadata
- */
-struct GGUFModel {
-    // Header
-    uint32_t version = 0;
-    uint64_t tensor_count = 0;
-    uint64_t metadata_kv_count = 0;
-    uint32_t alignment = 32;
-
-    // Metadata
-    std::string architecture;      // "qwen2", "llama", etc.
-    uint64_t context_length = 0;   // max_position_embeddings
-    uint64_t embedding_length = 0; // hidden_size (d_model)
-    uint64_t block_count = 0;      // num_hidden_layers
-    uint64_t head_count = 0;       // num_attention_heads
-    uint64_t head_count_kv = 0;    // num_key_value_heads (GQA)
-    uint64_t vocab_size = 0;       // vocabulary size
-    float rope_theta = 10000.0f;   // RoPE base frequency
-
-    std::map<std::string, GGUFValue> metadata;
-    std::vector<GGUFTensorInfo> tensors;
-
-    uint64_t data_offset = 0;      // Byte offset to tensor data region
-
-    // Helper methods
-    bool hasMetadata(const std::string& key) const;
-    GGUFTensorInfo* findTensor(const std::string& name);
-    const GGUFTensorInfo* findTensor(const std::string& name) const;
-};
-
-// =============================================================================
-// GGUF LOADER
-// =============================================================================
-
-/**
- * @brief Streamlined GGUF model loader for V2
- *
- * Usage:
- *   ModelLoader loader;
- *   if (!loader.loadModel("model.gguf")) { error(); }
- *   auto embedding = loader.loadTensor("token_embd.weight", device_idx);
- *   auto wq = loader.loadTensor("blk.0.attn_q.weight", device_idx);
- */
-class ModelLoader {
-public:
     /**
-     * @brief Construct ModelLoader with optional TensorFactory
-     * @param factory TensorFactory for NUMA-aware tensor creation (optional)
+     * @brief GGUF metadata value types
      */
-    explicit ModelLoader(TensorFactory* factory = nullptr);
-    ~ModelLoader() = default;
+    enum class GGUFValueType : uint32_t
+    {
+        UINT8 = 0,
+        INT8 = 1,
+        UINT16 = 2,
+        INT16 = 3,
+        UINT32 = 4,
+        INT32 = 5,
+        FLOAT32 = 6,
+        BOOL = 7,
+        STRING = 8,
+        ARRAY = 9,
+        UINT64 = 10,
+        INT64 = 11,
+        FLOAT64 = 12
+    };
 
     /**
-     * @brief Load GGUF file and parse metadata
-     * @param file_path Path to .gguf model file
-     * @return true if successful, false on error
-     */
-    bool loadModel(const std::string& file_path);
-
-    /**
-     * @brief Check if model has been loaded
-     */
-    bool isLoaded() const { return loaded_; }
-
-    /**
-     * @brief Get parsed model metadata
-     */
-    const GGUFModel& getModel() const { return model_; }
-
-    /**
-     * @brief Load tensor from GGUF file
-     * @param tensor_name Name of tensor (e.g., "token_embd.weight", "blk.0.attn_q.weight")
-     * @param device_idx Device index for tensor placement (0 = CPU, 1+ = GPU)
-     * @return Tensor with appropriate type (FP32Tensor, IQ4_NLTensor, etc.) or nullptr on error
+     * @brief GGUF tensor types (quantization formats)
      *
-     * @note Returns tensors in native format (quantized weights stay quantized)
-     * @note Tensor type determined by GGUF metadata (F32 → FP32Tensor, IQ4_NL → IQ4_NLTensor)
+     * V2 supports subset of V1 formats (common formats only):
+     *  - F32: Unquantized 32-bit float (baseline)
+     *  - F16: Half precision 16-bit float (2× compression)
+     *  - Q4_0: 4-bit quantization (8× compression)
+     *  - Q6_K: 6-bit K-quant (5.3× compression)
+     *  - Q8_0: 8-bit quantization (4× compression)
+     *  - IQ4_NL: 4-bit importance-weighted quantization
+     *
+     * Also defined but not yet implemented (will log warning on load):
+     *  - Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q8_K
+     *  - IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M
      */
-    std::shared_ptr<TensorBase> loadTensor(const std::string& tensor_name, int device_idx = 0);
+    enum class GGUFTensorType : uint32_t
+    {
+        F32 = 0,
+        F16 = 1,
+        Q4_0 = 2,
+        BF16 = 30,
+        Q4_1 = 3,
+        Q5_0 = 6,
+        Q5_1 = 7,
+        Q8_0 = 8,
+        Q2_K = 10,
+        Q3_K = 11,
+        Q4_K = 12,
+        Q5_K = 13,
+        Q6_K = 14,
+        Q8_K = 15,
+        IQ2_XXS = 16,
+        IQ2_XS = 17,
+        IQ3_XXS = 18,
+        IQ1_S = 19,
+        IQ4_NL = 20,
+        IQ3_S = 21,
+        IQ2_S = 22,
+        IQ4_XS = 23,
+        IQ1_M = 29
+    };
 
-private:
-    // Tensor factory (optional, for NUMA-aware allocation)
-    TensorFactory* factory_;
+    /**
+     * @brief GGUF metadata value (variant type)
+     */
+    struct GGUFValue
+    {
+        GGUFValueType type;
+        std::vector<uint8_t> data;
 
-    // Parsing helpers
-    bool parseHeader();
-    bool parseMetadata();
-    bool parseTensorInfo();
-    void extractModelMetadata();
+        // Typed accessors
+        uint32_t asUInt32() const;
+        uint64_t asUInt64() const;
+        float asFloat32() const;
+        std::string asString() const;
+    };
 
-    // Low-level readers
-    template<typename T>
-    bool readValue(T& value);
-    bool readString(std::string& str);
-    bool readArray(GGUFValue& value);
+    /**
+     * @brief GGUF tensor metadata
+     */
+    struct GGUFTensorInfo
+    {
+        std::string name;
+        std::vector<uint64_t> dimensions;
+        GGUFTensorType type;
+        uint64_t offset;     // Byte offset from data_offset (NOT file start!)
+        uint64_t size_bytes; // Total size in bytes
 
-    // State
-    bool loaded_ = false;
-    std::string file_path_;
-    std::ifstream file_stream_;
-    GGUFModel model_;
-};
+        // Helper methods
+        bool isQuantized() const;
+        size_t getTypeSize() const;  // Bytes per block
+        size_t getBlockSize() const; // Elements per block
+    };
 
-// =============================================================================
-// TEMPLATE IMPLEMENTATIONS
-// =============================================================================
+    /**
+     * @brief Parsed GGUF model metadata
+     */
+    struct GGUFModel
+    {
+        // Header
+        uint32_t version = 0;
+        uint64_t tensor_count = 0;
+        uint64_t metadata_kv_count = 0;
+        uint32_t alignment = 32;
 
-template<typename T>
-bool ModelLoader::readValue(T& value) {
-    return file_stream_.read(reinterpret_cast<char*>(&value), sizeof(T)).good();
-}
+        // Metadata
+        std::string architecture;      // "qwen2", "llama", etc.
+        uint64_t context_length = 0;   // max_position_embeddings
+        uint64_t embedding_length = 0; // hidden_size (d_model)
+        uint64_t block_count = 0;      // num_hidden_layers
+        uint64_t head_count = 0;       // num_attention_heads
+        uint64_t head_count_kv = 0;    // num_key_value_heads (GQA)
+        uint64_t vocab_size = 0;       // vocabulary size
+        float rope_theta = 10000.0f;   // RoPE base frequency
+
+        std::map<std::string, GGUFValue> metadata;
+        std::vector<GGUFTensorInfo> tensors;
+
+        uint64_t data_offset = 0; // Byte offset to tensor data region
+
+        // Helper methods
+        bool hasMetadata(const std::string &key) const;
+        GGUFTensorInfo *findTensor(const std::string &name);
+        const GGUFTensorInfo *findTensor(const std::string &name) const;
+    };
+
+    // =============================================================================
+    // GGUF LOADER
+    // =============================================================================
+
+    /**
+     * @brief Streamlined GGUF model loader for V2
+     *
+     * Usage:
+     *   ModelLoader loader;
+     *   if (!loader.loadModel("model.gguf")) { error(); }
+     *   auto embedding = loader.loadTensor("token_embd.weight", device_idx);
+     *   auto wq = loader.loadTensor("blk.0.attn_q.weight", device_idx);
+     */
+    class ModelLoader
+    {
+    public:
+        /**
+         * @brief Construct ModelLoader with optional TensorFactory
+         * @param factory TensorFactory for NUMA-aware tensor creation (optional)
+         */
+        explicit ModelLoader(TensorFactory *factory = nullptr);
+        ~ModelLoader() = default;
+
+        /**
+         * @brief Load GGUF file and parse metadata
+         * @param file_path Path to .gguf model file
+         * @return true if successful, false on error
+         */
+        bool loadModel(const std::string &file_path);
+
+        /**
+         * @brief Check if model has been loaded
+         */
+        bool isLoaded() const { return loaded_; }
+
+        /**
+         * @brief Get parsed model metadata
+         */
+        const GGUFModel &getModel() const { return model_; }
+
+        /**
+         * @brief Load tensor from GGUF file
+         * @param tensor_name Name of tensor (e.g., "token_embd.weight", "blk.0.attn_q.weight")
+         * @param device_idx Device index for tensor placement (0 = CPU, 1+ = GPU)
+         * @return Tensor with appropriate type (FP32Tensor, IQ4_NLTensor, etc.) or nullptr on error
+         *
+         * @note Returns tensors in native format (quantized weights stay quantized)
+         * @note Tensor type determined by GGUF metadata (F32 → FP32Tensor, IQ4_NL → IQ4_NLTensor)
+         */
+        std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name, int device_idx = 0);
+
+    private:
+        // Tensor factory (optional, for NUMA-aware allocation)
+        TensorFactory *factory_;
+
+        // Parsing helpers
+        bool parseHeader();
+        bool parseMetadata();
+        bool parseTensorInfo();
+        void extractModelMetadata();
+
+        // Low-level readers
+        template <typename T>
+        bool readValue(T &value);
+        bool readString(std::string &str);
+        bool readArray(GGUFValue &value);
+
+        // State
+        bool loaded_ = false;
+        std::string file_path_;
+        std::ifstream file_stream_;
+        GGUFModel model_;
+    };
+
+    // =============================================================================
+    // TEMPLATE IMPLEMENTATIONS
+    // =============================================================================
+
+    template <typename T>
+    bool ModelLoader::readValue(T &value)
+    {
+        return file_stream_.read(reinterpret_cast<char *>(&value), sizeof(T)).good();
+    }
 
 } // namespace llaminar2

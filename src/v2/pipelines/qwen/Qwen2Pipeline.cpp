@@ -61,11 +61,14 @@ namespace llaminar2
 
         // Create TensorFactory for NUMA-aware allocation (if MPI context available)
         std::unique_ptr<TensorFactory> factory;
-        if (mpi_ctx_) {
+        if (mpi_ctx_)
+        {
             factory = std::make_unique<TensorFactory>(*mpi_ctx_);
-            std::cout << "[Qwen2Pipeline] Using TensorFactory with NUMA node " 
+            std::cout << "[Qwen2Pipeline] Using TensorFactory with NUMA node "
                       << factory->getNumaNode() << " for rank " << mpi_ctx_->rank() << "\n";
-        } else {
+        }
+        else
+        {
             std::cout << "[Qwen2Pipeline] No MPI context, using default tensor allocation\n";
         }
 

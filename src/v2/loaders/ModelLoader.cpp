@@ -208,7 +208,7 @@ namespace llaminar2
     // GGUF LOADER
     // =============================================================================
 
-    ModelLoader::ModelLoader(TensorFactory* factory)
+    ModelLoader::ModelLoader(TensorFactory *factory)
         : factory_(factory), loaded_(false) {}
 
     bool ModelLoader::loadModel(const std::string &file_path)
@@ -330,11 +330,14 @@ namespace llaminar2
         {
         case GGUFTensorType::F32:
             // FP32: Copy raw bytes as float array
-            if (factory_) {
+            if (factory_)
+            {
                 auto fp32_tensor = factory_->createFP32(shape);
                 std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
                 tensor = std::move(fp32_tensor);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<FP32Tensor>(shape);
                 std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
             }
@@ -342,12 +345,15 @@ namespace llaminar2
 
         case GGUFTensorType::F16:
             // FP16: Raw data is already in FP16 format (uint16_t)
-            if (factory_) {
+            if (factory_)
+            {
                 // Convert raw bytes to uint16_t vector
                 std::vector<uint16_t> fp16_data(raw.size() / 2);
                 std::memcpy(fp16_data.data(), raw.data(), raw.size());
                 tensor = factory_->createFP16(shape, fp16_data);
-            } else {
+            }
+            else
+            {
                 std::vector<uint16_t> fp16_data(raw.size() / 2);
                 std::memcpy(fp16_data.data(), raw.data(), raw.size());
                 tensor = std::make_shared<FP16Tensor>(shape, fp16_data);
@@ -356,131 +362,179 @@ namespace llaminar2
 
         // IQ formats (4-bit, 2-bit, 3-bit, 1-bit non-linear quantization)
         case GGUFTensorType::IQ4_NL:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ4_NL, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ4_NLTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ4_XS:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ4_XS, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ4_XSTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ2_XXS:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ2_XXS, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ2_XXSTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ2_XS:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ2_XS, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ2_XSTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ3_XXS:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ3_XXS, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ3_XXSTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ2_S:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ2_S, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ2_STensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ3_S:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ3_S, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ3_STensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ1_S:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ1_S, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ1_STensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::IQ1_M:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::IQ1_M, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<IQ1_MTensor>(shape, raw);
             }
             break;
 
         // Simple quantization formats (8-bit, 4-bit)
         case GGUFTensorType::Q8_0:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q8_0, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q8_0Tensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::Q4_0:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q4_0, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q4_0Tensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::Q4_1:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q4_1, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q4_1Tensor>(shape, raw);
             }
             break;
 
         // K-quant formats (6-bit, 5-bit, 3-bit, 2-bit with hierarchical scales)
         case GGUFTensorType::Q6_K:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q6_K, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q6_KTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::Q5_K:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q5_K, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q5_KTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::Q3_K:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q3_K, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q3_KTensor>(shape, raw);
             }
             break;
 
         case GGUFTensorType::Q2_K:
-            if (factory_) {
+            if (factory_)
+            {
                 tensor = factory_->createQuantized(TensorType::Q2_K, shape, raw);
-            } else {
+            }
+            else
+            {
                 tensor = std::make_shared<Q2_KTensor>(shape, raw);
             }
             break;
