@@ -103,9 +103,13 @@ namespace llaminar
         // Track sequence lengths
         sequence_lengths_.clear();
         sequence_lengths_.reserve(token_batches.size());
+        // Preserve the original token sequences for replay-based decode parity (full-context reconstruction)
+        original_sequences_.clear();
+        original_sequences_.reserve(token_batches.size());
         for (const auto &tokens : token_batches)
         {
             sequence_lengths_.push_back(static_cast<int>(tokens.size()));
+            original_sequences_.push_back(tokens);
         }
 
         if (getRank() == 0)
@@ -180,46 +184,133 @@ namespace llaminar
         int D = config_.getLayerConfig().d_model;
         int vocab = config_.getLayerConfig().vocab_size;
 
-        // Step 1: Embed decode tokens [B, 1, D]
-        std::shared_ptr<TensorBase> hidden = std::make_shared<SimpleTensor>(std::vector<int>{B, 1, D});
-        const auto &embedding_weight = batch_weights->embedding();
-        if (!embedding_weight)
+        // Step 0: assign decode step index for snapshot suffixing BEFORE any embedding work
+        if (debugEnv().pipeline.decode_stage_snapshots)
         {
-            LOG_ERROR("decodeBatch: embedding weight is null");
-            return false;
+            int step = generated_steps_; // 0-based decode step
+            setDecodeStep(step);
+            if (getRank() == 0 && debugEnv().pipeline.decode_snapshot_verbose)
+            {
+                LOG_INFO("[BatchQwenPipeline] decodeBatch: starting replay decode step=" << step << " batch_size=" << B
+                                                                                         << " decode_stage_snapshots=" << (debugEnv().pipeline.decode_stage_snapshots ? "1" : "0")
+                                                                                         << " snapshot_source=" << getSnapshotSource());
+            }
         }
 
-        const float *emb_data = embedding_weight->data();
-        float *h_data = hidden->data();
+        std::shared_ptr<TensorBase> hidden;
 
-        for (int b = 0; b < B; ++b)
+        // Replay mode: rebuild full context each step and run full layers to mirror sequential replay path
+        if (debugEnv().pipeline.batch_decode_replay)
         {
-            int token_id = next_tokens[b];
-            if (token_id < 0 || token_id >= vocab)
+            // Build cumulative token sequences per batch entry
+            if (replay_tokens_.empty())
             {
-                LOG_ERROR("decodeBatch: invalid token " << token_id << " at batch " << b);
+                // Seed replay vectors with ORIGINAL prefill context so replay matches sequential full-context path
+                if (original_sequences_.size() != static_cast<size_t>(B))
+                {
+                    LOG_WARN("decodeBatch(replay): original_sequences_ size mismatch (" << original_sequences_.size() << " vs B=" << B << ") - seeding with empty context");
+                    replay_tokens_.resize(B);
+                }
+                else
+                {
+                    replay_tokens_ = original_sequences_; // copy full prefill context
+                    if (getRank() == 0)
+                    {
+                        LOG_DEBUG("[BatchQwenPipeline] decodeBatch(replay): Seeded replay tokens with original prefill context (len[0]=" << replay_tokens_[0].size() << ")");
+                    }
+                }
+            }
+            for (int b = 0; b < B; ++b)
+            {
+                replay_tokens_[b].push_back(next_tokens[b]);
+            }
+
+            // Compose batch of cumulative sequences
+            std::vector<std::vector<int>> cumulative;
+            cumulative.reserve(B);
+            for (int b = 0; b < B; ++b)
+            {
+                cumulative.push_back(replay_tokens_[b]);
+            }
+
+            // Prepare embedding for full context [B, T_full, D]
+            if (!prepareEmbedding(cumulative, *batch_weights, hidden))
+            {
+                LOG_ERROR("decodeBatch(replay): embedding preparation failed");
+                return false;
+            }
+            if (getRank() == 0 && debugEnv().pipeline.decode_snapshot_verbose)
+            {
+                LOG_INFO("[BatchQwenPipeline] decodeBatch(replay): prepared cumulative embedding T_full=" << hidden->shape()[1]
+                                                                                                          << " D=" << hidden->shape()[2] << " step=" << currentDecodeStep());
+            }
+
+            // Run full layers as prefill=false to keep stage semantics (causal masking inside attention)
+            if (!runBatchedLayers(hidden, *batch_weights, false))
+            {
+                LOG_ERROR("decodeBatch(replay): layer execution failed");
+                return false;
+            }
+            // Lightweight sampler: dump first 8 values of layer0 ATTENTION_NORM vs original embedding for parity debugging
+            if (getRank() == 0 && debugEnv().pipeline.decode_snapshot_verbose)
+            {
+                // embedding snapshot already captured as batch_EMBEDDING (flattened). We can sample directly from hidden buffers after first norm.
+                if (hidden && hidden->shape().size() == 3)
+                {
+                    const int sample_count = 8;
+                    std::ostringstream oss;
+                    oss << "[BATCH_REPLAY_SAMPLE] step=" << currentDecodeStep() << " first_seq_first_token_hidden[0.." << sample_count - 1 << "]: ";
+                    const float *data = hidden->data();
+                    for (int i = 0; i < sample_count; ++i)
+                    {
+                        oss << data[i] << (i + 1 < sample_count ? "," : "");
+                    }
+                    LOG_INFO(oss.str());
+                }
+            }
+
+            if (!projectOutput(hidden, *batch_weights, out_logits))
+            {
+                LOG_ERROR("decodeBatch(replay): output projection failed");
+                return false;
+            }
+        }
+        else
+        {
+            // Previous single-token path (no KV cache) for baseline incremental batching
+            hidden = std::make_shared<SimpleTensor>(std::vector<int>{B, 1, D});
+            const auto &embedding_weight = batch_weights->embedding();
+            if (!embedding_weight)
+            {
+                LOG_ERROR("decodeBatch: embedding weight is null");
                 return false;
             }
 
-            const float *token_emb = emb_data + token_id * D;
-            float *dst = h_data + b * D; // [B, 1, D] with T=1
-            std::copy(token_emb, token_emb + D, dst);
-        }
-
-        // Step 2: Run through all layers (decode mode without KV cache for now)
-        // Note: KV cache integration deferred to Phase 4.2 for complexity reasons
-        // Current approach: each decode step is independent (slower but correct)
-        if (!runBatchedLayers(hidden, *batch_weights, false))
-        {
-            LOG_ERROR("decodeBatch: layer execution failed");
-            return false;
-        }
-
-        // Step 3: Project to logits [B, vocab]
-        if (!projectOutput(hidden, *batch_weights, out_logits))
-        {
-            LOG_ERROR("decodeBatch: output projection failed");
-            return false;
+            const float *emb_data = embedding_weight->data();
+            float *h_data = hidden->data();
+            for (int b = 0; b < B; ++b)
+            {
+                int token_id = next_tokens[b];
+                if (token_id < 0 || token_id >= vocab)
+                {
+                    LOG_ERROR("decodeBatch: invalid token " << token_id << " at batch " << b);
+                    return false;
+                }
+                const float *token_emb = emb_data + token_id * D;
+                float *dst = h_data + b * D; // [B, 1, D] with T=1
+                std::copy(token_emb, token_emb + D, dst);
+            }
+            captureIfEnabled(PipelineStage::EMBEDDING, -1, hidden);
+            if (!runBatchedLayers(hidden, *batch_weights, false))
+            {
+                LOG_ERROR("decodeBatch: layer execution failed");
+                return false;
+            }
+            if (!projectOutput(hidden, *batch_weights, out_logits))
+            {
+                LOG_ERROR("decodeBatch: output projection failed");
+                return false;
+            }
         }
 
         last_logits_ = out_logits;
@@ -229,6 +320,7 @@ namespace llaminar
             LOG_DEBUG("[BatchQwenPipeline] decodeBatch completed: B=" << B << " -> logits ["
                                                                       << out_logits->shape()[0] << "," << out_logits->shape()[1] << "]");
         }
+        generated_steps_++;
         return true;
     }
 
@@ -439,6 +531,18 @@ namespace llaminar
                 if (attn_op)
                 {
                     attn_op->setLayerIndex(layer);
+                    // In replay mode, we process the FULL cumulative sequence each time,
+                    // so RoPE positions are always [0, 1, 2, ..., T-1] regardless of decode step.
+                    // Therefore n_past should always be 0 (no offset).
+                    // In true incremental mode (non-replay), we would use the actual KV cache length.
+                    const int n_past_for_rope = debugEnv().pipeline.batch_decode_replay ? 0 : generated_steps_;
+                    attn_op->setSequencePosition(n_past_for_rope);
+                    if (getRank() == 0 && layer == 0 && debugEnv().pipeline.decode_stage_snapshots)
+                    {
+                        LOG_INFO("[BATCH_NPAST_DEBUG] Layer " << layer << " setSequencePosition(n_past=" << n_past_for_rope
+                                                              << ") [replay=" << (debugEnv().pipeline.batch_decode_replay ? "yes" : "no")
+                                                              << ", generated_steps=" << generated_steps_ << "]");
+                    }
                     attn_op->setSnapshotCallback([this](PipelineStage stage, int layer_idx,
                                                         const std::shared_ptr<TensorBase> &tensor)
                                                  { this->captureIfEnabled(stage, layer_idx, tensor); });
@@ -652,29 +756,32 @@ namespace llaminar
         {
             LOG_DEBUG("[BatchQwenPipeline] runBatchedLayers: all " << n_layers << " layers complete");
 
-            // Print performance breakdown
-            double total_ms = total_attn_norm_ms + total_attention_ms + total_attn_residual_ms +
-                              total_ffn_norm_ms + total_gate_ms + total_up_ms +
-                              total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
-
-            std::cout << "\n[PERF_BREAKDOWN] Batch=" << B << " SeqLen=" << T << " Total=" << total_ms << "ms\n";
-            std::cout << "  Attn Norm:      " << std::setw(8) << std::fixed << std::setprecision(2) << total_attn_norm_ms << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * total_attn_norm_ms / total_ms) << "%)\n";
-            std::cout << "  Attention:      " << std::setw(8) << total_attention_ms << " ms (" << std::setw(5) << (100.0 * total_attention_ms / total_ms) << "%)\n";
-            std::cout << "  Attn Residual:  " << std::setw(8) << total_attn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_attn_residual_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Norm:       " << std::setw(8) << total_ffn_norm_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_norm_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Gate:       " << std::setw(8) << total_gate_ms << " ms (" << std::setw(5) << (100.0 * total_gate_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Up:         " << std::setw(8) << total_up_ms << " ms (" << std::setw(5) << (100.0 * total_up_ms / total_ms) << "%)\n";
-            std::cout << "  FFN SwiGLU:     " << std::setw(8) << total_swiglu_ms << " ms (" << std::setw(5) << (100.0 * total_swiglu_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Down:       " << std::setw(8) << total_down_ms << " ms (" << std::setw(5) << (100.0 * total_down_ms / total_ms) << "%)\n";
-            std::cout << "  FFN Residual:   " << std::setw(8) << total_ffn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_residual_ms / total_ms) << "%)\n";
-            std::cout << std::flush;
-
-            // Print detailed attention breakdown
-            auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
-            if (attn_op)
+            if (debugEnv().performance.enable)
             {
-                attn_op->printPerformanceBreakdown();
-                attn_op->resetPerformanceCounters();
+                // Print performance breakdown
+                double total_ms = total_attn_norm_ms + total_attention_ms + total_attn_residual_ms +
+                                total_ffn_norm_ms + total_gate_ms + total_up_ms +
+                                total_swiglu_ms + total_down_ms + total_ffn_residual_ms;
+
+                std::cout << "\n[PERF_BREAKDOWN] Batch=" << B << " SeqLen=" << T << " Total=" << total_ms << "ms\n";
+                std::cout << "  Attn Norm:      " << std::setw(8) << std::fixed << std::setprecision(2) << total_attn_norm_ms << " ms (" << std::setw(5) << std::setprecision(1) << (100.0 * total_attn_norm_ms / total_ms) << "%)\n";
+                std::cout << "  Attention:      " << std::setw(8) << total_attention_ms << " ms (" << std::setw(5) << (100.0 * total_attention_ms / total_ms) << "%)\n";
+                std::cout << "  Attn Residual:  " << std::setw(8) << total_attn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_attn_residual_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Norm:       " << std::setw(8) << total_ffn_norm_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_norm_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Gate:       " << std::setw(8) << total_gate_ms << " ms (" << std::setw(5) << (100.0 * total_gate_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Up:         " << std::setw(8) << total_up_ms << " ms (" << std::setw(5) << (100.0 * total_up_ms / total_ms) << "%)\n";
+                std::cout << "  FFN SwiGLU:     " << std::setw(8) << total_swiglu_ms << " ms (" << std::setw(5) << (100.0 * total_swiglu_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Down:       " << std::setw(8) << total_down_ms << " ms (" << std::setw(5) << (100.0 * total_down_ms / total_ms) << "%)\n";
+                std::cout << "  FFN Residual:   " << std::setw(8) << total_ffn_residual_ms << " ms (" << std::setw(5) << (100.0 * total_ffn_residual_ms / total_ms) << "%)\n";
+                std::cout << std::flush;
+
+                // Print detailed attention breakdown
+                auto *attn_op = dynamic_cast<MPIAttentionBatchOperator *>(getKernel("attention"));
+                if (attn_op)
+                {
+                    attn_op->printPerformanceBreakdown();
+                    attn_op->resetPerformanceCounters();
+                }
             }
         }
 

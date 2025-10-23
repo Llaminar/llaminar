@@ -37,6 +37,10 @@
 #include <cstdlib>
 #include "utils/DebugEnv.h"
 
+// Include typed tensor headers
+#include "tensors/Q8_0Tensor.h"
+#include "tensors/IQ4_NLTensor.h"
+
 // Include upstream gguf API for offset comparison diagnostics
 extern "C"
 {
@@ -52,6 +56,7 @@ extern "C"
 #endif
 #include <filesystem>
 #include "tensors/SimpleTensor.h"
+#include "tensors/TensorFactory.h" // QuantizedTensor early return support
 #include <iostream>
 #include <cstdio>
 #include <cstdint>
@@ -60,19 +65,9 @@ extern "C"
 #define K_SCALE_SIZE 12
 #endif
 
-typedef uint16_t ggml_half;
-
 // =============================================================================
-// FP16/FP32 CONVERSION HELPERS
+// FP16/FP32 CONVERSION HELPERS (restored)
 // =============================================================================
-// These functions mirror ggml's FP16 conversion to ensure identical behavior
-// for edge cases (subnormals, denormals, etc.). Critical for numerical parity.
-
-/**
- * @brief Convert raw 32-bit representation to float
- * @param w Raw bits representing a float
- * @return Float value
- */
 static inline float fp32_from_bits(uint32_t w)
 {
     union
@@ -83,12 +78,6 @@ static inline float fp32_from_bits(uint32_t w)
     fp32.as_bits = w;
     return fp32.as_value;
 }
-
-/**
- * @brief Convert float to raw 32-bit representation
- * @param f Float value
- * @return Raw bits
- */
 static inline uint32_t fp32_to_bits(float f)
 {
     union
@@ -99,49 +88,25 @@ static inline uint32_t fp32_to_bits(float f)
     fp32.as_value = f;
     return fp32.as_bits;
 }
-
-/**
- * @brief Convert FP16 (half precision) to FP32 (single precision)
- * @param h 16-bit half-precision float
- * @return 32-bit single-precision float
- *
- * Handles special cases:
- *  - Normalized values: Standard conversion
- *  - Denormalized values: Uses magic bias technique
- *  - Preserves sign bit
- */
 static inline float ggml_compute_fp16_to_fp32(uint16_t h)
 {
-    const uint32_t w = static_cast<uint32_t>(h) << 16;
-    const uint32_t sign = w & UINT32_C(0x80000000);
+    const uint32_t w = (uint32_t)h << 16;
+    const uint32_t sign = w & 0x80000000u;
     const uint32_t two_w = w + w;
-
-    const uint32_t exp_offset = UINT32_C(0xE0) << 23;
+    const uint32_t exp_offset = 0xE0u << 23;
 #if (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || defined(__GNUC__) && !defined(__STRICT_ANSI__)) && (!defined(__cplusplus) || __cplusplus >= 201703L)
     const float exp_scale = 0x1.0p-112f;
 #else
-    const float exp_scale = fp32_from_bits(UINT32_C(0x7800000));
+    const float exp_scale = fp32_from_bits(0x7800000u);
 #endif
     const float normalized_value = fp32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
-
-    const uint32_t magic_mask = UINT32_C(126) << 23;
+    const uint32_t magic_mask = 126u << 23;
     const float magic_bias = 0.5f;
     const float denormalized_value = fp32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
-
-    const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
+    const uint32_t denormalized_cutoff = 1u << 27;
     const uint32_t result = sign | (two_w < denormalized_cutoff ? fp32_to_bits(denormalized_value) : fp32_to_bits(normalized_value));
     return fp32_from_bits(result);
 }
-
-// =============================================================================
-// MODELLOADER: Constructor and Utility Functions
-// =============================================================================
-
-/**
- * @brief Construct a new ModelLoader
- *
- * Initializes an empty model loader. Must call loadFromFile() before use.
- */
 ModelLoader::ModelLoader() : loaded_(false) {}
 
 /**
@@ -748,10 +713,184 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
     std::vector<float> data_f32;
 
     // Branch based on tensor type: Quantized vs FP16/FP32
-    if (info->isQuantized())
+    bool quant_meta = info->isQuantized();
+    // (quant debug logs removed)
+    if (quant_meta)
     {
+        // Phase 2: Quantized optional early return (before performing full dequantizeTensor)
+        const auto &qenv = loader_env_load.quant;
+        std::cerr << "[QUANT_CHECK] tensor=" << tensor_name
+                  << " enable=" << qenv.enable
+                  << " load_quantized=" << qenv.load_quantized
+                  << " force_fp32=" << qenv.force_fp32_weights << std::endl;
+        // (quant gating debug removed)
+        if (qenv.enable && qenv.load_quantized && !qenv.force_fp32_weights)
+        {
+            std::cerr << "[SELECTIVE_QUANT] Entering selective quantization for tensor: " << tensor_name << std::endl;
+
+            // === SELECTIVE QUANTIZATION: Classify weight role BEFORE creating Q8_0 ===
+            // Only large matrix weights (W_Q, W_K, W_V, W_O, W1, W2, W3) benefit from Q8_0.
+            // Keep embeddings, norms, biases as FP32 for compatibility and performance.
+            llaminar::WeightRole role = llaminar::classifyWeightRole(tensor_name);
+            bool should_quantize = false;
+
+            switch (role)
+            {
+            case llaminar::WeightRole::W_Q:
+            case llaminar::WeightRole::W_K:
+            case llaminar::WeightRole::W_V:
+            case llaminar::WeightRole::W_O:
+            case llaminar::WeightRole::W1:
+            case llaminar::WeightRole::W2:
+            case llaminar::WeightRole::W3:
+                // Large matrix weights: Q8_0 saves significant memory (4× compression)
+                should_quantize = true;
+                break;
+
+            case llaminar::WeightRole::Embedding:
+                // Embeddings: Keep FP32 for fast token-indexed lookup
+                // (Q8_0 would require row decode per token, inefficient for random access)
+                LOG_INFO("[SELECTIVE_QUANT] Skipping Q8_0 for embedding '" << tensor_name << "' (role=Embedding), using FP32");
+                should_quantize = false;
+                break;
+
+            case llaminar::WeightRole::Unknown:
+                // Unknown roles (norms, biases, etc.): Keep FP32 for safety
+                // Most are small (<1KB) - quantization saves minimal memory
+                LOG_INFO("[SELECTIVE_QUANT] Skipping Q8_0 for '" << tensor_name << "' (role=Unknown), using FP32");
+                should_quantize = false;
+                break;
+            }
+
+            std::cerr << "[SELECTIVE_QUANT] tensor=" << tensor_name
+                      << " role=" << llaminar::weightRoleToString(role)
+                      << " should_quantize=" << should_quantize
+                      << " quant_type=" << static_cast<int>(info->type) << std::endl;
+
+            if (!should_quantize)
+            {
+                // Force FP32 fallback for this weight (skip typed tensor creation)
+                std::cerr << "[SELECTIVE_QUANT] Skipping Q8_0 for '" << tensor_name
+                          << "', falling through to FP32 path" << std::endl;
+                LOG_INFO("Selective quantization: '" << tensor_name << "' → FP32 (role="
+                                                     << llaminar::weightRoleToString(role) << ")");
+                // Fall through to FP32 dequantization below
+            }
+            else
+            {
+                // === TYPED TENSOR PATH: Create native quantized tensors ===
+                // Keep weights in compressed format - no FP32 conversion!
+
+                std::vector<int> shape2d;
+                shape2d.reserve(info->dimensions.size());
+                for (auto d : info->dimensions)
+                    shape2d.push_back(static_cast<int>(d));
+
+                // Create typed tensor based on GGML format
+                std::shared_ptr<llaminar::TensorBase> typed_tensor;
+
+                switch (info->type)
+                {
+                case GGUFTensorType::Q8_0:
+                    // Q8_0: Use typed Q8_0Tensor (8-bit, 4× compression)
+                    try
+                    {
+                        typed_tensor = std::make_shared<llaminar::Q8_0Tensor>(shape2d, raw);
+                        LOG_INFO("Loaded Q8_0 tensor '" << tensor_name << "' shape=["
+                                                        << shape2d[0] << "x" << shape2d[1] << "] role="
+                                                        << llaminar::weightRoleToString(role) << " compressed_size="
+                                                        << raw.size() << " bytes");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("Failed to create Q8_0Tensor for '" << tensor_name << "': " << e.what());
+                        // Fall through to FP32 fallback
+                        typed_tensor = nullptr;
+                    }
+                    break;
+
+                case GGUFTensorType::IQ4_NL:
+                    // IQ4_NL: Use typed IQ4_NLTensor (4.5 bits/value, ~4.3× compression)
+                    try
+                    {
+                        typed_tensor = std::make_shared<llaminar::IQ4_NLTensor>(shape2d, raw);
+                        LOG_INFO("Loaded IQ4_NL tensor '" << tensor_name << "' shape=["
+                                                          << shape2d[0] << "x" << shape2d[1] << "] role="
+                                                          << llaminar::weightRoleToString(role) << " compressed_size="
+                                                          << raw.size() << " bytes");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("Failed to create IQ4_NLTensor for '" << tensor_name << "': " << e.what());
+                        // Fall through to FP32 fallback
+                        typed_tensor = nullptr;
+                    }
+                    break;
+
+                case GGUFTensorType::Q4_0:
+                case GGUFTensorType::Q5_0:
+                case GGUFTensorType::Q4_K:
+                case GGUFTensorType::Q5_K:
+                case GGUFTensorType::Q6_K:
+                case GGUFTensorType::Q8_K:
+                    // Other quant types: Fallback to old QuantizedTensor wrapper (for now)
+                    // TODO: Implement Q4_0Tensor, Q6_KTensor, etc. in Week 3
+                    llaminar::QuantFormat qf;
+                    switch (info->type)
+                    {
+                    case GGUFTensorType::Q4_0:
+                        qf = llaminar::QuantFormat::Q4_0;
+                        break;
+                    case GGUFTensorType::Q5_0:
+                        qf = llaminar::QuantFormat::Q5_0;
+                        break;
+                    case GGUFTensorType::Q4_K:
+                        qf = llaminar::QuantFormat::Q4_K;
+                        break;
+                    case GGUFTensorType::Q5_K:
+                        qf = llaminar::QuantFormat::Q5_K;
+                        break;
+                    case GGUFTensorType::Q6_K:
+                        qf = llaminar::QuantFormat::Q6_K;
+                        break;
+                    case GGUFTensorType::Q8_K:
+                        qf = llaminar::QuantFormat::Q8_K;
+                        break;
+                    default:
+                        qf = llaminar::QuantFormat::F32;
+                        break;
+                    }
+                    if (qf != llaminar::QuantFormat::F32)
+                    {
+                        typed_tensor = llaminar::TensorFactory::create_quantized(shape2d, qf, raw);
+                        LOG_INFO("Loaded quantized tensor '" << tensor_name << "' format="
+                                                             << static_cast<int>(qf) << " (using old QuantizedTensor wrapper)");
+                    }
+                    break;
+
+                default:
+                    // Unsupported quantization type - will fall back to FP32
+                    LOG_DEBUG("Unsupported quantization type " << static_cast<int>(info->type)
+                                                               << " for '" << tensor_name << "', will decode to FP32");
+                    typed_tensor = nullptr;
+                    break;
+                }
+
+                // If typed tensor created successfully, return it
+                if (typed_tensor)
+                {
+                    if (qenv.verify_blocks)
+                    {
+                        LOG_WARN("[QUANT_VERIFY] verify_blocks requested but decode logic is placeholder; skipping tensor '" << tensor_name << "'.");
+                    }
+                    return typed_tensor;
+                }
+                // Otherwise, fall through to FP32 dequantization below
+            } // End of if (should_quantize)
+        }
+        // (quant fallback debug removed)
         // === Quantized Path: Delegate to ggml dequantizers ===
-        // Log debug info for troubleshooting quantization issues
+        // Log debug info for troubleshooting quantization issues (fallback path)
         if (dbg)
         {
             std::ostringstream oss;
@@ -2157,7 +2296,9 @@ const ModelLoader::CachedFullTensor *ModelLoader::getOrCacheFullQuantTensor(cons
         n_elems *= d;
     std::vector<float> decoded;
     if (info.isQuantized())
+    {
         decoded = dequantizeTensor(adjusted_info, raw, tensor_name);
+    }
     else
     {
         if (info.type == GGUFTensorType::F32)

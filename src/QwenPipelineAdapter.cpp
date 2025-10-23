@@ -130,6 +130,11 @@ namespace llaminar
 
     bool QwenPipelineAdapter::decode(int next_token, const IModelWeights &weights_base, StageContext &ctx)
     {
+        if (legacy_ && legacy_->getRank() == 0)
+        {
+            LOG_DEBUG("[ADAPTER_DECODE_ENTRY] token=" << next_token << " current_size=" << current_tokens_.size());
+        }
+
         ctx.stage = InferenceStage::Decode;
         current_tokens_.push_back(next_token);
         ctx.seq_len = (int)current_tokens_.size();
@@ -182,6 +187,19 @@ namespace llaminar
         }
 
         // Fallback: replay full sequence
+        if (legacy_ && legacy_->getRank() == 0)
+        {
+            LOG_DEBUG("[ADAPTER_REPLAY_FALLBACK] current_tokens_size=" << current_tokens_.size()
+                                                                       << " decode_step=" << (ctx.generated - 1));
+        }
+
+        // Set decode step before execute so snapshots get correct _decN suffix
+        // ctx.generated is incremented at the top of this method, so decode step = generated - 1
+        if (legacy_ && debugEnv().pipeline.decode_stage_snapshots)
+        {
+            legacy_->setDecodeStep(ctx.generated - 1);
+        }
+
         if (legacy_ && !legacy_->execute(current_tokens_, wm->inner, last_logits_))
         {
             LOG_ERROR("QwenPipelineAdapter: legacy execute failed in decode (replay fallback)");

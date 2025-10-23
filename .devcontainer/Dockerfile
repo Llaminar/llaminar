@@ -63,6 +63,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     lsb-release \
+    linux-tools-generic \
+    linux-tools-common \ 
+    linux-tools-$(uname -r) \
     # Python for scripting and tooling
     python3 \
     python3-pip \
@@ -76,7 +79,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     libeigen3-dev \
     # Node.js for MCP servers (will be installed via features)
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    sudo ln -s /usr/lib/linux-tools-6.8.0-86/perf /usr/lib/linux-tools/6.14.0-33-generic/perf
 
 # Build and install GoogleTest libraries (CMake find_package friendly)
 RUN cmake -S /usr/src/googletest -B /tmp/googletest-build \

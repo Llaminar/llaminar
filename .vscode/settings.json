@@ -71,7 +71,8 @@
         "stop_token": "cpp",
         "cmath": "cpp",
         "iosfwd": "cpp",
-        "iostream": "cpp"
+        "iostream": "cpp",
+        "typeinfo": "c"
     },
     "files.exclude": {
         "**/build/**": true,

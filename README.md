@@ -4,7 +4,7 @@ A high-performance, MPI-first LLM inference engine with multi-architecture pipel
 
 **Key Features:**
 - ✨ **Multi-Architecture Pipeline**: Factory-based system supporting Qwen, LLaMA, and extensible to new model families
-- 🚀 **Adaptive Backend Selection**: Intelligent routing between OpenBLAS (low latency) and COSMA (high throughput)
+- 🚀 **Adaptive Backend Selection**: Intelligent routing between OpenBLAS (low latency), COSMA (distributed), and Intel MKL (BF16 acceleration)
 - 🔧 **Distributed Execution**: MPI-aware kernels with 1D tensor sharding and NUMA optimization
 - 📊 **Comprehensive Observability**: Structured environment controls, performance counters, and validation
 
@@ -207,6 +207,33 @@ Machine learning is a type of artificial intelligence...
 - **Disable instrumentation** - Ensure environment variables like `LLAMINAR_COSMA_VALIDATE_TILE` are unset
 - **Greedy sampling** - Benchmark uses greedy sampling for deterministic, reproducible results
 - **Phase-specific tests** - Use `-n 0` or `-p ""` to isolate prefill or decode performance
+
+### Performance Comparison: Llaminar vs llama.cpp
+
+**Verified Benchmark Results** (October 2025):
+- **Model**: Qwen 2.5 0.5B Instruct Q8_0 (638 MB)
+- **Hardware**: 2-socket Cascade Lake (56 physical cores)
+- **Configuration**: Both systems built in Release mode with native optimizations
+
+| System | Throughput | Speedup |
+|--------|------------|---------|
+| **Llaminar** (MPI 2 ranks × 28 threads) | **86.08 tok/s** | **5.47×** |
+| llama.cpp (56 threads single process) | 15.74 tok/s | 1.0× baseline |
+
+**Why Llaminar is Faster:**
+1. **MPI Distribution**: Explicit socket binding with NUMA-aware memory placement
+2. **Hierarchical Parallelism**: 2 ranks × 28 threads vs flat 56 threads reduces synchronization overhead
+3. **Memory Locality**: K/V cache and activations allocated locally per socket
+4. **Adaptive Backend**: Intelligent routing between OpenBLAS (baseline), COSMA (distributed), and Intel MKL (BF16 quantized)
+
+**Scaling Characteristics:**
+- Short sequences (8 tokens): 3-4× advantage
+- Medium sequences (256-512 tokens): 5-6× advantage ✅ **Verified**
+- Long sequences (1024+ tokens): Expected 6-8× advantage
+
+For detailed methodology and reproducibility instructions, see:
+- `changelog/2025-10-19-performance-verification-llaminar-vs-llama-cpp.md`
+- `BENCHMARK_MODE_GUIDE.md`
 
 ## Performance Optimization
 
@@ -466,6 +493,204 @@ Implications:
 1. Existing GGUF files using Q4_1 / Q5_1 / Q8_1 must be re-exported (e.g., via llama.cpp quantization tools) to one of the supported formats.
 2. Tests referencing the removed formats have been pruned (e.g., Q5_1 layout micro test).
 3. Numeric ids for removed formats are reserved; they will not be repurposed to avoid silent misinterpretation.
+
+## Matrix Multiplication Backends
+
+Llaminar supports three matrix multiplication backends, each optimized for different operation profiles:
+
+### 1. OpenBLAS (Baseline - Always Available)
+
+**Purpose**: Fast, reliable single-node BLAS operations with multi-threading support.
+
+**Optimal Use Cases**:
+- Small operations (< 8K elements): Single-threaded to minimize overhead
+- Medium operations (8K - 8M elements): Multi-threaded within socket
+- Decode phase: Low-latency single-token generation
+- FP32 fallback: When quantization/distributed paths unavailable
+
+**Performance Characteristics**:
+- Single token decode: ~1.04 tok/s (Q8_0, Debug build)
+- Prefill (8 tokens): ~6.58 tok/s
+- Prefill (512 tokens): ~33.60 tok/s
+- 134× faster than COSMA for single-token operations
+
+**Build Configuration**:
+```bash
+# OpenBLAS is always linked (default)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+**Environment Variables**:
+- `OMP_NUM_THREADS`: Thread count (auto-set by run_llaminar.sh to physical cores per socket)
+- `OPENBLAS_NUM_THREADS`: Override OpenBLAS-specific threading
+- `KMP_AFFINITY`, `KMP_BLOCKTIME`: Intel OpenMP runtime tuning
+
+### 2. COSMA (Distributed - Large Prefill)
+
+**Purpose**: Distributed matrix multiplication for large context construction across MPI ranks.
+
+**Optimal Use Cases**:
+- Large prefill operations (≥ 4096 tokens by default)
+- Very large operations (≥ 64K tokens): Can be 3.6× faster than local OpenBLAS
+- Multi-node deployment with high-bandwidth interconnect
+- Memory-bound operations benefiting from distributed layout
+
+**Engagement Criteria** (all must be satisfied):
+1. `seq_len >= LLAMINAR_COSMA_PREFILL_THRESHOLD` (default 4096)
+2. MPI world size > 1 (multi-rank execution)
+3. `ADAPTIVE_DISABLE_COSMA` environment variable NOT set
+4. Operation size exceeds fast path threshold
+
+**Build Configuration**:
+```bash
+# COSMA is included via git submodule
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+  -DCOSMA_WITH_PROFILING=OFF \
+  -DBUILD_SHARED_LIBS=OFF
+cmake --build build --parallel
+```
+
+**Environment Variables**:
+| Variable | Purpose | Default |
+|----------|---------|--------|
+| `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Sequence length threshold to enable COSMA | 4096 |
+| `ADAPTIVE_DISABLE_COSMA` | Force all ops to OpenBLAS path | Unset (COSMA enabled) |
+| `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft memory budget per allocation | 2048 MB |
+| `LLAMINAR_COSMA_VALIDATE_TILE` | Tile size for OpenBLAS spot-check (debugging) | 0 (disabled) |
+| `LLAMINAR_COSMA_LOG_LEVEL` | Verbosity (`trace`/`debug`/`info`/`warn`/`error`) | info |
+| `LLAMINAR_COSMA_DUMP_STATS` | Emit counters at shutdown | 0 (disabled) |
+
+**Performance Notes**:
+- Communication overhead dominates for small operations (< 64 tokens)
+- Becomes competitive at ≥ 8K tokens
+- Best for sustained large context (e.g., document summarization, RAG)
+
+### 3. Intel MKL (BF16 Acceleration - Optional)
+
+**Purpose**: Hardware-accelerated BF16 (bfloat16) matrix multiplication for quantized inference.
+
+**Optimal Use Cases**:
+- BF16-quantized weight inference (when `LLAMINAR_QUANT_BF16_GEMM=1`)
+- Large prefill with quantized models
+- Intel CPUs with AVX512_BF16 support (Ice Lake, Sapphire Rapids) for hardware acceleration
+- Production deployments requiring maximum BF16 performance
+
+**Why MKL?** Provides hardware-accelerated BF16 GEMM on Ice Lake+ CPUs and optimized software emulation on older architectures. While OpenBLAS BF16 emulation is now verified working (v0.3.26, October 2025), Intel MKL offers better performance on supported hardware.
+
+**Note**: Earlier concerns about OpenBLAS BF16 bugs (January 2025) were resolved after comprehensive testing - OpenBLAS v0.3.26 verified working correctly on Cascade Lake without NaN issues.
+
+**Backend Selection Priority** (when `LLAMINAR_QUANT_BF16_GEMM=1`):
+1. **Try Intel MKL** `cblas_sbgemm` (default when `HAVE_MKL` defined - hardware accelerated on Ice Lake+)
+2. **Try OpenBLAS** `cblas_sbgemm` (verified working in v0.3.26 - software emulation reliable)
+3. **Fallback to FP32** expansion + `cblas_sgemm` (rarely needed - both backends verified working)
+
+**Build Configuration**:
+```bash
+# Build with Intel MKL support
+cmake -B build_mkl -S . -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/opt/intel/oneapi/mkl/latest" \
+  -DUSE_MKL=ON
+cmake --build build_mkl --parallel
+
+# Verify MKL linkage
+ldd build_mkl/llaminar | grep mkl
+# Expected: libmkl_intel_lp64.so, libmkl_core.so, libmkl_gnu_thread.so
+```
+
+**Environment Variables**:
+| Variable | Purpose | Default / Notes |
+|----------|---------|----------------|
+| `LLAMINAR_QUANT_BF16_GEMM` | Enable BF16 GEMM path | 0 (disabled) - Set to 1 to activate |
+| `LLAMINAR_QUANT_BF16_PREFER_MKL` | **DEPRECATED** - MKL now default | Set to 0 to force OpenBLAS BF16 |
+| `MKL_NUM_THREADS` | MKL-specific thread count | Inherits from `OMP_NUM_THREADS` |
+| `MKL_DYNAMIC` | Dynamic thread adjustment | false (static recommended) |
+
+**Parity Testing** (Oct 2025):
+- ✅ **387/387 stages passing** vs PyTorch ground truth
+- ✅ Max relative L2 error: < 1e-4 (well within FP32 tolerance)
+- ✅ All prefill projections (Q/K/V, FFN gate/up/down, LM head) validated
+- ✅ Identical results to OpenBLAS on Ice Lake (hardware BF16)
+- ✅ OpenBLAS BF16 emulation verified working (v0.3.26, Cascade Lake - no NaN issues)
+
+**Performance Characteristics**:
+- Expected: Within 3% of FP32 baseline (same FLOPs, half bandwidth)
+- Memory: 2× savings vs FP32 (16-bit vs 32-bit storage)
+- Throughput: Primarily memory-bound, not compute-bound on current hardware
+
+**When NOT to use MKL BF16**:
+- Decode phase: Overhead exceeds benefit for single-token ops
+- Small prefill (< 512 tokens): FP32 OpenBLAS faster due to setup cost
+- ARM or AMD CPUs: No AVX512_BF16 support (use OpenBLAS)
+- Debug builds: Validation overhead masks performance benefits
+
+### Backend Selection Decision Tree
+
+```
+Operation Request
+│
+├─ BF16 quantized weight? (LLAMINAR_QUANT_BF16_GEMM=1)
+│  ├─ HAVE_MKL defined?
+│  │  ├─ Yes → Intel MKL cblas_sbgemm
+│  │  └─ No → OpenBLAS cblas_sbgemm (or FP32 fallback if unavailable)
+│  └─ No → Continue to size-based selection
+│
+├─ Very small op? (< 8K elements)
+│  └─ Single-threaded OpenBLAS (minimal overhead)
+│
+├─ Large prefill? (seq_len ≥ 4096 AND world_size > 1)
+│  ├─ COSMA available AND not disabled?
+│  │  └─ COSMA distributed path
+│  └─ Multi-threaded OpenBLAS
+│
+└─ Default: Multi-threaded OpenBLAS
+```
+
+### Comparison Matrix
+
+| Backend | Latency | Throughput | Memory | Best For | MPI Required |
+|---------|---------|------------|--------|----------|-------------|
+| OpenBLAS | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | Standard | Decode, small prefill | No |
+| COSMA | ⭐⭐ | ⭐⭐⭐⭐⭐ | Distributed | Large prefill (≥4K tokens) | Yes (np>1) |
+| Intel MKL | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 50% saved | BF16 quantized inference | No |
+
+### Testing Backend Correctness
+
+```bash
+# OpenBLAS parity test
+ctest --test-dir build -R "ParityFramework.OpenBLASPrefillVsPyTorch" --verbose
+
+# COSMA parity test (requires MPI)
+mpirun -np 2 ctest --test-dir build -R "ParityFramework.COSMAPrefillVsPyTorch" --verbose
+
+# Intel MKL parity test (requires build_mkl)
+ctest --test-dir build_mkl -R "ParityFramework.MKLPrefillVsPyTorch" --verbose
+
+# All three backends
+GTEST_FILTER="ParityFramework.*VsPyTorch" \
+  ctest --test-dir build_mkl -R "ParityFrameworkTest" --verbose
+```
+
+### Debugging Backend Selection
+
+```bash
+# Force OpenBLAS path (disable COSMA)
+export ADAPTIVE_DISABLE_COSMA=1
+./run_llaminar.sh -m model.gguf -v
+
+# Force MKL BF16 path
+export LLAMINAR_QUANT_BF16_GEMM=1
+./run_llaminar.sh -m model.gguf -v
+
+# Force OpenBLAS BF16 (bypass MKL)
+export LLAMINAR_QUANT_BF16_GEMM=1
+export LLAMINAR_QUANT_BF16_PREFER_MKL=0
+./run_llaminar.sh -m model.gguf -v
+
+# Validate COSMA tiles (debugging only)
+export LLAMINAR_COSMA_VALIDATE_TILE=64
+mpirun -np 2 ./run_llaminar.sh -m model.gguf -v
+```
 
 ## COSMA Prefill (Phase 1)
 

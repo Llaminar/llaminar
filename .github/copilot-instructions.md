@@ -2,25 +2,82 @@
 
 This document provides comprehensive guidelines for working with the Llaminar LLM inference engine, including build processes, debugging techniques, and kernel development best practices learned from our MPI and performance optimization work.
 
+**⚠️ Architecture Note**: Llaminar has two parallel architectures:
+- **V1 (Production)**: `src/` - Operator-based MPI distributed inference (fully functional)
+- **V2 (Development)**: `src/v2/` - Operator-free kernel-centric design (in development)
+
+Most sections in this document apply to **V1**. For V2-specific guidance, see `.github/instructions/llaminar-v2-architecture.instructions.md`.
+
 ## Table of Contents
-- [Project Overview](#project-overview)
+- [Architecture Overview (V1 vs V2)](#architecture-overview-v1-vs-v2)
+- [Project Overview (V1)](#project-overview-v1)
 - [Build System](#build-system)
-- [Testing Guidelines](#testing-guidelines)
+- [Testing Guidelines (V1)](#testing-guidelines-v1)
 - [Debugging with GDB](#debugging-with-gdb)
-- [Kernel Development](#kernel-development)
+- [Kernel Development (V1)](#kernel-development-v1)
+- [Kernel Development (V2)](#kernel-development-v2)
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
-- [COSMA vs OpenBLAS Integration](#cosma-vs-openblas-integration)
+- [COSMA vs OpenBLAS Integration (V1)](#cosma-vs-openblas-integration-v1)
 - [Code Quality Guidelines](#code-quality-guidelines)
+- [Documentation Standards](#documentation-standards)
 
-## Project Overview
+## Architecture Overview (V1 vs V2)
+
+### V1 Architecture (Production - `src/`)
+
+**Design Philosophy**: Operator-based MPI distributed inference
+
+**Key Characteristics**:
+- ✅ **Production Ready**: Fully functional Qwen inference with MPI distribution
+- ✅ **Operator Abstraction**: `MPILinearOperator`, `MPIAttentionOperator`, etc.
+- ✅ **Centralized Backend Selection**: MatMulBackendSelector for OpenBLAS/COSMA/MKL
+- ✅ **Parity Testing**: PyTorch ground truth validation
+- ✅ **Batch Processing**: BatchQwenPipeline for multi-sequence throughput
+
+**When to use V1**:
+- Production inference workloads
+- MPI multi-node distributed execution
+- Batch processing (multi-user serving)
+- When you need proven, tested code
+
+### V2 Architecture (Development - `src/v2/`)
+
+**Design Philosophy**: Operator-free kernel-centric design
+
+**Key Characteristics**:
+- 🔄 **In Development**: Basic pipeline structure, not feature-complete
+- 🎯 **No Operator Layer**: Pipelines call kernels directly
+- 🎯 **Per-Tensor Device Affinity**: Each tensor knows its device placement
+- 🎯 **Heterogeneous Execution**: Mix CUDA, ROCm, Vulkan in single run
+- 🎯 **IBlockDecoder Pattern**: Generic quantized GEMM kernel (see V2 kernel development)
+
+**When to use V2**:
+- Experimenting with new architectures
+- Multi-GPU heterogeneous execution (future)
+- Learning the next-generation design
+- Contributing to V2 development
+
+**Migration Status**:
+- ✅ Basic infrastructure (tensors, kernels, backends)
+- ✅ IQ4_NL quantized tensor with fused GEMM
+- ✅ Generic QuantizedGemmKernel (IBlockDecoder pattern)
+- ❌ Full pipeline implementation (incomplete)
+- ❌ MPI distribution (not yet ported)
+- ❌ Production testing (not validated)
+
+**See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for comprehensive V2 documentation.
+
+---
+
+## Project Overview (V1)
 
 Llaminar is a high-performance, distributed LLM inference engine built on:
 - **Multi-Architecture Pipeline System**: Factory-based extensible architecture for Qwen, LLaMA, and future models
-- **Centralized Backend Selection**: Single decision point via MatMulBackendSelector for OpenBLAS vs COSMA
+- **Centralized Backend Selection**: Single decision point via MatMulBackendSelector for OpenBLAS, COSMA, and Intel MKL
 - **Hybrid Tensor System**: Zero-copy COSMA optimization with backward compatibility
 - **MPI Distribution**: Multi-node inference with NUMA-aware deployment
-- **Adaptive Backends**: OpenBLAS for small operations, COSMA for large-scale distributed computing
+- **Adaptive Backends**: OpenBLAS (baseline), COSMA (distributed), Intel MKL (BF16 acceleration)
 - **Comprehensive Observability**: Structured environment snapshot, performance counters, validation framework
 
 ### Pipeline Architecture
@@ -50,7 +107,7 @@ All transformer operations are implemented as MPI-aware operators in `src/operat
 Each operator handles:
 - Tensor partition specifications (which dimensions are sharded vs replicated)
 - MPI collective operations (Allreduce, broadcast, gather)
-- Backend selection (OpenBLAS vs COSMA for large operations)
+- Backend selection (OpenBLAS, COSMA, or Intel MKL based on operation characteristics)
 - NUMA-aware memory allocation
 
 ### Batch Processing Architecture
@@ -139,7 +196,7 @@ For details, see:
 - ✅ Memory-constrained environments
 - ✅ Variable-length sequences with large variance
 
-**Benchmark script:**
+**Benchmark scripts:**
 ```bash
 # Compare batch vs sequential performance
 ./run_batch_performance.sh
@@ -148,6 +205,13 @@ For details, see:
 # - Throughput improvement (tokens/sec)
 # - Memory overhead
 # - Scaling with batch size
+
+# Run any benchmark with optimal MPI/OpenMP settings
+./run_benchmark.sh <benchmark_executable> [args...]
+
+# Examples:
+./run_benchmark.sh benchmark_iq4nl_gemm
+./run_benchmark.sh test_batch_performance --gtest_filter='*.Scaling'
 ```
 
 ### Key Architecture Components
@@ -165,8 +229,10 @@ For details, see:
 - `src/LlamaPipelineAdapter.{h,cpp}`: LLaMA adapter (prototype)
 
 **Backend and Execution:**
-- `src/MatmulBackendSelection.{h,cpp}`: Centralized backend decision logic (OpenBLAS vs COSMA)
+- `src/MatmulBackendSelection.{h,cpp}`: Centralized backend decision logic (OpenBLAS, COSMA, Intel MKL)
 - `src/BackendSelector.{h,cpp}`: Backend selection infrastructure
+- `src/AdaptiveMatmul.{h,cpp}`: Adaptive matrix multiplication with BF16 quantization support
+- `src/backends/MKLBackend.{h,cpp}`: Intel MKL BF16 GEMM backend (optional, enabled with -DUSE_MKL=ON)
 - `src/CosmaPrefillManager.{h,cpp}`: COSMA distributed prefill coordination
 - `src/CosmaPrefillProvider.{h,cpp}`: COSMA-specific prefill implementation
 - `src/OpenblasPrefillProvider.{h,cpp}`: OpenBLAS prefill implementation
@@ -192,7 +258,7 @@ For details, see:
 
 ## Build System
 
-### Standard Build Process
+### V1 Build Process
 
 ```bash
 # Debug build (development)
@@ -206,9 +272,36 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
   -DCOSMA_SCALAPACK=CUSTOM \
   -DCOSMA_SCALAPACK_LINK_LIBRARIES=/usr/lib/x86_64-linux-gnu/libscalapack-openmpi.so
 cmake --build build --parallel
+
+# Intel MKL-enabled build (BF16 support)
+cmake -B build_mkl -S . -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/opt/intel/oneapi/mkl/latest" \
+  -DUSE_MKL=ON \
+  -DCOSMA_WITH_PROFILING=OFF \
+  -DBUILD_SHARED_LIBS=OFF
+cmake --build build_mkl --parallel
 ```
 
-### Available Build Targets
+### V2 Build Process
+
+```bash
+# V2 Debug build (experimental)
+cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build_v2 --parallel
+
+# V2 Release build
+cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --parallel
+
+# Run V2 (device enumeration)
+./build_v2/src/v2/llaminar2 --list-devices
+```
+
+**V2 Build Targets**:
+- `llaminar2_core`: Core V2 library
+- `llaminar2`: V2 executable (minimal functionality)
+
+### Available Build Targets (V1)
 
 ```bash
 # Core library only
@@ -241,12 +334,15 @@ The project includes predefined VS Code tasks:
 Always use the canonical launch script for optimal performance:
 
 ```bash
-# Canonical way to run Llaminar
+# Canonical way to run Llaminar (RELEASE mode)
 ./run_llaminar.sh [arguments]
 
-# Examples
+# DEBUG mode version (for smoke testing new features with debug logging etc):
+./run_llaminar_debug.sh [arguments]
+
+# Examples (RELEASE mode builds)
 ./run_llaminar.sh -v --print-topology
-./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v # [any other arguments...]
 ```
 
 ## Benchmark Mode
@@ -256,18 +352,11 @@ Always use the canonical launch script for optimal performance:
 Llaminar provides a dedicated `--benchmark` mode for clean performance measurement:
 
 ```bash
-# Recommended: Use canonical launcher
+# Recommended: Use canonical launcher (RELEASE mode)
 ./run_llaminar.sh --benchmark \
   -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
   -p "Your prompt here" \
   -n 50
-
-# Direct MPI execution (2 processes)
-mpirun -np 2 --bind-to socket --map-by socket \
-  ./build/llaminar --benchmark \
-  -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
-  -p "Explain machine learning." \
-  -n 100
 ```
 
 ### Benchmark Features
@@ -335,8 +424,8 @@ mpirun -np 2 --bind-to socket --map-by socket \
 
 ```bash
 # 1. Use Release builds for accurate timing
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build_release --parallel
 
 # 2. Disable heavy instrumentation
 unset LLAMINAR_COSMA_VALIDATE_TILE
@@ -354,6 +443,10 @@ unset LLAMINAR_EMBED_TRACE
 # 5. Use phase-specific modes to isolate performance
 ./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128  # Decode-only
 ./run_llaminar.sh --benchmark -m model.gguf -n 0          # Prefill-only
+
+# 6. For component benchmarks, use the generic benchmark runner
+./run_benchmark.sh benchmark_iq4nl_gemm         # IQ4_NL GEMM performance
+./run_benchmark.sh test_batch_performance       # Batch scaling tests
 ```
 
 ### Performance Notes
@@ -394,6 +487,58 @@ Llaminar includes several specialized performance testing scripts:
   - Validates throughput improvements from batching
   - Measures memory overhead and scaling characteristics
 
+### Generic Benchmark Runner
+
+For component-level performance benchmarking, use the **generic benchmark runner** which provides canonical MPI/OpenMP configuration for any benchmark executable:
+
+```bash
+# Run any benchmark with optimal settings (auto-detects in build_release/)
+./run_benchmark.sh benchmark_iq4nl_gemm
+
+# With full path
+./run_benchmark.sh ./build_release/test_performance
+
+# Pass arguments (GTest filters, etc)
+./run_benchmark.sh test_batch_performance --gtest_filter='*.ThroughputScaling'
+
+# Override MPI/OpenMP settings if needed
+LLAMINAR_MPI_PROCS=4 ./run_benchmark.sh my_benchmark
+OMP_NUM_THREADS=16 ./run_benchmark.sh my_benchmark
+```
+
+**Features:**
+- **Automatic path detection**: Searches `build_release/` and `build/` directories
+- **Topology auto-detection**: Detects sockets, cores, hyperthreading
+- **Canonical settings**: Same MPI/OpenMP configuration as `run_llaminar.sh`
+- **Argument forwarding**: Passes all extra arguments to the benchmark
+- **Environment overrides**: Customize via `LLAMINAR_MPI_PROCS`, `OMP_NUM_THREADS`
+
+**Convenience Wrappers:**
+```bash
+# Specialized wrapper for IQ4_NL GEMM benchmark
+./run_iq4nl_benchmark.sh  # Delegates to run_benchmark.sh
+
+# These are equivalent:
+./run_iq4nl_benchmark.sh
+./run_benchmark.sh benchmark_iq4nl_gemm
+```
+
+**Creating New Benchmarks:**
+```bash
+# 1. Create benchmark source (e.g., tests/benchmark_my_feature.cpp)
+# 2. Add to CMakeLists.txt
+add_executable(benchmark_my_feature tests/benchmark_my_feature.cpp)
+target_link_libraries(benchmark_my_feature llaminar_core)
+
+# 3. Build it
+cmake --build build_release --target benchmark_my_feature --parallel
+
+# 4. Run with optimal settings
+./run_benchmark.sh benchmark_my_feature
+```
+
+**See also:** `BENCHMARK_RUNNER_GUIDE.md` for comprehensive documentation including usage examples, configuration details, and troubleshooting.
+
 ### Canonical Environment Variables
 
 ```bash
@@ -422,11 +567,13 @@ mpirun -np 2 --bind-to socket --map-by socket \
   --report-bindings ./build/llaminar
 ```
 
-## Testing Guidelines
+## Testing Guidelines (V1)
+
+**Note**: This section describes V1 testing infrastructure. V2 testing is minimal and under development.
 
 ### Test Organization
 
-Llaminar has a comprehensive test suite organized into several categories:
+Llaminar V1 has a comprehensive test suite organized into several categories:
 
 1. **Smoke Tests** (~5s): Fast sanity checks for core functionality
 2. **Unit Tests** (~2m30s): Individual component validation (no model loading)
@@ -466,7 +613,7 @@ ctest --test-dir build --output-on-failure --verbose \
   -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -150
 
 # Parity Integration (220s) with a GTEST filter to target only PyTorch parity tests in the suite:
-GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
+GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.MKLPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
 
 # Integration Tests (3m0s)
 ctest --test-dir build --output-on-failure --verbose \
@@ -585,11 +732,13 @@ mpirun -np 2 numactl --cpubind=0 ./build/llaminar : numactl --cpubind=1 ./build/
 timeout 60 mpirun -np 2 ./build/llaminar
 ```
 
-## Kernel Development
+## Kernel Development (V1)
+
+**Note**: This section describes V1 operator-based kernel development. For V2's operator-free approach, see [Kernel Development (V2)](#kernel-development-v2).
 
 ### Kernel Base Classes
 
-All kernels should inherit from appropriate base classes:
+All V1 kernels should inherit from appropriate base classes:
 ```cpp
 // For MPI-aware kernels
 class MyKernel : public MPIKernelBase {
@@ -667,6 +816,138 @@ bool MyKernel::execute(const std::vector<std::shared_ptr<TensorBase>>& inputs,
     }
 }
 ```
+
+## Kernel Development (V2)
+
+**Purpose**: V2 kernel development follows the **operator-free design** with direct pipeline orchestration and the **IBlockDecoder strategy pattern** for quantized tensors.
+
+### Core V2 Principles
+
+1. **No Operator Layer**: Pipelines call kernels directly (no `MPILinearOperator`, etc.)
+2. **Per-Tensor Device Affinity**: Tensors know their device placement
+3. **Strategy Pattern**: Generic kernels + format-specific decode strategies
+4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
+
+### IBlockDecoder Strategy Pattern
+
+**Problem**: Quantized tensors (IQ4_NL, Q6_K, Q8_0) need format-specific decode logic, but we want a **single generic GEMM kernel**.
+
+**Solution**: IBlockDecoder interface + QuantizedGemmKernel
+
+```cpp
+// src/v2/tensors/TensorKernels.h
+class IBlockDecoder {
+public:
+    __attribute__((always_inline))
+    virtual void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const = 0;
+    
+    __attribute__((always_inline))
+    virtual const void* get_raw_block_at(size_t row_idx, size_t k_block_offset) const = 0;
+    
+    __attribute__((always_inline))
+    virtual size_t block_size() const = 0;
+};
+
+// src/v2/tensors/Tensors.h
+class IQ4_NLTensor : public TensorBase, public IBlockDecoder {
+    // Inline implementation for zero overhead
+    void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
+        const IQ4_NLBlock& block = blocks_[row_idx * blocks_per_row_ + k_block_offset];
+        decodeBlock(block, output);  // Format-specific decode
+    }
+    
+    size_t block_size() const override { return 32; }  // IQ4_NL: 32 elements/block
+    
+    std::unique_ptr<ITensorGemm> createGemm() const override {
+        return std::make_unique<QuantizedGemmKernel>(this);  // Generic kernel
+    }
+};
+
+// src/v2/kernels/cpu/QuantizedGemm.h
+class QuantizedGemmKernel : public ITensorGemm {
+    const IBlockDecoder* decoder_;  // Strategy interface
+    
+    bool multiply(...) override {
+        // Generic implementation works for all quantized formats
+        decoder_->decode_block_at(j, kb, B_block);  // Inlined (zero overhead)
+        // ... accumulate ...
+    }
+};
+```
+
+**Benefits**:
+- ✅ **Code Reuse**: ~350 lines generic kernel vs ~1000 lines per format
+- ✅ **Zero Overhead**: `always_inline` eliminates virtual dispatch
+- ✅ **Extensibility**: New formats just implement IBlockDecoder
+
+### Adding New Quantized Formats (V2)
+
+```cpp
+// tensors/Q6_KTensor.h
+class Q6_KTensor : public TensorBase, public IBlockDecoder {
+public:
+    void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
+        const Q6_KBlock& block = blocks_[row_idx * blocks_per_row_ + k_block_offset];
+        decodeQ6KBlock(block, output);  // Q6_K-specific decode
+    }
+    
+    size_t block_size() const override { return 256; }  // Q6_K: 256 elements/block
+    
+    std::unique_ptr<ITensorGemm> createGemm() const override {
+        return std::make_unique<QuantizedGemmKernel>(this);  // Reuse generic kernel!
+    }
+    
+private:
+    static void decodeQ6KBlock(const Q6_KBlock& block, float* output);
+};
+```
+
+**Result**: Single QuantizedGemmKernel works for IQ4_NL, Q6_K, Q8_0, etc.
+
+### V2 Kernel Interface Design
+
+All V2 kernels implement ITensor* interfaces:
+
+```cpp
+// src/v2/tensors/TensorKernels.h
+class ITensorGemm {
+public:
+    virtual bool multiply(const float* A, float* C, int m, int n, int k, ...) = 0;
+};
+
+class ITensorAttention {
+public:
+    virtual bool execute(const TensorBase* Q, const TensorBase* K, 
+                        const TensorBase* V, TensorBase* output, ...) = 0;
+};
+
+class ITensorRoPE {
+public:
+    virtual bool execute(TensorBase* tensor, const RoPEParams& params) = 0;
+};
+```
+
+**Key Difference from V1**: No MPI context in kernel interfaces (handled by pipeline)
+
+### V2 Pipeline Orchestration
+
+```cpp
+// src/v2/pipelines/QwenPipeline.cpp
+bool QwenPipeline::attention_block(int layer, TensorBase* in, TensorBase* out) {
+    // Direct kernel calls (no operators!)
+    auto device = device_mgr_.selectDevice(in->size_bytes(), OperationType::ATTENTION);
+    auto gemm = device->getGemmKernel();
+    auto rope = device->getRoPEKernel();
+    
+    auto Q = allocateTensor({seq_len, d_model});
+    gemm->execute(in, weights_.wq[layer], Q.get(), {});  // Q projection
+    
+    rope->execute(Q.get(), {.seq_offset = 0, .theta_base = 10000.0f});
+    // ... etc
+}
+```
+
+**See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for complete V2 documentation.
 
 ## MPI Development Best Practices
 
@@ -876,7 +1157,9 @@ cmake --build build_release --target test_batch_performance --parallel
 ./run_batch_performance.sh --filter '*PrefillThroughputScaling'
 ```
 
-## COSMA vs OpenBLAS Integration
+## COSMA vs OpenBLAS Integration (V1)
+
+**Note**: This section applies to V1 architecture. V2 backend selection works differently (per-tensor device affinity).
 
 ### When to Use Each Backend
 
@@ -931,6 +1214,30 @@ bool execute_with_fallback(const TensorInputs& inputs) {
     
     // Fallback to reliable OpenBLAS
     return execute_openblas_path(inputs);
+}
+
+// BF16 quantized path with MKL default (OpenBLAS verified working)
+bool execute_bf16_matmul(const float* A, const bfloat16_t* B, float* C, int m, int n, int k) {
+    #ifdef HAVE_MKL
+        // Try Intel MKL cblas_sbgemm (default when MKL available - hardware accelerated on Ice Lake+)
+        try {
+            return MKLBackend::multiply_bf16(A, B, C, m, n, k);
+        } catch (const std::exception& e) {
+            LOG_WARN("MKL BF16 failed: " << e.what() << ", trying OpenBLAS");
+        }
+    #endif
+    
+    // Fallback to OpenBLAS BF16 (verified working in v0.3.26 - software emulation reliable)
+    if (debugEnv().quant.bf16_prefer_mkl == 0) {
+        try {
+            return OpenBLASBackend::multiply_bf16(A, B, C, m, n, k);
+        } catch (const std::exception& e) {
+            LOG_WARN("OpenBLAS BF16 failed: " << e.what() << ", expanding to FP32");
+        }
+    }
+    
+    // Final fallback: FP32 expansion (rarely needed - both backends work)
+    return multiply_fp32_fallback(A, B, C, m, n, k);
 }
 ```
 
@@ -1000,6 +1307,7 @@ if (registry.get_snapshot(key, snapshot)) {
 **Tests:**
 - `COSMAPrefillVsPyTorch`: COSMA backend vs PyTorch (prefill phase)
 - `OpenBLASPrefillVsPyTorch`: OpenBLAS backend vs PyTorch (prefill phase)
+- `MKLPrefillVsPyTorch`: Intel MKL BF16 backend vs PyTorch (prefill phase)
 - `TrueIncrementalDecodeVsPyTorch`: Incremental decode vs PyTorch (autoregressive)
 
 **Status**: ✅ All passing with <0.1% relative error
@@ -1191,6 +1499,12 @@ Use these to control verbosity, backend selection, and validation when working o
 |----------|-------------|----------------------|---------------|
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
 | `LLAMINAR_DEQUANT_ANOMALIES` | Emits warnings for anomalous Q6_K (and future) values (NaN/Inf/huge). | Disabled unless set. | Dequant safety diagnostics |
+| `LLAMINAR_QUANT_OUTPUT_BF16` | Enable BF16 activation storage (Phase 5). | 0 (off) | Activation memory optimization |
+| `LLAMINAR_FORCE_FP32_RMSNORM` | Force FP32 for RMSNorm (safety-first). | 1 (on, force FP32) | Numerical stability |
+| `LLAMINAR_ALLOW_BF16_RMSNORM` | Allow BF16 RMSNorm (experimental). | 0 (off) | Numerical stability |
+| `LLAMINAR_FORCE_FP32_SOFTMAX` | Force FP32 for Softmax. | 1 (on, force FP32) | Numerical stability |
+| `LLAMINAR_ALLOW_BF16_SOFTMAX` | Allow BF16 Softmax (experimental). | 0 (off) | Numerical stability |
+| `LLAMINAR_FORCE_FP32_LOGITS` | Force FP32 for logits output. | 1 (on, force FP32) | Output precision |
 | `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Sequence length threshold to switch to COSMA prefill path. | 4096 | Prefill path gating |
 | `ADAPTIVE_DISABLE_COSMA` | Force all operations down OpenBLAS/adaptive local path. | Unset (COSMA enabled when threshold met) | Backend selection override |
 | `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft memory budget for COSMA working set; fallback if exceeded. | 2048 | Memory safety / preflight |
@@ -1205,6 +1519,17 @@ Use these to control verbosity, backend selection, and validation when working o
 # Rich dequant + anomaly diagnostics
 export LLAMINAR_DEQUANT_STATS=1
 export LLAMINAR_DEQUANT_ANOMALIES=1
+
+# Enable BF16 activation storage (Phase 5)
+export LLAMINAR_QUANT_OUTPUT_BF16=1
+export LLAMINAR_FORCE_FP32_RMSNORM=0     # Must explicitly disable force flag
+export LLAMINAR_ALLOW_BF16_RMSNORM=1     # Then enable BF16 support
+
+# NOTE: FORCE_FP32 and ALLOW_BF16 flags are INDEPENDENT (not mutually exclusive)
+# To enable BF16 for an operation, you must:
+#   1. Set ALLOW_BF16_<operation>=1
+#   2. Set FORCE_FP32_<operation>=0
+# Both conditions must be true for BF16 to be used.
 
 # Force baseline path (skip COSMA) for A/B perf comparison
 export ADAPTIVE_DISABLE_COSMA=1
@@ -1335,29 +1660,38 @@ Disable heavy validation & trace logging prior to performance measurement to ens
 ### Key Documentation Files
 
 **Developer Guidelines:**
-- **`.github/copilot-instructions.md`** (this file): Comprehensive development guidelines
-- **`.github/instructions/parity-test-framework.instructions.md`**: Complete parity testing guide
-- **`.github/instructions/llaminar-architecture.instructions.md`**: Architecture deep dive
+- **`.github/copilot-instructions.md`** (this file): Comprehensive development guidelines for V1 and V2
+- **`.github/instructions/llaminar-v2-architecture.instructions.md`**: Complete V2 architecture documentation
+- **`.github/instructions/parity-test-framework.instructions.md`**: V1 parity testing guide
 
 **Performance and Benchmarking:**
-- `./run_llaminar.sh`: Canonical launcher with optimal MPI/OpenMP settings
-- `./run_batch_performance.sh`: Batch vs sequential performance comparison
-- `./run_pytorch_parity_test.sh`: PyTorch parity testing with metrics
-- `./run_performance_demo.sh`: Production-style adaptive matmul demo
+- `./run_llaminar.sh`: Canonical V1 launcher with optimal MPI/OpenMP settings (RELEASE mode: `build_release/`)
+- `./run_llaminar_debug.sh`: V1 debug version of the above launcher (DEBUG mode: `build/`)
+- `./run_batch_performance.sh`: V1 batch vs sequential performance comparison
+- `./run_pytorch_parity_test.sh`: V1 PyTorch parity testing with metrics
+- `./run_performance_demo.sh`: V1 production-style adaptive matmul demo
 
 **Model Support:**
-- Qwen 2.5 family: Fully supported (0.5B-72B)
-- LLaMA 3.x: Prototype support (adapter exists)
-- Quantization: Q4_0, Q6_K, Q8_0, F16, F32
+- **V1**: Qwen 2.5 family (0.5B-72B), LLaMA 3.x (prototype)
+- **V2**: Basic infrastructure only (not production-ready)
+- **Quantization**: Q4_0, Q6_K, Q8_0, IQ4_NL, F16, F32
 
-**Key Source Directories:**
-- `src/`: Core inference engine
+**Key Source Directories (V1):**
+- `src/`: Core V1 inference engine
 - `src/operators/`: MPI-aware transformer operators
 - `src/tensors/`: Hybrid tensor system (SimpleTensor, COSMATensor)
 - `src/backends/`: Backend implementations (OpenBLAS, COSMA, CUDA/ROCm stubs)
 - `src/weights/`: Weight loading and verification
 - `src/utils/`: Utilities (logging, performance tracing, environment config)
 - `tests/`: Comprehensive test suite (unit, integration, parity)
+
+**Key Source Directories (V2):**
+- `src/v2/`: V2 operator-free architecture
+- `src/v2/tensors/`: Tensor base classes, quantized tensors (IQ4_NL)
+- `src/v2/kernels/`: Kernel implementations (CPU, CUDA, ROCm, Vulkan)
+- `src/v2/pipelines/`: Pipeline orchestration (QwenPipeline)
+- `src/v2/backends/`: Backend device management
+- `src/v2/utils/`: V2-specific utilities (MPIContext, CPUFeatures)
 
 ### Writing Documentation and Changelogs
 
@@ -1384,23 +1718,34 @@ When we write documentation and changelogs at the end of our work runs:
 
 ### Project Status (October 2025)
 
-**Production Ready:**
+**V1 Production Ready:**
 - ✅ Sequential Qwen inference (0.5B-72B)
 - ✅ Multi-rank MPI distribution
 - ✅ OpenBLAS backend (all sizes)
+- ✅ Intel MKL backend (BF16 quantized inference)
 - ✅ COSMA backend (large prefill ≥8K tokens)
 - ✅ NUMA-aware memory allocation
 - ✅ PyTorch parity tests (prefill + decode)
-- ✅ Batch attention parity (8/8 stages)
+- ✅ Batch attention parity (17/17 stages)
 
-**In Progress:**
-- 🔄 Batch pipeline full validation (attention ✅, FFN/LM head 🔍)
+**V1 In Progress:**
+- 🔄 Batch pipeline full validation (attention ✅, FFN/LM head ✅)
 - 🔄 LLaMA adapter completion
 - 🔄 CUDA/ROCm backend integration
 
-**Experimental:**
-- 🧪 Graph-based execution (deprecated, may be removed)
-- 🧪 Adaptive transformer pipeline
+**V2 Development Status:**
+- ✅ Basic infrastructure (tensors, kernels, backends)
+- ✅ IQ4_NL quantized tensor with IBlockDecoder pattern
+- ✅ Generic QuantizedGemmKernel (335-451 GFLOPS)
+- ✅ FP32/BF16 tensor types
+- ✅ Device enumeration (CPU, CUDA, ROCm, Vulkan stubs)
+- ❌ Full pipeline implementation (incomplete)
+- ❌ MPI distribution (not yet ported)
+- ❌ Production testing (not validated)
+
+**Deprecated/Experimental:**
+- 🧪 Graph-based execution (V1, deprecated, may be removed)
+- 🧪 Adaptive transformer pipeline (V1, experimental)
 
 ### Getting Help
 

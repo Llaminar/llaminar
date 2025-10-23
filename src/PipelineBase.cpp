@@ -81,9 +81,36 @@ namespace llaminar
         return TensorFactory::create_simple(shape);
     }
 
-    std::shared_ptr<TensorBase> PipelineBase::createLocalTensor(const std::vector<int> &shape)
+    std::shared_ptr<TensorBase> PipelineBase::createLocalTensor(const std::vector<int> &shape, bool use_bf16)
     {
+        // Check for empty tensors (e.g., rank with no tokens)
+        // Empty tensors should always be SimpleTensor to avoid BF16Tensor complications
+        bool is_empty = false;
+        for (int dim : shape)
+        {
+            if (dim == 0)
+            {
+                is_empty = true;
+                break;
+            }
+        }
+
+        if (is_empty)
+        {
+            // Always use SimpleTensor for empty tensors
+            return TensorFactory::create_simple(shape);
+        }
+
         // Create tensor for local computation on current rank
+        // Check environment flag for BF16 activation storage (Phase 5)
+        // use_bf16 parameter allows explicit override (e.g., for KV cache in Phase 5+)
+        const auto &env = debugEnv();
+        bool should_use_bf16 = use_bf16 || env.quant.output_bf16;
+
+        if (should_use_bf16)
+        {
+            return TensorFactory::create_bf16(shape);
+        }
         return TensorFactory::create_simple(shape);
     }
 
@@ -647,8 +674,22 @@ namespace llaminar
                                                                     << " layer=" << layer_index << " source='" << snapshot_source_ << "' shape=" << shape.size() << "D");
         }
 
+        // Compose dynamic source if decode step snapshots enabled
+        const auto &env = debugEnv();
+        std::string effective_source = snapshot_source_;
+        if (env.pipeline.decode_stage_snapshots && current_decode_step_ >= 0)
+        {
+            effective_source += "_dec" + std::to_string(current_decode_step_);
+            if (env.pipeline.decode_snapshot_verbose && getRank() == 0)
+            {
+                LOG_INFO("[DecodeSnapshot] stage=" << stage_to_string(stage)
+                                                   << " layer=" << layer_index
+                                                   << " step=" << current_decode_step_
+                                                   << " key_source=" << effective_source);
+            }
+        }
         // Delegate to virtual method (can be overridden for custom behavior)
-        captureStageSnapshot(stage, layer_index, tensor->data(), seq_len, feature_dim, snapshot_source_);
+        captureStageSnapshot(stage, layer_index, tensor->data(), seq_len, feature_dim, effective_source);
     }
 
     void PipelineBase::captureIfEnabled(

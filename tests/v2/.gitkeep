@@ -1,0 +1,3 @@
+# v2 tests will go here, sorted in folders and named by class name
+# tests/v2/tensors/Test__IQ4_NLTensor.cpp
+# etc

@@ -4,3 +4,6 @@
 [submodule "llama.cpp"]
 	path = llama.cpp
 	url = https://github.com/ggerganov/llama.cpp.git
+[submodule "external/OpenBLAS"]
+	path = external/OpenBLAS
+	url = https://github.com/xianyi/OpenBLAS.git
