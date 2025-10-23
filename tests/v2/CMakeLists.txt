@@ -148,7 +148,7 @@ endfunction()
 find_package(GTest REQUIRED)
 
 # Test: FP32Tensor class
-add_executable(v2_test_tensor_basics unit/Test__FP32Tensor.cpp)
+add_executable(v2_test_tensor_basics unit/tensors/Test__FP32Tensor.cpp)
 target_link_libraries(v2_test_tensor_basics 
     llaminar2_core 
     GTest::gtest
@@ -160,7 +160,7 @@ add_v2_test(V2_Unit_TensorBasics
 )
 
 # Test: ModelLoader
-add_executable(v2_test_model_loader unit/Test__ModelLoader.cpp)
+add_executable(v2_test_model_loader unit/loaders/Test__ModelLoader.cpp)
 target_link_libraries(v2_test_model_loader 
     llaminar2_core 
     GTest::gtest
@@ -172,7 +172,7 @@ add_v2_test(V2_Unit_ModelLoader
 )
 
 # Test: IQ4_NL Tensor GEMM
-add_executable(v2_test_iq4nl_tensor unit/Test__IQ4_NLTensor.cpp)
+add_executable(v2_test_iq4nl_tensor unit/tensors/Test__IQ4_NLTensor.cpp)
 target_link_libraries(v2_test_iq4nl_tensor 
     llaminar2_core 
     GTest::gtest
