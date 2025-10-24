@@ -6,13 +6,16 @@
  * - Device manager initialization
  * - Multi-GPU heterogeneous support
  * - Direct kernel orchestration
+ * - Architecture-agnostic pipeline creation via PipelineFactory
  *
  * @author David Sanftenberg
  */
 
 #include "utils/MPIContext.h"
 #include "backends/ComputeBackend.h"
+#include "pipelines/PipelineFactory.h"
 #include "pipelines/qwen/Qwen2Pipeline.h"
+#include "loaders/ModelLoader.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -120,6 +123,9 @@ int main(int argc, char *argv[])
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
+    // Ensure pipeline registrations (static constructors may not run in executables)
+    ensureQwen2Registration();
+
     // Parse arguments
     std::string model_path;
     std::string prompt = "Hello, my name is";
@@ -195,18 +201,46 @@ int main(int argc, char *argv[])
     // Get MPI context
     auto mpi_ctx = MPIContextFactory::global();
 
+    // Load model to detect architecture
+    ModelLoader loader;
+    if (!loader.loadModel(model_path))
+    {
+        std::cerr << "Error: Failed to load model: " << model_path << "\n";
+        MPI_Finalize();
+        return 1;
+    }
+
+    const auto &model = loader.getModel();
+    std::string architecture = model.architecture;
+
     if (mpi_ctx->rank() == 0)
     {
         const auto &devices = dm.devices();
         std::cout << "\n=== Llaminar v2 ===\n"
                   << "Model: " << model_path << "\n"
+                  << "Architecture: " << architecture << "\n"
                   << "Device: " << device_idx << " (" << devices[device_idx].name << ")\n"
                   << "MPI ranks: " << mpi_ctx->world_size() << "\n"
                   << "\n";
     }
 
-    // Create pipeline
-    auto pipeline = std::make_unique<Qwen2Pipeline>(model_path, mpi_ctx, device_idx);
+    // Create pipeline using factory
+    auto pipeline = PipelineFactory::instance().create(architecture, model_path, mpi_ctx, device_idx);
+    if (!pipeline)
+    {
+        std::cerr << "Error: Failed to create pipeline for architecture: " << architecture << "\n";
+        std::cerr << "Supported architectures: ";
+        auto supported = PipelineFactory::instance().supportedArchitectures();
+        for (size_t i = 0; i < supported.size(); ++i)
+        {
+            std::cerr << supported[i];
+            if (i + 1 < supported.size())
+                std::cerr << ", ";
+        }
+        std::cerr << "\n";
+        MPI_Finalize();
+        return 1;
+    }
 
     // TODO: Tokenize prompt (for now, use dummy tokens)
     std::vector<int> tokens = {1, 2, 3, 4, 5, 6, 7, 8}; // Placeholder
