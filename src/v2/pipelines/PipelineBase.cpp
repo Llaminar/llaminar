@@ -1,7 +1,6 @@
 /**
  * @file PipelineBase.cpp
- * @brief Base class implementation for transformer pipelines
- *
+ * @brief Base pipeline implementation
  * @author David Sanftenberg
  */
 
@@ -11,12 +10,19 @@
 namespace llaminar2
 {
 
-    PipelineBase::PipelineBase(const std::string &model_path,
+    PipelineBase::PipelineBase(std::shared_ptr<ModelContext> model_ctx,
                                std::shared_ptr<MPIContext> mpi_ctx,
                                int device_idx)
-        : mpi_ctx_(mpi_ctx), device_idx_(device_idx), model_path_(model_path)
+        : model_ctx_(model_ctx), mpi_ctx_(mpi_ctx), device_idx_(device_idx)
     {
-        std::cout << "[PipelineBase] Initializing with model: " << model_path << "\n";
+        if (!model_ctx_)
+        {
+            throw std::runtime_error("PipelineBase: model_ctx cannot be null");
+        }
+
+        model_path_ = model_ctx_->path();
+
+        std::cout << "[PipelineBase] Initializing with model: " << model_path_ << "\n";
 
         if (mpi_ctx_)
         {
@@ -24,8 +30,14 @@ namespace llaminar2
                       << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size() << "\n";
         }
 
-        std::cout << "[PipelineBase] Device index: " << device_idx_
-                  << (device_idx_ == -1 ? " (CPU)" : " (GPU)") << "\n";
+        if (device_idx_ >= 0)
+        {
+            std::cout << "[PipelineBase] Device index: " << device_idx_ << " (GPU)\n";
+        }
+        else
+        {
+            std::cout << "[PipelineBase] Device index: " << device_idx_ << " (CPU)\n";
+        }
     }
 
 } // namespace llaminar2

@@ -32,11 +32,11 @@ namespace llaminar2
      * @brief Creator function for Qwen2Pipeline
      */
     static std::unique_ptr<PipelineBase> createQwen2(
-        const std::string &model_path,
+        std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
         int device_idx)
     {
-        return std::make_unique<Qwen2Pipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx);
     }
 
     /**
@@ -65,22 +65,35 @@ namespace llaminar2
     // Pipeline Implementation
     // =============================================================================
 
-    Qwen2Pipeline::Qwen2Pipeline(const std::string &model_path,
+    Qwen2Pipeline::Qwen2Pipeline(std::shared_ptr<ModelContext> model_ctx,
                                  std::shared_ptr<MPIContext> mpi_ctx,
                                  int device_idx)
-        : PipelineBase(model_path, mpi_ctx, device_idx)
+        : PipelineBase(model_ctx, mpi_ctx, device_idx)
     {
         std::cout << "[Qwen2Pipeline] Initializing Qwen 2.x pipeline\n";
 
-        // TODO: Read architecture from GGUF metadata instead of hardcoding
-        // For now, hardcode Qwen 2.5 0.5B architecture
-        n_layers_ = 24;
-        n_heads_ = 14;
-        n_kv_heads_ = 2;
-        head_dim_ = 64;
-        d_model_ = 896;
-        d_ff_ = 4864;
-        vocab_size_ = 151936;
+        // Read architecture from GGUF metadata
+        const GGUFModel &model = model_ctx_->model();
+        n_layers_ = static_cast<int>(model.block_count);
+        d_model_ = static_cast<int>(model.embedding_length);
+        vocab_size_ = static_cast<int>(model.vocab_size);
+        n_heads_ = static_cast<int>(model.head_count);
+        n_kv_heads_ = static_cast<int>(model.head_count_kv);
+        
+        // Calculate head_dim from d_model and n_heads
+        head_dim_ = d_model_ / n_heads_;
+        
+        // Read FFN intermediate size from metadata
+        if (model.hasMetadata("qwen2.feed_forward_length"))
+        {
+            d_ff_ = static_cast<int>(model.metadata.at("qwen2.feed_forward_length").asUInt32());
+        }
+        else
+        {
+            // Fallback: typical ratio for Qwen models
+            d_ff_ = d_model_ * 4;
+            std::cout << "[Qwen2Pipeline] Warning: feed_forward_length not in metadata, using " << d_ff_ << "\n";
+        }
 
         std::cout << "[Qwen2Pipeline] Architecture: " << n_layers_ << " layers, "
                   << d_model_ << " d_model, " << vocab_size_ << " vocab\n";
@@ -89,9 +102,9 @@ namespace llaminar2
         std::cout << "[Qwen2Pipeline] FFN: " << d_ff_ << " intermediate_size (SwiGLU)\n";
 
         // Load model weights
-        if (!load_weights(model_path))
+        if (!load_weights(model_path_))
         {
-            throw std::runtime_error("Failed to load model weights from: " + model_path);
+            throw std::runtime_error("Failed to load model weights from: " + model_path_);
         }
 
         std::cout << "[Qwen2Pipeline] Pipeline initialized successfully\n";

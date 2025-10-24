@@ -29,6 +29,7 @@
 #pragma once
 
 #include "PipelineBase.h"
+#include "../loaders/ModelContext.h"
 #include <map>
 #include <memory>
 #include <string>
@@ -49,13 +50,13 @@ namespace llaminar2
         /**
          * @brief Pipeline creator function type
          *
-         * @param model_path Path to GGUF model file
+         * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
          * @return Unique pointer to created pipeline, or nullptr on error
          */
         using CreateFn = std::function<std::unique_ptr<PipelineBase>(
-            const std::string &model_path,
+            std::shared_ptr<ModelContext> model_ctx,
             std::shared_ptr<MPIContext> mpi_ctx,
             int device_idx)>;
 
@@ -81,7 +82,7 @@ namespace llaminar2
          * @brief Create pipeline for specified architecture
          *
          * @param architecture Architecture name from GGUF metadata
-         * @param model_path Path to GGUF model file
+         * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
          * @return Unique pointer to created pipeline, or nullptr if architecture not supported
@@ -90,7 +91,7 @@ namespace llaminar2
          */
         std::unique_ptr<PipelineBase> create(
             const std::string &architecture,
-            const std::string &model_path,
+            std::shared_ptr<ModelContext> model_ctx,
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
             int device_idx = -1) const;
 

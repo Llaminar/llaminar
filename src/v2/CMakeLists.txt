@@ -11,6 +11,7 @@ option(HAVE_MKL "Enable Intel MKL" OFF)
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
     loaders/ModelLoader.cpp
+    loaders/ModelContext.cpp
     pipelines/PipelineBase.cpp
     pipelines/PipelineFactory.cpp
     pipelines/qwen/Qwen2Pipeline.cpp

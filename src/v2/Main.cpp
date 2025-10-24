@@ -16,6 +16,7 @@
 #include "pipelines/PipelineFactory.h"
 #include "pipelines/qwen/Qwen2Pipeline.h"
 #include "loaders/ModelLoader.h"
+#include "loaders/ModelContext.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -201,17 +202,17 @@ int main(int argc, char *argv[])
     // Get MPI context
     auto mpi_ctx = MPIContextFactory::global();
 
-    // Load model to detect architecture
-    ModelLoader loader;
-    if (!loader.loadModel(model_path))
+    // Create model context (loads model and validates)
+    auto model_ctx = ModelContext::create(model_path);
+    if (!model_ctx)
     {
         std::cerr << "Error: Failed to load model: " << model_path << "\n";
         MPI_Finalize();
         return 1;
     }
 
-    const auto &model = loader.getModel();
-    std::string architecture = model.architecture;
+    const auto &model = model_ctx->model();
+    std::string architecture = model_ctx->architecture();
 
     if (mpi_ctx->rank() == 0)
     {
@@ -225,7 +226,7 @@ int main(int argc, char *argv[])
     }
 
     // Create pipeline using factory
-    auto pipeline = PipelineFactory::instance().create(architecture, model_path, mpi_ctx, device_idx);
+    auto pipeline = PipelineFactory::instance().create(architecture, model_ctx, mpi_ctx, device_idx);
     if (!pipeline)
     {
         std::cerr << "Error: Failed to create pipeline for architecture: " << architecture << "\n";

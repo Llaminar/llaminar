@@ -39,7 +39,7 @@ namespace llaminar2
 
     std::unique_ptr<PipelineBase> PipelineFactory::create(
         const std::string &architecture,
-        const std::string &model_path,
+        std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
         int device_idx) const
     {
@@ -61,7 +61,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        return it->second(model_path, mpi_ctx, device_idx);
+        return it->second(model_ctx, mpi_ctx, device_idx);
     }
 
     bool PipelineFactory::isSupported(const std::string &architecture) const

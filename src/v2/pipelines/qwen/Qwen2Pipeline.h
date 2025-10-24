@@ -43,11 +43,11 @@ namespace llaminar2
         /**
          * @brief Construct Qwen2 pipeline
          *
-         * @param model_path Path to GGUF model file
+         * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
          */
-        Qwen2Pipeline(const std::string &model_path,
+        Qwen2Pipeline(std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx = nullptr,
                       int device_idx = -1);
 

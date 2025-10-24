@@ -15,6 +15,7 @@
 #include "../../src/v2/pipelines/PipelineBase.h"
 #include "../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
 #include "../../src/v2/utils/MPIContext.h"
+#include "../../src/v2/loaders/ModelContext.h"
 #include <gtest/gtest.h>
 #include <memory>
 #include <string>
@@ -32,11 +33,10 @@ using namespace llaminar2;
 class MockPipeline : public PipelineBase
 {
 public:
-    MockPipeline(const std::string &model_path,
+    MockPipeline(std::shared_ptr<ModelContext> model_ctx,
                  std::shared_ptr<MPIContext> mpi_ctx,
                  int device_idx)
-        : PipelineBase(model_path, mpi_ctx, device_idx),
-          model_path_(model_path)
+        : PipelineBase(model_ctx, mpi_ctx, device_idx)
     {
         n_layers_ = 12;
         d_model_ = 768;
@@ -53,9 +53,6 @@ public:
 protected:
     bool load_weights(const std::string &) override { return true; }
     bool transformer_layer(int, int) override { return true; }
-
-private:
-    std::string model_path_;
 };
 
 // =============================================================================
@@ -102,11 +99,11 @@ TEST_F(Test__PipelineFactory, SingletonInstance)
 
 TEST_F(Test__PipelineFactory, RegisterCreator)
 {
-    auto creator = [](const std::string &model_path,
+    auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
                       int device_idx) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
     };
 
     PipelineFactory::instance().registerCreator("test_arch", creator);
@@ -117,22 +114,22 @@ TEST_F(Test__PipelineFactory, RegisterCreator)
 TEST_F(Test__PipelineFactory, RegisterDuplicateCreator)
 {
     // Register first time
-    auto creator1 = [](const std::string &model_path,
+    auto creator1 = [](std::shared_ptr<ModelContext> model_ctx,
                        std::shared_ptr<MPIContext> mpi_ctx,
                        int device_idx) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
     };
 
     PipelineFactory::instance().registerCreator("test_duplicate", creator1);
     size_t count_after_first = PipelineFactory::instance().registeredCount();
 
     // Try to register again (should be ignored)
-    auto creator2 = [](const std::string &model_path,
+    auto creator2 = [](std::shared_ptr<ModelContext> model_ctx,
                        std::shared_ptr<MPIContext> mpi_ctx,
                        int device_idx) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
     };
 
     PipelineFactory::instance().registerCreator("test_duplicate", creator2);
@@ -163,17 +160,20 @@ TEST_F(Test__PipelineFactory, RegisterNullCreator)
 TEST_F(Test__PipelineFactory, CreateSupportedArchitecture)
 {
     // Register a mock architecture
-    auto creator = [](const std::string &model_path,
+    auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
                       int device_idx) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
     };
 
     PipelineFactory::instance().registerCreator("test_create", creator);
 
+    // Create model context (use test-only factory - doesn't actually load)
+    auto model_ctx = ModelContext::createForTesting("test.gguf");
+
     // Create pipeline
-    auto pipeline = PipelineFactory::instance().create("test_create", "test.gguf", nullptr, -1);
+    auto pipeline = PipelineFactory::instance().create("test_create", model_ctx, nullptr, -1);
 
     ASSERT_NE(pipeline, nullptr);
     EXPECT_STREQ(pipeline->architecture(), "mock");
@@ -181,8 +181,11 @@ TEST_F(Test__PipelineFactory, CreateSupportedArchitecture)
 
 TEST_F(Test__PipelineFactory, CreateUnsupportedArchitecture)
 {
+    // Create a test model context
+    auto model_ctx = ModelContext::createForTesting("test.gguf");
+
     // Try to create pipeline for unsupported architecture
-    auto pipeline = PipelineFactory::instance().create("nonexistent", "test.gguf", nullptr, -1);
+    auto pipeline = PipelineFactory::instance().create("nonexistent", model_ctx, nullptr, -1);
 
     EXPECT_EQ(pipeline, nullptr);
 }
@@ -190,27 +193,28 @@ TEST_F(Test__PipelineFactory, CreateUnsupportedArchitecture)
 TEST_F(Test__PipelineFactory, CreateWithParameters)
 {
     // Register a mock architecture
-    auto creator = [](const std::string &model_path,
+    auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
                       int device_idx) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
     };
 
     PipelineFactory::instance().registerCreator("test_params", creator);
 
-    // Create pipeline with specific parameters
+    // Create model context
     std::string test_path = "models/test.gguf";
+    auto model_ctx = ModelContext::createForTesting(test_path);
     int test_device = 0;
 
-    auto pipeline = PipelineFactory::instance().create("test_params", test_path, nullptr, test_device);
+    auto pipeline = PipelineFactory::instance().create("test_params", model_ctx, nullptr, test_device);
 
     ASSERT_NE(pipeline, nullptr);
 
     // Verify parameters were passed correctly
     auto mock = dynamic_cast<MockPipeline *>(pipeline.get());
     ASSERT_NE(mock, nullptr);
-    EXPECT_EQ(mock->getModelPath(), test_path);
+    EXPECT_EQ(mock->getModelPath(), model_ctx->path());
     EXPECT_EQ(mock->getDeviceIdx(), test_device);
 }
 
@@ -276,11 +280,11 @@ TEST_F(Test__PipelineFactory, Qwen2AutoRegistered)
 TEST_F(Test__PipelineFactory, FullWorkflow)
 {
     // Register a test architecture
-    auto creator = [](const std::string &model_path,
+    auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
                       int device_idx) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_path, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
     };
 
     const std::string arch_name = "test_workflow";
@@ -294,8 +298,11 @@ TEST_F(Test__PipelineFactory, FullWorkflow)
     auto it = std::find(supported.begin(), supported.end(), arch_name);
     EXPECT_NE(it, supported.end());
 
+    // Create model context for testing
+    auto model_ctx = ModelContext::createForTesting("test.gguf");
+
     // Create pipeline
-    auto pipeline = PipelineFactory::instance().create(arch_name, "test.gguf", nullptr, -1);
+    auto pipeline = PipelineFactory::instance().create(arch_name, model_ctx, nullptr, -1);
     ASSERT_NE(pipeline, nullptr);
 
     // Verify architecture

@@ -18,6 +18,7 @@
 
 #include "../utils/MPIContext.h"
 #include "../backends/ComputeBackend.h"
+#include "../loaders/ModelContext.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorKernels.h"
 #include <vector>
@@ -39,11 +40,11 @@ namespace llaminar2
         /**
          * @brief Construct pipeline base
          *
-         * @param model_path Path to GGUF model file
+         * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
          */
-        PipelineBase(const std::string &model_path,
+        PipelineBase(std::shared_ptr<ModelContext> model_ctx,
                      std::shared_ptr<MPIContext> mpi_ctx = nullptr,
                      int device_idx = -1);
 
@@ -73,6 +74,13 @@ namespace llaminar2
         virtual const char *architecture() const = 0;
 
         /**
+         * @brief Get model context
+         *
+         * @return Model context with metadata and loader
+         */
+        std::shared_ptr<ModelContext> model_context() const { return model_ctx_; }
+
+        /**
          * @brief Get MPI context
          *
          * @return MPI context pointer, or nullptr if not using MPI
@@ -88,10 +96,11 @@ namespace llaminar2
 
     protected:
         // Context management
+        std::shared_ptr<ModelContext> model_ctx_;
         std::shared_ptr<MPIContext> mpi_ctx_;
         int device_idx_; // Default device (-1 = CPU)
 
-        // Model path for loading weights
+        // Model path for convenience (from model_ctx_)
         std::string model_path_;
 
         // Common model parameters (set by derived classes)
