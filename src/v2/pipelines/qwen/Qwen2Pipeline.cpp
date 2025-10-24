@@ -41,13 +41,14 @@ namespace llaminar2
 
     /**
      * @brief Register Qwen2Pipeline with factory
-     * 
+     *
      * Made public so tests can force registration if needed
      */
     void ensureQwen2Registration()
     {
         static bool registered = false;
-        if (!registered) {
+        if (!registered)
+        {
             PipelineFactory::instance().registerCreator("qwen2", &createQwen2);
             registered = true;
         }
@@ -79,10 +80,10 @@ namespace llaminar2
         vocab_size_ = static_cast<int>(model.vocab_size);
         n_heads_ = static_cast<int>(model.head_count);
         n_kv_heads_ = static_cast<int>(model.head_count_kv);
-        
+
         // Calculate head_dim from d_model and n_heads
         head_dim_ = d_model_ / n_heads_;
-        
+
         // Read FFN intermediate size from metadata
         if (model.hasMetadata("qwen2.feed_forward_length"))
         {
@@ -114,30 +115,8 @@ namespace llaminar2
     {
         std::cout << "[Qwen2Pipeline] Loading weights from: " << model_path << "\n";
 
-        // Create TensorFactory for NUMA-aware allocation (if MPI context available)
-        std::unique_ptr<TensorFactory> factory;
-        if (mpi_ctx_)
-        {
-            factory = std::make_unique<TensorFactory>(*mpi_ctx_);
-            std::cout << "[Qwen2Pipeline] Using TensorFactory with NUMA node "
-                      << factory->getNumaNode() << " for rank " << mpi_ctx_->rank() << "\n";
-        }
-        else
-        {
-            std::cout << "[Qwen2Pipeline] No MPI context, using default tensor allocation\n";
-        }
-
-        // Load GGUF model file
-        ModelLoader loader(factory.get());
-        if (!loader.loadModel(model_path))
-        {
-            std::cerr << "[Qwen2Pipeline] Failed to load GGUF model: " << model_path << std::endl;
-            return false;
-        }
-
-        const GGUFModel &model = loader.getModel();
-
-        // Validate architecture
+        // Validate architecture from model context
+        const GGUFModel &model = model_ctx_->model();
         if (model.architecture != "qwen2")
         {
             std::cerr << "[Qwen2Pipeline] Architecture mismatch: expected qwen2, got "
@@ -145,8 +124,7 @@ namespace llaminar2
             return false;
         }
 
-        // Validate hyperparameters match hardcoded values
-        // TODO: Use GGUF metadata to initialize architecture params instead of hardcoding
+        // Validate hyperparameters match metadata-derived values
         if (model.block_count != static_cast<uint64_t>(n_layers_))
         {
             std::cerr << "[Qwen2Pipeline] Layer count mismatch: expected " << n_layers_
@@ -160,9 +138,9 @@ namespace llaminar2
         std::cout << "  Hidden size: " << model.embedding_length << "\n";
         std::cout << "  Vocab size: " << model.vocab_size << "\n";
 
-        // Load embedding table
+        // Load embedding table via ModelContext (handles distribution strategy)
         std::cout << "[Qwen2Pipeline] Loading embedding table...\n";
-        embedding_table_ = loader.loadTensor("token_embd.weight", device_idx_);
+        embedding_table_ = model_ctx_->getWeight("token_embd.weight", device_idx_);
         if (!embedding_table_)
         {
             std::cerr << "[Qwen2Pipeline] Failed to load embedding table" << std::endl;
@@ -171,7 +149,7 @@ namespace llaminar2
         std::cout << "  Embedding shape: " << embedding_table_->shape()[0]
                   << " x " << embedding_table_->shape()[1] << "\n";
 
-        // Load layer weights
+        // Load layer weights via ModelContext
         layers_.resize(n_layers_);
         for (int i = 0; i < n_layers_; ++i)
         {
@@ -180,17 +158,17 @@ namespace llaminar2
             std::string prefix = "blk." + std::to_string(i) + ".";
 
             // Attention weights
-            layer.wq = loader.loadTensor(prefix + "attn_q.weight", device_idx_);
-            layer.wk = loader.loadTensor(prefix + "attn_k.weight", device_idx_);
-            layer.wv = loader.loadTensor(prefix + "attn_v.weight", device_idx_);
-            layer.wo = loader.loadTensor(prefix + "attn_output.weight", device_idx_);
-            layer.attn_norm = loader.loadTensor(prefix + "attn_norm.weight", device_idx_);
+            layer.wq = model_ctx_->getWeight(prefix + "attn_q.weight", device_idx_);
+            layer.wk = model_ctx_->getWeight(prefix + "attn_k.weight", device_idx_);
+            layer.wv = model_ctx_->getWeight(prefix + "attn_v.weight", device_idx_);
+            layer.wo = model_ctx_->getWeight(prefix + "attn_output.weight", device_idx_);
+            layer.attn_norm = model_ctx_->getWeight(prefix + "attn_norm.weight", device_idx_);
 
             // FFN weights
-            layer.gate_proj = loader.loadTensor(prefix + "ffn_gate.weight", device_idx_);
-            layer.up_proj = loader.loadTensor(prefix + "ffn_up.weight", device_idx_);
-            layer.down_proj = loader.loadTensor(prefix + "ffn_down.weight", device_idx_);
-            layer.ffn_norm = loader.loadTensor(prefix + "ffn_norm.weight", device_idx_);
+            layer.gate_proj = model_ctx_->getWeight(prefix + "ffn_gate.weight", device_idx_);
+            layer.up_proj = model_ctx_->getWeight(prefix + "ffn_up.weight", device_idx_);
+            layer.down_proj = model_ctx_->getWeight(prefix + "ffn_down.weight", device_idx_);
+            layer.ffn_norm = model_ctx_->getWeight(prefix + "ffn_norm.weight", device_idx_);
 
             // Validate all tensors loaded
             if (!layer.wq || !layer.wk || !layer.wv || !layer.wo || !layer.attn_norm ||
@@ -207,8 +185,8 @@ namespace llaminar2
 
         // Final norm and LM head
         std::cout << "[Qwen2Pipeline] Loading final norm and LM head...\n";
-        final_norm_ = loader.loadTensor("output_norm.weight", device_idx_);
-        lm_head_ = loader.loadTensor("output.weight", device_idx_);
+        final_norm_ = model_ctx_->getWeight("output_norm.weight", device_idx_);
+        lm_head_ = model_ctx_->getWeight("output.weight", device_idx_);
 
         if (!final_norm_ || !lm_head_)
         {

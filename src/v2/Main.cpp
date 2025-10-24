@@ -203,7 +203,7 @@ int main(int argc, char *argv[])
     auto mpi_ctx = MPIContextFactory::global();
 
     // Create model context (loads model and validates)
-    auto model_ctx = ModelContext::create(model_path);
+    auto model_ctx = ModelContext::create(model_path, mpi_ctx);
     if (!model_ctx)
     {
         std::cerr << "Error: Failed to load model: " << model_path << "\n";

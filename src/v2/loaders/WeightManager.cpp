@@ -1,0 +1,132 @@
+/**
+ * @file WeightManager.cpp
+ * @brief Weight distribution and caching implementation
+ * @author David Sanftenberg
+ */
+
+#include "WeightManager.h"
+#include <iostream>
+
+namespace llaminar2
+{
+
+    WeightManager::WeightManager(ModelLoader &loader,
+                                 std::shared_ptr<MPIContext> mpi_ctx,
+                                 WeightDistributionStrategy strategy)
+        : loader_(loader), mpi_ctx_(mpi_ctx), strategy_(strategy)
+    {
+        int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+
+        if (rank == 0)
+        {
+            std::cout << "[WeightManager] Initialized with strategy: ";
+            switch (strategy_)
+            {
+            case WeightDistributionStrategy::REPLICATED:
+                std::cout << "REPLICATED (full copy per rank)\n";
+                break;
+            case WeightDistributionStrategy::SHARDED:
+                std::cout << "SHARDED (partitioned across ranks)\n";
+                break;
+            case WeightDistributionStrategy::INTERLEAVED:
+                std::cout << "INTERLEAVED (NUMA-aware global)\n";
+                break;
+            }
+        }
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, int device_idx)
+    {
+        // Check cache first
+        auto it = cache_.find(name);
+        if (it != cache_.end())
+        {
+            return it->second;
+        }
+
+        // Load based on strategy
+        std::shared_ptr<TensorBase> tensor;
+
+        switch (strategy_)
+        {
+        case WeightDistributionStrategy::REPLICATED:
+            tensor = getReplicatedWeight(name, device_idx);
+            break;
+
+        case WeightDistributionStrategy::SHARDED:
+            tensor = getShardedWeight(name, device_idx);
+            break;
+
+        case WeightDistributionStrategy::INTERLEAVED:
+            tensor = getInterleavedWeight(name, device_idx);
+            break;
+
+        default:
+            std::cerr << "[WeightManager] Unknown strategy: " << static_cast<int>(strategy_) << "\n";
+            return nullptr;
+        }
+
+        // Cache the loaded tensor
+        if (tensor)
+        {
+            cache_[name] = tensor;
+        }
+
+        return tensor;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::getReplicatedWeight(const std::string &name, int device_idx)
+    {
+        // Phase 1: Simple replication - each rank loads independently
+        // No MPI coordination needed
+
+        auto tensor = loader_.loadTensor(name, device_idx);
+        if (!tensor)
+        {
+            int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            std::cerr << "[WeightManager] Rank " << rank << " failed to load: " << name << "\n";
+            return nullptr;
+        }
+
+        return tensor;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::getShardedWeight(const std::string &name, int device_idx)
+    {
+        // Phase 2: Sharded strategy (not yet implemented)
+        // TODO: Implement column-wise sharding for linear layer weights
+        //
+        // For weight matrix [out_dim, in_dim]:
+        // 1. Get tensor shape from loader
+        // 2. Calculate this rank's slice: out_dim / world_size
+        // 3. Load only this rank's slice from GGUF
+        // 4. Kernels will need to do Allreduce after matmul
+        //
+        // Example:
+        //   int rank = mpi_ctx_->rank();
+        //   int world_size = mpi_ctx_->world_size();
+        //   auto shape = loader_.getTensorShape(name);
+        //   size_t slice_start = (shape[0] / world_size) * rank;
+        //   size_t slice_size = shape[0] / world_size;
+        //   return loader_.loadTensorSlice(name, slice_start, slice_size, device_idx);
+
+        std::cerr << "[WeightManager] SHARDED strategy not yet implemented, falling back to REPLICATED\n";
+        return getReplicatedWeight(name, device_idx);
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::getInterleavedWeight(const std::string &name, int device_idx)
+    {
+        // Phase 3: Interleaved strategy (not yet implemented)
+        // TODO: Implement NUMA-aware allocation with page interleaving
+        //
+        // For shared-memory multi-socket systems:
+        // 1. Allocate with NUMA interleave policy (mbind)
+        // 2. Memory distributed across NUMA nodes
+        // 3. All ranks can access, but with varying latency
+        // 4. Good for systems with fast interconnect (NVLink, etc.)
+
+        std::cerr << "[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED\n";
+        return getReplicatedWeight(name, device_idx);
+    }
+
+} // namespace llaminar2

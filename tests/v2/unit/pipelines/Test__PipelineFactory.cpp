@@ -66,7 +66,7 @@ protected:
     {
         // Force Qwen2 registration (static constructors in libraries may not run)
         ensureQwen2Registration();
-        
+
         // Track initial count for tests that check cumulative state
         initial_count_ = PipelineFactory::instance().registeredCount();
     }
@@ -266,7 +266,7 @@ TEST_F(Test__PipelineFactory, Qwen2AutoRegistered)
 
     // Verify the count includes qwen2
     EXPECT_GE(PipelineFactory::instance().registeredCount(), 1);
-    
+
     // Note: We don't actually create a Qwen2Pipeline here because:
     // 1. It requires a valid GGUF model file
     // 2. We're only testing the factory registration, not pipeline functionality
