@@ -195,6 +195,31 @@ add_v2_test(V2_Unit_PipelineFactory
     LABELS "V2;Unit;Pipeline;Factory"
 )
 
+# Test: WeightPlacementMap
+add_executable(v2_test_weight_placement_map Test__WeightPlacementMap.cpp)
+target_link_libraries(v2_test_weight_placement_map 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightPlacementMap 
+    COMMAND v2_test_weight_placement_map
+    LABELS "V2;Unit;WeightPlacementMap;Phase1"
+)
+
+# Test: DeviceOrchestrator
+add_executable(v2_test_device_orchestrator Test__DeviceOrchestrator.cpp)
+target_link_libraries(v2_test_device_orchestrator 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceOrchestrator 
+    COMMAND v2_test_device_orchestrator
+    LABELS "V2;Unit;DeviceOrchestrator;Phase1"
+    MPI_PROCS 1
+)
+
 # Placeholder for additional unit test executables (to be added)
 # Example:
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)

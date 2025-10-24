@@ -17,6 +17,7 @@
 #include "pipelines/qwen/Qwen2Pipeline.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
+#include "loaders/DeviceOrchestrator.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -33,12 +34,16 @@ void print_usage(const char *prog_name)
               << "  -p, --prompt TEXT       Prompt text\n"
               << "  -n, --n-predict N       Number of tokens to generate (default: 128)\n"
               << "  --device DEVICE         Device to use (auto, cpu, cuda:N, rocm:N)\n"
+              << "  --strategy STRATEGY     Placement strategy (auto, all-gpu, all-cpu, layer-split)\n"
+              << "  --offload-layers N      Layers to keep on GPU (for layer-split strategy)\n"
               << "  --list-devices          List available devices and exit\n"
+              << "  -v, --verbose           Verbose placement logging\n"
               << "  -h, --help              Show this help\n"
               << "\n"
               << "Examples:\n"
               << "  " << prog_name << " -m model.gguf -p \"Hello\" -n 50\n"
               << "  " << prog_name << " --device cuda:0 -m model.gguf\n"
+              << "  " << prog_name << " --strategy layer-split --offload-layers 16 -m model.gguf\n"
               << "  " << prog_name << " --list-devices\n";
 }
 
@@ -132,7 +137,10 @@ int main(int argc, char *argv[])
     std::string prompt = "Hello, my name is";
     int n_predict = 128;
     std::string device_str = "auto";
+    std::string strategy_str = "auto";
+    int offload_layers = 0;
     bool list_devices_only = false;
+    bool verbose = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -168,6 +176,20 @@ int main(int argc, char *argv[])
             if (i + 1 < argc)
                 device_str = argv[++i];
         }
+        else if (arg == "--strategy")
+        {
+            if (i + 1 < argc)
+                strategy_str = argv[++i];
+        }
+        else if (arg == "--offload-layers")
+        {
+            if (i + 1 < argc)
+                offload_layers = std::stoi(argv[++i]);
+        }
+        else if (arg == "-v" || arg == "--verbose")
+        {
+            verbose = true;
+        }
     }
 
     // Initialize device manager
@@ -202,11 +224,47 @@ int main(int argc, char *argv[])
     // Get MPI context
     auto mpi_ctx = MPIContextFactory::global();
 
-    // Create model context (loads model and validates)
-    auto model_ctx = ModelContext::create(model_path, mpi_ctx);
+    // Parse placement strategy
+    PlacementStrategy strategy = PlacementStrategy::AUTO;
+    if (strategy_str == "all-gpu") {
+        strategy = PlacementStrategy::ALL_GPU;
+    } else if (strategy_str == "all-cpu") {
+        strategy = PlacementStrategy::ALL_CPU;
+    } else if (strategy_str == "layer-split") {
+        strategy = PlacementStrategy::LAYER_SPLIT;
+    } else if (strategy_str != "auto") {
+        std::cerr << "Warning: Unknown strategy '" << strategy_str << "', using AUTO\n";
+    }
+
+    // Create orchestration config
+    OrchestrationConfig orch_config;
+    orch_config.strategy = strategy;
+    orch_config.gpu_device_idx = device_idx;
+    orch_config.offload_layers = offload_layers;
+    orch_config.verbose = verbose;
+
+    // Create device orchestrator
+    auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager*){});
+    auto orchestrator = std::make_shared<DeviceOrchestrator>(
+        device_mgr_shared, mpi_ctx, orch_config);
+
+    // Create model context (loads metadata but not weights yet)
+    auto model_ctx = ModelContext::create(model_path, mpi_ctx, nullptr);
     if (!model_ctx)
     {
         std::cerr << "Error: Failed to load model: " << model_path << "\n";
+        MPI_Finalize();
+        return 1;
+    }
+
+    // Create placement map from orchestrator
+    auto placement_map = orchestrator->createPlacementMap(model_ctx);
+
+    // Re-create model context with placement map (this creates WeightManager)
+    model_ctx = ModelContext::create(model_path, mpi_ctx, placement_map);
+    if (!model_ctx)
+    {
+        std::cerr << "Error: Failed to load model with placement map: " << model_path << "\n";
         MPI_Finalize();
         return 1;
     }

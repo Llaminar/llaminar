@@ -13,6 +13,8 @@ add_library(llaminar2_core STATIC
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
+    loaders/WeightPlacementMap.cpp
+    loaders/DeviceOrchestrator.cpp
     pipelines/PipelineBase.cpp
     pipelines/PipelineFactory.cpp
     pipelines/qwen/Qwen2Pipeline.cpp

@@ -12,8 +12,9 @@ namespace llaminar2
 
     WeightManager::WeightManager(ModelLoader &loader,
                                  std::shared_ptr<MPIContext> mpi_ctx,
+                                 std::shared_ptr<WeightPlacementMap> placement_map,
                                  WeightDistributionStrategy strategy)
-        : loader_(loader), mpi_ctx_(mpi_ctx), strategy_(strategy)
+        : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map), strategy_(strategy)
     {
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
@@ -35,7 +36,7 @@ namespace llaminar2
         }
     }
 
-    std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, int device_idx)
+    std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, int device_idx, int layer_idx)
     {
         // Check cache first
         auto it = cache_.find(name);
@@ -44,21 +45,30 @@ namespace llaminar2
             return it->second;
         }
 
+        // Determine device from placement map if not explicitly provided
+        int target_device = device_idx;
+        if (target_device < 0 && placement_map_) {
+            target_device = placement_map_->getDeviceForWeight(name, layer_idx);
+        }
+        if (target_device < 0) {
+            target_device = 0; // Default to device 0
+        }
+
         // Load based on strategy
         std::shared_ptr<TensorBase> tensor;
 
         switch (strategy_)
         {
         case WeightDistributionStrategy::REPLICATED:
-            tensor = getReplicatedWeight(name, device_idx);
+            tensor = getReplicatedWeight(name, target_device);
             break;
 
         case WeightDistributionStrategy::SHARDED:
-            tensor = getShardedWeight(name, device_idx);
+            tensor = getShardedWeight(name, target_device);
             break;
 
         case WeightDistributionStrategy::INTERLEAVED:
-            tensor = getInterleavedWeight(name, device_idx);
+            tensor = getInterleavedWeight(name, target_device);
             break;
 
         default:

@@ -12,6 +12,7 @@
 
 #include "ModelLoader.h"
 #include "WeightManager.h"
+#include "WeightPlacementMap.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
@@ -43,6 +44,7 @@ namespace llaminar2
          *
          * @param model_path Path to GGUF model file
          * @param mpi_ctx MPI context for distributed weight management (nullptr = single rank)
+         * @param placement_map Fine-grained weight placement decisions (nullptr = default all to device 0)
          * @param factory Optional TensorFactory for NUMA-aware allocation
          * @param strategy Weight distribution strategy (default: REPLICATED)
          * @return Shared pointer to context, or nullptr on error
@@ -50,6 +52,7 @@ namespace llaminar2
         static std::shared_ptr<ModelContext> create(
             const std::string &model_path,
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+            std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
             TensorFactory *factory = nullptr,
             WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
 
@@ -109,10 +112,15 @@ namespace llaminar2
 
     private:
         // Private constructor - use create() factory method
-        explicit ModelContext(const std::string &model_path,
-                              std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-                              TensorFactory *factory = nullptr,
-                              WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
+        private:
+        /**
+         * @brief Private constructor (use create() instead)
+         */
+        ModelContext(const std::string &model_path,
+                     std::shared_ptr<MPIContext> mpi_ctx,
+                     std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
+                     TensorFactory *factory = nullptr,
+                     WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
 
         std::string model_path_;
         ModelLoader loader_;
