@@ -44,6 +44,7 @@ add_library(llaminar2_core STATIC
     tensors/IQ1_STensor.cpp
     tensors/IQ1_MTensor.cpp
     kernels/cpu/QuantizedGemm.cpp
+    utils/ArgParser.cpp
 )
 
 target_include_directories(llaminar2_core PUBLIC 

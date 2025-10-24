@@ -13,18 +13,51 @@
 #include "ModelContext.h"
 #include <memory>
 #include <string>
+#include <optional>
+#include <vector>
 
 namespace llaminar2 {
+
+/**
+ * @brief Device map rule types for CUSTOM strategy
+ */
+enum class DeviceMapRuleType {
+    INVALID,        ///< Invalid/unparseable rule
+    LAYER_RANGE,    ///< Layer range: "0-11:gpu:0"
+    PERCENTAGE,     ///< Percentage: "first_50%:gpu" or "last_25%:cpu"
+    PATTERN         ///< Pattern match: "embed:gpu", "*experts.0*:cpu"
+};
+
+/**
+ * @brief Device map rule for custom placement
+ */
+struct DeviceMapRule {
+    DeviceMapRuleType type = DeviceMapRuleType::INVALID;
+    int device_idx = -1;
+    
+    // LAYER_RANGE fields
+    int start_layer = -1;
+    int end_layer = -1;
+    
+    // PERCENTAGE fields
+    float percentage = 0.0f;
+    bool is_first = true;  // true = first_N%, false = last_N%
+    
+    // PATTERN fields
+    std::string pattern;
+};
 
 /**
  * @brief Placement strategy types supported by the orchestrator
  */
 enum class PlacementStrategy {
-    ALL_GPU,        ///< All weights on GPU device 0
-    ALL_CPU,        ///< All weights on CPU
-    LAYER_SPLIT,    ///< First N layers on GPU, rest on CPU
-    AUTO,           ///< Automatic based on available memory
-    CUSTOM          ///< User-provided custom mapping
+    ALL_GPU,         ///< All weights on GPU device 0
+    ALL_CPU,         ///< All weights on CPU
+    LAYER_SPLIT,     ///< First N layers on GPU, rest on CPU
+    AUTO,            ///< Automatic based on available memory
+    MEMORY_AWARE,    ///< Auto-fit layers within memory budget (Phase 2)
+    MOE_OPTIMIZED,   ///< MoE-aware placement (shared experts GPU, sparse CPU) (Phase 2)
+    CUSTOM           ///< User-provided custom device map string (Phase 2)
 };
 
 /**
@@ -35,8 +68,23 @@ struct OrchestrationConfig {
     int gpu_device_idx = 0;           ///< Which GPU to use (if multiple)
     int cpu_device_idx = -1;          ///< CPU device index (or -1 for auto-detect)
     int offload_layers = 0;           ///< Number of layers to keep on GPU (LAYER_SPLIT)
-    std::string device_map_str;       ///< Custom device map string (future)
-    bool verbose = false;             ///< Log placement decisions
+    
+    // Phase 2: Custom device map
+    std::string device_map;           ///< Custom device map string (e.g., "0-11:gpu:0,12-23:cpu")
+    
+    // Phase 2: Memory constraints
+    std::optional<size_t> max_gpu_memory_mb;  ///< Max GPU memory budget (MB)
+    std::optional<size_t> max_cpu_memory_mb;  ///< Max CPU memory budget (MB)
+    
+    // Phase 2: MoE-specific
+    bool moe_shared_experts_gpu = true;   ///< Put MoE shared experts on GPU
+    bool moe_sparse_experts_cpu = true;   ///< Put MoE sparse experts on CPU
+    
+    // Phase 2: Multi-GPU
+    bool multi_gpu = false;               ///< Enable multi-GPU distribution
+    std::string gpu_split = "even";       ///< GPU split strategy: "even", "weighted", or "0.6,0.4"
+    
+    bool verbose = false;                 ///< Log placement decisions
 };
 
 /**
@@ -97,6 +145,18 @@ public:
      */
     const OrchestrationConfig& config() const { return config_; }
 
+    // ========================================================================
+    // Public Testing Interface (Phase 2)
+    // ========================================================================
+    // These methods are public for testing purposes, allowing direct
+    // verification of device map parsing logic.
+    
+    /**
+     * @brief Parse device map string into rules (exposed for testing)
+     */
+    std::vector<DeviceMapRule> parseDeviceMapString(
+        const std::string& device_map_str) const;
+
 private:
     /**
      * @brief Create ALL_GPU placement map
@@ -121,6 +181,42 @@ private:
      */
     std::shared_ptr<WeightPlacementMap> createAutoMap(
         const std::shared_ptr<ModelContext>& model_ctx);
+
+    /**
+     * @brief Create MEMORY_AWARE placement map (Phase 2)
+     */
+    std::shared_ptr<WeightPlacementMap> createMemoryAwareMap(
+        const std::shared_ptr<ModelContext>& model_ctx);
+
+    /**
+     * @brief Create MOE_OPTIMIZED placement map (Phase 2)
+     */
+    std::shared_ptr<WeightPlacementMap> createMoEOptimizedMap(
+        const std::shared_ptr<ModelContext>& model_ctx);
+
+    /**
+     * @brief Create CUSTOM placement map from device map string (Phase 2)
+     */
+    std::shared_ptr<WeightPlacementMap> createCustomMap(
+        const std::shared_ptr<ModelContext>& model_ctx);
+
+    /**
+     * @brief Parse individual device map rule (Phase 2)
+     */
+    DeviceMapRule parseDeviceMapRule(const std::string& rule_str) const;
+
+    /**
+     * @brief Parse device string to device index (Phase 2)
+     */
+    int parseDeviceString(const std::string& device_type, int device_id) const;
+
+    /**
+     * @brief Apply parsed device map rule to placement map (Phase 2)
+     */
+    void applyDeviceMapRule(
+        std::shared_ptr<WeightPlacementMap>& map,
+        const DeviceMapRule& rule,
+        const std::shared_ptr<ModelContext>& model_ctx) const;
 
     /**
      * @brief Detect CPU device index from DeviceManager

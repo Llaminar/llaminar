@@ -12,6 +12,7 @@
  */
 
 #include "utils/MPIContext.h"
+#include "utils/ArgParser.h"
 #include "backends/ComputeBackend.h"
 #include "pipelines/PipelineFactory.h"
 #include "pipelines/qwen/Qwen2Pipeline.h"
@@ -24,28 +25,6 @@
 #include <string>
 
 using namespace llaminar2;
-
-void print_usage(const char *prog_name)
-{
-    std::cout << "Usage: " << prog_name << " [options]\n"
-              << "\n"
-              << "Options:\n"
-              << "  -m, --model PATH        Model file path (GGUF format)\n"
-              << "  -p, --prompt TEXT       Prompt text\n"
-              << "  -n, --n-predict N       Number of tokens to generate (default: 128)\n"
-              << "  --device DEVICE         Device to use (auto, cpu, cuda:N, rocm:N)\n"
-              << "  --strategy STRATEGY     Placement strategy (auto, all-gpu, all-cpu, layer-split)\n"
-              << "  --offload-layers N      Layers to keep on GPU (for layer-split strategy)\n"
-              << "  --list-devices          List available devices and exit\n"
-              << "  -v, --verbose           Verbose placement logging\n"
-              << "  -h, --help              Show this help\n"
-              << "\n"
-              << "Examples:\n"
-              << "  " << prog_name << " -m model.gguf -p \"Hello\" -n 50\n"
-              << "  " << prog_name << " --device cuda:0 -m model.gguf\n"
-              << "  " << prog_name << " --strategy layer-split --offload-layers 16 -m model.gguf\n"
-              << "  " << prog_name << " --list-devices\n";
-}
 
 void list_devices()
 {
@@ -132,89 +111,49 @@ int main(int argc, char *argv[])
     // Ensure pipeline registrations (static constructors may not run in executables)
     ensureQwen2Registration();
 
-    // Parse arguments
-    std::string model_path;
-    std::string prompt = "Hello, my name is";
-    int n_predict = 128;
-    std::string device_str = "auto";
-    std::string strategy_str = "auto";
-    int offload_layers = 0;
-    bool list_devices_only = false;
-    bool verbose = false;
+    // Parse command-line arguments using centralized ArgParser
+    ArgContext args = ArgParser::parse(argc, argv);
 
-    for (int i = 1; i < argc; ++i)
+    // Handle help
+    if (args.show_help)
     {
-        std::string arg = argv[i];
-
-        if (arg == "-h" || arg == "--help")
+        if (MPIContextFactory::global()->rank() == 0)
         {
-            print_usage(argv[0]);
-            MPI_Finalize();
-            return 0;
+            ArgParser::printUsage(argv[0]);
         }
-        else if (arg == "--list-devices")
-        {
-            list_devices_only = true;
-        }
-        else if (arg == "-m" || arg == "--model")
-        {
-            if (i + 1 < argc)
-                model_path = argv[++i];
-        }
-        else if (arg == "-p" || arg == "--prompt")
-        {
-            if (i + 1 < argc)
-                prompt = argv[++i];
-        }
-        else if (arg == "-n" || arg == "--n-predict")
-        {
-            if (i + 1 < argc)
-                n_predict = std::stoi(argv[++i]);
-        }
-        else if (arg == "--device")
-        {
-            if (i + 1 < argc)
-                device_str = argv[++i];
-        }
-        else if (arg == "--strategy")
-        {
-            if (i + 1 < argc)
-                strategy_str = argv[++i];
-        }
-        else if (arg == "--offload-layers")
-        {
-            if (i + 1 < argc)
-                offload_layers = std::stoi(argv[++i]);
-        }
-        else if (arg == "-v" || arg == "--verbose")
-        {
-            verbose = true;
-        }
+        MPI_Finalize();
+        return 0;
     }
 
     // Initialize device manager
     auto &dm = DeviceManager::instance();
     dm.initialize();
 
-    // List devices and exit if requested
-    if (list_devices_only)
+    // Handle list devices
+    if (args.list_devices)
     {
-        list_devices();
+        if (MPIContextFactory::global()->rank() == 0)
+        {
+            list_devices();
+        }
         MPI_Finalize();
         return 0;
     }
 
     // Validate required arguments
-    if (model_path.empty())
+    if (args.model_path.empty())
     {
-        std::cerr << "Error: Model path required (-m)\n\n";
-        print_usage(argv[0]);
+        if (MPIContextFactory::global()->rank() == 0)
+        {
+            std::cerr << "Error: Model path required (-m)\n\n";
+            ArgParser::printUsage(argv[0]);
+        }
         MPI_Finalize();
         return 1;
     }
 
     // Parse device
-    int device_idx = parse_device(device_str, dm);
+    int device_idx = parse_device(args.device, dm);
     if (device_idx < 0)
     {
         MPI_Finalize();
@@ -226,22 +165,38 @@ int main(int argc, char *argv[])
 
     // Parse placement strategy
     PlacementStrategy strategy = PlacementStrategy::AUTO;
-    if (strategy_str == "all-gpu") {
+    if (args.strategy == "all-gpu") {
         strategy = PlacementStrategy::ALL_GPU;
-    } else if (strategy_str == "all-cpu") {
+    } else if (args.strategy == "all-cpu") {
         strategy = PlacementStrategy::ALL_CPU;
-    } else if (strategy_str == "layer-split") {
+    } else if (args.strategy == "layer-split") {
         strategy = PlacementStrategy::LAYER_SPLIT;
-    } else if (strategy_str != "auto") {
-        std::cerr << "Warning: Unknown strategy '" << strategy_str << "', using AUTO\n";
+    } else if (args.strategy == "memory-aware") {
+        strategy = PlacementStrategy::MEMORY_AWARE;
+    } else if (args.strategy == "moe-optimized") {
+        strategy = PlacementStrategy::MOE_OPTIMIZED;
+    } else if (args.strategy == "custom") {
+        strategy = PlacementStrategy::CUSTOM;
+    } else if (args.strategy != "auto") {
+        if (mpi_ctx->rank() == 0) {
+            std::cerr << "Warning: Unknown strategy '" << args.strategy << "', using AUTO\n";
+        }
     }
 
-    // Create orchestration config
+    // Create orchestration config from ArgContext
     OrchestrationConfig orch_config;
     orch_config.strategy = strategy;
     orch_config.gpu_device_idx = device_idx;
-    orch_config.offload_layers = offload_layers;
-    orch_config.verbose = verbose;
+    orch_config.offload_layers = args.offload_layers;
+    orch_config.verbose = args.verbose;
+    // TODO: Add new fields to OrchestrationConfig for Phase 2:
+    // orch_config.device_map = args.device_map;
+    // orch_config.max_gpu_memory_mb = args.max_gpu_memory_mb;
+    // orch_config.max_cpu_memory_mb = args.max_cpu_memory_mb;
+    // orch_config.moe_shared_experts_gpu = args.moe_shared_experts_gpu;
+    // orch_config.moe_sparse_experts_cpu = args.moe_sparse_experts_cpu;
+    // orch_config.multi_gpu = args.multi_gpu;
+    // orch_config.gpu_split = args.gpu_split;
 
     // Create device orchestrator
     auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager*){});
@@ -249,10 +204,13 @@ int main(int argc, char *argv[])
         device_mgr_shared, mpi_ctx, orch_config);
 
     // Create model context (loads metadata but not weights yet)
-    auto model_ctx = ModelContext::create(model_path, mpi_ctx, nullptr);
+    auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr);
     if (!model_ctx)
     {
-        std::cerr << "Error: Failed to load model: " << model_path << "\n";
+        if (mpi_ctx->rank() == 0)
+        {
+            std::cerr << "Error: Failed to load model: " << args.model_path << "\n";
+        }
         MPI_Finalize();
         return 1;
     }
@@ -261,10 +219,13 @@ int main(int argc, char *argv[])
     auto placement_map = orchestrator->createPlacementMap(model_ctx);
 
     // Re-create model context with placement map (this creates WeightManager)
-    model_ctx = ModelContext::create(model_path, mpi_ctx, placement_map);
+    model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map);
     if (!model_ctx)
     {
-        std::cerr << "Error: Failed to load model with placement map: " << model_path << "\n";
+        if (mpi_ctx->rank() == 0)
+        {
+            std::cerr << "Error: Failed to load model with placement map: " << args.model_path << "\n";
+        }
         MPI_Finalize();
         return 1;
     }
@@ -276,9 +237,10 @@ int main(int argc, char *argv[])
     {
         const auto &devices = dm.devices();
         std::cout << "\n=== Llaminar v2 ===\n"
-                  << "Model: " << model_path << "\n"
+                  << "Model: " << args.model_path << "\n"
                   << "Architecture: " << architecture << "\n"
                   << "Device: " << device_idx << " (" << devices[device_idx].name << ")\n"
+                  << "Strategy: " << args.strategy << "\n"
                   << "MPI ranks: " << mpi_ctx->world_size() << "\n"
                   << "\n";
     }
@@ -287,16 +249,19 @@ int main(int argc, char *argv[])
     auto pipeline = PipelineFactory::instance().create(architecture, model_ctx, mpi_ctx, device_idx);
     if (!pipeline)
     {
-        std::cerr << "Error: Failed to create pipeline for architecture: " << architecture << "\n";
-        std::cerr << "Supported architectures: ";
-        auto supported = PipelineFactory::instance().supportedArchitectures();
-        for (size_t i = 0; i < supported.size(); ++i)
+        if (mpi_ctx->rank() == 0)
         {
-            std::cerr << supported[i];
-            if (i + 1 < supported.size())
-                std::cerr << ", ";
+            std::cerr << "Error: Failed to create pipeline for architecture: " << architecture << "\n";
+            std::cerr << "Supported architectures: ";
+            auto supported = PipelineFactory::instance().supportedArchitectures();
+            for (size_t i = 0; i < supported.size(); ++i)
+            {
+                std::cerr << supported[i];
+                if (i + 1 < supported.size())
+                    std::cerr << ", ";
+            }
+            std::cerr << "\n";
         }
-        std::cerr << "\n";
         MPI_Finalize();
         return 1;
     }
@@ -308,17 +273,22 @@ int main(int argc, char *argv[])
     if (mpi_ctx->rank() == 0)
     {
         std::cout << "Running inference...\n";
+        std::cout << "Prompt: \"" << args.prompt << "\"\n";
+        std::cout << "Generating " << args.n_predict << " tokens...\n\n";
     }
 
     if (!pipeline->forward(tokens.data(), tokens.size()))
     {
-        std::cerr << "Error: Forward pass failed\n";
+        if (mpi_ctx->rank() == 0)
+        {
+            std::cerr << "Error: Forward pass failed\n";
+        }
         MPI_Finalize();
         return 1;
     }
 
     // Generate tokens
-    for (int i = 0; i < n_predict; ++i)
+    for (int i = 0; i < args.n_predict; ++i)
     {
         const float *logits = pipeline->logits();
 

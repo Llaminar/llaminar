@@ -168,6 +168,7 @@ target_link_libraries(v2_test_model_loader
 )
 add_v2_test(V2_Unit_ModelLoader 
     COMMAND v2_test_model_loader
+    MPI_PROCS 1
     LABELS "V2;Unit;ModelLoader"
 )
 
@@ -217,6 +218,32 @@ target_link_libraries(v2_test_device_orchestrator
 add_v2_test(V2_Unit_DeviceOrchestrator 
     COMMAND v2_test_device_orchestrator
     LABELS "V2;Unit;DeviceOrchestrator;Phase1"
+    MPI_PROCS 1
+)
+
+# Test: ArgParser
+add_executable(v2_test_arg_parser Test__ArgParser.cpp)
+target_link_libraries(v2_test_arg_parser 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ArgParser 
+    COMMAND v2_test_arg_parser
+    LABELS "V2;Unit;ArgParser;Phase2"
+    MPI_PROCS 1
+)
+
+# Test: DeviceOrchestrator Phase 2
+add_executable(v2_test_device_orchestrator_phase2 Test__DeviceOrchestrator_Phase2.cpp)
+target_link_libraries(v2_test_device_orchestrator_phase2 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceOrchestrator_Phase2 
+    COMMAND v2_test_device_orchestrator_phase2
+    LABELS "V2;Unit;DeviceOrchestrator;Phase2"
     MPI_PROCS 1
 )
 
