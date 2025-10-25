@@ -257,6 +257,9 @@ namespace llaminar2
         virtual const float *data() const = 0; // Returns host pointer (syncs from device if needed)
         virtual float *mutable_data() = 0;     // Returns host pointer, marks dirty
 
+        // Device transfers (Phase 4.2)
+        virtual bool copyFrom(const TensorBase *src) = 0; // Copy data from another tensor (handles device transfers)
+
         // Kernel creation (fused operations)
         virtual std::unique_ptr<ITensorGemm> createGemm() = 0;
         virtual std::unique_ptr<ITensorRoPE> createRoPE() = 0;
@@ -272,7 +275,7 @@ namespace llaminar2
     class FP32Tensor : public TensorBase
     {
     public:
-        explicit FP32Tensor(const std::vector<size_t> &shape);
+        explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
         ~FP32Tensor() override;
 
         // TensorBase interface
@@ -285,6 +288,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Device-aware copy
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -333,6 +338,8 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -386,6 +393,8 @@ namespace llaminar2
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -437,6 +446,8 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to temp buffer
         float *mutable_data() override;     // Not supported for quantized tensors
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override; // Fused dequant+GEMM
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -541,6 +552,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -561,6 +574,14 @@ namespace llaminar2
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         static void decodeBlock(const Q8_0Block &block, float *output);
+
+#if defined(__AVX512F__)
+        static void decodeBlockAVX512(const Q8_0Block &block, float *output);
+#endif
+
+#if defined(__AVX2__)
+        static void decodeBlockAVX2(const Q8_0Block &block, float *output);
+#endif
     };
 
     // ===== Q4_0 Tensor (4-bit quantization) =====
@@ -588,6 +609,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -607,6 +630,10 @@ namespace llaminar2
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         static void decodeBlock(const Q4_0Block &block, float *output);
+
+#if defined(__AVX2__)
+        static void decodeBlockAVX2(const Q4_0Block &block, float *output);
+#endif
     };
 
     // ===== Q4_1 Tensor (4-bit with min) =====
@@ -634,6 +661,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -653,6 +682,10 @@ namespace llaminar2
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         static void decodeBlock(const Q4_1Block &block, float *output);
+
+#if defined(__AVX2__)
+        static void decodeBlockAVX2(const Q4_1Block &block, float *output);
+#endif
     };
 
     // ===== K-quant Tensors =====
@@ -677,6 +710,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -696,6 +731,10 @@ namespace llaminar2
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         static void decodeBlock(const Q6_KBlock &block, float *output);
+
+#if defined(__AVX2__)
+        static void decodeBlockAVX2(const Q6_KBlock &block, float *output);
+#endif
     };
 
     // Implementation: Q2_KTensor.cpp
@@ -717,6 +756,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -759,6 +800,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -799,6 +842,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -841,6 +886,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -881,6 +928,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -925,6 +974,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -965,6 +1016,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -1007,6 +1060,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -1047,6 +1102,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -1089,6 +1146,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -1129,6 +1188,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -1171,6 +1232,8 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
@@ -1211,6 +1274,8 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
         std::unique_ptr<ITensorRoPE> createRoPE() override;

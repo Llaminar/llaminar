@@ -24,7 +24,6 @@
 
 namespace llaminar2
 {
-
     /**
      * @brief Ensure Qwen2 pipeline is registered with factory
      *
@@ -61,16 +60,17 @@ namespace llaminar2
          * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
+         * @param placement_map Weight placement map (nullptr = use device_idx for all)
          */
         Qwen2Pipeline(std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-                      int device_idx = -1);
+                      int device_idx = -1,
+                      std::shared_ptr<WeightPlacementMap> placement_map = nullptr);
 
         ~Qwen2Pipeline() override = default;
 
         // PipelineBase interface
         bool forward(const int *tokens, int seq_len) override;
-        const float *logits() const override;
         const char *architecture() const override { return "qwen2"; }
 
         /**
@@ -109,6 +109,10 @@ namespace llaminar2
         // PipelineBase interface
         bool transformer_layer(int layer_idx, int seq_len) override;
 
+        // Multi-device infrastructure (implements abstract methods from PipelineBase)
+        std::vector<std::string> getAllWeightNames() const override;
+        ActivationBuffers createBuffersForDevice(int device_idx, int max_seq_len) override;
+
     private:
         // Qwen2-specific architecture parameters
         int n_heads_ = 0;
@@ -124,7 +128,10 @@ namespace llaminar2
 
         // Activations (FP32, on host or device depending on device_idx)
         std::shared_ptr<FP32Tensor> current_hidden_; // [seq_len, d_model]
-        std::shared_ptr<FP32Tensor> logits_;         // [seq_len, vocab_size]
+
+        // Pre-allocated activation buffers (Phase 4.1: one pool per active device)
+        // Legacy single-device mode: activation_buffers_ = buffers_per_device_[device_idx_]
+        ActivationBuffers activation_buffers_; // Deprecated: kept for backward compat
 
         // Helper methods for dimension specifications (Qwen2-specific)
         TensorSpec spec_hidden(int seq_len) const
@@ -151,6 +158,12 @@ namespace llaminar2
                               "ffn_intermediate[" + std::to_string(seq_len) + "," + std::to_string(d_ff_) + "]");
         }
 
+        TensorSpec spec_ffn_gate_up(int seq_len) const
+        {
+            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)},
+                              "ffn_gate_up[" + std::to_string(seq_len) + "," + std::to_string(d_ff_) + "]");
+        }
+
         TensorSpec spec_logits(int seq_len) const
         {
             return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size_)},
@@ -166,6 +179,9 @@ namespace llaminar2
         // Helper methods
         bool attention_block(const LayerWeights &layer, int seq_len);
         bool ffn_block(const LayerWeights &layer, int seq_len);
+
+        // Buffer management (legacy single-device support)
+        void allocate_activation_buffers(int max_seq_len);
     };
 
 } // namespace llaminar2

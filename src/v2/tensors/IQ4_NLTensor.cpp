@@ -455,4 +455,15 @@ namespace llaminar2
         }
     }
 
+
+
+
+    bool IQ4_NLTensor::copyFrom(const TensorBase *src)
+    {
+        // Quantized tensors are read-only weights - no transfer needed
+        (void)src;
+        std::cerr << "[IQ4_NLTensor::copyFrom] Not implemented\n";
+        return false;
+    }
+
 } // namespace llaminar2

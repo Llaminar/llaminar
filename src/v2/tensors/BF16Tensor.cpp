@@ -6,6 +6,7 @@
 
 #include "Tensors.h"
 #include "../utils/BFloat16.h"
+#include "../kernels/cpu/BF16GemmKernel.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -80,9 +81,45 @@ namespace llaminar2
         throw std::runtime_error("BF16Tensor::mutable_data: BF16 tensors are immutable (use from_fp32 to update)");
     }
 
+    bool BF16Tensor::copyFrom(const TensorBase *src)
+    {
+        if (!src)
+        {
+            return false;
+        }
+
+        // Check shape compatibility
+        if (src->shape() != shape_)
+        {
+            return false;
+        }
+
+        // Get FP32 data from source and convert to BF16
+        const float *src_data = src->data();
+        if (!src_data)
+        {
+            return false;
+        }
+
+        // Calculate element count from shape
+        size_t element_count = 1;
+        for (size_t dim : shape_)
+        {
+            element_count *= dim;
+        }
+
+        // Convert FP32 to BF16 and store
+        from_fp32(src_data, element_count);
+
+        // Clear cache to force re-dequantization
+        dequant_cache_.clear();
+
+        return true;
+    }
+
     std::unique_ptr<ITensorGemm> BF16Tensor::createGemm()
     {
-        throw std::runtime_error("BF16Tensor: GEMM not yet implemented");
+        return std::make_unique<BF16GemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> BF16Tensor::createRoPE()

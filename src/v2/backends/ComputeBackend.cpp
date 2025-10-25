@@ -13,6 +13,7 @@
 
 #include "ComputeBackend.h"
 #include "../utils/DebugEnv.h"
+#include "../utils/CPUFeatures.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
@@ -71,12 +72,16 @@ namespace llaminar2
     {
         ComputeDevice dev;
 
+        // Backend is selected at compile time based on CPU vendor
+        // (see CMakeLists.txt BLAS_BACKEND selection)
 #ifdef HAVE_MKL
         dev.type = ComputeBackendType::CPU_MKL;
         dev.name = "Intel MKL (CPU)";
-#else
+#elif defined(HAVE_OPENBLAS)
         dev.type = ComputeBackendType::CPU_OPENBLAS;
         dev.name = "OpenBLAS (CPU)";
+#else
+#error "No BLAS backend configured - set BLAS_BACKEND in CMake"
 #endif
 
         dev.device_id = 0;

@@ -1,11 +1,19 @@
 # Llaminar v2 - Clean greenfield implementation
 cmake_minimum_required(VERSION 3.18)
 
+# Enable native CPU optimizations (AVX512/AVX2/FMA)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
+
 # Backend options (default to OFF - enable explicitly when ready)
 option(HAVE_CUDA "Enable CUDA backend" OFF)
 option(HAVE_ROCM "Enable ROCm backend" OFF)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
-option(HAVE_MKL "Enable Intel MKL" OFF)
+
+# CPU BLAS backend: Auto-select based on CPU vendor, or manual override
+# Note: MKL and OpenBLAS cannot be linked together due to symbol conflicts
+# We select one at CMake configure time based on CPU detection
+set(BLAS_BACKEND "AUTO" CACHE STRING "BLAS backend: AUTO, MKL, or OPENBLAS")
+set_property(CACHE BLAS_BACKEND PROPERTY STRINGS AUTO MKL OPENBLAS)
 
 # V2 Core Library
 add_library(llaminar2_core STATIC
@@ -45,6 +53,7 @@ add_library(llaminar2_core STATIC
     tensors/IQ1_MTensor.cpp
     kernels/cpu/QuantizedGemm.cpp
     kernels/cpu/FP32GemmKernel.cpp
+    kernels/cpu/BF16GemmKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
     kernels/cpu/CPURMSNormKernel.cpp
     kernels/cpu/CPUSoftmaxKernel.cpp
@@ -62,40 +71,69 @@ target_compile_features(llaminar2_core PUBLIC cxx_std_17)
 
 # Dependencies
 find_package(MPI REQUIRED)
+find_package(OpenMP REQUIRED)
 
-# Find OpenBLAS (required for GEMM operations)
-# When built standalone (not from parent CMakeLists.txt)
-if(NOT DEFINED OPENBLAS_LIBRARIES)
-    find_package(BLAS REQUIRED)
-    find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include)
-    if(CBLAS_INCLUDE_DIR)
-        message(STATUS "V2: Found CBLAS include: ${CBLAS_INCLUDE_DIR}")
-        target_include_directories(llaminar2_core PUBLIC ${CBLAS_INCLUDE_DIR})
+# ============================================================================
+# BLAS Backend Selection (MKL vs OpenBLAS)
+# ============================================================================
+# Detect CPU vendor to choose optimal BLAS backend
+if(BLAS_BACKEND STREQUAL "AUTO")
+    # Detect CPU vendor at configure time
+    execute_process(
+        COMMAND bash -c "lscpu | grep 'Vendor ID:' | awk '{print $3}'"
+        OUTPUT_VARIABLE CPU_VENDOR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    
+    if(CPU_VENDOR STREQUAL "GenuineIntel")
+        message(STATUS "V2: Detected Intel CPU - preferring Intel MKL")
+        set(BLAS_BACKEND_SELECTED "MKL")
     else()
-        message(WARNING "V2: CBLAS header not found - using fallback")
+        message(STATUS "V2: Detected non-Intel CPU (${CPU_VENDOR}) - preferring OpenBLAS")
+        set(BLAS_BACKEND_SELECTED "OPENBLAS")
     endif()
-    set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
-    message(STATUS "V2: Using system BLAS: ${BLAS_LIBRARIES}")
+else()
+    set(BLAS_BACKEND_SELECTED ${BLAS_BACKEND})
+    message(STATUS "V2: Manual BLAS backend selection: ${BLAS_BACKEND_SELECTED}")
 endif()
 
-# Find Intel MKL if enabled (optional, for BF16 GEMM acceleration)
-if(HAVE_MKL)
-    if(NOT DEFINED MKL_LIBRARIES)
-        find_package(MKL CONFIG QUIET)
-        if(MKL_FOUND)
-            message(STATUS "V2: Intel MKL found - enabling MKL backend")
-            set(MKL_INCLUDE_DIRS ${MKL_INCLUDE})
-            set(MKL_LIBRARIES MKL::MKL)
-            target_include_directories(llaminar2_core PUBLIC ${MKL_INCLUDE_DIRS})
+# Find and link the selected BLAS backend
+if(BLAS_BACKEND_SELECTED STREQUAL "MKL")
+    # Try to find Intel MKL
+    find_package(MKL CONFIG QUIET)
+    if(MKL_FOUND)
+        message(STATUS "V2: Intel MKL found - using MKL backend")
+        target_compile_definitions(llaminar2_core PUBLIC HAVE_MKL)
+        target_include_directories(llaminar2_core PUBLIC ${MKL_INCLUDE})
+        target_link_libraries(llaminar2_core PUBLIC MKL::MKL)
+        set(BLAS_LIBRARIES_SELECTED ${MKL_LIBRARIES})
+    else()
+        message(WARNING "V2: Intel MKL requested but not found - falling back to OpenBLAS")
+        message(WARNING "V2: Install MKL with: sudo apt install intel-oneapi-mkl-devel")
+        set(BLAS_BACKEND_SELECTED "OPENBLAS")
+    endif()
+endif()
+
+if(BLAS_BACKEND_SELECTED STREQUAL "OPENBLAS" OR NOT MKL_FOUND)
+    # Find OpenBLAS
+    if(NOT DEFINED OPENBLAS_LIBRARIES)
+        find_package(BLAS REQUIRED)
+        find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include /usr/include/x86_64-linux-gnu)
+        if(CBLAS_INCLUDE_DIR)
+            message(STATUS "V2: Found CBLAS include: ${CBLAS_INCLUDE_DIR}")
+            target_include_directories(llaminar2_core PUBLIC ${CBLAS_INCLUDE_DIR})
         else()
-            message(WARNING "V2: Intel MKL requested (HAVE_MKL=ON) but not found")
-            message(WARNING "V2: Install with: sudo apt install intel-oneapi-mkl-devel")
-            set(HAVE_MKL OFF)
+            message(WARNING "V2: CBLAS header not found - using fallback")
         endif()
-    else()
-        message(STATUS "V2: Using MKL from parent: ${MKL_LIBRARIES}")
+        set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
+        message(STATUS "V2: Using OpenBLAS: ${BLAS_LIBRARIES}")
     endif()
+    target_compile_definitions(llaminar2_core PUBLIC HAVE_OPENBLAS)
+    target_link_libraries(llaminar2_core PUBLIC ${OPENBLAS_LIBRARIES})
+    set(BLAS_LIBRARIES_SELECTED ${OPENBLAS_LIBRARIES})
 endif()
+
+message(STATUS "V2: Selected BLAS backend: ${BLAS_BACKEND_SELECTED}")
 
 # Try to find libnuma (optional, for NUMA-aware allocation)
 find_library(NUMA_LIBRARY NAMES numa)
@@ -109,13 +147,10 @@ endif()
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
-    ${OPENBLAS_LIBRARIES}
+    OpenMP::OpenMP_CXX
 )
 
-# Link MKL if available
-if(HAVE_MKL AND DEFINED MKL_LIBRARIES)
-    target_link_libraries(llaminar2_core PUBLIC ${MKL_LIBRARIES})
-endif()
+# BLAS libraries are linked above in the backend selection section
 
 # Add conditional backend support
 if(HAVE_CUDA)

@@ -72,7 +72,8 @@
         "cmath": "cpp",
         "iosfwd": "cpp",
         "iostream": "cpp",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "span": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,

@@ -24,10 +24,10 @@ namespace llaminar2
         size_t iq4_m_tile = 64; ///< Default: 64 (optimal from tile sweep)
         size_t iq4_n_tile = 32; ///< Default: 32 (optimal from tile sweep)
 
-        // Experimental features (disabled by default)
-        bool iq4_microkernel = false;      ///< Multi-block vectorized decode
-        bool iq4_direct_decode = false;    ///< Direct decode path (vs cache-blocked)
-        bool iq4_gemm_microkernel = false; ///< GEMM microkernel optimization
+        // Experimental features
+        bool iq4_microkernel = false;     ///< Multi-block vectorized decode (experimental)
+        bool iq4_direct_decode = false;   ///< Direct decode path (vs cache-blocked, experimental)
+        bool iq4_gemm_microkernel = true; ///< GEMM microkernel optimization (CANONICAL - enabled by default)
 
         // Override tile sizes (0 = use adaptive defaults)
         int iq4_override_m_tile = 0;      ///< Override M tile size (FP32)

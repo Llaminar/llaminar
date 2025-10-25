@@ -50,7 +50,7 @@ TEST(Test__TensorDimensions, ValidationPassesCorrectShape)
 
     // Should not abort in debug mode when shape matches
     VALIDATE_TENSOR(tensor, spec, "test_stage");
-    
+
     // If we got here, validation passed
     SUCCEED();
 }
@@ -62,7 +62,7 @@ TEST(Test__TensorDimensions, SameShapeValidation)
 
     // Should not abort when shapes match
     ASSERT_SAME_SHAPE(tensor1, tensor2, "test_stage");
-    
+
     SUCCEED();
 }
 
@@ -81,11 +81,11 @@ TEST(Test__TensorDimensions, ValidationCompilesAway)
 
     // This should compile to nothing and have zero runtime cost
     VALIDATE_TENSOR(tensor, spec, "test_stage");
-    
+
     // Verify we can even pass mismatched specs (validation is disabled)
     TensorSpec wrong_spec({16, 512}, "wrong[16, 512]");
-    VALIDATE_TENSOR(tensor, wrong_spec, "test_stage");  // No error in release!
-    
+    VALIDATE_TENSOR(tensor, wrong_spec, "test_stage"); // No error in release!
+
     SUCCEED();
 }
 

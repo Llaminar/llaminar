@@ -144,4 +144,15 @@ namespace llaminar2
         throw std::runtime_error("IQ3_STensor: RMSNorm not supported");
     }
 
+
+
+
+    bool IQ3_STensor::copyFrom(const TensorBase *src)
+    {
+        // Quantized tensors are read-only weights - no transfer needed
+        (void)src;
+        std::cerr << "[IQ3_STensor::copyFrom] Not implemented\n";
+        return false;
+    }
+
 } // namespace llaminar2

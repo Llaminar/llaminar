@@ -196,4 +196,15 @@ namespace llaminar2
     }
 #endif
 
+
+
+
+    bool Q8_0Tensor::copyFrom(const TensorBase *src)
+    {
+        // Quantized tensors are read-only weights - no transfer needed
+        (void)src;
+        std::cerr << "[Q8_0Tensor::copyFrom] Not implemented\n";
+        return false;
+    }
+
 } // namespace llaminar2

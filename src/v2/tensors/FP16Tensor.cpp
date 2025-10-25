@@ -80,6 +80,42 @@ namespace llaminar2
         throw std::runtime_error("FP16Tensor::mutable_data: FP16 tensors are immutable (use from_fp32 to update)");
     }
 
+    bool FP16Tensor::copyFrom(const TensorBase *src)
+    {
+        if (!src)
+        {
+            return false;
+        }
+
+        // Check shape compatibility
+        if (src->shape() != shape_)
+        {
+            return false;
+        }
+
+        // Get FP32 data from source and convert to FP16
+        const float *src_data = src->data();
+        if (!src_data)
+        {
+            return false;
+        }
+
+        // Calculate element count from shape
+        size_t element_count = 1;
+        for (size_t dim : shape_)
+        {
+            element_count *= dim;
+        }
+
+        // Convert FP32 to FP16 and store
+        from_fp32(src_data, element_count);
+
+        // Clear cache to force re-dequantization
+        dequant_cache_.clear();
+
+        return true;
+    }
+
     std::unique_ptr<ITensorGemm> FP16Tensor::createGemm()
     {
         throw std::runtime_error("FP16Tensor: GEMM not yet implemented");

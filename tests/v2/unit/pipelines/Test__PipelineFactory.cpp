@@ -47,6 +47,22 @@ public:
     const float *logits() const override { return nullptr; }
     const char *architecture() const override { return "mock"; }
 
+    // Implement abstract methods from PipelineBase
+    std::vector<std::string> getAllWeightNames() const override
+    {
+        return {"mock.weight"};
+    }
+
+    ActivationBuffers createBuffersForDevice(int device_idx, int max_seq_len) override
+    {
+        ActivationBuffers buffers;
+        buffers.max_seq_len = max_seq_len;
+        // Create minimal buffers for testing
+        buffers.residual = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(max_seq_len), 768}, device_idx);
+        return buffers;
+    }
+
     std::string getModelPath() const { return model_path_; }
     int getDeviceIdx() const { return device_idx_; }
 

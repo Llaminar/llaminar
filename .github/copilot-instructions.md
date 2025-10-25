@@ -13,6 +13,7 @@ Most sections in this document apply to **V1**. For V2-specific guidance, see `.
 - [Project Overview (V1)](#project-overview-v1)
 - [Build System](#build-system)
 - [Testing Guidelines (V1)](#testing-guidelines-v1)
+  - [CTest Label Best Practices](#ctest-label-best-practices)
 - [Debugging with GDB](#debugging-with-gdb)
 - [Kernel Development (V1)](#kernel-development-v1)
 - [Kernel Development (V2)](#kernel-development-v2)
@@ -459,9 +460,9 @@ unset LLAMINAR_EMBED_TRACE
 
 ## Development Profiling (Advanced)
 
-### Performance Testing Scripts
+### Performance Testing Scripts (V1)
 
-Llaminar includes several specialized performance testing scripts:
+Llaminar V1 includes several specialized performance testing scripts:
 
 ```bash
 # Batch vs Sequential Performance Comparison
@@ -490,6 +491,8 @@ Llaminar includes several specialized performance testing scripts:
 ### Generic Benchmark Runner
 
 For component-level performance benchmarking, use the **generic benchmark runner** which provides canonical MPI/OpenMP configuration for any benchmark executable:
+
+**Note**: This script is primarily for V1 component benchmarks. **V2 performance tests use CTest directly** (see [V2 Performance Testing](#v2-performance-testing) below).
 
 ```bash
 # Run any benchmark with optimal settings (auto-detects in build_release/)
@@ -671,6 +674,211 @@ bash -lc 'set -m; mpirun -np 2 gdb -q --batch -ex "handle SIGUSR1 pass nostop no
 - ❌ `test_graph.cpp`: Generic compute graph (architecture removed)
 - ❌ `LinearKernelTest`: Legacy non-MPI kernel (retired after MPI migration)
 
+### CTest Label Best Practices
+
+**Philosophy**: Labels should describe **what** is tested, not **when** it was developed.
+
+V2 tests use a **4-tier hierarchical labeling system** for flexible filtering and self-documentation:
+
+#### Tier 1 - Test Type (Required)
+- `Unit` - Isolated component tests (no model loading, fast)
+- `Integration` - Multi-component tests (may load models)
+- `E2E` - End-to-end pipeline tests (full inference workflow)
+- `Parity` - Ground truth validation (PyTorch/llama.cpp comparison)
+- `Performance` - Benchmarks (run manually, not in standard CTest suites)
+
+#### Tier 2 - Architecture (Optional)
+- `V2` - V2 architecture tests
+- `V1` - V1 architecture tests (when needed for disambiguation)
+
+#### Tier 3 - Component (Specific)
+Use labels that describe the **system component** being tested:
+- `DeviceManagement` - Device orchestration, discovery, selection
+- `TensorOperations` - Tensor creation, manipulation, conversion
+- `Kernels` - Computational kernels (GEMM, RoPE, Attention)
+- `ModelLoading` - GGUF parsing, weight loading, verification
+- `PipelineExecution` - Pipeline lifecycle, forward pass, factory
+- `WeightPlacement` - Weight distribution strategies
+- `DataTransfer` - Cross-device buffer management
+- `ArgumentParsing` - CLI argument handling
+
+#### Tier 4 - Feature (Granular)
+Use labels that describe **specific capabilities** being tested:
+- `Orchestration` - Orchestrator-specific features
+- `Quantization` - Quantized tensor formats
+- `MultiDevice` - Heterogeneous execution
+- `CrossDevice` - Cross-device operations
+- `HeterogeneousExecution` - Mixed device types
+- `BasicFeatures` / `AdvancedFeatures` - Capability level
+- Format-specific: `IQ4_NL`, `FP32`, `BF16`
+- Operation-specific: `GEMM`, `RoPE`, `Attention`
+
+#### Naming Conventions
+
+**DO**:
+- ✅ Use **CamelCase** for all labels (matches V2 file naming: `Test__ClassName.cpp`)
+- ✅ Be **specific**: `PipelineFactory` not `Factory`, `FP32Tensor` not `Tensor`
+- ✅ Use **feature names**: `WeightPlacement`, `DeviceOrchestration`
+- ✅ Apply **multiple labels** per test for flexible filtering
+- ✅ Use standard abbreviations: `CPU`, `GPU`, `MPI`, `GEMM`, `GGUF`
+
+**DON'T**:
+- ❌ Use **timeline-based labels**: `Phase1`, `Phase2`, `Milestone3`
+- ❌ Use **generic labels** without context: `Factory`, `Pipeline`, `Tensor`
+- ❌ Use **ambiguous abbreviations**: `P1`, `Mgmt`, `Exec`
+- ❌ Mix **naming styles**: Stick to CamelCase throughout
+
+#### Example: Good vs Bad Labels
+
+```cmake
+# ❌ BAD: Timeline-based, generic, unhelpful
+set_tests_properties(v2_test_orchestrator 
+    PROPERTIES LABELS "Phase1;Unit;V2")
+
+# ❌ BAD: Too generic, unclear what's tested
+set_tests_properties(v2_test_factory 
+    PROPERTIES LABELS "Factory;Unit;V2")
+
+# ✅ GOOD: Feature-descriptive, hierarchical, filterable
+set_tests_properties(v2_test_device_orchestrator 
+    PROPERTIES LABELS "V2;Unit;DeviceManagement;Orchestration;BasicFeatures")
+
+# ✅ GOOD: Specific component, multiple filter dimensions
+set_tests_properties(v2_test_iq4nl_gemm 
+    PROPERTIES LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM")
+```
+
+#### Filtering Examples
+
+Multiple labels enable flexible test filtering:
+
+```bash
+# By component (all device management tests)
+ctest -L DeviceManagement
+
+# By feature (all quantization tests)
+ctest -L Quantization
+
+# By test type (all unit tests)
+ctest -L "V2;Unit"
+
+# Combined filters (device management orchestration tests)
+ctest -L "DeviceManagement" -L "Orchestration"
+
+# Exclude specific labels (all tests except performance)
+ctest -LE Performance
+```
+
+#### Adding New Tests
+
+When adding tests to `tests/v2/CMakeLists.txt`, follow this pattern:
+
+```cmake
+# 1. Create test executable
+add_executable(v2_test_my_feature Test__MyFeature.cpp)
+target_link_libraries(v2_test_my_feature llaminar2_core GTest::gtest_main)
+
+# 2. Add test with hierarchical labels
+add_v2_test(V2_Unit_MyFeature
+    COMMAND v2_test_my_feature
+    LABELS "V2;Unit;ComponentName;FeatureName;SpecificDetail"
+)
+```
+
+**Label Selection Checklist**:
+1. ✅ Does the label describe **what** is tested, not **when**?
+2. ✅ Would a new developer understand what the label means?
+3. ✅ Can tests be logically filtered using this label?
+4. ✅ Is the label **specific** enough to be useful?
+5. ✅ Does the label follow **CamelCase** convention?
+
+#### Documentation
+
+Test label conventions are documented in:
+- **`tests/v2/CMakeLists.txt`**: 50-line comment block with tier definitions and examples
+- **`changelog/2025-10-24-ctest-label-standardization.md`**: Complete migration guide
+
+**See Also**:
+- CTest documentation: https://cmake.org/cmake/help/latest/manual/ctest.1.html#ctest-labels
+- V2 test organization: `tests/v2/CMakeLists.txt` (lines 1-100)
+
+### V2 Performance Testing
+
+**V2 Performance Test Suite** (`tests/v2/performance/`)
+
+V2 includes a dedicated performance test framework for benchmarking component-level throughput, latency, and memory usage. Performance tests are integrated into CTest with optimal MPI/OpenMP settings.
+
+**⚠️ CRITICAL**: V2 **requires `-march=native`** for SIMD optimizations (AVX512/AVX2/FMA). Without it, performance is 4-12× slower due to scalar fallback. This is now enabled by default in `src/v2/CMakeLists.txt`.
+
+#### Running V2 Performance Tests
+
+```bash
+# From workspace root - first ensure Release build exists
+cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --parallel
+
+# Run all V2 performance tests
+cd build_v2
+ctest -L Performance --verbose
+
+# Run specific benchmarks
+ctest -L "Performance;GEMM" --verbose          # All GEMM benchmarks
+ctest -L "Performance;IQ4_NL" --verbose        # IQ4_NL quantized tests
+ctest -R "V2_Perf_IQ4NL_GEMM" --verbose        # Specific test by name
+```
+
+#### Available V2 Benchmarks
+
+**IQ4_NL GEMM Performance** (`Perf__IQ4_NL_GEMM`)
+- Benchmarks IQ4_NL quantized matrix multiplication with AVX512/AVX2 SIMD
+- Test cases: Single token, small batch (32), medium batch (128), large batch (512)
+- Metrics: Time/iteration (ms), throughput (GFLOPS), memory bandwidth (GB/s)
+- Uses real Qwen 2.5 0.5B IQ4_NL weights
+- **Expected Performance** (Release with AVX512):
+  - Small batch (32): ~8 GFLOPS
+  - Medium batch (128): ~20 GFLOPS
+  - Large batch (512): ~25 GFLOPS
+
+**Optimal Settings Automatically Applied:**
+- CPU topology detection (sockets, cores per socket)
+- OpenMP: `OMP_NUM_THREADS=$CORES_PER_SOCKET`, `OMP_PLACES=sockets`, `OMP_PROC_BIND=close`
+- MPI core pinning: `--bind-to socket`, `--map-by socket`, `--report-bindings`
+- BLAS threading: `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` auto-configured
+- **SIMD Optimization**: `-march=native -mtune=native` (enables AVX512/AVX2/FMA)
+
+#### Adding New V2 Performance Tests
+
+```bash
+# 1. Create performance test (e.g., Perf__MyFeature.cpp)
+# File: tests/v2/performance/Perf__MyFeature.cpp
+
+# 2. Add to tests/v2/CMakeLists.txt
+add_executable(v2_perf_my_feature performance/Perf__MyFeature.cpp)
+target_link_libraries(v2_perf_my_feature llaminar2_core GTest::gtest GTest::gtest_main)
+
+add_v2_perf_test(V2_Perf_MyFeature
+    COMMAND v2_perf_my_feature
+    LABELS "V2;Performance;MyComponent;MyFeature"
+    MPI_PROCS 1  # Single rank for pure performance
+)
+
+# 3. Build and run
+cmake --build build_v2_release --target v2_perf_my_feature --parallel
+cd build_v2 && ctest -L Performance -R "MyFeature" --verbose
+```
+
+**Best Practices:**
+- Use Release builds (`-O3 -DNDEBUG -march=native`)
+- Include warmup iterations (3-10) before timed section
+- Use MPI barriers around timed code
+- Test multiple workload sizes (small/medium/large)
+- Report multiple metrics (time, GFLOPS, bandwidth)
+- Use realistic input data (not all zeros)
+
+**Documentation:**
+- Comprehensive guide: `tests/v2/performance/README.md` (500+ lines)
+- Framework details: `changelog/2025-10-24-v2-performance-test-framework.md`
+- V2 architecture: `.github/instructions/llaminar-v2-architecture.instructions.md`
 
 ## Checking Files for Compile Errors / Problems
 

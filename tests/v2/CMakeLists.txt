@@ -156,7 +156,19 @@ target_link_libraries(v2_test_tensor_basics
 )
 add_v2_test(V2_Unit_TensorBasics 
     COMMAND v2_test_tensor_basics
-    LABELS "V2;Unit;Tensor"
+    LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
+)
+
+# Test: BF16Tensor class
+add_executable(v2_test_bf16_tensor unit/tensors/Test__BF16Tensor.cpp)
+target_link_libraries(v2_test_bf16_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BF16Tensor 
+    COMMAND v2_test_bf16_tensor
+    LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM"
 )
 
 # Test: ModelLoader
@@ -169,7 +181,7 @@ target_link_libraries(v2_test_model_loader
 add_v2_test(V2_Unit_ModelLoader 
     COMMAND v2_test_model_loader
     MPI_PROCS 1
-    LABELS "V2;Unit;ModelLoader"
+    LABELS "V2;Unit;ModelLoading;GGUF;WeightLoading"
 )
 
 # Test: IQ4_NL Tensor GEMM
@@ -181,7 +193,7 @@ target_link_libraries(v2_test_iq4nl_tensor
 )
 add_v2_test(V2_Unit_IQ4_NLTensor 
     COMMAND v2_test_iq4nl_tensor
-    LABELS "V2;Unit;IQ4_NL;GEMM"
+    LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
 # Test: PipelineFactory
@@ -193,7 +205,7 @@ target_link_libraries(v2_test_pipeline_factory
 )
 add_v2_test(V2_Unit_PipelineFactory 
     COMMAND v2_test_pipeline_factory
-    LABELS "V2;Unit;Pipeline;Factory"
+    LABELS "V2;Unit;PipelineExecution;Factory;Registration"
 )
 
 # Test: WeightPlacementMap
@@ -205,7 +217,7 @@ target_link_libraries(v2_test_weight_placement_map
 )
 add_v2_test(V2_Unit_WeightPlacementMap 
     COMMAND v2_test_weight_placement_map
-    LABELS "V2;Unit;WeightPlacementMap;Phase1"
+    LABELS "V2;Unit;WeightPlacement;DeviceManagement"
 )
 
 # Test: DeviceOrchestrator
@@ -217,7 +229,7 @@ target_link_libraries(v2_test_device_orchestrator
 )
 add_v2_test(V2_Unit_DeviceOrchestrator 
     COMMAND v2_test_device_orchestrator
-    LABELS "V2;Unit;DeviceOrchestrator;Phase1"
+    LABELS "V2;Unit;DeviceManagement;Orchestration;BasicFeatures"
     MPI_PROCS 1
 )
 
@@ -230,7 +242,7 @@ target_link_libraries(v2_test_arg_parser
 )
 add_v2_test(V2_Unit_ArgParser 
     COMMAND v2_test_arg_parser
-    LABELS "V2;Unit;ArgParser;Phase2"
+    LABELS "V2;Unit;ArgumentParsing;CLI"
     MPI_PROCS 1
 )
 
@@ -243,7 +255,7 @@ target_link_libraries(v2_test_device_orchestrator_phase2
 )
 add_v2_test(V2_Unit_DeviceOrchestrator_Phase2 
     COMMAND v2_test_device_orchestrator_phase2
-    LABELS "V2;Unit;DeviceOrchestrator;Phase2"
+    LABELS "V2;Unit;DeviceManagement;Orchestration;AdvancedFeatures"
     MPI_PROCS 1
 )
 
@@ -257,7 +269,7 @@ target_link_libraries(v2_test_cpu_kernels
 )
 add_v2_test(V2_Unit_CPUKernels 
     COMMAND v2_test_cpu_kernels
-    LABELS "V2;Unit;CPUKernels;Phase3"
+    LABELS "V2;Unit;Kernels;CPU;ComputeBackends"
     MPI_PROCS 1
 )
 
@@ -270,7 +282,46 @@ target_link_libraries(v2_test_tensor_dimensions
 )
 add_v2_test(V2_Unit_TensorDimensions 
     COMMAND v2_test_tensor_dimensions
-    LABELS "V2;Unit;TensorDimensions;Phase3"
+    LABELS "V2;Unit;TensorOperations;Dimensions;ShapeHandling"
+    MPI_PROCS 1
+)
+
+# Test: Multi-Device Support (Phase 4.1)
+add_executable(v2_test_multi_device Test__MultiDevice.cpp)
+target_link_libraries(v2_test_multi_device 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MultiDevice 
+    COMMAND v2_test_multi_device
+    LABELS "V2;Unit;DeviceManagement;MultiDevice;HeterogeneousExecution"
+    MPI_PROCS 1
+)
+
+# Test: Device Transfer (Phase 4.2)
+add_executable(v2_test_device_transfer Test__DeviceTransfer.cpp)
+target_link_libraries(v2_test_device_transfer 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceTransfer 
+    COMMAND v2_test_device_transfer
+    LABELS "V2;Unit;DataTransfer;CrossDevice;BufferManagement"
+    MPI_PROCS 1
+)
+
+# Test: Device-Aware Execution (Phase 4.3)
+add_executable(v2_test_device_aware_execution Test__DeviceAwareExecution.cpp)
+target_link_libraries(v2_test_device_aware_execution 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceAwareExecution 
+    COMMAND v2_test_device_aware_execution
+    LABELS "V2;Unit;DeviceManagement;Orchestration;DeviceAwareness"
     MPI_PROCS 1
 )
 
@@ -329,18 +380,206 @@ add_v2_test(V2_Unit_TensorDimensions
 # )
 
 # =============================================================================
-# Performance Tests (Optional)
+# Performance Tests
 # =============================================================================
 # Benchmarks for throughput, latency, memory usage
-# Not part of standard test suites (run manually or in CI performance stage)
+# Performance tests require Release builds and optimal MPI/OpenMP settings
+# They are integrated into CTest but labeled separately for manual execution
+#
+# Usage:
+#   ctest -L Performance --verbose                    # Run all performance tests
+#   ctest -L "Performance;GEMM" --verbose             # Run GEMM benchmarks
+#   ctest -L "Performance;IQ4_NL" --verbose           # Run IQ4_NL benchmarks
+#
+# Performance tests automatically:
+#   - Build/use Release configuration (build_v2_release)
+#   - Apply optimal MPI/OpenMP settings (from run_benchmark.sh)
+#   - Pin to physical cores for consistent measurements
+#   - Report GFLOPS, bandwidth, and latency metrics
 
-# Placeholder for performance test executables (to be added)
+# Helper function: Add V2 Performance Test
+# Similar to add_v2_test but optimized for performance measurement
+function(add_v2_perf_test TEST_NAME)
+    cmake_parse_arguments(
+        ARG                             # Prefix for parsed args
+        ""                              # Options (boolean flags)
+        "MPI_PROCS"                     # One-value keywords
+        "COMMAND;LABELS"                # Multi-value keywords
+        ${ARGN}                         # Arguments to parse
+    )
+    
+    # Detect CPU topology for optimal thread/process counts
+    execute_process(
+        COMMAND bash -c "lscpu | grep 'Socket(s):' | awk '{print $2}'"
+        OUTPUT_VARIABLE NUM_SOCKETS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    execute_process(
+        COMMAND bash -c "lscpu | grep 'Core(s) per socket:' | awk '{print $4}'"
+        OUTPUT_VARIABLE CORES_PER_SOCKET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    
+    # Fallback to safe defaults if detection fails
+    if(NOT NUM_SOCKETS OR NUM_SOCKETS EQUAL "")
+        set(NUM_SOCKETS 1)
+    endif()
+    if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "")
+        set(CORES_PER_SOCKET 1)
+    endif()
+    
+    # Default MPI processes: 1 for pure performance tests (no distribution overhead)
+    if(NOT DEFINED ARG_MPI_PROCS)
+        set(ARG_MPI_PROCS 1)
+    endif()
+    
+    # Build mpirun command with optimal settings (from run_benchmark.sh)
+    set(MPI_CMD
+        mpirun
+        -np ${ARG_MPI_PROCS}
+        --bind-to socket
+        --map-by socket
+        --mca mpi_leave_pinned 1
+        --mca btl_vader_single_copy_mechanism none
+        --report-bindings               # Verify core pinning
+        # Export OpenMP environment variables to MPI ranks
+        -x OMP_NUM_THREADS=${CORES_PER_SOCKET}
+        -x OMP_PLACES=sockets
+        -x OMP_PROC_BIND=close
+        -x OMP_NESTED=false
+        -x OMP_DYNAMIC=false
+        -x KMP_AFFINITY=granularity=fine,compact,1,0
+        -x KMP_BLOCKTIME=0
+        -x OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET}
+        -x GOTO_NUM_THREADS=${CORES_PER_SOCKET}
+        -x MKL_NUM_THREADS=${CORES_PER_SOCKET}
+        -x MKL_DYNAMIC=false
+    )
+    
+    # Add --oversubscribe if we have fewer sockets than MPI ranks
+    if(NUM_SOCKETS LESS ARG_MPI_PROCS)
+        list(APPEND MPI_CMD --oversubscribe)
+    endif()
+    
+    # Check if Release build exists, warn if not
+    set(RELEASE_BUILD_DIR "${CMAKE_CURRENT_LIST_DIR}/../../build_v2_release")
+    if(NOT EXISTS ${RELEASE_BUILD_DIR})
+        message(STATUS "Performance tests require Release build (build_v2_release)")
+        message(STATUS "Will attempt to build Release configuration automatically")
+        
+        # Add custom target to build Release if needed
+        add_custom_target(ensure_v2_release_build
+            COMMAND ${CMAKE_COMMAND} -E echo "Building V2 Release configuration..."
+            COMMAND ${CMAKE_COMMAND} -B ${RELEASE_BUILD_DIR} -S ${CMAKE_CURRENT_LIST_DIR}/../.. -DCMAKE_BUILD_TYPE=Release
+            COMMAND ${CMAKE_COMMAND} --build ${RELEASE_BUILD_DIR} --parallel
+            WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+            COMMENT "Ensuring V2 Release build exists for performance tests"
+        )
+    endif()
+    
+    # Create the test with mpirun wrapper
+    # Use full path to executable so it works regardless of working directory
+    list(GET ARG_COMMAND 0 EXECUTABLE_NAME)
+    set(EXECUTABLE_PATH "${CMAKE_BINARY_DIR}/performance/${EXECUTABLE_NAME}")
+    list(REMOVE_AT ARG_COMMAND 0)
+    add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${EXECUTABLE_PATH} ${ARG_COMMAND})
+    
+    # Set environment variables for optimal performance (from run_benchmark.sh)
+    # Working directory: project root so model paths work correctly
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        LABELS "${ARG_LABELS}"
+        ENVIRONMENT "OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
+    )
+    
+    # Note: Performance tests do NOT require V2_Models fixture
+    # They control model loading themselves for benchmarking
+endfunction()
+
+# Performance Test: IQ4_NL Quantized GEMM
+# Benchmarks IQ4_NL quantized matrix multiplication with FP32 and BF16 activations
+# Test cases: SingleToken, SmallBatch, MediumBatch, LargeBatch (prefill)
+add_executable(v2_perf_iq4nl_gemm performance/Perf__IQ4_NL_GEMM.cpp)
+target_link_libraries(v2_perf_iq4nl_gemm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_iq4nl_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_IQ4NL_GEMM
+    COMMAND v2_perf_iq4nl_gemm
+    LABELS "V2;Performance;GEMM;IQ4_NL;Quantization;Throughput"
+    MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
+)
+
+# Profiling tool: GEMM hotpath analysis
+add_executable(v2_profile_gemm_hotpath performance/profile_gemm_hotpath.cpp)
+target_link_libraries(v2_profile_gemm_hotpath llaminar2_core)
+set_target_properties(v2_profile_gemm_hotpath PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+# Future performance tests can be added here following the same pattern:
 # Example:
-# add_executable(v2_benchmark_gemm performance/benchmark_gemm.cpp)
-# target_link_libraries(v2_benchmark_gemm llaminar2_core GTest::gtest_main)
-# # Note: Performance tests don't use add_v2_test since they're not part of CTest by default
-# # They can be run manually: ./build_v2/tests/v2/v2_benchmark_gemm
+# add_executable(v2_perf_attention performance/Perf__Attention.cpp)
+# target_link_libraries(v2_perf_attention llaminar2_core GTest::gtest GTest::gtest_main)
+# add_v2_perf_test(V2_Perf_Attention
+#     COMMAND v2_perf_attention
+#     LABELS "V2;Performance;Attention;Throughput"
+# )
 
+# =============================================================================
+# Test Suite Labels
+# =============================================================================
+# V2 tests use hierarchical, feature-based labels for flexible filtering:
+#
+# TIER 1 - Test Type (Required):
+#   Unit                    - Isolated component tests (no model loading)
+#   Integration             - Multi-component tests (may load models)
+#   E2E                     - End-to-end pipeline tests (full inference)
+#   Parity                  - Ground truth validation (PyTorch/llama.cpp)
+#   Performance             - Benchmarks (run manually, not in CTest)
+#
+# TIER 2 - Architecture (Optional):
+#   V2                      - V2 architecture tests
+#
+# TIER 3 - Component (Specific to what's being tested):
+#   DeviceManagement        - Device orchestration, discovery, selection
+#   TensorOperations        - Tensor creation, manipulation, conversion
+#   Kernels                 - Computational kernels (GEMM, RoPE, Attention)
+#   ModelLoading            - GGUF parsing, weight loading
+#   PipelineExecution       - Pipeline lifecycle, forward pass
+#   WeightPlacement         - Weight distribution strategies
+#   DataTransfer            - Cross-device buffer management
+#   ArgumentParsing         - CLI argument handling
+#
+# TIER 4 - Feature (Granular specifics):
+#   Orchestration           - Orchestrator-specific features
+#   Quantization            - Quantized tensor formats
+#   MultiDevice             - Heterogeneous execution
+#   CrossDevice             - Cross-device operations
+#   HeterogeneousExecution  - Mixed device types
+#   BasicFeatures           - Core functionality
+#   AdvancedFeatures        - Extended capabilities
+#   etc. (feature-specific)
+#
+# FILTERING EXAMPLES:
+#   ctest -L "V2;Unit"                          # All V2 unit tests
+#   ctest -L DeviceManagement                   # All device management tests
+#   ctest -L "TensorOperations;Quantization"    # All quantized tensor tests
+#   ctest -L Orchestration                      # All orchestrator tests
+#   ctest -L GEMM                               # All GEMM-related tests
+#   ctest -R "V2_Unit_.*"                       # All V2 unit tests (by name)
+#
+# NAMING CONVENTIONS:
+#   - Use CamelCase for label names (matches file naming)
+#   - Be specific: "PipelineFactory" not "Factory"
+#   - Feature-based, not timeline-based: "WeightPlacement" not "Phase1"
+#   - Multiple labels per test enable flexible filtering dimensions
+#
 # =============================================================================
 # Test Suite Labels
 # =============================================================================

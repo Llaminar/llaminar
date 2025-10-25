@@ -4,6 +4,7 @@
  * @author David Sanftenberg
  */
 
+#include "../utils/Logger.h"
 #include "ModelLoader.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
@@ -223,7 +224,7 @@ namespace llaminar2
         file_stream_.open(file_path, std::ios::binary);
         if (!file_stream_)
         {
-            std::cerr << "[ModelLoader] Failed to open file: " << file_path << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to open file: " << file_path);
             return false;
         }
 
@@ -232,19 +233,19 @@ namespace llaminar2
         // Parse Model structure
         if (!parseHeader())
         {
-            std::cerr << "[ModelLoader] Failed to parse header" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to parse header");
             return false;
         }
 
         if (!parseMetadata())
         {
-            std::cerr << "[ModelLoader] Failed to parse metadata" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to parse metadata");
             return false;
         }
 
         if (!parseTensorInfo())
         {
-            std::cerr << "[ModelLoader] Failed to parse tensor info" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to parse tensor info");
             return false;
         }
 
@@ -262,20 +263,20 @@ namespace llaminar2
             file_stream_.seekg(static_cast<std::streamoff>(aligned), std::ios::beg);
             if (!file_stream_)
             {
-                std::cerr << "[ModelLoader] Failed to seek to aligned data offset" << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to seek to aligned data offset");
                 return false;
             }
         }
 
         model_.data_offset = aligned;
 
-        std::cout << "[ModelLoader] Loaded " << file_path << std::endl;
-        std::cout << "  Architecture: " << model_.architecture << std::endl;
-        std::cout << "  Layers: " << model_.block_count << std::endl;
-        std::cout << "  Hidden size: " << model_.embedding_length << std::endl;
-        std::cout << "  Vocab size: " << model_.vocab_size << std::endl;
-        std::cout << "  Heads: " << model_.head_count << " (KV: " << model_.head_count_kv << ")" << std::endl;
-        std::cout << "  Tensors: " << model_.tensor_count << std::endl;
+        LOG_INFO("[ModelLoader] Loaded " << file_path);
+        LOG_INFO("  Architecture: " << model_.architecture);
+        LOG_INFO("  Layers: " << model_.block_count);
+        LOG_INFO("  Hidden size: " << model_.embedding_length);
+        LOG_INFO("  Vocab size: " << model_.vocab_size);
+        LOG_INFO("  Heads: " << model_.head_count << " (KV: " << model_.head_count_kv << ")");
+        LOG_INFO("  Tensors: " << model_.tensor_count);
 
         loaded_ = true;
         return true;
@@ -285,7 +286,7 @@ namespace llaminar2
     {
         if (!loaded_)
         {
-            std::cerr << "[ModelLoader] Model not loaded" << std::endl;
+            LOG_ERROR("[ModelLoader] Model not loaded");
             return nullptr;
         }
 
@@ -293,7 +294,7 @@ namespace llaminar2
         const GGUFTensorInfo *info = model_.findTensor(tensor_name);
         if (!info)
         {
-            std::cerr << "[ModelLoader] Tensor not found: " << tensor_name << std::endl;
+            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
             return nullptr;
         }
 
@@ -301,7 +302,7 @@ namespace llaminar2
         file_stream_.seekg(model_.data_offset + info->offset, std::ios::beg);
         if (!file_stream_)
         {
-            std::cerr << "[ModelLoader] Failed to seek to tensor: " << tensor_name << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to seek to tensor: " << tensor_name);
             return nullptr;
         }
 
@@ -309,7 +310,7 @@ namespace llaminar2
         std::vector<uint8_t> raw(info->size_bytes);
         if (!file_stream_.read(reinterpret_cast<char *>(raw.data()), raw.size()))
         {
-            std::cerr << "[ModelLoader] Failed to read tensor data: " << tensor_name << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to read tensor data: " << tensor_name);
             return nullptr;
         }
 
@@ -597,28 +598,28 @@ namespace llaminar2
         char magic[4];
         if (!file_stream_.read(magic, 4) || std::string(magic, 4) != "GGUF")
         {
-            std::cerr << "[ModelLoader] Invalid magic number (not a GGUF file)" << std::endl;
+            LOG_ERROR("[ModelLoader] Invalid magic number (not a GGUF file)");
             return false;
         }
 
         // Read version
         if (!readValue(model_.version))
         {
-            std::cerr << "[ModelLoader] Failed to read version" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to read version");
             return false;
         }
 
         // Read tensor count
         if (!readValue(model_.tensor_count))
         {
-            std::cerr << "[ModelLoader] Failed to read tensor count" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to read tensor count");
             return false;
         }
 
         // Read metadata count
         if (!readValue(model_.metadata_kv_count))
         {
-            std::cerr << "[ModelLoader] Failed to read metadata count" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to read metadata count");
             return false;
         }
 
@@ -637,7 +638,7 @@ namespace llaminar2
 
         if (len > 1000000)
         { // 1MB sanity check
-            std::cerr << "[ModelLoader] String length too large: " << len << std::endl;
+            LOG_ERROR("[ModelLoader] String length too large: " << len);
             return false;
         }
 
@@ -664,7 +665,7 @@ namespace llaminar2
         // Sanity check on array length
         if (array_len > 1000000)
         {
-            std::cerr << "[ModelLoader] Array length too large: " << array_len << std::endl;
+            LOG_ERROR("[ModelLoader] Array length too large: " << array_len);
             return false;
         }
 
@@ -707,7 +708,7 @@ namespace llaminar2
             }
             return true;
         default:
-            std::cerr << "[ModelLoader] Unknown array element type: " << elem_type << std::endl;
+            LOG_ERROR("[ModelLoader] Unknown array element type: " << elem_type);
             return false;
         }
 
@@ -716,7 +717,7 @@ namespace llaminar2
         value.data.resize(total_bytes);
         if (!file_stream_.read(reinterpret_cast<char *>(value.data.data()), total_bytes))
         {
-            std::cerr << "[ModelLoader] Failed to read array data" << std::endl;
+            LOG_ERROR("[ModelLoader] Failed to read array data");
             return false;
         }
 
@@ -731,7 +732,7 @@ namespace llaminar2
             std::string key;
             if (!readString(key))
             {
-                std::cerr << "[ModelLoader] Failed to read metadata key " << i << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to read metadata key " << i);
                 return false;
             }
 
@@ -739,7 +740,7 @@ namespace llaminar2
             uint32_t value_type;
             if (!readValue(value_type))
             {
-                std::cerr << "[ModelLoader] Failed to read value type for key: " << key << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to read value type for key: " << key);
                 return false;
             }
 
@@ -760,7 +761,7 @@ namespace llaminar2
 
                 if (str_len > 1000000)
                 {
-                    std::cerr << "[ModelLoader] String value too large: " << str_len << std::endl;
+                    LOG_ERROR("[ModelLoader] String value too large: " << str_len);
                     return false;
                 }
 
@@ -797,7 +798,7 @@ namespace llaminar2
                     value_size = 8;
                     break;
                 default:
-                    std::cerr << "[ModelLoader] Unknown value type: " << value_type << std::endl;
+                    LOG_ERROR("[ModelLoader] Unknown value type: " << value_type);
                     return false;
                 }
 
@@ -825,7 +826,7 @@ namespace llaminar2
             // Read tensor name
             if (!readString(tensor.name))
             {
-                std::cerr << "[ModelLoader] Failed to read tensor name " << i << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to read tensor name " << i);
                 return false;
             }
 
@@ -833,7 +834,7 @@ namespace llaminar2
             uint32_t n_dims;
             if (!readValue(n_dims))
             {
-                std::cerr << "[ModelLoader] Failed to read dimensions for: " << tensor.name << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to read dimensions for: " << tensor.name);
                 return false;
             }
 
@@ -861,7 +862,7 @@ namespace llaminar2
             uint32_t type_val;
             if (!readValue(type_val))
             {
-                std::cerr << "[ModelLoader] Failed to read type for: " << tensor.name << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to read type for: " << tensor.name);
                 return false;
             }
             tensor.type = static_cast<GGUFTensorType>(type_val);
@@ -869,7 +870,7 @@ namespace llaminar2
             // Read tensor offset
             if (!readValue(tensor.offset))
             {
-                std::cerr << "[ModelLoader] Failed to read offset for: " << tensor.name << std::endl;
+                LOG_ERROR("[ModelLoader] Failed to read offset for: " << tensor.name);
                 return false;
             }
 
@@ -911,10 +912,10 @@ namespace llaminar2
     void ModelLoader::extractModelMetadata()
     {
         // Debug: Print all metadata keys
-        std::cout << "[ModelLoader] Available metadata keys:\n";
+        LOG_INFO("[ModelLoader] Available metadata keys:\n");
         for (const auto &kv : model_.metadata)
         {
-            std::cout << "  " << kv.first << " (type=" << static_cast<int>(kv.second.type) << ")\n";
+            LOG_INFO("  " << kv.first << " (type=" << static_cast<int>(kv.second.type) << ")\n");
         }
 
         // Extract common hyperparameters from metadata
@@ -985,15 +986,15 @@ namespace llaminar2
         }
 
         // Debug output
-        std::cout << "[ModelLoader] Extracted metadata:\n";
-        std::cout << "  architecture: " << model_.architecture << "\n";
-        std::cout << "  context_length: " << model_.context_length << "\n";
-        std::cout << "  embedding_length: " << model_.embedding_length << "\n";
-        std::cout << "  block_count: " << model_.block_count << "\n";
-        std::cout << "  head_count: " << model_.head_count << "\n";
-        std::cout << "  head_count_kv: " << model_.head_count_kv << "\n";
-        std::cout << "  vocab_size: " << model_.vocab_size << "\n";
-        std::cout << "  rope_theta: " << model_.rope_theta << "\n";
+        LOG_INFO("[ModelLoader] Extracted metadata:\n");
+        LOG_INFO("  architecture: " << model_.architecture);
+        LOG_INFO("  context_length: " << model_.context_length);
+        LOG_INFO("  embedding_length: " << model_.embedding_length);
+        LOG_INFO("  block_count: " << model_.block_count);
+        LOG_INFO("  head_count: " << model_.head_count);
+        LOG_INFO("  head_count_kv: " << model_.head_count_kv);
+        LOG_INFO("  vocab_size: " << model_.vocab_size);
+        LOG_INFO("  rope_theta: " << model_.rope_theta);
     }
 
 } // namespace llaminar2

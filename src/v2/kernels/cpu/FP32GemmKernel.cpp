@@ -2,11 +2,19 @@
  * @file FP32GemmKernel.cpp
  * @brief CPU FP32 GEMM kernel implementation
  *
+ * Supports OpenBLAS and Intel MKL backends.
+ * Both use the same cblas_sgemm API.
+ *
  * @author David Sanftenberg
  */
 
 #include "FP32GemmKernel.h"
+
+#ifdef HAVE_MKL
+#include <mkl_cblas.h>
+#else
 #include <cblas.h>
+#endif
 
 namespace llaminar2
 {
@@ -73,10 +81,10 @@ namespace llaminar2
                 CblasNoTrans, CblasTrans,
                 m, n, k,
                 alpha,
-                A, k,      // A is [m, k], lda = k
-                B, k,      // B is [n, k], ldb = k
+                A, k, // A is [m, k], lda = k
+                B, k, // B is [n, k], ldb = k
                 beta,
-                C, n       // C is [m, n], ldc = n
+                C, n // C is [m, n], ldc = n
             );
         }
         else
@@ -87,10 +95,10 @@ namespace llaminar2
                 CblasNoTrans, CblasNoTrans,
                 m, n, k,
                 alpha,
-                A, k,      // A is [m, k], lda = k
-                B, n,      // B is [k, n], ldb = n
+                A, k, // A is [m, k], lda = k
+                B, n, // B is [k, n], ldb = n
                 beta,
-                C, n       // C is [m, n], ldc = n
+                C, n // C is [m, n], ldc = n
             );
         }
 

@@ -83,7 +83,7 @@ namespace llaminar2
     class ITensorSwiGLU;
 
     /**
-     * @brief CPU compute context (OpenBLAS)
+     * @brief CPU compute context (OpenBLAS or Intel MKL)
      */
     class CPUComputeContext : public ComputeContext
     {
@@ -97,8 +97,15 @@ namespace llaminar2
         void copy_from_device(void *dst, const void *src, size_t bytes) override;
         void synchronize() override { /* no-op for CPU */ }
 
-        ComputeBackendType backend_type() const override { return ComputeBackendType::CPU_OPENBLAS; }
-        bool supports_bf16() const override { return true; } // Software emulation
+        ComputeBackendType backend_type() const override
+        {
+#ifdef HAVE_MKL
+            return ComputeBackendType::CPU_MKL;
+#else
+            return ComputeBackendType::CPU_OPENBLAS;
+#endif
+        }
+        bool supports_bf16() const override { return true; } // Software emulation (or MKL native)
         bool supports_fp16() const override { return true; }
         bool supports_int8() const override { return true; }
 

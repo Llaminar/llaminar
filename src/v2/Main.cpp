@@ -11,6 +11,7 @@
  * @author David Sanftenberg
  */
 
+#include "utils/Logger.h"
 #include "utils/MPIContext.h"
 #include "utils/ArgParser.h"
 #include "backends/ComputeBackend.h"
@@ -33,31 +34,31 @@ void list_devices()
 
     const auto &devices = dm.devices();
 
-    std::cout << "\n=== Available Devices ===\n\n";
+    LOG_INFO("\n=== Available Devices ===\n\n");
     for (size_t i = 0; i < devices.size(); ++i)
     {
         const auto &dev = devices[i];
-        std::cout << "Device " << i << ": ";
+        LOG_INFO("Device " << i << ": ");
 
         switch (dev.type)
         {
         case ComputeBackendType::CPU_OPENBLAS:
-            std::cout << "CPU (OpenBLAS)";
+            LOG_INFO("CPU (OpenBLAS)");
             break;
         case ComputeBackendType::CPU_MKL:
-            std::cout << "CPU (Intel MKL)";
+            LOG_INFO("CPU (Intel MKL)");
             break;
         case ComputeBackendType::GPU_CUDA:
-            std::cout << "GPU (CUDA) - " << dev.name;
+            LOG_INFO("GPU (CUDA) - " << dev.name);
             break;
         case ComputeBackendType::GPU_ROCM:
-            std::cout << "GPU (ROCm) - " << dev.name;
+            LOG_INFO("GPU (ROCm) - " << dev.name);
             break;
         case ComputeBackendType::GPU_VULKAN:
-            std::cout << "GPU (Vulkan) - " << dev.name;
+            LOG_INFO("GPU (Vulkan) - " << dev.name);
             break;
         case ComputeBackendType::GPU_METAL:
-            std::cout << "GPU (Metal) - " << dev.name;
+            LOG_INFO("GPU (Metal) - " << dev.name);
             break;
         }
 
@@ -65,13 +66,13 @@ void list_devices()
         {
             double total_gb = dev.total_memory_bytes / (1024.0 * 1024.0 * 1024.0);
             double free_gb = dev.free_memory_bytes / (1024.0 * 1024.0 * 1024.0);
-            std::cout << " (" << total_gb << " GB total, " << free_gb << " GB free)";
+            LOG_INFO(" (" << total_gb << " GB total, " << free_gb << " GB free)");
         }
 
-        std::cout << "\n";
+        LOG_INFO("\n");
     }
 
-    std::cout << "\n";
+    LOG_INFO("\n");
 }
 
 int parse_device(const std::string &device_str, DeviceManager &dm)
@@ -98,7 +99,7 @@ int parse_device(const std::string &device_str, DeviceManager &dm)
         return dm.find_device(ComputeBackendType::GPU_ROCM, device_id);
     }
 
-    std::cerr << "Error: Unknown device format: " << device_str << "\n";
+    LOG_ERROR("Error: Unknown device format: " << device_str);
     return -1;
 }
 
@@ -107,6 +108,9 @@ int main(int argc, char *argv[])
     // Initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+
+    // Initialize logging from environment (LLAMINAR_LOG_LEVEL)
+    initializeLogging();
 
     // Ensure pipeline registrations (static constructors may not run in executables)
     ensureQwen2Registration();
@@ -145,7 +149,7 @@ int main(int argc, char *argv[])
     {
         if (MPIContextFactory::global()->rank() == 0)
         {
-            std::cerr << "Error: Model path required (-m)\n\n";
+            LOG_ERROR("Error: Model path required (-m)\n\n");
             ArgParser::printUsage(argv[0]);
         }
         MPI_Finalize();
@@ -193,7 +197,7 @@ int main(int argc, char *argv[])
     {
         if (mpi_ctx->rank() == 0)
         {
-            std::cerr << "Warning: Unknown strategy '" << args.strategy << "', using AUTO\n";
+            LOG_ERROR("Warning: Unknown strategy '" << args.strategy << "', using AUTO\n");
         }
     }
 
@@ -223,7 +227,7 @@ int main(int argc, char *argv[])
     {
         if (mpi_ctx->rank() == 0)
         {
-            std::cerr << "Error: Failed to load model: " << args.model_path << "\n";
+            LOG_ERROR("Error: Failed to load model: " << args.model_path);
         }
         MPI_Finalize();
         return 1;
@@ -238,7 +242,7 @@ int main(int argc, char *argv[])
     {
         if (mpi_ctx->rank() == 0)
         {
-            std::cerr << "Error: Failed to load model with placement map: " << args.model_path << "\n";
+            LOG_ERROR("Error: Failed to load model with placement map: " << args.model_path);
         }
         MPI_Finalize();
         return 1;
@@ -265,16 +269,16 @@ int main(int argc, char *argv[])
     {
         if (mpi_ctx->rank() == 0)
         {
-            std::cerr << "Error: Failed to create pipeline for architecture: " << architecture << "\n";
-            std::cerr << "Supported architectures: ";
+            LOG_ERROR("Error: Failed to create pipeline for architecture: " << architecture);
+            LOG_ERROR("Supported architectures: ");
             auto supported = PipelineFactory::instance().supportedArchitectures();
             for (size_t i = 0; i < supported.size(); ++i)
             {
                 std::cerr << supported[i];
                 if (i + 1 < supported.size())
-                    std::cerr << ", ";
+                    LOG_ERROR(", ");
             }
-            std::cerr << "\n";
+            LOG_ERROR("\n");
         }
         MPI_Finalize();
         return 1;
@@ -286,16 +290,16 @@ int main(int argc, char *argv[])
     // Run inference
     if (mpi_ctx->rank() == 0)
     {
-        std::cout << "Running inference...\n";
-        std::cout << "Prompt: \"" << args.prompt << "\"\n";
-        std::cout << "Generating " << args.n_predict << " tokens...\n\n";
+        LOG_INFO("Running inference...\n");
+        LOG_INFO("Prompt: \"" << args.prompt << "\"\n");
+        LOG_INFO("Generating " << args.n_predict << " tokens...\n\n");
     }
 
     if (!pipeline->forward(tokens.data(), tokens.size()))
     {
         if (mpi_ctx->rank() == 0)
         {
-            std::cerr << "Error: Forward pass failed\n";
+            LOG_ERROR("Error: Forward pass failed\n");
         }
         MPI_Finalize();
         return 1;
@@ -315,7 +319,7 @@ int main(int argc, char *argv[])
 
     if (mpi_ctx->rank() == 0)
     {
-        std::cout << "\nInference complete.\n";
+        LOG_INFO("\nInference complete.\n");
     }
 
     MPI_Finalize();

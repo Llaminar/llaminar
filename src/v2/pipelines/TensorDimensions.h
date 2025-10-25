@@ -20,11 +20,11 @@
  *
  *   // 1. Define architecture-specific spec helpers (in pipeline class):
  *   TensorSpec spec_hidden(int seq_len) const {
- *       return TensorSpec({seq_len, d_model_}, 
- *                         "hidden[" + std::to_string(seq_len) + "," + 
+ *       return TensorSpec({seq_len, d_model_},
+ *                         "hidden[" + std::to_string(seq_len) + "," +
  *                         std::to_string(d_model_) + "]");
  *   }
- *   
+ *
  *   // 2. Validate tensors at each pipeline stage:
  *   VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_embedding");
  *   VALIDATE_TENSOR(Q, spec_q(seq_len), "after_q_proj");
@@ -68,7 +68,7 @@ namespace llaminar2
 
         /**
          * @brief Create tensor specification
-         * 
+         *
          * @param shape Expected shape dimensions
          * @param desc Human-readable description (e.g., "Q[seq_len, n_heads*head_dim]")
          */
@@ -126,9 +126,9 @@ namespace llaminar2
         }
     };
 
-// =============================================================================
-// Validation Macros (compile away in Release builds)
-// =============================================================================
+    // =============================================================================
+    // Validation Macros (compile away in Release builds)
+    // =============================================================================
 
 #ifdef NDEBUG
 // Release build: all validation compiles to nothing
@@ -147,24 +147,24 @@ namespace llaminar2
  * @param spec TensorSpec describing expected shape
  * @param stage Pipeline stage name (for error messages)
  */
-#define VALIDATE_TENSOR(tensor, spec, stage)                                                                      \
-    do                                                                                                             \
-    {                                                                                                              \
-        if (!(tensor))                                                                                             \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Tensor is null\n";                         \
-            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";               \
-            std::abort();                                                                                          \
-        }                                                                                                          \
-        const auto &_actual_shape = (tensor)->shape();                                                            \
-        if (!(spec).matches(_actual_shape))                                                                       \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape mismatch\n";                         \
-            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";               \
-            std::cerr << "  Actual:   " << TensorSpec::shape_str(_actual_shape) << "\n";                          \
-            std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n";           \
-            std::abort();                                                                                          \
-        }                                                                                                          \
+#define VALIDATE_TENSOR(tensor, spec, stage)                                                            \
+    do                                                                                                  \
+    {                                                                                                   \
+        if (!(tensor))                                                                                  \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Tensor is null\n";               \
+            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";     \
+            std::abort();                                                                               \
+        }                                                                                               \
+        const auto &_actual_shape = (tensor)->shape();                                                  \
+        if (!(spec).matches(_actual_shape))                                                             \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape mismatch\n";               \
+            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";     \
+            std::cerr << "  Actual:   " << TensorSpec::shape_str(_actual_shape) << "\n";                \
+            std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n"; \
+            std::abort();                                                                               \
+        }                                                                                               \
     } while (0)
 
 /**
@@ -174,24 +174,24 @@ namespace llaminar2
  * @param spec TensorSpec describing expected shape
  * @param stage Pipeline stage name
  */
-#define VALIDATE_TENSOR_PTR(tensor_ptr, spec, stage)                                                              \
-    do                                                                                                             \
-    {                                                                                                              \
-        if (!(tensor_ptr))                                                                                         \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Tensor pointer is null\n";                 \
-            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";               \
-            std::abort();                                                                                          \
-        }                                                                                                          \
-        const auto &_actual_shape = (tensor_ptr)->shape();                                                        \
-        if (!(spec).matches(_actual_shape))                                                                       \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape mismatch\n";                         \
-            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";               \
-            std::cerr << "  Actual:   " << TensorSpec::shape_str(_actual_shape) << "\n";                          \
-            std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n";           \
-            std::abort();                                                                                          \
-        }                                                                                                          \
+#define VALIDATE_TENSOR_PTR(tensor_ptr, spec, stage)                                                    \
+    do                                                                                                  \
+    {                                                                                                   \
+        if (!(tensor_ptr))                                                                              \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Tensor pointer is null\n";       \
+            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";     \
+            std::abort();                                                                               \
+        }                                                                                               \
+        const auto &_actual_shape = (tensor_ptr)->shape();                                              \
+        if (!(spec).matches(_actual_shape))                                                             \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape mismatch\n";               \
+            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";     \
+            std::cerr << "  Actual:   " << TensorSpec::shape_str(_actual_shape) << "\n";                \
+            std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n"; \
+            std::abort();                                                                               \
+        }                                                                                               \
     } while (0)
 
 /**
@@ -201,17 +201,17 @@ namespace llaminar2
  * @param spec TensorSpec describing expected shape
  * @param stage Pipeline stage name
  */
-#define VALIDATE_SHAPE(actual_shape, spec, stage)                                                                 \
-    do                                                                                                             \
-    {                                                                                                              \
-        if (!(spec).matches(actual_shape))                                                                        \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape mismatch\n";                         \
-            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";               \
-            std::cerr << "  Actual:   " << TensorSpec::shape_str(actual_shape) << "\n";                           \
-            std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n";           \
-            std::abort();                                                                                          \
-        }                                                                                                          \
+#define VALIDATE_SHAPE(actual_shape, spec, stage)                                                       \
+    do                                                                                                  \
+    {                                                                                                   \
+        if (!(spec).matches(actual_shape))                                                              \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape mismatch\n";               \
+            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n";     \
+            std::cerr << "  Actual:   " << TensorSpec::shape_str(actual_shape) << "\n";                 \
+            std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n"; \
+            std::abort();                                                                               \
+        }                                                                                               \
     } while (0)
 
 /**
@@ -221,34 +221,34 @@ namespace llaminar2
  * @param tensor2 Second tensor
  * @param stage Pipeline stage name
  */
-#define ASSERT_SAME_SHAPE(tensor1, tensor2, stage)                                                                \
-    do                                                                                                             \
-    {                                                                                                              \
-        if (!(tensor1) || !(tensor2))                                                                              \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": One or both tensors are null\n";           \
-            std::abort();                                                                                          \
-        }                                                                                                          \
-        const auto &_shape1 = (tensor1)->shape();                                                                 \
-        const auto &_shape2 = (tensor2)->shape();                                                                 \
-        if (_shape1.size() != _shape2.size())                                                                     \
-        {                                                                                                          \
-            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape rank mismatch\n";                    \
-            std::cerr << "  Tensor1: " << TensorSpec::shape_str(_shape1) << "\n";                                 \
-            std::cerr << "  Tensor2: " << TensorSpec::shape_str(_shape2) << "\n";                                 \
-            std::abort();                                                                                          \
-        }                                                                                                          \
-        for (size_t _i = 0; _i < _shape1.size(); ++_i)                                                            \
-        {                                                                                                          \
-            if (_shape1[_i] != _shape2[_i])                                                                       \
-            {                                                                                                      \
-                std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape dimension mismatch\n";           \
-                std::cerr << "  Tensor1: " << TensorSpec::shape_str(_shape1) << "\n";                             \
-                std::cerr << "  Tensor2: " << TensorSpec::shape_str(_shape2) << "\n";                             \
-                std::cerr << "  Hint: Tensors must have identical shapes for this operation\n";                   \
-                std::abort();                                                                                      \
-            }                                                                                                      \
-        }                                                                                                          \
+#define ASSERT_SAME_SHAPE(tensor1, tensor2, stage)                                                      \
+    do                                                                                                  \
+    {                                                                                                   \
+        if (!(tensor1) || !(tensor2))                                                                   \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": One or both tensors are null\n"; \
+            std::abort();                                                                               \
+        }                                                                                               \
+        const auto &_shape1 = (tensor1)->shape();                                                       \
+        const auto &_shape2 = (tensor2)->shape();                                                       \
+        if (_shape1.size() != _shape2.size())                                                           \
+        {                                                                                               \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape rank mismatch\n";          \
+            std::cerr << "  Tensor1: " << TensorSpec::shape_str(_shape1) << "\n";                       \
+            std::cerr << "  Tensor2: " << TensorSpec::shape_str(_shape2) << "\n";                       \
+            std::abort();                                                                               \
+        }                                                                                               \
+        for (size_t _i = 0; _i < _shape1.size(); ++_i)                                                  \
+        {                                                                                               \
+            if (_shape1[_i] != _shape2[_i])                                                             \
+            {                                                                                           \
+                std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Shape dimension mismatch\n"; \
+                std::cerr << "  Tensor1: " << TensorSpec::shape_str(_shape1) << "\n";                   \
+                std::cerr << "  Tensor2: " << TensorSpec::shape_str(_shape2) << "\n";                   \
+                std::cerr << "  Hint: Tensors must have identical shapes for this operation\n";         \
+                std::abort();                                                                           \
+            }                                                                                           \
+        }                                                                                               \
     } while (0)
 
 #endif // NDEBUG
