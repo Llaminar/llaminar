@@ -34,7 +34,6 @@
 #include "tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
 #include "kernels/cpu/QuantizedGemm.h"
-#include "kernels/cpu/QuantizedGemmOptimized.h" // Template version (no virtual dispatch)
 
 using namespace llaminar2;
 
@@ -238,13 +237,13 @@ protected:
             static_cast<size_t>(config.seq_len),
             static_cast<size_t>(config.out_features)});
 
-        // Use optimized template GEMM kernel (no virtual dispatch overhead)
-        llaminar2::QuantizedGemmOptimized<llaminar2::IQ4_NLTensor> gemm(weight.get());
+        // Use virtual dispatch GEMM kernel
+        auto gemm = weight->createGemm();
 
         // Global warmup iterations (before all trials)
         for (int i = 0; i < config.warmup_iters; ++i)
         {
-            bool success = gemm.multiply(
+            bool success = gemm->multiply(
                 activation->data(),     // A (activation) - read-only
                 output->mutable_data(), // C (output) - mutable
                 config.seq_len,         // m
@@ -252,7 +251,9 @@ protected:
                 config.in_features,     // k
                 true,                   // transpose_B (weights are transposed)
                 1.0f,                   // alpha
-                0.0f                    // beta
+                0.0f,                   // beta
+                nullptr,                // MPI context (not needed)
+                -1                      // rank (not needed)
             );
 
             if (!success)
@@ -273,7 +274,7 @@ protected:
 
             for (int i = 0; i < config.bench_iters; ++i)
             {
-                bool success = gemm.multiply(
+                bool success = gemm->multiply(
                     activation->data(),
                     output->mutable_data(),
                     config.seq_len,
@@ -281,7 +282,9 @@ protected:
                     config.in_features,
                     true,
                     1.0f,
-                    0.0f);
+                    0.0f,
+                    nullptr,
+                    -1);
 
                 if (!success)
                 {
@@ -469,133 +472,6 @@ TEST_F(IQ4_NL_GEMM_Perf, SingleToken_Decode)
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
-}
-
-/**
- * @brief Direct comparison: Virtual dispatch vs Template (no virtual dispatch)
- *
- * This test runs BOTH implementations on the SAME workload to measure
- * the actual overhead of virtual dispatch in the hot path.
- */
-TEST_F(IQ4_NL_GEMM_Perf, VirtualVsTemplate_Comparison)
-{
-    BenchmarkConfig config{
-        .seq_len = 1024,
-        .in_features = 896,
-        .out_features = 896,
-        .warmup_iters = 3,
-        .bench_iters = 20,
-        .num_trials = 5,
-        .description = "Virtual Dispatch vs Template (1024x896x896)"};
-
-    auto weight = getWeightTensor();
-
-    // Test 1: Template version (current implementation in benchmarkFP32)
-    BenchmarkStats template_stats = benchmarkFP32(config, weight);
-
-    // Test 2: Virtual dispatch version (using createGemm factory)
-    auto activation = createFP32Activation(config.seq_len, config.in_features);
-    auto output = std::make_shared<llaminar2::FP32Tensor>(std::vector<size_t>{
-        static_cast<size_t>(config.seq_len),
-        static_cast<size_t>(config.out_features)});
-
-    auto gemm = weight->createGemm(); // Factory returns ITensorGemm interface
-
-    // Warmup
-    for (int i = 0; i < config.warmup_iters; ++i)
-    {
-        gemm->multiply(activation->data(), output->mutable_data(),
-                       config.seq_len, config.out_features, config.in_features,
-                       true, 1.0f, 0.0f, nullptr, -1);
-    }
-
-    // Run multiple trials for virtual dispatch version
-    std::vector<double> virtual_trial_times_ms;
-    virtual_trial_times_ms.reserve(config.num_trials);
-
-    for (int trial = 0; trial < config.num_trials; ++trial)
-    {
-        MPI_Barrier(MPI_COMM_WORLD);
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < config.bench_iters; ++i)
-        {
-            gemm->multiply(activation->data(), output->mutable_data(),
-                           config.seq_len, config.out_features, config.in_features,
-                           true, 1.0f, 0.0f, nullptr, -1);
-        }
-        MPI_Barrier(MPI_COMM_WORLD);
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        virtual_trial_times_ms.push_back(elapsed_ms / config.bench_iters);
-    }
-
-    // Calculate virtual dispatch statistics
-    BenchmarkStats virtual_stats;
-    double sum = 0.0;
-    for (double t : virtual_trial_times_ms)
-        sum += t;
-    virtual_stats.mean_ms = sum / virtual_trial_times_ms.size();
-
-    double sq_diff_sum = 0.0;
-    for (double t : virtual_trial_times_ms)
-    {
-        double diff = t - virtual_stats.mean_ms;
-        sq_diff_sum += diff * diff;
-    }
-    virtual_stats.stddev_ms = std::sqrt(sq_diff_sum / virtual_trial_times_ms.size());
-
-    double flops = 2.0 * config.seq_len * config.in_features * config.out_features;
-    virtual_stats.mean_gflops = (flops / virtual_stats.mean_ms) / 1e6;
-    virtual_stats.stddev_gflops = (flops / 1e6) * virtual_stats.stddev_ms /
-                                  (virtual_stats.mean_ms * virtual_stats.mean_ms);
-
-    // Only rank 0 prints comparison and validates
-    if (rank_ == 0)
-    {
-        double virtual_cv = (virtual_stats.stddev_ms / virtual_stats.mean_ms) * 100.0;
-        double template_cv = (template_stats.stddev_ms / template_stats.mean_ms) * 100.0;
-
-        // Print comparison
-        std::cout << "\n";
-        std::cout << "╔════════════════════════════════════════════════════════════════╗\n";
-        std::cout << "║ Virtual Dispatch vs Template Comparison                       ║\n";
-        std::cout << "╠════════════════════════════════════════════════════════════════╣\n";
-        std::cout << "║ Virtual Dispatch (ITensorGemm interface):                      ║\n";
-        std::cout << "║   Time:        " << std::setw(7) << std::fixed << std::setprecision(2) << virtual_stats.mean_ms
-                  << " ± " << std::setw(5) << virtual_stats.stddev_ms << " ms";
-        std::cout << " (CV: " << std::setw(4) << std::setprecision(1) << virtual_cv << "%)        ║\n";
-        std::cout << "║   Throughput:  " << std::setw(7) << std::fixed << std::setprecision(2) << virtual_stats.mean_gflops
-                  << " ± " << std::setw(5) << virtual_stats.stddev_gflops << " GFLOPS                      ║\n";
-        std::cout << "╠════════════════════════════════════════════════════════════════╣\n";
-        std::cout << "║ Template (QuantizedGemmOptimized<IQ4_NLTensor>):               ║\n";
-        std::cout << "║   Time:        " << std::setw(7) << std::fixed << std::setprecision(2) << template_stats.mean_ms
-                  << " ± " << std::setw(5) << template_stats.stddev_ms << " ms";
-        std::cout << " (CV: " << std::setw(4) << std::setprecision(1) << template_cv << "%)        ║\n";
-        std::cout << "║   Throughput:  " << std::setw(7) << std::fixed << std::setprecision(2) << template_stats.mean_gflops
-                  << " ± " << std::setw(5) << template_stats.stddev_gflops << " GFLOPS                      ║\n";
-        std::cout << "╠════════════════════════════════════════════════════════════════╣\n";
-
-        double speedup = virtual_stats.mean_ms / template_stats.mean_ms;
-        if (speedup > 1.0)
-        {
-            std::cout << "║ Result: Template is " << std::fixed << std::setprecision(2) << speedup << "× FASTER";
-            std::cout << std::string(34 - std::to_string((int)(speedup * 100)).length(), ' ') << "║\n";
-        }
-        else
-        {
-            double slowdown = template_stats.mean_ms / virtual_stats.mean_ms;
-            std::cout << "║ Result: Template is " << std::fixed << std::setprecision(2) << slowdown << "× SLOWER (unexpected!)";
-            std::cout << std::string(25 - std::to_string((int)(slowdown * 100)).length(), ' ') << "║\n";
-        }
-        std::cout << "╚════════════════════════════════════════════════════════════════╝\n";
-
-        // Note: Virtual dispatch overhead appears negligible in this environment
-        // Performance is dominated by other factors (memory bandwidth, cache effects)
-        // EXPECT_GE(speedup, 1.0) << "Template version should eliminate virtual dispatch overhead";
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD); // Ensure all ranks finish before test ends
 }
 
 // Main function for standalone execution
