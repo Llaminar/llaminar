@@ -28,8 +28,9 @@ namespace llaminar2
     PipelineBase::PipelineBase(std::shared_ptr<ModelContext> model_ctx,
                                std::shared_ptr<MPIContext> mpi_ctx,
                                int device_idx,
-                               std::shared_ptr<WeightPlacementMap> placement_map)
-        : model_ctx_(model_ctx), mpi_ctx_(mpi_ctx), device_idx_(device_idx), placement_map_(placement_map)
+                               std::shared_ptr<WeightPlacementMap> placement_map,
+                               const PipelineConfig &config)
+        : model_ctx_(model_ctx), mpi_ctx_(mpi_ctx), device_idx_(device_idx), config_(config), placement_map_(placement_map)
     {
         if (!model_ctx_)
         {
@@ -39,6 +40,8 @@ namespace llaminar2
         model_path_ = model_ctx_->path();
 
         LOG_INFO("[PipelineBase] Initializing with model: " << model_path_);
+        LOG_INFO("[PipelineBase] Runtime config: max_seq_len=" << config_.max_seq_len
+                                                               << ", n_threads=" << config_.n_threads << ", batch_size=" << config_.batch_size);
 
         if (mpi_ctx_)
         {
@@ -63,8 +66,28 @@ namespace llaminar2
                       << device_idx_ << ")\n";
             placement_map_ = std::make_shared<WeightPlacementMap>(device_idx_);
         }
+
+        // Generic pipeline initialization (derived classes have already set architecture params)
+        // Derived constructors must set n_layers_, n_heads_, n_kv_heads_, head_dim_, d_model_
+        // BEFORE calling initializeInfrastructure()
     }
 
+    void PipelineBase::initializeInfrastructure()
+    {
+        // Use max_seq_len from runtime configuration
+        int max_seq_len = config_.max_seq_len;
+
+        // Phase 4.1: Device infrastructure (device discovery, buffer allocation)
+        initializeDeviceInfrastructure(max_seq_len);
+
+        // Phase 2: MPI strategy configuration (auto-select or validate)
+        configureMPIStrategy();
+
+        // Phase 3: KV cache initialization (uses attention device placement)
+        initializeKVCache(max_seq_len);
+
+        LOG_INFO("Pipeline infrastructure initialized (max_seq_len=" << max_seq_len << ")");
+    }
     const float *PipelineBase::logits() const
     {
         DEBUG_ASSERT_NOT_NULL(logits_.get(), "logits() called before forward()");

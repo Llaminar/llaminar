@@ -2,14 +2,14 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "cmake: configure (debug)",
+            "label": "V2: configure (debug)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "-B",
-                "${workspaceFolder}/build",
+                "${workspaceFolder}/build_v2",
                 "-S",
-                "${workspaceFolder}",
+                "${workspaceFolder}/src/v2",
                 "-G",
                 "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Debug",
@@ -28,25 +28,21 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure CMake project with Debug settings (includes coverage)"
+            "detail": "Configure V2 project with Debug settings"
         },
         {
-            "label": "cmake: configure (release)",
+            "label": "V2: configure (release)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "-B",
-                "${workspaceFolder}/build_release",
+                "${workspaceFolder}/build_v2_release",
                 "-S",
-                "${workspaceFolder}",
+                "${workspaceFolder}/src/v2",
                 "-G",
                 "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Release",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                "-DCOSMA_WITH_PROFILING=OFF",
-                "-DBUILD_SHARED_LIBS=OFF",
-                "-DCOSMA_SCALAPACK=CUSTOM",
-                "-DCOSMA_SCALAPACK_LINK_LIBRARIES=/usr/lib/x86_64-linux-gnu/libscalapack-openmpi.so"
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
             ],
             "group": "build",
             "presentation": {
@@ -58,15 +54,15 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure CMake project with optimized Release settings"
+            "detail": "Configure V2 project with optimized Release settings"
         },
         {
-            "label": "cmake: build (debug)",
+            "label": "V2: build (debug)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/build",
+                "${workspaceFolder}/build_v2",
                 "--config",
                 "Debug",
                 "--parallel"
@@ -84,16 +80,16 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "dependsOn": "cmake: configure (debug)",
-            "detail": "Build CMake project in Debug mode"
+            "dependsOn": "V2: configure (debug)",
+            "detail": "Build V2 project in Debug mode"
         },
         {
-            "label": "cmake: build (release)",
+            "label": "V2: build (release)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/build_release",
+                "${workspaceFolder}/build_v2_release",
                 "--config",
                 "Release",
                 "--parallel"
@@ -108,16 +104,16 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "dependsOn": "cmake: configure (release)",
-            "detail": "Build CMake project in Release mode"
+            "dependsOn": "V2: configure (release)",
+            "detail": "Build V2 project in Release mode"
         },
         {
-            "label": "cmake: clean (debug)",
+            "label": "V2: clean (debug)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/build",
+                "${workspaceFolder}/build_v2",
                 "--target",
                 "clean"
             ],
@@ -130,15 +126,15 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "detail": "Clean Debug build artifacts"
+            "detail": "Clean V2 Debug build artifacts"
         },
         {
-            "label": "cmake: clean (release)",
+            "label": "V2: clean (release)",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/build_release",
+                "${workspaceFolder}/build_v2_release",
                 "--target",
                 "clean"
             ],
@@ -151,19 +147,15 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "detail": "Clean Release build artifacts"
+            "detail": "Clean V2 Release build artifacts"
         },
         {
-            "label": "test: smoke tests",
+            "label": "V2: test all",
             "type": "shell",
-            "command": "ctest",
+            "command": "bash",
             "args": [
-                "--test-dir",
-                "${workspaceFolder}/build",
-                "--output-on-failure",
-                "--parallel",
-                "-R",
-                "^(BasicTest|NumaTest|PipelineFactoryTest|DequantTest|TPPartitionSpecTest|LargeMatmulPlanTest|WeightRoleClassification|MPILinearKernelTest|MPIRMSNormKernelTest|MPIAttentionKernelTest|MPISoftmaxCorrectnessTest|RMSNormCoreCorrectness|SoftmaxCoreCorrectness|LinearOrientationCorrectnessTest)$"
+                "-c",
+                "ctest --test-dir ${workspaceFolder}/build_v2 --output-on-failure --parallel && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
             ],
             "group": "test",
             "presentation": {
@@ -174,20 +166,80 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build (debug)",
-            "detail": "Run quick smoke tests (~5s, 14 tests) - core functionality validation"
+            "dependsOn": "V2: build (debug)",
+            "detail": "Run all V2 tests + show coverage report"
         },
         {
-            "label": "test: parity tests",
+            "label": "V2: test unit",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "ctest --test-dir ${workspaceFolder}/build_v2 --output-on-failure --parallel -R '^V2_Unit_' && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "V2: build (debug)",
+            "detail": "Run V2 unit tests + show coverage report"
+        },
+        {
+            "label": "V2: test integration",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "ctest --test-dir ${workspaceFolder}/build_v2 --output-on-failure --parallel -R '^V2_Integration_' && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "V2: build (debug)",
+            "detail": "Run V2 integration tests + show coverage report"
+        },
+        {
+            "label": "V2: test e2e",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "ctest --test-dir ${workspaceFolder}/build_v2 --output-on-failure --verbose -R '^V2_E2E_' && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "V2: build (debug)",
+            "detail": "Run V2 end-to-end tests + show coverage report"
+        },
+        {
+            "label": "V2: test performance",
             "type": "shell",
             "command": "ctest",
             "args": [
                 "--test-dir",
-                "${workspaceFolder}/build",
+                "${workspaceFolder}/build_v2_release",
                 "--output-on-failure",
                 "--verbose",
                 "-R",
-                "(ParityFrameworkTest|AbstractPipelineParity)"
+                "^V2_Perf_"
             ],
             "group": "test",
             "presentation": {
@@ -198,20 +250,20 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build (debug)",
-            "detail": "Run parity tests - PyTorch and llama.cpp comparisons (~4min)"
+            "dependsOn": "V2: build (release)",
+            "detail": "Run V2 performance benchmarks (tests/v2/performance/) - requires Release build"
         },
         {
-            "label": "test: unit tests",
+            "label": "V2: test parity",
             "type": "shell",
             "command": "ctest",
             "args": [
                 "--test-dir",
-                "${workspaceFolder}/build",
+                "${workspaceFolder}/build_v2",
                 "--output-on-failure",
-                "--parallel",
-                "-E",
-                "(Integration|ParityFrameworkTest|Incremental|Qwen|Prefill|.*Stress.*)"
+                "--verbose",
+                "-R",
+                "^V2_Parity_"
             ],
             "group": "test",
             "presentation": {
@@ -222,60 +274,8 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "cmake: build (debug)",
-            "detail": "Run all unit tests - no heavy integration (~2m30s)"
-        },
-        {
-            "label": "bench: run performance benchmarks",
-            "type": "shell",
-            "command": "${workspaceFolder}/run_performance_bench.sh",
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "cmake: build (release)",
-            "detail": "Run performance benchmarks (requires Release build)"
-        },
-        {
-            "label": "gcov: show coverage metrics",
-            "type": "shell",
-            "command": "${workspaceFolder}/.vscode/show-coverage.sh",
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Display coverage metrics summary from gcov"
-        },
-        {
-            "label": "gcov: reset coverage data",
-            "type": "shell",
-            "command": "find",
-            "args": [
-                "${workspaceFolder}/build",
-                "-name",
-                "*.gcda",
-                "-delete"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Delete all .gcda coverage data files to start fresh"
+            "dependsOn": "V2: build (debug)",
+            "detail": "Run V2 parity tests (future: tests/v2/parity/)"
         }
     ]
 }

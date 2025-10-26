@@ -32,52 +32,25 @@ else
     exit 1
 fi
 
-# Find all test executables
-TEST_EXECUTABLES=(
-    "$BUILD_DIR/tests/v2/v2_test_model_loader"
-    # Add more test executables here as they are created
-    # "$BUILD_DIR/tests/v2/v2_test_other"
-)
+# Run unit tests using CTest
+echo -e "${YELLOW}Running V2 unit tests (tests/v2/unit/)...${NC}"
+echo ""
 
-FAILED_TESTS=()
-PASSED_TESTS=()
+# Run CTest with unit test filter
+# Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
+set +e
+ctest --test-dir "$BUILD_DIR" -R "^V2_Unit_" --output-on-failure
+EXIT_CODE=$?
+set -e
 
-# Run each test executable
-for TEST_EXEC in "${TEST_EXECUTABLES[@]}"; do
-    if [ -f "$TEST_EXEC" ]; then
-        TEST_NAME=$(basename "$TEST_EXEC")
-        echo -e "${YELLOW}Running ${TEST_NAME}...${NC}"
-        
-        # Run test and check exit code
-        set +e
-        $TEST_EXEC > /dev/null 2>&1
-        EXIT_CODE=$?
-        set -e
-        
-        if [ $EXIT_CODE -eq 0 ]; then
-            # All tests passed
-            echo -e "${GREEN}✓ ${TEST_NAME}: All tests passed${NC}"
-            PASSED_TESTS+=("$TEST_NAME")
-        else
-            # Some tests failed
-            echo -e "${RED}✗ ${TEST_NAME}: Some tests failed (exit code: $EXIT_CODE)${NC}"
-            FAILED_TESTS+=("$TEST_NAME")
-        fi
-        echo ""
-    fi
-done
-
-# Summary
+echo ""
 echo "================================================"
-if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
+if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ All unit tests passed!${NC}"
     echo -e "${GREEN}Proceeding with commit...${NC}"
     exit 0
 else
-    echo -e "${RED}❌ Some tests failed:${NC}"
-    for TEST in "${FAILED_TESTS[@]}"; do
-        echo -e "   ${RED}• ${TEST}${NC}"
-    done
+    echo -e "${RED}❌ Some unit tests failed.${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"

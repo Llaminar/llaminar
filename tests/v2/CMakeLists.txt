@@ -127,7 +127,7 @@ function(add_v2_test TEST_NAME)
     endif()
     
     # Create the test with mpirun wrapper
-    # Note: executables are in build_v2/tests/v2/ directory
+    # Note: Use full path to executable (CMAKE_CURRENT_BINARY_DIR)
     add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${ARG_COMMAND})
     
     # Determine default log level based on test type (Unit/Integration = DEBUG, Performance = INFO)
@@ -137,12 +137,13 @@ function(add_v2_test TEST_NAME)
     endif()
     
     # Set environment variables for optimal performance + logging
-    # Working directory: project root so model paths work correctly
+    # Working directory: project root (so model paths like "models/..." work)
+    # CMAKE_SOURCE_DIR is /workspaces/llaminar/src/v2, so go up two levels to reach project root
     set_tests_properties(${TEST_NAME} PROPERTIES
         FIXTURES_REQUIRED V2_Models                    # Requires V2_Models fixture
         LABELS "${ARG_LABELS}"
         ENVIRONMENT "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL};OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     )
 endfunction()
 
@@ -164,7 +165,7 @@ target_link_libraries(v2_test_tensor_basics
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_TensorBasics 
-    COMMAND v2_test_tensor_basics
+    COMMAND $<TARGET_FILE:v2_test_tensor_basics>
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
@@ -176,7 +177,7 @@ target_link_libraries(v2_test_bf16_tensor
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_BF16Tensor 
-    COMMAND v2_test_bf16_tensor
+    COMMAND $<TARGET_FILE:v2_test_bf16_tensor>
     LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM"
 )
 
@@ -218,7 +219,7 @@ target_link_libraries(v2_test_model_loader
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_ModelLoader 
-    COMMAND v2_test_model_loader
+    COMMAND $<TARGET_FILE:v2_test_model_loader>
     MPI_PROCS 1
     LABELS "V2;Unit;ModelLoading;GGUF;WeightLoading"
 )
@@ -231,7 +232,7 @@ target_link_libraries(v2_test_iq4nl_tensor
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_IQ4_NLTensor 
-    COMMAND v2_test_iq4nl_tensor
+    COMMAND $<TARGET_FILE:v2_test_iq4nl_tensor>
     LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
@@ -243,7 +244,7 @@ target_link_libraries(v2_test_pipeline_factory
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_PipelineFactory 
-    COMMAND v2_test_pipeline_factory
+    COMMAND $<TARGET_FILE:v2_test_pipeline_factory>
     LABELS "V2;Unit;PipelineExecution;Factory;Registration"
 )
 
@@ -255,7 +256,7 @@ target_link_libraries(v2_test_device_orchestrator
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_DeviceOrchestrator 
-    COMMAND v2_test_device_orchestrator
+    COMMAND $<TARGET_FILE:v2_test_device_orchestrator>
     LABELS "V2;Unit;DeviceManagement;Orchestration;BasicFeatures"
     MPI_PROCS 1
 )
@@ -268,9 +269,8 @@ target_link_libraries(v2_test_arg_parser
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_ArgParser 
-    COMMAND v2_test_arg_parser
-    LABELS "V2;Unit;ArgumentParsing;CLI"
-    MPI_PROCS 1
+    COMMAND $<TARGET_FILE:v2_test_arg_parser>
+    LABELS "V2;Unit;CLI;ArgumentParsing"
 )
 
 # Test: Vectorized Primitives
@@ -281,7 +281,7 @@ target_link_libraries(v2_test_vectorized_primitives
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_VectorizedPrimitives 
-    COMMAND v2_test_vectorized_primitives
+    COMMAND $<TARGET_FILE:v2_test_vectorized_primitives>
     LABELS "V2;Unit;Kernels;VectorizedPrimitives;RoPE;RMSNorm;Softmax;AVX512;AVX2"
     MPI_PROCS 1
 )
@@ -294,12 +294,10 @@ target_link_libraries(v2_test_mpi_vectorized_attention
     GTest::gtest_main
 )
 add_v2_test(V2_Integration_MPIVectorizedAttention 
-    COMMAND v2_test_mpi_vectorized_attention
-    LABELS "V2;Integration;PipelineExecution;MPI;TensorParallel;VectorizedPrimitives;Attention"
-    MPI_PROCS 1
-)
-
-# Test: DeviceOrchestrator Phase 2
+    COMMAND $<TARGET_FILE:v2_test_mpi_vectorized_attention>
+    LABELS "V2;Integration;MPI;Attention;PipelineExecution;VectorizedPrimitives;TensorParallel"
+    MPI_PROCS 2
+)# Test: DeviceOrchestrator Phase 2
 add_executable(v2_test_device_orchestrator_phase2 Test__DeviceOrchestrator_Phase2.cpp)
 target_link_libraries(v2_test_device_orchestrator_phase2 
     llaminar2_core 
@@ -307,7 +305,7 @@ target_link_libraries(v2_test_device_orchestrator_phase2
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_DeviceOrchestrator_Phase2 
-    COMMAND v2_test_device_orchestrator_phase2
+    COMMAND $<TARGET_FILE:v2_test_device_orchestrator_phase2>
     LABELS "V2;Unit;DeviceManagement;Orchestration;AdvancedFeatures"
     MPI_PROCS 1
 )
@@ -321,7 +319,7 @@ target_link_libraries(v2_test_cpu_kernels
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_CPUKernels 
-    COMMAND v2_test_cpu_kernels
+    COMMAND $<TARGET_FILE:v2_test_cpu_kernels>
     LABELS "V2;Unit;Kernels;CPU;ComputeBackends"
     MPI_PROCS 1
 )
@@ -334,8 +332,8 @@ target_link_libraries(v2_test_mpi_tensor_parallel_correctness
     MPI::MPI_CXX
 )
 add_v2_test(V2_Integration_MPITensorParallelCorrectness 
-    COMMAND v2_test_mpi_tensor_parallel_correctness
-    LABELS "V2;Integration;MPI;TensorParallel;Correctness;Attention"
+    COMMAND $<TARGET_FILE:v2_test_mpi_tensor_parallel_correctness>
+    LABELS "V2;Integration;MPI;TensorParallel;Attention;Correctness"
     MPI_PROCS 2
 )
 
@@ -347,7 +345,7 @@ target_link_libraries(v2_test_tensor_dimensions
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_TensorDimensions 
-    COMMAND v2_test_tensor_dimensions
+    COMMAND $<TARGET_FILE:v2_test_tensor_dimensions>
     LABELS "V2;Unit;TensorOperations;Dimensions;ShapeHandling"
     MPI_PROCS 1
 )
@@ -360,7 +358,7 @@ target_link_libraries(v2_test_multi_device
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_MultiDevice 
-    COMMAND v2_test_multi_device
+    COMMAND $<TARGET_FILE:v2_test_multi_device>
     LABELS "V2;Unit;DeviceManagement;MultiDevice;HeterogeneousExecution"
     MPI_PROCS 1
 )
@@ -373,7 +371,7 @@ target_link_libraries(v2_test_device_transfer
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_DeviceTransfer 
-    COMMAND v2_test_device_transfer
+    COMMAND $<TARGET_FILE:v2_test_device_transfer>
     LABELS "V2;Unit;DataTransfer;CrossDevice;BufferManagement"
     MPI_PROCS 1
 )
@@ -386,7 +384,7 @@ target_link_libraries(v2_test_device_aware_execution
     GTest::gtest_main
 )
 add_v2_test(V2_Unit_DeviceAwareExecution 
-    COMMAND v2_test_device_aware_execution
+    COMMAND $<TARGET_FILE:v2_test_device_aware_execution>
     LABELS "V2;Unit;DeviceManagement;Orchestration;DeviceAwareness"
     MPI_PROCS 1
 )
@@ -401,9 +399,9 @@ target_link_libraries(v2_test_mpi_tensor_parallel
     GTest::gtest 
     MPI::MPI_CXX
 )
-add_v2_test(V2_Unit_MPITensorParallel
-    COMMAND v2_test_mpi_tensor_parallel
-    LABELS "V2;Unit;MPI;TensorParallel;DistributedExecution;StrategySelection"
+add_v2_test(V2_Unit_MPITensorParallel 
+    COMMAND $<TARGET_FILE:v2_test_mpi_tensor_parallel>
+    LABELS "V2;Unit;MPI;TensorParallel;StrategySelection;DistributedExecution"
     MPI_PROCS 2
 )
 
@@ -412,7 +410,7 @@ add_v2_test(V2_Unit_MPITensorParallel
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)
 # target_link_libraries(v2_test_tensor_factory llaminar2_core GTest::gtest_main)
 # add_v2_test(V2_Unit_TensorFactory 
-#     COMMAND v2_test_tensor_factory
+#     COMMAND $<TARGET_FILE:v2_test_tensor_factory>
 #     LABELS "V2;Unit;TensorFactory"
 # )
 
@@ -427,7 +425,7 @@ add_v2_test(V2_Unit_MPITensorParallel
 # add_executable(v2_test_model_loader integration/test_model_loader.cpp)
 # target_link_libraries(v2_test_model_loader llaminar2_core GTest::gtest_main)
 # add_v2_test(V2_Integration_ModelLoader
-#     COMMAND v2_test_model_loader
+#     COMMAND $<TARGET_FILE:v2_test_model_loader>
 #     LABELS "V2;Integration;ModelLoader"
 # )
 
@@ -461,7 +459,7 @@ add_v2_test(V2_E2E_Qwen2Correctness
 # add_executable(v2_test_pytorch_parity pytorch_parity/test_pytorch_parity.cpp)
 # target_link_libraries(v2_test_pytorch_parity llaminar2_core GTest::gtest_main)
 # add_v2_test(V2_Parity_PyTorch
-#     COMMAND v2_test_pytorch_parity
+#     COMMAND $<TARGET_FILE:v2_test_pytorch_parity>
 #     LABELS "V2;Parity;PyTorch"
 # )
 
@@ -597,7 +595,7 @@ set_target_properties(v2_perf_iq4nl_gemm PROPERTIES
 )
 
 add_v2_perf_test(V2_Perf_IQ4NL_GEMM
-    COMMAND v2_perf_iq4nl_gemm
+    COMMAND $<TARGET_FILE:v2_perf_iq4nl_gemm>
     LABELS "V2;Performance;GEMM;IQ4_NL;Quantization;Throughput"
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
 )
@@ -619,7 +617,7 @@ set_target_properties(v2_perf_qwen2_e2e PROPERTIES
 )
 
 add_v2_perf_test(V2_Perf_Qwen2E2E
-    COMMAND v2_perf_qwen2_e2e
+    COMMAND $<TARGET_FILE:v2_perf_qwen2_e2e>
     LABELS "V2;Performance;E2E;Qwen;Pipeline;Throughput;Models"
     MPI_PROCS 2
 )
@@ -634,7 +632,7 @@ set_target_properties(v2_perf_mpi_tensor_parallel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
 )
 add_v2_perf_test(V2_Perf_MPITensorParallel 
-    COMMAND v2_perf_mpi_tensor_parallel
+    COMMAND $<TARGET_FILE:v2_perf_mpi_tensor_parallel>
     LABELS "V2;Performance;MPI;TensorParallel;Attention;Speedup"
     MPI_PROCS 2
 )
@@ -652,7 +650,7 @@ add_v2_perf_test(V2_Perf_MPITensorParallel
 # add_executable(v2_perf_attention performance/Perf__Attention.cpp)
 # target_link_libraries(v2_perf_attention llaminar2_core GTest::gtest GTest::gtest_main)
 # add_v2_perf_test(V2_Perf_Attention
-#     COMMAND v2_perf_attention
+#     COMMAND $<TARGET_FILE:v2_perf_attention>
 #     LABELS "V2;Performance;Attention;Throughput"
 # )
 

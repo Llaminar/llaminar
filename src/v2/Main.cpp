@@ -16,6 +16,7 @@
 #include "utils/ArgParser.h"
 #include "backends/ComputeBackend.h"
 #include "pipelines/PipelineFactory.h"
+#include "pipelines/PipelineConfig.h"
 #include "pipelines/qwen/Qwen2Pipeline.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
@@ -263,8 +264,16 @@ int main(int argc, char *argv[])
                   << "\n";
     }
 
+    // Create runtime configuration from parsed arguments
+    PipelineConfig pipeline_config;
+    pipeline_config.max_seq_len = args.max_seq_len;
+    pipeline_config.n_threads = args.n_threads;
+    pipeline_config.batch_size = args.batch_size;
+    pipeline_config.use_mmap = args.use_mmap;
+    pipeline_config.seed = args.seed;
+
     // Create pipeline using factory
-    auto pipeline = PipelineFactory::instance().create(architecture, model_ctx, mpi_ctx, device_idx);
+    auto pipeline = PipelineFactory::instance().create(architecture, model_ctx, mpi_ctx, device_idx, pipeline_config);
     if (!pipeline)
     {
         if (mpi_ctx->rank() == 0)

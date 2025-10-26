@@ -41,7 +41,8 @@ namespace llaminar2
         const std::string &architecture,
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx) const
+        int device_idx,
+        const PipelineConfig &config) const
     {
         auto it = creators_.find(architecture);
         if (it == creators_.end())
@@ -61,7 +62,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        return it->second(model_ctx, mpi_ctx, device_idx);
+        return it->second(model_ctx, mpi_ctx, device_idx, config);
     }
 
     bool PipelineFactory::isSupported(const std::string &architecture) const

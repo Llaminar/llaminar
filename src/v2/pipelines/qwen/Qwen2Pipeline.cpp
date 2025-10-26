@@ -39,10 +39,11 @@ namespace llaminar2
     static std::unique_ptr<PipelineBase> createQwen2(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx)
+        int device_idx,
+        const PipelineConfig &config)
     {
         // Factory doesn't have placement_map yet (Phase 4.2 integration)
-        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx, nullptr);
+        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     }
 
     /**
@@ -75,8 +76,9 @@ namespace llaminar2
     Qwen2Pipeline::Qwen2Pipeline(std::shared_ptr<ModelContext> model_ctx,
                                  std::shared_ptr<MPIContext> mpi_ctx,
                                  int device_idx,
-                                 std::shared_ptr<WeightPlacementMap> placement_map)
-        : PipelineBase(model_ctx, mpi_ctx, device_idx, placement_map)
+                                 std::shared_ptr<WeightPlacementMap> placement_map,
+                                 const PipelineConfig &config)
+        : PipelineBase(model_ctx, mpi_ctx, device_idx, placement_map, config)
     {
         LOG_INFO("Initializing Qwen 2.x pipeline");
 
@@ -114,20 +116,10 @@ namespace llaminar2
         layers_.resize(n_layers_);
 
         // =============================================================================
-        // Generic Initialization (uses PipelineBase helpers)
+        // Generic Initialization (PipelineBase handles device/MPI/KV cache setup)
         // =============================================================================
 
-        // TODO: Make max_seq_len configurable (default 2048 for now)
-        int max_seq_len = 2048;
-
-        // Phase 4.1: Device infrastructure (device discovery, buffer allocation)
-        initializeDeviceInfrastructure(max_seq_len);
-
-        // Phase 2: MPI strategy configuration (auto-select or validate)
-        configureMPIStrategy();
-
-        // Phase 3: KV cache initialization (uses attention device placement)
-        initializeKVCache(max_seq_len);
+        initializeInfrastructure();
 
         LOG_INFO("Pipeline initialized (weights loaded on-demand)");
     }
@@ -172,6 +164,11 @@ namespace llaminar2
 
         // Residual (d_model)
         buffers.residual = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_model_)},
+            device_idx);
+
+        // Normalization buffer (shared across attention and FFN)
+        buffers.normalized = std::make_shared<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_model_)},
             device_idx);
 
@@ -225,11 +222,7 @@ namespace llaminar2
 
         // Embedding lookup
         auto embed_table = getEmbeddingTable();
-        if (!embed_table)
-        {
-            LOG_ERROR("Failed to load embedding table");
-            return false;
-        }
+        VALIDATE_POINTER(embed_table, "embedding table");
 
         // Manual embedding lookup: hidden[i] = embed_table[tokens[i]]
         const float *embed_data = embed_table->data();
@@ -261,26 +254,12 @@ namespace llaminar2
 
         // Final normalization
         auto final_norm = getFinalNorm();
-        if (!final_norm)
-        {
-            LOG_ERROR("Failed to load final norm");
-            return false;
-        }
-
-        auto norm_kernel = final_norm->createRMSNorm();
-        if (!norm_kernel)
-        {
-            LOG_ERROR("Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        if (!norm_kernel->apply(
-                current_hidden_->data(), final_norm->data(), current_hidden_->mutable_data(),
-                seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), device_idx_))
-        {
-            LOG_ERROR("Final RMSNorm failed");
-            return false;
-        }
+        VALIDATE_POINTER(final_norm, "final norm");
+        VALIDATE_KERNEL(norm_kernel, final_norm->createRMSNorm(), "RMSNorm kernel");
+        VALIDATE_OP(norm_kernel->apply(
+                        current_hidden_->data(), final_norm->data(), current_hidden_->mutable_data(),
+                        seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), device_idx_),
+                    "Final RMSNorm");
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_final_norm");
 
@@ -298,30 +277,17 @@ namespace llaminar2
         VALIDATE_TENSOR(logits_, spec_logits(seq_len), "logits_allocation");
 
         auto lm_head = getLMHead();
-        if (!lm_head)
-        {
-            LOG_ERROR("Failed to load LM head");
-            return false;
-        }
-
-        auto lm_gemm = lm_head->createGemm();
-        if (!lm_gemm)
-        {
-            LOG_ERROR("Failed to create LM head GEMM kernel");
-            return false;
-        }
+        VALIDATE_POINTER(lm_head, "LM head");
+        VALIDATE_KERNEL(lm_gemm, lm_head->createGemm(), "LM head GEMM kernel");
 
         // LM head: logits = hidden @ lm_head^T
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
         // output: [seq_len, vocab_size]
-        if (!lm_gemm->multiply(
-                current_hidden_->data(), logits_->mutable_data(),
-                seq_len, vocab_size_, d_model_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
-        {
-            LOG_ERROR("LM head projection failed");
-            return false;
-        }
+        VALIDATE_OP(lm_gemm->multiply(
+                        current_hidden_->data(), logits_->mutable_data(),
+                        seq_len, vocab_size_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_),
+                    "LM head projection");
 
         VALIDATE_TENSOR(logits_, spec_logits(seq_len), "after_lm_head");
 
@@ -388,126 +354,87 @@ namespace llaminar2
         std::memcpy(buffers.residual->mutable_data(), input_hidden->data(),
                     seq_len * d_model_ * sizeof(float));
 
-        // Create temporary tensor for normalized hidden (same device as input)
-        auto normalized_hidden = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)},
-            attn_device);
+        // Reuse pre-allocated normalized buffer (no allocation in hot path!)
+        auto normalized_hidden = buffers.normalized;
 
         // Copy input to normalized_hidden for in-place normalization
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     seq_len * d_model_ * sizeof(float));
 
         // 1. Pre-attention RMSNorm
-        auto norm_kernel = layer.attn_norm->createRMSNorm();
-        if (!norm_kernel ||
-            !norm_kernel->apply(
-                normalized_hidden->data(), layer.attn_norm->data(), normalized_hidden->mutable_data(),
-                seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), attn_device))
-        {
-            LOG_ERROR("Attention norm failed");
-            return false;
-        }
+        VALIDATE_KERNEL(norm_kernel, layer.attn_norm->createRMSNorm(), "RMSNorm kernel");
+        VALIDATE_OP(norm_kernel->apply(
+                        normalized_hidden->data(), layer.attn_norm->data(), normalized_hidden->mutable_data(),
+                        seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), attn_device),
+                    "Attention norm");
         VALIDATE_TENSOR(normalized_hidden, spec_hidden(seq_len), "after_attn_norm");
 
         // 2. Q/K/V projections (use device-appropriate buffers)
-        auto q_gemm = layer.wq->createGemm();
-        auto k_gemm = layer.wk->createGemm();
-        auto v_gemm = layer.wv->createGemm();
-
-        if (!q_gemm || !k_gemm || !v_gemm)
-        {
-            LOG_ERROR("Failed to create Q/K/V GEMM kernels");
-            return false;
-        }
+        VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
+        VALIDATE_KERNEL(k_gemm, layer.wk->createGemm(), "K GEMM kernel");
+        VALIDATE_KERNEL(v_gemm, layer.wv->createGemm(), "V GEMM kernel");
 
         // Q = hidden @ wq^T
-        if (!q_gemm->multiply(
-                normalized_hidden->data(), buffers.Q->mutable_data(),
-                seq_len, n_heads_ * head_dim_, d_model_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device))
-        {
-            LOG_ERROR("Q projection failed");
-            return false;
-        }
+        VALIDATE_OP(q_gemm->multiply(
+                        normalized_hidden->data(), buffers.Q->mutable_data(),
+                        seq_len, n_heads_ * head_dim_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                    "Q projection");
         VALIDATE_TENSOR(buffers.Q, spec_q(seq_len), "after_q_proj");
 
         // K = hidden @ wk^T
-        if (!k_gemm->multiply(
-                normalized_hidden->data(), buffers.K->mutable_data(),
-                seq_len, n_kv_heads_ * head_dim_, d_model_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device))
-        {
-            LOG_ERROR("K projection failed");
-            return false;
-        }
+        VALIDATE_OP(k_gemm->multiply(
+                        normalized_hidden->data(), buffers.K->mutable_data(),
+                        seq_len, n_kv_heads_ * head_dim_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                    "K projection");
         VALIDATE_TENSOR(buffers.K, spec_kv(seq_len), "after_k_proj");
 
         // V = hidden @ wv^T
-        if (!v_gemm->multiply(
-                normalized_hidden->data(), buffers.V->mutable_data(),
-                seq_len, n_kv_heads_ * head_dim_, d_model_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device))
-        {
-            LOG_ERROR("V projection failed");
-            return false;
-        }
+        VALIDATE_OP(v_gemm->multiply(
+                        normalized_hidden->data(), buffers.V->mutable_data(),
+                        seq_len, n_kv_heads_ * head_dim_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                    "V projection");
         VALIDATE_TENSOR(buffers.V, spec_kv(seq_len), "after_v_proj");
 
         // 3. Apply RoPE to Q and K
+        // Position IDs are absolute positions in the sequence (not relative offsets)
+        // Prefill: [0, 1, 2, ..., seq_len-1]
+        // Incremental decode: [current_position_, current_position_+1, ...]
         std::vector<int> position_ids(seq_len);
         for (int i = 0; i < seq_len; ++i)
         {
-            position_ids[i] = i; // TODO: Handle incremental decode position offset
+            position_ids[i] = current_position_ + i;
         }
 
-        auto rope_kernel = layer.wq->createRoPE(); // Any weight can create RoPE kernel
-        if (!rope_kernel)
-        {
-            LOG_ERROR("Failed to create RoPE kernel");
-            return false;
-        }
-
-        if (!rope_kernel->apply(
-                buffers.Q->mutable_data(), buffers.K->mutable_data(), position_ids.data(),
-                seq_len, n_heads_, n_kv_heads_, head_dim_,
-                false, mpi_ctx_.get(), attn_device))
-        {
-            LOG_ERROR("RoPE application failed");
-            return false;
-        }
+        VALIDATE_KERNEL(rope_kernel, layer.wq->createRoPE(), "RoPE kernel"); // Any weight can create RoPE kernel
+        VALIDATE_OP(rope_kernel->apply(
+                        buffers.Q->mutable_data(), buffers.K->mutable_data(), position_ids.data(),
+                        seq_len, n_heads_, n_kv_heads_, head_dim_,
+                        false, mpi_ctx_.get(), attn_device),
+                    "RoPE application");
         VALIDATE_TENSOR(buffers.Q, spec_q(seq_len), "after_rope_q");
         VALIDATE_TENSOR(buffers.K, spec_kv(seq_len), "after_rope_k");
 
         // 4. GQA attention computation (MPI-aware)
         // Dispatches to tensor-parallel if mpi_strategy_ == TensorParallel
-        if (!attention_gqa_mpi(
-                buffers.Q.get(), buffers.K.get(),
-                buffers.V.get(), buffers.attn_output.get(),
-                n_heads_, n_kv_heads_, head_dim_,
-                /*causal=*/true, /*window_size=*/-1))
-        {
-            LOG_ERROR("GQA attention failed");
-            return false;
-        }
+        VALIDATE_OP(attention_gqa_mpi(
+                        buffers.Q.get(), buffers.K.get(),
+                        buffers.V.get(), buffers.attn_output.get(),
+                        n_heads_, n_kv_heads_, head_dim_,
+                        /*causal=*/true, /*window_size=*/-1),
+                    "GQA attention");
 
         VALIDATE_TENSOR(buffers.attn_output, spec_q(seq_len), "after_attention");
 
         // 5. Output projection (reuse attn_proj buffer)
-        auto o_gemm = layer.wo->createGemm();
-        if (!o_gemm)
-        {
-            LOG_ERROR("Failed to create output GEMM kernel");
-            return false;
-        }
-
-        if (!o_gemm->multiply(
-                buffers.attn_output->data(), buffers.attn_proj->mutable_data(),
-                seq_len, d_model_, n_heads_ * head_dim_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device))
-        {
-            LOG_ERROR("Output projection failed");
-            return false;
-        }
+        VALIDATE_KERNEL(o_gemm, layer.wo->createGemm(), "output GEMM kernel");
+        VALIDATE_OP(o_gemm->multiply(
+                        buffers.attn_output->data(), buffers.attn_proj->mutable_data(),
+                        seq_len, d_model_, n_heads_ * head_dim_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                    "Output projection");
         VALIDATE_TENSOR(buffers.attn_proj, spec_hidden(seq_len), "after_attn_out_proj");
 
         // 6. Residual connection - write back to current_hidden_
@@ -556,94 +483,59 @@ namespace llaminar2
         std::memcpy(buffers.residual->mutable_data(), input_hidden->data(),
                     seq_len * d_model_ * sizeof(float));
 
-        // Create temporary tensor for normalized hidden (same device as input)
-        auto normalized_hidden = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)},
-            ffn_device);
+        // Reuse pre-allocated normalized buffer (no allocation in hot path!)
+        auto normalized_hidden = buffers.normalized;
 
         // Copy input to normalized_hidden for in-place normalization
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     seq_len * d_model_ * sizeof(float));
 
         // 1. Pre-FFN RMSNorm
-        auto norm_kernel = layer.ffn_norm->createRMSNorm();
-        if (!norm_kernel ||
-            !norm_kernel->apply(
-                normalized_hidden->data(), layer.ffn_norm->data(), normalized_hidden->mutable_data(),
-                seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), ffn_device))
-        {
-            LOG_ERROR("FFN norm failed");
-            return false;
-        }
+        VALIDATE_KERNEL(norm_kernel, layer.ffn_norm->createRMSNorm(), "RMSNorm kernel");
+        VALIDATE_OP(norm_kernel->apply(
+                        normalized_hidden->data(), layer.ffn_norm->data(), normalized_hidden->mutable_data(),
+                        seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), ffn_device),
+                    "FFN norm");
         VALIDATE_TENSOR(normalized_hidden, spec_hidden(seq_len), "after_ffn_norm");
 
         // 2. Gate and up projections (use device-appropriate buffers)
-        auto gate_gemm = layer.gate_proj->createGemm();
-        auto up_gemm = layer.up_proj->createGemm();
-
-        if (!gate_gemm || !up_gemm)
-        {
-            LOG_ERROR("Failed to create gate/up GEMM kernels");
-            return false;
-        }
+        VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");
+        VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
 
         // gate = hidden @ gate_proj^T
-        if (!gate_gemm->multiply(
-                normalized_hidden->data(), buffers.gate->mutable_data(),
-                seq_len, d_ff_, d_model_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device))
-        {
-            LOG_ERROR("Gate projection failed");
-            return false;
-        }
+        VALIDATE_OP(gate_gemm->multiply(
+                        normalized_hidden->data(), buffers.gate->mutable_data(),
+                        seq_len, d_ff_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                    "Gate projection");
         VALIDATE_TENSOR(buffers.gate, spec_ffn_gate_up(seq_len), "after_gate_proj");
 
         // up = hidden @ up_proj^T
-        if (!up_gemm->multiply(
-                normalized_hidden->data(), buffers.up->mutable_data(),
-                seq_len, d_ff_, d_model_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device))
-        {
-            LOG_ERROR("Up projection failed");
-            return false;
-        }
+        VALIDATE_OP(up_gemm->multiply(
+                        normalized_hidden->data(), buffers.up->mutable_data(),
+                        seq_len, d_ff_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                    "Up projection");
         VALIDATE_TENSOR(buffers.up, spec_ffn_gate_up(seq_len), "after_up_proj");
 
         // 3. SwiGLU activation (up buffer reused for output)
-        auto swiglu_kernel = layer.gate_proj->createSwiGLU();
-        if (!swiglu_kernel)
-        {
-            LOG_ERROR("Failed to create SwiGLU kernel");
-            return false;
-        }
-
-        if (!swiglu_kernel->apply(
-                buffers.gate->data(), buffers.up->data(),
-                buffers.up->mutable_data(),
-                seq_len, d_ff_, false, mpi_ctx_.get(), ffn_device))
-        {
-            LOG_ERROR("SwiGLU activation failed");
-            return false;
-        }
+        VALIDATE_KERNEL(swiglu_kernel, layer.gate_proj->createSwiGLU(), "SwiGLU kernel");
+        VALIDATE_OP(swiglu_kernel->apply(
+                        buffers.gate->data(), buffers.up->data(),
+                        buffers.up->mutable_data(),
+                        seq_len, d_ff_, false, mpi_ctx_.get(), ffn_device),
+                    "SwiGLU activation");
         VALIDATE_TENSOR(buffers.up, spec_ffn_intermediate(seq_len), "after_swiglu");
 
         // 4. Down projection (reuse ffn_output buffer)
-        auto down_gemm = layer.down_proj->createGemm();
-        if (!down_gemm)
-        {
-            LOG_ERROR("Failed to create down GEMM kernel");
-            return false;
-        }
+        VALIDATE_KERNEL(down_gemm, layer.down_proj->createGemm(), "down GEMM kernel");
 
         // ffn_output = up @ down_proj^T
-        if (!down_gemm->multiply(
-                buffers.up->data(), buffers.ffn_output->mutable_data(),
-                seq_len, d_model_, d_ff_,
-                true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device))
-        {
-            LOG_ERROR("Down projection failed");
-            return false;
-        }
+        VALIDATE_OP(down_gemm->multiply(
+                        buffers.up->data(), buffers.ffn_output->mutable_data(),
+                        seq_len, d_model_, d_ff_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                    "Down projection");
         VALIDATE_TENSOR(buffers.ffn_output, spec_hidden(seq_len), "after_down_proj");
 
         // 5. Residual connection - write back to current_hidden_

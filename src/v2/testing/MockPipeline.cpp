@@ -5,6 +5,7 @@
  */
 
 #include "MockPipeline.h"
+#include "../pipelines/PipelineConfig.h"
 #include "../loaders/ModelContext.h"
 #include "../utils/Logger.h"
 
@@ -21,7 +22,8 @@ namespace llaminar2
                   ModelContext::createForTesting("mock_test.gguf"), // Test-only model context
                   mpi_ctx,                                          // mpi_ctx
                   -1,                                               // device_idx (CPU)
-                  nullptr),                                         // placement_map
+                  nullptr,                                          // placement_map
+                  PipelineConfig{}),                                // config (defaults)
               n_heads_(n_heads),
               n_kv_heads_(n_kv_heads),
               head_dim_(head_dim)

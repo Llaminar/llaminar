@@ -56,6 +56,14 @@ namespace llaminar2
                     ctx.n_predict = std::stoi(val);
             }
 
+            // Maximum sequence length
+            else if (matchesFlag(arg, "-c", "--ctx-size"))
+            {
+                std::string val = getNextArg(argv, argc, i, "ctx-size");
+                if (!val.empty())
+                    ctx.max_seq_len = std::stoi(val);
+            }
+
             // Temperature
             else if (matchesFlag(arg, "-t", "--temperature"))
             {
@@ -232,6 +240,7 @@ namespace llaminar2
         std::cout << "Inference:\n";
         std::cout << "  -p, --prompt TEXT         Prompt text (default: \"Hello, my name is\")\n";
         std::cout << "  -n, --n-predict N         Tokens to generate (default: 128)\n";
+        std::cout << "  -c, --ctx-size N          Maximum context size (default: 2048)\n";
         std::cout << "  -t, --temperature T       Sampling temperature (default: 0.8)\n";
         std::cout << "  --top-k K                 Top-k sampling (default: 40)\n";
         std::cout << "  --top-p P                 Top-p sampling (default: 0.9)\n";

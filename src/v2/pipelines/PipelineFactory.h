@@ -29,6 +29,7 @@
 #pragma once
 
 #include "PipelineBase.h"
+#include "PipelineConfig.h"
 #include "../loaders/ModelContext.h"
 #include <map>
 #include <memory>
@@ -53,12 +54,14 @@ namespace llaminar2
          * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
+         * @param config Runtime configuration (max_seq_len, threading, etc.)
          * @return Unique pointer to created pipeline, or nullptr on error
          */
         using CreateFn = std::function<std::unique_ptr<PipelineBase>(
             std::shared_ptr<ModelContext> model_ctx,
             std::shared_ptr<MPIContext> mpi_ctx,
-            int device_idx)>;
+            int device_idx,
+            const PipelineConfig &config)>;
 
         /**
          * @brief Get singleton instance
@@ -85,6 +88,7 @@ namespace llaminar2
          * @param model_ctx Model context with GGUF metadata and loader
          * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
          * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
+         * @param config Runtime configuration (max_seq_len, threading, etc.)
          * @return Unique pointer to created pipeline, or nullptr if architecture not supported
          *
          * @note Returns nullptr if architecture not registered
@@ -93,7 +97,8 @@ namespace llaminar2
             const std::string &architecture,
             std::shared_ptr<ModelContext> model_ctx,
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-            int device_idx = -1) const;
+            int device_idx = -1,
+            const PipelineConfig &config = PipelineConfig{}) const;
 
         /**
          * @brief Check if architecture is supported

@@ -12,6 +12,7 @@
  */
 
 #include "../../src/v2/pipelines/PipelineFactory.h"
+#include "../../src/v2/pipelines/PipelineConfig.h"
 #include "../../src/v2/pipelines/PipelineBase.h"
 #include "../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
 #include "../../src/v2/utils/MPIContext.h"
@@ -35,8 +36,10 @@ class MockPipeline : public PipelineBase
 public:
     MockPipeline(std::shared_ptr<ModelContext> model_ctx,
                  std::shared_ptr<MPIContext> mpi_ctx,
-                 int device_idx)
-        : PipelineBase(model_ctx, mpi_ctx, device_idx)
+                 int device_idx,
+                 std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
+                 const PipelineConfig &config = PipelineConfig{})
+        : PipelineBase(model_ctx, mpi_ctx, device_idx, placement_map, config)
     {
         n_layers_ = 12;
         d_model_ = 768;
@@ -116,9 +119,10 @@ TEST_F(Test__PipelineFactory, RegisterCreator)
 {
     auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
-                      int device_idx) -> std::unique_ptr<PipelineBase>
+                      int device_idx,
+                      const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     };
 
     PipelineFactory::instance().registerCreator("test_arch", creator);
@@ -131,9 +135,10 @@ TEST_F(Test__PipelineFactory, RegisterDuplicateCreator)
     // Register first time
     auto creator1 = [](std::shared_ptr<ModelContext> model_ctx,
                        std::shared_ptr<MPIContext> mpi_ctx,
-                       int device_idx) -> std::unique_ptr<PipelineBase>
+                       int device_idx,
+                       const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     };
 
     PipelineFactory::instance().registerCreator("test_duplicate", creator1);
@@ -142,9 +147,10 @@ TEST_F(Test__PipelineFactory, RegisterDuplicateCreator)
     // Try to register again (should be ignored)
     auto creator2 = [](std::shared_ptr<ModelContext> model_ctx,
                        std::shared_ptr<MPIContext> mpi_ctx,
-                       int device_idx) -> std::unique_ptr<PipelineBase>
+                       int device_idx,
+                       const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     };
 
     PipelineFactory::instance().registerCreator("test_duplicate", creator2);
@@ -177,9 +183,10 @@ TEST_F(Test__PipelineFactory, CreateSupportedArchitecture)
     // Register a mock architecture
     auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
-                      int device_idx) -> std::unique_ptr<PipelineBase>
+                      int device_idx,
+                      const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     };
 
     PipelineFactory::instance().registerCreator("test_create", creator);
@@ -210,9 +217,10 @@ TEST_F(Test__PipelineFactory, CreateWithParameters)
     // Register a mock architecture
     auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
-                      int device_idx) -> std::unique_ptr<PipelineBase>
+                      int device_idx,
+                      const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     };
 
     PipelineFactory::instance().registerCreator("test_params", creator);
@@ -297,9 +305,10 @@ TEST_F(Test__PipelineFactory, FullWorkflow)
     // Register a test architecture
     auto creator = [](std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
-                      int device_idx) -> std::unique_ptr<PipelineBase>
+                      int device_idx,
+                      const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
     {
-        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx);
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
     };
 
     const std::string arch_name = "test_workflow";

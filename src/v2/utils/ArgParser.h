@@ -28,12 +28,11 @@ namespace llaminar2
         // Inference parameters
         std::string prompt = "Hello, my name is";
         int n_predict = 128;
+        int max_seq_len = 2048; // Maximum sequence length for KV cache and activations
         float temperature = 0.8f;
         int top_k = 40;
         float top_p = 0.9f;
-        int seed = -1; // -1 = random
-
-        // Device configuration
+        int seed = -1;               // -1 = random        // Device configuration
         std::string device = "auto"; // "auto", "cpu", "cuda:N", "rocm:N"
 
         // Placement strategy

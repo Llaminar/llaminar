@@ -23,11 +23,87 @@
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorKernels.h"
 #include "../tensors/KVCache.h" // KV cache for autoregressive decode
+#include "PipelineConfig.h"     // Runtime configuration
 #include "MPIStrategy.h"        // MPI parallelization strategies
 #include <vector>
 #include <memory>
 #include <string>
 #include <map>
+
+/**
+ * @brief Validate pointer is non-null, log error and return false if null
+ *
+ * Usage: VALIDATE_POINTER(ptr, "description")
+ *
+ * Expands to:
+ *   if (!ptr) {
+ *       LOG_ERROR("Failed to load description");
+ *       return false;
+ *   }
+ *
+ * @param ptr Pointer to validate
+ * @param desc Description for error message (will be prefixed with "Failed to load ")
+ */
+#define VALIDATE_POINTER(ptr, desc)                 \
+    do                                              \
+    {                                               \
+        if (!(ptr))                                 \
+        {                                           \
+            LOG_ERROR("Failed to load " << (desc)); \
+            return false;                           \
+        }                                           \
+    } while (0)
+
+/**
+ * @brief Validate pointer and create kernel, log error and return false if fails
+ *
+ * Usage: VALIDATE_KERNEL(kernel_var, tensor_ptr->createKernel(), "kernel type")
+ *
+ * Expands to:
+ *   auto kernel_var = tensor_ptr->createKernel();
+ *   if (!kernel_var) {
+ *       LOG_ERROR("Failed to create kernel type");
+ *       return false;
+ *   }
+ *
+ * @param var Variable name to assign kernel to
+ * @param expr Expression that creates the kernel
+ * @param desc Description for error message (will be prefixed with "Failed to create ")
+ */
+#define VALIDATE_KERNEL(var, expr, desc)              \
+    auto var = (expr);                                \
+    do                                                \
+    {                                                 \
+        if (!(var))                                   \
+        {                                             \
+            LOG_ERROR("Failed to create " << (desc)); \
+            return false;                             \
+        }                                             \
+    } while (0)
+
+/**
+ * @brief Validate operation succeeded, log error and return false if failed
+ *
+ * Usage: VALIDATE_OP(some_operation(), "operation description")
+ *
+ * Expands to:
+ *   if (!some_operation()) {
+ *       LOG_ERROR("operation description failed");
+ *       return false;
+ *   }
+ *
+ * @param expr Boolean expression or function call to validate
+ * @param desc Description for error message (will be suffixed with " failed")
+ */
+#define VALIDATE_OP(expr, desc)             \
+    do                                      \
+    {                                       \
+        if (!(expr))                        \
+        {                                   \
+            LOG_ERROR((desc) << " failed"); \
+            return false;                   \
+        }                                   \
+    } while (0)
 
 namespace llaminar2
 {
@@ -42,6 +118,9 @@ namespace llaminar2
     {
         // Residual connections
         std::shared_ptr<FP32Tensor> residual;
+
+        // Normalization buffer (reused by attention and FFN blocks)
+        std::shared_ptr<FP32Tensor> normalized;
 
         // Attention buffers
         std::shared_ptr<FP32Tensor> Q;
@@ -68,18 +147,19 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Construct pipeline base
+         * @brief Construct pipeline with MPI context and device placement
          *
-         * @param model_ctx Model context with GGUF metadata and loader
-         * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
-         * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
-         * @param placement_map Weight placement map (nullptr = create default with all on device_idx)
+         * @param model_ctx Model context with GGUF metadata and weights
+         * @param mpi_ctx MPI context for distributed execution (nullptr = single-rank)
+         * @param device_idx Default device index (-1 = CPU, ≥0 = GPU)
+         * @param placement_map Optional weight placement strategy (nullptr = single device)
+         * @param config Runtime configuration (max_seq_len, threading, etc.)
          */
         PipelineBase(std::shared_ptr<ModelContext> model_ctx,
-                     std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-                     int device_idx = -1,
-                     std::shared_ptr<WeightPlacementMap> placement_map = nullptr);
-
+                     std::shared_ptr<MPIContext> mpi_ctx,
+                     int device_idx,
+                     std::shared_ptr<WeightPlacementMap> placement_map,
+                     const PipelineConfig &config = PipelineConfig{});
         virtual ~PipelineBase() = default;
 
         /**
@@ -130,7 +210,8 @@ namespace llaminar2
         // Context management
         std::shared_ptr<ModelContext> model_ctx_;
         std::shared_ptr<MPIContext> mpi_ctx_;
-        int device_idx_; // -1 = CPU, ≥0 = GPU device
+        int device_idx_;        // Primary device (-1 = CPU, ≥0 = GPU index)
+        PipelineConfig config_; // Runtime configuration (max_seq_len, etc.)
 
         // Model path for convenience (from model_ctx_)
         std::string model_path_;
@@ -342,6 +423,34 @@ namespace llaminar2
          * @param max_seq_len Maximum sequence length for KV cache (e.g., 2048)
          */
         void initializeKVCache(int max_seq_len);
+
+        /**
+         * @brief Complete pipeline infrastructure initialization
+         *
+         * Performs all generic initialization steps in sequence:
+         * 1. Device infrastructure (discovery, buffer allocation)
+         * 2. MPI strategy configuration
+         * 3. KV cache initialization
+         *
+         * Derived classes should call this as the LAST step in their constructor,
+         * after setting all architecture parameters (n_layers_, d_model_, n_heads_,
+         * n_kv_heads_, head_dim_, etc.).
+         *
+         * Example usage in derived constructor:
+         *   Qwen2Pipeline(...) : PipelineBase(...) {
+         *       // 1. Read architecture from GGUF metadata
+         *       n_layers_ = model.block_count;
+         *       n_heads_ = model.head_count;
+         *       // ... etc
+         *
+         *       // 2. Derived-specific setup (weight vectors, etc)
+         *       layers_.resize(n_layers_);
+         *
+         *       // 3. Call generic initialization (LAST step)
+         *       initializeInfrastructure();
+         *   }
+         */
+        void initializeInfrastructure();
 
         /**
          * @brief Log MPI strategy info (override for custom logging)

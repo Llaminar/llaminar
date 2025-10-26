@@ -56,18 +56,19 @@ namespace llaminar2
         };
 
         /**
-         * @brief Construct Qwen2 pipeline
+         * @brief Construct Qwen 2.x pipeline
          *
-         * @param model_ctx Model context with GGUF metadata and loader
-         * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
-         * @param device_idx Default device for tensors (-1 = CPU, ≥0 = GPU device)
-         * @param placement_map Weight placement map (nullptr = use device_idx for all)
+         * @param model_ctx Model context with GGUF metadata and weights
+         * @param mpi_ctx MPI context (nullptr = single-rank)
+         * @param device_idx Default device (-1 = CPU, ≥0 = GPU)
+         * @param placement_map Weight placement strategy (nullptr = single device)
+         * @param config Runtime configuration (max_seq_len, threading, etc.)
          */
         Qwen2Pipeline(std::shared_ptr<ModelContext> model_ctx,
-                      std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-                      int device_idx = -1,
-                      std::shared_ptr<WeightPlacementMap> placement_map = nullptr);
-
+                      std::shared_ptr<MPIContext> mpi_ctx,
+                      int device_idx,
+                      std::shared_ptr<WeightPlacementMap> placement_map,
+                      const PipelineConfig &config = PipelineConfig{});
         ~Qwen2Pipeline() override = default;
 
         // PipelineBase interface

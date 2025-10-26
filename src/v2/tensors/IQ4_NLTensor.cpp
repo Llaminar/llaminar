@@ -346,17 +346,13 @@ namespace llaminar2
     void IQ4_NLTensor::decodeBlockAVX512(const IQ4_NLBlock &block, float *output)
     {
         const float d = simd::fp16_to_fp32(block.d);
-        // Prepare lookup buffer (32 int8 values)
-        alignas(64) int8_t lookup_values[32];
+        // Use scalar fallback - kvalues_iq4nl are floats, not int8
         for (size_t j = 0; j < 16; ++j)
         {
             const uint8_t qbyte = block.qs[j];
-            lookup_values[j] = kvalues_iq4nl[qbyte & 0x0F];    // Low nibble
-            lookup_values[j + 16] = kvalues_iq4nl[qbyte >> 4]; // High nibble
+            output[j] = d * kvalues_iq4nl[qbyte & 0x0F];    // Low nibble
+            output[j + 16] = d * kvalues_iq4nl[qbyte >> 4]; // High nibble
         }
-        // Convert and scale: 16 elements at a time (AVX512 helper)
-        simd::convert_i8_to_f32_scaled_avx512(lookup_values, d, output);
-        simd::convert_i8_to_f32_scaled_avx512(lookup_values + 16, d, output + 16);
     }
 #endif
 
@@ -364,19 +360,13 @@ namespace llaminar2
     void IQ4_NLTensor::decodeBlockAVX2(const IQ4_NLBlock &block, float *output)
     {
         const float d = simd::fp16_to_fp32(block.d);
-        // Prepare lookup buffer (32 int8 values)
-        alignas(32) int8_t lookup_values[32];
+        // Use scalar fallback - kvalues_iq4nl are floats, not int8
         for (size_t j = 0; j < 16; ++j)
         {
             const uint8_t qbyte = block.qs[j];
-            lookup_values[j] = kvalues_iq4nl[qbyte & 0x0F];    // Low nibble
-            lookup_values[j + 16] = kvalues_iq4nl[qbyte >> 4]; // High nibble
+            output[j] = d * kvalues_iq4nl[qbyte & 0x0F];    // Low nibble
+            output[j + 16] = d * kvalues_iq4nl[qbyte >> 4]; // High nibble
         }
-        // Convert and scale: 8 elements at a time (AVX2 helper)
-        simd::convert_i8_to_f32_scaled_avx2(lookup_values, d, output);
-        simd::convert_i8_to_f32_scaled_avx2(lookup_values + 8, d, output + 8);
-        simd::convert_i8_to_f32_scaled_avx2(lookup_values + 16, d, output + 16);
-        simd::convert_i8_to_f32_scaled_avx2(lookup_values + 24, d, output + 24);
     }
 
     void IQ4_NLTensor::decodeBlockVectorizedAVX2(const IQ4_NLBlock &block, float *output)
@@ -454,9 +444,6 @@ namespace llaminar2
             }
         }
     }
-
-
-
 
     bool IQ4_NLTensor::copyFrom(const TensorBase *src)
     {

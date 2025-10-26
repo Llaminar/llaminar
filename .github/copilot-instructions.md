@@ -687,6 +687,13 @@ V2 tests use a **4-tier hierarchical labeling system** for flexible filtering an
 - `Parity` - Ground truth validation (PyTorch/llama.cpp comparison)
 - `Performance` - Benchmarks (run manually, not in standard CTest suites)
 
+**Folder-to-Label Mapping** (`tests/v2/`):
+- `tests/v2/unit/` → Must include `Unit` label
+- `tests/v2/integration/` → Must include `Integration` label
+- `tests/v2/e2e/` → Must include `E2E` label
+- `tests/v2/performance/` → Must include `Performance` label
+- Future `tests/v2/parity/` → Must include `Parity` label
+
 #### Tier 2 - Architecture (Optional)
 - `V2` - V2 architecture tests
 - `V1` - V1 architecture tests (when needed for disambiguation)
@@ -753,20 +760,24 @@ set_tests_properties(v2_test_iq4nl_gemm
 Multiple labels enable flexible test filtering:
 
 ```bash
+# By test type (all unit tests) - Used by precommit hook
+ctest -R "^V2_Unit_"  # Regex filter by test name
+ctest -L Unit         # Label filter (also works)
+
 # By component (all device management tests)
 ctest -L DeviceManagement
 
 # By feature (all quantization tests)
 ctest -L Quantization
 
-# By test type (all unit tests)
-ctest -L "V2;Unit"
-
 # Combined filters (device management orchestration tests)
 ctest -L "DeviceManagement" -L "Orchestration"
 
 # Exclude specific labels (all tests except performance)
 ctest -LE Performance
+
+# Precommit hook command (unit tests only)
+ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
 ```
 
 #### Adding New Tests
