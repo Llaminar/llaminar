@@ -757,6 +757,23 @@ add_v2_perf_test(V2_Perf_MPITensorParallel
 #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
 # )
 
+# Perf: IQ4_NL GEMM tile sweep optimization
+add_executable(v2_perf_iq4nl_tile_sweep performance/Perf__IQ4_NL_TileSweep.cpp)
+target_link_libraries(v2_perf_iq4nl_tile_sweep 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_iq4nl_tile_sweep PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+add_v2_perf_test(V2_Perf_IQ4NL_TileSweep
+    COMMAND $<TARGET_FILE:v2_perf_iq4nl_tile_sweep>
+    LABELS "V2;Performance;TensorOperations;Quantization;IQ4_NL;GEMM;CacheOptimization"
+    MPI_PROCS 2
+)
+
 # Future performance tests can be added here following the same pattern:
 # Example:
 # add_executable(v2_perf_attention performance/Perf__Attention.cpp)
