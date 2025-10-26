@@ -774,6 +774,22 @@ add_v2_perf_test(V2_Perf_IQ4NL_TileSweep
     MPI_PROCS 2
 )
 
+# Perf: L1 cache optimization comparison (Original vs L1-Opt)
+add_executable(v2_perf_l1_opt_comparison performance/Perf__L1OptimizationComparison.cpp)
+target_link_libraries(v2_perf_l1_opt_comparison 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_l1_opt_comparison PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+add_v2_perf_test(V2_Perf_L1OptComparison
+    COMMAND $<TARGET_FILE:v2_perf_l1_opt_comparison>
+    LABELS "V2;Performance;TensorOperations;Quantization;IQ4_NL;GEMM;CacheOptimization;L1Cache"
+    MPI_PROCS 2
+)
+
 # Future performance tests can be added here following the same pattern:
 # Example:
 # add_executable(v2_perf_attention performance/Perf__Attention.cpp)

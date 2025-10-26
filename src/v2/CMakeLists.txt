@@ -59,6 +59,8 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/SoftmaxPrimitives.cpp
     # CPU kernels (use vectorized primitives)
     kernels/cpu/QuantizedGemm.cpp
+    kernels/cpu/QuantizedGemmOptimizedL1.cpp
+    kernels/cpu/QuantizedGemmL1Opt.cpp
     kernels/cpu/FP32GemmKernel.cpp
     kernels/cpu/FP32StandaloneGemm.cpp
     kernels/cpu/BF16GemmKernel.cpp
