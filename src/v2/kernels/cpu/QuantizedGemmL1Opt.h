@@ -74,14 +74,15 @@ namespace llaminar2
 
         // Panel dimensions (optimized for L1/L2 cache)
         static constexpr int MC = 256; // M panel size (L1: 256×896×4 = 896 KB for A panel)
-        static constexpr int NC = 128; // N panel size (L2: 896×128×4 = 447 KB for B tile)
+        static constexpr int NC = 64;  // N panel size (OPTIMIZED: 896×64×4 = 224 KB for B tile)
         static constexpr int KC = 256; // K panel size (balance between reuse and working set)
+        static constexpr int PREFETCH_DISTANCE = 64; // Prefetch 64 floats ahead
 
         // Micro-kernel: C[MR×NR] += A[MR×KC] * B[KC×NR]
         void micro_kernel(
             const float *A_panel, const float *B_panel,
             float *C, int ldc, int k_panel,
-            float alpha, float beta);
+            float alpha, float beta, int mr, int nr);
 
         // Pack panels for better cache utilization
         void pack_A_panel(const float *A, float *A_packed, int m_panel, int k_panel, int lda);
