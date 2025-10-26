@@ -97,7 +97,8 @@ namespace llaminar2
     bool PipelineBase::attention_gqa(
         TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
         int n_heads, int n_kv_heads, int head_dim,
-        bool causal, int window_size)
+        bool causal, int window_size,
+        int batch_size, const std::vector<int> *sequence_lengths)
     {
         // Validate inputs
         if (!Q || !K || !V || !output)
@@ -210,9 +211,22 @@ namespace llaminar2
         // Apply causal mask (if enabled)
         if (causal)
         {
-            LOG_DEBUG("[Baseline] Applying causal mask");
+            LOG_DEBUG("[Baseline] Applying causal mask (batch_size=" << batch_size << ")");
             std::vector<float> mask(seq_len * seq_len);
-            attention_utils::create_causal_mask(mask.data(), seq_len, window_size);
+
+            if (batch_size == 1)
+            {
+                // Single sequence: standard causal mask
+                attention_utils::create_causal_mask(mask.data(), seq_len, window_size);
+            }
+            else
+            {
+                // Batched sequences: block-diagonal causal mask with padding
+                int padded_seq_len = seq_len / batch_size;
+                const int *seq_lens_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
+                attention_utils::create_batch_causal_mask(
+                    mask.data(), batch_size, padded_seq_len, seq_lens_ptr, window_size);
+            }
 
             // Apply mask to each head separately
             for (int h = 0; h < n_heads; ++h)
@@ -272,6 +286,211 @@ namespace llaminar2
                 for (int d = 0; d < head_dim; ++d)
                 {
                     output_data[s * n_heads * head_dim + h * head_dim + d] = context_h[s * head_dim + d];
+                }
+            }
+        }
+
+        return true;
+    }
+
+    bool PipelineBase::attention_gqa_batch(
+        TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+        const std::vector<int> &actual_lengths,
+        int batch_size, int seq_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size)
+    {
+        // Validate inputs
+        if (!Q || !K || !V || !output)
+        {
+            LOG_ERROR("[PipelineBase] attention_gqa_batch: null pointer");
+            return false;
+        }
+
+        if (n_heads % n_kv_heads != 0)
+        {
+            LOG_ERROR("[PipelineBase] attention_gqa_batch: n_heads (" << n_heads
+                                                                      << ") must be divisible by n_kv_heads (" << n_kv_heads << ")");
+            return false;
+        }
+
+        if (static_cast<int>(actual_lengths.size()) != batch_size)
+        {
+            LOG_ERROR("[PipelineBase] attention_gqa_batch: actual_lengths size ("
+                      << actual_lengths.size() << ") != batch_size (" << batch_size << ")");
+            return false;
+        }
+
+        // Validate tensor shapes
+        const auto &q_shape = Q->shape();
+        if (q_shape.size() != 2)
+        {
+            LOG_ERROR("[PipelineBase] attention_gqa_batch: Q must be 2D");
+            return false;
+        }
+
+        const int total_seq_len = batch_size * seq_len;
+        if (static_cast<int>(q_shape[0]) != total_seq_len)
+        {
+            LOG_ERROR("[PipelineBase] attention_gqa_batch: Q shape[0] ("
+                      << q_shape[0] << ") != batch_size * seq_len (" << total_seq_len << ")");
+            return false;
+        }
+
+        // Get tensor data pointers
+        const float *Q_data = Q->data();
+        const float *K_data = K->data();
+        const float *V_data = V->data();
+        float *output_data = output->mutable_data();
+
+        // Broadcast K/V heads if needed (GQA)
+        std::vector<float> K_broadcast;
+        std::vector<float> V_broadcast;
+        const float *K_expanded = K_data;
+        const float *V_expanded = V_data;
+
+        if (n_kv_heads < n_heads)
+        {
+            // Need to broadcast K/V
+            K_broadcast.resize(total_seq_len * n_heads * head_dim);
+            V_broadcast.resize(total_seq_len * n_heads * head_dim);
+
+            attention_utils::broadcast_kv_heads(
+                K_data, K_broadcast.data(),
+                total_seq_len, n_heads, n_kv_heads, head_dim);
+
+            attention_utils::broadcast_kv_heads(
+                V_data, V_broadcast.data(),
+                total_seq_len, n_heads, n_kv_heads, head_dim);
+
+            K_expanded = K_broadcast.data();
+            V_expanded = V_broadcast.data();
+        }
+
+        // Create combined causal + padding mask [batch_size, seq_len, seq_len]
+        std::vector<float> combined_mask(batch_size * seq_len * seq_len);
+        attention_utils::create_combined_batch_mask(
+            combined_mask.data(),
+            batch_size,
+            seq_len,
+            actual_lengths.data(),
+            causal,
+            window_size);
+
+        // Create temporary tensor for scores: [batch_size * n_heads, seq_len, seq_len]
+        auto scores_tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(batch_size * n_heads * seq_len), static_cast<size_t>(seq_len)});
+        float *scores = scores_tensor->mutable_data();
+
+        // Compute attention scores per batch and head: Q @ K^T
+        // Process each batch and head separately
+        for (int b = 0; b < batch_size; ++b)
+        {
+            for (int h = 0; h < n_heads; ++h)
+            {
+                // Extract contiguous head data for this batch
+                std::vector<float> Q_bh(seq_len * head_dim);
+                std::vector<float> K_bh(seq_len * head_dim);
+
+                const int batch_offset = b * seq_len;
+                for (int s = 0; s < seq_len; ++s)
+                {
+                    for (int d = 0; d < head_dim; ++d)
+                    {
+                        const int global_pos = (batch_offset + s) * n_heads * head_dim + h * head_dim + d;
+                        Q_bh[s * head_dim + d] = Q_data[global_pos];
+                        K_bh[s * head_dim + d] = K_expanded[global_pos];
+                    }
+                }
+
+                // GEMM: scores[b,h] = Q_bh @ K_bh^T
+                // Q_bh: [seq_len, head_dim], K_bh: [seq_len, head_dim]
+                // scores[b,h]: [seq_len, seq_len]
+                float *scores_bh = scores + (b * n_heads + h) * seq_len * seq_len;
+
+                if (!FP32StandaloneGemm::multiply_with_b(
+                        Q_bh.data(), K_bh.data(), scores_bh,
+                        seq_len, seq_len, head_dim,
+                        true, 1.0f, 0.0f))
+                {
+                    LOG_ERROR("[PipelineBase] attention_gqa_batch: Q·K^T GEMM failed for batch " << b << " head " << h);
+                    return false;
+                }
+            }
+        }
+
+        // Scale scores by 1/sqrt(head_dim)
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+#pragma omp parallel for if (batch_size * n_heads * seq_len * seq_len > 8192)
+        for (int i = 0; i < batch_size * n_heads * seq_len * seq_len; ++i)
+        {
+            scores[i] *= scale;
+        }
+
+        // Apply combined causal + padding mask
+        // Broadcast mask across heads: mask[b, seq_len, seq_len] -> all heads for batch b
+        for (int b = 0; b < batch_size; ++b)
+        {
+            const float *mask_b = combined_mask.data() + b * seq_len * seq_len;
+            for (int h = 0; h < n_heads; ++h)
+            {
+                float *scores_bh = scores + (b * n_heads + h) * seq_len * seq_len;
+                attention_utils::apply_attention_mask(scores_bh, mask_b, seq_len, seq_len);
+            }
+        }
+
+        // Apply softmax per batch and head
+        primitives::SoftmaxRowArgs softmax_args;
+        softmax_args.causal = false; // Already masked above
+        softmax_args.scale = 1.0f;   // Already scaled above
+        softmax_args.rows = batch_size * n_heads * seq_len;
+        softmax_args.cols = seq_len;
+        softmax_args.scores = scores;
+
+        primitives::softmax_row_major_vectorized(softmax_args);
+
+        // Compute context: scores @ V
+        std::memset(output_data, 0, total_seq_len * n_heads * head_dim * sizeof(float));
+
+        for (int b = 0; b < batch_size; ++b)
+        {
+            for (int h = 0; h < n_heads; ++h)
+            {
+                // Extract contiguous V_bh data
+                std::vector<float> V_bh(seq_len * head_dim);
+                const int batch_offset = b * seq_len;
+                for (int s = 0; s < seq_len; ++s)
+                {
+                    for (int d = 0; d < head_dim; ++d)
+                    {
+                        const int global_pos = (batch_offset + s) * n_heads * head_dim + h * head_dim + d;
+                        V_bh[s * head_dim + d] = V_expanded[global_pos];
+                    }
+                }
+
+                // Temporary contiguous output for this batch-head
+                std::vector<float> context_bh(seq_len * head_dim);
+
+                // GEMM: context_bh = scores[b,h] @ V_bh
+                const float *scores_bh = scores + (b * n_heads + h) * seq_len * seq_len;
+
+                if (!FP32StandaloneGemm::multiply_with_b(
+                        scores_bh, V_bh.data(), context_bh.data(),
+                        seq_len, head_dim, seq_len,
+                        false, 1.0f, 0.0f))
+                {
+                    LOG_ERROR("[PipelineBase] attention_gqa_batch: scores·V GEMM failed for batch " << b << " head " << h);
+                    return false;
+                }
+
+                // Write back to strided output
+                for (int s = 0; s < seq_len; ++s)
+                {
+                    for (int d = 0; d < head_dim; ++d)
+                    {
+                        const int global_pos = (batch_offset + s) * n_heads * head_dim + h * head_dim + d;
+                        output_data[global_pos] = context_bh[s * head_dim + d];
+                    }
                 }
             }
         }
@@ -460,19 +679,20 @@ namespace llaminar2
     bool PipelineBase::attention_gqa_mpi(
         TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
         int n_heads, int n_kv_heads, int head_dim,
-        bool causal, int window_size)
+        bool causal, int window_size,
+        int batch_size, const std::vector<int> *sequence_lengths)
     {
         // Fast path: No MPI or single-rank execution
         if (!mpi_ctx_ || mpi_ctx_->world_size() == 1 || mpi_strategy_ == MPIStrategy::None)
         {
-            return attention_gqa(Q, K, V, output, n_heads, n_kv_heads, head_dim, causal, window_size);
+            return attention_gqa(Q, K, V, output, n_heads, n_kv_heads, head_dim, causal, window_size, batch_size, sequence_lengths);
         }
 
         // Dispatch based on MPI strategy
         switch (mpi_strategy_)
         {
         case MPIStrategy::TensorParallel:
-            return attention_gqa_tensor_parallel(Q, K, V, output, n_heads, n_kv_heads, head_dim, causal, window_size);
+            return attention_gqa_tensor_parallel(Q, K, V, output, n_heads, n_kv_heads, head_dim, causal, window_size, batch_size, sequence_lengths);
 
         case MPIStrategy::SequenceParallel:
             // TODO: Implement sequence-parallel attention (Phase 6)
@@ -481,7 +701,7 @@ namespace llaminar2
 
         case MPIStrategy::PipelineParallel:
             // Pipeline-parallel doesn't change attention (distributes layers instead)
-            return attention_gqa(Q, K, V, output, n_heads, n_kv_heads, head_dim, causal, window_size);
+            return attention_gqa(Q, K, V, output, n_heads, n_kv_heads, head_dim, causal, window_size, batch_size, sequence_lengths);
 
         case MPIStrategy::Hybrid:
             // TODO: Implement hybrid strategy (Phase 6)
@@ -497,7 +717,8 @@ namespace llaminar2
     bool PipelineBase::attention_gqa_tensor_parallel(
         TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
         int n_heads, int n_kv_heads, int head_dim,
-        bool causal, int window_size)
+        bool causal, int window_size,
+        int batch_size, const std::vector<int> *sequence_lengths)
     {
         // Validate MPI context
         if (!mpi_ctx_)
@@ -530,14 +751,31 @@ namespace llaminar2
             return false;
         }
 
-        // Infer seq_len from Q shape
+        // Infer dimensions from Q shape and batch_size
         const auto &q_shape = Q->shape();
         if (q_shape.size() != 2)
         {
             LOG_ERROR("[PipelineBase] Q must be 2D, got " << q_shape.size() << "D");
             return false;
         }
-        int seq_len = static_cast<int>(q_shape[0]);
+        int total_tokens = static_cast<int>(q_shape[0]);
+
+        // Compute per-batch sequence length
+        int effective_batch_size = (batch_size > 0) ? batch_size : 1;
+        int seq_len = total_tokens / effective_batch_size;
+
+        if (total_tokens % effective_batch_size != 0)
+        {
+            LOG_ERROR("[PipelineBase] total_tokens (" << total_tokens
+                                                      << ") not divisible by batch_size (" << effective_batch_size << ")");
+            return false;
+        }
+
+        LOG_DEBUG("[MPI TP] Batch-aware attention: total_tokens=" << total_tokens
+                                                                  << " batch_size=" << effective_batch_size
+                                                                  << " seq_len_per_batch=" << seq_len);
+
+        int padded_seq_len = seq_len;
 
         // 1. Distribute attention heads across ranks
         auto [start_head, local_n_heads] = getHeadDistribution(n_heads);
@@ -569,28 +807,28 @@ namespace llaminar2
 
         if (n_kv_heads < n_heads)
         {
-            K_broadcast.resize(seq_len * n_heads * head_dim);
-            V_broadcast.resize(seq_len * n_heads * head_dim);
+            K_broadcast.resize(total_tokens * n_heads * head_dim);
+            V_broadcast.resize(total_tokens * n_heads * head_dim);
 
             attention_utils::broadcast_kv_heads(
                 K_data, K_broadcast.data(),
-                seq_len, n_heads, n_kv_heads, head_dim);
+                total_tokens, n_heads, n_kv_heads, head_dim);
 
             attention_utils::broadcast_kv_heads(
                 V_data, V_broadcast.data(),
-                seq_len, n_heads, n_kv_heads, head_dim);
+                total_tokens, n_heads, n_kv_heads, head_dim);
 
             K_expanded = K_broadcast.data();
             V_expanded = V_broadcast.data();
         }
 
         // 3. Allocate local output buffer for this rank's heads
-        // [seq_len, local_n_heads * head_dim]
-        std::vector<float> local_output(seq_len * local_n_heads * head_dim, 0.0f);
+        // [total_tokens, local_n_heads * head_dim] - use total_tokens to cover all batches
+        std::vector<float> local_output(total_tokens * local_n_heads * head_dim, 0.0f);
 
-        // Temporary scores for local heads: [local_n_heads, seq_len, seq_len]
+        // Temporary scores for local heads: [local_n_heads, total_tokens, total_tokens]
         auto local_scores_tensor = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(local_n_heads * seq_len), static_cast<size_t>(seq_len)});
+            std::vector<size_t>{static_cast<size_t>(local_n_heads * total_tokens), static_cast<size_t>(total_tokens)});
         float *local_scores = local_scores_tensor->mutable_data();
 
         // 4. Compute attention for local heads only
@@ -599,27 +837,27 @@ namespace llaminar2
             size_t global_h = start_head + local_h;
 
             // Extract contiguous Q_h and K_h for this head
-            std::vector<float> Q_h(seq_len * head_dim);
-            std::vector<float> K_h(seq_len * head_dim);
+            std::vector<float> Q_h(total_tokens * head_dim);
+            std::vector<float> K_h(total_tokens * head_dim);
 
-            for (int s = 0; s < seq_len; ++s)
+            for (int t = 0; t < total_tokens; ++t)
             {
                 for (int d = 0; d < head_dim; ++d)
                 {
-                    Q_h[s * head_dim + d] = Q_data[s * n_heads * head_dim + global_h * head_dim + d];
-                    K_h[s * head_dim + d] = K_expanded[s * n_heads * head_dim + global_h * head_dim + d];
+                    Q_h[t * head_dim + d] = Q_data[t * n_heads * head_dim + global_h * head_dim + d];
+                    K_h[t * head_dim + d] = K_expanded[t * n_heads * head_dim + global_h * head_dim + d];
                 }
             }
 
             // GEMM: scores[local_h] = Q_h @ K_h^T
-            float *scores_h = local_scores + local_h * seq_len * seq_len;
+            float *scores_h = local_scores + local_h * total_tokens * total_tokens;
 
             LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << " (local " << local_h << "): Q[0]="
                                        << Q_h[0] << " K[0]=" << K_h[0]);
 
             if (!FP32StandaloneGemm::multiply_with_b(
                     Q_h.data(), K_h.data(), scores_h,
-                    seq_len, seq_len, head_dim,
+                    total_tokens, total_tokens, head_dim,
                     true, 1.0f, 0.0f))
             {
                 LOG_ERROR("[PipelineBase] Q·K^T GEMM failed for local head " << local_h);
@@ -627,51 +865,63 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << ": scores[0]=" << scores_h[0]
-                                       << " scores[" << (seq_len * seq_len - 1) << "]=" << scores_h[seq_len * seq_len - 1]);
+                                       << " scores[" << (total_tokens * total_tokens - 1) << "]=" << scores_h[total_tokens * total_tokens - 1]);
         }
 
         // 5. Scale scores by 1/sqrt(head_dim) - vectorized
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         LOG_DEBUG("[MPI TP] Rank " << rank << ": Scaling scores by " << scale
                                    << " (1/sqrt(" << head_dim << "))");
-#pragma omp parallel for if (local_n_heads * seq_len * seq_len > 8192)
-        for (int i = 0; i < local_n_heads * seq_len * seq_len; ++i)
+#pragma omp parallel for if (local_n_heads * total_tokens * total_tokens > 8192)
+        for (int i = 0; i < local_n_heads * total_tokens * total_tokens; ++i)
         {
             local_scores[i] *= scale;
         }
         LOG_DEBUG("[MPI TP] Rank " << rank << " after scaling: scores[0]=" << local_scores[0]
-                                   << " scores[" << (local_n_heads * seq_len * seq_len - 1) << "]="
-                                   << local_scores[local_n_heads * seq_len * seq_len - 1]);
+                                   << " scores[" << (local_n_heads * total_tokens * total_tokens - 1) << "]="
+                                   << local_scores[local_n_heads * total_tokens * total_tokens - 1]);
 
         // 6. Apply causal mask (if enabled)
         if (causal)
         {
-            LOG_DEBUG("[MPI TP] Rank " << rank << ": Applying causal mask");
-            std::vector<float> mask(seq_len * seq_len);
-            attention_utils::create_causal_mask(mask.data(), seq_len, window_size);
+            LOG_DEBUG("[MPI TP] Rank " << rank << ": Applying causal mask (batch_size=" << batch_size << ")");
+            std::vector<float> mask(total_tokens * total_tokens);
+
+            if (effective_batch_size == 1)
+            {
+                // Single sequence: standard causal mask
+                attention_utils::create_causal_mask(mask.data(), total_tokens, window_size);
+            }
+            else
+            {
+                // Batched sequences: block-diagonal causal mask with padding
+                const int *seq_lens_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
+                attention_utils::create_batch_causal_mask(
+                    mask.data(), effective_batch_size, padded_seq_len, seq_lens_ptr, window_size);
+            }
 
             for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
             {
-                float *scores_h = local_scores + local_h * seq_len * seq_len;
-                attention_utils::apply_attention_mask(scores_h, mask.data(), seq_len, seq_len);
+                float *scores_h = local_scores + local_h * total_tokens * total_tokens;
+                attention_utils::apply_attention_mask(scores_h, mask.data(), total_tokens, total_tokens);
             }
             LOG_DEBUG("[MPI TP] Rank " << rank << " after masking: scores[0]=" << local_scores[0]
-                                       << " scores[" << (seq_len - 1) << "]=" << local_scores[seq_len - 1]);
+                                       << " scores[" << (total_tokens - 1) << "]=" << local_scores[total_tokens - 1]);
         }
 
         // 7. Softmax over local scores - using vectorized primitives
         primitives::SoftmaxRowArgs softmax_args;
         softmax_args.causal = false; // Already masked in step 6
         softmax_args.scale = 1.0f;   // Already scaled in step 5
-        softmax_args.rows = local_n_heads * seq_len;
-        softmax_args.cols = seq_len;
+        softmax_args.rows = local_n_heads * total_tokens;
+        softmax_args.cols = total_tokens;
         softmax_args.scores = local_scores;
 
         // Use vectorized row-major softmax (AVX512/AVX2/scalar fallback)
         primitives::softmax_row_major_vectorized(softmax_args);
 
         LOG_DEBUG("[MPI TP] Rank " << rank << " after softmax: scores[0]=" << local_scores[0]
-                                   << " scores[" << (seq_len - 1) << "]=" << local_scores[seq_len - 1]
+                                   << " scores[" << (total_tokens - 1) << "]=" << local_scores[total_tokens - 1]
                                    << " (should sum to ~1.0 per row)");
 
         if (mpi_config_.verbose_logging && rank == 0)
@@ -685,23 +935,23 @@ namespace llaminar2
             size_t global_h = start_head + local_h;
 
             // Extract contiguous V_h for this head
-            std::vector<float> V_h(seq_len * head_dim);
-            for (int s = 0; s < seq_len; ++s)
+            std::vector<float> V_h(total_tokens * head_dim);
+            for (int t = 0; t < total_tokens; ++t)
             {
                 for (int d = 0; d < head_dim; ++d)
                 {
-                    V_h[s * head_dim + d] = V_expanded[s * n_heads * head_dim + global_h * head_dim + d];
+                    V_h[t * head_dim + d] = V_expanded[t * n_heads * head_dim + global_h * head_dim + d];
                 }
             }
 
             // Temporary contiguous context for this head
-            std::vector<float> context_h(seq_len * head_dim);
+            std::vector<float> context_h(total_tokens * head_dim);
 
-            const float *scores_h = local_scores + local_h * seq_len * seq_len;
+            const float *scores_h = local_scores + local_h * total_tokens * total_tokens;
 
             if (!FP32StandaloneGemm::multiply_with_b(
                     scores_h, V_h.data(), context_h.data(),
-                    seq_len, head_dim, seq_len,
+                    total_tokens, head_dim, total_tokens,
                     false, 1.0f, 0.0f))
             {
                 LOG_ERROR("[PipelineBase] scores·V GEMM failed for local head " << local_h);
@@ -712,38 +962,40 @@ namespace llaminar2
                                        << " V[0]=" << V_h[0]);
 
             // Write to local_output buffer (contiguous for this rank's heads)
-            for (int s = 0; s < seq_len; ++s)
+            for (int t = 0; t < total_tokens; ++t)
             {
                 for (int d = 0; d < head_dim; ++d)
                 {
-                    local_output[s * local_n_heads * head_dim + local_h * head_dim + d] = context_h[s * head_dim + d];
+                    local_output[t * local_n_heads * head_dim + local_h * head_dim + d] = context_h[t * head_dim + d];
                 }
             }
         }
 
         LOG_DEBUG("[MPI TP] Rank " << rank << ": local_output[0]=" << local_output[0]
-                                   << " local_output[" << (seq_len * local_n_heads * head_dim - 1) << "]="
-                                   << local_output[seq_len * local_n_heads * head_dim - 1]);
+                                   << " local_output[" << (total_tokens * local_n_heads * head_dim - 1) << "]="
+                                   << local_output[total_tokens * local_n_heads * head_dim - 1]);
 
         // 9. Allreduce: Sum local outputs from all ranks
         // Each rank contributes its local heads at the correct global offset
+        // Use total_tokens (not seq_len) to cover all batches
 
         // Zero-initialize global output
-        std::memset(output_data, 0, seq_len * n_heads * head_dim * sizeof(float));
+        std::memset(output_data, 0, total_tokens * n_heads * head_dim * sizeof(float));
 
         // Create temporary buffer for allreduce (each rank's contribution)
-        std::vector<float> send_buffer(seq_len * n_heads * head_dim, 0.0f);
+        std::vector<float> send_buffer(total_tokens * n_heads * head_dim, 0.0f);
 
         // Copy local heads to correct position in send buffer
-        for (int s = 0; s < seq_len; ++s)
+        // Iterate over ALL tokens (including all batches)
+        for (int t = 0; t < total_tokens; ++t)
         {
             for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
             {
                 size_t global_h = start_head + local_h;
                 for (int d = 0; d < head_dim; ++d)
                 {
-                    send_buffer[s * n_heads * head_dim + global_h * head_dim + d] =
-                        local_output[s * local_n_heads * head_dim + local_h * head_dim + d];
+                    send_buffer[t * n_heads * head_dim + global_h * head_dim + d] =
+                        local_output[t * local_n_heads * head_dim + local_h * head_dim + d];
                 }
             }
         }
@@ -760,17 +1012,18 @@ namespace llaminar2
                                    << " send_buffer[8000]=" << send_buffer[8000]);
 
         // Allreduce: Sum contributions from all ranks
+        // Use total_tokens (not seq_len) to cover all batches
         mpi_ctx_->allreduce_sum(
             send_buffer.data(),
             output_data,
-            seq_len * n_heads * head_dim);
+            total_tokens * n_heads * head_dim);
 
         LOG_DEBUG("[MPI TP] Rank " << rank << " AFTER allreduce: output[0]=" << output_data[0]
                                    << " output[100]=" << output_data[100]
                                    << " output[1000]=" << output_data[1000]
                                    << " output[8000]=" << output_data[8000]
-                                   << " output[" << (seq_len * n_heads * head_dim - 1) << "]="
-                                   << output_data[seq_len * n_heads * head_dim - 1]);
+                                   << " output[" << (total_tokens * n_heads * head_dim - 1) << "]="
+                                   << output_data[total_tokens * n_heads * head_dim - 1]);
 
         // 10. Barrier to ensure all ranks complete
         mpi_ctx_->barrier();
@@ -1025,7 +1278,7 @@ namespace llaminar2
         // Phase 3: Use placement map to detect attention devices per layer
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
         kv_cache_ = std::make_shared<KVCache>(n_layers_, max_seq_len, n_kv_heads_, head_dim_, attention_devices);
-        current_position_ = 0;
+        current_positions_.clear(); // Will be resized to batch_size in forward_batch()
 
         LOG_INFO("Initialized KV cache: " << n_layers_ << " layers, "
                                           << max_seq_len << " max_seq_len, "

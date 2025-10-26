@@ -236,6 +236,32 @@ add_v2_test(V2_Unit_IQ4_NLTensor
     LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
+# Test: BatchedKVCache
+add_executable(v2_test_batched_kv_cache unit/tensors/Test__BatchedKVCache.cpp)
+target_link_libraries(v2_test_batched_kv_cache
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BatchedKVCache
+    COMMAND $<TARGET_FILE:v2_test_batched_kv_cache>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TensorOperations;Batching;KVCache;MultiSequence"
+)
+
+# Test: BatchPaddingUtils
+add_executable(v2_test_batch_padding_utils unit/utils/Test__BatchPaddingUtils.cpp)
+target_link_libraries(v2_test_batch_padding_utils
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BatchPaddingUtils
+    COMMAND $<TARGET_FILE:v2_test_batch_padding_utils>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Batching;Padding;Masking;Bucketing"
+)
+
 # Test: PipelineFactory
 add_executable(v2_test_pipeline_factory unit/pipelines/Test__PipelineFactory.cpp)
 target_link_libraries(v2_test_pipeline_factory 
@@ -405,6 +431,37 @@ add_v2_test(V2_Unit_MPITensorParallel
     MPI_PROCS 2
 )
 
+# MPI Batch Operations - Systematic validation of MPI assumptions with batched data
+add_executable(v2_test_mpi_batch_operations 
+    integration/Test__MPIBatchOperations.cpp
+    integration/mpi_gtest_main.cpp  # Custom main with MPI_Init
+)
+target_link_libraries(v2_test_mpi_batch_operations 
+    llaminar2_core 
+    GTest::gtest  # Use gtest, not gtest_main (we provide our own main)
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MPIBatchOperations 
+    COMMAND $<TARGET_FILE:v2_test_mpi_batch_operations>
+    LABELS "V2;Integration;MPI;Batching;TensorParallel;AssumptionValidation;Models"
+    MPI_PROCS 2
+)
+
+# MPI Batched Attention E2E - End-to-end validation of tensor-parallel batched attention
+add_executable(v2_test_mpi_batched_attention 
+    integration/Test__MPIBatchedAttention.cpp
+)
+target_link_libraries(v2_test_mpi_batched_attention 
+    llaminar2_core 
+    GTest::gtest  # Provides its own MPI-aware main()
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MPIBatchedAttention 
+    COMMAND $<TARGET_FILE:v2_test_mpi_batched_attention>
+    LABELS "V2;Integration;MPI;Batching;TensorParallel;E2E;Attention;Models"
+    MPI_PROCS 2
+)
+
 # Placeholder for additional unit test executables (to be added)
 # Example:
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)
@@ -419,6 +476,19 @@ add_v2_test(V2_Unit_MPITensorParallel
 # =============================================================================
 # Medium-complexity tests involving multiple components
 # May load models, test pipelines, verify end-to-end data flow
+
+# Test: Batched Attention (Phase 2)
+add_executable(v2_test_batched_attention integration/Test__BatchedAttention.cpp)
+target_link_libraries(v2_test_batched_attention 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_BatchedAttention
+    COMMAND $<TARGET_FILE:v2_test_batched_attention>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Batching;Attention;CausalMasking;PaddingMasking;GQA"
+)
 
 # Placeholder for integration test executables (to be added)
 # Example:

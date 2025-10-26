@@ -48,6 +48,8 @@ namespace llaminar2
         {
             const int heads_per_kv = n_heads / n_kv_heads;
 
+// Parallelize over sequences (outer loop)
+#pragma omp parallel for if (seq_len * n_kv_heads > 512)
             for (int s = 0; s < seq_len; ++s)
             {
                 for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
@@ -87,6 +89,8 @@ namespace llaminar2
         {
             const float neg_inf = -std::numeric_limits<float>::infinity();
 
+// Parallelize over rows (each row independent)
+#pragma omp parallel for if (seq_len * seq_len > 1024)
             for (int i = 0; i < seq_len; ++i)
             {
                 for (int j = 0; j < seq_len; ++j)
@@ -100,6 +104,90 @@ namespace llaminar2
                     }
 
                     mask[i * seq_len + j] = can_attend ? 0.0f : neg_inf;
+                }
+            }
+        }
+
+        /**
+         * @brief Create batch-aware causal attention mask with sequence boundaries
+         *
+         * For batched inputs: [batch_size, padded_seq_len, ...]
+         * - Causal masking within each sequence (token i can only attend to tokens [0..i] in same sequence)
+         * - Full masking across sequence boundaries (sequences cannot see each other)
+         * - Optional padding masking for variable-length sequences
+         *
+         * Mask structure for batch_size=2, padded_seq_len=2:
+         * ```
+         *      s0t0  s0t1  s1t0  s1t1
+         * s0t0   0    -∞    -∞    -∞     (seq0, tok0 can only see itself)
+         * s0t1   0     0    -∞    -∞     (seq0, tok1 can see seq0's tok0-1)
+         * s1t0  -∞    -∞     0    -∞     (seq1, tok0 can only see itself - isolated from seq0!)
+         * s1t1  -∞    -∞     0     0     (seq1, tok1 can see seq1's tok0-1)
+         * ```
+         *
+         * @param mask Output mask [total_len, total_len] where total_len = batch_size * padded_seq_len
+         * @param batch_size Number of sequences in batch
+         * @param padded_seq_len Maximum sequence length (after padding)
+         * @param sequence_lengths Actual length per sequence (nullptr = all sequences use padded_seq_len)
+         * @param window_size Sliding window size (-1 = full attention, 0+ = local window)
+         */
+        inline void create_batch_causal_mask(
+            float *mask,
+            int batch_size,
+            int padded_seq_len,
+            const int *sequence_lengths = nullptr,
+            int window_size = -1)
+        {
+            const float neg_inf = -std::numeric_limits<float>::infinity();
+            const int total_len = batch_size * padded_seq_len;
+
+// Parallelize over rows - each row's mask is independent
+// Use flattened 1D iteration for better load balancing
+#pragma omp parallel for if (total_len * total_len > 4096) schedule(static)
+            for (int i = 0; i < total_len; ++i)
+            {
+                const int batch_i = i / padded_seq_len; // Which sequence does token i belong to?
+                const int pos_i = i % padded_seq_len;   // Position within that sequence
+
+                // Get actual sequence length for this sequence
+                const int actual_len_i = sequence_lengths ? sequence_lengths[batch_i] : padded_seq_len;
+
+                // If token i is a padding token, it cannot attend to anything
+                const bool i_is_padding = (pos_i >= actual_len_i);
+
+                for (int j = 0; j < total_len; ++j)
+                {
+                    const int batch_j = j / padded_seq_len;
+                    const int pos_j = j % padded_seq_len;
+
+                    bool can_attend = false;
+
+                    // Padding tokens cannot attend to anything
+                    if (!i_is_padding)
+                    {
+                        // 1. Must be in same sequence (block-diagonal structure)
+                        if (batch_i == batch_j)
+                        {
+                            // 2. Check if token j is within valid sequence (not padding)
+                            const int actual_len_j = sequence_lengths ? sequence_lengths[batch_j] : padded_seq_len;
+                            const bool j_is_padding = (pos_j >= actual_len_j);
+
+                            if (!j_is_padding)
+                            {
+                                // 3. Causal constraint: can't attend to future tokens
+                                if (pos_i >= pos_j)
+                                {
+                                    // 4. Sliding window constraint (if enabled)
+                                    if (window_size < 0 || (pos_i - pos_j < window_size))
+                                    {
+                                        can_attend = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
                 }
             }
         }
@@ -120,7 +208,11 @@ namespace llaminar2
             float *scores, const float *mask,
             int rows, int cols)
         {
-            for (int i = 0; i < rows * cols; ++i)
+            const int total = rows * cols;
+
+// Parallelize mask application (vectorizable)
+#pragma omp parallel for if (total > 4096)
+            for (int i = 0; i < total; ++i)
             {
                 scores[i] += mask[i];
             }
@@ -166,6 +258,73 @@ namespace llaminar2
             for (int i = 0; i < count; ++i)
             {
                 scores[i] *= scale;
+            }
+        }
+
+        /**
+         * @brief Create combined causal + padding mask for batched attention
+         *
+         * Combines two masking constraints:
+         * 1. Causal masking: token i cannot attend to tokens j > i (future)
+         * 2. Padding masking: real tokens cannot attend to padding positions
+         *
+         * Result: mask[batch, seq_len, seq_len]
+         * - mask[b, i, j] = 0.0    if position (b,i) can attend to position (b,j)
+         * - mask[b, i, j] = -inf   otherwise
+         *
+         * Masking rules:
+         * - Cross-batch masking: Always masked (batch b cannot attend to batch b')
+         * - Causal masking: Masked if j > i (cannot attend to future)
+         * - Padding masking: Masked if j >= actual_lengths[b] (padding position)
+         *
+         * @param mask Output mask [batch_size * seq_len * seq_len]
+         * @param batch_size Number of sequences in batch
+         * @param seq_len Maximum sequence length
+         * @param actual_lengths Actual length of each sequence [batch_size]
+         * @param causal Apply causal masking (default: true)
+         * @param window_size Sliding window size (-1 = full attention)
+         */
+        inline void create_combined_batch_mask(
+            float *mask,
+            int batch_size,
+            int seq_len,
+            const int *actual_lengths,
+            bool causal = true,
+            int window_size = -1)
+        {
+            const float neg_inf = -std::numeric_limits<float>::infinity();
+
+            for (int b = 0; b < batch_size; ++b)
+            {
+                const int actual_len = actual_lengths[b];
+
+                for (int i = 0; i < seq_len; ++i)
+                {
+                    for (int j = 0; j < seq_len; ++j)
+                    {
+                        bool can_attend = true;
+
+                        // 1. Padding mask: Cannot attend to padding positions
+                        if (j >= actual_len)
+                        {
+                            can_attend = false;
+                        }
+
+                        // 2. Causal mask: Cannot attend to future positions
+                        if (causal && can_attend && j > i)
+                        {
+                            can_attend = false;
+                        }
+
+                        // 3. Sliding window mask (if enabled)
+                        if (window_size >= 0 && can_attend && (i - j >= window_size))
+                        {
+                            can_attend = false;
+                        }
+
+                        mask[b * seq_len * seq_len + i * seq_len + j] = can_attend ? 0.0f : neg_inf;
+                    }
+                }
             }
         }
 

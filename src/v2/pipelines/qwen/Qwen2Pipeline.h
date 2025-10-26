@@ -21,7 +21,7 @@
 
 #include "../PipelineBase.h"
 #include "../TensorDimensions.h"
-#include "../../tensors/KVCache.h"
+#include "../../tensors/BatchedKVCache.h"
 
 namespace llaminar2
 {
@@ -56,31 +56,57 @@ namespace llaminar2
         };
 
         /**
-         * @brief Construct Qwen 2.x pipeline
+         * @brief Construct Qwen 2.x pipeline (batch-first design)
          *
          * @param model_ctx Model context with GGUF metadata and weights
          * @param mpi_ctx MPI context (nullptr = single-rank)
          * @param device_idx Default device (-1 = CPU, ≥0 = GPU)
          * @param placement_map Weight placement strategy (nullptr = single device)
          * @param config Runtime configuration (max_seq_len, threading, etc.)
+         * @param batch_size Number of sequences to process simultaneously (default=1)
          */
         Qwen2Pipeline(std::shared_ptr<ModelContext> model_ctx,
                       std::shared_ptr<MPIContext> mpi_ctx,
                       int device_idx,
                       std::shared_ptr<WeightPlacementMap> placement_map,
-                      const PipelineConfig &config = PipelineConfig{});
+                      const PipelineConfig &config = PipelineConfig{},
+                      int batch_size = 1);
         ~Qwen2Pipeline() override = default;
 
         // PipelineBase interface
-        bool forward(const int *tokens, int seq_len) override;
+        bool forward(const int *tokens, int seq_len) override; // Legacy single-sequence (wraps batch version)
         const char *architecture() const override { return "qwen2"; }
+
+        /**
+         * @brief Batch-first forward pass (primary interface)
+         *
+         * @param token_batches Vector of token sequences (batch_size sequences)
+         * @return true if forward pass succeeded
+         */
+        bool forward_batch(const std::vector<std::vector<int>> &token_batches);
 
         /**
          * @brief Get output logits for E2E testing/validation
          *
-         * @return Logits tensor [seq_len, vocab_size], or nullptr if forward() not called
+         * @param seq_idx Sequence index in batch (default=0)
+         * @return Logits tensor [padded_seq_len, vocab_size], or nullptr if forward() not called
          */
-        const float *getLogits() const { return logits(); }
+        const float *getLogits(int seq_idx = 0) const;
+
+        /**
+         * @brief Get batch size
+         */
+        int batch_size() const { return batch_size_; }
+
+        /**
+         * @brief Get padded sequence length for current batch
+         */
+        int padded_seq_len() const { return padded_seq_len_; }
+
+        /**
+         * @brief Get sequence lengths for current batch
+         */
+        const std::vector<int> &sequence_lengths() const { return sequence_lengths_; }
 
         /**
          * @brief Get specific layer weight for device placement
@@ -126,50 +152,60 @@ namespace llaminar2
         // Qwen2-specific architecture parameters
         int d_ff_ = 0;
 
+        // Batch configuration
+        int batch_size_ = 1;                // Number of sequences in batch
+        int padded_seq_len_ = 0;            // Max sequence length in current batch
+        std::vector<int> sequence_lengths_; // Actual length per sequence [batch_size]
+
         // Weights (quantized, stay on host for CPU, uploaded to GPU for GPU backends)
         std::shared_ptr<TensorBase> embedding_table_; // [vocab_size, d_model] FP32
         std::vector<LayerWeights> layers_;            // Per-layer weights
         std::shared_ptr<TensorBase> final_norm_;      // Final RMSNorm gamma [d_model]
         std::shared_ptr<TensorBase> lm_head_;         // [d_model, vocab_size] IQ4_NL
 
-        // Activations (FP32, on host or device depending on device_idx)
-        std::shared_ptr<FP32Tensor> current_hidden_; // [seq_len, d_model]
+        // Activations (FP32, sized for batch_size * max_seq_len)
+        std::shared_ptr<FP32Tensor> current_hidden_; // [batch_size * padded_seq_len, d_model]
+        std::shared_ptr<FP32Tensor> logits_buffer_;  // [batch_size * padded_seq_len, vocab_size]
 
-        // Helper methods for dimension specifications (Qwen2-specific)
-        TensorSpec spec_hidden(int seq_len) const
+        // Batched KV cache
+        std::shared_ptr<BatchedKVCache> kv_cache_batched_;
+
+        // Helper methods for dimension specifications (batch-aware)
+        // All tensors treat first dimension as batch_size * padded_seq_len
+        TensorSpec spec_hidden(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)},
-                              "hidden[" + std::to_string(seq_len) + "," + std::to_string(d_model_) + "]");
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_model_)},
+                              "hidden[" + std::to_string(effective_seq_len) + "," + std::to_string(d_model_) + "]");
         }
 
-        TensorSpec spec_q(int seq_len) const
+        TensorSpec spec_q(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)},
-                              "Q[" + std::to_string(seq_len) + "," + std::to_string(n_heads_ * head_dim_) + "]");
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(n_heads_ * head_dim_)},
+                              "Q[" + std::to_string(effective_seq_len) + "," + std::to_string(n_heads_ * head_dim_) + "]");
         }
 
-        TensorSpec spec_kv(int seq_len) const
+        TensorSpec spec_kv(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-                              "KV[" + std::to_string(seq_len) + "," + std::to_string(n_kv_heads_ * head_dim_) + "]");
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)},
+                              "KV[" + std::to_string(effective_seq_len) + "," + std::to_string(n_kv_heads_ * head_dim_) + "]");
         }
 
-        TensorSpec spec_ffn_intermediate(int seq_len) const
+        TensorSpec spec_ffn_intermediate(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)},
-                              "ffn_intermediate[" + std::to_string(seq_len) + "," + std::to_string(d_ff_) + "]");
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_ff_)},
+                              "ffn_intermediate[" + std::to_string(effective_seq_len) + "," + std::to_string(d_ff_) + "]");
         }
 
-        TensorSpec spec_ffn_gate_up(int seq_len) const
+        TensorSpec spec_ffn_gate_up(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)},
-                              "ffn_gate_up[" + std::to_string(seq_len) + "," + std::to_string(d_ff_) + "]");
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_ff_)},
+                              "ffn_gate_up[" + std::to_string(effective_seq_len) + "," + std::to_string(d_ff_) + "]");
         }
 
-        TensorSpec spec_logits(int seq_len) const
+        TensorSpec spec_logits(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size_)},
-                              "logits[" + std::to_string(seq_len) + "," + std::to_string(vocab_size_) + "]");
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
+                              "logits[" + std::to_string(effective_seq_len) + "," + std::to_string(vocab_size_) + "]");
         }
 
         TensorSpec spec_norm_gamma() const
@@ -178,9 +214,11 @@ namespace llaminar2
                               "norm_gamma[" + std::to_string(d_model_) + "]");
         }
 
-        // Helper methods
-        bool attention_block(const LayerWeights &layer, int layer_idx, int seq_len);
-        bool ffn_block(const LayerWeights &layer, int seq_len);
+        // Helper methods (batch-aware)
+        bool attention_block(const LayerWeights &layer, int layer_idx, int effective_seq_len);
+        bool ffn_block(const LayerWeights &layer, int effective_seq_len);
+        bool embedding_batch(const std::vector<std::vector<int>> &token_batches, TensorBase *output);
+        bool lm_head_batch(TensorBase *hidden, int effective_seq_len);
 
     public:
         /**
@@ -192,13 +230,13 @@ namespace llaminar2
             {
                 kv_cache_->clear();
             }
-            current_position_ = 0;
+            current_positions_.assign(batch_size_, 0);
         }
 
         /**
-         * @brief Get current cache position
+         * @brief Get current cache position (for first sequence)
          */
-        int get_position() const { return current_position_; }
+        int get_position() const { return current_positions_.empty() ? 0 : current_positions_[0]; }
     };
 
 } // namespace llaminar2

@@ -52,6 +52,7 @@ add_library(llaminar2_core STATIC
     tensors/IQ3_STensor.cpp
     tensors/IQ1_STensor.cpp
     tensors/IQ1_MTensor.cpp
+    tensors/BatchedKVCache.cpp
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
@@ -70,6 +71,7 @@ add_library(llaminar2_core STATIC
     testing/AttentionTestHarness.cpp
     testing/PerfHarness.cpp
     utils/ArgParser.cpp
+    utils/BatchPaddingUtils.cpp
 )
 
 target_include_directories(llaminar2_core PUBLIC 

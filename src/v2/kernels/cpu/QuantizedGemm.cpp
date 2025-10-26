@@ -199,7 +199,15 @@ namespace llaminar2
 #pragma omp parallel
         {
             // Thread-local buffer for N_TILE B columns (decode multiple at once)
-            std::vector<float> B_tile(k * N_TILE);
+            // CRITICAL: Align to 64 bytes for AVX-512 _mm512_load_ps intrinsics
+            // std::vector does NOT guarantee alignment, so we use aligned_alloc
+            size_t tile_size = k * N_TILE;
+            void *tile_ptr = aligned_alloc(64, tile_size * sizeof(float) + 64); // Extra space for alignment
+            if (!tile_ptr)
+            {
+                throw std::bad_alloc();
+            }
+            float *B_tile = reinterpret_cast<float *>(tile_ptr);
 
 #pragma omp for schedule(dynamic)
             for (int jj = 0; jj < n; jj += N_TILE)
@@ -222,7 +230,7 @@ namespace llaminar2
                             for (int jv = 0; jv < 4; ++jv)
                             {
                                 int j = jj + j_vec + jv;
-                                float *B_col = B_tile.data() + (j_vec + jv) * k;
+                                float *B_col = B_tile + (j_vec + jv) * k;
                                 decoder_->decode_block_at(j, kb, B_col + k_start);
                             }
                         }
@@ -231,7 +239,7 @@ namespace llaminar2
                     for (; j_vec < n_block; ++j_vec)
                     {
                         int j = jj + j_vec;
-                        float *B_col = B_tile.data() + j_vec * k;
+                        float *B_col = B_tile + j_vec * k;
                         for (int kb = 0; kb < num_k_blocks; ++kb)
                         {
                             size_t k_start = kb * BLOCK_SIZE;
@@ -245,7 +253,7 @@ namespace llaminar2
                     for (int j_local = 0; j_local < n_block; ++j_local)
                     {
                         int j = jj + j_local;
-                        float *B_col = B_tile.data() + j_local * k;
+                        float *B_col = B_tile + j_local * k;
 
                         for (int kb = 0; kb < num_k_blocks; ++kb)
                         {
@@ -279,7 +287,7 @@ namespace llaminar2
                         for (int j_local = 0; j_local < n_block; ++j_local)
                         {
                             int j = jj + j_local;
-                            const float *B_col = B_tile.data() + j_local * k;
+                            const float *B_col = B_tile + j_local * k;
 
                             float acc = dot_product_simd(A_row, B_col, k);
                             size_t c_idx = i * n + j;
@@ -288,6 +296,9 @@ namespace llaminar2
                     }
                 }
             }
+
+            // Free aligned allocation before thread exits
+            free(tile_ptr);
         }
 
         return true;

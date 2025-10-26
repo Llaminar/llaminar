@@ -671,6 +671,7 @@ namespace llaminar2
 
         // Actually read the array data (don't skip it!)
         value.type = GGUFValueType::ARRAY;
+        value.array_length = array_len; // Store array length
 
         // Determine element size
         size_t elem_size = 0;
@@ -983,6 +984,17 @@ namespace llaminar2
         if (model_.vocab_size == 0)
         {
             model_.vocab_size = get_uint("tokenizer.ggml.tokens.length");
+        }
+
+        // Fallback: Read array length from tokenizer.ggml.tokens (most common case)
+        if (model_.vocab_size == 0)
+        {
+            auto it = model_.metadata.find("tokenizer.ggml.tokens");
+            if (it != model_.metadata.end() && it->second.type == GGUFValueType::ARRAY)
+            {
+                model_.vocab_size = it->second.asArrayLength();
+                LOG_INFO("[ModelLoader] Extracted vocab_size from tokenizer.ggml.tokens array: " << model_.vocab_size);
+            }
         }
 
         // Debug output

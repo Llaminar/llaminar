@@ -111,12 +111,14 @@ namespace llaminar2
     {
         GGUFValueType type;
         std::vector<uint8_t> data;
+        uint64_t array_length = 0; // For ARRAY type, stores number of elements
 
         // Typed accessors
         uint32_t asUInt32() const;
         uint64_t asUInt64() const;
         float asFloat32() const;
         std::string asString() const;
+        uint64_t asArrayLength() const { return array_length; }
     };
 
     /**

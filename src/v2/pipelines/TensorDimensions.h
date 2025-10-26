@@ -76,7 +76,7 @@ namespace llaminar2
             : expected_shape(std::move(shape)), description(desc) {}
 
         /**
-         * @brief Check if tensor matches this specification
+         * @brief Check if tensor matches this specification (exact match)
          */
         bool matches(const std::vector<size_t> &actual_shape) const
         {
@@ -87,6 +87,39 @@ namespace llaminar2
             {
                 if (actual_shape[i] != expected_shape[i])
                     return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Check if tensor can hold the expected data (relaxed match)
+         *
+         * Allows first dimension (typically seq_len) to be >= expected.
+         * This is used for pre-allocated buffers sized for max_seq_len
+         * but used with actual seq_len <= max_seq_len.
+         *
+         * Example: Buffer allocated as [2048, 896] can be validated against
+         *          spec for [1, 896] since we only use first row.
+         */
+        bool matches_prefix(const std::vector<size_t> &actual_shape) const
+        {
+            if (actual_shape.size() != expected_shape.size())
+                return false;
+
+            for (size_t i = 0; i < actual_shape.size(); ++i)
+            {
+                if (i == 0)
+                {
+                    // First dimension: allow actual >= expected (buffer can be larger)
+                    if (actual_shape[i] < expected_shape[i])
+                        return false;
+                }
+                else
+                {
+                    // Other dimensions: require exact match
+                    if (actual_shape[i] != expected_shape[i])
+                        return false;
+                }
             }
             return true;
         }
@@ -134,6 +167,7 @@ namespace llaminar2
 // Release build: all validation compiles to nothing
 #define VALIDATE_TENSOR(tensor, spec, stage) ((void)0)
 #define VALIDATE_TENSOR_PTR(tensor_ptr, spec, stage) ((void)0)
+#define VALIDATE_TENSOR_BUFFER(tensor, spec, stage) ((void)0)
 #define VALIDATE_SHAPE(actual_shape, spec, stage) ((void)0)
 #define ASSERT_SAME_SHAPE(tensor1, tensor2, stage) ((void)0)
 
@@ -192,6 +226,36 @@ namespace llaminar2
             std::cerr << "  Hint: Check for accidental transpose or incorrect projection dimensions\n"; \
             std::abort();                                                                               \
         }                                                                                               \
+    } while (0)
+
+/**
+ * @brief Validate pre-allocated buffer (allows first dimension >= expected)
+ *
+ * Use for buffers allocated with max_seq_len but used with actual seq_len.
+ * First dimension can be larger (buffer capacity), other dimensions must match exactly.
+ *
+ * @param tensor Shared pointer to TensorBase (buffer)
+ * @param spec TensorSpec describing minimum required shape
+ * @param stage Pipeline stage name
+ */
+#define VALIDATE_TENSOR_BUFFER(tensor, spec, stage)                                                 \
+    do                                                                                              \
+    {                                                                                               \
+        if (!(tensor))                                                                              \
+        {                                                                                           \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Tensor is null\n";           \
+            std::cerr << "  Expected: " << (spec).description << " " << (spec).shape_str() << "\n"; \
+            std::abort();                                                                           \
+        }                                                                                           \
+        const auto &_actual_shape = (tensor)->shape();                                              \
+        if (!(spec).matches_prefix(_actual_shape))                                                  \
+        {                                                                                           \
+            std::cerr << "[TENSOR VALIDATION ERROR] " << (stage) << ": Buffer too small\n";         \
+            std::cerr << "  Required: " << (spec).description << " " << (spec).shape_str() << "\n"; \
+            std::cerr << "  Actual:   " << TensorSpec::shape_str(_actual_shape) << "\n";            \
+            std::cerr << "  Hint: Buffer first dimension must be >= required seq_len\n";            \
+            std::abort();                                                                           \
+        }                                                                                           \
     } while (0)
 
 /**

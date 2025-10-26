@@ -938,15 +938,58 @@ Just don't forget to reconfigure cmake to disable ASAN when you're done debuggin
 
 ### MPI-Specific Debugging
 
+**Recommended: GDB Command File Approach** (works in containers, no GUI needed)
+
 ```bash
-# Debug specific MPI rank
+# 1. Create GDB command file to avoid interactive prompts
+cat > /tmp/gdbcommands.txt << 'EOF'
+set debuginfod enabled off
+set pagination off
+handle SIGSEGV stop print
+run
+thread apply all bt full
+quit
+EOF
+
+# 2. Run both MPI ranks under GDB with command file
+cd /workspaces/llaminar
+timeout 120 mpirun -np 2 \
+  gdb -x /tmp/gdbcommands.txt --args \
+  ./build_v2/tests/v2/v2_test_qwen2_e2e_correctness \
+  --gtest_filter=Qwen2E2ECorrectness.SingleTokenInference 2>&1 | tee gdb_output.log
+
+# 3. Analyze backtrace
+grep -A 50 "Program received signal" gdb_output.log
+```
+
+**Key Points**:
+- `--args` separates GDB options from executable arguments (CRITICAL!)
+- Command file prevents blocking on debuginfod/pagination prompts
+- `thread apply all bt full` shows all threads with variables
+- Works in containers without X11/xterm
+- Timeout prevents infinite hangs
+
+**Alternative: Per-Rank Logging** (when backtrace differs by rank)
+
+```bash
+# Capture separate log per MPI rank
+timeout 120 bash -c 'mpirun -np 2 bash -c "gdb -x /tmp/gdbcommands.txt --args ./build/my_test 2>&1 | tee /tmp/gdb_rank_\$OMPI_COMM_WORLD_RANK.log"'
+
+# Then examine rank-specific backtraces
+grep -A 50 "Program received signal" /tmp/gdb_rank_0.log
+grep -A 50 "Program received signal" /tmp/gdb_rank_1.log
+```
+
+**Legacy Approaches** (less reliable in containers)
+
+```bash
+# Debug specific MPI rank (requires multiple terminals)
 mpirun -np 2 -host localhost:1 gdb ./build/llaminar : -host localhost:1 ./build/llaminar
 
-# Use GDB with MPI (tmux/screen recommended)
+# Use GDB with MPI via xterm (requires X11 forwarding)
 mpirun -np 2 xterm -hold -e gdb -ex run --args ./build/llaminar --verbose
 
-# Debugging hanging MPI programs
-# In separate terminal:
+# Debugging hanging MPI programs (attach to running process)
 ps aux | grep llaminar
 gdb -p <PID>
 (gdb) bt    # Get backtrace of hanging process

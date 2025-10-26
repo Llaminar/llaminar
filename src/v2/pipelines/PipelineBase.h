@@ -284,12 +284,13 @@ namespace llaminar2
         std::shared_ptr<KVCache> kv_cache_;
 
         /**
-         * @brief Current position in sequence (for incremental decode)
+         * @brief Current position per sequence (for incremental decode, batch-aware)
          *
-         * Tracks how many tokens have been processed.
-         * Reset to 0 on clear(), incremented by forward().
+         * Tracks how many tokens have been processed for each sequence in batch.
+         * Size equals batch_size (resized in forward_batch()).
+         * Reset to 0 on clear(), incremented per-sequence by forward().
          */
-        int current_position_ = 0;
+        std::vector<int> current_positions_;
 
         /**
          * @brief Get all weight names for device discovery (architecture-specific)
@@ -519,6 +520,8 @@ namespace llaminar2
          * @param head_dim Dimension per head
          * @param causal Apply causal masking for autoregressive generation
          * @param window_size Sliding window size (-1 = full attention, ≥0 = local window)
+         * @param batch_size Number of sequences in batch (default=1 for single sequence)
+         * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
          * @note Single-rank implementation (no MPI coordination)
@@ -527,6 +530,50 @@ namespace llaminar2
          */
         virtual bool attention_gqa(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal = true, int window_size = -1,
+            int batch_size = 1, const std::vector<int> *sequence_lengths = nullptr);
+
+        /**
+         * @brief Batched grouped-query attention (GQA) with padding support
+         *
+         * Computes attention for multiple sequences simultaneously:
+         *   For each batch b:
+         *     attention(Q[b], K[b], V[b]) = softmax(Q·K^T / sqrt(head_dim) + mask[b]) · V
+         *
+         * Masking:
+         * - Causal mask: Token i cannot attend to tokens j > i (if causal=true)
+         * - Padding mask: Real tokens cannot attend to padding positions
+         * - Combined mask applied before softmax
+         *
+         * Input shapes:
+         * - Q: [batch_size * seq_len, n_heads * head_dim]
+         * - K: [batch_size * seq_len, n_kv_heads * head_dim]
+         * - V: [batch_size * seq_len, n_kv_heads * head_dim]
+         * - output: [batch_size * seq_len, n_heads * head_dim]
+         * - actual_lengths: [batch_size] (actual sequence lengths, not padded)
+         *
+         * @param Q Query tensor for all batches (flattened)
+         * @param K Key tensor for all batches (flattened)
+         * @param V Value tensor for all batches (flattened)
+         * @param output Output tensor for all batches (pre-allocated, flattened)
+         * @param actual_lengths Actual sequence lengths (before padding) [batch_size]
+         * @param batch_size Number of sequences
+         * @param seq_len Maximum sequence length (after padding)
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param causal Apply causal masking
+         * @param window_size Sliding window size
+         * @return true on success, false on error
+         *
+         * @note Single-rank implementation (no MPI coordination yet)
+         * @note For MPI parallelization, extend with attention_gqa_batch_mpi()
+         */
+        virtual bool attention_gqa_batch(
+            TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            const std::vector<int> &actual_lengths,
+            int batch_size, int seq_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal = true, int window_size = -1);
 
@@ -549,12 +596,15 @@ namespace llaminar2
          * @param head_dim Dimension per head
          * @param causal Apply causal masking
          * @param window_size Sliding window size
+         * @param batch_size Number of sequences in batch (default=1 for single sequence)
+         * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          */
         bool attention_gqa_mpi(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal = true, int window_size = -1);
+            bool causal = true, int window_size = -1,
+            int batch_size = 1, const std::vector<int> *sequence_lengths = nullptr);
 
         /**
          * @brief Tensor-parallel attention implementation
@@ -575,6 +625,8 @@ namespace llaminar2
          * @param head_dim Dimension per head
          * @param causal Apply causal masking
          * @param window_size Sliding window size
+         * @param batch_size Number of sequences in batch (default=1)
+         * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
          * @note Requires n_heads % world_size == 0 (validated in constructor)
@@ -582,7 +634,8 @@ namespace llaminar2
         bool attention_gqa_tensor_parallel(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int window_size);
+            bool causal, int window_size,
+            int batch_size = 1, const std::vector<int> *sequence_lengths = nullptr);
 
         // ===== MPI Strategy Management =====
 
