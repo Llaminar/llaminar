@@ -803,8 +803,8 @@ namespace llaminar2
         if (!Q_data || !K_data || !V_data || !output_data)
         {
             LOG_ERROR("[PipelineBase] Null pointer in attention tensors: "
-                     << "Q=" << (void*)Q_data << " K=" << (void*)K_data
-                     << " V=" << (void*)V_data << " output=" << (void*)output_data);
+                      << "Q=" << (void *)Q_data << " K=" << (void *)K_data
+                      << " V=" << (void *)V_data << " output=" << (void *)output_data);
             return false;
         }
 
@@ -1012,7 +1012,7 @@ namespace llaminar2
         LOG_DEBUG("[MPI TP] Rank " << rank << ": send_buffer[0]=" << send_buffer[0]
                                    << " (global head 0 position, rank computes heads " << start_head
                                    << "-" << (start_head + local_n_heads - 1) << ")");
-        
+
         // Bounds-safe debug logging (only access valid indices)
         const size_t buffer_size = send_buffer.size();
         if (start_head * head_dim < buffer_size)
@@ -1021,12 +1021,15 @@ namespace llaminar2
                                        << send_buffer[start_head * head_dim]
                                        << " (first element of head " << start_head << ")");
         }
-        
+
         std::ostringstream debug_msg;
         debug_msg << "[MPI TP] Rank " << rank << " BEFORE allreduce (buffer_size=" << buffer_size << "):";
-        if (buffer_size > 100) debug_msg << " send_buffer[100]=" << send_buffer[100];
-        if (buffer_size > 1000) debug_msg << " send_buffer[1000]=" << send_buffer[1000];
-        if (buffer_size > 8000) debug_msg << " send_buffer[8000]=" << send_buffer[8000];
+        if (buffer_size > 100)
+            debug_msg << " send_buffer[100]=" << send_buffer[100];
+        if (buffer_size > 1000)
+            debug_msg << " send_buffer[1000]=" << send_buffer[1000];
+        if (buffer_size > 8000)
+            debug_msg << " send_buffer[8000]=" << send_buffer[8000];
         LOG_DEBUG(debug_msg.str());
 
         // Allreduce: Sum contributions from all ranks
@@ -1041,10 +1044,14 @@ namespace llaminar2
         std::ostringstream debug_msg_after;
         debug_msg_after << "[MPI TP] Rank " << rank << " AFTER allreduce (output_size=" << output_size << "):";
         debug_msg_after << " output[0]=" << output_data[0];
-        if (output_size > 100) debug_msg_after << " output[100]=" << output_data[100];
-        if (output_size > 1000) debug_msg_after << " output[1000]=" << output_data[1000];
-        if (output_size > 8000) debug_msg_after << " output[8000]=" << output_data[8000];
-        if (output_size > 0) debug_msg_after << " output[" << (output_size - 1) << "]=" << output_data[output_size - 1];
+        if (output_size > 100)
+            debug_msg_after << " output[100]=" << output_data[100];
+        if (output_size > 1000)
+            debug_msg_after << " output[1000]=" << output_data[1000];
+        if (output_size > 8000)
+            debug_msg_after << " output[8000]=" << output_data[8000];
+        if (output_size > 0)
+            debug_msg_after << " output[" << (output_size - 1) << "]=" << output_data[output_size - 1];
         LOG_DEBUG(debug_msg_after.str());
 
         // 10. Barrier to ensure all ranks complete

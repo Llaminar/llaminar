@@ -1,6 +1,16 @@
 # Llaminar v2 - Clean greenfield implementation
 cmake_minimum_required(VERSION 3.18)
 
+# Enable ccache if available
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    message(STATUS "V2: Found ccache: ${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+else()
+    message(STATUS "V2: ccache not found - using direct compilation")
+endif()
+
 # Enable native CPU optimizations (AVX512/AVX2/FMA)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 
@@ -9,11 +19,43 @@ option(HAVE_CUDA "Enable CUDA backend" OFF)
 option(HAVE_ROCM "Enable ROCm backend" OFF)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 
+# Find Python3 for code generation scripts
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
+
 # CPU BLAS backend: Auto-select based on CPU vendor, or manual override
 # Note: MKL and OpenBLAS cannot be linked together due to symbol conflicts
 # We select one at CMake configure time based on CPU detection
 set(BLAS_BACKEND "AUTO" CACHE STRING "BLAS backend: AUTO, MKL, or OPENBLAS")
 set_property(CACHE BLAS_BACKEND PROPERTY STRINGS AUTO MKL OPENBLAS)
+
+# Generate microkernel instantiations (auto-run Python script at configure time)
+set(GENERATE_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generate_gemm_microkernel_instantiations.py")
+set(GENERATED_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake")
+
+# Check if generation is needed (script newer than output, or output doesn't exist)
+if(NOT EXISTS ${GENERATED_SOURCES_CMAKE} OR 
+   ${GENERATE_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_SOURCES_CMAKE})
+    message(STATUS "V2: Generating GEMM microkernel instantiations...")
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} ${GENERATE_GEMM_SCRIPT}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu
+        RESULT_VARIABLE GENERATE_RESULT
+        OUTPUT_VARIABLE GENERATE_OUTPUT
+        ERROR_VARIABLE GENERATE_ERROR
+    )
+    
+    if(NOT GENERATE_RESULT EQUAL 0)
+        message(FATAL_ERROR "V2: Failed to generate GEMM microkernels:\n${GENERATE_ERROR}")
+    endif()
+    
+    message(STATUS "V2: Generated 64 microkernel files with 1225 variants")
+else()
+    message(STATUS "V2: GEMM microkernel instantiations are up-to-date")
+endif()
+
+# Include generated microkernel instantiations
+include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake)
 
 # V2 Core Library
 add_library(llaminar2_core STATIC
@@ -57,10 +99,11 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
     kernels/cpu/primitives/SoftmaxPrimitives.cpp
-    # CPU kernels (use vectorized primitives)
-    kernels/cpu/QuantizedGemm.cpp
-    kernels/cpu/QuantizedGemmOptimizedL1.cpp
-    kernels/cpu/QuantizedGemmL1Opt.cpp
+    # CPU kernels and auto-tuning infrastructure
+    kernels/cpu/GemmAutoTuner.cpp         # Auto-tuner singleton + factory function
+    kernels/cpu/SmartGemmSearch.cpp       # Intelligent hierarchical search strategies
+    # kernels/cpu/GemmVariantGenerator.cpp  # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
+    # kernels/cpu/GemmVariantGenerator_Generated.cpp # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
     kernels/cpu/FP32GemmKernel.cpp
     kernels/cpu/FP32StandaloneGemm.cpp
     kernels/cpu/BF16GemmKernel.cpp
@@ -74,6 +117,9 @@ add_library(llaminar2_core STATIC
     testing/PerfHarness.cpp
     utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp
+    # Generated GEMM microkernel template instantiations (1225 total across 64 files)
+    kernels/cpu/GemmMicroKernelInit.cpp
+    ${MICROKERNEL_INSTANTIATION_SOURCES}
 )
 
 target_include_directories(llaminar2_core PUBLIC 

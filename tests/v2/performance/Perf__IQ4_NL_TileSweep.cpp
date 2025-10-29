@@ -31,7 +31,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
-#include "kernels/cpu/QuantizedGemm.h"
+// Note: No longer needs QuantizedGemm.h - uses ITensorGemm interface
 
 using namespace llaminar2;
 
@@ -246,10 +246,10 @@ protected:
 
         // Find best configuration
         auto best = std::max_element(results.begin(), results.end(),
-                                      [](const TilePerformance &a, const TilePerformance &b)
-                                      {
-                                          return a.mean_gflops < b.mean_gflops;
-                                      });
+                                     [](const TilePerformance &a, const TilePerformance &b)
+                                     {
+                                         return a.mean_gflops < b.mean_gflops;
+                                     });
 
         if (best != results.end())
         {

@@ -78,7 +78,7 @@ namespace llaminar2
     {
         // If on device, sync to host
         // TODO: Implement lazy sync when device support is added
-        
+
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;
@@ -91,7 +91,7 @@ namespace llaminar2
         // Mark as dirty if on device
         // TODO: Implement dirty flag when device support is added
         host_dirty_ = true;
-        
+
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;
@@ -270,28 +270,36 @@ namespace llaminar2
         // Determine the actual parent tensor and data pointer
         // If this is already a view, chain to the root parent
         std::shared_ptr<FP32Tensor> root_parent;
-        if (is_view_) {
+        if (is_view_)
+        {
             root_parent = std::dynamic_pointer_cast<FP32Tensor>(parent_);
-            if (!root_parent) {
+            if (!root_parent)
+            {
                 std::cerr << "[FP32Tensor::create_view] ERROR: Failed to cast parent to FP32Tensor (is_view=true)\n";
                 return nullptr;
             }
-        } else {
+        }
+        else
+        {
             // Get a proper shared_ptr to this object (increments ref count)
-            try {
+            try
+            {
                 auto self_ptr = shared_from_this();
                 root_parent = std::dynamic_pointer_cast<FP32Tensor>(self_ptr);
-                if (!root_parent) {
+                if (!root_parent)
+                {
                     std::cerr << "[FP32Tensor::create_view] ERROR: Failed to cast shared_from_this to FP32Tensor\n";
                     return nullptr;
                 }
-            } catch (const std::bad_weak_ptr& e) {
+            }
+            catch (const std::bad_weak_ptr &e)
+            {
                 std::cerr << "[FP32Tensor::create_view] ERROR: shared_from_this() failed - object not managed by shared_ptr!\n";
                 std::cerr << "[FP32Tensor::create_view] Exception: " << e.what() << "\n";
                 return nullptr;
             }
         }
-        
+
         std::vector<float> *root_data = is_view_ ? parent_data_ptr_ : &host_data_;
         size_t root_offset = is_view_ ? (view_offset_ + offset) : offset;
 

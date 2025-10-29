@@ -31,6 +31,7 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 compile_commands.json
+**/generated/*
 
 # Debug files
 *.dSYM/

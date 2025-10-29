@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     bsdmainutils \
     strace \
+    ccache \
     # MPI dependencies for hyper-scalability
     openmpi-bin \
     openmpi-common \

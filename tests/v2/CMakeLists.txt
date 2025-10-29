@@ -408,6 +408,144 @@ add_v2_test(V2_Unit_CPUKernels
     MPI_PROCS 1
 )
 
+# Test: GEMM Auto-Tuner Integration
+add_executable(v2_test_gemm_autotuner_integration unit/Test__GemmAutoTunerIntegration.cpp)
+target_link_libraries(v2_test_gemm_autotuner_integration 
+    llaminar2_core 
+    ${OPENBLAS_LIBRARIES}
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GemmAutoTunerIntegration 
+    COMMAND $<TARGET_FILE:v2_test_gemm_autotuner_integration>
+    LABELS "V2;Unit;Kernels;AutoTuning;GEMM;QuantizedTensors"
+    MPI_PROCS 1
+)
+
+# Test: GEMM Tiling Debug (isolate 2-tile column bug)
+add_executable(v2_test_tiling_debug unit/Test__TilingDebug.cpp)
+target_link_libraries(v2_test_tiling_debug 
+    llaminar2_core 
+    ${OPENBLAS_LIBRARIES}
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TilingDebug 
+    COMMAND $<TARGET_FILE:v2_test_tiling_debug>
+    LABELS "V2;Unit;Kernels;GEMM;Tiling;Debug"
+    MPI_PROCS 1
+)
+
+# Test: GEMM Auto-Tuner Correctness (validates all kernel variants)
+add_executable(v2_test_gemm_autotuner_correctness unit/Test__GemmAutoTunerCorrectness.cpp)
+target_link_libraries(v2_test_gemm_autotuner_correctness 
+    llaminar2_core 
+    ${OPENBLAS_LIBRARIES}
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GemmAutoTunerCorrectness 
+    COMMAND $<TARGET_FILE:v2_test_gemm_autotuner_correctness>
+    LABELS "V2;Unit;Kernels;AutoTuning;GEMM;Correctness;AllVariants"
+    MPI_PROCS 1
+)
+
+# Test: GEMM Template Infrastructure (Phase 1 validation)
+add_executable(v2_test_gemm_template_infrastructure unit/Test__GemmTemplateInfrastructure.cpp)
+target_link_libraries(v2_test_gemm_template_infrastructure 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GemmTemplateInfrastructure 
+    COMMAND $<TARGET_FILE:v2_test_gemm_template_infrastructure>
+    LABELS "V2;Unit;Kernels;GEMM;Templates;SimdTraits;MicroKernel"
+    MPI_PROCS 1
+)
+
+# Test: GEMM Macro vs Template (Phase 2 validation - correctness + performance)
+add_executable(v2_test_gemm_macro_vs_template unit/Test__GemmMacroVsTemplate.cpp)
+target_link_libraries(v2_test_gemm_macro_vs_template 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GemmMacroVsTemplate 
+    COMMAND $<TARGET_FILE:v2_test_gemm_macro_vs_template>
+    LABELS "V2;Unit;Kernels;GEMM;Templates;Validation;Correctness;Performance"
+    MPI_PROCS 1
+)
+
+# Test: MicroKernel Adapter Packing (cache-blocked buffer management)
+add_executable(v2_test_microkernel_adapter_packing unit/Test__MicroKernelAdapter_Packing.cpp)
+target_link_libraries(v2_test_microkernel_adapter_packing 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MicroKernelAdapterPacking
+    COMMAND $<TARGET_FILE:v2_test_microkernel_adapter_packing>
+    LABELS "V2;Unit;Kernels;MicroKernel;CacheBlocking;Packing;BufferManagement"
+    MPI_PROCS 1
+)
+
+# Test: MicroKernel Padding (unit test for required buffer size)
+add_executable(v2_test_microkernel_padding unit/Test__MicroKernelPadding.cpp)
+target_link_libraries(v2_test_microkernel_padding 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MicroKernelPadding
+    COMMAND $<TARGET_FILE:v2_test_microkernel_padding>
+    LABELS "V2;Unit;Kernels;MicroKernel;Padding;BufferManagement;SIMD;BoundsChecking"
+    MPI_PROCS 1
+)
+
+# Test: Micro-Kernel Write Bounds Verification
+add_executable(v2_test_microkernel_bounds unit/Test__MicroKernelBounds.cpp)
+target_link_libraries(v2_test_microkernel_bounds 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MicroKernelBounds
+    COMMAND $<TARGET_FILE:v2_test_microkernel_bounds>
+    LABELS "V2;Unit;Kernels;MicroKernel;BoundsChecking;WriteVerification"
+    MPI_PROCS 1
+)
+
+# Test: Micro-Kernel Mathematical Correctness
+# Validates numerical correctness against reference implementations (naive GEMM, OpenBLAS)
+# Tests: identity, zero, diagonal, random matrices, edge cases, all tile variants
+add_executable(v2_test_microkernel_correctness unit/Test__MicroKernelCorrectness.cpp)
+target_link_libraries(v2_test_microkernel_correctness 
+    llaminar2_core 
+    ${OPENBLAS_LIBRARIES}
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MicroKernelCorrectness
+    COMMAND $<TARGET_FILE:v2_test_microkernel_correctness>
+    LABELS "V2;Unit;Kernels;MicroKernel;GEMM;Correctness;NumericalAccuracy;Parity"
+    MPI_PROCS 1
+)
+
+# Test: GEMM Debug (minimal test to debug kernel issues)
+# NOTE: Commented out - Test__GemmDebug.cpp not found
+# add_executable(v2_test_gemm_debug unit/Test__GemmDebug.cpp)
+# target_link_libraries(v2_test_gemm_debug 
+#     llaminar2_core 
+#     ${OPENBLAS_LIBRARIES}
+#     GTest::gtest
+#     GTest::gtest_main
+# )
+# add_v2_test(V2_Unit_GemmDebug 
+#     COMMAND $<TARGET_FILE:v2_test_gemm_debug>
+#     LABELS "V2;Unit;Kernels;GEMM;Debug"
+#     MPI_PROCS 1
+# )
+
 # Test: MPI Tensor-Parallel Correctness (Phase 3a)
 add_executable(v2_test_mpi_tensor_parallel_correctness Test__MPITensorParallelCorrectness.cpp)
 target_link_libraries(v2_test_mpi_tensor_parallel_correctness 
@@ -530,6 +668,20 @@ add_v2_test(V2_Integration_BatchedAttention
     COMMAND $<TARGET_FILE:v2_test_batched_attention>
     MPI_PROCS 1
     LABELS "V2;Integration;Batching;Attention;CausalMasking;PaddingMasking;GQA"
+)
+
+# Test: MicroKernel AutoTuner Integration (October 2025)
+add_executable(v2_test_microkernel_autotuner_integration 
+    integration/test_microkernel_autotuner_integration.cpp)
+target_link_libraries(v2_test_microkernel_autotuner_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_MicroKernelAutoTuner
+    COMMAND $<TARGET_FILE:v2_test_microkernel_autotuner_integration>
+    MPI_PROCS 1
+    LABELS "V2;Integration;MicroKernel;AutoTuner;GEMM;Performance"
 )
 
 # Placeholder for integration test executables (to be added)
@@ -674,11 +826,8 @@ function(add_v2_perf_test TEST_NAME)
     endif()
     
     # Create the test with mpirun wrapper
-    # Use full path to executable so it works regardless of working directory
-    list(GET ARG_COMMAND 0 EXECUTABLE_NAME)
-    set(EXECUTABLE_PATH "${CMAKE_BINARY_DIR}/performance/${EXECUTABLE_NAME}")
-    list(REMOVE_AT ARG_COMMAND 0)
-    add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${EXECUTABLE_PATH} ${ARG_COMMAND})
+    # ARG_COMMAND already contains the full executable path (from $<TARGET_FILE:...>)
+    add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${ARG_COMMAND})
     
     # Set environment variables for optimal performance (from run_benchmark.sh)
     # Working directory: project root so model paths work correctly
@@ -710,6 +859,46 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM
     COMMAND $<TARGET_FILE:v2_perf_iq4nl_gemm>
     LABELS "V2;Performance;GEMM;IQ4_NL;Quantization;Throughput"
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
+)
+
+# Performance Test: 64×32 Tile Size Comparison
+# Compares V1's optimal 64×32 tile against auto-selected tiles for 1024 tokens
+add_executable(v2_perf_tile64x32_comparison performance/Perf__Tile64x32Comparison.cpp)
+target_link_libraries(v2_perf_tile64x32_comparison 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_tile64x32_comparison PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Tile64x32Comparison
+    COMMAND $<TARGET_FILE:v2_perf_tile64x32_comparison>
+    LABELS "V2;Performance;GEMM;TileSizeOptimization;AutoTuning"
+    MPI_PROCS 1  # Single rank benchmark
+)
+
+# Performance Test: GEMM Tile Size Scaling (Phase 4)
+# Benchmarks all tile sizes (4, 8, 16, 32) across matrix dimensions
+# Validates larger tiles provide speedup for appropriate problem sizes
+add_executable(v2_perf_gemm_tile_scaling 
+    performance/Perf__GemmTileSizeScaling.cpp
+    e2e/gtest_mpi_main.cpp  # MPI-aware GTest main
+)
+target_link_libraries(v2_perf_gemm_tile_scaling 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_gemm_tile_scaling PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_GemmTileScaling
+    COMMAND $<TARGET_FILE:v2_perf_gemm_tile_scaling>
+    LABELS "V2;Performance;GEMM;Templates;TileSize;Scaling;Phase4"
+    MPI_PROCS 2  # Use 2 ranks for consistency
 )
 
 # Performance Test: Qwen2 E2E Pipeline Throughput
@@ -774,35 +963,31 @@ add_v2_perf_test(V2_Perf_IQ4NL_TileSweep
     MPI_PROCS 2
 )
 
-# Perf: L1 cache optimization comparison (Original vs L1-Opt)
-add_executable(v2_perf_l1_opt_comparison performance/Perf__L1OptimizationComparison.cpp)
-target_link_libraries(v2_perf_l1_opt_comparison 
+# Perf: Auto-tuner validation (verifies optimal kernel selection)
+add_executable(v2_perf_gemm_autotuner performance/Perf__GemmAutoTuner.cpp)
+target_link_libraries(v2_perf_gemm_autotuner 
     llaminar2_core 
     GTest::gtest
-    MPI::MPI_CXX
 )
-set_target_properties(v2_perf_l1_opt_comparison PROPERTIES
+set_target_properties(v2_perf_gemm_autotuner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
 )
-add_v2_perf_test(V2_Perf_L1OptComparison
-    COMMAND $<TARGET_FILE:v2_perf_l1_opt_comparison>
-    LABELS "V2;Performance;TensorOperations;Quantization;IQ4_NL;GEMM;CacheOptimization;L1Cache"
-    MPI_PROCS 2
+add_v2_perf_test(V2_Perf_GemmAutoTuner
+    COMMAND $<TARGET_FILE:v2_perf_gemm_autotuner>
+    LABELS "V2;Performance;Kernels;GEMM;AutoTuning;KernelSelection;TileSizeSweep"
+    MPI_PROCS 1
 )
 
-# Perf: Hybrid NC strategy validation (small vs large batch)
-add_executable(v2_perf_hybrid_nc_strategy performance/Perf__HybridNCStrategy.cpp)
-target_link_libraries(v2_perf_hybrid_nc_strategy 
+# Perf: Micro-Kernel Scaling (2 MPI ranks for multi-socket performance)
+add_executable(v2_perf_microkernel_scaling performance/Perf__MicroKernelScaling.cpp)
+target_link_libraries(v2_perf_microkernel_scaling 
     llaminar2_core 
     GTest::gtest
     MPI::MPI_CXX
 )
-set_target_properties(v2_perf_hybrid_nc_strategy PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-add_v2_perf_test(V2_Perf_HybridNCStrategy
-    COMMAND $<TARGET_FILE:v2_perf_hybrid_nc_strategy>
-    LABELS "V2;Performance;TensorOperations;Quantization;IQ4_NL;GEMM;CacheOptimization;AdaptiveStrategy"
+add_v2_perf_test(V2_Perf_MicroKernelScaling
+    COMMAND $<TARGET_FILE:v2_perf_microkernel_scaling>
+    LABELS "V2;Performance;Kernels;GEMM;MicroKernel;MultiSocket;MPIScaling;Throughput"
     MPI_PROCS 2
 )
 

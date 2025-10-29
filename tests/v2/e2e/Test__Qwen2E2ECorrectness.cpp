@@ -269,7 +269,7 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
     // Single-rank execution (rank 0 only)
     std::unique_ptr<Qwen2Pipeline> pipeline_single;
     std::vector<float> logits_single;
-    
+
     if (rank_ == 0)
     {
         pipeline_single = std::make_unique<Qwen2Pipeline>(
@@ -281,7 +281,7 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
         const auto &model = model_ctx_single_->model();
         size_t vocab_size = model.vocab_size;
         size_t seq_len = tokens.size();
-        
+
         logits_single.resize(seq_len * vocab_size);
         const float *logits_ptr_single = pipeline_single->getLogits(0);
         ASSERT_NE(logits_ptr_single, nullptr);
@@ -840,8 +840,8 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
 
     // Test configuration: 2 sequences with different lengths
     std::vector<std::vector<int>> batch = {
-        {151644, 9906, 1374, 374},     // Sequence 0: 4 tokens
-        {151644, 9906}                   // Sequence 1: 2 tokens
+        {151644, 9906, 1374, 374}, // Sequence 0: 4 tokens
+        {151644, 9906}             // Sequence 1: 2 tokens
     };
 
     const int batch_size = static_cast<int>(batch.size());

@@ -7,7 +7,7 @@
 #include "Tensors.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
-#include "../kernels/cpu/QuantizedGemm.h"
+#include "../kernels/cpu/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -41,7 +41,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ4_XSTensor::createGemm()
     {
-        return std::make_unique<QuantizedGemmKernel>(this);
+        return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
     void IQ4_XSTensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
@@ -129,9 +129,6 @@ namespace llaminar2
     {
         throw std::runtime_error("IQ4_XSTensor: RMSNorm not supported");
     }
-
-
-
 
     bool IQ4_XSTensor::copyFrom(const TensorBase *src)
     {

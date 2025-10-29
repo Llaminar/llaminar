@@ -6,7 +6,7 @@
 
 #include "Tensors.h"
 #include "Tensors.h"
-#include "../kernels/cpu/QuantizedGemm.h"
+#include "../kernels/cpu/GemmAutoTuner.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
 #include <cstring>
@@ -43,7 +43,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q4_0Tensor::createGemm()
     {
-        return std::make_unique<QuantizedGemmKernel>(this);
+        return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
     void Q4_0Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const

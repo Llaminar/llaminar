@@ -1,0 +1,6 @@
+IQ4_NL GEMM Tile Size Comparison - LargeBatch_Prefill (512x896x896)
+====================================================================
+
+Testing 64×32...
+║   Time per iter:    4.09    ± 0.04  ms (CV: 0.9 %)            ║
+║   Throughput:       201.15  ± 1.85  GFLOPS                      ║

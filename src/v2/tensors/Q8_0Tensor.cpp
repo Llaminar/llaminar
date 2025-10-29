@@ -6,7 +6,7 @@
 
 #include "Tensors.h"
 #include "Tensors.h"
-#include "../kernels/cpu/QuantizedGemm.h"
+#include "../kernels/cpu/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -112,7 +112,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
         // Use generic QuantizedGemmKernel with IBlockDecoder interface
-        return std::make_unique<QuantizedGemmKernel>(this);
+        return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
     void Q8_0Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
@@ -195,9 +195,6 @@ namespace llaminar2
         }
     }
 #endif
-
-
-
 
     bool Q8_0Tensor::copyFrom(const TensorBase *src)
     {

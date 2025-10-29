@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <omp.h>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -33,7 +34,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
-#include "kernels/cpu/QuantizedGemm.h"
+// Note: No longer needs QuantizedGemm.h - uses ITensorGemm interface via createGemm()
 
 using namespace llaminar2;
 
@@ -82,6 +83,16 @@ protected:
         // Initialize MPI context
         MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
         MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
+
+        // CRITICAL: Verify OpenMP is configured with multiple threads
+        int max_threads = omp_get_max_threads();
+        if (rank_ == 0)
+        {
+            std::cout << "[Performance Test] OpenMP max threads: " << max_threads << std::endl;
+        }
+        ASSERT_GT(max_threads, 1)
+            << "OpenMP not configured! Expected OMP_NUM_THREADS > 1, got " << max_threads
+            << ". Performance tests require multi-threaded execution.";
 
         // Load model to get real IQ4_NL weights
         std::string model_path = "models/qwen2.5-0.5b-instruct-iq4_nl.gguf";

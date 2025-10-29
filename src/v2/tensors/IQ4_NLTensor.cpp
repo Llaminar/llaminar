@@ -13,7 +13,7 @@
 #include "../utils/DebugEnv.h"
 #include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/QuantizedGemm.h"
+#include "../kernels/cpu/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -108,8 +108,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ4_NLTensor::createGemm()
     {
-        // Return generic QuantizedGemmKernel using this tensor's IBlockDecoder interface
-        return std::make_unique<QuantizedGemmKernel>(this);
+        // Use factory to create auto-tuned kernel
+        return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
     std::unique_ptr<ITensorRoPE> IQ4_NLTensor::createRoPE()

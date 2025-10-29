@@ -6,7 +6,7 @@
 
 #include "Tensors.h"
 #include "Tensors.h"
-#include "../kernels/cpu/QuantizedGemm.h"
+#include "../kernels/cpu/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -37,7 +37,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q3_KTensor::createGemm()
     {
-        return std::make_unique<QuantizedGemmKernel>(this);
+        return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
     void Q3_KTensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
@@ -163,9 +163,6 @@ namespace llaminar2
     {
         throw std::runtime_error("Q3_KTensor: RMSNorm not supported");
     }
-
-
-
 
     bool Q3_KTensor::copyFrom(const TensorBase *src)
     {

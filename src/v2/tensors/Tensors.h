@@ -13,6 +13,7 @@
 #pragma once
 
 #include "TensorKernels.h"
+#include "FP16Utils.h"
 #include <vector>
 #include <memory>
 #include <cstddef>
@@ -341,7 +342,6 @@ namespace llaminar2
         std::vector<size_t> shape_;
         int device_idx_; // -1 = host, ≥0 = device index
 
-        
         // Ownership model:
         // - If is_view_ == false: owns host_data_
         // - If is_view_ == true: parent_data_ptr_ points to parent's host_data_
@@ -350,8 +350,8 @@ namespace llaminar2
         std::vector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
         size_t view_offset_;                  // Offset into parent data (only used when is_view_)
         std::shared_ptr<FP32Tensor> parent_;  // Keep parent alive (only used when is_view_)
- // Always allocated
-        void *device_data_;            // Allocated if device_idx ≥ 0
+                                              // Always allocated
+        void *device_data_;                   // Allocated if device_idx ≥ 0
 
         bool host_dirty_;   // Host modified, needs upload
         bool device_dirty_; // Device modified, needs download
@@ -401,7 +401,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -464,7 +465,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -527,7 +529,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -641,7 +644,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -707,7 +711,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -768,7 +773,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -826,7 +832,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -882,7 +889,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -934,7 +942,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -986,7 +995,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1038,7 +1048,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1090,7 +1101,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1144,7 +1156,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1196,7 +1209,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1248,7 +1262,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1300,7 +1315,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1352,7 +1368,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1404,7 +1421,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1456,7 +1474,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
@@ -1508,7 +1527,8 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override
         {
-            (void)new_shape; (void)offset;
+            (void)new_shape;
+            (void)offset;
             return nullptr; // TODO: Implement views if needed
         }
 
