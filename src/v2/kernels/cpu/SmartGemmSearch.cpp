@@ -99,7 +99,7 @@ namespace llaminar
                 // Strategy: Include ALL variants that the CPU can execute
                 // Don't artificially prefer AVX512 - let benchmarking decide!
                 // (AVX2 often beats AVX512 on small matrices due to frequency scaling)
-                
+
                 for (auto *variant : variants)
                 {
                     const char *name = variant->name();
@@ -142,14 +142,14 @@ namespace llaminar
                 {
                     // Base analytical score (cache efficiency, unrolling, prefetch)
                     double base_score = computeAnalyticalScore(variant->config(), m, n, k);
-                    
+
                     // ISA preference score (AVX2 vs AVX512 based on problem size)
                     double isa_score = scoreISAPreference(variant->name(), m, n, k);
-                    
+
                     // Combined score: 70% base (cache/unroll/prefetch) + 30% ISA preference
                     // Prioritize good tile/cache characteristics over ISA to avoid selecting bad tiles
                     double total_score = 0.70 * base_score + 0.30 * isa_score;
-                    
+
                     scored.push_back({total_score, variant});
                 }
 
@@ -390,33 +390,45 @@ namespace llaminar
                 // ISA preference depends on problem size
                 // Small matrices: AVX2 often wins due to lower frequency scaling penalty
                 // Large matrices: AVX512 wins due to more SIMD parallelism
-                
+
                 size_t problem_size = static_cast<size_t>(m) * n * k;
                 bool is_avx512 = isAVX512(variant_name);
                 bool is_avx2 = isAVX2(variant_name);
-                
+
                 // Single token (1×896×896 = 802K): Very strong AVX2 preference
-                if (m <= 8 || problem_size < 2000000) {
-                    if (is_avx2) return 1.0;
-                    if (is_avx512) return 0.40;  // 60% penalty - must be strong to override tile optimization
+                if (m <= 8 || problem_size < 2000000)
+                {
+                    if (is_avx2)
+                        return 1.0;
+                    if (is_avx512)
+                        return 0.40; // 60% penalty - must be strong to override tile optimization
                     return 0.3;
                 }
                 // Small batch 32 tokens (32×896×896 = 25M): Moderate AVX2 preference
-                else if (problem_size < 50000000) {
-                    if (is_avx2) return 1.0;
-                    if (is_avx512) return 0.75;  // 25% penalty
+                else if (problem_size < 50000000)
+                {
+                    if (is_avx2)
+                        return 1.0;
+                    if (is_avx512)
+                        return 0.75; // 25% penalty
                     return 0.3;
                 }
                 // Medium batch 128 tokens (128×896×896 = 102M): Slight AVX2 preference
-                else if (problem_size < 200000000) {
-                    if (is_avx2) return 1.0;
-                    if (is_avx512) return 0.92;  // 8% penalty
+                else if (problem_size < 200000000)
+                {
+                    if (is_avx2)
+                        return 1.0;
+                    if (is_avx512)
+                        return 0.92; // 8% penalty
                     return 0.3;
                 }
                 // Large batch 512+ tokens (>200M): Neutral
-                else {
-                    if (is_avx512) return 1.0;
-                    if (is_avx2) return 1.0;  // Completely neutral for large batches
+                else
+                {
+                    if (is_avx512)
+                        return 1.0;
+                    if (is_avx2)
+                        return 1.0; // Completely neutral for large batches
                     return 0.3;
                 }
             }

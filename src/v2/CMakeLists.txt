@@ -57,6 +57,28 @@ endif()
 # Include generated microkernel instantiations
 include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake)
 
+# =============================================================================
+# llama.cpp Integration (for dequant parity testing)
+# =============================================================================
+message(STATUS "V2: Configuring llama.cpp submodule for dequant reference...")
+set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable llama.cpp tests" FORCE)
+set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Disable llama.cpp CLI tools" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Disable llama.cpp examples" FORCE)
+set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Disable llama.cpp server" FORCE)
+set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Disable llama.cpp common utils" FORCE)
+set(LLAMA_CURL OFF CACHE BOOL "Disable llama.cpp libcurl dependency" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "Disable GGML CUDA backend" FORCE)
+set(GGML_METAL OFF CACHE BOOL "Disable GGML Metal backend" FORCE)
+set(GGML_SYCL OFF CACHE BOOL "Disable GGML SYCL backend" FORCE)
+set(GGML_RPC OFF CACHE BOOL "Disable GGML RPC backend" FORCE)
+set(GGML_NATIVE ON CACHE BOOL "Enable native CPU optimizations for GGML" FORCE)
+
+# Only add llama.cpp if not already added by parent project
+if(NOT TARGET ggml)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp 
+                     ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp)
+endif()
+
 # V2 Core Library
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
@@ -68,16 +90,19 @@ add_library(llaminar2_core STATIC
     pipelines/PipelineBase.cpp
     pipelines/PipelineFactory.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
+    tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
     tensors/TensorFactory.cpp
     tensors/KVCache.cpp
     tensors/IQ4_NLTensor.cpp
-    # Simple quantization formats (Q8_0, Q4_0, Q4_1)
+    # Simple quantization formats (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1)
     tensors/Q8_0Tensor.cpp
     tensors/Q4_0Tensor.cpp
     tensors/Q4_1Tensor.cpp
+    tensors/Q5_0Tensor.cpp
+    tensors/Q5_1Tensor.cpp
     # K-quant formats (Q6_K, Q2_K, Q5_K, Q3_K, Q4_K, Q8_K)
     tensors/Q6_KTensor.cpp
     tensors/Q2_KTensor.cpp

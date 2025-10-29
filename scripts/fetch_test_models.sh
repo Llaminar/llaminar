@@ -18,12 +18,21 @@ STABLE_MODELS=(
 # Large 7B models for IQ format testing (downloaded separately with specific URLs)
 # These require LLAMINAR_FETCH_7B_IQ_MODELS=1 to enable due to size (~1-3GB each)
 LARGE_7B_IQ_MODELS=(
+  # Legacy 0.5B models (RichardErkhov)
   "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ3_M.gguf"
   "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ3_XS.gguf"
   "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ3_S.gguf"
   "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ4_NL.gguf"
   "https://huggingface.co/RichardErkhov/unsloth_-_Qwen2-0.5B-gguf/resolve/main/Qwen2-0.5B.IQ4_XS.gguf"
   "https://huggingface.co/unsloth/Qwen2.5-Omni-7B-GGUF/resolve/main/Qwen2.5-Omni-7B-BF16.gguf"
+  
+  # Qwen2.5-7B models (bartowski) - for missing format coverage
+  "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q2_K.gguf"      # Q2_K format
+  "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q3_K_M.gguf"    # Q3_K format
+  "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf"      # Q4_1 format (mislabeled upstream)
+  "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-IQ4_XS.gguf"    # IQ4_XS format
+  "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-IQ3_XS.gguf"    # IQ3_XXS, IQ3_S formats
+  "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-IQ2_M.gguf"     # IQ2_S format
 )
 
 # Experimental / legacy variants that produced 404s during CI runs.

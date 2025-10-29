@@ -5,6 +5,7 @@
  */
 
 #include "PipelineFactory.h"
+#include "../utils/Logger.h"
 #include <iostream>
 
 namespace llaminar2
@@ -20,21 +21,19 @@ namespace llaminar2
     {
         if (!creator)
         {
-            std::cerr << "[PipelineFactory] Warning: Attempted to register null creator for architecture '"
-                      << architecture << "'" << std::endl;
+            LOG_ERROR("[PipelineFactory] Warning: Attempted to register null creator for architecture '" << architecture << "'");
             return;
         }
 
         auto it = creators_.find(architecture);
         if (it != creators_.end())
         {
-            std::cerr << "[PipelineFactory] Warning: Creator already registered for architecture '"
-                      << architecture << "' (ignoring duplicate)" << std::endl;
+            LOG_ERROR("[PipelineFactory] Warning: Creator already registered for architecture '" << architecture << "' (ignoring duplicate)");
             return;
         }
 
         creators_[architecture] = creator;
-        std::cout << "[PipelineFactory] Registered pipeline for architecture '" << architecture << "'" << std::endl;
+        LOG_INFO("[PipelineFactory] Registered pipeline for architecture '" << architecture << "'");
     }
 
     std::unique_ptr<PipelineBase> PipelineFactory::create(
@@ -47,18 +46,17 @@ namespace llaminar2
         auto it = creators_.find(architecture);
         if (it == creators_.end())
         {
-            std::cerr << "[PipelineFactory] Error: No pipeline registered for architecture '"
-                      << architecture << "'" << std::endl;
-            std::cerr << "[PipelineFactory] Supported architectures: ";
+            LOG_ERROR("[PipelineFactory] Error: No pipeline registered for architecture '" << architecture << "'");
+            std::string supported_list = "[PipelineFactory] Supported architectures: ";
             bool first = true;
             for (const auto &kv : creators_)
             {
                 if (!first)
-                    std::cerr << ", ";
-                std::cerr << kv.first;
+                    supported_list += ", ";
+                supported_list += kv.first;
                 first = false;
             }
-            std::cerr << std::endl;
+            LOG_ERROR(supported_list);
             return nullptr;
         }
 

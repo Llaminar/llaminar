@@ -7,6 +7,7 @@
 #include "Tensors.h"
 #include "Tensors.h"
 #include "../kernels/cpu/GemmAutoTuner.h"
+#include "../utils/Logger.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -16,12 +17,18 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+#include "SIMDHelpers.h"
+#include "FP16Utils.h"
+#include <algorithm>
+#include <cmath>
 #endif
 
 namespace llaminar2
 {
+
     Q8_0Tensor::Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), raw_data_(raw_data), device_idx_(-1), device_blocks_(nullptr)
+        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr)
     {
         if (shape.empty())
         {
@@ -47,9 +54,97 @@ namespace llaminar2
         }
     }
 
+    // Private view constructor
+    Q8_0Tensor::Q8_0Tensor(const std::vector<size_t> &shape,
+                           const uint8_t *parent_raw_data,
+                           size_t byte_offset,
+                           std::shared_ptr<TensorBase> parent)
+        : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
+          view_byte_offset_(byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr)
+    {
+        // Views don't allocate raw_data_, they borrow via raw_data_ptr_
+    }
+
     Q8_0Tensor::~Q8_0Tensor()
     {
         // Destructor
+    }
+
+    std::shared_ptr<TensorBase> Q8_0Tensor::create_view(
+        const std::vector<size_t> &new_shape,
+        size_t offset)
+    {
+        // Validate 2D shape
+        if (new_shape.size() != 2)
+        {
+            LOG_ERROR("[Q8_0Tensor::create_view] ERROR: View must be 2D (got "
+                      << new_shape.size() << "D)");
+            return nullptr;
+        }
+
+        // Validate K dimension matches (row-slice only)
+        if (new_shape[1] != shape_[1])
+        {
+            LOG_ERROR("[Q8_0Tensor::create_view] ERROR: View must preserve K dimension\n"
+                      << "  Parent K: " << shape_[1] << ", View K: " << new_shape[1]);
+            return nullptr;
+        }
+
+        size_t K = shape_[1];
+
+        // Validate offset is row-aligned
+        if (offset % K != 0)
+        {
+            LOG_ERROR("[Q8_0Tensor::create_view] ERROR: Offset must be row-aligned (multiple of K="
+                      << K << ")\n"
+                      << "  Got offset: " << offset);
+            return nullptr;
+        }
+
+        // Validate bounds
+        size_t start_row = offset / K;
+        size_t view_rows = new_shape[0];
+        if (start_row + view_rows > shape_[0])
+        {
+            LOG_ERROR("[Q8_0Tensor::create_view] ERROR: View exceeds parent bounds\n"
+                      << "  Parent rows: " << shape_[0] << ", Start row: " << start_row
+                      << ", View rows: " << view_rows);
+            return nullptr;
+        }
+
+        // Calculate byte offset
+        size_t blocks_per_row = (K + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
+        size_t block_offset = start_row * blocks_per_row;
+        size_t byte_offset = block_offset * sizeof(Q8_0Block);
+
+        // Determine root parent
+        std::shared_ptr<TensorBase> root_parent;
+        const uint8_t *root_data_ptr;
+        size_t root_byte_offset;
+
+        if (is_view_)
+        {
+            root_parent = parent_;
+            root_data_ptr = raw_data_ptr_;
+            root_byte_offset = view_byte_offset_ + byte_offset;
+        }
+        else
+        {
+            try
+            {
+                root_parent = shared_from_this();
+            }
+            catch (const std::bad_weak_ptr &e)
+            {
+                LOG_ERROR("[Q8_0Tensor::create_view] ERROR: shared_from_this() failed");
+                return nullptr;
+            }
+            root_data_ptr = raw_data_.data();
+            root_byte_offset = byte_offset;
+        }
+
+        return std::shared_ptr<Q8_0Tensor>(new Q8_0Tensor(
+            new_shape, root_data_ptr, root_byte_offset, root_parent));
     }
 
     bool Q8_0Tensor::set_device(int device_idx)
@@ -68,7 +163,8 @@ namespace llaminar2
             dequant_cache_.resize(total_elements);
 
             // Decode all blocks (parallelized for large tensors)
-            const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(raw_data_.data());
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
             size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
 
 #pragma omp parallel for collapse(2) if (total_elements > 10000)
@@ -115,19 +211,14 @@ namespace llaminar2
         return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
-    void Q8_0Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
+    void Q8_0Tensor::decodeBlockScalar(const Q8_0Block &block, float *output)
     {
-        const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
-        const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(raw_data_.data());
-        const Q8_0Block &block = blocks[row_idx * blocks_per_row + k_block_offset];
-        decodeBlock(block, output);
-    }
-
-    const void *Q8_0Tensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
-    {
-        const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
-        const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(raw_data_.data());
-        return &blocks[row_idx * blocks_per_row + k_block_offset];
+        // Scalar implementation for Q8_0: simple scale * int8 value
+        const float scale = fp16_to_fp32(block.d);
+        for (size_t i = 0; i < Q8_0Block::BLOCK_SIZE; ++i)
+        {
+            output[i] = scale * static_cast<float>(block.qs[i]);
+        }
     }
 
     void Q8_0Tensor::decodeBlock(const Q8_0Block &block, float *output)
@@ -137,12 +228,7 @@ namespace llaminar2
 #elif defined(__AVX2__)
         decodeBlockAVX2(block, output);
 #else
-        // Scalar fallback
-        const float scale = fp16_to_fp32(block.d);
-        for (size_t i = 0; i < Q8_0Block::BLOCK_SIZE; ++i)
-        {
-            output[i] = scale * static_cast<float>(block.qs[i]);
-        }
+        decodeBlockScalar(block, output);
 #endif
     }
 
@@ -200,8 +286,123 @@ namespace llaminar2
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
-        std::cerr << "[Q8_0Tensor::copyFrom] Not implemented\n";
+        LOG_ERROR("[Q8_0Tensor::copyFrom] Not implemented");
         return false;
+    }
+
+    // ===== Format Conversion Methods (TensorBase interface) =====
+
+    void Q8_0Tensor::to_bf16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to BF16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = simd::fp32_to_bf16(temp_fp32[i]);
+        }
+    }
+
+    void Q8_0Tensor::to_fp16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to FP16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = fp32_to_fp16(temp_fp32[i]);
+        }
+    }
+
+    void Q8_0Tensor::to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size) const
+    {
+        // Decode to FP32 first, then quantize to int8
+        const size_t total_elements = element_count();
+        std::vector<float> temp_fp32(total_elements);
+        to_fp32(temp_fp32.data());
+
+        const size_t num_blocks = (total_elements + block_size - 1) / block_size;
+
+#pragma omp parallel for
+        for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
+        {
+            const size_t offset = block_idx * block_size;
+            const size_t count = std::min(block_size, total_elements - offset);
+
+            // Find max absolute value in block
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(temp_fp32[offset + i]));
+            }
+
+            // Compute scale factor (avoid division by zero)
+            const float scale = (max_abs > 1e-10f) ? (127.0f / max_abs) : 0.0f;
+            dst_scales[block_idx] = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+            // Quantize block to int8 with rounding
+            for (size_t i = 0; i < count; ++i)
+            {
+                const float val = temp_fp32[offset + i] * scale;
+                const float clamped = std::max(-127.0f, std::min(127.0f, val));
+                dst_int8[offset + i] = static_cast<int8_t>(std::round(clamped));
+            }
+
+            // Zero-fill partial block tail (if any)
+            for (size_t i = count; i < block_size; ++i)
+            {
+                dst_int8[offset + i] = 0;
+            }
+        }
+    }
+
+    void Q8_0Tensor::to_fp32_row(size_t row_idx, float *buffer) const
+    {
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            throw std::runtime_error("to_fp32_row() requires 2D tensor");
+        }
+        if (row_idx >= shp[0])
+        {
+            throw std::out_of_range("Row index out of bounds");
+        }
+
+        const size_t cols = shp[1];
+        const size_t blocks_per_row = (cols + block_size() - 1) / block_size();
+
+        for (size_t kb = 0; kb < blocks_per_row; ++kb)
+        {
+            const size_t offset = kb * block_size();
+            const size_t count = std::min(block_size(), cols - offset);
+
+            float temp[256]; // Max block size
+            decode_block_at(row_idx, kb, temp);
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                buffer[offset + i] = temp[i];
+            }
+        }
+    }
+
+    void Q8_0Tensor::to_fp32_span(size_t offset, size_t count, float *buffer) const
+    {
+        if (offset + count > element_count())
+        {
+            throw std::out_of_range("Span exceeds tensor bounds");
+        }
+
+        // Decode full tensor (inefficient but simple)
+        std::vector<float> temp_fp32(element_count());
+        to_fp32(temp_fp32.data());
+        std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
 
 } // namespace llaminar2

@@ -131,6 +131,7 @@ namespace llaminar2
         GGUFTensorType type;
         uint64_t offset;     // Byte offset from data_offset (NOT file start!)
         uint64_t size_bytes; // Total size in bytes
+        uint16_t split_idx;  // Index of split file containing this tensor (0 = main file)
 
         // Helper methods
         bool isQuantized() const;
@@ -163,6 +164,12 @@ namespace llaminar2
         std::vector<GGUFTensorInfo> tensors;
 
         uint64_t data_offset = 0; // Byte offset to tensor data region
+
+        // Multi-part GGUF support
+        uint16_t split_count = 1;                 // Number of split files (1 = no split)
+        uint16_t split_no = 0;                    // This file's split index (0-based)
+        std::vector<std::string> split_paths;     // Paths to all split files
+        std::vector<uint64_t> split_data_offsets; // Data offset for each split
 
         // Helper methods
         bool hasMetadata(const std::string &key) const;
@@ -231,6 +238,11 @@ namespace llaminar2
         bool parseTensorInfo();
         void extractModelMetadata();
 
+        // Multi-part GGUF helpers
+        bool loadSplitFiles();
+        std::string generateSplitPath(const std::string &base_path, uint16_t split_no, uint16_t split_count);
+        bool parseSplitPath(const std::string &split_path, std::string &prefix, uint16_t &split_no, uint16_t &split_count);
+
         // Low-level readers
         template <typename T>
         bool readValue(T &value);
@@ -241,6 +253,7 @@ namespace llaminar2
         bool loaded_ = false;
         std::string file_path_;
         std::ifstream file_stream_;
+        std::vector<std::ifstream> split_streams_; // Additional file streams for multi-part GGUF
         GGUFModel model_;
     };
 

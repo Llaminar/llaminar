@@ -45,8 +45,8 @@ namespace llaminar2
 
         if (mpi_ctx_)
         {
-            std::cout << "[PipelineBase] MPI context provided, rank "
-                      << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size() << "\n";
+            LOG_INFO("[PipelineBase] MPI context provided, rank "
+                     << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size());
         }
 
         if (device_idx_ >= 0)
@@ -62,8 +62,7 @@ namespace llaminar2
         // Create default placement map if not provided (all weights on device_idx_)
         if (!placement_map_)
         {
-            std::cout << "[PipelineBase] No placement map provided, creating default (all on device "
-                      << device_idx_ << ")\n";
+            LOG_INFO("[PipelineBase] No placement map provided, creating default (all on device " << device_idx_ << ")");
             placement_map_ = std::make_shared<WeightPlacementMap>(device_idx_);
         }
 
@@ -109,8 +108,7 @@ namespace llaminar2
 
         if (n_heads % n_kv_heads != 0)
         {
-            std::cerr << "[PipelineBase] attention_gqa: n_heads (" << n_heads
-                      << ") must be divisible by n_kv_heads (" << n_kv_heads << ")\n";
+            LOG_ERROR("[PipelineBase] attention_gqa: n_heads (" << n_heads << ") must be divisible by n_kv_heads (" << n_kv_heads << ")");
             return false;
         }
 
@@ -630,8 +628,8 @@ namespace llaminar2
         }
 
         // Transfer required
-        std::cout << "[PipelineBase] [" << context << "] Transferring activation from device "
-                  << current_device << " to device " << target_device << "\n";
+        LOG_DEBUG("[PipelineBase] [" << context << "] Transferring activation from device "
+                                     << current_device << " to device " << target_device);
 
         // Get target device's buffers
         ActivationBuffers &target_buffers = const_cast<PipelineBase *>(this)->getBuffersForDevice(target_device);
@@ -654,8 +652,7 @@ namespace llaminar2
         // Validate staging buffer size
         if (staging_count < activation_count)
         {
-            std::cerr << "[PipelineBase] Staging buffer too small: " << staging_count
-                      << " < " << activation_count << "\n";
+            LOG_ERROR("[PipelineBase] Staging buffer too small: " << staging_count << " < " << activation_count);
             return nullptr;
         }
 

@@ -255,13 +255,13 @@ int main(int argc, char *argv[])
     if (mpi_ctx->rank() == 0)
     {
         const auto &devices = dm.devices();
-        std::cout << "\n=== Llaminar v2 ===\n"
-                  << "Model: " << args.model_path << "\n"
-                  << "Architecture: " << architecture << "\n"
-                  << "Device: " << device_idx << " (" << devices[device_idx].name << ")\n"
-                  << "Strategy: " << args.strategy << "\n"
-                  << "MPI ranks: " << mpi_ctx->world_size() << "\n"
-                  << "\n";
+        LOG_INFO("\n=== Llaminar v2 ===");
+        LOG_INFO("Model: " << args.model_path);
+        LOG_INFO("Architecture: " << architecture);
+        LOG_INFO("Device: " << device_idx << " (" << devices[device_idx].name << ")");
+        LOG_INFO("Strategy: " << args.strategy);
+        LOG_INFO("MPI ranks: " << mpi_ctx->world_size());
+        LOG_INFO("");
     }
 
     // Create runtime configuration from parsed arguments
@@ -279,15 +279,15 @@ int main(int argc, char *argv[])
         if (mpi_ctx->rank() == 0)
         {
             LOG_ERROR("Error: Failed to create pipeline for architecture: " << architecture);
-            LOG_ERROR("Supported architectures: ");
+            std::string supported_archs = "Supported architectures: ";
             auto supported = PipelineFactory::instance().supportedArchitectures();
             for (size_t i = 0; i < supported.size(); ++i)
             {
-                std::cerr << supported[i];
+                supported_archs += supported[i];
                 if (i + 1 < supported.size())
-                    LOG_ERROR(", ");
+                    supported_archs += ", ";
             }
-            LOG_ERROR("\n");
+            LOG_ERROR(supported_archs);
         }
         MPI_Finalize();
         return 1;

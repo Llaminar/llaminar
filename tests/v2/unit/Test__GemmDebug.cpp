@@ -37,7 +37,7 @@ TEST(GemmDebug, SimpleTest)
 
     // Decode to verify
     std::vector<float> decoded(n * k);
-    tensor->decode_to_fp32(decoded.data());
+    tensor->to_fp32(decoded.data());
 
     std::cout << "Decoded row 0 [0:4]: ";
     for (int i = 0; i < 4; ++i)

@@ -35,6 +35,10 @@ namespace llaminar2
         int iq4_override_m_tile_bf16 = 0; ///< Override M tile size (BF16)
         int iq4_override_n_tile_bf16 = 0; ///< Override N tile size (BF16)
 
+        // SIMD path control for testing (LLAMINAR_DEQUANT_SIMD_PATH)
+        // Values: "auto" (default), "scalar", "avx2", "avx512"
+        std::string simd_path = "auto"; ///< Force specific SIMD path for testing
+
         DequantConfig()
         {
             // Parse environment variables
@@ -66,6 +70,13 @@ namespace llaminar2
             if (gemm_micro_env)
             {
                 iq4_gemm_microkernel = (std::atoi(gemm_micro_env) != 0);
+            }
+
+            // SIMD path control for testing
+            const char *simd_path_env = std::getenv("LLAMINAR_DEQUANT_SIMD_PATH");
+            if (simd_path_env)
+            {
+                simd_path = simd_path_env;
             }
         }
     };

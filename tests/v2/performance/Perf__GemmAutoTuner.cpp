@@ -435,7 +435,7 @@ TEST_F(Perf__GemmAutoTuner, SmallMatrix_SingleToken)
     printResults("Single Token", m, n, k, manual_results, auto_result);
 
     // Validation: Auto-tuner should select a variant within 40% of best performance
-    // 
+    //
     // NOTE: This test has exceptionally high variance (20-40%) due to:
     //   1. AVX512 frequency scaling sensitivity to CPU state (thermal/power)
     //   2. Manual sweep vs auto-tuner running in different system states
@@ -450,22 +450,26 @@ TEST_F(Perf__GemmAutoTuner, SmallMatrix_SingleToken)
     const double selected_time = auto_result.time_ms;
     const double ratio = selected_time / best_time;
     const double tolerance = 1.40; // 40% tolerance due to high variance (increased from 10%)
-    
-    if (ratio <= tolerance) {
+
+    if (ratio <= tolerance)
+    {
         // Test passes - log whether it's faster or slower for info
-        if (ratio < 1.0) {
+        if (ratio < 1.0)
+        {
             double pct_faster = (1.0 - ratio) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_faster << "% faster than manual best" << std::endl;
-        } else {
+        }
+        else
+        {
             double pct_slower = (ratio - 1.0) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_slower << "% slower (within " << ((tolerance - 1.0) * 100) << "% tolerance)" << std::endl;
         }
     }
-    
-    EXPECT_LE(ratio, tolerance) 
-        << "Auto-tuner selection exceeds tolerance: " 
+
+    EXPECT_LE(ratio, tolerance)
+        << "Auto-tuner selection exceeds tolerance: "
         << std::fixed << std::setprecision(1) << ((ratio - 1.0) * 100) << "% slower than best "
         << "(selected: " << auto_result.name << " @ " << selected_time << "ms, "
         << "best: " << manual_results[0].name << " @ " << best_time << "ms)";
@@ -496,21 +500,25 @@ TEST_F(Perf__GemmAutoTuner, SmallBatch_32Tokens)
     const double selected_time = auto_result.time_ms;
     const double ratio = selected_time / best_time;
     const double tolerance = 1.25; // 25% tolerance for this high-variance boundary case
-    
-    if (ratio <= tolerance) {
-        if (ratio < 1.0) {
+
+    if (ratio <= tolerance)
+    {
+        if (ratio < 1.0)
+        {
             double pct_faster = (1.0 - ratio) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_faster << "% faster than manual best" << std::endl;
-        } else {
+        }
+        else
+        {
             double pct_slower = (ratio - 1.0) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_slower << "% slower (within " << ((tolerance - 1.0) * 100) << "% tolerance)" << std::endl;
         }
     }
-    
-    EXPECT_LE(ratio, tolerance) 
-        << "Auto-tuner selection exceeds tolerance: " 
+
+    EXPECT_LE(ratio, tolerance)
+        << "Auto-tuner selection exceeds tolerance: "
         << std::fixed << std::setprecision(1) << ((ratio - 1.0) * 100) << "% slower than best "
         << "(selected: " << auto_result.name << " @ " << selected_time << "ms, "
         << "best: " << manual_results[0].name << " @ " << best_time << "ms)";
@@ -538,21 +546,25 @@ TEST_F(Perf__GemmAutoTuner, MediumBatch_128Tokens)
     const double selected_time = auto_result.time_ms;
     const double ratio = selected_time / best_time;
     const double tolerance = 1.10;
-    
-    if (ratio <= tolerance) {
-        if (ratio < 1.0) {
+
+    if (ratio <= tolerance)
+    {
+        if (ratio < 1.0)
+        {
             double pct_faster = (1.0 - ratio) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_faster << "% faster than manual best" << std::endl;
-        } else {
+        }
+        else
+        {
             double pct_slower = (ratio - 1.0) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_slower << "% slower (within " << ((tolerance - 1.0) * 100) << "% tolerance)" << std::endl;
         }
     }
-    
-    EXPECT_LE(ratio, tolerance) 
-        << "Auto-tuner selection exceeds tolerance: " 
+
+    EXPECT_LE(ratio, tolerance)
+        << "Auto-tuner selection exceeds tolerance: "
         << std::fixed << std::setprecision(1) << ((ratio - 1.0) * 100) << "% slower than best "
         << "(selected: " << auto_result.name << " @ " << selected_time << "ms, "
         << "best: " << manual_results[0].name << " @ " << best_time << "ms)";
@@ -580,21 +592,25 @@ TEST_F(Perf__GemmAutoTuner, LargeBatch_512Tokens)
     const double selected_time = auto_result.time_ms;
     const double ratio = selected_time / best_time;
     const double tolerance = 1.10;
-    
-    if (ratio <= tolerance) {
-        if (ratio < 1.0) {
+
+    if (ratio <= tolerance)
+    {
+        if (ratio < 1.0)
+        {
             double pct_faster = (1.0 - ratio) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_faster << "% faster than manual best" << std::endl;
-        } else {
+        }
+        else
+        {
             double pct_slower = (ratio - 1.0) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_slower << "% slower (within " << ((tolerance - 1.0) * 100) << "% tolerance)" << std::endl;
         }
     }
-    
-    EXPECT_LE(ratio, tolerance) 
-        << "Auto-tuner selection exceeds tolerance: " 
+
+    EXPECT_LE(ratio, tolerance)
+        << "Auto-tuner selection exceeds tolerance: "
         << std::fixed << std::setprecision(1) << ((ratio - 1.0) * 100) << "% slower than best "
         << "(selected: " << auto_result.name << " @ " << selected_time << "ms, "
         << "best: " << manual_results[0].name << " @ " << best_time << "ms)";
@@ -622,21 +638,25 @@ TEST_F(Perf__GemmAutoTuner, NonSquare_QKVProjection)
     const double selected_time = auto_result.time_ms;
     const double ratio = selected_time / best_time;
     const double tolerance = 1.10;
-    
-    if (ratio <= tolerance) {
-        if (ratio < 1.0) {
+
+    if (ratio <= tolerance)
+    {
+        if (ratio < 1.0)
+        {
             double pct_faster = (1.0 - ratio) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_faster << "% faster than manual best" << std::endl;
-        } else {
+        }
+        else
+        {
             double pct_slower = (ratio - 1.0) * 100;
-            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1) 
+            std::cout << "  ✓ Test PASSED: Selected variant is " << std::fixed << std::setprecision(1)
                       << pct_slower << "% slower (within " << ((tolerance - 1.0) * 100) << "% tolerance)" << std::endl;
         }
     }
-    
-    EXPECT_LE(ratio, tolerance) 
-        << "Auto-tuner selection exceeds tolerance: " 
+
+    EXPECT_LE(ratio, tolerance)
+        << "Auto-tuner selection exceeds tolerance: "
         << std::fixed << std::setprecision(1) << ((ratio - 1.0) * 100) << "% slower than best "
         << "(selected: " << auto_result.name << " @ " << selected_time << "ms, "
         << "best: " << manual_results[0].name << " @ " << best_time << "ms)";

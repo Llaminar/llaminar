@@ -5,6 +5,7 @@
  */
 
 #include "WeightManager.h"
+#include "../utils/Logger.h"
 #include <iostream>
 
 namespace llaminar2
@@ -20,19 +21,20 @@ namespace llaminar2
 
         if (rank == 0)
         {
-            std::cout << "[WeightManager] Initialized with strategy: ";
+            std::string strategy_name;
             switch (strategy_)
             {
             case WeightDistributionStrategy::REPLICATED:
-                std::cout << "REPLICATED (full copy per rank)\n";
+                strategy_name = "REPLICATED (full copy per rank)";
                 break;
             case WeightDistributionStrategy::SHARDED:
-                std::cout << "SHARDED (partitioned across ranks)\n";
+                strategy_name = "SHARDED (partitioned across ranks)";
                 break;
             case WeightDistributionStrategy::INTERLEAVED:
-                std::cout << "INTERLEAVED (NUMA-aware global)\n";
+                strategy_name = "INTERLEAVED (NUMA-aware global)";
                 break;
             }
+            LOG_INFO("[WeightManager] Initialized with strategy: " << strategy_name);
         }
     }
 
@@ -74,7 +76,7 @@ namespace llaminar2
             break;
 
         default:
-            std::cerr << "[WeightManager] Unknown strategy: " << static_cast<int>(strategy_) << "\n";
+            LOG_ERROR("[WeightManager] Unknown strategy: " << static_cast<int>(strategy_));
             return nullptr;
         }
 
@@ -96,7 +98,7 @@ namespace llaminar2
         if (!tensor)
         {
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-            std::cerr << "[WeightManager] Rank " << rank << " failed to load: " << name << "\n";
+            LOG_ERROR("[WeightManager] Rank " << rank << " failed to load: " << name);
             return nullptr;
         }
 
@@ -122,7 +124,7 @@ namespace llaminar2
         //   size_t slice_size = shape[0] / world_size;
         //   return loader_.loadTensorSlice(name, slice_start, slice_size, device_idx);
 
-        std::cerr << "[WeightManager] SHARDED strategy not yet implemented, falling back to REPLICATED\n";
+        LOG_ERROR("[WeightManager] SHARDED strategy not yet implemented, falling back to REPLICATED");
         return getReplicatedWeight(name, device_idx);
     }
 
@@ -137,7 +139,7 @@ namespace llaminar2
         // 3. All ranks can access, but with varying latency
         // 4. Good for systems with fast interconnect (NVLink, etc.)
 
-        std::cerr << "[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED\n";
+        LOG_ERROR("[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED");
         return getReplicatedWeight(name, device_idx);
     }
 

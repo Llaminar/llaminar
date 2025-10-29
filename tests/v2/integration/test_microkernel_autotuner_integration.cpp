@@ -1,10 +1,10 @@
 /**
  * @file test_microkernel_autotuner_integration.cpp
  * @brief Test microkernel registry integration with auto-tuner
- * 
+ *
  * Verifies that the auto-tuner can access all 1,225 pre-compiled
  * microkernel instantiations and select optimal configurations.
- * 
+ *
  * @author David Sanftenberg
  * @date October 2025
  */
@@ -69,7 +69,7 @@ private:
 TEST(MicroKernelAutoTunerIntegration, RegistryPopulated)
 {
     auto &registry = kernels::gemm::MicroKernelRegistry::instance();
-    
+
     EXPECT_EQ(registry.size(), 1225)
         << "Registry should contain 1,225 pre-compiled instantiations";
 }
@@ -80,16 +80,16 @@ TEST(MicroKernelAutoTunerIntegration, RegistryPopulated)
 TEST(MicroKernelAutoTunerIntegration, VariantsRegistered)
 {
     TestBlockDecoder decoder(896, 896); // Qwen 0.5B hidden size
-    
+
     // Register all variants from microkernel registry
     auto variants = kernels::gemm::registerMicroKernelVariants(&decoder);
-    
+
     std::cout << "Registered " << variants.size() << " variants with auto-tuner\n";
-    
+
     // Should have 1,225 variants available
     EXPECT_EQ(variants.size(), 1225)
         << "Auto-tuner should receive all 1,225 variants from registry";
-    
+
     // Verify at least some variants are present
     EXPECT_GT(variants.size(), 0) << "At least some variants should be registered";
 }
@@ -99,19 +99,20 @@ TEST(MicroKernelAutoTunerIntegration, VariantsRegistered)
  */
 TEST(MicroKernelAutoTunerIntegration, AutoTunerSelection)
 {
-    std::cout << "\n[VERIFICATION] Testing all shapes with padding fix\n" << std::flush;
+    std::cout << "\n[VERIFICATION] Testing all shapes with padding fix\n"
+              << std::flush;
     TestBlockDecoder decoder(896, 896);
-    
+
     auto &tuner = GemmAutoTuner::instance();
     tuner.clearCache(); // Start fresh
-    
+
     // Register variants
     auto variants = kernels::gemm::registerMicroKernelVariants(&decoder);
     for (auto &variant : variants)
     {
         tuner.registerVariant(std::move(variant));
     }
-    
+
     // Test typical inference shapes - full performance matrix
     const std::vector<std::tuple<int, int, int>> test_shapes = {
         {1, 896, 896},    // Single token decode
@@ -123,15 +124,15 @@ TEST(MicroKernelAutoTunerIntegration, AutoTunerSelection)
         {2048, 896, 896}, // Very large prefill
         {4096, 896, 896}, // Extreme prefill
     };
-    
+
     for (const auto &[m, n, k] : test_shapes)
     {
         auto *kernel = tuner.getOptimalKernel(m, n, k);
-        
+
         ASSERT_NE(kernel, nullptr)
             << "Auto-tuner should return valid kernel for shape ("
             << m << ", " << n << ", " << k << ")";
-        
+
         auto config = kernel->config();
         std::cout << "Shape (" << m << ", " << n << ", " << k << ") -> "
                   << "tile " << config.tile_m << "×" << config.tile_n
@@ -146,13 +147,13 @@ TEST(MicroKernelAutoTunerIntegration, AutoTunerSelection)
 TEST(MicroKernelAutoTunerIntegration, L1OptConfigAvailable)
 {
     auto &registry = kernels::gemm::MicroKernelRegistry::instance();
-    
+
     // L1Opt config from analysis: AVX512, 8×6 tile, unroll=4, prefetch=2
     bool has_l1opt = registry.has_kernel("simd::AVX512Tag", 8, 6, 4, 2);
-    
+
     EXPECT_TRUE(has_l1opt)
         << "L1Opt configuration (666 GFLOPS baseline) should be in registry";
-    
+
     if (has_l1opt)
     {
         auto bundle = registry.get_kernel("simd::AVX512Tag", 8, 6, 4, 2);
@@ -168,33 +169,33 @@ TEST(MicroKernelAutoTunerIntegration, KernelCorrectnessSmoke)
 {
     // Small smoke test: 4×4 matrix multiplication
     const int m = 4, n = 4, k = 4;
-    
+
     TestBlockDecoder decoder(k, n);
-    
+
     auto &tuner = GemmAutoTuner::instance();
     tuner.clearCache();
-    
+
     // Register variants
     auto variants = kernels::gemm::registerMicroKernelVariants(&decoder);
     for (auto &variant : variants)
     {
         tuner.registerVariant(std::move(variant));
     }
-    
+
     // Get kernel
     auto *kernel = tuner.getOptimalKernel(m, n, k);
     ASSERT_NE(kernel, nullptr);
-    
+
     // Create test matrices
     std::vector<float> A(m * k, 1.0f); // All ones
     std::vector<float> C(m * n, 0.0f); // Initialize to zero
-    
+
     // Execute kernel: C = A × B (B is all ones from decoder)
     bool success = kernel->multiply(
         A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     EXPECT_TRUE(success) << "Kernel execution should succeed";
-    
+
     // Verify result: each element should be k (sum of k ones)
     for (int i = 0; i < m * n; ++i)
     {
@@ -209,47 +210,49 @@ TEST(MicroKernelAutoTunerIntegration, KernelCorrectnessSmoke)
 TEST(MicroKernelAutoTunerIntegration, LargeShape1024x896x896)
 {
     const int m = 1024, n = 896, k = 896;
-    
+
     std::cout << "\n[TEST] Testing problematic shape: m=" << m << ", n=" << n << ", k=" << k << "\n";
-    std::cout << "[TEST] Buffer sizes: A=" << (m*k*4) << " bytes, C=" << (m*n*4) << " bytes\n";
-    
+    std::cout << "[TEST] Buffer sizes: A=" << (m * k * 4) << " bytes, C=" << (m * n * 4) << " bytes\n";
+
     TestBlockDecoder decoder(k, n);
-    
+
     auto &tuner = GemmAutoTuner::instance();
     tuner.clearCache();
-    
+
     // Register variants
     auto variants = kernels::gemm::registerMicroKernelVariants(&decoder);
     for (auto &variant : variants)
     {
         tuner.registerVariant(std::move(variant));
     }
-    
-    std::cout << "[TEST] About to call getOptimalKernel() - this is where it crashes\n" << std::flush;
-    
+
+    std::cout << "[TEST] About to call getOptimalKernel() - this is where it crashes\n"
+              << std::flush;
+
     // Get kernel - THIS IS WHERE IT CRASHES
     auto *kernel = tuner.getOptimalKernel(m, n, k);
-    
+
     std::cout << "[TEST] getOptimalKernel() returned successfully\n";
     ASSERT_NE(kernel, nullptr);
-    
+
     // Create test matrices
     std::vector<float> A(m * k, 1.0f);
     std::vector<float> C(m * n, 0.0f);
-    
-    std::cout << "[TEST] About to execute kernel\n" << std::flush;
-    
+
+    std::cout << "[TEST] About to execute kernel\n"
+              << std::flush;
+
     // Execute kernel
     bool success = kernel->multiply(
         A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     std::cout << "[TEST] Kernel execution completed\n";
     EXPECT_TRUE(success) << "Kernel execution should succeed";
-    
+
     // Verify result (spot check - full verification would be slow)
     EXPECT_NEAR(C[0], static_cast<float>(k), 1e-3f) << "C[0] should equal k=" << k;
-    EXPECT_NEAR(C[m*n-1], static_cast<float>(k), 1e-3f) << "C[last] should equal k=" << k;
-    
+    EXPECT_NEAR(C[m * n - 1], static_cast<float>(k), 1e-3f) << "C[last] should equal k=" << k;
+
     std::cout << "[TEST] Test completed successfully\n";
 }
 

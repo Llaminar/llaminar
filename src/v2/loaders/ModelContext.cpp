@@ -5,6 +5,7 @@
  */
 
 #include "ModelContext.h"
+#include "../utils/Logger.h"
 #include <iostream>
 
 namespace llaminar2
@@ -34,7 +35,7 @@ namespace llaminar2
         // Load model metadata
         if (!ctx->loader_.loadModel(model_path))
         {
-            std::cerr << "[ModelContext] Failed to load model: " << model_path << std::endl;
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
             return nullptr;
         }
 

@@ -6,6 +6,7 @@
  */
 
 #include "DeviceOrchestrator.h"
+#include "../utils/Logger.h"
 #include <iostream>
 #include <algorithm>
 
@@ -59,7 +60,7 @@ namespace llaminar2
             return createCustomMap(model_ctx);
 
         default:
-            std::cerr << "[DeviceOrchestrator] Unknown strategy, falling back to AUTO" << std::endl;
+            LOG_ERROR("[DeviceOrchestrator] Unknown strategy, falling back to AUTO");
             return createAutoMap(model_ctx);
         }
     }
@@ -226,7 +227,7 @@ namespace llaminar2
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
             if (rank == 0)
             {
-                std::cout << "[DeviceOrchestrator] " << message << std::endl;
+                LOG_INFO("[DeviceOrchestrator] " << message);
             }
         }
     }

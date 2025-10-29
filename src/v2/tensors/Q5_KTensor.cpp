@@ -9,11 +9,32 @@
 #include "../kernels/cpu/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
+#include "../utils/Logger.h"
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#include "SIMDHelpers.h"
+#include "FP16Utils.h"
+#include <algorithm>
+#include <cmath>
+#endif
 
 namespace llaminar2
 {
+
     Q5_KTensor::Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), raw_data_(raw_data), device_idx_(-1), device_blocks_(nullptr)
+        : shape_(shape),
+          is_view_(false),
+          raw_data_(raw_data),
+          raw_data_ptr_(nullptr),
+          view_byte_offset_(0),
+          parent_(nullptr),
+          device_idx_(-1),
+          device_blocks_(nullptr)
     {
         if (shape.empty())
         {
@@ -35,78 +56,362 @@ namespace llaminar2
         }
     }
 
+    // Private view constructor (borrows parent's data)
+    Q5_KTensor::Q5_KTensor(
+        const std::vector<size_t> &shape,
+        const uint8_t *parent_raw_data,
+        size_t byte_offset,
+        std::shared_ptr<TensorBase> parent)
+        : shape_(shape),
+          is_view_(true),
+          raw_data_(), // Empty vector (view doesn't own data)
+          raw_data_ptr_(parent_raw_data),
+          view_byte_offset_(byte_offset),
+          parent_(parent),
+          device_idx_(-1),
+          device_blocks_(nullptr)
+    {
+    }
+
+    std::shared_ptr<TensorBase> Q5_KTensor::create_view(
+        const std::vector<size_t> &new_shape,
+        size_t offset)
+    {
+        // Validate: must be 2D
+        if (new_shape.size() != 2)
+        {
+            throw std::invalid_argument("Q5_KTensor::create_view: only 2D views supported");
+        }
+
+        // Validate: K dimension must match
+        if (new_shape[1] != shape_[1])
+        {
+            throw std::invalid_argument("Q5_KTensor::create_view: K dimension must match parent");
+        }
+
+        // Validate: offset must be row-aligned (multiple of K)
+        if (offset % shape_[1] != 0)
+        {
+            throw std::invalid_argument("Q5_KTensor::create_view: offset must be row-aligned");
+        }
+
+        // Validate: view must fit within parent bounds
+        size_t start_row = offset / shape_[1];
+        size_t end_row = start_row + new_shape[0];
+        if (end_row > shape_[0])
+        {
+            throw std::out_of_range("Q5_KTensor::create_view: view extends beyond parent bounds");
+        }
+
+        // Calculate byte offset for view
+        // Q5_K: 256 elements per block, 176 bytes per block
+        const size_t K = shape_[1];
+        const size_t blocks_per_row = (K + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
+        const size_t bytes_per_row = blocks_per_row * sizeof(Q5_KBlock);
+        size_t byte_offset = start_row * bytes_per_row;
+
+        // If this is already a view, accumulate offsets and use the root parent
+        const uint8_t *base_ptr;
+        std::shared_ptr<TensorBase> root_parent;
+
+        if (is_view_)
+        {
+            // Chain views: add offsets
+            byte_offset += view_byte_offset_;
+            base_ptr = raw_data_ptr_;
+            root_parent = parent_; // Use root parent, not intermediate view
+        }
+        else
+        {
+            // First-level view
+            base_ptr = raw_data_.data();
+            root_parent = shared_from_this();
+        }
+
+        // Create view using private constructor
+        return std::shared_ptr<Q5_KTensor>(new Q5_KTensor(new_shape, base_ptr, byte_offset, root_parent));
+    }
+
     std::unique_ptr<ITensorGemm> Q5_KTensor::createGemm()
     {
         return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
-    void Q5_KTensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
-    {
-        const size_t blocks_per_row = (shape_[1] + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
-        const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(raw_data_.data());
-        const Q5_KBlock &block = blocks[row_idx * blocks_per_row + k_block_offset];
-        decodeBlock(block, output);
-    }
-
-    const void *Q5_KTensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
-    {
-        const size_t blocks_per_row = (shape_[1] + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
-        const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(raw_data_.data());
-        return &blocks[row_idx * blocks_per_row + k_block_offset];
-    }
-
     void Q5_KTensor::decodeBlock(const Q5_KBlock &block, float *output)
     {
-        // Q5_K: 256 elements, 8 sub-blocks of 32 elements
+#if defined(__AVX512F__)
+        decodeBlockAVX512(block, output);
+#elif defined(__AVX2__)
+        decodeBlockAVX2(block, output);
+#else
+        decodeBlockScalar(block, output);
+#endif
+    }
+
+    void Q5_KTensor::decodeBlockScalar(const Q5_KBlock &block, float *output)
+    {
+        // Q5_K: 256 elements processed in 4 groups of 64 elements
+        // Reference: llama.cpp ggml-quants.c dequantize_row_q5_K()
         // Each element is 5 bits: 4 bits in qs[], 1 bit in qh[]
-        // Decode: d * scale * q5 - dmin * min
 
         const float d = fp16_to_fp32(block.d);
         const float dmin = fp16_to_fp32(block.dmin);
 
-        // Extract 8 6-bit scales from packed bytes (12 bytes → 8×6 bits)
-        uint8_t scales[8];
-        uint8_t mins[8];
-        for (size_t i = 0; i < 8; ++i)
+        const uint8_t *ql = block.qs;
+        const uint8_t *qh = block.qh;
+        float *y = output;
+
+        size_t is = 0;
+        uint8_t u1 = 1, u2 = 2; // Bit masks for high bit extraction
+
+        // Process 4 groups of 64 elements each (256 total)
+        for (size_t j = 0; j < 256; j += 64)
         {
-            const size_t base = i * 3 / 2; // 3 bytes per 2 scales
-            if (i % 2 == 0)
+            // Extract scale and min for first 32 elements
+            uint8_t sc1, m1;
+            get_scale_min_k4(is + 0, block.scales, &sc1, &m1);
+            const float d1 = d * sc1;
+            const float m1_val = dmin * m1;
+
+            // Extract scale and min for second 32 elements
+            uint8_t sc2, m2;
+            get_scale_min_k4(is + 1, block.scales, &sc2, &m2);
+            const float d2 = d * sc2;
+            const float m2_val = dmin * m2;
+
+            // First 32 elements: lower 4 bits + high bit from u1 mask
+            for (size_t l = 0; l < 32; ++l)
             {
-                scales[i] = block.scales[base] & 0x3F;
-                mins[i] = block.scales[base + 1] & 0x3F;
+                const uint8_t q_low = ql[l] & 0xF;
+                const uint8_t q_high = (qh[l] & u1) ? 16 : 0;
+                *y++ = d1 * (q_low + q_high) - m1_val;
             }
-            else
+
+            // Second 32 elements: upper 4 bits + high bit from u2 mask
+            for (size_t l = 0; l < 32; ++l)
             {
-                scales[i] = ((block.scales[base] >> 6) | ((block.scales[base + 1] & 0x0F) << 2));
-                mins[i] = (block.scales[base + 1] >> 4);
+                const uint8_t q_low = ql[l] >> 4;
+                const uint8_t q_high = (qh[l] & u2) ? 16 : 0;
+                *y++ = d2 * (q_low + q_high) - m2_val;
             }
+
+            ql += 32;
+            is += 2;
+            u1 <<= 2; // Shift masks for next group
+            u2 <<= 2;
         }
+    }
 
-        // Decode 8 sub-blocks
-        for (size_t sub_block = 0; sub_block < 8; ++sub_block)
+#if defined(__AVX2__)
+    void Q5_KTensor::decodeBlockAVX2(const Q5_KBlock &block, float *output)
+    {
+        // AVX2: Process 8 floats at a time
+        const float d = fp16_to_fp32(block.d);
+        const float dmin = fp16_to_fp32(block.dmin);
+
+        const uint8_t *ql = block.qs;
+        const uint8_t *qh = block.qh;
+        float *y = output;
+
+        size_t is = 0;
+        uint8_t u1 = 1, u2 = 2;
+
+        // Process 4 groups of 64 elements each (256 total)
+        for (size_t j = 0; j < 256; j += 64)
         {
-            const float scale_val = d * static_cast<float>(scales[sub_block]);
-            const float min_val = dmin * static_cast<float>(mins[sub_block]);
+            // Extract scale and min for first 32 elements
+            uint8_t sc1, m1;
+            get_scale_min_k4(is + 0, block.scales, &sc1, &m1);
+            const float d1 = d * sc1;
+            const float m1_val = dmin * m1;
 
-            // Each sub-block has 32 elements
-            for (size_t j = 0; j < 32; ++j)
+            // Extract scale and min for second 32 elements
+            uint8_t sc2, m2;
+            get_scale_min_k4(is + 1, block.scales, &sc2, &m2);
+            const float d2 = d * sc2;
+            const float m2_val = dmin * m2;
+
+            // First 32 elements: lower 4 bits + high bit from u1 mask
+            __m256 d1_vec = _mm256_set1_ps(d1);
+            __m256 m1_vec = _mm256_set1_ps(m1_val);
+            __m256i u1_mask = _mm256_set1_epi32(u1);
+
+            for (size_t l = 0; l < 32; l += 8)
             {
-                const size_t idx = sub_block * 32 + j;
+                // Load 8 bytes for lower 4 bits
+                __m128i ql_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(ql + l));
+                __m256i ql_32 = _mm256_cvtepu8_epi32(ql_bytes);
+                __m256i q_low = _mm256_and_si256(ql_32, _mm256_set1_epi32(0xF));
 
-                // Get 4 lower bits from qs[]
-                const size_t qs_idx = sub_block * 16 + j / 2;
-                const uint8_t qs_val = (j % 2 == 0) ? (block.qs[qs_idx] & 0x0F) : (block.qs[qs_idx] >> 4);
+                // Load 8 bytes for high bits
+                __m128i qh_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qh + l));
+                __m256i qh_32 = _mm256_cvtepu8_epi32(qh_bytes);
 
-                // Get 1 high bit from qh[] (8 bits per byte)
-                const size_t qh_idx = sub_block * 4 + j / 8;
-                const size_t qh_shift = j % 8;
-                const uint8_t qh_val = (block.qh[qh_idx] >> qh_shift) & 0x01;
+                // Test high bit: (qh & u1) != 0 ? 16 : 0
+                __m256i high_bit_set = _mm256_and_si256(qh_32, u1_mask);
+                __m256i is_nonzero = _mm256_cmpeq_epi32(high_bit_set, _mm256_setzero_si256());
+                __m256i q_high = _mm256_and_si256(_mm256_xor_si256(is_nonzero, _mm256_set1_epi32(-1)), _mm256_set1_epi32(16));
 
-                // Reconstruct 5-bit value: (qh << 4) | qs
-                const int q5 = static_cast<int>((qh_val << 4) | qs_val);
+                // Combine: q_low + q_high
+                __m256i q_combined = _mm256_add_epi32(q_low, q_high);
+                __m256 q_float = _mm256_cvtepi32_ps(q_combined);
 
-                output[idx] = scale_val * static_cast<float>(q5) - min_val;
+                // Apply formula: d1 * q_float - m1_val
+                __m256 result = _mm256_fmadd_ps(d1_vec, q_float, _mm256_sub_ps(_mm256_setzero_ps(), m1_vec));
+                _mm256_storeu_ps(y + l, result);
             }
+            y += 32;
+
+            // Second 32 elements: upper 4 bits + high bit from u2 mask
+            __m256 d2_vec = _mm256_set1_ps(d2);
+            __m256 m2_vec = _mm256_set1_ps(m2_val);
+            __m256i u2_mask = _mm256_set1_epi32(u2);
+
+            for (size_t l = 0; l < 32; l += 8)
+            {
+                // Load 8 bytes for upper 4 bits
+                __m128i ql_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(ql + l));
+                __m256i ql_32 = _mm256_cvtepu8_epi32(ql_bytes);
+                __m256i q_low = _mm256_srli_epi32(ql_32, 4);
+
+                // Load 8 bytes for high bits
+                __m128i qh_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qh + l));
+                __m256i qh_32 = _mm256_cvtepu8_epi32(qh_bytes);
+
+                // Test high bit: (qh & u2) != 0 ? 16 : 0
+                __m256i high_bit_set = _mm256_and_si256(qh_32, u2_mask);
+                __m256i is_nonzero = _mm256_cmpeq_epi32(high_bit_set, _mm256_setzero_si256());
+                __m256i q_high = _mm256_and_si256(_mm256_xor_si256(is_nonzero, _mm256_set1_epi32(-1)), _mm256_set1_epi32(16));
+
+                // Combine: q_low + q_high
+                __m256i q_combined = _mm256_add_epi32(q_low, q_high);
+                __m256 q_float = _mm256_cvtepi32_ps(q_combined);
+
+                // Apply formula: d2 * q_float - m2_val
+                __m256 result = _mm256_fmadd_ps(d2_vec, q_float, _mm256_sub_ps(_mm256_setzero_ps(), m2_vec));
+                _mm256_storeu_ps(y + l, result);
+            }
+            y += 32;
+
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    void Q5_KTensor::decodeBlockAVX512(const Q5_KBlock &block, float *output)
+    {
+        // AVX512: Process 16 floats at a time
+        const float d = fp16_to_fp32(block.d);
+        const float dmin = fp16_to_fp32(block.dmin);
+
+        const uint8_t *ql = block.qs;
+        const uint8_t *qh = block.qh;
+        float *y = output;
+
+        size_t is = 0;
+        uint8_t u1 = 1, u2 = 2;
+
+        // Process 4 groups of 64 elements each (256 total)
+        for (size_t j = 0; j < 256; j += 64)
+        {
+            // Extract scale and min for first 32 elements
+            uint8_t sc1, m1;
+            get_scale_min_k4(is + 0, block.scales, &sc1, &m1);
+            const float d1 = d * sc1;
+            const float m1_val = dmin * m1;
+
+            // Extract scale and min for second 32 elements
+            uint8_t sc2, m2;
+            get_scale_min_k4(is + 1, block.scales, &sc2, &m2);
+            const float d2 = d * sc2;
+            const float m2_val = dmin * m2;
+
+            // First 32 elements: lower 4 bits + high bit from u1 mask
+            __m512 d1_vec = _mm512_set1_ps(d1);
+            __m512 m1_vec = _mm512_set1_ps(m1_val);
+            __m512i u1_mask = _mm512_set1_epi32(u1);
+
+            for (size_t l = 0; l < 32; l += 16)
+            {
+                // Load 16 bytes for lower 4 bits
+                __m128i ql_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ql + l));
+                __m512i ql_32 = _mm512_cvtepu8_epi32(ql_bytes);
+                __m512i q_low = _mm512_and_si512(ql_32, _mm512_set1_epi32(0xF));
+
+                // Load 16 bytes for high bits
+                __m128i qh_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qh + l));
+                __m512i qh_32 = _mm512_cvtepu8_epi32(qh_bytes);
+
+                // Test high bit: (qh & u1) != 0 ? 16 : 0
+                __m512i high_bit_set = _mm512_and_si512(qh_32, u1_mask);
+                __mmask16 is_nonzero = _mm512_cmpneq_epi32_mask(high_bit_set, _mm512_setzero_si512());
+                __m512i q_high = _mm512_maskz_set1_epi32(is_nonzero, 16);
+
+                // Combine: q_low + q_high
+                __m512i q_combined = _mm512_add_epi32(q_low, q_high);
+                __m512 q_float = _mm512_cvtepi32_ps(q_combined);
+
+                // Apply formula: d1 * q_float - m1_val
+                __m512 result = _mm512_fmadd_ps(d1_vec, q_float, _mm512_sub_ps(_mm512_setzero_ps(), m1_vec));
+                _mm512_storeu_ps(y + l, result);
+            }
+            y += 32;
+
+            // Second 32 elements: upper 4 bits + high bit from u2 mask
+            __m512 d2_vec = _mm512_set1_ps(d2);
+            __m512 m2_vec = _mm512_set1_ps(m2_val);
+            __m512i u2_mask = _mm512_set1_epi32(u2);
+
+            for (size_t l = 0; l < 32; l += 16)
+            {
+                // Load 16 bytes for upper 4 bits
+                __m128i ql_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ql + l));
+                __m512i ql_32 = _mm512_cvtepu8_epi32(ql_bytes);
+                __m512i q_low = _mm512_srli_epi32(ql_32, 4);
+
+                // Load 16 bytes for high bits
+                __m128i qh_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qh + l));
+                __m512i qh_32 = _mm512_cvtepu8_epi32(qh_bytes);
+
+                // Test high bit: (qh & u2) != 0 ? 16 : 0
+                __m512i high_bit_set = _mm512_and_si512(qh_32, u2_mask);
+                __mmask16 is_nonzero = _mm512_cmpneq_epi32_mask(high_bit_set, _mm512_setzero_si512());
+                __m512i q_high = _mm512_maskz_set1_epi32(is_nonzero, 16);
+
+                // Combine: q_low + q_high
+                __m512i q_combined = _mm512_add_epi32(q_low, q_high);
+                __m512 q_float = _mm512_cvtepi32_ps(q_combined);
+
+                // Apply formula: d2 * q_float - m2_val
+                __m512 result = _mm512_fmadd_ps(d2_vec, q_float, _mm512_sub_ps(_mm512_setzero_ps(), m2_vec));
+                _mm512_storeu_ps(y + l, result);
+            }
+            y += 32;
+
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+#endif
+
+    // Helper function matching llama.cpp's get_scale_min_k4
+    inline void Q5_KTensor::get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m)
+    {
+        if (j < 4)
+        {
+            *d = q[j] & 63;
+            *m = q[j + 4] & 63;
+        }
+        else
+        {
+            *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+            *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
         }
     }
 
@@ -124,7 +429,9 @@ namespace llaminar2
         {
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
-            const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(raw_data_.data());
+            // Use view-aware data pointer
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
             size_t blocks_per_row = (shape_[1] + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
             for (size_t r = 0; r < shape_[0]; ++r)
             {
@@ -166,8 +473,123 @@ namespace llaminar2
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
-        std::cerr << "[Q5_KTensor::copyFrom] Not implemented\n";
+        LOG_ERROR("[Q5_KTensor::copyFrom] Not implemented");
         return false;
+    }
+
+    // ===== Format Conversion Methods (TensorBase interface) =====
+
+    void Q5_KTensor::to_bf16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to BF16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = simd::fp32_to_bf16(temp_fp32[i]);
+        }
+    }
+
+    void Q5_KTensor::to_fp16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to FP16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = fp32_to_fp16(temp_fp32[i]);
+        }
+    }
+
+    void Q5_KTensor::to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size) const
+    {
+        // Decode to FP32 first, then quantize to int8
+        const size_t total_elements = element_count();
+        std::vector<float> temp_fp32(total_elements);
+        to_fp32(temp_fp32.data());
+
+        const size_t num_blocks = (total_elements + block_size - 1) / block_size;
+
+#pragma omp parallel for
+        for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
+        {
+            const size_t offset = block_idx * block_size;
+            const size_t count = std::min(block_size, total_elements - offset);
+
+            // Find max absolute value in block
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(temp_fp32[offset + i]));
+            }
+
+            // Compute scale factor (avoid division by zero)
+            const float scale = (max_abs > 1e-10f) ? (127.0f / max_abs) : 0.0f;
+            dst_scales[block_idx] = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+            // Quantize block to int8 with rounding
+            for (size_t i = 0; i < count; ++i)
+            {
+                const float val = temp_fp32[offset + i] * scale;
+                const float clamped = std::max(-127.0f, std::min(127.0f, val));
+                dst_int8[offset + i] = static_cast<int8_t>(std::round(clamped));
+            }
+
+            // Zero-fill partial block tail (if any)
+            for (size_t i = count; i < block_size; ++i)
+            {
+                dst_int8[offset + i] = 0;
+            }
+        }
+    }
+
+    void Q5_KTensor::to_fp32_row(size_t row_idx, float *buffer) const
+    {
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            throw std::runtime_error("to_fp32_row() requires 2D tensor");
+        }
+        if (row_idx >= shp[0])
+        {
+            throw std::out_of_range("Row index out of bounds");
+        }
+
+        const size_t cols = shp[1];
+        const size_t blocks_per_row = (cols + block_size() - 1) / block_size();
+
+        for (size_t kb = 0; kb < blocks_per_row; ++kb)
+        {
+            const size_t offset = kb * block_size();
+            const size_t count = std::min(block_size(), cols - offset);
+
+            float temp[256]; // Max block size
+            decode_block_at(row_idx, kb, temp);
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                buffer[offset + i] = temp[i];
+            }
+        }
+    }
+
+    void Q5_KTensor::to_fp32_span(size_t offset, size_t count, float *buffer) const
+    {
+        if (offset + count > element_count())
+        {
+            throw std::out_of_range("Span exceeds tensor bounds");
+        }
+
+        // Decode full tensor (inefficient but simple)
+        std::vector<float> temp_fp32(element_count());
+        to_fp32(temp_fp32.data());
+        std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
 
 } // namespace llaminar2

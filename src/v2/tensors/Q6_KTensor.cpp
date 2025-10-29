@@ -7,13 +7,36 @@
 #include "Tensors.h"
 #include "Tensors.h"
 #include "../kernels/cpu/GemmAutoTuner.h"
+#include "../utils/DebugEnv.h"
+#include "../utils/CPUFeatures.h"
 #include <cstring>
 #include <stdexcept>
+#include "../utils/Logger.h"
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#include "SIMDHelpers.h"
+#include "FP16Utils.h"
+#include <algorithm>
+#include <cmath>
+#endif
 
 namespace llaminar2
 {
+
     Q6_KTensor::Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), raw_data_(raw_data), device_idx_(-1), device_blocks_(nullptr)
+        : shape_(shape),
+          is_view_(false),
+          raw_data_(raw_data),
+          raw_data_ptr_(nullptr),
+          view_byte_offset_(0),
+          parent_(nullptr),
+          device_idx_(-1),
+          device_blocks_(nullptr)
     {
         if (shape.empty())
         {
@@ -35,67 +58,233 @@ namespace llaminar2
         }
     }
 
+    // Private view constructor
+    Q6_KTensor::Q6_KTensor(const std::vector<size_t> &shape,
+                           const uint8_t *parent_raw_data,
+                           size_t byte_offset,
+                           std::shared_ptr<TensorBase> parent)
+        : shape_(shape),
+          is_view_(true),
+          raw_data_(), // Empty (view borrows parent data)
+          raw_data_ptr_(parent_raw_data),
+          view_byte_offset_(byte_offset),
+          parent_(parent),
+          device_idx_(-1),
+          device_blocks_(nullptr)
+    {
+    }
+
+    std::shared_ptr<TensorBase> Q6_KTensor::create_view(
+        const std::vector<size_t> &new_shape,
+        size_t offset)
+    {
+        // Validation: must be 2D
+        if (shape_.size() != 2 || new_shape.size() != 2)
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: only 2D row-slice views supported");
+        }
+
+        // Validation: K dimension must match
+        if (new_shape[1] != shape_[1])
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: column count (K) must match parent");
+        }
+
+        // Validation: offset must be row-aligned
+        if (offset % shape_[1] != 0)
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: offset must be row-aligned");
+        }
+
+        // Validation: bounds check
+        if (offset + new_shape[0] * new_shape[1] > shape_[0] * shape_[1])
+        {
+            throw std::out_of_range("Q6_KTensor::create_view: view exceeds parent bounds");
+        }
+
+        // Calculate block offset
+        const size_t cols = shape_[1];
+        const size_t blocks_per_row = (cols + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const size_t first_row = offset / cols;
+        const size_t block_offset = first_row * blocks_per_row;
+        const size_t byte_offset = block_offset * sizeof(Q6_KBlock);
+
+        // Get root parent data pointer
+        const uint8_t *root_data_ptr;
+        size_t cumulative_byte_offset;
+        std::shared_ptr<TensorBase> root_parent;
+
+        if (is_view_)
+        {
+            // Chain to root parent
+            root_data_ptr = raw_data_ptr_;
+            cumulative_byte_offset = view_byte_offset_ + byte_offset;
+            root_parent = parent_; // Already points to root
+        }
+        else
+        {
+            // Create view from owned tensor
+            root_data_ptr = raw_data_.data();
+            cumulative_byte_offset = byte_offset;
+            root_parent = std::static_pointer_cast<TensorBase>(shared_from_this());
+        }
+
+        // Create view using private constructor
+        return std::shared_ptr<Q6_KTensor>(new Q6_KTensor(
+            new_shape,
+            root_data_ptr,
+            cumulative_byte_offset,
+            root_parent));
+    }
+
     std::unique_ptr<ITensorGemm> Q6_KTensor::createGemm()
     {
         return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
-    void Q6_KTensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
-    {
-        const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
-        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(raw_data_.data());
-        const Q6_KBlock &block = blocks[row_idx * blocks_per_row + k_block_offset];
-        decodeBlock(block, output);
-    }
-
-    const void *Q6_KTensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
-    {
-        const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
-        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(raw_data_.data());
-        return &blocks[row_idx * blocks_per_row + k_block_offset];
-    }
-
     void Q6_KTensor::decodeBlock(const Q6_KBlock &block, float *output)
     {
-        // Q6_K: 256 elements per super-block, 16 sub-blocks of 16 elements each
-        // Each element is 6 bits: 4 bits in ql[], 2 bits in qh[]
-        // Decode formula: value = d * scales[sub_block] * reconstruct_6bit(ql[i], qh[i])
+        // Check debug environment for forced SIMD path
+        const auto &env = debugEnv();
+
+        if (env.dequant.simd_path == "scalar")
+        {
+            decodeBlockScalar(block, output);
+            return;
+        }
+
+#if defined(__AVX512F__)
+        if (env.dequant.simd_path == "avx512" ||
+            (env.dequant.simd_path == "auto" && cpu_supports_avx512()))
+        {
+            decodeBlockAVX512(block, output);
+            return;
+        }
+#endif
+
+#if defined(__AVX2__)
+        if (env.dequant.simd_path == "avx2" ||
+            (env.dequant.simd_path == "auto" && cpu_supports_avx2()))
+        {
+            decodeBlockAVX2(block, output);
+            return;
+        }
+#endif
+
+        // Final fallback to scalar
+        decodeBlockScalar(block, output);
+    }
+
+    void Q6_KTensor::decodeBlockScalar(const Q6_KBlock &block, float *output)
+    {
+        // Q6_K: 256 elements per super-block, processed in 2 halves of 128 elements
+        // Reference: llama.cpp ggml-quants.c dequantize_row_q6_K()
+        // Each half uses interleaved layout with 4 values per iteration
 
         const float d = fp16_to_fp32(block.d);
 
-        // Process 16 sub-blocks
-        for (size_t sub_block = 0; sub_block < 16; ++sub_block)
+        const uint8_t *ql = block.ql;
+        const uint8_t *qh = block.qh;
+        const int8_t *sc = block.scales;
+
+        float *y = output;
+
+        // Process 2 halves of 128 elements each
+        for (size_t n = 0; n < 256; n += 128)
         {
-            const float scale = static_cast<float>(block.scales[sub_block]) * d;
-
-            // Each sub-block has 16 elements
-            for (size_t j = 0; j < 16; ++j)
+            // Each half: 32 iterations producing 4 values each (32*4 = 128)
+            for (size_t l = 0; l < 32; ++l)
             {
-                const size_t idx = sub_block * 16 + j;
+                const size_t is = l / 16; // Scale index (0 or 1 per half)
 
-                // Get 4 lower bits from ql[]
-                const uint8_t ql_byte = block.ql[sub_block * 8 + j / 2];
-                const uint8_t ql_val = (j % 2 == 0) ? (ql_byte & 0x0F) : (ql_byte >> 4);
+                // Reconstruct 4 6-bit values from ql[] and qh[]
+                const int8_t q1 = static_cast<int8_t>((ql[l] & 0xF) | ((qh[l] >> 0) & 3) << 4) - 32;
+                const int8_t q2 = static_cast<int8_t>((ql[l + 32] & 0xF) | ((qh[l] >> 2) & 3) << 4) - 32;
+                const int8_t q3 = static_cast<int8_t>((ql[l] >> 4) | ((qh[l] >> 4) & 3) << 4) - 32;
+                const int8_t q4 = static_cast<int8_t>((ql[l + 32] >> 4) | ((qh[l] >> 6) & 3) << 4) - 32;
 
-                // Get 2 higher bits from qh[] (packed 4 per byte)
-                const size_t qh_byte_idx = sub_block * 4 + j / 4;
-                const size_t qh_bit_shift = (j % 4) * 2;
-                const uint8_t qh_val = (block.qh[qh_byte_idx] >> qh_bit_shift) & 0x03;
-
-                // Reconstruct 6-bit value: (qh << 4) | ql
-                const int q6 = static_cast<int>((qh_val << 4) | ql_val);
-
-                // Subtract bias and scale (Q6_K uses bias of 32)
-                output[idx] = scale * static_cast<float>(q6 - 32);
+                // Apply scales and output to interleaved positions
+                // Scale indices: is+0, is+2, is+4, is+6
+                y[l + 0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
             }
+
+            // Advance pointers for next half
+            y += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
         }
     }
+
+#if defined(__AVX512F__)
+    void Q6_KTensor::decodeBlockAVX512(const Q6_KBlock &block, float *output)
+    {
+        // AVX512 implementation for Q6_K
+        // Note: Q6_K has complex bit unpacking that doesn't vectorize as cleanly
+        // This implementation processes 8 elements at a time within the 32-iteration loop
+
+        const float d = fp16_to_fp32(block.d);
+        const __m512 vd = _mm512_set1_ps(d);
+        const __m512i voffset = _mm512_set1_epi32(32);
+
+        const uint8_t *ql = block.ql;
+        const uint8_t *qh = block.qh;
+        const int8_t *sc = block.scales;
+
+        float *y = output;
+
+        // Process 2 halves of 128 elements each
+        for (size_t n = 0; n < 256; n += 128)
+        {
+            // Process in chunks of 8 iterations (32 values)
+            for (size_t l = 0; l < 32; l += 8)
+            {
+                const size_t is = l / 16; // Scale index (0 or 1 per half)
+
+                // Extract 8 q1 values
+                __m256i vql_low = _mm256_cvtepu8_epi32(_mm_loadu_si64(&ql[l]));
+                __m256i vqh_bytes = _mm256_cvtepu8_epi32(_mm_loadu_si64(&qh[l]));
+                __m256i vq1_low = _mm256_and_si256(vql_low, _mm256_set1_epi32(0xF));
+                __m256i vq1_high = _mm256_and_si256(vqh_bytes, _mm256_set1_epi32(0x3));
+                vq1_high = _mm256_slli_epi32(vq1_high, 4);
+                __m512i vq1 = _mm512_cvtepi32_epi64(_mm256_or_si256(vq1_low, vq1_high));
+                vq1 = _mm512_sub_epi64(vq1, _mm512_cvtepi32_epi64(_mm256_set1_epi32(32)));
+
+                // For simplicity in this complex format, fall back to scalar for remaining values
+                // Full SIMD optimization requires significant complexity due to interleaved layout
+                for (size_t i = 0; i < 8 && l + i < 32; ++i)
+                {
+                    const int8_t q1 = static_cast<int8_t>((ql[l + i] & 0xF) | ((qh[l + i] >> 0) & 3) << 4) - 32;
+                    const int8_t q2 = static_cast<int8_t>((ql[l + i + 32] & 0xF) | ((qh[l + i] >> 2) & 3) << 4) - 32;
+                    const int8_t q3 = static_cast<int8_t>((ql[l + i] >> 4) | ((qh[l + i] >> 4) & 3) << 4) - 32;
+                    const int8_t q4 = static_cast<int8_t>((ql[l + i + 32] >> 4) | ((qh[l + i] >> 6) & 3) << 4) - 32;
+
+                    y[l + i + 0] = d * sc[is + 0] * q1;
+                    y[l + i + 32] = d * sc[is + 2] * q2;
+                    y[l + i + 64] = d * sc[is + 4] * q3;
+                    y[l + i + 96] = d * sc[is + 6] * q4;
+                }
+            }
+
+            // Advance pointers for next half
+            y += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+#endif
 
 #if defined(__AVX2__)
     void Q6_KTensor::decodeBlockAVX2(const Q6_KBlock &block, float *output)
     {
-        // TODO: Optimize with AVX2 (complex bit unpacking, deferred for initial implementation)
-        decodeBlock(block, output);
+        // AVX2 implementation for Q6_K
+        // Due to complex bit unpacking and interleaved layout, we use scalar fallback
+        // Full AVX2 optimization would require significant code complexity for modest gains
+        decodeBlockScalar(block, output);
     }
 #endif
 
@@ -113,7 +302,8 @@ namespace llaminar2
         {
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
-            const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(raw_data_.data());
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
             size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
             for (size_t r = 0; r < shape_[0]; ++r)
             {
@@ -155,8 +345,123 @@ namespace llaminar2
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
-        std::cerr << "[Q6_KTensor::copyFrom] Not implemented\n";
+        LOG_ERROR("[Q6_KTensor::copyFrom] Not implemented");
         return false;
+    }
+
+    // ===== Format Conversion Methods (TensorBase interface) =====
+
+    void Q6_KTensor::to_bf16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to BF16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = simd::fp32_to_bf16(temp_fp32[i]);
+        }
+    }
+
+    void Q6_KTensor::to_fp16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to FP16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = fp32_to_fp16(temp_fp32[i]);
+        }
+    }
+
+    void Q6_KTensor::to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size) const
+    {
+        // Decode to FP32 first, then quantize to int8
+        const size_t total_elements = element_count();
+        std::vector<float> temp_fp32(total_elements);
+        to_fp32(temp_fp32.data());
+
+        const size_t num_blocks = (total_elements + block_size - 1) / block_size;
+
+#pragma omp parallel for
+        for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
+        {
+            const size_t offset = block_idx * block_size;
+            const size_t count = std::min(block_size, total_elements - offset);
+
+            // Find max absolute value in block
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(temp_fp32[offset + i]));
+            }
+
+            // Compute scale factor (avoid division by zero)
+            const float scale = (max_abs > 1e-10f) ? (127.0f / max_abs) : 0.0f;
+            dst_scales[block_idx] = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+            // Quantize block to int8 with rounding
+            for (size_t i = 0; i < count; ++i)
+            {
+                const float val = temp_fp32[offset + i] * scale;
+                const float clamped = std::max(-127.0f, std::min(127.0f, val));
+                dst_int8[offset + i] = static_cast<int8_t>(std::round(clamped));
+            }
+
+            // Zero-fill partial block tail (if any)
+            for (size_t i = count; i < block_size; ++i)
+            {
+                dst_int8[offset + i] = 0;
+            }
+        }
+    }
+
+    void Q6_KTensor::to_fp32_row(size_t row_idx, float *buffer) const
+    {
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            throw std::runtime_error("to_fp32_row() requires 2D tensor");
+        }
+        if (row_idx >= shp[0])
+        {
+            throw std::out_of_range("Row index out of bounds");
+        }
+
+        const size_t cols = shp[1];
+        const size_t blocks_per_row = (cols + block_size() - 1) / block_size();
+
+        for (size_t kb = 0; kb < blocks_per_row; ++kb)
+        {
+            const size_t offset = kb * block_size();
+            const size_t count = std::min(block_size(), cols - offset);
+
+            float temp[256]; // Max block size
+            decode_block_at(row_idx, kb, temp);
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                buffer[offset + i] = temp[i];
+            }
+        }
+    }
+
+    void Q6_KTensor::to_fp32_span(size_t offset, size_t count, float *buffer) const
+    {
+        if (offset + count > element_count())
+        {
+            throw std::out_of_range("Span exceeds tensor bounds");
+        }
+
+        // Decode full tensor (inefficient but simple)
+        std::vector<float> temp_fp32(element_count());
+        to_fp32(temp_fp32.data());
+        std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
 
 } // namespace llaminar2

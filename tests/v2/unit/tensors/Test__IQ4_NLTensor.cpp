@@ -200,7 +200,7 @@ TEST_F(Test__IQ4_NLTensor, BasicDecode)
     auto tensor = createSimpleTensor();
 
     std::vector<float> decoded(64);
-    tensor->decode_to_fp32(decoded.data());
+    tensor->to_fp32(decoded.data());
 
     // Row 0: scale=1.0, all indices=0 → all values = 1.0 * kvalues_iq4nl[0]
     // Row 1: scale=2.0, all indices=1 → all values = 2.0 * kvalues_iq4nl[1]
@@ -250,7 +250,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_1x1)
 
     // Compute expected result manually
     std::vector<float> B_decoded(64);
-    tensor->decode_to_fp32(B_decoded.data());
+    tensor->to_fp32(B_decoded.data());
 
     std::vector<float> C_expected(2, 0.0f);
     referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 1, 2, 32);
@@ -282,7 +282,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_SmallBatch)
 
     // Reference computation
     std::vector<float> B_decoded(8 * 64);
-    tensor->decode_to_fp32(B_decoded.data());
+    tensor->to_fp32(B_decoded.data());
 
     std::vector<float> C_expected(4 * 8, 0.0f);
     referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 4, 8, 64);
@@ -314,7 +314,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_MediumBatch)
 
     // Reference
     std::vector<float> B_decoded(16 * 128);
-    tensor->decode_to_fp32(B_decoded.data());
+    tensor->to_fp32(B_decoded.data());
 
     std::vector<float> C_expected(16 * 16, 0.0f);
     referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 16, 16, 128);
@@ -345,7 +345,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_LargeBatch)
 
     // Reference
     std::vector<float> B_decoded(32 * 256);
-    tensor->decode_to_fp32(B_decoded.data());
+    tensor->to_fp32(B_decoded.data());
 
     std::vector<float> C_expected(32 * 32, 0.0f);
     referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 32, 32, 256);
@@ -377,7 +377,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_AlphaBeta)
 
     // Reference
     std::vector<float> B_decoded(64);
-    tensor->decode_to_fp32(B_decoded.data());
+    tensor->to_fp32(B_decoded.data());
 
     std::vector<float> C_expected = C_backup;
     referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 2, 2, 32, alpha, beta);
@@ -408,7 +408,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_NonAlignedK)
 
     // Reference
     std::vector<float> B_decoded(4 * 50);
-    tensor->decode_to_fp32(B_decoded.data());
+    tensor->to_fp32(B_decoded.data());
 
     std::vector<float> C_expected(3 * 4, 0.0f);
     referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 3, 4, 50);
@@ -502,11 +502,11 @@ TEST_F(Test__IQ4_NLTensor, DecodeToBF16)
 
     // Decode to FP32 (ground truth)
     std::vector<float> decoded_fp32(2 * 64);
-    tensor->decode_to_fp32(decoded_fp32.data());
+    tensor->to_fp32(decoded_fp32.data());
 
     // Decode to BF16
     std::vector<uint16_t> decoded_bf16(2 * 64);
-    tensor->decode_to_bf16(decoded_bf16.data());
+    tensor->to_bf16(decoded_bf16.data());
 
     // Convert BF16 back to FP32 for comparison
     std::vector<float> bf16_as_fp32(2 * 64);
@@ -535,6 +535,245 @@ TEST_F(Test__IQ4_NLTensor, DecodeToBF16)
     // BF16 should preserve ~3 decimal digits (2^-7 ≈ 0.008 = 0.8% worst case)
     // Use 1% as tolerance to account for quantization + BF16 truncation
     EXPECT_LT(max_rel_error, 0.01f) << "BF16 precision loss too high: " << max_rel_error;
+}
+
+// =============================================================================
+// SIMD EQUIVALENCY TESTS
+// =============================================================================
+
+/**
+ * @brief Test scalar vs AVX2 equivalency for IQ4_NL block decode
+ *
+ * IQ4_NL uses lookup table quantization (kvalues_iq4nl[16]), so SIMD must
+ * produce identical results to scalar when accessing the same lookup values.
+ */
+#ifdef __AVX2__
+TEST_F(Test__IQ4_NLTensor, SIMD_ScalarVsAVX2Equivalency)
+{
+    // Create a test block with varying nibble indices (0-15)
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(2.5f); // Non-trivial scale
+
+    // Fill with pattern that exercises all 16 lookup table entries
+    for (int i = 0; i < 16; ++i)
+    {
+        uint8_t low_nibble = i % 16;
+        uint8_t high_nibble = (15 - i) % 16;
+        block.qs[i] = (high_nibble << 4) | low_nibble;
+    }
+
+    // Decode with scalar and AVX2
+    std::vector<float> scalar_output(32);
+    std::vector<float> avx2_output(32);
+
+    IQ4_NLTensor::decodeBlockScalar(block, scalar_output.data());
+    IQ4_NLTensor::decodeBlockAVX2(block, avx2_output.data());
+
+    // Compare outputs (should be identical - exact lookup table matches)
+    constexpr float TOLERANCE = 1e-6f;
+    for (size_t i = 0; i < 32; ++i)
+    {
+        float diff = std::abs(scalar_output[i] - avx2_output[i]);
+        EXPECT_LT(diff, TOLERANCE)
+            << "Mismatch at index " << i
+            << ": scalar=" << scalar_output[i]
+            << ", avx2=" << avx2_output[i]
+            << ", diff=" << diff;
+    }
+}
+#endif // __AVX2__
+
+/**
+ * @brief Test scalar vs AVX512 equivalency for IQ4_NL block decode
+ */
+#ifdef __AVX512F__
+TEST_F(Test__IQ4_NLTensor, SIMD_ScalarVsAVX512Equivalency)
+{
+    // Create a test block with varying nibble indices
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(1.75f); // Non-trivial scale
+
+    // Fill with pattern that exercises all 16 lookup table entries
+    for (int i = 0; i < 16; ++i)
+    {
+        uint8_t low_nibble = (i * 7) % 16; // Pseudorandom pattern
+        uint8_t high_nibble = (i * 11) % 16;
+        block.qs[i] = (high_nibble << 4) | low_nibble;
+    }
+
+    // Decode with scalar and AVX512
+    std::vector<float> scalar_output(32);
+    std::vector<float> avx512_output(32);
+
+    IQ4_NLTensor::decodeBlockScalar(block, scalar_output.data());
+    IQ4_NLTensor::decodeBlockAVX512(block, avx512_output.data());
+
+    // Compare outputs
+    constexpr float TOLERANCE = 1e-6f;
+    for (size_t i = 0; i < 32; ++i)
+    {
+        float diff = std::abs(scalar_output[i] - avx512_output[i]);
+        EXPECT_LT(diff, TOLERANCE)
+            << "Mismatch at index " << i
+            << ": scalar=" << scalar_output[i]
+            << ", avx512=" << avx512_output[i]
+            << ", diff=" << diff;
+    }
+}
+#endif // __AVX512F__
+
+/**
+ * @brief Test AVX2 vs AVX512 cross-validation
+ */
+#if defined(__AVX2__) && defined(__AVX512F__)
+TEST_F(Test__IQ4_NLTensor, SIMD_AVX2VsAVX512Equivalency)
+{
+    // Create a test block
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(3.14f);
+
+    // Fill with comprehensive pattern
+    for (int i = 0; i < 16; ++i)
+    {
+        block.qs[i] = ((i * 3) % 16) | (((i * 5) % 16) << 4);
+    }
+
+    // Decode with both SIMD implementations
+    std::vector<float> avx2_output(32);
+    std::vector<float> avx512_output(32);
+
+    IQ4_NLTensor::decodeBlockAVX2(block, avx2_output.data());
+    IQ4_NLTensor::decodeBlockAVX512(block, avx512_output.data());
+
+    // Compare outputs
+    constexpr float TOLERANCE = 1e-6f;
+    for (size_t i = 0; i < 32; ++i)
+    {
+        float diff = std::abs(avx2_output[i] - avx512_output[i]);
+        EXPECT_LT(diff, TOLERANCE)
+            << "Mismatch at index " << i
+            << ": avx2=" << avx2_output[i]
+            << ", avx512=" << avx512_output[i]
+            << ", diff=" << diff;
+    }
+}
+#endif // __AVX2__ && __AVX512F__
+
+/**
+ * @brief Edge case: All nibbles = 0 (first lookup table entry)
+ */
+TEST_F(Test__IQ4_NLTensor, SIMD_EdgeCase_AllZeroIndices)
+{
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(1.0f);
+
+    // All nibbles = 0 -> all outputs = kvalues_iq4nl[0]
+    for (int i = 0; i < 16; ++i)
+    {
+        block.qs[i] = 0x00;
+    }
+
+    std::vector<float> output(32);
+    IQ4_NLTensor::decodeBlock(block, output.data());
+
+    // All outputs should be 1.0f * kvalues_iq4nl[0]
+    float expected = static_cast<float>(kvalues_iq4nl[0]);
+
+    for (size_t i = 0; i < 32; ++i)
+    {
+        EXPECT_FLOAT_EQ(output[i], expected)
+            << "Index " << i << " should be " << expected;
+    }
+}
+
+/**
+ * @brief Edge case: All nibbles = 15 (last lookup table entry)
+ */
+TEST_F(Test__IQ4_NLTensor, SIMD_EdgeCase_AllMaxIndices)
+{
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(2.0f);
+
+    // All nibbles = 15 -> all outputs = 2.0f * kvalues_iq4nl[15]
+    for (int i = 0; i < 16; ++i)
+    {
+        block.qs[i] = 0xFF;
+    }
+
+    std::vector<float> output(32);
+    IQ4_NLTensor::decodeBlock(block, output.data());
+
+    // All outputs should be 2.0f * kvalues_iq4nl[15]
+    float expected = 2.0f * static_cast<float>(kvalues_iq4nl[15]);
+
+    for (size_t i = 0; i < 32; ++i)
+    {
+        EXPECT_FLOAT_EQ(output[i], expected)
+            << "Index " << i << " should be " << expected;
+    }
+}
+
+/**
+ * @brief Edge case: Zero scale (all outputs should be 0.0f)
+ */
+TEST_F(Test__IQ4_NLTensor, SIMD_EdgeCase_ZeroScale)
+{
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(0.0f); // Zero scale
+
+    // Random nibble indices (shouldn't matter with zero scale)
+    for (int i = 0; i < 16; ++i)
+    {
+        block.qs[i] = (i * 17) % 256;
+    }
+
+    std::vector<float> output(32);
+    IQ4_NLTensor::decodeBlock(block, output.data());
+
+    // All outputs should be 0.0f
+    for (size_t i = 0; i < 32; ++i)
+    {
+        EXPECT_FLOAT_EQ(output[i], 0.0f)
+            << "Index " << i << " should be 0.0f with zero scale";
+    }
+}
+
+/**
+ * @brief Edge case: Random nibbles across full range [0, 15]
+ */
+TEST_F(Test__IQ4_NLTensor, SIMD_EdgeCase_RandomNibbles)
+{
+    IQ4_NLBlock block;
+    block.d = fp32_to_fp16(1.5f);
+
+    // Random pattern covering all lookup table entries
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> dist(0, 15);
+
+    for (int i = 0; i < 16; ++i)
+    {
+        uint8_t low_nibble = dist(rng);
+        uint8_t high_nibble = dist(rng);
+        block.qs[i] = (high_nibble << 4) | low_nibble;
+    }
+
+    // Decode with scalar (reference) and main path
+    std::vector<float> scalar_output(32);
+    std::vector<float> main_output(32);
+
+    IQ4_NLTensor::decodeBlockScalar(block, scalar_output.data());
+    IQ4_NLTensor::decodeBlock(block, main_output.data());
+
+    // Should match exactly
+    constexpr float TOLERANCE = 1e-6f;
+    for (size_t i = 0; i < 32; ++i)
+    {
+        float diff = std::abs(scalar_output[i] - main_output[i]);
+        EXPECT_LT(diff, TOLERANCE)
+            << "Mismatch at index " << i
+            << ": scalar=" << scalar_output[i]
+            << ", main=" << main_output[i];
+    }
 }
 
 // =============================================================================

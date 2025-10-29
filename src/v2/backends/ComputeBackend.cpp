@@ -13,6 +13,7 @@
 
 #include "ComputeBackend.h"
 #include "../utils/DebugEnv.h"
+#include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
@@ -353,20 +354,18 @@ namespace llaminar2
         contexts_.resize(devices_.size(), nullptr);
 
         // Log discovered devices
-        std::cout << "[DeviceManager] Enumerated " << devices_.size() << " device(s):\n";
+        LOG_INFO("[DeviceManager] Enumerated " << devices_.size() << " device(s):");
         for (size_t i = 0; i < devices_.size(); ++i)
         {
             const auto &dev = devices_[i];
-            std::cout << "  [" << i << "] " << backend_type_name(dev.type)
-                      << " - " << dev.name
-                      << " (" << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB";
+            std::string device_info = "  [" + std::to_string(i) + "] " + backend_type_name(dev.type) + " - " + dev.name + " (" + std::to_string(dev.total_memory_bytes / (1024 * 1024 * 1024)) + " GB";
             if (dev.type != ComputeBackendType::CPU_OPENBLAS &&
                 dev.type != ComputeBackendType::CPU_MKL)
             {
-                std::cout << ", SM " << (dev.compute_capability / 10) << "."
-                          << (dev.compute_capability % 10);
+                device_info += ", SM " + std::to_string(dev.compute_capability / 10) + "." + std::to_string(dev.compute_capability % 10);
             }
-            std::cout << ")\n";
+            device_info += ")";
+            LOG_INFO(device_info);
         }
     }
 
@@ -374,7 +373,7 @@ namespace llaminar2
     {
         if (device_index >= devices_.size())
         {
-            std::cerr << "[DeviceManager] Invalid device index: " << device_index << "\n";
+            LOG_ERROR("[DeviceManager] Invalid device index: " << device_index << "");
             return nullptr;
         }
 
@@ -407,15 +406,15 @@ namespace llaminar2
             auto cuda_ctx = std::make_shared<CUDAComputeContext>();
             if (cudaSetDevice(device.device_id) != cudaSuccess)
             {
-                std::cerr << "[DeviceManager] Failed to set CUDA device "
-                          << device.device_id << "\n";
+                LOG_ERROR("[DeviceManager] Failed to set CUDA device "
+                          << device.device_id << "");
                 return nullptr;
             }
 
             cudaStream_t stream;
             if (cudaStreamCreate(&stream) != cudaSuccess)
             {
-                std::cerr << "[DeviceManager] Failed to create CUDA stream\n";
+                LOG_ERROR("[DeviceManager] Failed to create CUDA stream");
                 return nullptr;
             }
             cuda_ctx->stream = stream;
@@ -424,7 +423,7 @@ namespace llaminar2
             cublasHandle_t cublas_handle;
             if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
             {
-                std::cerr << "[DeviceManager] Failed to create cuBLAS handle\n";
+                LOG_ERROR("[DeviceManager] Failed to create cuBLAS handle");
                 cudaStreamDestroy(stream);
                 return nullptr;
             }
@@ -441,15 +440,15 @@ namespace llaminar2
             auto rocm_ctx = std::make_shared<ROCmComputeContext>();
             if (hipSetDevice(device.device_id) != hipSuccess)
             {
-                std::cerr << "[DeviceManager] Failed to set ROCm device "
-                          << device.device_id << "\n";
+                LOG_ERROR("[DeviceManager] Failed to set ROCm device "
+                          << device.device_id << "");
                 return nullptr;
             }
 
             hipStream_t stream;
             if (hipStreamCreate(&stream) != hipSuccess)
             {
-                std::cerr << "[DeviceManager] Failed to create HIP stream\n";
+                LOG_ERROR("[DeviceManager] Failed to create HIP stream");
                 return nullptr;
             }
             rocm_ctx->stream = stream;
@@ -458,7 +457,7 @@ namespace llaminar2
             hipblasHandle_t hipblas_handle;
             if (hipblasCreate(&hipblas_handle) != HIPBLAS_STATUS_SUCCESS)
             {
-                std::cerr << "[DeviceManager] Failed to create hipBLAS handle\n";
+                LOG_ERROR("[DeviceManager] Failed to create hipBLAS handle");
                 hipStreamDestroy(stream);
                 return nullptr;
             }
@@ -473,24 +472,24 @@ namespace llaminar2
         case ComputeBackendType::GPU_VULKAN:
             // TODO: Vulkan context initialization
             ctx = std::make_shared<VulkanComputeContext>();
-            std::cerr << "[DeviceManager] Vulkan context creation not fully implemented\n";
+            LOG_ERROR("[DeviceManager] Vulkan context creation not fully implemented");
             break;
 #else
         case ComputeBackendType::GPU_VULKAN:
-            std::cerr << "[DeviceManager] Vulkan not available in this build\n";
+            LOG_ERROR("[DeviceManager] Vulkan not available in this build");
             return nullptr;
 #endif
 
         default:
-            std::cerr << "[DeviceManager] Unknown backend type\n";
+            LOG_ERROR("[DeviceManager] Unknown backend type");
             return nullptr;
         }
 
         // Cache context
         contexts_[device_index] = ctx;
 
-        std::cout << "[DeviceManager] Created context for device " << device_index
-                  << " (" << backend_type_name(device.type) << ")\n";
+        LOG_INFO("[DeviceManager] Created context for device " << device_index
+                                                               << " (" << backend_type_name(device.type) << ")");
 
         return ctx;
     }
@@ -511,7 +510,7 @@ namespace llaminar2
     {
         if (devices_.empty())
         {
-            std::cerr << "[DeviceManager] No devices available\n";
+            LOG_ERROR("[DeviceManager] No devices available");
             return 0;
         }
 
@@ -562,7 +561,7 @@ namespace llaminar2
         if (candidates.empty())
         {
             // Fall back to CPU
-            std::cout << "[DeviceManager] No suitable GPU found, using CPU\n";
+            LOG_INFO("[DeviceManager] No suitable GPU found, using CPU");
             return 0;
         }
 
@@ -576,9 +575,9 @@ namespace llaminar2
                   });
 
         size_t selected = candidates[0].index;
-        std::cout << "[DeviceManager] Auto-selected device " << selected
-                  << " (" << backend_type_name(devices_[selected].type)
-                  << "): " << devices_[selected].name << "\n";
+        LOG_INFO("[DeviceManager] Auto-selected device " << selected
+                                                         << " (" << backend_type_name(devices_[selected].type)
+                                                         << "): " << devices_[selected].name << "");
 
         return selected;
     }
@@ -683,8 +682,8 @@ namespace llaminar2
         cudaError_t err = cudaMalloc(&ptr, bytes);
         if (err != cudaSuccess)
         {
-            std::cerr << "[CUDA] Failed to allocate " << bytes << " bytes: "
-                      << cudaGetErrorString(err) << "\n";
+            LOG_ERROR("[CUDA] Failed to allocate " << bytes << " bytes: "
+                                                   << cudaGetErrorString(err) << "");
             return nullptr;
         }
         return ptr;
@@ -703,7 +702,7 @@ namespace llaminar2
         cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess)
         {
-            std::cerr << "[CUDA] copy_to_device failed: " << cudaGetErrorString(err) << "\n";
+            LOG_ERROR("[CUDA] copy_to_device failed: " << cudaGetErrorString(err) << "");
         }
     }
 
@@ -712,7 +711,7 @@ namespace llaminar2
         cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
         if (err != cudaSuccess)
         {
-            std::cerr << "[CUDA] copy_from_device failed: " << cudaGetErrorString(err) << "\n";
+            LOG_ERROR("[CUDA] copy_from_device failed: " << cudaGetErrorString(err) << "");
         }
     }
 
@@ -740,7 +739,7 @@ namespace llaminar2
         hipError_t err = hipMalloc(&ptr, bytes);
         if (err != hipSuccess)
         {
-            std::cerr << "[ROCm] Failed to allocate " << bytes << " bytes\n";
+            LOG_ERROR("[ROCm] Failed to allocate " << bytes << " bytes");
             return nullptr;
         }
         return ptr;
@@ -759,7 +758,7 @@ namespace llaminar2
         hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
         if (err != hipSuccess)
         {
-            std::cerr << "[ROCm] copy_to_device failed\n";
+            LOG_ERROR("[ROCm] copy_to_device failed");
         }
     }
 
@@ -768,7 +767,7 @@ namespace llaminar2
         hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
         if (err != hipSuccess)
         {
-            std::cerr << "[ROCm] copy_from_device failed\n";
+            LOG_ERROR("[ROCm] copy_from_device failed");
         }
     }
 
@@ -793,7 +792,7 @@ namespace llaminar2
     void *VulkanComputeContext::allocate(size_t bytes)
     {
         // TODO: Vulkan buffer allocation
-        std::cerr << "[Vulkan] allocate() not yet implemented\n";
+        LOG_ERROR("[Vulkan] allocate() not yet implemented");
         return nullptr;
     }
 
@@ -805,13 +804,13 @@ namespace llaminar2
     void VulkanComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
     {
         // TODO: Vulkan staging buffer upload
-        std::cerr << "[Vulkan] copy_to_device() not yet implemented\n";
+        LOG_ERROR("[Vulkan] copy_to_device() not yet implemented");
     }
 
     void VulkanComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
     {
         // TODO: Vulkan staging buffer download
-        std::cerr << "[Vulkan] copy_from_device() not yet implemented\n";
+        LOG_ERROR("[Vulkan] copy_from_device() not yet implemented");
     }
 
     void VulkanComputeContext::synchronize()

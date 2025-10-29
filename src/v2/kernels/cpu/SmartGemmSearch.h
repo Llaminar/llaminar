@@ -175,7 +175,7 @@ namespace llaminar
                  *
                  * Small matrices: AVX2 often faster (less frequency scaling penalty)
                  * Large matrices: AVX512 faster (more SIMD parallelism)
-                 * 
+                 *
                  * @param variant_name Name of variant (to check ISA)
                  * @param m Number of rows
                  * @param n Number of columns

@@ -1712,13 +1712,13 @@ TEST_F(Test__ModelLoader, LoadIQ4_XSTensor)
     file.write(reinterpret_cast<const char *>(&val_len), 8);
     file.write("test", 4);
 
-    // Tensor info: IQ4_XS (32×1 = 32 elements = 1 block × 18 bytes)
+    // Tensor info: IQ4_XS (256×1 = 256 elements = 1 super-block × 136 bytes)
     uint64_t name_len = 13;
     file.write(reinterpret_cast<const char *>(&name_len), 8);
     file.write("iq4_xs_tensor", 13);
     uint32_t n_dims = 2;
     file.write(reinterpret_cast<const char *>(&n_dims), 4);
-    uint64_t dims[2] = {32, 1};
+    uint64_t dims[2] = {256, 1};
     file.write(reinterpret_cast<const char *>(dims), 16);
     uint32_t tensor_type = 23; // IQ4_XS
     file.write(reinterpret_cast<const char *>(&tensor_type), 4);
@@ -1735,9 +1735,9 @@ TEST_F(Test__ModelLoader, LoadIQ4_XSTensor)
         cur++;
     }
 
-    // Tensor data: 1 block × 18 bytes
-    std::vector<uint8_t> iq4_xs_data(18, 0xAA);
-    file.write(reinterpret_cast<const char *>(iq4_xs_data.data()), 18);
+    // Tensor data: 1 super-block × 136 bytes
+    std::vector<uint8_t> iq4_xs_data(136, 0xAA);
+    file.write(reinterpret_cast<const char *>(iq4_xs_data.data()), 136);
     file.close();
 
     ModelLoader loader;

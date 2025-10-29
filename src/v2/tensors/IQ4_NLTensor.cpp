@@ -11,6 +11,7 @@
 #include "FP16Utils.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
+#include "../utils/Logger.h"
 #include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
 #include "../kernels/cpu/GemmAutoTuner.h"
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 
 // SIMD intrinsics
 #if defined(__AVX512F__)
@@ -34,7 +36,8 @@ namespace llaminar2
     // ========== Constructor & Destructor ==========
 
     IQ4_NLTensor::IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), raw_data_(raw_data), device_idx_(-1), device_blocks_(nullptr)
+        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr)
     {
         if (shape_.size() != 2)
         {
@@ -57,13 +60,113 @@ namespace llaminar2
         }
     }
 
+    // Private view constructor
+    IQ4_NLTensor::IQ4_NLTensor(const std::vector<size_t> &shape,
+                               const uint8_t *parent_raw_data,
+                               size_t byte_offset,
+                               std::shared_ptr<TensorBase> parent)
+        : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
+          view_byte_offset_(byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr)
+    {
+        // Views don't allocate raw_data_, they borrow via raw_data_ptr_
+    }
+
     IQ4_NLTensor::~IQ4_NLTensor()
     {
         // TODO: Free device_blocks_ if allocated
         if (device_blocks_)
         {
-            std::cerr << "[IQ4_NLTensor] TODO: Free device blocks in destructor\n";
+            LOG_DEBUG("[IQ4_NLTensor] TODO: Free device blocks in destructor");
         }
+    }
+
+    // ========== View Support ==========
+
+    std::shared_ptr<TensorBase> IQ4_NLTensor::create_view(
+        const std::vector<size_t> &new_shape,
+        size_t offset)
+    {
+        // 1. Validate new_shape is 2D
+        if (new_shape.size() != 2)
+        {
+            LOG_ERROR("[IQ4_NLTensor::create_view] ERROR: View must be 2D (got "
+                      << new_shape.size() << "D)");
+            return nullptr;
+        }
+
+        // 2. Validate K dimension matches parent (row-slice restriction)
+        if (new_shape[1] != shape_[1])
+        {
+            LOG_ERROR("[IQ4_NLTensor::create_view] ERROR: View must preserve K dimension (column count)\n"
+                      << "  Parent K: " << shape_[1] << ", View K: " << new_shape[1]);
+            return nullptr;
+        }
+
+        size_t K = shape_[1];
+
+        // 3. Validate offset is row-aligned
+        if (offset % K != 0)
+        {
+            LOG_ERROR("[IQ4_NLTensor::create_view] ERROR: Offset must be row-aligned (multiple of K="
+                      << K << ")\n"
+                      << "  Got offset: " << offset << " (not divisible by " << K << ")");
+            return nullptr;
+        }
+
+        // 4. Validate bounds
+        size_t start_row = offset / K;
+        size_t view_rows = new_shape[0];
+        if (start_row + view_rows > shape_[0])
+        {
+            LOG_ERROR("[IQ4_NLTensor::create_view] ERROR: View exceeds parent bounds\n"
+                      << "  Parent rows: " << shape_[0] << ", Start row: " << start_row
+                      << ", View rows: " << view_rows);
+            return nullptr;
+        }
+
+        // 5. Calculate byte offset in raw_data_
+        size_t blocks_per_row = (K + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+        size_t block_offset = start_row * blocks_per_row;
+        size_t byte_offset = block_offset * sizeof(IQ4_NLBlock);
+
+        // 6. Determine root parent and data pointer
+        std::shared_ptr<TensorBase> root_parent;
+        const uint8_t *root_data_ptr;
+        size_t root_byte_offset;
+
+        if (is_view_)
+        {
+            // Chain to existing parent
+            root_parent = parent_;
+            root_data_ptr = raw_data_ptr_;
+            root_byte_offset = view_byte_offset_ + byte_offset;
+        }
+        else
+        {
+            // This is the root parent
+            try
+            {
+                root_parent = shared_from_this();
+            }
+            catch (const std::bad_weak_ptr &e)
+            {
+                LOG_ERROR("[IQ4_NLTensor::create_view] ERROR: shared_from_this() failed - "
+                          << "object not managed by shared_ptr!\n"
+                          << "  Exception: " << e.what());
+                return nullptr;
+            }
+            root_data_ptr = raw_data_.data();
+            root_byte_offset = byte_offset;
+        }
+
+        // 7. Create view using private constructor
+        auto view_tensor = std::shared_ptr<IQ4_NLTensor>(new IQ4_NLTensor(
+            new_shape,
+            root_data_ptr,
+            root_byte_offset,
+            root_parent));
+
+        return view_tensor;
     }
 
     // ========== Shape and Metadata ==========
@@ -79,7 +182,7 @@ namespace llaminar2
     bool IQ4_NLTensor::set_device(int device_idx)
     {
         // TODO: Implement device transfer for quantized tensors
-        std::cerr << "[IQ4_NLTensor] set_device not yet implemented\n";
+        LOG_DEBUG("[IQ4_NLTensor] set_device not yet implemented");
         device_idx_ = device_idx;
         return true;
     }
@@ -138,7 +241,8 @@ namespace llaminar2
     {
         const size_t rows = shape_[0];
         const size_t cols = shape_[1];
-        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
         const size_t blocks_per_row = (cols + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
         const auto &env = debugEnv();
 
@@ -179,7 +283,8 @@ namespace llaminar2
     {
         const size_t rows = shape_[0];
         const size_t cols = shape_[1];
-        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
         const size_t blocks_per_row = (cols + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
 
         // Decode to FP32 first, then convert to BF16
@@ -217,7 +322,8 @@ namespace llaminar2
         // Use per-row block layout: each row has blocks_per_row contiguous blocks
         const int cols = shape_[1];
         const size_t blocks_per_row = (cols + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
         const IQ4_NLBlock *row_blocks = blocks + row_idx * blocks_per_row;
 
         // Decode all blocks for this row
@@ -246,7 +352,8 @@ namespace llaminar2
         size_t start_block = offset / IQ4_NLBlock::BLOCK_SIZE;
         size_t end_block = (offset + count - 1) / IQ4_NLBlock::BLOCK_SIZE;
 
-        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
 
         size_t buffer_offset = 0;
         for (size_t block_idx = start_block; block_idx <= end_block; ++block_idx)
@@ -264,12 +371,69 @@ namespace llaminar2
         }
     }
 
+    void IQ4_NLTensor::to_fp16(uint16_t *dst) const
+    {
+        // Decode to FP32 first, then convert to FP16
+        const size_t count = element_count();
+        std::vector<float> temp_fp32(count);
+        decode_to_fp32(temp_fp32.data());
+
+#pragma omp parallel for
+        for (size_t i = 0; i < count; ++i)
+        {
+            dst[i] = fp32_to_fp16(temp_fp32[i]);
+        }
+    }
+
+    void IQ4_NLTensor::to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size) const
+    {
+        // Decode to FP32 first, then quantize to int8
+        const size_t total_elements = element_count();
+        std::vector<float> temp_fp32(total_elements);
+        decode_to_fp32(temp_fp32.data());
+
+        const size_t num_blocks = (total_elements + block_size - 1) / block_size;
+
+#pragma omp parallel for
+        for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
+        {
+            const size_t offset = block_idx * block_size;
+            const size_t count = std::min(block_size, total_elements - offset);
+
+            // Find max absolute value in block
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(temp_fp32[offset + i]));
+            }
+
+            // Compute scale factor (avoid division by zero)
+            const float scale = (max_abs > 1e-10f) ? (127.0f / max_abs) : 0.0f;
+            dst_scales[block_idx] = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+            // Quantize block to int8 with rounding
+            for (size_t i = 0; i < count; ++i)
+            {
+                const float val = temp_fp32[offset + i] * scale;
+                const float clamped = std::max(-127.0f, std::min(127.0f, val));
+                dst_int8[offset + i] = static_cast<int8_t>(std::round(clamped));
+            }
+
+            // Zero-fill partial block tail (if any)
+            for (size_t i = count; i < block_size; ++i)
+            {
+                dst_int8[offset + i] = 0;
+            }
+        }
+    }
+
     // ========== Fused Kernel Helpers ==========
 
     const IQ4_NLBlock &IQ4_NLTensor::get_block_at(size_t row_idx, size_t k_block_offset) const
     {
         const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
         const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
         return blocks[block_idx];
     }
@@ -277,7 +441,8 @@ namespace llaminar2
     void IQ4_NLTensor::decode_tile_blocks(size_t row_start, size_t tile_n, size_t k_block_offset, float *output) const
     {
         const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
 
         for (size_t r = 0; r < tile_n; ++r)
         {
@@ -297,14 +462,7 @@ namespace llaminar2
         // Optional direct decode bypasses SIMD helper temp buffer
         if (env.dequant.iq4_direct_decode)
         {
-            const float d = simd::fp16_to_fp32(block.d);
-#pragma omp simd
-            for (size_t j = 0; j < 16; ++j)
-            {
-                const uint8_t qbyte = block.qs[j];
-                output[j] = d * static_cast<float>(kvalues_iq4nl[qbyte & 0x0F]);
-                output[j + 16] = d * static_cast<float>(kvalues_iq4nl[qbyte >> 4]);
-            }
+            decodeBlockScalar(block, output);
             return;
         }
 
@@ -325,6 +483,11 @@ namespace llaminar2
 #endif
 
         // Scalar fallback
+        decodeBlockScalar(block, output);
+    }
+
+    void IQ4_NLTensor::decodeBlockScalar(const IQ4_NLBlock &block, float *output)
+    {
         const float d = simd::fp16_to_fp32(block.d);
 
 #pragma omp simd
@@ -422,7 +585,7 @@ namespace llaminar2
     {
         // TODO: Implement experimental microkernel
         // For now, fall back to standard decode
-        std::cerr << "[IQ4_NLTensor] Microkernel not yet implemented, using standard path\n";
+        LOG_DEBUG("[IQ4_NLTensor] Microkernel not yet implemented, using standard path");
 
 #pragma omp parallel for schedule(static) if (rows > 4)
         for (int row = 0; row < rows; ++row)
@@ -449,7 +612,7 @@ namespace llaminar2
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
-        std::cerr << "[IQ4_NLTensor::copyFrom] Not implemented\n";
+        LOG_ERROR("[IQ4_NLTensor::copyFrom] Not implemented");
         return false;
     }
 

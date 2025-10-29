@@ -137,7 +137,7 @@ namespace llaminar2
         case GGUFTensorType::IQ2_S:
             return 82;
         case GGUFTensorType::IQ4_XS:
-            return 18;
+            return 136; // IQ4_XS uses 256-element super-blocks (136 bytes), not 32-element blocks
         case GGUFTensorType::IQ1_M:
             return 56;
         default:
@@ -155,8 +155,8 @@ namespace llaminar2
         case GGUFTensorType::Q5_1:
         case GGUFTensorType::Q8_0:
         case GGUFTensorType::IQ4_NL:
-        case GGUFTensorType::IQ4_XS:
             return 32;
+        case GGUFTensorType::IQ4_XS: // IQ4_XS uses 256-element super-blocks like K-quants
         case GGUFTensorType::Q2_K:
         case GGUFTensorType::Q3_K:
         case GGUFTensorType::Q4_K:
@@ -252,6 +252,19 @@ namespace llaminar2
         // Extract model hyperparameters from metadata
         extractModelMetadata();
 
+        // Check for multi-part GGUF metadata
+        auto split_count_it = model_.metadata.find("split.count");
+        if (split_count_it != model_.metadata.end())
+        {
+            model_.split_count = static_cast<uint16_t>(split_count_it->second.asUInt32());
+        }
+
+        auto split_no_it = model_.metadata.find("split.no");
+        if (split_no_it != model_.metadata.end())
+        {
+            model_.split_no = static_cast<uint16_t>(split_no_it->second.asUInt32());
+        }
+
         // Calculate data offset (32-byte aligned after header/metadata)
         std::streampos pos = file_stream_.tellg();
         uint64_t cur = static_cast<uint64_t>(pos);
@@ -270,6 +283,16 @@ namespace llaminar2
 
         model_.data_offset = aligned;
 
+        // Load additional split files if this is a multi-part GGUF
+        if (model_.split_count > 1)
+        {
+            if (!loadSplitFiles())
+            {
+                LOG_ERROR("[ModelLoader] Failed to load split files");
+                return false;
+            }
+        }
+
         LOG_INFO("[ModelLoader] Loaded " << file_path);
         LOG_INFO("  Architecture: " << model_.architecture);
         LOG_INFO("  Layers: " << model_.block_count);
@@ -277,6 +300,10 @@ namespace llaminar2
         LOG_INFO("  Vocab size: " << model_.vocab_size);
         LOG_INFO("  Heads: " << model_.head_count << " (KV: " << model_.head_count_kv << ")");
         LOG_INFO("  Tensors: " << model_.tensor_count);
+        if (model_.split_count > 1)
+        {
+            LOG_INFO("  Split files: " << model_.split_count);
+        }
 
         loaded_ = true;
         return true;
@@ -298,9 +325,34 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Select correct file stream based on split index
+        std::ifstream *stream = &file_stream_;
+        uint64_t data_offset = model_.data_offset;
+
+        if (model_.split_count > 1)
+        {
+            if (info->split_idx == 0)
+            {
+                // Tensor in main file
+                stream = &file_stream_;
+                data_offset = model_.split_data_offsets[0];
+            }
+            else if (info->split_idx < model_.split_count)
+            {
+                // Tensor in split file
+                stream = &split_streams_[info->split_idx - 1];
+                data_offset = model_.split_data_offsets[info->split_idx];
+            }
+            else
+            {
+                LOG_ERROR("[ModelLoader] Invalid split index " << info->split_idx << " for tensor: " << tensor_name);
+                return nullptr;
+            }
+        }
+
         // Seek to tensor data
-        file_stream_.seekg(model_.data_offset + info->offset, std::ios::beg);
-        if (!file_stream_)
+        stream->seekg(data_offset + info->offset, std::ios::beg);
+        if (!(*stream))
         {
             LOG_ERROR("[ModelLoader] Failed to seek to tensor: " << tensor_name);
             return nullptr;
@@ -308,7 +360,7 @@ namespace llaminar2
 
         // Read raw bytes
         std::vector<uint8_t> raw(info->size_bytes);
-        if (!file_stream_.read(reinterpret_cast<char *>(raw.data()), raw.size()))
+        if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
         {
             LOG_ERROR("[ModelLoader] Failed to read tensor data: " << tensor_name);
             return nullptr;
@@ -512,6 +564,28 @@ namespace llaminar2
             }
             break;
 
+        case GGUFTensorType::Q5_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_0, shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_0Tensor>(shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_1:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_1, shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_1Tensor>(shape, raw);
+            }
+            break;
+
         // K-quant formats (6-bit, 5-bit, 3-bit, 2-bit with hierarchical scales)
         case GGUFTensorType::Q6_K:
             if (factory_)
@@ -580,8 +654,8 @@ namespace llaminar2
             break;
 
         default:
-            std::cerr << "[ModelLoader] Unsupported tensor type: "
-                      << static_cast<int>(info->type) << " for tensor: " << tensor_name << std::endl;
+            LOG_ERROR("[ModelLoader] Unsupported tensor type: "
+                      << static_cast<int>(info->type) << " for tensor: " << tensor_name);
             return nullptr;
         }
 
@@ -623,9 +697,9 @@ namespace llaminar2
             return false;
         }
 
-        std::cout << "[ModelLoader] Header: version=" << model_.version
-                  << ", tensors=" << model_.tensor_count
-                  << ", metadata=" << model_.metadata_kv_count << std::endl;
+        LOG_DEBUG("[ModelLoader] Header: version=" << model_.version
+                                                   << ", tensors=" << model_.tensor_count
+                                                   << ", metadata=" << model_.metadata_kv_count);
 
         return true;
     }
@@ -845,8 +919,8 @@ namespace llaminar2
             {
                 if (!readValue(tensor.dimensions[j]))
                 {
-                    std::cerr << "[ModelLoader] Failed to read dimension " << j
-                              << " for: " << tensor.name << std::endl;
+                    LOG_ERROR("[ModelLoader] Failed to read dimension " << j
+                                                                        << " for: " << tensor.name);
                     return false;
                 }
             }
@@ -901,10 +975,13 @@ namespace llaminar2
             }
             else
             {
-                std::cerr << "[ModelLoader] Unknown tensor type: " << type_val
-                          << " for: " << tensor.name << std::endl;
+                LOG_ERROR("[ModelLoader] Unknown tensor type: " << type_val
+                                                                << " for: " << tensor.name);
                 return false;
             }
+
+            // Initialize split index to 0 (main file) - will be updated by loadSplitFiles() if needed
+            tensor.split_idx = 0;
         }
 
         return true;
@@ -1007,6 +1084,240 @@ namespace llaminar2
         LOG_INFO("  head_count_kv: " << model_.head_count_kv);
         LOG_INFO("  vocab_size: " << model_.vocab_size);
         LOG_INFO("  rope_theta: " << model_.rope_theta);
+    }
+
+    // =============================================================================
+    // MULTI-PART GGUF HELPERS
+    // =============================================================================
+
+    std::string ModelLoader::generateSplitPath(const std::string &base_path, uint16_t split_no, uint16_t split_count)
+    {
+        // Extract directory and filename without extension
+        size_t last_slash = base_path.find_last_of("/\\");
+        std::string dir = (last_slash != std::string::npos) ? base_path.substr(0, last_slash + 1) : "";
+        std::string filename = (last_slash != std::string::npos) ? base_path.substr(last_slash + 1) : base_path;
+
+        // Remove .gguf extension if present
+        size_t gguf_pos = filename.rfind(".gguf");
+        std::string prefix = (gguf_pos != std::string::npos) ? filename.substr(0, gguf_pos) : filename;
+
+        // Format: prefix-00001-of-00005.gguf (1-based indexing for filename)
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer), "%s%s-%05d-of-%05d.gguf",
+                 dir.c_str(), prefix.c_str(), split_no + 1, split_count);
+        return std::string(buffer);
+    }
+
+    bool ModelLoader::parseSplitPath(const std::string &split_path, std::string &prefix,
+                                     uint16_t &split_no, uint16_t &split_count)
+    {
+        // Look for pattern: prefix-NNNNN-of-MMMMM.gguf
+        size_t gguf_pos = split_path.rfind(".gguf");
+        if (gguf_pos == std::string::npos)
+            return false;
+
+        std::string without_ext = split_path.substr(0, gguf_pos);
+
+        // Find last "-of-"
+        size_t of_pos = without_ext.rfind("-of-");
+        if (of_pos == std::string::npos)
+            return false;
+
+        // Extract split count (after "-of-")
+        std::string count_str = without_ext.substr(of_pos + 4);
+        split_count = static_cast<uint16_t>(std::stoul(count_str));
+
+        // Find second-to-last dash (before split number)
+        size_t second_dash = without_ext.rfind('-', of_pos - 1);
+        if (second_dash == std::string::npos)
+            return false;
+
+        // Extract split number (1-based in filename, convert to 0-based)
+        std::string num_str = without_ext.substr(second_dash + 1, of_pos - second_dash - 1);
+        split_no = static_cast<uint16_t>(std::stoul(num_str)) - 1;
+
+        // Extract prefix
+        prefix = without_ext.substr(0, second_dash);
+
+        return true;
+    }
+
+    bool ModelLoader::loadSplitFiles()
+    {
+        // Check if this is a split model
+        if (model_.split_count <= 1)
+            return true; // Single file, nothing to do
+
+        LOG_INFO("[ModelLoader] Loading multi-part GGUF: " << model_.split_count << " splits");
+
+        // Verify main file is split 0
+        if (model_.split_no != 0)
+        {
+            LOG_ERROR("[ModelLoader] Main file must be split 0, got split " << model_.split_no);
+            return false;
+        }
+
+        // Generate paths for all splits
+        model_.split_paths.resize(model_.split_count);
+        model_.split_data_offsets.resize(model_.split_count);
+
+        model_.split_paths[0] = file_path_;
+        model_.split_data_offsets[0] = model_.data_offset;
+
+        // Load additional split files (1 to split_count-1)
+        split_streams_.resize(model_.split_count - 1);
+
+        for (uint16_t idx = 1; idx < model_.split_count; ++idx)
+        {
+            std::string split_path = generateSplitPath(file_path_, idx, model_.split_count);
+            model_.split_paths[idx] = split_path;
+
+            LOG_INFO("[ModelLoader] Loading split " << idx << ": " << split_path);
+
+            // Open split file
+            split_streams_[idx - 1].open(split_path, std::ios::binary);
+            if (!split_streams_[idx - 1])
+            {
+                LOG_ERROR("[ModelLoader] Failed to open split file: " << split_path);
+                return false;
+            }
+
+            // Parse split header to get tensor info
+            std::ifstream &stream = split_streams_[idx - 1];
+
+            // Read GGUF magic
+            uint32_t magic;
+            stream.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+            if (magic != 0x46554747) // "GGUF"
+            {
+                LOG_ERROR("[ModelLoader] Invalid GGUF magic in split " << idx);
+                return false;
+            }
+
+            // Read version
+            uint32_t version;
+            stream.read(reinterpret_cast<char *>(&version), sizeof(version));
+
+            // Read tensor and metadata counts
+            uint64_t tensor_count, kv_count;
+            stream.read(reinterpret_cast<char *>(&tensor_count), sizeof(tensor_count));
+            stream.read(reinterpret_cast<char *>(&kv_count), sizeof(kv_count));
+
+            // Skip metadata KV pairs
+            for (uint64_t i = 0; i < kv_count; ++i)
+            {
+                // Skip key
+                uint64_t key_len;
+                stream.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
+                stream.seekg(key_len, std::ios::cur);
+
+                // Skip value type
+                uint32_t value_type;
+                stream.read(reinterpret_cast<char *>(&value_type), sizeof(value_type));
+
+                // Skip value data (complex, but we can estimate)
+                // For simplicity, read and discard based on type
+                // This is a simplified version - full implementation would parse all types
+                switch (value_type)
+                {
+                case 4: // UINT32
+                    stream.seekg(4, std::ios::cur);
+                    break;
+                case 5: // INT32
+                    stream.seekg(4, std::ios::cur);
+                    break;
+                case 6: // FLOAT32
+                    stream.seekg(4, std::ios::cur);
+                    break;
+                case 8: // STRING
+                {
+                    uint64_t str_len;
+                    stream.read(reinterpret_cast<char *>(&str_len), sizeof(str_len));
+                    stream.seekg(str_len, std::ios::cur);
+                    break;
+                }
+                case 9: // ARRAY
+                {
+                    uint32_t arr_type;
+                    uint64_t arr_len;
+                    stream.read(reinterpret_cast<char *>(&arr_type), sizeof(arr_type));
+                    stream.read(reinterpret_cast<char *>(&arr_len), sizeof(arr_len));
+                    // Skip array elements (simplified)
+                    size_t elem_size = (arr_type == 4 || arr_type == 5 || arr_type == 6) ? 4 : 8;
+                    stream.seekg(elem_size * arr_len, std::ios::cur);
+                    break;
+                }
+                default:
+                    stream.seekg(8, std::ios::cur); // Guess
+                }
+            }
+
+            // Parse tensor info from this split
+            for (uint64_t i = 0; i < tensor_count; ++i)
+            {
+                GGUFTensorInfo info;
+
+                // Read tensor name
+                uint64_t name_len;
+                stream.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
+                info.name.resize(name_len);
+                stream.read(&info.name[0], name_len);
+
+                // Read n_dims
+                uint32_t n_dims;
+                stream.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
+
+                // Read dimensions
+                info.dimensions.resize(n_dims);
+                for (uint32_t d = 0; d < n_dims; ++d)
+                {
+                    stream.read(reinterpret_cast<char *>(&info.dimensions[d]), sizeof(uint64_t));
+                }
+
+                // Read tensor type
+                uint32_t type_val;
+                stream.read(reinterpret_cast<char *>(&type_val), sizeof(type_val));
+                info.type = static_cast<GGUFTensorType>(type_val);
+
+                // Read offset
+                stream.read(reinterpret_cast<char *>(&info.offset), sizeof(info.offset));
+
+                // Calculate size
+                info.size_bytes = 1;
+                for (auto dim : info.dimensions)
+                {
+                    info.size_bytes *= dim;
+                }
+                size_t type_size = info.getTypeSize();
+                size_t block_size = info.getBlockSize();
+                if (block_size > 0)
+                {
+                    info.size_bytes = (info.size_bytes / block_size) * type_size;
+                }
+                else
+                {
+                    info.size_bytes *= type_size;
+                }
+
+                // Mark which split this tensor belongs to
+                info.split_idx = idx;
+
+                // Add to model's tensor list
+                model_.tensors.push_back(info);
+            }
+
+            // Calculate data offset (32-byte aligned)
+            std::streampos pos = stream.tellg();
+            uint64_t cur = static_cast<uint64_t>(pos);
+            uint64_t align = model_.alignment ? model_.alignment : 32;
+            uint64_t aligned = (cur + align - 1) / align * align;
+            model_.split_data_offsets[idx] = aligned;
+
+            LOG_INFO("[ModelLoader] Split " << idx << " has " << tensor_count << " tensors");
+        }
+
+        LOG_INFO("[ModelLoader] Total tensors across all splits: " << model_.tensors.size());
+        return true;
     }
 
 } // namespace llaminar2

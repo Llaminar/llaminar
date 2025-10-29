@@ -368,3 +368,272 @@ TEST(Test__BF16Tensor, CreateGemmNotNull)
     ASSERT_NE(gemm, nullptr);
     EXPECT_TRUE(gemm->supports_device(-1)); // Should support CPU
 }
+
+// ========== View Tests ==========
+
+/**
+ * @brief Test basic view creation
+ */
+TEST(Test__BF16Tensor, BasicViewCreation)
+{
+    // Create parent tensor [10, 20] = 200 elements
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    // Fill with test data (0, 1, 2, ..., 199)
+    std::vector<float> test_data(200);
+    for (size_t i = 0; i < 200; ++i)
+    {
+        test_data[i] = static_cast<float>(i);
+    }
+    parent->from_fp32(test_data.data(), 200);
+
+    // Create a view of first 5 rows
+    auto view = parent->create_view({5, 20}, 0);
+
+    ASSERT_NE(view, nullptr) << "View creation failed";
+    EXPECT_EQ(view->shape().size(), 2);
+    EXPECT_EQ(view->shape()[0], 5);
+    EXPECT_EQ(view->shape()[1], 20);
+    EXPECT_TRUE(view->is_view());
+
+    // Verify data pointer is valid
+    const float *view_data = view->data();
+    ASSERT_NE(view_data, nullptr) << "View data pointer is null";
+
+    // Verify first element (BF16 tolerance)
+    EXPECT_NEAR(view_data[0], 0.0f, 0.1f);
+}
+
+/**
+ * @brief Test view creation with offset
+ */
+TEST(Test__BF16Tensor, ViewWithOffset)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    // Fill with test data
+    std::vector<float> test_data(200);
+    for (size_t i = 0; i < 200; ++i)
+    {
+        test_data[i] = static_cast<float>(i);
+    }
+    parent->from_fp32(test_data.data(), 200);
+
+    // Create a view starting at element 100 (row 5)
+    auto view = parent->create_view({3, 20}, 100);
+
+    ASSERT_NE(view, nullptr);
+    EXPECT_TRUE(view->is_view());
+
+    const float *view_data = view->data();
+    ASSERT_NE(view_data, nullptr);
+
+    // First element should be ~100 (BF16 tolerance)
+    EXPECT_NEAR(view_data[0], 100.0f, 1.0f) << "First element should be ~100";
+}
+
+/**
+ * @brief Test view bounds checking
+ */
+TEST(Test__BF16Tensor, ViewBoundsChecking)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    // Try to create a view that exceeds parent bounds
+    auto view = parent->create_view({20, 20}, 0); // 400 elements > 200 available
+
+    EXPECT_EQ(view, nullptr) << "View creation should fail for out-of-bounds request";
+}
+
+/**
+ * @brief Test view with offset that exceeds bounds
+ */
+TEST(Test__BF16Tensor, ViewOffsetBoundsChecking)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    // Try to create a view with offset that exceeds bounds
+    auto view = parent->create_view({5, 20}, 150); // offset 150 + 100 elements > 200
+
+    EXPECT_EQ(view, nullptr) << "View creation should fail when offset + size exceeds bounds";
+}
+
+/**
+ * @brief Test view lifetime (parent stays alive via shared_ptr)
+ */
+TEST(Test__BF16Tensor, ViewLifetime)
+{
+    std::shared_ptr<TensorBase> view;
+    const float *view_data_ptr = nullptr;
+
+    {
+        auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+        std::vector<float> test_data(200);
+        for (size_t i = 0; i < 200; ++i)
+        {
+            test_data[i] = static_cast<float>(i * 2);
+        }
+        parent->from_fp32(test_data.data(), 200);
+
+        // Create view in inner scope
+        view = parent->create_view({5, 20}, 0);
+        ASSERT_NE(view, nullptr);
+        view_data_ptr = view->data();
+        ASSERT_NE(view_data_ptr, nullptr);
+
+        // parent goes out of scope here
+    }
+
+    // View still exists, should keep parent alive
+    EXPECT_NE(view->data(), nullptr) << "View data should still be valid";
+    EXPECT_TRUE(view->is_view());
+
+    // Data should still be accessible (BF16 tolerance)
+    const float *current_data = view->data();
+    EXPECT_NEAR(current_data[0], 0.0f, 0.1f) << "View data should still be accessible";
+}
+
+/**
+ * @brief Test view chaining (view of a view)
+ */
+TEST(Test__BF16Tensor, ViewChaining)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    std::vector<float> test_data(200);
+    for (size_t i = 0; i < 200; ++i)
+    {
+        test_data[i] = static_cast<float>(i);
+    }
+    parent->from_fp32(test_data.data(), 200);
+
+    // Create first view (rows 2-6)
+    auto view1 = parent->create_view({5, 20}, 40); // offset = 2 rows * 20 cols
+    ASSERT_NE(view1, nullptr);
+    EXPECT_TRUE(view1->is_view());
+
+    // Cast to BF16Tensor to create view of view
+    auto bf16_view1 = std::dynamic_pointer_cast<BF16Tensor>(view1);
+    ASSERT_NE(bf16_view1, nullptr);
+
+    // Create view of view (first 2 rows of view1)
+    auto view2 = bf16_view1->create_view({2, 20}, 0);
+    ASSERT_NE(view2, nullptr);
+    EXPECT_TRUE(view2->is_view());
+
+    // Verify view2 points to correct data in original parent
+    const float *view2_data = view2->data();
+    ASSERT_NE(view2_data, nullptr);
+
+    // First element should be ~40 (offset 40 in parent, BF16 tolerance)
+    EXPECT_NEAR(view2_data[0], 40.0f, 1.0f) << "Chained view should point to element 40";
+}
+
+/**
+ * @brief Test view data modification affects parent
+ */
+TEST(Test__BF16Tensor, ViewModification)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    std::vector<float> test_data(200, 1.0f);
+    parent->from_fp32(test_data.data(), 200);
+
+    // Create view
+    auto view = parent->create_view({5, 20}, 0);
+    ASSERT_NE(view, nullptr);
+
+    auto bf16_view = std::dynamic_pointer_cast<BF16Tensor>(view);
+    ASSERT_NE(bf16_view, nullptr);
+
+    // Modify through view
+    std::vector<float> new_data(100, 42.0f);
+    bf16_view->from_fp32(new_data.data(), 100);
+
+    // Verify parent data changed (BF16 tolerance)
+    const float *parent_data = parent->data();
+    EXPECT_NEAR(parent_data[0], 42.0f, 0.5f) << "Parent should reflect view modification";
+    EXPECT_NEAR(parent_data[99], 42.0f, 0.5f);
+}
+
+/**
+ * @brief Test view with different shape (reshape)
+ */
+TEST(Test__BF16Tensor, ViewReshape)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    std::vector<float> test_data(200);
+    for (size_t i = 0; i < 200; ++i)
+    {
+        test_data[i] = static_cast<float>(i);
+    }
+    parent->from_fp32(test_data.data(), 200);
+
+    // Create view with different shape but same total elements
+    auto view = parent->create_view({20, 10}, 0);
+
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape()[0], 20);
+    EXPECT_EQ(view->shape()[1], 10);
+
+    const float *view_data = view->data();
+    ASSERT_NE(view_data, nullptr);
+
+    // Data should still be accessible in new shape (BF16 tolerance)
+    EXPECT_NEAR(view_data[0], 0.0f, 0.1f);
+    EXPECT_NEAR(view_data[10], 10.0f, 0.5f);
+}
+
+/**
+ * @brief Test view of subset with reshape
+ */
+TEST(Test__BF16Tensor, ViewSubsetReshape)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    std::vector<float> test_data(200);
+    for (size_t i = 0; i < 200; ++i)
+    {
+        test_data[i] = static_cast<float>(i);
+    }
+    parent->from_fp32(test_data.data(), 200);
+
+    // Take 120 elements starting at offset 40, reshape to [6, 20]
+    auto view = parent->create_view({6, 20}, 40);
+
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape()[0], 6);
+    EXPECT_EQ(view->shape()[1], 20);
+
+    const float *view_data = view->data();
+    EXPECT_NEAR(view_data[0], 40.0f, 1.0f);
+}
+
+/**
+ * @brief Test multiple views of same parent
+ */
+TEST(Test__BF16Tensor, MultipleViews)
+{
+    auto parent = std::make_shared<BF16Tensor>(std::vector<size_t>{10, 20});
+
+    std::vector<float> test_data(200);
+    for (size_t i = 0; i < 200; ++i)
+    {
+        test_data[i] = static_cast<float>(i);
+    }
+    parent->from_fp32(test_data.data(), 200);
+
+    // Create multiple non-overlapping views
+    auto view1 = parent->create_view({3, 20}, 0);   // rows 0-2
+    auto view2 = parent->create_view({3, 20}, 60);  // rows 3-5
+    auto view3 = parent->create_view({4, 20}, 120); // rows 6-9
+
+    ASSERT_NE(view1, nullptr);
+    ASSERT_NE(view2, nullptr);
+    ASSERT_NE(view3, nullptr);
+
+    EXPECT_NEAR(view1->data()[0], 0.0f, 0.1f);
+    EXPECT_NEAR(view2->data()[0], 60.0f, 1.0f);
+    EXPECT_NEAR(view3->data()[0], 120.0f, 2.0f);
+}

@@ -1,0 +1,476 @@
+/**
+ * @file Test__IQ2_XSTensor.cpp
+ * @brief SIMD equivalency tests for IQ2_XS quantized tensor
+ *
+ * Tests that scalar, AVX2, and AVX512 decode implementations produce identical results.
+ *
+ * IQ2_XS Structure:
+ * - Block size: 256 elements (8 sub-blocks of 32 elements each)
+ * - Quantization: 2-bit using iq2xs_grid[512] lookup table (9-bit indices)
+ * - Scaling: FP16 global scale + 8 per-sub-block scales (4-bit each, 2 per byte)
+ * - Formula: output = db[l/2] * grid[j] * sign
+ *   where db[0/1] = d * (0.5 + (scales & 0xf / scales >> 4)) * 0.25
+ * - Block structure: 74 bytes = d(2) + qs[64] + scales[8]
+ * - Grid lookup: 9-bit grid indices (lower 9 bits of uint16_t qs)
+ * - Sign handling: 7-bit sign masks from ksigns_iq2xs table (upper 7 bits of qs)
+ *
+ * @author David Sanftenberg
+ */
+
+#include <gtest/gtest.h>
+#include "../../../../src/v2/tensors/Tensors.h"
+#include "../../../../src/v2/tensors/FP16Utils.h"
+#include "../../../../src/v2/tensors/IQQuantTables.h"
+#include <cmath>
+#include <cstring>
+#include <random>
+#include <random>
+
+using namespace llaminar2;
+
+class IQ2_XSSIMDTest : public ::testing::Test
+{
+protected:
+    std::mt19937 rng_;
+    static constexpr float TOLERANCE = 1e-6f;
+
+    // Helper: Create IQ2_XS block with specific pattern
+    IQ2_XSBlock createBlock(float scale, const std::vector<uint16_t> &qs_values, const std::vector<uint8_t> &scale_values)
+    {
+        IQ2_XSBlock block;
+        block.d = fp32_to_fp16(scale);
+
+        // Copy qs values (32 uint16_t for 256 elements)
+        if (qs_values.size() != 32)
+        {
+            throw std::invalid_argument("IQ2_XS requires exactly 32 uint16_t qs values");
+        }
+        std::memcpy(block.qs, qs_values.data(), 32 * sizeof(uint16_t));
+
+        // Copy per-sub-block scales (8 bytes, each containing 2 4-bit scales)
+        if (scale_values.size() != 8)
+        {
+            throw std::invalid_argument("IQ2_XS requires exactly 8 uint8_t scale values");
+        }
+        std::memcpy(block.scales, scale_values.data(), 8);
+
+        return block;
+    }
+
+    // Helper: Compare two float arrays
+    bool compareArrays(const float *a, const float *b, size_t count, float tolerance = TOLERANCE)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (std::fabs(a[i] - b[i]) > tolerance)
+            {
+                std::cerr << "Mismatch at index " << i << ": " << a[i] << " vs " << b[i]
+                          << " (diff: " << std::fabs(a[i] - b[i]) << ")" << std::endl;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @brief Create a random IQ2_XS tensor for GEMM testing
+     */
+    std::unique_ptr<IQ2_XSTensor> createRandomTensor(size_t rows, size_t cols)
+    {
+        std::vector<size_t> shape = {rows, cols};
+        size_t blocks_per_row = (cols + 255) / 256; // 256 elements per block
+        size_t total_blocks = rows * blocks_per_row;
+        std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ2_XSBlock));
+
+        std::uniform_real_distribution<float> scale_dist(0.1f, 2.0f);
+        std::uniform_int_distribution<uint8_t> byte_dist(0, 255);
+
+        for (size_t b = 0; b < total_blocks; ++b)
+        {
+            IQ2_XSBlock *block = reinterpret_cast<IQ2_XSBlock *>(raw_data.data() + b * sizeof(IQ2_XSBlock));
+            block->d = fp32_to_fp16(scale_dist(rng_));
+            // Randomize all other bytes in the block
+            uint8_t *block_bytes = reinterpret_cast<uint8_t *>(block);
+            for (size_t i = 2; i < sizeof(IQ2_XSBlock); ++i)
+            {
+                block_bytes[i] = byte_dist(rng_);
+            }
+        }
+
+        return std::make_unique<IQ2_XSTensor>(shape, raw_data);
+    }
+
+    /**
+     * @brief Compute reference GEMM: C = A @ B^T
+     */
+    void referenceGEMM(const float *A, const float *B, float *C,
+                       int m, int n, int k)
+    {
+        for (int i = 0; i < m; ++i)
+        {
+            for (int j = 0; j < n; ++j)
+            {
+                float sum = 0.0f;
+                for (int l = 0; l < k; ++l)
+                {
+                    sum += A[i * k + l] * B[j * k + l]; // B is [n, k]
+                }
+                C[i * n + j] = sum;
+            }
+        }
+    }
+
+    /**
+     * @brief Check if two matrices are approximately equal
+     */
+    bool matricesEqual(const float *A, const float *B, int size, float tolerance = 1e-4f)
+    {
+        for (int i = 0; i < size; ++i)
+        {
+            float diff = std::abs(A[i] - B[i]);
+            float rel_error = diff / (std::abs(A[i]) + 1e-8f);
+            if (diff > tolerance && rel_error > tolerance)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// ============================================================================
+// SIMD Equivalency Tests
+// ============================================================================
+
+TEST_F(IQ2_XSSIMDTest, ScalarVsAVX2Equivalency)
+{
+    // Create block with varying qs and scale values
+    std::vector<uint16_t> qs_values(32);
+    std::vector<uint8_t> scale_values(8);
+
+    for (size_t i = 0; i < 32; ++i)
+    {
+        // 9-bit grid index in lower bits, 7-bit sign pattern in upper bits
+        uint16_t grid_idx = (i * 13) % 512;    // 9-bit index
+        uint16_t sign_pattern = (i * 7) % 128; // 7-bit pattern
+        qs_values[i] = grid_idx | (sign_pattern << 9);
+    }
+
+    for (size_t i = 0; i < 8; ++i)
+    {
+        // Two 4-bit scales per byte
+        scale_values[i] = ((i * 3) % 16) | (((i * 5) % 16) << 4);
+    }
+
+    auto block = createBlock(1.5f, qs_values, scale_values);
+
+    float output_scalar[256];
+    float output_avx2[256];
+
+    IQ2_XSTensor::decodeBlockScalar(block, output_scalar);
+
+#ifdef __AVX2__
+    IQ2_XSTensor::decodeBlockAVX2(block, output_avx2);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx2, 256))
+        << "Scalar and AVX2 implementations should produce identical results";
+#else
+    GTEST_SKIP() << "AVX2 not available on this platform";
+#endif
+}
+
+TEST_F(IQ2_XSSIMDTest, ScalarVsAVX512Equivalency)
+{
+    // Different pattern from AVX2 test
+    std::vector<uint16_t> qs_values(32);
+    std::vector<uint8_t> scale_values(8);
+
+    for (size_t i = 0; i < 32; ++i)
+    {
+        uint16_t grid_idx = (i * 17) % 512;
+        uint16_t sign_pattern = (i * 11) % 128;
+        qs_values[i] = grid_idx | (sign_pattern << 9);
+    }
+
+    for (size_t i = 0; i < 8; ++i)
+    {
+        scale_values[i] = ((i * 7) % 16) | (((i * 11) % 16) << 4);
+    }
+
+    auto block = createBlock(2.0f, qs_values, scale_values);
+
+    float output_scalar[256];
+    float output_avx512[256];
+
+    IQ2_XSTensor::decodeBlockScalar(block, output_scalar);
+
+#ifdef __AVX512F__
+    IQ2_XSTensor::decodeBlockAVX512(block, output_avx512);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx512, 256))
+        << "Scalar and AVX512 implementations should produce identical results";
+#else
+    GTEST_SKIP() << "AVX512 not available on this platform";
+#endif
+}
+
+TEST_F(IQ2_XSSIMDTest, AVX2VsAVX512Equivalency)
+{
+#if defined(__AVX2__) && defined(__AVX512F__)
+    std::vector<uint16_t> qs_values(32);
+    std::vector<uint8_t> scale_values(8);
+
+    for (size_t i = 0; i < 32; ++i)
+    {
+        uint16_t grid_idx = (i * 23) % 512;
+        uint16_t sign_pattern = (i * 29) % 128;
+        qs_values[i] = grid_idx | (sign_pattern << 9);
+    }
+
+    for (size_t i = 0; i < 8; ++i)
+    {
+        scale_values[i] = ((i * 13) % 16) | (((i * 17) % 16) << 4);
+    }
+
+    auto block = createBlock(0.75f, qs_values, scale_values);
+
+    float output_avx2[256];
+    float output_avx512[256];
+
+    IQ2_XSTensor::decodeBlockAVX2(block, output_avx2);
+    IQ2_XSTensor::decodeBlockAVX512(block, output_avx512);
+
+    EXPECT_TRUE(compareArrays(output_avx2, output_avx512, 256))
+        << "AVX2 and AVX512 implementations should produce identical results";
+#else
+    GTEST_SKIP() << "Both AVX2 and AVX512 required for this test";
+#endif
+}
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+TEST_F(IQ2_XSSIMDTest, EdgeCase_ZeroScale)
+{
+    std::vector<uint16_t> qs_values(32, 0);
+    std::vector<uint8_t> scale_values(8, 0);
+    auto block = createBlock(0.0f, qs_values, scale_values);
+
+    float output[256];
+    IQ2_XSTensor::decodeBlockScalar(block, output);
+
+    // With zero scale, all outputs should be zero
+    for (size_t i = 0; i < 256; ++i)
+    {
+        EXPECT_FLOAT_EQ(output[i], 0.0f) << "Zero scale should produce zero output at index " << i;
+    }
+}
+
+TEST_F(IQ2_XSSIMDTest, EdgeCase_AllZeroIndices)
+{
+    // All grid indices = 0 (maps to iq2xs_grid[0])
+    std::vector<uint16_t> qs_values(32, 0);
+    std::vector<uint8_t> scale_values(8, 0x77); // Scale = 7 in both nibbles
+
+    auto block = createBlock(1.0f, qs_values, scale_values);
+
+    float output_scalar[256];
+    IQ2_XSTensor::decodeBlockScalar(block, output_scalar);
+
+#ifdef __AVX2__
+    float output_avx2[256];
+    IQ2_XSTensor::decodeBlockAVX2(block, output_avx2);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx2, 256));
+#endif
+
+#ifdef __AVX512F__
+    float output_avx512[256];
+    IQ2_XSTensor::decodeBlockAVX512(block, output_avx512);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx512, 256));
+#endif
+}
+
+TEST_F(IQ2_XSSIMDTest, EdgeCase_AllMaxIndices)
+{
+    // All grid indices = 511 (9-bit max)
+    std::vector<uint16_t> qs_values(32);
+    for (size_t i = 0; i < 32; ++i)
+    {
+        qs_values[i] = 511 | (127 << 9); // Max grid index + max sign pattern
+    }
+    std::vector<uint8_t> scale_values(8, 0xFF); // Max scales
+
+    auto block = createBlock(1.0f, qs_values, scale_values);
+
+    float output_scalar[256];
+    IQ2_XSTensor::decodeBlockScalar(block, output_scalar);
+
+#ifdef __AVX2__
+    float output_avx2[256];
+    IQ2_XSTensor::decodeBlockAVX2(block, output_avx2);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx2, 256));
+#endif
+
+#ifdef __AVX512F__
+    float output_avx512[256];
+    IQ2_XSTensor::decodeBlockAVX512(block, output_avx512);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx512, 256));
+#endif
+}
+
+TEST_F(IQ2_XSSIMDTest, EdgeCase_MaxScale)
+{
+    std::vector<uint16_t> qs_values(32);
+    for (size_t i = 0; i < 32; ++i)
+    {
+        qs_values[i] = ((i * 19) % 512) | (((i * 23) % 128) << 9);
+    }
+    std::vector<uint8_t> scale_values(8);
+    for (size_t i = 0; i < 8; ++i)
+    {
+        scale_values[i] = ((i * 3) % 16) | (((i * 5) % 16) << 4);
+    }
+
+    // Use a large but valid FP16 value
+    auto block = createBlock(65504.0f, qs_values, scale_values);
+
+    float output_scalar[256];
+    IQ2_XSTensor::decodeBlockScalar(block, output_scalar);
+
+#ifdef __AVX2__
+    float output_avx2[256];
+    IQ2_XSTensor::decodeBlockAVX2(block, output_avx2);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx2, 256));
+#endif
+
+#ifdef __AVX512F__
+    float output_avx512[256];
+    IQ2_XSTensor::decodeBlockAVX512(block, output_avx512);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx512, 256));
+#endif
+}
+
+// =============================================================================
+// GEMM Tests
+// =============================================================================
+
+TEST_F(IQ2_XSSIMDTest, GEMM_SmallBatch)
+{
+    auto tensor = createRandomTensor(8, 256); // 8 output features, 256 input features (1 block per row)
+
+    auto gemm = tensor->createGemm();
+    ASSERT_NE(gemm, nullptr);
+
+    // A: [4, 256] - 4 input sequences
+    std::vector<float> A(4 * 256);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &v : A)
+        v = dist(rng_);
+
+    // C: [4, 8] - result
+    std::vector<float> C(4 * 8, 0.0f);
+
+    bool success = gemm->multiply(A.data(), C.data(), 4, 8, 256, true);
+    ASSERT_TRUE(success);
+
+    // Reference computation
+    std::vector<float> B_decoded(8 * 256);
+    tensor->to_fp32(B_decoded.data());
+
+    std::vector<float> C_expected(4 * 8, 0.0f);
+    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 4, 8, 256);
+
+    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 4 * 8, 1e-3f));
+}
+
+TEST_F(IQ2_XSSIMDTest, GEMM_MediumBatch)
+{
+    auto tensor = createRandomTensor(16, 512); // 16 output features, 512 input features (2 blocks per row)
+
+    auto gemm = tensor->createGemm();
+
+    // A: [16, 512]
+    std::vector<float> A(16 * 512);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (auto &v : A)
+        v = dist(rng_);
+
+    // C: [16, 16]
+    std::vector<float> C(16 * 16, 0.0f);
+
+    bool success = gemm->multiply(A.data(), C.data(), 16, 16, 512, true);
+    ASSERT_TRUE(success);
+
+    // Reference
+    std::vector<float> B_decoded(16 * 512);
+    tensor->to_fp32(B_decoded.data());
+
+    std::vector<float> C_expected(16 * 16, 0.0f);
+    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 16, 16, 512);
+
+    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 16 * 16, 1e-3f));
+}
+
+TEST_F(IQ2_XSSIMDTest, GEMM_LargeBatch)
+{
+    auto tensor = createRandomTensor(32, 768); // 32 output features, 768 input features (3 blocks per row)
+
+    auto gemm = tensor->createGemm();
+
+    // A: [32, 768]
+    std::vector<float> A(32 * 768);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    for (auto &v : A)
+        v = dist(rng_);
+
+    // C: [32, 32]
+    std::vector<float> C(32 * 32, 0.0f);
+
+    bool success = gemm->multiply(A.data(), C.data(), 32, 32, 768, true);
+    ASSERT_TRUE(success);
+
+    // Reference
+    std::vector<float> B_decoded(32 * 768);
+    tensor->to_fp32(B_decoded.data());
+
+    std::vector<float> C_expected(32 * 32, 0.0f);
+    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 32, 32, 768);
+
+    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 32 * 32, 1e-3f));
+}
+
+TEST_F(IQ2_XSSIMDTest, EdgeCase_RandomValues)
+{
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> scale_dist(0.1f, 10.0f);
+    std::uniform_int_distribution<uint16_t> qs_dist(0, 0xFFFF);
+    std::uniform_int_distribution<uint8_t> scale_byte_dist(0, 0xFF);
+
+    std::vector<uint16_t> qs_values(32);
+    for (size_t i = 0; i < 32; ++i)
+    {
+        qs_values[i] = qs_dist(rng);
+    }
+
+    std::vector<uint8_t> scale_values(8);
+    for (size_t i = 0; i < 8; ++i)
+    {
+        scale_values[i] = scale_byte_dist(rng);
+    }
+
+    auto block = createBlock(scale_dist(rng), qs_values, scale_values);
+
+    float output_scalar[256];
+    IQ2_XSTensor::decodeBlockScalar(block, output_scalar);
+
+#ifdef __AVX2__
+    float output_avx2[256];
+    IQ2_XSTensor::decodeBlockAVX2(block, output_avx2);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx2, 256));
+#endif
+
+#ifdef __AVX512F__
+    float output_avx512[256];
+    IQ2_XSTensor::decodeBlockAVX512(block, output_avx512);
+    EXPECT_TRUE(compareArrays(output_scalar, output_avx512, 256));
+#endif
+}
