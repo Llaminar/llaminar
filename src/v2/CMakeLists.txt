@@ -14,10 +14,65 @@ endif()
 # Enable native CPU optimizations (AVX512/AVX2/FMA)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 
-# Backend options (default to OFF - enable explicitly when ready)
+# Backend options (temporarily disabled due to header conflicts - will enable separately)
+# CUDA and ROCm cannot be linked together due to type conflicts in headers
+# We'll add separate GPU kernel compilation units later
 option(HAVE_CUDA "Enable CUDA backend" OFF)
 option(HAVE_ROCM "Enable ROCm backend" OFF)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
+
+# =============================================================================
+# CUDA Backend Configuration
+# =============================================================================
+if(HAVE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    
+    message(STATUS "V2: CUDA enabled")
+    message(STATUS "V2: CUDA Toolkit Version: ${CUDAToolkit_VERSION}")
+    message(STATUS "V2: CUDA Include: ${CUDAToolkit_INCLUDE_DIRS}")
+    message(STATUS "V2: nvcc: ${CMAKE_CUDA_COMPILER}")
+    
+    # CUDA compile flags
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_70 -gencode=arch=compute_70,code=sm_70")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_75,code=sm_75")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_80,code=sm_80")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_86,code=sm_86")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_89,code=sm_89")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90,code=sm_90")
+    
+    # Relocatable device code for separate compilation
+    set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+# =============================================================================
+# ROCm Backend Configuration
+# =============================================================================
+if(HAVE_ROCM)
+    # Set ROCm path (standard install location)
+    if(NOT DEFINED ROCM_PATH)
+        set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation path")
+    endif()
+    
+    # Find HIP
+    list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH})
+    find_package(hip REQUIRED)
+    find_package(hipblas REQUIRED)
+    
+    message(STATUS "V2: ROCm enabled")
+    message(STATUS "V2: ROCm Path: ${ROCM_PATH}")
+    message(STATUS "V2: HIP Version: ${hip_VERSION}")
+    message(STATUS "V2: hipcc: ${HIP_HIPCC_EXECUTABLE}")
+    
+    # ROCm compile flags (support common AMD architectures)
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx900")  # Vega 10
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx906")  # Vega 20
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx908")  # MI100
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx90a")  # MI200
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx940")  # MI300
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx1030") # Navi 21
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx1100") # Navi 31
+endif()
 
 # Find Python3 for code generation scripts
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -145,6 +200,7 @@ add_library(llaminar2_core STATIC
     utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp
     utils/NUMATopology.cpp
+    utils/MPIStager.cpp
     # Generated GEMM microkernel template instantiations (1225 total across 64 files)
     kernels/cpu/GemmMicroKernelInit.cpp
     ${MICROKERNEL_INSTANTIATION_SOURCES}
@@ -241,19 +297,35 @@ target_link_libraries(llaminar2_core PUBLIC
 
 # BLAS libraries are linked above in the backend selection section
 
-# Add conditional backend support
+# =============================================================================
+# Link CUDA backend if enabled
+# =============================================================================
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(llaminar2_core PUBLIC CUDA::cudart CUDA::cublas)
+    target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(llaminar2_core PUBLIC 
+        CUDA::cudart 
+        CUDA::cublas
+        CUDA::nvml  # For GPU NUMA node detection
+    )
+    message(STATUS "V2: Linked CUDA runtime, cuBLAS, and NVML")
 endif()
 
+# =============================================================================
+# Link ROCm backend if enabled
+# =============================================================================
 if(HAVE_ROCM)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM)
-    # ROCm libraries will be found by parent CMakeLists.txt
-    if(HIP_LIBRARY AND HIPBLAS_LIBRARY)
-        target_link_libraries(llaminar2_core PUBLIC ${HIP_LIBRARY} ${HIPBLAS_LIBRARY})
-    endif()
+    target_include_directories(llaminar2_core PUBLIC 
+        ${ROCM_PATH}/include
+        ${ROCM_PATH}/hip/include
+        ${ROCM_PATH}/hipblas/include
+    )
+    target_link_libraries(llaminar2_core PUBLIC 
+        hip::host      # HIP runtime
+        roc::hipblas   # hipBLAS
+    )
+    message(STATUS "V2: Linked HIP runtime and hipBLAS")
 endif()
 
 if(HAVE_VULKAN)

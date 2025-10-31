@@ -881,6 +881,30 @@ add_v2_test(V2_Unit_PipelineFactory
     LABELS "V2;Unit;PipelineExecution;Factory;Registration"
 )
 
+# Test: GQAAttention
+add_executable(v2_test_gqa_attention unit/pipelines/Test__GQAAttention.cpp)
+target_link_libraries(v2_test_gqa_attention 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GQAAttention 
+    COMMAND $<TARGET_FILE:v2_test_gqa_attention>
+    LABELS "V2;Unit;PipelineExecution;Attention;GQA;MQA;MHA"
+)
+
+# Test: CPUAttention kernel interface
+add_executable(v2_test_cpu_attention unit/kernels/Test__CPUAttention.cpp)
+target_link_libraries(v2_test_cpu_attention 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUAttention 
+    COMMAND $<TARGET_FILE:v2_test_cpu_attention>
+    LABELS "V2;Unit;Kernels;Attention;CPUKernel;InterfaceTest"
+)
+
 # Test: DeviceOrchestrator
 add_executable(v2_test_device_orchestrator Test__DeviceOrchestrator.cpp)
 target_link_libraries(v2_test_device_orchestrator 
@@ -1189,6 +1213,21 @@ target_link_libraries(v2_test_mpi_batched_attention
 add_v2_test(V2_Integration_MPIBatchedAttention 
     COMMAND $<TARGET_FILE:v2_test_mpi_batched_attention>
     LABELS "V2;Integration;MPI;Batching;TensorParallel;E2E;Attention;Models"
+    MPI_PROCS 2
+)
+
+# MPI Staging Tests - Validates MPIStager utility for GPU↔Host transfers
+add_executable(v2_test_mpi_staging 
+    integration/Test__MPIStaging.cpp
+)
+target_link_libraries(v2_test_mpi_staging 
+    llaminar2_core 
+    GTest::gtest  # Provides its own MPI-aware main()
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MPIStaging 
+    COMMAND $<TARGET_FILE:v2_test_mpi_staging>
+    LABELS "V2;Integration;MPI;Staging;CPUTensors;ErrorHandling;Allreduce;Allgather"
     MPI_PROCS 2
 )
 
