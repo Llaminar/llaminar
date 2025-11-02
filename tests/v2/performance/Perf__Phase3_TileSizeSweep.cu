@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cutlass/half.h>
+#include <cute/arch/mma_sm80.hpp> // For SM80_16x8x16_F32F16F16F32_TN
 #include "kernels/cuda/CudaGemmKernel.cuh"
 #include "kernels/cuda/IQ4_NL_BlockDecoder.h"
 #include <chrono>
@@ -18,6 +19,7 @@
 #include <vector>
 
 using namespace llaminar2::cuda;
+using namespace cute; // For MMA atoms
 
 class Phase3_TileSizeSweep : public ::testing::Test
 {
@@ -67,7 +69,7 @@ protected:
         // Warmup
         for (int i = 0; i < 3; ++i)
         {
-            launchQuantizedGemmCuTe<cutlass::half_t, IQ4_NL_Decoder<IQ4_NLBlock>, TILE_M, TILE_N, TILE_K>(
+            launchQuantizedGemmCuTe<cutlass::half_t, SM80_16x8x16_F32F16F16F32_TN, 2, 2, 1, IQ4_NL_Decoder<IQ4_NLBlock>, TILE_M, TILE_N, TILE_K>(
                 d_A, d_C, m, n, k, decoder, 0);
             cudaDeviceSynchronize();
         }
@@ -78,7 +80,7 @@ protected:
 
         for (int i = 0; i < num_iters; ++i)
         {
-            launchQuantizedGemmCuTe<cutlass::half_t, IQ4_NL_Decoder<IQ4_NLBlock>, TILE_M, TILE_N, TILE_K>(
+            launchQuantizedGemmCuTe<cutlass::half_t, SM80_16x8x16_F32F16F16F32_TN, 2, 2, 1, IQ4_NL_Decoder<IQ4_NLBlock>, TILE_M, TILE_N, TILE_K>(
                 d_A, d_C, m, n, k, decoder, 0);
         }
 

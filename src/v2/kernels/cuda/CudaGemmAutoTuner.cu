@@ -265,42 +265,71 @@ namespace llaminar2
             // Vectorized loads (1 = scalar, 2/4 = vector)
             const std::vector<int> vectorize_values = {1, 2, 4};
 
-            // Explode parameter space (must match Python generator's nested loop order)
-            for (int tm : tile_m_values)
-            {
-                for (int tn : tile_n_values)
-                {
-                    for (int tk : tile_k_values)
-                    {
-                        for (int thm : threads_m_values)
-                        {
-                            for (int thn : threads_n_values)
-                            {
-                                for (int wm : work_m_values)
-                                {
-                                    for (int wn : work_n_values)
-                                    {
-                                        for (int prefetch : prefetch_values)
-                                        {
-                                            for (bool transpose : transpose_values)
-                                            {
-                                                for (int vectorize : vectorize_values)
-                                                {
-                                                    CudaGemmConfig config{
-                                                        .tile_m = tm,
-                                                        .tile_n = tn,
-                                                        .tile_k = tk,
-                                                        .threads_m = thm,
-                                                        .threads_n = thn,
-                                                        .work_per_thread_m = wm,
-                                                        .work_per_thread_n = wn,
-                                                        .prefetch_stages = prefetch,
-                                                        .transpose_smem = transpose,
-                                                        .vectorize_load = vectorize};
+            // NEW: Tensor Core atom configuration
+            // atom_type: 0 = SM80_16x8x16 (K=16, more K per iteration)
+            //            1 = SM80_16x8x8  (K=8, smaller footprint, may help small problems)
+            const std::vector<int> atom_type_values = {0}; // Start with 16x8x16 only (conservative)
+            
+            // Atom layout: how many atoms to tile together
+            // Layout 2×2×1 = 4 atoms → 32×16 output tile (was hardcoded before)
+            // Layout 1×1×1 = 1 atom → 16×8 output tile (smaller for tiny matrices)
+            // Layout 4×4×1 = 16 atoms → 64×32 output tile (larger for big matrices)
+            const std::vector<int> atom_layout_m_values = {1, 2};  // Conservative: 1 or 2 atoms in M
+            const std::vector<int> atom_layout_n_values = {1, 2};  // Conservative: 1 or 2 atoms in N
+            const std::vector<int> atom_layout_k_values = {1};     // Always 1 for SM80
 
-                                                    if (config.isValid())
+            // Explode parameter space (must match Python generator's nested loop order if used)
+            for (int atom_type : atom_type_values)
+            {
+                for (int atom_m : atom_layout_m_values)
+                {
+                    for (int atom_n : atom_layout_n_values)
+                    {
+                        for (int atom_k : atom_layout_k_values)
+                        {
+                            for (int tm : tile_m_values)
+                            {
+                                for (int tn : tile_n_values)
+                                {
+                                    for (int tk : tile_k_values)
+                                    {
+                                        for (int thm : threads_m_values)
+                                        {
+                                            for (int thn : threads_n_values)
+                                            {
+                                                for (int wm : work_m_values)
+                                                {
+                                                    for (int wn : work_n_values)
                                                     {
-                                                        candidates.push_back(config);
+                                                        for (int prefetch : prefetch_values)
+                                                        {
+                                                            for (bool transpose : transpose_values)
+                                                            {
+                                                                for (int vectorize : vectorize_values)
+                                                                {
+                                                                    CudaGemmConfig config{
+                                                                        .tile_m = tm,
+                                                                        .tile_n = tn,
+                                                                        .tile_k = tk,
+                                                                        .threads_m = thm,
+                                                                        .threads_n = thn,
+                                                                        .work_per_thread_m = wm,
+                                                                        .work_per_thread_n = wn,
+                                                                        .prefetch_stages = prefetch,
+                                                                        .transpose_smem = transpose,
+                                                                        .vectorize_load = vectorize,
+                                                                        .atom_type = atom_type,
+                                                                        .atom_layout_m = atom_m,
+                                                                        .atom_layout_n = atom_n,
+                                                                        .atom_layout_k = atom_k};
+
+                                                                    if (config.isValid())
+                                                                    {
+                                                                        candidates.push_back(config);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }

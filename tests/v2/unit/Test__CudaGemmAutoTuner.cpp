@@ -51,9 +51,10 @@ TEST_F(Test__CudaGemmAutoTuner, GeneratesValidConfigurations)
 {
     auto configs = CudaGemmAutoTuner::instance().getAvailableConfigs();
 
-    // Should generate 500-1000 valid configurations (expanded search space)
-    EXPECT_GE(configs.size(), 100) << "Too few configurations generated";
-    EXPECT_LE(configs.size(), 1000) << "Too many configurations generated";
+    // Should generate 2000-3000 valid configurations (atom-aware search space: 4× expansion)
+    // Base configs (648) × atom_layouts (4) = 2,592 configs
+    EXPECT_GE(configs.size(), 2000) << "Too few configurations generated";
+    EXPECT_LE(configs.size(), 3000) << "Too many configurations generated";
 
     // All configs should be valid
     for (const auto &config : configs)

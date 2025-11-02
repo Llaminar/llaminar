@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cutlass/half.h>
+#include <cute/arch/mma_sm80.hpp> // For SM80_16x8x16_F32F16F16F32_TN
 #include <vector>
 #include <iostream>
 
@@ -14,6 +15,7 @@
 #include "kernels/cuda/IQ4_NL_BlockDecoder.h"
 
 using namespace llaminar2::cuda;
+using namespace cute; // For MMA atoms
 
 TEST(Phase2_5_TensorCore_FP16, AsyncCopyPerformance)
 {
@@ -49,7 +51,7 @@ TEST(Phase2_5_TensorCore_FP16, AsyncCopyPerformance)
 
     for (int i = 0; i < 10; ++i)
     {
-        launchQuantizedGemmCuTe<cutlass::half_t, IQ4_NL_Decoder<IQ4_NLBlock>>(
+        launchQuantizedGemmCuTe<cutlass::half_t, SM80_16x8x16_F32F16F16F32_TN, 2, 2, 1, IQ4_NL_Decoder<IQ4_NLBlock>>(
             d_A, d_C, m, n, k, decoder, 0);
     }
     cudaDeviceSynchronize();
@@ -62,7 +64,7 @@ TEST(Phase2_5_TensorCore_FP16, AsyncCopyPerformance)
     cudaEventRecord(start);
     for (int i = 0; i < iters; ++i)
     {
-        launchQuantizedGemmCuTe<cutlass::half_t, IQ4_NL_Decoder<IQ4_NLBlock>>(
+        launchQuantizedGemmCuTe<cutlass::half_t, SM80_16x8x16_F32F16F16F32_TN, 2, 2, 1, IQ4_NL_Decoder<IQ4_NLBlock>>(
             d_A, d_C, m, n, k, decoder, 0);
     }
     cudaEventRecord(stop);

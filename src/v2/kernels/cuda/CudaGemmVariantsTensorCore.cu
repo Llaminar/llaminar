@@ -78,14 +78,42 @@ namespace llaminar2
             const int num_k_blocks = k / 32;
             IQ4_NL_Decoder<IQ4_NLBlock> decoder(B_blocks, n, num_k_blocks);
 
-// Macro to reduce boilerplate for template instantiation
-// Uses SM80_16x8x16 atom with 2×2×1 layout by default (can be made configurable later)
-#define LAUNCH_TENSORCORE(TM, TN, TK)                                                                                        \
-    if (config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                   \
-    {                                                                                                                        \
-        return launchQuantizedGemmCuTe<float, SM80_16x8x16_F32F16F16F32_TN, 2, 2, 1, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
-            A, C, m, n, k, decoder, stream);                                                                                 \
+            // ============================================================================
+            // ATOM-AWARE KERNEL DISPATCH
+            // ============================================================================
+            // The configuration now includes atom_type and atom_layout_* parameters
+            // We dispatch to different kernel instantiations based on these settings
+            //
+            // Atom types:
+            //   0 = SM80_16x8x16_F32F16F16F32_TN (K=16, more efficient for larger K)
+            //   1 = SM80_16x8x8_F32F16F16F32_TN  (K=8,  smaller footprint)
+            //
+            // Atom layouts:
+            //   1×1×1 = Single atom (16×8 or 16×8 output per K-slice)
+            //   2×2×1 = 4 atoms (32×16 output per K-slice) - was hardcoded default
+            //   4×4×1 = 16 atoms (64×32 output per K-slice)
+
+// Helper macros for different atom configurations
+#define LAUNCH_ATOM_16x8x16(AM, AN, AK, TM, TN, TK)                                                                                   \
+    if (config.atom_type == 0 && config.atom_layout_m == AM && config.atom_layout_n == AN && config.atom_layout_k == AK &&           \
+        config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                           \
+    {                                                                                                                                \
+        return launchQuantizedGemmCuTe<float, SM80_16x8x16_F32F16F16F32_TN, AM, AN, AK, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
+            A, C, m, n, k, decoder, stream);                                                                                         \
     }
+
+#define LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)                                                                                  \
+    if (config.atom_type == 1 && config.atom_layout_m == AM && config.atom_layout_n == AN && config.atom_layout_k == AK &&          \
+        config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                          \
+    {                                                                                                                               \
+        return launchQuantizedGemmCuTe<float, SM80_16x8x8_F32F16F16F32_TN, AM, AN, AK, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
+            A, C, m, n, k, decoder, stream);                                                                                        \
+    }
+
+// Convenience macro that tries both atom types with given layout and tile size
+#define LAUNCH_TENSORCORE(AM, AN, AK, TM, TN, TK) \
+    LAUNCH_ATOM_16x8x16(AM, AN, AK, TM, TN, TK)    \
+    LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)
 
             // ============================================================================
             // COMPREHENSIVE TILE CONFIGURATION SPACE
@@ -98,77 +126,77 @@ namespace llaminar2
             // TILE_K = 16 (OPTIMAL for sm_80 - matches MMA instruction)
             // -------------------------------------------------------------------------
             // Small tiles - optimal for single-token decode (0.5B, 4B, 7B, 14B)
-            LAUNCH_TENSORCORE(16, 16, 16);
-            LAUNCH_TENSORCORE(16, 32, 16);
-            LAUNCH_TENSORCORE(16, 64, 16);
-            LAUNCH_TENSORCORE(16, 128, 16);
-            LAUNCH_TENSORCORE(16, 256, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 16, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 32, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 64, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 128, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 256, 16);
 
-            LAUNCH_TENSORCORE(32, 16, 16);
-            LAUNCH_TENSORCORE(32, 32, 16);
-            LAUNCH_TENSORCORE(32, 64, 16); // Phase 3 winner for m=32!
-            LAUNCH_TENSORCORE(32, 128, 16);
-            LAUNCH_TENSORCORE(32, 256, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 16, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 32, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 16); // Phase 3 winner for m=32!
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 128, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 256, 16);
 
             // Medium tiles - good for small batches
-            LAUNCH_TENSORCORE(64, 16, 16);
-            LAUNCH_TENSORCORE(64, 32, 16);
-            LAUNCH_TENSORCORE(64, 64, 16); // Phase 2.5 baseline
-            LAUNCH_TENSORCORE(64, 128, 16);
-            LAUNCH_TENSORCORE(64, 256, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 16, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 32, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 16); // Phase 2.5 baseline
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 128, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 256, 16);
 
             // Large tiles - good for prefill and large batches
-            LAUNCH_TENSORCORE(128, 16, 16);
-            LAUNCH_TENSORCORE(128, 32, 16);
-            LAUNCH_TENSORCORE(128, 64, 16);
-            LAUNCH_TENSORCORE(128, 128, 16);
-            LAUNCH_TENSORCORE(128, 256, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 16, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 32, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 64, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 128, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 256, 16);
 
-            LAUNCH_TENSORCORE(256, 16, 16);
-            LAUNCH_TENSORCORE(256, 32, 16);
-            LAUNCH_TENSORCORE(256, 64, 16);
-            LAUNCH_TENSORCORE(256, 128, 16);
-            LAUNCH_TENSORCORE(256, 256, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 256, 16, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 256, 32, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 256, 64, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 256, 128, 16);
+            LAUNCH_TENSORCORE(2, 2, 1, 256, 256, 16);
 
             // TILE_K = 32 (ALTERNATIVE - more K-tiles, may help large matrices)
             // -------------------------------------------------------------------------
-            LAUNCH_TENSORCORE(16, 16, 32);
-            LAUNCH_TENSORCORE(16, 32, 32);
-            LAUNCH_TENSORCORE(16, 64, 32);
-            LAUNCH_TENSORCORE(16, 128, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 16, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 32, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 64, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 128, 32);
 
-            LAUNCH_TENSORCORE(32, 16, 32);
-            LAUNCH_TENSORCORE(32, 32, 32);
-            LAUNCH_TENSORCORE(32, 64, 32); // Phase 3: worse than K=16
-            LAUNCH_TENSORCORE(32, 128, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 16, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 32, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 32); // Phase 3: worse than K=16
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 128, 32);
 
-            LAUNCH_TENSORCORE(64, 16, 32);
-            LAUNCH_TENSORCORE(64, 32, 32);
-            LAUNCH_TENSORCORE(64, 64, 32);
-            LAUNCH_TENSORCORE(64, 128, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 16, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 32, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 128, 32);
 
-            LAUNCH_TENSORCORE(128, 16, 32);
-            LAUNCH_TENSORCORE(128, 32, 32);
-            LAUNCH_TENSORCORE(128, 64, 32);
-            LAUNCH_TENSORCORE(128, 128, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 16, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 32, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 64, 32);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 128, 32);
 
             // TILE_K = 64 (EXPERIMENTAL - fewer K-tiles, larger shared memory)
             // -------------------------------------------------------------------------
-            LAUNCH_TENSORCORE(16, 16, 64);
-            LAUNCH_TENSORCORE(16, 32, 64);
-            LAUNCH_TENSORCORE(16, 64, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 16, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 32, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 16, 64, 64);
 
-            LAUNCH_TENSORCORE(32, 16, 64);
-            LAUNCH_TENSORCORE(32, 32, 64);
-            LAUNCH_TENSORCORE(32, 64, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 16, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 32, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 64);
 
-            LAUNCH_TENSORCORE(64, 16, 64);
-            LAUNCH_TENSORCORE(64, 32, 64);
-            LAUNCH_TENSORCORE(64, 64, 64); // Large shared memory (>48KB, may not fit sm_70)
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 16, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 32, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 64); // Large shared memory (>48KB, may not fit sm_70)
 
-            LAUNCH_TENSORCORE(128, 16, 64);
-            LAUNCH_TENSORCORE(128, 32, 64);
-            LAUNCH_TENSORCORE(128, 64, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 16, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 32, 64);
+            LAUNCH_TENSORCORE(2, 2, 1, 128, 64, 64);
 
 #undef LAUNCH_TENSORCORE
 
