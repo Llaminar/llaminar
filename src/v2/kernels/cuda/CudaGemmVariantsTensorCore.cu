@@ -116,87 +116,179 @@ namespace llaminar2
     LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)
 
             // ============================================================================
-            // COMPREHENSIVE TILE CONFIGURATION SPACE
+            // ATOM-AWARE TILE CONFIGURATION SPACE
             // ============================================================================
-            // Based on Phase 3 findings and model size requirements:
-            // - Small tiles (16, 32) good for single-token decode (m=1-32)
-            // - Medium tiles (64) good for small batches (m=32-128)
-            // - Large tiles (128, 256) good for prefill and large batches (m≥128)
+            // Systematically generated for all atom layout × tile size combinations
+            // Total configs: 3 atom layouts × 53 tile sizes = 159 kernel instantiations
+            // Each instantiates 2 atom types → 318 total kernel variants
 
-            // TILE_K = 16 (OPTIMAL for sm_80 - matches MMA instruction)
+            // Atom layout 1×1×1 (Small: 16×8 output tile per atom)
             // -------------------------------------------------------------------------
-            // Small tiles - optimal for single-token decode (0.5B, 4B, 7B, 14B)
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 16, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 32, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 64, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 128, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 256, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 16, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 32, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 64, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 128, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 256, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 16, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 32, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 64, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 128, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 256, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 16, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 32, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 64, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 128, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 256, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 256, 16, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 256, 32, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 256, 64, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 256, 128, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 256, 256, 16);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 16, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 32, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 64, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 128, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 16, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 32, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 64, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 128, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 16, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 32, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 64, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 128, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 16, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 32, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 64, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 128, 32);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 16, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 32, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 16, 64, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 16, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 32, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 32, 64, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 16, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 32, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 64, 64, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 16, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 32, 64);
+            LAUNCH_TENSORCORE(1, 1, 1, 128, 64, 64);
+
+            // Atom layout 2×2×1 (Medium: 32×16 output tile per 4 atoms) - Original default
+            // -------------------------------------------------------------------------
             LAUNCH_TENSORCORE(2, 2, 1, 16, 16, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 32, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 64, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 128, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 256, 16);
-
             LAUNCH_TENSORCORE(2, 2, 1, 32, 16, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 32, 32, 16);
-            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 16); // Phase 3 winner for m=32!
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 16); // Phase 3 winner for m=32
             LAUNCH_TENSORCORE(2, 2, 1, 32, 128, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 32, 256, 16);
-
-            // Medium tiles - good for small batches
             LAUNCH_TENSORCORE(2, 2, 1, 64, 16, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 32, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 16); // Phase 2.5 baseline
             LAUNCH_TENSORCORE(2, 2, 1, 64, 128, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 256, 16);
-
-            // Large tiles - good for prefill and large batches
             LAUNCH_TENSORCORE(2, 2, 1, 128, 16, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 32, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 64, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 128, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 256, 16);
-
             LAUNCH_TENSORCORE(2, 2, 1, 256, 16, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 256, 32, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 256, 64, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 256, 128, 16);
             LAUNCH_TENSORCORE(2, 2, 1, 256, 256, 16);
-
-            // TILE_K = 32 (ALTERNATIVE - more K-tiles, may help large matrices)
-            // -------------------------------------------------------------------------
             LAUNCH_TENSORCORE(2, 2, 1, 16, 16, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 32, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 64, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 128, 32);
-
             LAUNCH_TENSORCORE(2, 2, 1, 32, 16, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 32, 32, 32);
-            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 32); // Phase 3: worse than K=16
+            LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 32, 128, 32);
-
             LAUNCH_TENSORCORE(2, 2, 1, 64, 16, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 32, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 128, 32);
-
             LAUNCH_TENSORCORE(2, 2, 1, 128, 16, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 32, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 64, 32);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 128, 32);
-
-            // TILE_K = 64 (EXPERIMENTAL - fewer K-tiles, larger shared memory)
-            // -------------------------------------------------------------------------
             LAUNCH_TENSORCORE(2, 2, 1, 16, 16, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 32, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 16, 64, 64);
-
             LAUNCH_TENSORCORE(2, 2, 1, 32, 16, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 32, 32, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 32, 64, 64);
-
             LAUNCH_TENSORCORE(2, 2, 1, 64, 16, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 64, 32, 64);
-            LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 64); // Large shared memory (>48KB, may not fit sm_70)
-
+            LAUNCH_TENSORCORE(2, 2, 1, 64, 64, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 16, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 32, 64);
             LAUNCH_TENSORCORE(2, 2, 1, 128, 64, 64);
+
+            // Atom layout 4×4×1 (Large: 64×32 output tile per 16 atoms)
+            // -------------------------------------------------------------------------
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 16, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 32, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 64, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 128, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 256, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 16, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 32, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 64, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 128, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 256, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 16, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 32, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 64, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 128, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 256, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 16, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 32, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 64, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 128, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 256, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 256, 16, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 256, 32, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 256, 64, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 256, 128, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 256, 256, 16);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 16, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 32, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 64, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 128, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 16, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 32, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 64, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 128, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 16, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 32, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 64, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 128, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 16, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 32, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 64, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 128, 32);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 16, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 32, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 16, 64, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 16, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 32, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 32, 64, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 16, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 32, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 64, 64, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 16, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 32, 64);
+            LAUNCH_TENSORCORE(4, 4, 1, 128, 64, 64);
 
 #undef LAUNCH_TENSORCORE
 

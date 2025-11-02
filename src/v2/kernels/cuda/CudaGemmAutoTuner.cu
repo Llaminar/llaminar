@@ -266,17 +266,21 @@ namespace llaminar2
             const std::vector<int> vectorize_values = {1, 2, 4};
 
             // NEW: Tensor Core atom configuration
-            // atom_type: 0 = SM80_16x8x16 (K=16, more K per iteration)
-            //            1 = SM80_16x8x8  (K=8, smaller footprint, may help small problems)
-            const std::vector<int> atom_type_values = {0}; // Start with 16x8x16 only (conservative)
+            // atom_type: 0 = SM80_16x8x16 (K=16, more K per iteration, better for medium/large K)
+            //            1 = SM80_16x8x8  (K=8, smaller footprint, may help small matrices)
+            const std::vector<int> atom_type_values = {0, 1}; // Both atom types for diversity
             
             // Atom layout: how many atoms to tile together
-            // Layout 2×2×1 = 4 atoms → 32×16 output tile (was hardcoded before)
+            // Layout 2×2×1 = 4 atoms → 32×16 output tile (was hardcoded before, good baseline)
             // Layout 1×1×1 = 1 atom → 16×8 output tile (smaller for tiny matrices)
             // Layout 4×4×1 = 16 atoms → 64×32 output tile (larger for big matrices)
-            const std::vector<int> atom_layout_m_values = {1, 2};  // Conservative: 1 or 2 atoms in M
-            const std::vector<int> atom_layout_n_values = {1, 2};  // Conservative: 1 or 2 atoms in N
-            const std::vector<int> atom_layout_k_values = {1};     // Always 1 for SM80
+            // 
+            // PRACTICAL SUBSET: Using 3 representative layouts to keep config count manageable
+            // Full space would be 648 × 2 atom_types × 9 layouts = 11,664 configs (too many)
+            // Current space: 648 × 2 atom_types × 3 layouts = 3,888 configs (good balance)
+            const std::vector<int> atom_layout_m_values = {1, 2, 4};  // Representative: small, medium, large
+            const std::vector<int> atom_layout_n_values = {1, 2, 4};  // Representative: small, medium, large  
+            const std::vector<int> atom_layout_k_values = {1};        // Always 1 for SM80
 
             // Explode parameter space (must match Python generator's nested loop order if used)
             for (int atom_type : atom_type_values)
@@ -287,6 +291,13 @@ namespace llaminar2
                     {
                         for (int atom_k : atom_layout_k_values)
                         {
+                            // FILTER: Only use square/balanced atom layouts for practical subset
+                            // 1×1×1 (tiny), 2×2×1 (medium), 4×4×1 (large)
+                            // Skip asymmetric layouts like 1×2, 2×4, etc. to keep config count manageable
+                            if (atom_m != atom_n) {
+                                continue;  // Skip non-square layouts
+                            }
+
                             for (int tm : tile_m_values)
                             {
                                 for (int tn : tile_n_values)
