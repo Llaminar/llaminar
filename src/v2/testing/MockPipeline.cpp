@@ -34,7 +34,7 @@ namespace llaminar2
             n_kv_heads_ = n_kv_heads;
             head_dim_ = head_dim;
             d_model_ = n_heads * head_dim;
-            
+
             // Initialize workspace buffers and infrastructure
             initializeInfrastructure();
         }

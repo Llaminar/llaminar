@@ -114,8 +114,7 @@ namespace llaminar2
 
         if (host_buffer.size() != numel)
         {
-            throw std::invalid_argument("[MPIStager] toDevice: buffer size mismatch (host="
-                                        + std::to_string(host_buffer.size()) + ", tensor=" + std::to_string(numel) + ")");
+            throw std::invalid_argument("[MPIStager] toDevice: buffer size mismatch (host=" + std::to_string(host_buffer.size()) + ", tensor=" + std::to_string(numel) + ")");
         }
 
         int device_id = tensor->device_index();
@@ -202,7 +201,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[MPIStager] " << backend->backendName() << " D2H: copied " << count << " floats ("
-                                  << (bytes / 1024.0 / 1024.0) << " MB)");
+                                 << (bytes / 1024.0 / 1024.0) << " MB)");
     }
 
     void MPIStager::hostToDevice(float *dst, const float *src, size_t count, int device_id)
@@ -222,7 +221,7 @@ namespace llaminar2
         }
 
         LOG_TRACE("[MPIStager] " << backend->backendName() << " H2D: copied " << count << " floats ("
-                                  << (bytes / 1024.0 / 1024.0) << " MB)");
+                                 << (bytes / 1024.0 / 1024.0) << " MB)");
     }
 
 } // namespace llaminar2

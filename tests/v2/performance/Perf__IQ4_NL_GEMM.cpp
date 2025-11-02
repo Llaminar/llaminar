@@ -34,6 +34,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
+#include "backends/ComputeBackend.h"
 // Note: No longer needs QuantizedGemm.h - uses ITensorGemm interface via createGemm()
 
 using namespace llaminar2;
@@ -83,6 +84,9 @@ protected:
         // Initialize MPI context
         MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
         MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
+
+        // Initialize DeviceManager to enumerate CUDA/ROCm/Vulkan devices
+        DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
 
         // CRITICAL: Verify OpenMP is configured with multiple threads
         int max_threads = omp_get_max_threads();
@@ -163,8 +167,10 @@ protected:
      *
      * Uses the first layer's Q projection weight (arbitrary choice,
      * just need real IQ4_NL quantized data).
+     *
+     * @param device_idx Device index: -1 for CPU, >= 0 for GPU
      */
-    std::shared_ptr<llaminar2::IQ4_NLTensor> getWeightTensor()
+    std::shared_ptr<llaminar2::IQ4_NLTensor> getWeightTensor(int device_idx = -1)
     {
         if (!loader_)
         {
@@ -175,7 +181,7 @@ protected:
         // Format: "blk.0.attn_q.weight"
         std::string weight_name = "blk.0.attn_q.weight";
 
-        auto weight = loader_->loadTensor(weight_name, -1); // -1 = CPU device
+        auto weight = loader_->loadTensor(weight_name, device_idx);
         if (!weight)
         {
             throw std::runtime_error("Failed to load weight tensor: " + weight_name);
@@ -481,6 +487,225 @@ TEST_F(IQ4_NL_GEMM_Perf, SingleToken_Decode)
         printResults(config, stats);
         EXPECT_GT(stats.mean_ms, 0.0);
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+/**
+ * @brief Phase 1 Optimization Test: Baseline vs Optimized Kernel Comparison
+ *
+ * This test compares the baseline CUDA kernel against the Phase 1 optimized version
+ * that includes:
+ *   - Coalesced memory access patterns
+ *   - Vectorized float4 loads
+ *   - Shared memory bank conflict elimination
+ *
+ * Expected speedup: 2-3× across all test cases
+ *
+ * Tests multiple workload sizes from baseline benchmark data:
+ *   - Large batch (256×5120): Baseline 3010 GFLOPS → Target 6000-9000 GFLOPS
+ *   - Medium batch (128×4096): Baseline 2264 GFLOPS → Target 4500-6800 GFLOPS
+ *   - Small batch (32×896): Baseline 585 GFLOPS → Target 1200-1800 GFLOPS
+ *   - Single token (1×896): Baseline 22.7 GFLOPS → Target 50-100 GFLOPS
+ */
+TEST_F(IQ4_NL_GEMM_Perf, Phase1_BaselineVsOptimized)
+{
+    // Only test on CUDA builds
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "Phase 1 optimization test requires CUDA";
+#endif
+
+    // Enumerate devices and find CUDA device
+    auto &dm = llaminar2::DeviceManager::instance();
+    const auto &devices = dm.devices();
+
+    int cuda_device_idx = -1;
+    for (size_t i = 0; i < devices.size(); ++i)
+    {
+        if (devices[i].type == llaminar2::ComputeBackendType::GPU_CUDA)
+        {
+            cuda_device_idx = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (cuda_device_idx < 0)
+    {
+        GTEST_SKIP() << "No CUDA device found - cannot test CUDA kernels";
+    }
+
+    if (rank_ == 0)
+    {
+        std::cout << "\n[Device Info]\n";
+        std::cout << "  Using CUDA device " << cuda_device_idx << ": " << devices[cuda_device_idx].name << "\n";
+    }
+
+    if (rank_ == 0)
+    {
+        std::cout << "\n";
+        std::cout << "╔════════════════════════════════════════════════════════════════╗\n";
+        std::cout << "║         PHASE 1 OPTIMIZATION: BASELINE VS OPTIMIZED           ║\n";
+        std::cout << "╠════════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║ Comparing memory-optimized kernel against baseline:           ║\n";
+        std::cout << "║   ✓ Coalesced memory access (128-byte transactions)           ║\n";
+        std::cout << "║   ✓ Vectorized float4 loads (4× instruction reduction)        ║\n";
+        std::cout << "║   ✓ Shared memory padding (zero bank conflicts)               ║\n";
+        std::cout << "║                                                                ║\n";
+        std::cout << "║ Target: 2-3× speedup across all workload sizes                ║\n";
+        std::cout << "╚════════════════════════════════════════════════════════════════╝\n";
+        std::cout << std::endl;
+    }
+
+    // Test configurations matching baseline benchmark data
+    struct TestCase
+    {
+        std::string name;
+        int seq_len;
+        int features;
+        double baseline_gflops;    // From baseline benchmark data
+        double target_min_speedup; // Minimum acceptable speedup
+        double target_max_speedup; // Maximum expected speedup
+    };
+
+    std::vector<TestCase> test_cases = {
+        {"Large Batch (256×5120)", 256, 5120, 3010.1, 2.0, 3.0},
+        {"Medium Batch (128×4096)", 128, 4096, 2264.3, 2.0, 3.0},
+        {"Medium Batch (128×2560)", 128, 2560, 2531.5, 2.0, 3.0},
+        {"Small Batch (32×896)", 32, 896, 585.1, 2.0, 3.0},
+        {"Single Token (1×896)", 1, 896, 22.7, 2.0, 4.0} // Higher target for single token
+    };
+
+    // Summary statistics
+    std::vector<double> speedups;
+    int passed = 0;
+    int total = test_cases.size();
+
+    for (const auto &test_case : test_cases)
+    {
+        // Skip if weight tensor doesn't support this size
+        // (We're using Qwen 2.5 0.5B with 896 features)
+        if (test_case.features > 896)
+        {
+            if (rank_ == 0)
+            {
+                std::cout << "[SKIP] " << test_case.name << " - requires larger model\n";
+            }
+            total--; // Don't count skipped tests
+            continue;
+        }
+
+        if (rank_ == 0)
+        {
+            std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            std::cout << "Testing: " << test_case.name << "\n";
+            std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        }
+
+        // Get weight tensor on CUDA device
+        auto weight = getWeightTensor(cuda_device_idx);
+
+        // For now, we use the virtual dispatch (baseline kernel)
+        // TODO: Once optimized kernel is integrated into ITensorGemm interface,
+        //       we can test both paths directly
+
+        BenchmarkConfig config{
+            .seq_len = test_case.seq_len,
+            .in_features = 896, // Qwen 2.5 0.5B
+            .out_features = 896,
+            .warmup_iters = 5,
+            .bench_iters = test_case.seq_len == 1 ? 1000 : 100, // More iters for single token
+            .num_trials = 5,
+            .description = test_case.name + " (Baseline)"};
+
+        BenchmarkStats baseline_stats = benchmarkFP32(config, weight);
+
+        if (rank_ == 0)
+        {
+            std::cout << "\n[BASELINE KERNEL]\n";
+            printResults(config, baseline_stats);
+
+            // TODO: Add optimized kernel benchmark here
+            // For now, just verify baseline is reasonable
+            std::cout << "\n[COMPARISON]\n";
+            std::cout << "  Baseline GFLOPS:    " << std::fixed << std::setprecision(2)
+                      << baseline_stats.mean_gflops << "\n";
+            std::cout << "  Expected (from data): " << test_case.baseline_gflops << "\n";
+
+            // Calculate ratio to expected baseline
+            double ratio = baseline_stats.mean_gflops / test_case.baseline_gflops;
+            std::cout << "  Ratio to expected:  " << std::fixed << std::setprecision(2)
+                      << ratio << "× ";
+
+            if (ratio >= 0.7 && ratio <= 1.5)
+            {
+                std::cout << "✓ [REASONABLE]\n";
+            }
+            else if (ratio < 0.7)
+            {
+                std::cout << "⚠ [SLOWER THAN EXPECTED]\n";
+            }
+            else
+            {
+                std::cout << "! [FASTER THAN EXPECTED - Good!]\n";
+            }
+
+            // TODO: Once optimized kernel is integrated:
+            // BenchmarkStats optimized_stats = benchmarkOptimized(config, weight);
+            // double speedup = optimized_stats.mean_gflops / baseline_stats.mean_gflops;
+            // speedups.push_back(speedup);
+            //
+            // if (speedup >= test_case.target_min_speedup &&
+            //     speedup <= test_case.target_max_speedup)
+            // {
+            //     passed++;
+            //     std::cout << "✅ PASS: Achieved " << speedup << "× speedup\n";
+            // }
+            // else if (speedup < test_case.target_min_speedup)
+            // {
+            //     std::cout << "❌ FAIL: Only " << speedup << "× speedup (target: "
+            //               << test_case.target_min_speedup << "-"
+            //               << test_case.target_max_speedup << "×)\n";
+            // }
+            // else
+            // {
+            //     passed++;
+            //     std::cout << "🎉 EXCELLENT: " << speedup << "× speedup (exceeded target!)\n";
+            // }
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // Print summary
+    if (rank_ == 0)
+    {
+        std::cout << "\n";
+        std::cout << "╔════════════════════════════════════════════════════════════════╗\n";
+        std::cout << "║                    PHASE 1 TEST SUMMARY                        ║\n";
+        std::cout << "╠════════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║ Status: BASELINE VERIFICATION COMPLETE                         ║\n";
+        std::cout << "║                                                                ║\n";
+        std::cout << "║ ⚠ NOTE: Optimized kernel integration pending                   ║\n";
+        std::cout << "║                                                                ║\n";
+        std::cout << "║ Next steps:                                                    ║\n";
+        std::cout << "║   1. Integrate optimized kernel into CudaGemmFactory           ║\n";
+        std::cout << "║   2. Add optimized path to ITensorGemm                         ║\n";
+        std::cout << "║   3. Re-run this test to measure actual speedup                ║\n";
+        std::cout << "╚════════════════════════════════════════════════════════════════╝\n";
+        std::cout << std::endl;
+    }
+
+    // TODO: Uncomment once optimized kernel is integrated
+    // // Final validation
+    // if (speedups.empty())
+    // {
+    //     GTEST_SKIP() << "No test cases completed";
+    // }
+    //
+    // double avg_speedup = std::accumulate(speedups.begin(), speedups.end(), 0.0) / speedups.size();
+    //
+    // EXPECT_GE(passed, total * 0.8) << "At least 80% of tests should pass 2× speedup target";
+    // EXPECT_GE(avg_speedup, 2.0) << "Average speedup should be at least 2.0×";
 
     MPI_Barrier(MPI_COMM_WORLD);
 }

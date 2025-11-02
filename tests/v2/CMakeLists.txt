@@ -1725,6 +1725,8 @@ add_v2_perf_test(V2_Perf_GemmTileScaling
 # Benchmarks ALL kernel variants for 0.5B/4B model matrix shapes
 # Compares heuristic ranking vs empirical performance
 # Validates auto-selection logic makes good choices
+# NOTE: Excluded from default ALL target to avoid running on every build
+#       Build manually with: cmake --build . --target v2_perf_cuda_heuristic_validation
 if(HAVE_CUDA)
     add_executable(v2_perf_cuda_heuristic_validation 
         performance/Perf__CudaGemmHeuristicValidation.cpp
@@ -1736,6 +1738,7 @@ if(HAVE_CUDA)
     )
     set_target_properties(v2_perf_cuda_heuristic_validation PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        EXCLUDE_FROM_ALL TRUE  # Don't build as part of default ALL target
     )
     
     add_v2_perf_test(V2_Perf_CudaHeuristicValidation
@@ -1762,6 +1765,21 @@ if(HAVE_CUDA)
     # Make training depend on the benchmark executable
     add_dependencies(train_cuda_heuristic v2_perf_cuda_heuristic_validation)
     
+    # Hash-based automatic retraining (only retrains if CSV changed)
+    # Run with: cmake --build . --target train_cuda_heuristic_auto
+    add_custom_target(train_cuda_heuristic_auto
+        COMMAND ${CMAKE_COMMAND} -E echo "Checking if ML retraining needed (hash-based)..."
+        COMMAND bash ${PROJECT_SOURCE_DIR}/scripts/check_cuda_heuristic_needs_retrain.sh && 
+                bash ${PROJECT_SOURCE_DIR}/scripts/train_cuda_heuristic.sh || 
+                ${CMAKE_COMMAND} -E echo "Heuristic weights already up-to-date"
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Auto-train CUDA GEMM heuristic (only if CSV hash changed)"
+        VERBATIM
+    )
+    
+    # Make auto-training depend on the benchmark executable
+    add_dependencies(train_cuda_heuristic_auto v2_perf_cuda_heuristic_validation)
+    
     # Optional: Auto-train after running performance test
     # Uncomment to automatically regenerate weights when benchmark data changes
     # add_custom_command(
@@ -1776,6 +1794,34 @@ if(HAVE_CUDA)
     #     VERBATIM
     # )
     
+    # Performance Test: CUDA GEMM Heuristic Canary (Generalization Validation)
+    # Tests ML heuristic with UNTRAINED matrix shapes to detect overfitting
+    # Does NOT export training data - purely validation/testing
+    # Expected: >70% top-20 hit rate on unseen configurations
+    # NOTE: Excluded from default ALL target to avoid running on every build
+    #       Build manually with: cmake --build . --target v2_perf_cuda_heuristic_canary
+    add_executable(v2_perf_cuda_heuristic_canary 
+        performance/Perf__CudaGemmHeuristicCanary.cpp
+    )
+    target_link_libraries(v2_perf_cuda_heuristic_canary 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    set_target_properties(v2_perf_cuda_heuristic_canary PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        EXCLUDE_FROM_ALL TRUE  # Don't build as part of default ALL target
+    )
+    set_target_properties(v2_perf_cuda_heuristic_canary PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    )
+    
+    add_v2_perf_test(V2_Perf_CudaHeuristicCanary
+        COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_canary>
+        LABELS "V2;Performance;CUDA;GEMM;AutoTuning;HeuristicCanary;GeneralizationTest;NoTrainingData"
+        MPI_PROCS 1  # Single rank GPU benchmark
+    )
+
     # Performance Test: Tensor Core Heuristic Validation (Phase 3+)
     # COMPREHENSIVE benchmarking of ALL Tensor Core variants
     # Tests 0.5B, 4B, 7B, 14B model sizes with batch sizes 1, 8, 32, 128

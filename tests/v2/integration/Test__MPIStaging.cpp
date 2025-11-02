@@ -41,7 +41,7 @@ protected:
         rank_ = rank;
         world_size_ = world_size;
         mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size);
-        
+
         // Create tensor factory
         tensor_factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
     }

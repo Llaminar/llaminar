@@ -51,6 +51,16 @@ namespace llaminar2
         bool supportsFP16(int device_id) const override;
         bool supportsINT8(int device_id) const override;
 
+        // Compute operations
+        bool gemmIQ4NL(
+            const void *A_device,
+            const void *B_device,
+            void *C_device,
+            int m,
+            int n,
+            int k,
+            int device_id) override;
+
     private:
         int device_count_;
     };

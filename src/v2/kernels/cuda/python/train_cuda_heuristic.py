@@ -107,6 +107,77 @@ def engineer_features(df):
     # Total compute (for normalization)
     df['total_flops'] = 2 * df['m'] * df['n'] * df['k']
     
+    # ========================================================================
+    # ENHANCED FEATURES (Nov 2, 2025 - Generalization Improvements)
+    # ========================================================================
+    
+    # Batch size features (critical for generalization)
+    df['batch_size_log2'] = np.log2(df['m'].clip(lower=1))
+    df['is_single_token'] = (df['m'] == 1).astype(int)
+    df['is_power_of_2_batch'] = ((df['m'] & (df['m'] - 1)) == 0).astype(int)
+    
+    # Dimension alignment features (affects memory coalescing)
+    df['n_aligned_16'] = (df['n'] % 16 == 0).astype(int)
+    df['n_aligned_32'] = (df['n'] % 32 == 0).astype(int)
+    df['n_aligned_64'] = (df['n'] % 64 == 0).astype(int)
+    df['k_aligned_32'] = (df['k'] % 32 == 0).astype(int)  # IQ4_NL block size
+    
+    df['n_aligned_tile'] = (df['n'] % df['tile_n'] == 0).astype(int)
+    df['k_aligned_tile'] = (df['k'] % df['tile_k'] == 0).astype(int)
+    
+    # Thread block efficiency
+    df['warp_efficiency'] = ((df['threads_per_block'] % 32 == 0).astype(float))
+    df['blocks_per_sm_estimate'] = np.minimum(
+        1536 // df['threads_per_block'],  # Thread limit
+        (48 * 1024) // df['smem_per_block'].clip(lower=1)  # SMEM limit
+    ).clip(upper=16) / 16.0  # Normalize
+    
+    # Work distribution efficiency
+    df['work_imbalance'] = (df['m'] % (df['tile_m'] * df['work_m']) != 0).astype(int)
+    df['work_total'] = df['work_m'] * df['work_n']
+    df['work_per_thread_normalized'] = df['work_per_thread'] / df['work_total'].clip(lower=1)
+    
+    # Memory bandwidth features
+    df['bytes_loaded_per_flop'] = (
+        (df['m'] * df['k'] * 4 +  # A matrix (FP32)
+         df['n'] * (df['k'] / 32.0) * 20)  # B matrix (IQ4_NL: 20 bytes per 32 elements)
+        / (2.0 * df['m'] * df['n'] * df['k'])  # FLOPs
+    )
+    
+    # Prefetch stage effectiveness
+    df['prefetch_benefit'] = (
+        (df['prefetch_stages'] > 0).astype(int) * 
+        (df['arithmetic_intensity'] > 1.0).astype(int)  # Only helps if compute-bound
+    )
+    
+    # Vectorization effectiveness
+    df['vec_load_aligned'] = (
+        ((df['k'] % (df['vectorize_load'] * 4)) == 0).astype(int)  # 4 bytes per float
+    )
+    
+    # Tile coverage efficiency (edge cases)
+    df['m_tiles'] = np.ceil(df['m'] / df['tile_m'])
+    df['n_tiles'] = np.ceil(df['n'] / df['tile_n'])
+    df['k_tiles'] = np.ceil(df['k'] / df['tile_k'])
+    df['partial_tiles'] = (
+        (df['m'] % df['tile_m'] != 0).astype(int) +
+        (df['n'] % df['tile_n'] != 0).astype(int) +
+        (df['k'] % df['tile_k'] != 0).astype(int)
+    )
+    
+    # Problem size classification (more granular)
+    df['size_category'] = 0
+    df.loc[df['m'] < 8, 'size_category'] = 0  # Tiny
+    df.loc[(df['m'] >= 8) & (df['m'] < 32), 'size_category'] = 1  # Small
+    df.loc[(df['m'] >= 32) & (df['m'] < 128), 'size_category'] = 2  # Medium
+    df.loc[(df['m'] >= 128) & (df['m'] < 512), 'size_category'] = 3  # Large
+    df.loc[df['m'] >= 512, 'size_category'] = 4  # Huge
+    
+    # Interaction features (captures non-linear relationships)
+    df['tile_size_x_batch'] = df['tile_size'] * np.log1p(df['m'])
+    df['occupancy_x_intensity'] = df['occupancy_estimate'] * df['arithmetic_intensity']
+    df['work_per_thread_x_batch'] = df['work_per_thread'] * np.log1p(df['m'])
+    
     return df
 
 def plot_results(y_true, y_pred, feature_importance, feature_names, output_file='cuda_heuristic_validation.png'):
@@ -433,73 +504,154 @@ def main():
                     'work_m', 'work_n', 'prefetch_stages', 'transpose_smem', 'vectorize_load',
                     'm', 'n', 'k']
     
-    engineered_features = ['threads_per_block', 'tile_size', 'tile_area', 'work_per_thread',
-                          'occupancy_estimate', 'arithmetic_intensity',
-                          'm_over_tile_m', 'n_over_tile_n', 'k_over_tile_k',
-                          'tile_coverage_m', 'tile_coverage_n',
-                          'is_tiny', 'is_small', 'is_medium', 'is_large',
-                          'is_square', 'aspect_ratio', 'tile_aspect_ratio', 'tile_shape_match']
+    # Original engineered features
+    base_engineered = ['threads_per_block', 'tile_size', 'tile_area', 'work_per_thread',
+                       'occupancy_estimate', 'arithmetic_intensity',
+                       'm_over_tile_m', 'n_over_tile_n', 'k_over_tile_k',
+                       'tile_coverage_m', 'tile_coverage_n',
+                       'is_tiny', 'is_small', 'is_medium', 'is_large',
+                       'is_square', 'aspect_ratio', 'tile_aspect_ratio', 'tile_shape_match']
     
-    feature_columns = raw_features + engineered_features
+    # NEW: Enhanced features for better generalization
+    enhanced_features = [
+        # Batch-aware
+        'batch_size_log2', 'is_single_token', 'is_power_of_2_batch',
+        # Alignment
+        'n_aligned_16', 'n_aligned_32', 'n_aligned_64', 'k_aligned_32',
+        'n_aligned_tile', 'k_aligned_tile',
+        # Efficiency
+        'warp_efficiency', 'blocks_per_sm_estimate', 'work_imbalance',
+        'work_total', 'work_per_thread_normalized',
+        # Memory/compute
+        'bytes_loaded_per_flop', 'prefetch_benefit', 'vec_load_aligned',
+        # Tile coverage
+        'm_tiles', 'n_tiles', 'k_tiles', 'partial_tiles', 'size_category',
+        # Interactions
+        'tile_size_x_batch', 'occupancy_x_intensity', 'work_per_thread_x_batch'
+    ]
+    
+    feature_columns = raw_features + base_engineered + enhanced_features
     X = df_features[feature_columns]
     y = df_features['gflops']
     
-    print(f"      Feature count: {len(feature_columns)}")
+    print(f"      Feature count: {len(feature_columns)} ({len(base_engineered)} base + {len(enhanced_features)} enhanced)")
     print(f"      Target: GFLOPS (range {y.min():.1f} - {y.max():.1f})")
     
-    # Train/test split (stratify by test_name to ensure all workloads represented)
-    print("\n[3/6] Splitting train/test sets...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=df_features['test_name']
-    )
-    print(f"      Train: {len(X_train)} samples")
-    print(f"      Test:  {len(X_test)} samples")
+    # Model-based train/val/test split to prevent overfitting
+    print("\n[3/6] Splitting train/val/test sets by MODEL SIZE...")
+    print("      Strategy: NEVER let model see 14B/235B/671B during training")
+    print("      This tests true generalization to unseen model sizes")
     
-    # Scale features
+    # Define splits based on model families
+    train_tests = [
+        'Qwen_0_5B_SingleToken_QKV', 'Qwen_0_5B_Batch32_QKV', 'Qwen_0_5B_FFN_Gate',
+        'Qwen_7B_SingleToken_QKV', 'Qwen_7B_Batch128_QKV', 'Qwen_7B_FFN_Gate',
+        'Qwen_72B_SingleToken_QKV', 'Qwen_72B_Batch128_QKV', 'Qwen_72B_FFN_Down'
+    ]
+    
+    val_tests = [
+        'Qwen_4B_SingleToken_QKV', 'Qwen_4B_Batch128_QKV', 'Qwen_4B_FFN_Down',
+        'Qwen_32B_SingleToken_QKV', 'Qwen_32B_FFN_Down'
+    ]
+    
+    # All remaining tests (14B, 235B, 671B) are test/hold-out
+    all_tests = df_features['test_name'].unique()
+    test_tests = [t for t in all_tests if t not in train_tests and t not in val_tests]
+    
+    # Split data
+    train_mask = df_features['test_name'].isin(train_tests)
+    val_mask = df_features['test_name'].isin(val_tests)
+    test_mask = df_features['test_name'].isin(test_tests)
+    
+    X_train = X[train_mask]
+    y_train = y[train_mask]
+    
+    X_val = X[val_mask]
+    y_val = y[val_mask]
+    
+    X_test = X[test_mask]
+    y_test = y[test_mask]
+    
+    print(f"      Train: {len(X_train)} samples ({len(train_tests)} model sizes)")
+    print(f"             Models: 0.5B, 7B, 72B")
+    print(f"      Val:   {len(X_val)} samples ({len(val_tests)} model sizes)")
+    print(f"             Models: 4B, 32B")
+    print(f"      Test:  {len(X_test)} samples ({len(test_tests)} model sizes - UNSEEN)")
+    print(f"             Models: 14B, 235B, 671B")
+    print(f"      Total: {len(X_train) + len(X_val) + len(X_test)} samples")
+    
+    # Scale features (fit ONLY on training data to prevent leakage)
     print("\n[4/6] Scaling features...")
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
     X_test_scaled = scaler.transform(X_test)
     
     # Train model
     print("\n[5/6] Training Gradient Boosting Regressor...")
+    print("      Enhanced regularization to reduce overfitting:")
+    print("        - max_depth: 8 → 6 (shallower trees)")
+    print("        - learning_rate: 0.1 → 0.05 (slower, more stable)")
+    print("        - min_samples_split: 10 → 20 (more conservative)")
+    print("        - min_samples_leaf: 5 → 10 (smoother predictions)")
+    print("        - subsample: 0.8 → 0.7 (more stochastic)")
+    print("        - max_features: None → 'sqrt' (feature subsampling)")
+    
     model = GradientBoostingRegressor(
         n_estimators=200,
-        max_depth=8,
-        learning_rate=0.1,
-        min_samples_split=10,
-        min_samples_leaf=5,
-        subsample=0.8,
+        max_depth=6,              # Reduced from 8 → less overfitting
+        learning_rate=0.05,       # Reduced from 0.1 → slower, more stable
+        min_samples_split=20,     # Increased from 10 → more conservative splits
+        min_samples_leaf=10,      # Increased from 5 → smoother predictions
+        subsample=0.7,            # Reduced from 0.8 → more regularization
+        max_features='sqrt',      # Added feature subsampling
         random_state=42,
         verbose=1
     )
     
     model.fit(X_train_scaled, y_train)
     
-    # Evaluate
+    # Evaluate on all three sets
     print("\n[6/6] Evaluating model...")
     y_train_pred = model.predict(X_train_scaled)
+    y_val_pred = model.predict(X_val_scaled)
     y_test_pred = model.predict(X_test_scaled)
     
     train_r2 = r2_score(y_train, y_train_pred)
+    val_r2 = r2_score(y_val, y_val_pred)
     test_r2 = r2_score(y_test, y_test_pred)
+    
     train_mae = mean_absolute_error(y_train, y_train_pred)
+    val_mae = mean_absolute_error(y_val, y_val_pred)
     test_mae = mean_absolute_error(y_test, y_test_pred)
+    
     train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+    val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
     test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
     
     print("\n" + "=" * 80)
-    print("Model Performance:")
+    print("Model Performance (Gradient Boosting):")
     print("=" * 80)
-    print(f"Train R²:  {train_r2:.4f}")
-    print(f"Test R²:   {test_r2:.4f}")
-    print(f"Train MAE: {train_mae:.2f} GFLOPS")
-    print(f"Test MAE:  {test_mae:.2f} GFLOPS")
-    print(f"Train RMSE: {train_rmse:.2f} GFLOPS")
-    print(f"Test RMSE:  {test_rmse:.2f} GFLOPS")
+    print(f"{'':15s} {'R²':>10s} {'MAE':>12s} {'RMSE':>12s}")
+    print("-" * 80)
+    print(f"{'Train (seen)':15s} {train_r2:10.4f} {train_mae:10.2f} {train_rmse:10.2f}")
+    print(f"{'Val (seen)':15s} {val_r2:10.4f} {val_mae:10.2f} {val_rmse:10.2f}")
+    print(f"{'Test (UNSEEN)':15s} {test_r2:10.4f} {test_mae:10.2f} {test_rmse:10.2f}")
+    print("=" * 80)
+    print("\n⚠️  KEY METRIC: Test R² measures generalization to UNSEEN model sizes")
+    print(f"   Test models: {', '.join([t.split('_')[1] for t in test_tests[:5]])}... ({len(test_tests)} total)")
     
-    # Cross-validation
-    print("\nCross-validation (5-fold):")
+    # If test R² << train R², we're overfitting
+    if test_r2 < train_r2 - 0.1:
+        print(f"\n⚠️  WARNING: Test R² ({test_r2:.4f}) << Train R² ({train_r2:.4f})")
+        print("   Model may be overfitting to training sizes")
+        print("   Consider: More regularization, simpler model, or more diverse training data")
+    elif test_r2 >= train_r2 - 0.05:
+        print(f"\n✓  Good generalization: Test R² ({test_r2:.4f}) ≈ Train R² ({train_r2:.4f})")
+        print("   Model generalizes well to unseen model sizes!")
+    
+    # Cross-validation (only on training set)
+    print("\nCross-validation on training set (5-fold):")
     cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='r2')
     print(f"  R² scores: {cv_scores}")
     print(f"  Mean R²: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
@@ -510,12 +662,17 @@ def main():
     linear_model.fit(X_train_scaled, y_train)
     
     y_train_pred_linear = linear_model.predict(X_train_scaled)
+    y_val_pred_linear = linear_model.predict(X_val_scaled)
     y_test_pred_linear = linear_model.predict(X_test_scaled)
     
     linear_train_r2 = r2_score(y_train, y_train_pred_linear)
+    linear_val_r2 = r2_score(y_val, y_val_pred_linear)
     linear_test_r2 = r2_score(y_test, y_test_pred_linear)
     
-    print(f"Linear Model R² (train/test): {linear_train_r2:.4f} / {linear_test_r2:.4f}")
+    print(f"\nLinear Model Performance:")
+    print(f"  Train R²: {linear_train_r2:.4f}")
+    print(f"  Val R²:   {linear_val_r2:.4f}")
+    print(f"  Test R²:  {linear_test_r2:.4f}")
     print(f"Note: Linear model easier to port to C++, but less accurate than GB")
     
     # Export results

@@ -46,7 +46,7 @@ public:
         n_kv_heads_ = 2;
         head_dim_ = 64;
         d_model_ = n_heads_ * head_dim_; // 896
-        
+
         // Initialize workspace buffers and infrastructure
         initializeInfrastructure();
     }

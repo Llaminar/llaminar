@@ -21,6 +21,15 @@ option(HAVE_CUDA "Enable CUDA backend" OFF)
 option(HAVE_ROCM "Enable ROCm backend" OFF)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 
+# ML Heuristic auto-retraining option
+# When enabled, automatically checks CSV hash and retrains ML model on every build
+# Only retrains if benchmark data actually changed (hash-based, fast check)
+# DEFAULT: OFF (run manually to avoid long builds)
+option(AUTO_RETRAIN_ML_HEURISTIC "Automatically retrain ML heuristic if CSV changed" OFF)
+
+# ONNX Runtime option for neural network heuristic
+option(USE_ONNX_HEURISTIC "Enable ONNX Runtime for neural network heuristic" ON)
+
 # =============================================================================
 # GPU Backend Mutual Exclusion Check (Phase 3)
 # =============================================================================
@@ -42,6 +51,28 @@ if(HAVE_CUDA)
     message(STATUS "V2: CUDA Toolkit Version: ${CUDAToolkit_VERSION}")
     message(STATUS "V2: CUDA Include: ${CUDAToolkit_INCLUDE_DIRS}")
     message(STATUS "V2: nvcc: ${CMAKE_CUDA_COMPILER}")
+    
+    # ONNX Runtime for neural network heuristic
+    if(USE_ONNX_HEURISTIC)
+        # Look for ONNX Runtime in /opt/onnxruntime (manual install)
+        set(ONNXRUNTIME_ROOT "/opt/onnxruntime")
+        
+        if(EXISTS "${ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h")
+            message(STATUS "V2: ONNX Runtime found at ${ONNXRUNTIME_ROOT}")
+            message(STATUS "V2: Neural network heuristic enabled (Test R²=0.96)")
+            
+            set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
+            set(ONNXRUNTIME_LIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so")
+            
+            add_compile_definitions(HAVE_ONNX_RUNTIME)
+        else()
+            message(WARNING "V2: ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
+            message(WARNING "V2: Neural network heuristic disabled")
+            message(WARNING "V2: Download from: https://github.com/microsoft/onnxruntime/releases")
+            message(WARNING "V2: Extract to: /opt/onnxruntime")
+            set(USE_ONNX_HEURISTIC OFF)
+        endif()
+    endif()
     
     # CUDA compile flags
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_70 -gencode=arch=compute_70,code=sm_70")
@@ -133,6 +164,12 @@ if(HAVE_CUDA)
         kernels/cuda/CudaGemmFactory.cu
     )
     
+    # Add neural network if ONNX Runtime enabled
+    if(USE_ONNX_HEURISTIC AND ONNXRUNTIME_INCLUDE_DIR)
+        list(APPEND CUDA_KERNEL_SOURCES kernels/cuda/CudaGemmNeuralNetwork.cu)
+        message(STATUS "V2: Neural network source added to CUDA backend")
+    endif()
+    
     # CUDA backend library includes backend + kernels
     add_library(cuda_backend STATIC 
         backends/cuda/CUDABackend.cu
@@ -140,6 +177,36 @@ if(HAVE_CUDA)
     )
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(cuda_backend PUBLIC CUDA::cudart)
+    
+    # Link ONNX Runtime if enabled
+    if(USE_ONNX_HEURISTIC AND ONNXRUNTIME_INCLUDE_DIR)
+        target_include_directories(cuda_backend PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_link_libraries(cuda_backend PRIVATE ${ONNXRUNTIME_LIB})
+        message(STATUS "V2: CUDA backend linked with ONNX Runtime")
+    endif()
+    
+    # Hash-based automatic ML heuristic retraining
+    # Checks if CSV changed and retrains model before building CUDA backend
+    # Only retrains if benchmark data actually changed (hash-based, <1 sec overhead)
+    # Disable with: cmake -DAUTO_RETRAIN_ML_HEURISTIC=OFF
+    if(AUTO_RETRAIN_ML_HEURISTIC)
+        message(STATUS "V2: Auto-retrain ML heuristic enabled (hash-based check on every build)")
+        # Script path: go up 2 levels from src/v2 to workspace root
+        set(WORKSPACE_ROOT "${PROJECT_SOURCE_DIR}/../..")
+        add_custom_command(
+            TARGET cuda_backend PRE_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "[Auto-Retrain] Checking CUDA GEMM heuristic..."
+            COMMAND bash ${WORKSPACE_ROOT}/scripts/check_cuda_heuristic_needs_retrain.sh && 
+                    ${CMAKE_COMMAND} -E echo "[Auto-Retrain] CSV hash changed, retraining ML model..." &&
+                    bash ${WORKSPACE_ROOT}/scripts/train_cuda_heuristic.sh || 
+                    ${CMAKE_COMMAND} -E echo "[Auto-Retrain] Heuristic weights up-to-date (hash unchanged)"
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+            COMMENT "Auto-checking CUDA GEMM heuristic (hash-based)"
+            VERBATIM
+        )
+    else()
+        message(STATUS "V2: Auto-retrain ML heuristic disabled (manual training only)")
+    endif()
     
     # Add CUTLASS support for Tensor Cores (Phase 2)
     if(DEFINED ENV{CUTLASS_DIR})
@@ -463,6 +530,14 @@ endif()
 # Main executable
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
+
+# Profiling executable (for ncu profiling data collection)
+if(HAVE_CUDA)
+    add_executable(profile_cuda_config kernels/cuda/ProfileSingleConfig.cu)
+    target_link_libraries(profile_cuda_config cuda_backend CUDA::cudart)
+    target_include_directories(profile_cuda_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    message(STATUS "V2: Added profile_cuda_config executable for profiling data collection")
+endif()
 
 # Enable testing for V2
 enable_testing()

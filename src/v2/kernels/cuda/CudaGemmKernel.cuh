@@ -20,7 +20,7 @@
  *
  * EXAMPLE CONFIGURATIONS:
  * - Small:  SM80_16x8x8  + 1×1×1 layout = 16×8×8   CTA tile
- * - Medium: SM80_16x8x16 + 2×2×1 layout = 32×16×16 CTA tile  
+ * - Medium: SM80_16x8x16 + 2×2×1 layout = 32×16×16 CTA tile
  * - Large:  SM80_16x8x16 + 4×4×1 layout = 64×32×16 CTA tile
  *
  * ADVANTAGES OVER HARDCODED ATOMS:
@@ -110,7 +110,7 @@ namespace llaminar2
         {
             using SmemType = cutlass::half_t; // Convert to FP16 for Tensor Cores
             using CudaType = __half;
-            static constexpr bool can_use_async = false;            // Need manual conversion
+            static constexpr bool can_use_async = false; // Need manual conversion
 
             template <typename Decoder, typename BlockType>
             __device__ static inline void decode_block(const Decoder &decoder, const BlockType *block, CudaType *output)
@@ -183,8 +183,7 @@ namespace llaminar2
             // Layout must be rank-3 (M, N, K dimensions)
             using TiledMma = TiledMMA<
                 MMA_Atom<MmaAtomType>,
-                Layout<Shape<Int<AtomLayoutM>, Int<AtomLayoutN>, Int<AtomLayoutK>>>
-                >;
+                Layout<Shape<Int<AtomLayoutM>, Int<AtomLayoutN>, Int<AtomLayoutK>>>>;
 
             TiledMma tiled_mma;
 
@@ -438,14 +437,14 @@ namespace llaminar2
          * @param stream    CUDA stream (default 0)
          * @return          cudaSuccess or error code
          */
-        template <typename InputType, 
+        template <typename InputType,
                   typename MmaAtomType,
                   int AtomLayoutM,
-                  int AtomLayoutN, 
+                  int AtomLayoutN,
                   int AtomLayoutK,
-                  typename Decoder, 
-                  int TILE_M = 32, 
-                  int TILE_N = 64, 
+                  typename Decoder,
+                  int TILE_M = 32,
+                  int TILE_N = 64,
                   int TILE_K = 16>
         inline cudaError_t launchQuantizedGemmCuTe(
             const InputType *A,

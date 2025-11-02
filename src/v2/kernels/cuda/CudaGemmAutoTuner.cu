@@ -5,6 +5,7 @@
  * @author David Sanftenberg
  * @date October 31, 2025
  * @updated November 1, 2025 - Added ML-based tile predictor (Phase 3)
+ * @updated November 2, 2025 - Added ONNX neural network heuristic (Phase 24)
  */
 
 #include "CudaGemmAutoTuner.h"
@@ -13,6 +14,9 @@
 #include "generated/cuda_heuristic_lookup.h"
 #include "../../tensors/FP16Utils.h"
 #include "../../../../build_v2/autotuner_models/GemmAutoTunerML.h" // ML-based predictor
+#ifdef HAVE_ONNX_RUNTIME
+#include "CudaGemmNeuralNetwork.h"
+#endif
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -24,17 +28,24 @@
 #define LOG_INFO(msg) std::cout << "[INFO] " << msg << std::endl
 #define LOG_ERROR(msg) std::cerr << "[ERROR] " << msg << std::endl
 #define LOG_DEBUG(msg) std::cout << "[DEBUG] " << msg << std::endl
+#define LOG_WARN(msg) std::cerr << "[WARN] " << msg << std::endl
 
 namespace llaminar2
 {
     namespace cuda
     {
 
-        // Environment flag to switch between manual and ML heuristic
+        // Environment flags to control heuristic selection
         static bool useMLHeuristic()
         {
             const char *use_ml = std::getenv("LLAMINAR_USE_ML_HEURISTIC");
             return use_ml && std::atoi(use_ml) != 0;
+        }
+
+        static bool useNNHeuristic()
+        {
+            const char *use_nn = std::getenv("LLAMINAR_USE_NN_HEURISTIC");
+            return use_nn && std::atoi(use_nn) != 0;
         }
 
         // ============================================================================
@@ -269,18 +280,18 @@ namespace llaminar2
             // atom_type: 0 = SM80_16x8x16 (K=16, more K per iteration, better for medium/large K)
             //            1 = SM80_16x8x8  (K=8, smaller footprint, may help small matrices)
             const std::vector<int> atom_type_values = {0, 1}; // Both atom types for diversity
-            
+
             // Atom layout: how many atoms to tile together
             // Layout 2×2×1 = 4 atoms → 32×16 output tile (was hardcoded before, good baseline)
             // Layout 1×1×1 = 1 atom → 16×8 output tile (smaller for tiny matrices)
             // Layout 4×4×1 = 16 atoms → 64×32 output tile (larger for big matrices)
-            // 
+            //
             // PRACTICAL SUBSET: Using 3 representative layouts to keep config count manageable
             // Full space would be 648 × 2 atom_types × 9 layouts = 11,664 configs (too many)
             // Current space: 648 × 2 atom_types × 3 layouts = 3,888 configs (good balance)
-            const std::vector<int> atom_layout_m_values = {1, 2, 4};  // Representative: small, medium, large
-            const std::vector<int> atom_layout_n_values = {1, 2, 4};  // Representative: small, medium, large  
-            const std::vector<int> atom_layout_k_values = {1};        // Always 1 for SM80
+            const std::vector<int> atom_layout_m_values = {1, 2, 4}; // Representative: small, medium, large
+            const std::vector<int> atom_layout_n_values = {1, 2, 4}; // Representative: small, medium, large
+            const std::vector<int> atom_layout_k_values = {1};       // Always 1 for SM80
 
             // Explode parameter space (must match Python generator's nested loop order if used)
             for (int atom_type : atom_type_values)
@@ -294,8 +305,9 @@ namespace llaminar2
                             // FILTER: Only use square/balanced atom layouts for practical subset
                             // 1×1×1 (tiny), 2×2×1 (medium), 4×4×1 (large)
                             // Skip asymmetric layouts like 1×2, 2×4, etc. to keep config count manageable
-                            if (atom_m != atom_n) {
-                                continue;  // Skip non-square layouts
+                            if (atom_m != atom_n)
+                            {
+                                continue; // Skip non-square layouts
                             }
 
                             for (int tm : tile_m_values)
@@ -443,20 +455,25 @@ namespace llaminar2
 
             std::vector<ScoredConfig> scored;
 
-            // Check which heuristic to use
+            // Check which heuristic to use (priority: NN > ML > Manual)
+            bool use_nn = useNNHeuristic();
             bool use_ml = useMLHeuristic();
 
             // Log which heuristic is active (only once)
             static bool logged = false;
             if (!logged)
             {
-                if (use_ml)
+                if (use_nn)
+                {
+                    LOG_INFO("[CUDA AutoTuner] Using ONNX neural network heuristic (LLAMINAR_USE_NN_HEURISTIC=1)");
+                }
+                else if (use_ml)
                 {
                     LOG_INFO("[CUDA AutoTuner] Using ML-learned heuristic (LLAMINAR_USE_ML_HEURISTIC=1)");
                 }
                 else
                 {
-                    LOG_INFO("[CUDA AutoTuner] Using manual heuristic (set LLAMINAR_USE_ML_HEURISTIC=1 to use ML)");
+                    LOG_INFO("[CUDA AutoTuner] Using manual heuristic (set LLAMINAR_USE_ML_HEURISTIC=1 for ML or LLAMINAR_USE_NN_HEURISTIC=1 for NN)");
                 }
                 logged = true;
             }
@@ -470,7 +487,35 @@ namespace llaminar2
             {
                 double score = 0.0;
 
-                if (use_ml)
+                if (use_nn)
+                {
+                    // ONNX neural network heuristic: Works on ANY shape (no lookup table needed)
+                    // Trained on 0.5B/7B/72B, validated on 4B/32B, tested on 14B/235B/671B
+                    // Test R²=0.9569 (95.69% accuracy on unseen model sizes)
+#ifdef HAVE_ONNX_RUNTIME
+                    auto &nn = CudaGemmNeuralNetwork::instance();
+                    if (nn.isInitialized())
+                    {
+                        score = nn.predict(config, m, n, k); // Predicted GFLOPS (higher is better)
+                    }
+                    else
+                    {
+                        // NN not initialized - fallback to manual heuristic
+                        LOG_WARN("[CUDA AutoTuner] ONNX neural network not initialized, using manual heuristic");
+                        score = manualHeuristicScore(config, m, n, k);
+                    }
+#else
+                    // ONNX Runtime not available - fallback to manual heuristic
+                    static bool warned_once = false;
+                    if (!warned_once)
+                    {
+                        LOG_WARN("[CUDA AutoTuner] ONNX Runtime not available (rebuild with -DUSE_ONNX_HEURISTIC=ON), using manual heuristic");
+                        warned_once = true;
+                    }
+                    score = manualHeuristicScore(config, m, n, k);
+#endif
+                }
+                else if (use_ml)
                 {
                     // ML-learned heuristic: Use Gradient Boosting predictions from lookup table
                     // This gives us exact GB accuracy (R²=0.9999) without porting decision trees

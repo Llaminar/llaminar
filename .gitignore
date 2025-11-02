@@ -81,3 +81,9 @@ models/**.gguf
 .venv/
 *.pyc
 __pycache__/
+
+# ML/Benchmark training artifacts (should be in generated/ folder)
+src/v2/kernels/cuda/*.csv
+src/v2/kernels/cuda/*.png
+src/v2/kernels/cuda/*.txt
+src/v2/kernels/cuda/*_heuristic_*.h

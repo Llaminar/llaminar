@@ -58,7 +58,7 @@ TEST_F(Test__GPUBackendMemory_CUDA, DeviceCount)
 {
     // Should have at least 1 CUDA device in CI/dev environment
     EXPECT_GE(device_count, 0) << "CUDA backend should report device count";
-    
+
     if (device_count == 0)
     {
         GTEST_SKIP() << "No CUDA devices available, skipping CUDA tests";
@@ -219,7 +219,7 @@ TEST_F(Test__GPUBackendMemory_CUDA, LargeAllocation)
     const size_t bytes = 100 * 1024 * 1024; // 100 MB
 
     void *device_ptr = backend->allocate(bytes, device_id);
-    
+
     // May fail if GPU has insufficient memory
     if (device_ptr != nullptr)
     {
@@ -248,7 +248,7 @@ TEST_F(Test__GPUBackendMemory_CUDA, FreeNullPointer)
     }
 
     const int device_id = 0;
-    
+
     // Freeing nullptr should be a no-op (no crash)
     backend->free(nullptr, device_id);
 }
@@ -282,7 +282,7 @@ protected:
 TEST_F(Test__GPUBackendMemory_ROCm, DeviceCount)
 {
     EXPECT_GE(device_count, 0) << "ROCm backend should report device count";
-    
+
     if (device_count == 0)
     {
         GTEST_SKIP() << "No ROCm devices available, skipping ROCm tests";

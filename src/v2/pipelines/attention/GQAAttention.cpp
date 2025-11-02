@@ -626,21 +626,22 @@ namespace llaminar2
         //   1. Copy send_buffer from GPU to host (if needed)
         //   2. Perform MPI Allreduce on CPU
         //   3. Copy result back to GPU output tensor
-        
+
         // Check if we need GPU staging (output tensor on device)
         bool requires_staging = MPIStager::requiresStaging(output);
-        
+
         // For now, send_buffer is always std::vector<float> (CPU memory)
         // But output tensor might be on GPU in the future
-        
-        float* mpi_output_buffer = output_data;  // Default: use output tensor directly
-        std::vector<float> host_output_staging;   // Only allocated if GPU staging needed
-        
-        if (requires_staging) {
+
+        float *mpi_output_buffer = output_data; // Default: use output tensor directly
+        std::vector<float> host_output_staging; // Only allocated if GPU staging needed
+
+        if (requires_staging)
+        {
             // GPU tensor case: allocate staging buffer
             host_output_staging.resize(total_tokens * config.n_heads * config.head_dim);
             mpi_output_buffer = host_output_staging.data();
-            
+
             LOG_DEBUG("[MPI TP] Rank " << rank << ": GPU staging required, using host buffer");
         }
 
@@ -650,9 +651,10 @@ namespace llaminar2
             send_buffer.data(),
             mpi_output_buffer,
             total_tokens * config.n_heads * config.head_dim);
-        
+
         // Stage result back to GPU if needed
-        if (requires_staging) {
+        if (requires_staging)
+        {
             MPIStager::toDevice(host_output_staging, output);
             LOG_DEBUG("[MPI TP] Rank " << rank << ": Staged result back to GPU");
         }
@@ -663,9 +665,9 @@ namespace llaminar2
             const size_t output_size = total_tokens * config.n_heads * config.head_dim;
             std::ostringstream debug_msg_after;
             debug_msg_after << "[MPI TP] Rank " << rank << " AFTER allreduce (output_size=" << output_size << "):";
-            
+
             // Log from the buffer that contains the result
-            const float* result_buffer = requires_staging ? host_output_staging.data() : output_data;
+            const float *result_buffer = requires_staging ? host_output_staging.data() : output_data;
             debug_msg_after << " output[0]=" << result_buffer[0];
             if (output_size > 100)
                 debug_msg_after << " output[100]=" << result_buffer[100];

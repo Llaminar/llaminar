@@ -126,23 +126,23 @@ namespace llaminar2
         ITensorSwiGLU *get_swiglu_kernel();
 
     private:
-    struct Impl;
-    std::unique_ptr<Impl> pimpl_;
-};
+        struct Impl;
+        std::unique_ptr<Impl> pimpl_;
+    };
 
-// ============================================================================
-// GPU Compute Contexts (DEPRECATED - Phase 3)
-// ============================================================================
-// These classes are DEPRECATED as of Phase 3. Use IBackend interface instead:
-//   - src/v2/backends/IBackend.h (abstract interface)
-//   - src/v2/backends/cuda/CUDABackend.{h,cu} (CUDA implementation)
-//   - src/v2/backends/rocm/ROCmBackend.{h,cpp} (ROCm implementation)
-//
-// The code below is kept for Main.cpp device enumeration compatibility but
-// should NOT be extended. It will be removed in Phase 4.
-// ============================================================================
+    // ============================================================================
+    // GPU Compute Contexts (DEPRECATED - Phase 3)
+    // ============================================================================
+    // These classes are DEPRECATED as of Phase 3. Use IBackend interface instead:
+    //   - src/v2/backends/IBackend.h (abstract interface)
+    //   - src/v2/backends/cuda/CUDABackend.{h,cu} (CUDA implementation)
+    //   - src/v2/backends/rocm/ROCmBackend.{h,cpp} (ROCm implementation)
+    //
+    // The code below is kept for Main.cpp device enumeration compatibility but
+    // should NOT be extended. It will be removed in Phase 4.
+    // ============================================================================
 
-#if 0  // DISABLED: GPU contexts moved to IBackend (Phase 3)
+#if 0 // DISABLED: GPU contexts moved to IBackend (Phase 3)
 
 #ifdef HAVE_CUDA
 /**
@@ -223,13 +223,13 @@ public:
 };
 #endif
 
-#endif  // #if 0 - GPU contexts disabled (Phase 3)
+#endif // #if 0 - GPU contexts disabled (Phase 3)
 
-/**
- * @brief Device manager singleton
- *
- * Enumerates all available compute devices and manages context creation.
- *
+    /**
+     * @brief Device manager singleton
+     *
+     * Enumerates all available compute devices and manages context creation.
+     *
      * NUMA-Aware Filtering (Phase 1):
      * When initialized with a specific NUMA node, only enumerates devices
      * affine to that socket. This is critical for MPI multi-socket execution

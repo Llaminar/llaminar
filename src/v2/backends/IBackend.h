@@ -224,6 +224,48 @@ namespace llaminar2
          * @return true if INT8 supported (e.g., CUDA compute capability ≥ 6.1)
          */
         virtual bool supportsINT8(int device_id) const = 0;
+
+        // ====================================================================
+        // Compute Operations
+        // ====================================================================
+
+        /**
+         * @brief Quantized matrix multiplication: C = A * B (IQ4_NL format)
+         *
+         * Performs GEMM with FP32 activations and IQ4_NL quantized weights.
+         *
+         * @param A_device Device pointer to FP32 matrix A [m × k] row-major
+         * @param B_device Device pointer to IQ4_NL quantized matrix B [n × k/32] blocks
+         * @param C_device Device pointer to FP32 output matrix C [m × n] row-major
+         * @param m Number of rows in A and C
+         * @param n Number of columns in B and C
+         * @param k Number of columns in A and rows in B (must be multiple of 32)
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Requirements**:
+         * - All pointers must be valid device memory
+         * - k must be a multiple of 32 (IQ4_NL block size)
+         * - Matrices must be in row-major format
+         *
+         * **IQ4_NL Format** (each block encodes 32 floats in 18 bytes):
+         * - 2 bytes: FP16 scale factor
+         * - 16 bytes: Packed 4-bit indices (2 per byte)
+         * - Effective: 4.5 bits/value (~7.1× compression vs FP32)
+         *
+         * **Semantics**:
+         * - CUDA: Calls IQ4_NL_Gemm.cu kernel
+         * - ROCm: Calls IQ4_NL_Gemm.hip kernel (future)
+         * - CPU: Not applicable (use CPU kernel directly)
+         */
+        virtual bool gemmIQ4NL(
+            const void *A_device,
+            const void *B_device,
+            void *C_device,
+            int m,
+            int n,
+            int k,
+            int device_id) = 0;
     };
 
 } // namespace llaminar2

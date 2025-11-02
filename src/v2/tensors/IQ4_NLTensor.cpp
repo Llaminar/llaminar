@@ -15,6 +15,9 @@
 #include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
 #include "../kernels/cpu/GemmAutoTuner.h"
+#ifdef HAVE_CUDA
+#include "../kernels/cuda/CudaGemmFactory.h"
+#endif
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -211,8 +214,45 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ4_NLTensor::createGemm()
     {
-        // Use factory to create auto-tuned kernel
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        // Route to appropriate backend based on tensor's device placement
+        if (device_idx_ >= 0)
+        {
+            // Tensor is on a GPU device - get device type from DeviceManager
+            auto &dm = DeviceManager::instance();
+            const auto &devices = dm.devices();
+
+            if (static_cast<size_t>(device_idx_) >= devices.size())
+            {
+                LOG_ERROR("[IQ4_NLTensor] Invalid device_idx: " << device_idx_);
+                throw std::runtime_error("IQ4_NLTensor::createGemm: invalid device index");
+            }
+
+            const auto &device = devices[device_idx_];
+
+            // Route based on backend type
+            switch (device.type)
+            {
+#ifdef HAVE_CUDA
+            case ComputeBackendType::GPU_CUDA:
+                LOG_DEBUG("[IQ4_NLTensor] Creating CUDA GEMM kernel for device " << device_idx_);
+                return llaminar::v2::kernels::cuda::createCudaGemm(this);
+#endif
+#ifdef HAVE_ROCM
+            case ComputeBackendType::GPU_ROCM:
+                LOG_ERROR("[IQ4_NLTensor] ROCm GEMM not yet implemented");
+                throw std::runtime_error("ROCm GEMM not implemented");
+#endif
+            default:
+                LOG_ERROR("[IQ4_NLTensor] Unsupported GPU backend type: " << static_cast<int>(device.type));
+                throw std::runtime_error("Unsupported GPU backend type");
+            }
+        }
+        else
+        {
+            // Tensor is on CPU - use auto-tuned CPU kernel
+            LOG_DEBUG("[IQ4_NLTensor] Creating CPU GEMM kernel");
+            return llaminar::v2::kernels::createAutoTunedGemm(this);
+        }
     }
 
     std::unique_ptr<ITensorRoPE> IQ4_NLTensor::createRoPE()

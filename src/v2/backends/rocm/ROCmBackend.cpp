@@ -127,8 +127,8 @@ namespace llaminar2
         err = hipMalloc(&ptr, bytes);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend] hipMalloc failed for " << bytes << " bytes on device " 
-                      << device_id << ": " << hipGetErrorString(err));
+            LOG_ERROR("[ROCmBackend] hipMalloc failed for " << bytes << " bytes on device "
+                                                            << device_id << ": " << hipGetErrorString(err));
             return nullptr;
         }
 
@@ -152,8 +152,8 @@ namespace llaminar2
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipFree: " 
-                      << hipGetErrorString(err));
+            LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipFree: "
+                                                            << hipGetErrorString(err));
             return;
         }
 
@@ -259,7 +259,7 @@ namespace llaminar2
         // - MI100 (gfx908): Limited BF16 support
         // GCN architecture ID (gcnArch) is deprecated in newer ROCm versions
         // Use compute capability via prop.major/minor or architecture string
-        
+
         // Conservative check: Assume MI200+ (gfx90a and later) for full BF16
         // This is a heuristic - may need refinement based on actual hardware
         std::string arch_name(prop.gcnArchName);
@@ -311,6 +311,32 @@ namespace llaminar2
         return (arch_name.find("gfx9") != std::string::npos ||
                 arch_name.find("gfx10") != std::string::npos ||
                 arch_name.find("gfx11") != std::string::npos);
+    }
+
+    // ====================================================================
+    // Compute Operations
+    // ====================================================================
+
+    bool ROCmBackend::gemmIQ4NL(
+        const void *A_device,
+        const void *B_device,
+        void *C_device,
+        int m,
+        int n,
+        int k,
+        int device_id)
+    {
+        // TODO: Implement ROCm/HIP version of IQ4_NL GEMM kernel
+        // For now, return false to indicate not implemented
+        (void)A_device;
+        (void)B_device;
+        (void)C_device;
+        (void)m;
+        (void)n;
+        (void)k;
+        (void)device_id;
+
+        return false;
     }
 
 } // namespace llaminar2

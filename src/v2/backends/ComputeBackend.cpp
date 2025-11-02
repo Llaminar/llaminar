@@ -28,7 +28,7 @@
 // ============================================================================
 // GPU Backend Includes (DEPRECATED - Phase 3)
 // ============================================================================
-// These GPU includes are DEPRECATED as of Phase 3. GPU backends now use 
+// These GPU includes are DEPRECATED as of Phase 3. GPU backends now use
 // the IBackend interface (IBackend.h) with separate compilation units:
 //   - CUDABackend (backends/cuda/CUDABackend.cu)
 //   - ROCmBackend (backends/rocm/ROCmBackend.cpp)
@@ -37,7 +37,7 @@
 // See backends/IBackend.h for the new GPU abstraction interface.
 // ============================================================================
 
-#if 0  // GPU includes disabled (Phase 3)
+#if 1 // GPU includes enabled for Phase 1 testing
 // Conditional includes based on backend availability
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -52,7 +52,7 @@
 #ifdef HAVE_VULKAN
 #include <vulkan/vulkan.h>
 #endif
-#endif  // #if 0 - GPU includes disabled (Phase 3)
+#endif // #if 1 - GPU includes enabled for Phase 1 testing
 
 namespace llaminar2
 {
@@ -144,7 +144,7 @@ namespace llaminar2
     // See backends/cuda/CUDABackend.cu for new CUDA implementation.
     // ============================================================================
 
-#if 0  // CUDA enumeration disabled (Phase 3)
+#if 1 // CUDA enumeration enabled for Phase 1 testing
 #ifdef HAVE_CUDA
     static std::vector<ComputeDevice> enumerate_cuda_devices()
     {
@@ -201,13 +201,13 @@ namespace llaminar2
         return {}; // CUDA not available
     }
 #endif
-#endif  // #if 0 - CUDA enumeration disabled (Phase 3)
+#endif // #if 1 - CUDA enumeration enabled for Phase 1 testing
 
-    // Replacement stub (always returns empty)
-    static std::vector<ComputeDevice> enumerate_cuda_devices()
-    {
-        return {}; // GPU enumeration moved to IBackend (Phase 3)
-    }
+    // Replacement stub disabled (using real CUDA enumeration above)
+    // static std::vector<ComputeDevice> enumerate_cuda_devices()
+    // {
+    //     return {}; // GPU enumeration moved to IBackend (Phase 3)
+    // }
 
     // ============================================================================
     // ROCm Device Enumeration (DEPRECATED - Phase 3)
@@ -216,7 +216,7 @@ namespace llaminar2
     // See backends/rocm/ROCmBackend.cpp for new ROCm implementation.
     // ============================================================================
 
-#if 0  // ROCm enumeration disabled (Phase 3)
+#if 0 // ROCm enumeration disabled (Phase 3)
 #ifdef HAVE_ROCM
     static std::vector<ComputeDevice> enumerate_rocm_devices()
     {
@@ -273,7 +273,7 @@ namespace llaminar2
         return {}; // ROCm not available
     }
 #endif
-#endif  // #if 0 - ROCm enumeration disabled (Phase 3)
+#endif // #if 0 - ROCm enumeration disabled (Phase 3)
 
     // Replacement stub (always returns empty)
     static std::vector<ComputeDevice> enumerate_rocm_devices()
@@ -287,7 +287,7 @@ namespace llaminar2
     // Vulkan support is currently stubbed out.
     // ============================================================================
 
-#if 0  // Vulkan enumeration disabled (Phase 3)
+#if 0 // Vulkan enumeration disabled (Phase 3)
 #ifdef HAVE_VULKAN
     static std::vector<ComputeDevice> enumerate_vulkan_devices()
     {
@@ -368,7 +368,7 @@ namespace llaminar2
         return {}; // Vulkan not available
     }
 #endif
-#endif  // #if 0 - Vulkan enumeration disabled (Phase 3)
+#endif // #if 0 - Vulkan enumeration disabled (Phase 3)
 
     // Replacement stub (always returns empty)
     static std::vector<ComputeDevice> enumerate_vulkan_devices()
@@ -538,7 +538,7 @@ namespace llaminar2
             ctx = std::make_shared<CPUComputeContext>();
             break;
 
-#if 0  // GPU context creation disabled (Phase 3)
+#if 0 // GPU context creation disabled (Phase 3)
 #ifdef HAVE_CUDA
         case ComputeBackendType::GPU_CUDA:
         {
@@ -618,7 +618,7 @@ namespace llaminar2
             LOG_ERROR("[DeviceManager] Vulkan not available in this build");
             return nullptr;
 #endif
-#endif  // #if 0 - GPU context creation disabled (Phase 3)
+#endif // #if 0 - GPU context creation disabled (Phase 3)
 
         // GPU context creation now handled by IBackend (Phase 3)
         case ComputeBackendType::GPU_CUDA:
@@ -825,7 +825,7 @@ namespace llaminar2
     // See backends/cuda/CUDABackend.cu for new CUDA implementation.
     // ============================================================================
 
-#if 0  // CUDA context methods disabled (Phase 3)
+#if 0 // CUDA context methods disabled (Phase 3)
 #ifdef HAVE_CUDA
     void *CUDAComputeContext::allocate(size_t bytes)
     {
@@ -972,6 +972,6 @@ namespace llaminar2
         // TODO: Vulkan queue submit + wait
     }
 #endif
-#endif  // #if 0 - GPU context methods disabled (Phase 3)
+#endif // #if 0 - GPU context methods disabled (Phase 3)
 
 } // namespace llaminar2

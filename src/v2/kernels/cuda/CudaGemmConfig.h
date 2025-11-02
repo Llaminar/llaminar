@@ -60,10 +60,10 @@ namespace llaminar2
             int vectorize_load;  // Vectorized load width: 1=scalar, 2=float2, 4=float4
 
             // Tensor Core atom configuration (NEW - enables true configuration diversity)
-            int atom_type;      // 0 = SM80_16x8x16 (K=16), 1 = SM80_16x8x8 (K=8)
-            int atom_layout_m;  // Atoms in M dimension (1, 2, 4)
-            int atom_layout_n;  // Atoms in N dimension (1, 2, 4)
-            int atom_layout_k;  // Atoms in K dimension (always 1 for SM80)
+            int atom_type;     // 0 = SM80_16x8x16 (K=16), 1 = SM80_16x8x8 (K=8)
+            int atom_layout_m; // Atoms in M dimension (1, 2, 4)
+            int atom_layout_n; // Atoms in N dimension (1, 2, 4)
+            int atom_layout_k; // Atoms in K dimension (always 1 for SM80)
 
             /**
              * @brief Validate configuration consistency

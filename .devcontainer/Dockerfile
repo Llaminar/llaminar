@@ -12,11 +12,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 # CRITICAL: Install sed, grep, and core utilities FIRST before anything else
 # These are required by VS Code's UID update process
 RUN apt-get update && apt-get install -y \
+    wget \
+    sudo \
     sed \
     grep \
     coreutils \
     findutils \
+    gpg-agent \
     && rm -rf /var/lib/apt/lists/*
+
+# Add Intel MKL repo
+RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | \
+    gpg --dearmor | \
+    sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | \
+    sudo tee /etc/apt/sources.list.d/oneAPI.list
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -42,9 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openmpi-bin \
     openmpi-common \
     libopenmpi-dev \
-    # Linear algebra libraries for COSMA
+    # Linear algebra libraries
     libopenblas-dev \
     libscalapack-openmpi-dev \
+    intel-oneapi-mkl-devel \
     # NUMA support
     libnuma-dev \
     # Google Test / gMock for unit tests
@@ -96,6 +107,14 @@ RUN KERNEL_VERSION=$(uname -r) && \
 RUN cmake -S /usr/src/googletest -B /tmp/googletest-build \
     && cmake --build /tmp/googletest-build --target install \
     && rm -rf /tmp/googletest-build
+
+# Install NVIDIA CUTLASS (Tensor Core library) - header-only, no build needed
+# CUTLASS 4.2.1 supports CUDA 12.x and provides modern Tensor Core APIs
+RUN git clone --branch v4.2.1 --depth 1 https://github.com/NVIDIA/cutlass.git /opt/cutlass && \
+    chown -R vscode:vscode /opt/cutlass
+
+# Set CUTLASS environment variable for CMake
+ENV CUTLASS_DIR=/opt/cutlass
 
 # Install CUDA 12.9 (conditional)
 RUN if [ "$INSTALL_CUDA" = "true" ]; then \

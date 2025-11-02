@@ -94,26 +94,26 @@ namespace llaminar2
             //   4×4×1 = 16 atoms (64×32 output per K-slice)
 
 // Helper macros for different atom configurations
-#define LAUNCH_ATOM_16x8x16(AM, AN, AK, TM, TN, TK)                                                                                   \
-    if (config.atom_type == 0 && config.atom_layout_m == AM && config.atom_layout_n == AN && config.atom_layout_k == AK &&           \
-        config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                           \
-    {                                                                                                                                \
+#define LAUNCH_ATOM_16x8x16(AM, AN, AK, TM, TN, TK)                                                                               \
+    if (config.atom_type == 0 && config.atom_layout_m == AM && config.atom_layout_n == AN && config.atom_layout_k == AK &&        \
+        config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                        \
+    {                                                                                                                             \
         return launchQuantizedGemmCuTe<float, SM80_16x8x16_F32F16F16F32_TN, AM, AN, AK, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
-            A, C, m, n, k, decoder, stream);                                                                                         \
+            A, C, m, n, k, decoder, stream);                                                                                      \
     }
 
-#define LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)                                                                                  \
-    if (config.atom_type == 1 && config.atom_layout_m == AM && config.atom_layout_n == AN && config.atom_layout_k == AK &&          \
-        config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                          \
-    {                                                                                                                               \
+#define LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)                                                                               \
+    if (config.atom_type == 1 && config.atom_layout_m == AM && config.atom_layout_n == AN && config.atom_layout_k == AK &&       \
+        config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                       \
+    {                                                                                                                            \
         return launchQuantizedGemmCuTe<float, SM80_16x8x8_F32F16F16F32_TN, AM, AN, AK, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
-            A, C, m, n, k, decoder, stream);                                                                                        \
+            A, C, m, n, k, decoder, stream);                                                                                     \
     }
 
 // Convenience macro that tries both atom types with given layout and tile size
 #define LAUNCH_TENSORCORE(AM, AN, AK, TM, TN, TK) \
-    LAUNCH_ATOM_16x8x16(AM, AN, AK, TM, TN, TK)    \
-    LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)
+    LAUNCH_ATOM_16x8x16(AM, AN, AK, TM, TN, TK)   \
+        LAUNCH_ATOM_16x8x8(AM, AN, AK, TM, TN, TK)
 
             // ============================================================================
             // ATOM-AWARE TILE CONFIGURATION SPACE
