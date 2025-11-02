@@ -1,25 +1,33 @@
 /**
  * @file CudaGemmKernel.cuh
- * @brief Tensor Core CUDA GEMM kernel using CUTLASS CuTe API
+ * @brief Tensor Core CUDA GEMM kernel using CUTLASS CuTe API with templated MMA atoms
  *
  * @author David Sanftenberg
- * @date November 1, 2025
+ * @date November 2, 2025
  *
  * ✅ **MODERN IMPLEMENTATION**: Uses CUTLASS 4.2.1 CuTe template API
  *
- * ADVANTAGES OVER OLD WMMA:
- * - Template-based: Compiler optimized, less code
- * - Flexible tiling: Not limited to 16×16×16
- * - Async copy: Built-in cp.async support
- * - Modern API: Actively maintained by NVIDIA
+ * ARCHITECTURE - TEMPLATED MMA ATOMS:
+ * - MMA atom is now a template parameter (not hardcoded!)
+ * - Autotuner can select different atoms for different problem sizes
+ * - Atom layout is also templated (e.g., 1×1, 2×2, 4×4)
+ * - Enables true configuration space exploration
  *
- * PHASE 2 OPTIMIZATIONS (Tensor Cores):
- * 1. ✅ Tensor Core MMA via SM80_16x8x16_F16F16F32F32_TN
- * 2. ✅ Mixed precision: FP16 compute, FP32 accumulation
- * 3. ✅ Async copy: cp.async for global→shared transfers
- * 4. ✅ Optimized layouts: CuTe automatic layout selection
+ * TEMPLATE HIERARCHY:
+ * 1. MmaAtomType: Tensor Core instruction (e.g., SM80_16x8x16_F32F16F16F32_TN)
+ * 2. AtomLayout: How many atoms to tile (e.g., 2×2×1 = 4 atoms)
+ * 3. CTA Tile: Resulting block size (atom_size × atom_layout)
  *
- * EXPECTED PERFORMANCE: 4-6× over Phase 1 (425 GFLOPS → 1,700-2,550 GFLOPS)
+ * EXAMPLE CONFIGURATIONS:
+ * - Small:  SM80_16x8x8  + 1×1×1 layout = 16×8×8   CTA tile
+ * - Medium: SM80_16x8x16 + 2×2×1 layout = 32×16×16 CTA tile  
+ * - Large:  SM80_16x8x16 + 4×4×1 layout = 64×32×16 CTA tile
+ *
+ * ADVANTAGES OVER HARDCODED ATOMS:
+ * - Autotuner can explore atom types (8, 16, 32 K-dim)
+ * - Different atom layouts for different problem sizes
+ * - Factory instantiates specific kernel templates per config
+ * - True performance diversity in configuration space
  *
  * HARDWARE REQUIREMENTS:
  * - Compute Capability ≥ 8.0 (Ampere or newer)
@@ -60,7 +68,8 @@ namespace llaminar2
          * Maps input activation types to appropriate:
          * - Shared memory storage type (always matches InputType for zero-copy)
          * - CUDA native type (for decoder output)
-         * - MMA atom (Tensor Core instruction to use)
+         *
+         * NOTE: MMA atom is now a template parameter, not hardcoded here!
          */
         template <typename InputType>
         struct TensorCoreTraits;
@@ -71,7 +80,6 @@ namespace llaminar2
         {
             using SmemType = cutlass::half_t;
             using CudaType = __half;
-            using MmaAtom = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>; // FP16 in, FP32 accum
             static constexpr bool can_use_async = true;
 
             template <typename Decoder, typename BlockType>
@@ -87,7 +95,6 @@ namespace llaminar2
         {
             using SmemType = cutlass::bfloat16_t;
             using CudaType = __nv_bfloat16;
-            using MmaAtom = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>; // BF16 in, FP32 accum
             static constexpr bool can_use_async = true;
 
             template <typename Decoder, typename BlockType>
@@ -103,7 +110,6 @@ namespace llaminar2
         {
             using SmemType = cutlass::half_t; // Convert to FP16 for Tensor Cores
             using CudaType = __half;
-            using MmaAtom = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>; // FP16 in, FP32 accum
             static constexpr bool can_use_async = false;            // Need manual conversion
 
             template <typename Decoder, typename BlockType>
@@ -114,17 +120,24 @@ namespace llaminar2
         };
 
         /**
-         * @brief Phase 2 Tensor Core GEMM kernel using CuTe with templated input type
+         * @brief Phase 2 Tensor Core GEMM kernel using CuTe with templated input type and MMA atom
          *
-         * TEMPLATE INPUT TYPE:
-         * - InputType = float: FP32 input (Phase 2.0 - requires FP32→FP16 conversion, manual copy)
-         * - InputType = cutlass::half_t: FP16 input (Phase 2.5 - enables cp.async, much faster)
-         * - InputType = cutlass::bfloat16_t: BF16 input (Phase 3.0 - Ampere+, wider dynamic range)
+         * TEMPLATE PARAMETERS:
+         * - InputType: Input activation type (float, cutlass::half_t, or cutlass::bfloat16_t)
+         * - MmaAtomType: Tensor Core MMA atom instruction (e.g., SM80_16x8x16_F32F16F16F32_TN)
+         * - AtomLayoutM/N/K: How many atoms to tile (e.g., 2×2×1 = 4 atoms)
+         * - Decoder: Block decoder type (IQ4_NL_Decoder, Q6_K_Decoder, etc.)
+         * - TILE_M/N/K: CTA tile dimensions (must match atom_size × atom_layout)
          *
-         * IMPLEMENTATION STATUS:
-         * - Phase 2.0 (FP32 input): Manual copy, 1.3× speedup
-         * - Phase 2.5 (FP16 input): Async copy with TiledCopy
-         * - Phase 3.0 (BF16 input): Async copy, same performance as FP16 but better numerics
+         * ARCHITECTURE:
+         * - MMA atom: The fundamental Tensor Core operation (e.g., 16×8×16)
+         * - Atom layout: How many atoms to tile together (e.g., 2×2×1)
+         * - CTA tile: Resulting tile size (e.g., 32×16×16 = 16×2 × 8×2 × 16×1)
+         *
+         * EXAMPLE CONFIGURATIONS:
+         * - Small: SM80_16x8x8 with 1×1×1 layout = 16×8×8 CTA tile
+         * - Medium: SM80_16x8x16 with 2×2×1 layout = 32×16×16 CTA tile
+         * - Large: SM80_16x8x16 with 4×4×1 layout = 64×32×16 CTA tile
          *
          * KEY CUTE CONCEPTS:
          * - TiledMMA: Defines Tensor Core tile shape and layout
@@ -133,12 +146,20 @@ namespace llaminar2
          * - partition_*: Distributes work across threads
          *
          * @tparam InputType       Input activation type (float, cutlass::half_t, or cutlass::bfloat16_t)
+         * @tparam MmaAtomType     MMA atom instruction type (e.g., SM80_16x8x16_F32F16F16F32_TN)
+         * @tparam AtomLayoutM     Number of atoms in M dimension (default 2)
+         * @tparam AtomLayoutN     Number of atoms in N dimension (default 2)
+         * @tparam AtomLayoutK     Number of atoms in K dimension (default 1)
          * @tparam Decoder         Block decoder type (IQ4_NL_Decoder, Q6_K_Decoder, etc.)
          * @tparam TILE_M          M dimension of CTA tile (default 64)
          * @tparam TILE_N          N dimension of CTA tile (default 64)
          * @tparam TILE_K          K dimension of CTA tile (default 16)
          */
         template <typename InputType,
+                  typename MmaAtomType,
+                  int AtomLayoutM,
+                  int AtomLayoutN,
+                  int AtomLayoutK,
                   typename Decoder,
                   int TILE_M = 64,
                   int TILE_N = 64,
@@ -152,18 +173,17 @@ namespace llaminar2
         {
             // ==================== CuTe Type Definitions ====================
 
-            // Use type traits to select appropriate MMA atom and types
+            // Use type traits to select appropriate types (no longer includes MmaAtom)
             using Traits = TensorCoreTraits<InputType>;
-            using MmaAtom = typename Traits::MmaAtom;
             using SmemType = typename Traits::SmemType;
             using CudaType = typename Traits::CudaType;
             constexpr bool can_use_async = Traits::can_use_async;
 
-            // Create tiled MMA with 2×2×1 atom layout → 32×16×16 effective tile
+            // Create tiled MMA with templated atom and layout
             // Layout must be rank-3 (M, N, K dimensions)
             using TiledMma = TiledMMA<
-                MmaAtom,
-                Layout<Shape<_2, _2, _1>> // 2×2×1 atom grid → 32×16 output tile per K-slice
+                MMA_Atom<MmaAtomType>,
+                Layout<Shape<Int<AtomLayoutM>, Int<AtomLayoutN>, Int<AtomLayoutK>>>
                 >;
 
             TiledMma tiled_mma;
@@ -398,11 +418,18 @@ namespace llaminar2
         }
 
         /**
-         * @brief Launcher for CuTe Tensor Core kernel
+         * @brief Launcher for CuTe Tensor Core kernel with templated MMA atom
          *
          * Calculates optimal grid/block dimensions and launches kernel.
          *
-         * @param A         Input activation matrix [m × k] (FP32)
+         * TEMPLATE PARAMETERS:
+         * - InputType: Input activation type (float, cutlass::half_t, or cutlass::bfloat16_t)
+         * - MmaAtomType: Tensor Core MMA atom instruction (e.g., SM80_16x8x16_F32F16F16F32_TN)
+         * - AtomLayoutM/N/K: How many atoms to tile (e.g., 2×2×1)
+         * - Decoder: Block decoder type
+         * - TILE_M/N/K: CTA tile dimensions
+         *
+         * @param A         Input activation matrix [m × k]
          * @param C         Output matrix [m × n] (FP32)
          * @param m         Number of rows in A and C
          * @param n         Number of columns in C
@@ -410,12 +437,16 @@ namespace llaminar2
          * @param decoder   Quantized weight decoder
          * @param stream    CUDA stream (default 0)
          * @return          cudaSuccess or error code
-         *
-         * @note Phase 3 optimization: Default tiles changed from 64×64×16 to 32×64×16
-         *       for 41% speedup on single-token inference (m=32). Matches tile size to
-         *       typical decode workload dimensions for full resource utilization.
          */
-        template <typename InputType, typename Decoder, int TILE_M = 32, int TILE_N = 64, int TILE_K = 16>
+        template <typename InputType, 
+                  typename MmaAtomType,
+                  int AtomLayoutM,
+                  int AtomLayoutN, 
+                  int AtomLayoutK,
+                  typename Decoder, 
+                  int TILE_M = 32, 
+                  int TILE_N = 64, 
+                  int TILE_K = 16>
         inline cudaError_t launchQuantizedGemmCuTe(
             const InputType *A,
             float *C,
@@ -432,7 +463,7 @@ namespace llaminar2
             dim3 threads(128);
 
             // Launch kernel
-            quantized_gemm_kernel_cute<InputType, Decoder, TILE_M, TILE_N, TILE_K>
+            quantized_gemm_kernel_cute<InputType, MmaAtomType, AtomLayoutM, AtomLayoutN, AtomLayoutK, Decoder, TILE_M, TILE_N, TILE_K>
                 <<<blocks, threads, 0, stream>>>(A, C, m, n, k, decoder);
 
             return cudaGetLastError();

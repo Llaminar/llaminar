@@ -22,11 +22,13 @@
 #include "IQ4_NL_BlockDecoder.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cute/arch/mma_sm80.hpp> // For SM80 MMA atom types
 
 namespace llaminar2
 {
     namespace cuda
     {
+        using namespace cute; // For SM80_16x8x16_F32F16F16F32_TN
 
         /**
          * @brief Launch dispatcher for CuTe-based Tensor Core IQ4_NL kernel
@@ -77,11 +79,12 @@ namespace llaminar2
             IQ4_NL_Decoder<IQ4_NLBlock> decoder(B_blocks, n, num_k_blocks);
 
 // Macro to reduce boilerplate for template instantiation
-#define LAUNCH_TENSORCORE(TM, TN, TK)                                                   \
-    if (config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)              \
-    {                                                                                   \
-        return launchQuantizedGemmCuTe<float, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
-            A, C, m, n, k, decoder, stream);                                            \
+// Uses SM80_16x8x16 atom with 2×2×1 layout by default (can be made configurable later)
+#define LAUNCH_TENSORCORE(TM, TN, TK)                                                                                        \
+    if (config.tile_m == TM && config.tile_n == TN && config.tile_k == TK)                                                   \
+    {                                                                                                                        \
+        return launchQuantizedGemmCuTe<float, SM80_16x8x16_F32F16F16F32_TN, 2, 2, 1, IQ4_NL_Decoder<IQ4_NLBlock>, TM, TN, TK>( \
+            A, C, m, n, k, decoder, stream);                                                                                 \
     }
 
             // ============================================================================
