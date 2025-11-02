@@ -51,6 +51,9 @@ if(HAVE_CUDA)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_89,code=sm_89")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90,code=sm_90")
     
+    # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
+    
     # Relocatable device code for separate compilation
     set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 endif()
@@ -88,16 +91,88 @@ endif()
 # Backend Library Compilation (Phase 3)
 # =============================================================================
 
+# Find Python3 for code generation scripts (needed before backend compilation)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
+
 # CUDA backend (separate .cu compilation unit)
 if(HAVE_CUDA)
-    add_library(cuda_backend STATIC backends/cuda/CUDABackend.cu)
+    # Generate CUDA GEMM variant instantiations (auto-run Python script at configure time)
+    set(GENERATE_CUDA_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/generate_cuda_gemm_variants.py")
+    set(GENERATED_CUDA_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/generated/sources.cmake")
+    
+    # Check if generation is needed (script newer than output, or output doesn't exist)
+    if(NOT EXISTS ${GENERATED_CUDA_CMAKE} OR 
+       ${GENERATE_CUDA_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_CUDA_CMAKE})
+        message(STATUS "V2: Generating CUDA GEMM kernel variants...")
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} ${GENERATE_CUDA_GEMM_SCRIPT}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda
+            RESULT_VARIABLE GENERATE_CUDA_RESULT
+            OUTPUT_VARIABLE GENERATE_CUDA_OUTPUT
+            ERROR_VARIABLE GENERATE_CUDA_ERROR
+        )
+        
+        if(NOT GENERATE_CUDA_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to generate CUDA GEMM variants:\n${GENERATE_CUDA_ERROR}")
+        endif()
+        
+        message(STATUS "V2: Generated CUDA GEMM variants (200 configs in 10 .inc files)")
+    else()
+        message(STATUS "V2: CUDA GEMM variant .inc files are up-to-date")
+    endif()
+    
+    # CUDA kernels (separate translation units)
+    # Note: .inc files are #included in CudaGemmVariantsBaseline.cu, no separate compilation
+    set(CUDA_KERNEL_SOURCES
+        kernels/cuda/IQ4_NL_BlockDecoder.cu
+        kernels/cuda/CudaGemmVariantsBaseline.cu      # Standard CUDA kernels (baseline)
+        kernels/cuda/CudaGemmVariantsMemoryOpt.cu     # Memory-optimized kernels (Phase 1)
+        kernels/cuda/CudaGemmVariantsTensorCore.cu    # Tensor Core kernels (Phase 2+)
+        kernels/cuda/CudaGemmAutoTuner.cu
+        kernels/cuda/CudaGemmFactory.cu
+    )
+    
+    # CUDA backend library includes backend + kernels
+    add_library(cuda_backend STATIC 
+        backends/cuda/CUDABackend.cu
+        ${CUDA_KERNEL_SOURCES}
+    )
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(cuda_backend PUBLIC CUDA::cudart)
+    
+    # Add CUTLASS support for Tensor Cores (Phase 2)
+    if(DEFINED ENV{CUTLASS_DIR})
+        set(CUTLASS_DIR $ENV{CUTLASS_DIR})
+    else()
+        set(CUTLASS_DIR "/opt/cutlass")
+    endif()
+    
+    if(EXISTS "${CUTLASS_DIR}/include")
+        message(STATUS "V2: Found CUTLASS at ${CUTLASS_DIR}")
+        target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
+        target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
+        
+        # CUTLASS requires C++17 minimum
+        target_compile_features(cuda_backend PUBLIC cxx_std_17)
+        
+        # Add CUTLASS NVCC flags for Tensor Cores
+        # SM 86 = RTX 3090 (Ampere), SM 80 = A100, SM 75 = Turing
+        target_compile_options(cuda_backend PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_75,code=sm_75>  # Turing
+            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_80,code=sm_80>  # Ampere A100
+            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_86,code=sm_86>  # Ampere RTX 3090
+        )
+        
+        message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
+    else()
+        message(WARNING "V2: CUTLASS not found at ${CUTLASS_DIR} - Tensor Core kernels disabled")
+    endif()
     
     # Define HAVE_CUDA for MPIStager and other consumers
     add_compile_definitions(HAVE_CUDA)
     
-    message(STATUS "V2: CUDA backend library configured")
+    message(STATUS "V2: CUDA backend library configured with ${CMAKE_CURRENT_LIST_LENGTH} kernel(s)")
 endif()
 
 # ROCm backend (separate .cpp compilation unit with HIP)
