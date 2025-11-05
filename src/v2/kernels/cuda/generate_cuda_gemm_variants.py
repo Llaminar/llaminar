@@ -55,6 +55,19 @@ USE_TRANSPOSE_VALUES = [False, True]
 # Vectorized loads (1 = scalar, 2/4 = vector)
 VECTORIZE_VALUES = [1, 2, 4]
 
+# Atom configuration (MMA instruction shapes)
+# ATOM_TYPE: 0 = SM80_16x8x16 (K=16), 1 = SM80_16x8x8 (K=8)
+# Different K dimensions may perform better on different shapes
+ATOM_TYPE_VALUES = [0, 1]
+
+# ATOM_LAYOUT: How MMA atoms tile within a thread block tile
+# [M, N, K] repetition of the MMA atom (16×8×K)
+# Higher values increase tensor core utilization on large tiles
+# but may harm small tiles due to register pressure
+ATOM_LAYOUT_M_VALUES = [1, 2, 4]  # 1×16=16, 2×16=32, 4×16=64 rows
+ATOM_LAYOUT_N_VALUES = [1, 2, 4]  # 1×8=8, 2×8=16, 4×8=32 cols
+ATOM_LAYOUT_K_VALUES = [1]        # Always 1 for SM80 (K handled by atom type)
+
 # Output configuration
 # PARALLELISM: More files = better nvcc parallelization
 # With 56 cores and 37,380 configs, target ~100-150 configs per file
@@ -144,7 +157,9 @@ def is_valid_config(tile_m: int, tile_n: int, tile_k: int,
                     threads_m: int, threads_n: int,
                     work_m: int, work_n: int,
                     prefetch_stages: int, use_transpose: bool,
-                    vectorize: int) -> bool:
+                    vectorize: int,
+                    atom_type: int = 0, atom_layout_m: int = 1,
+                    atom_layout_n: int = 1, atom_layout_k: int = 1) -> bool:
     """
     Validate configuration against hardware constraints and kernel requirements.
     
@@ -154,6 +169,7 @@ def is_valid_config(tile_m: int, tile_n: int, tile_k: int,
       3. Block threads <= 1024
       4. Tile must equal (block_threads * work_items) - CRITICAL for kernel
       5. Vectorize must divide tile_k for alignment
+      6. Atom layout must be compatible with tile dimensions
     
     Note: threads_m/work_m are M dimension (rows)
           threads_n/work_n are N dimension (cols)
@@ -164,6 +180,21 @@ def is_valid_config(tile_m: int, tile_n: int, tile_k: int,
     if tile_m != threads_m * work_m:
         return False
     if tile_n != threads_n * work_n:
+        return False
+    
+    # Atom compatibility checks
+    # Atom type 0: SM80_16x8x16 (M=16, N=8, K=16)
+    # Atom type 1: SM80_16x8x8  (M=16, N=8, K=8)
+    atom_m_dim = 16
+    atom_n_dim = 8
+    atom_k_dim = 16 if atom_type == 0 else 8
+    
+    # Tile must be divisible by atom layout dimensions
+    if tile_m % (atom_m_dim * atom_layout_m) != 0:
+        return False
+    if tile_n % (atom_n_dim * atom_layout_n) != 0:
+        return False
+    if tile_k % (atom_k_dim * atom_layout_k) != 0:
         return False
     
     # Check shared memory
@@ -197,34 +228,40 @@ def generate_all_configs() -> List[Tuple]:
     Generate all valid kernel configurations.
     
     Returns: List of tuples (tile_m, tile_n, tile_k, threads_m, threads_n,
-                              work_m, work_n, prefetch_stages, use_transpose, vectorize)
+                              work_m, work_n, prefetch_stages, use_transpose, vectorize,
+                              atom_type, atom_layout_m, atom_layout_n, atom_layout_k)
     Note: threads_m/work_m correspond to M dimension (rows, Y)
           threads_n/work_n correspond to N dimension (cols, X)
     """
     valid_configs = []
     
     # Nested loops over parameter space
-    for tile_m in TILE_M_VALUES:
-        for tile_n in TILE_N_VALUES:
-            for tile_k in TILE_K_VALUES:
-                for block_threads_x in BLOCK_THREADS_X_VALUES:
-                    for block_threads_y in BLOCK_THREADS_Y_VALUES:
-                        for work_items_x in WORK_ITEMS_X_VALUES:
-                            for work_items_y in WORK_ITEMS_Y_VALUES:
-                                for prefetch_stages in PREFETCH_STAGES_VALUES:
-                                    for use_transpose in USE_TRANSPOSE_VALUES:
-                                        for vectorize in VECTORIZE_VALUES:
-                                            # CRITICAL: Map X/Y to M/N correctly
-                                            # M dimension (rows) uses Y values
-                                            # N dimension (cols) uses X values
-                                            config = (tile_m, tile_n, tile_k,
-                                                     block_threads_y, block_threads_x,  # threads_m, threads_n
-                                                     work_items_y, work_items_x,        # work_m, work_n
-                                                     prefetch_stages, use_transpose,
-                                                     vectorize)
-                                            
-                                            if is_valid_config(*config):
-                                                valid_configs.append(config)
+    for atom_type in ATOM_TYPE_VALUES:
+        for atom_m in ATOM_LAYOUT_M_VALUES:
+            for atom_n in ATOM_LAYOUT_N_VALUES:
+                for atom_k in ATOM_LAYOUT_K_VALUES:
+                    for tile_m in TILE_M_VALUES:
+                        for tile_n in TILE_N_VALUES:
+                            for tile_k in TILE_K_VALUES:
+                                for block_threads_x in BLOCK_THREADS_X_VALUES:
+                                    for block_threads_y in BLOCK_THREADS_Y_VALUES:
+                                        for work_items_x in WORK_ITEMS_X_VALUES:
+                                            for work_items_y in WORK_ITEMS_Y_VALUES:
+                                                for prefetch_stages in PREFETCH_STAGES_VALUES:
+                                                    for use_transpose in USE_TRANSPOSE_VALUES:
+                                                        for vectorize in VECTORIZE_VALUES:
+                                                            # CRITICAL: Map X/Y to M/N correctly
+                                                            # M dimension (rows) uses Y values
+                                                            # N dimension (cols) uses X values
+                                                            config = (tile_m, tile_n, tile_k,
+                                                                     block_threads_y, block_threads_x,  # threads_m, threads_n
+                                                                     work_items_y, work_items_x,        # work_m, work_n
+                                                                     prefetch_stages, use_transpose,
+                                                                     vectorize,
+                                                                     atom_type, atom_m, atom_n, atom_k)
+                                                            
+                                                            if is_valid_config(*config):
+                                                                valid_configs.append(config)
     
     return valid_configs
 
@@ -237,11 +274,13 @@ def select_top_configs(all_configs: List[Tuple], max_count: int = 200) -> List[T
       2. Occupancy potential (blocks per SM)
       3. Balance between tile dimensions
       4. Prefetching effectiveness
+      5. Atom layout efficiency (tensor core utilization)
     
     Returns: Top N configurations
     """
     def score_config(config):
-        tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, prefetch, transpose, vec = config
+        (tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, 
+         prefetch, transpose, vec, atom_type, atom_m, atom_n, atom_k) = config
         
         # Arithmetic intensity: more FLOPs per memory access
         flops = tile_m * tile_n * tile_k * 2  # GEMM FLOPs
@@ -265,13 +304,18 @@ def select_top_configs(all_configs: List[Tuple], max_count: int = 200) -> List[T
         aspect_ratio = min(tile_m, tile_n) / max(tile_m, tile_n)
         balance_score = aspect_ratio
         
+        # Atom layout: larger layouts may improve tensor core utilization
+        # but also increase register pressure
+        atom_layout_score = (atom_m * atom_n) / 16.0  # Max is 4×4=16
+        
         # Combined score
         score = (arithmetic_intensity * 10.0 +
                  occupancy_score * 50.0 +
                  work_per_thread * 5.0 +
                  prefetch_score * 20.0 +
                  vectorize_score * 10.0 +
-                 balance_score * 15.0)
+                 balance_score * 15.0 +
+                 atom_layout_score * 5.0)
         
         return score
     
@@ -364,14 +408,15 @@ namespace cuda {{
         
         # For each config: instantiate + create launcher + register
         for config in configs:
-            tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, prefetch, transpose, vec = config
+            (tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, 
+             prefetch, transpose, vec, atom_type, atom_m, atom_n, atom_k) = config
             transpose_str = "true" if transpose else "false"
             
             # Unique name for this variant
-            variant_name = f"variant_{tile_m}_{tile_n}_{tile_k}_{threads_m}_{threads_n}_{work_m}_{work_n}_{prefetch}_{1 if transpose else 0}_{vec}"
+            variant_name = f"variant_{tile_m}_{tile_n}_{tile_k}_{threads_m}_{threads_n}_{work_m}_{work_n}_{prefetch}_{1 if transpose else 0}_{vec}_{atom_type}_{atom_m}_{atom_n}_{atom_k}"
             
             # Launcher wrapper (no explicit instantiation - template will be implicitly instantiated when called)
-            f.write(f"""// Config: {tile_m}x{tile_n}x{tile_k}, threads={threads_m}x{threads_n}, work={work_m}x{work_n}, prefetch={prefetch}, transpose={transpose}, vec={vec}
+            f.write(f"""// Config: {tile_m}x{tile_n}x{tile_k}, threads={threads_m}x{threads_n}, work={work_m}x{work_n}, prefetch={prefetch}, transpose={transpose}, vec={vec}, atom={atom_type}({atom_m}x{atom_n}x{atom_k})
 // Launcher wrapper
 cudaError_t launch_{variant_name}(
     const float *A, const IQ4_NLBlock *B_blocks, float *C,
@@ -380,7 +425,8 @@ cudaError_t launch_{variant_name}(
     const int num_k_blocks = k / 32;
     IQ4_NL_Decoder<IQ4_NLBlock> decoder(B_blocks, n, num_k_blocks);
     quantized_gemm_kernel_variant<IQ4_NL_Decoder<IQ4_NLBlock>, {tile_m}, {tile_n}, {tile_k}, 
-        {threads_m}, {threads_n}, {work_m}, {work_n}, {prefetch}, {transpose_str}, {vec}>
+        {threads_m}, {threads_n}, {work_m}, {work_n}, {prefetch}, {transpose_str}, {vec},
+        {atom_type}, {atom_m}, {atom_n}, {atom_k}>
         <<<gridDim, blockDim, 0, stream>>>(A, C, m, n, k, decoder);
     return cudaGetLastError();
 }}
@@ -390,7 +436,8 @@ namespace {{
     __attribute__((constructor)) void register_{variant_name}() {{
         CudaGemmKernelRegistry::instance().register_kernel(
             {tile_m}, {tile_n}, {tile_k}, {threads_m}, {threads_n}, {work_m}, {work_n},
-            {prefetch}, {"true" if transpose else "false"}, {vec}, &launch_{variant_name});
+            {prefetch}, {"true" if transpose else "false"}, {vec},
+            {atom_type}, {atom_m}, {atom_n}, {atom_k}, &launch_{variant_name});
     }}
 }}
 
@@ -422,7 +469,8 @@ def write_cmake_file(filenames: List[str], output_dir: str):
 
 def generate_config_struct(config: Tuple) -> str:
     """Generate C++ struct initialization for a configuration."""
-    tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, prefetch, transpose, vec = config
+    (tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, 
+     prefetch, transpose, vec, atom_type, atom_m, atom_n, atom_k) = config
     
     transpose_str = "true" if transpose else "false"
     vec_str = "true" if vec > 1 else "false"
@@ -430,7 +478,8 @@ def generate_config_struct(config: Tuple) -> str:
     return f"""        {{.tile_m={tile_m}, .tile_n={tile_n}, .tile_k={tile_k},
           .threads_m={threads_m}, .threads_n={threads_n},
           .work_per_thread_m={work_m}, .work_per_thread_n={work_n},
-          .prefetch_stages={prefetch}, .transpose_smem={transpose_str}, .vectorize_load={vec_str}}}"""
+          .prefetch_stages={prefetch}, .transpose_smem={transpose_str}, .vectorize_load={vec_str},
+          .atom_type={atom_type}, .atom_layout_m={atom_m}, .atom_layout_n={atom_n}, .atom_layout_k={atom_k}}}"""
 
 def write_config_header(configs: List[Tuple], output_dir: str):
     """Write C++ header with generated config list for auto-tuner."""

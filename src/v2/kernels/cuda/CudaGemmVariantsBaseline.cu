@@ -69,6 +69,10 @@ namespace llaminar2
          * @tparam PREFETCH_STAGES 0=no prefetch, 1=double-buffer, 2=triple-buffer
          * @tparam TRANSPOSE_SMEM Transpose shared memory layout to reduce bank conflicts
          * @tparam VECTORIZE_LOAD Use vectorized (float4) loads when aligned
+         * @tparam ATOM_TYPE MMA atom instruction type (0=SM80_16x8x16, 1=SM80_16x8x8)
+         * @tparam ATOM_LAYOUT_M MMA atom layout in M dimension (1, 2, 4)
+         * @tparam ATOM_LAYOUT_N MMA atom layout in N dimension (1, 2, 4)
+         * @tparam ATOM_LAYOUT_K MMA atom layout in K dimension (always 1 for SM80)
          */
         template <
             typename Decoder,
@@ -77,8 +81,11 @@ namespace llaminar2
             int WORK_M, int WORK_N,
             int PREFETCH_STAGES,
             bool TRANSPOSE_SMEM,
-            int VECTORIZE_LOAD // ← Fixed: was bool, now int (1, 2, or 4 for float/float2/float4)
-            >
+            int VECTORIZE_LOAD, // ← Fixed: was bool, now int (1, 2, or 4 for float/float2/float4)
+            int ATOM_TYPE = 0,  // Default to SM80_16x8x16
+            int ATOM_LAYOUT_M = 1,
+            int ATOM_LAYOUT_N = 1,
+            int ATOM_LAYOUT_K = 1>
         __global__ void quantized_gemm_kernel_variant(
             const float *__restrict__ A,
             float *__restrict__ C,
@@ -92,6 +99,12 @@ namespace llaminar2
             // Note: TILE_K divisibility check moved to runtime (decoder.block_size() is not constexpr)
             static_assert(THREADS_M * THREADS_N <= 1024, "Thread block size exceeds limit");
             static_assert(PREFETCH_STAGES >= 0 && PREFETCH_STAGES <= 2, "PREFETCH_STAGES must be 0-2");
+
+            // Atom layout validation
+            static_assert(ATOM_TYPE == 0 || ATOM_TYPE == 1, "ATOM_TYPE must be 0 or 1");
+            static_assert(ATOM_LAYOUT_M == 1 || ATOM_LAYOUT_M == 2 || ATOM_LAYOUT_M == 4, "ATOM_LAYOUT_M must be 1, 2, or 4");
+            static_assert(ATOM_LAYOUT_N == 1 || ATOM_LAYOUT_N == 2 || ATOM_LAYOUT_N == 4, "ATOM_LAYOUT_N must be 1, 2, or 4");
+            static_assert(ATOM_LAYOUT_K == 1, "ATOM_LAYOUT_K must be 1 for SM80");
 
             // Shared memory allocation (sized for prefetch stages)
             // OPTIMIZATION: Add +1 padding to avoid bank conflicts
@@ -363,11 +376,12 @@ namespace llaminar2
 
             // Get JIT-compiled kernel (compiles if not cached)
             CUfunction kernel_func = CudaGemmJIT::instance().getKernel(config);
-            
+
             // Check if kernel compiled successfully (may fail due to resource constraints)
-            if (kernel_func == nullptr) {
+            if (kernel_func == nullptr)
+            {
                 // Return CONFIG_NOT_FOUND error (expected for invalid configs)
-                return static_cast<cudaError_t>(9999);  // Custom error code for "config not compilable"
+                return static_cast<cudaError_t>(9999); // Custom error code for "config not compilable"
             }
 
             // Convert to CUDA context for Driver API

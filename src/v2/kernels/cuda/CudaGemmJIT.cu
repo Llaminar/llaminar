@@ -105,11 +105,12 @@ namespace llaminar2
             auto start = std::chrono::high_resolution_clock::now();
 
             CompiledKernel compiled = compileKernel(config);
-            
+
             // Check if compilation succeeded (may fail due to resource constraints)
-            if (!compiled.isValid()) {
+            if (!compiled.isValid())
+            {
                 stats_.compilation_failures++;
-                return nullptr;  // Return null to signal failure
+                return nullptr; // Return null to signal failure
             }
 
             auto end = std::chrono::high_resolution_clock::now();
@@ -127,14 +128,16 @@ namespace llaminar2
 
         CompiledKernel CudaGemmJIT::compileKernel(const CudaGemmConfig &config)
         {
-            try {
+            try
+            {
                 // Generate specialized source code
                 std::string source = generateKernelSource(config);
                 std::cout << "[CudaGemmJIT] Generated source: " << source.length() << " bytes" << std::endl;
 
                 // Debug: Save generated source to disk for inspection
                 static bool debug_dump = std::getenv("CUDA_JIT_DEBUG_DUMP") != nullptr;
-                if (debug_dump) {
+                if (debug_dump)
+                {
                     std::string debug_path = cache_dir_ + "/debug_source_" + getCacheKey(config) + ".cu";
                     std::ofstream debug_file(debug_path);
                     debug_file << source;
@@ -145,93 +148,97 @@ namespace llaminar2
                 // Create NVRTC program
                 nvrtcProgram prog;
                 nvrtcResult create_res = nvrtcCreateProgram(&prog, source.c_str(),
-                                               "gemm_kernel.cu", 0, nullptr, nullptr);
-                
-                if (create_res != NVRTC_SUCCESS) {
+                                                            "gemm_kernel.cu", 0, nullptr, nullptr);
+
+                if (create_res != NVRTC_SUCCESS)
+                {
                     throw std::runtime_error(std::string("nvrtcCreateProgram failed: ") + nvrtcGetErrorString(create_res));
                 }
 
-            // Compile options (match your build configuration)
-            // IMPORTANT: Create arch string separately to avoid dangling pointer
-            std::string arch_option = "--gpu-architecture=" + gpu_arch_;
-            std::vector<const char *> opts = {
-                arch_option.c_str(),
-                "-std=c++17",
-                "--use_fast_math",
-                "--extra-device-vectorization"};
+                // Compile options (match your build configuration)
+                // IMPORTANT: Create arch string separately to avoid dangling pointer
+                std::string arch_option = "--gpu-architecture=" + gpu_arch_;
+                std::vector<const char *> opts = {
+                    arch_option.c_str(),
+                    "-std=c++17",
+                    "--use_fast_math",
+                    "--extra-device-vectorization"};
 
-            // Compile
-            nvrtcResult compile_res = nvrtcCompileProgram(prog, opts.size(), opts.data());
+                // Compile
+                nvrtcResult compile_res = nvrtcCompileProgram(prog, opts.size(), opts.data());
 
-            // Check for compilation errors
-            if (compile_res != NVRTC_SUCCESS)
-            {
-                size_t log_size;
-                nvrtcGetProgramLogSize(prog, &log_size);
-                std::string log(log_size, '\0');
-                nvrtcGetProgramLog(prog, &log[0]);
-                nvrtcDestroyProgram(&prog);
-                
-                // Check if this is a resource constraint failure (not an error)
-                // "uses too much shared data", "too many registers", etc.
-                if (log.find("uses too much") != std::string::npos ||
-                    log.find("too many registers") != std::string::npos) {
-                    // Return empty CompiledKernel (null module/function) to signal graceful skip
-                    // Note: This is expected for ~30% of configurations due to GPU hardware limits
-                    return CompiledKernel(nullptr, nullptr);
+                // Check for compilation errors
+                if (compile_res != NVRTC_SUCCESS)
+                {
+                    size_t log_size;
+                    nvrtcGetProgramLogSize(prog, &log_size);
+                    std::string log(log_size, '\0');
+                    nvrtcGetProgramLog(prog, &log[0]);
+                    nvrtcDestroyProgram(&prog);
+
+                    // Check if this is a resource constraint failure (not an error)
+                    // "uses too much shared data", "too many registers", etc.
+                    if (log.find("uses too much") != std::string::npos ||
+                        log.find("too many registers") != std::string::npos)
+                    {
+                        // Return empty CompiledKernel (null module/function) to signal graceful skip
+                        // Note: This is expected for ~30% of configurations due to GPU hardware limits
+                        return CompiledKernel(nullptr, nullptr);
+                    }
+
+                    // Actual compilation error - throw exception
+                    throw std::runtime_error("Kernel compilation failed:\n" + log);
                 }
-                
-                // Actual compilation error - throw exception
-                throw std::runtime_error("Kernel compilation failed:\n" + log);
-            }
 
-            // Get compiled CUBIN
-            size_t cubin_size;
-            nvrtcResult cubin_res = nvrtcGetCUBINSize(prog, &cubin_size);
-            
-            if (cubin_res != NVRTC_SUCCESS) {
-                // Fall back to PTX
-                size_t ptx_size;
-                NVRTC_CHECK(nvrtcGetPTXSize(prog, &ptx_size));
-                std::vector<char> ptx(ptx_size);
-                NVRTC_CHECK(nvrtcGetPTX(prog, ptx.data()));
-                
-                // For PTX, we need to load as PTX, not CUBIN
+                // Get compiled CUBIN
+                size_t cubin_size;
+                nvrtcResult cubin_res = nvrtcGetCUBINSize(prog, &cubin_size);
+
+                if (cubin_res != NVRTC_SUCCESS)
+                {
+                    // Fall back to PTX
+                    size_t ptx_size;
+                    NVRTC_CHECK(nvrtcGetPTXSize(prog, &ptx_size));
+                    std::vector<char> ptx(ptx_size);
+                    NVRTC_CHECK(nvrtcGetPTX(prog, ptx.data()));
+
+                    // For PTX, we need to load as PTX, not CUBIN
+                    // Save to disk cache
+                    saveToDiskCache(config, ptx.data(), ptx_size);
+
+                    // Load module from PTX
+                    CUmodule module;
+                    CU_CHECK(cuModuleLoadDataEx(&module, ptx.data(), 0, nullptr, nullptr));
+
+                    // Get kernel function
+                    CUfunction kernel;
+                    CU_CHECK(cuModuleGetFunction(&kernel, module, "quantized_gemm_kernel_iq4nl"));
+
+                    nvrtcDestroyProgram(&prog);
+                    return CompiledKernel(module, kernel);
+                }
+
+                std::vector<char> cubin(cubin_size);
+                nvrtcResult get_cubin_res = nvrtcGetCUBIN(prog, cubin.data());
+                NVRTC_CHECK(get_cubin_res);
+
                 // Save to disk cache
-                saveToDiskCache(config, ptx.data(), ptx_size);
-                
-                // Load module from PTX
+                saveToDiskCache(config, cubin.data(), cubin_size);
+
+                // Load module
                 CUmodule module;
-                CU_CHECK(cuModuleLoadDataEx(&module, ptx.data(), 0, nullptr, nullptr));
-                
+                CU_CHECK(cuModuleLoadData(&module, cubin.data()));
+
                 // Get kernel function
                 CUfunction kernel;
                 CU_CHECK(cuModuleGetFunction(&kernel, module, "quantized_gemm_kernel_iq4nl"));
-                
+
                 nvrtcDestroyProgram(&prog);
+
                 return CompiledKernel(module, kernel);
             }
-            
-            std::vector<char> cubin(cubin_size);
-            nvrtcResult get_cubin_res = nvrtcGetCUBIN(prog, cubin.data());
-            NVRTC_CHECK(get_cubin_res);
-
-            // Save to disk cache
-            saveToDiskCache(config, cubin.data(), cubin_size);
-
-            // Load module
-            CUmodule module;
-            CU_CHECK(cuModuleLoadData(&module, cubin.data()));
-
-            // Get kernel function
-            CUfunction kernel;
-            CU_CHECK(cuModuleGetFunction(&kernel, module, "quantized_gemm_kernel_iq4nl"));
-
-            nvrtcDestroyProgram(&prog);
-
-            return CompiledKernel(module, kernel);
-            
-            } catch (const std::exception& e) {
+            catch (const std::exception &e)
+            {
                 std::cerr << "[CudaGemmJIT] Exception in compileKernel: " << e.what() << std::endl;
                 throw;
             }

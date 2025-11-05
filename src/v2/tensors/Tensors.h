@@ -242,6 +242,7 @@ namespace llaminar2
         FP32,    // 32-bit float
         BF16,    // 16-bit bfloat
         FP16,    // 16-bit float
+        INT8,    // 8-bit integer (dequantized for AVX512-VNNI/CUDA INT8 GEMM)
         IQ4_NL,  // 4-bit quantized (non-linear)
         IQ4_XS,  // 4-bit quantized (extra-small IQ)
         Q8_0,    // 8-bit quantized
@@ -282,6 +283,7 @@ namespace llaminar2
         virtual bool is_on_device(int device_idx) const = 0;
 
         // Data access (fallback for non-fused operations)
+        // NOTE: Returns pointer in native type - use convertTo<T>() for type conversion
         virtual const float *data() const = 0; // Returns host pointer (syncs from device if needed)
         virtual float *mutable_data() = 0;     // Returns host pointer, marks dirty
 
@@ -296,7 +298,20 @@ namespace llaminar2
         virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
         virtual std::unique_ptr<ITensorAttention> createAttention() = 0;
 
-        // ===== Format Conversion Methods =====
+        // ===== Generic Type Conversion API =====
+
+        /**
+         * @brief Convert tensor data to requested type
+         * @tparam T Destination type: float (FP32), uint16_t (FP16/BF16 via format param), int8_t, int32_t
+         * @param dst Destination buffer (must be pre-allocated)
+         * @param format For uint16_t: TensorType::FP16 or TensorType::BF16 (default BF16)
+         * @note Zero-copy when T matches native type, otherwise converts
+         * @note Usage: tensor.to<float>(dst), tensor.to<int8_t>(dst), tensor.to<uint16_t>(dst, TensorType::FP16)
+         */
+        template <typename T>
+        void to(T *dst, TensorType format = TensorType::BF16) const;
+
+        // ===== Legacy Format Conversion Methods (implemented via convertTo<T>) =====
 
         /**
          * @brief Convert entire tensor to FP32 format
@@ -330,6 +345,21 @@ namespace llaminar2
         virtual void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const = 0;
 
         /**
+         * @brief Convert 2D tensor to INT8 with per-column and per-row scales
+         * @param dst_int8 Destination for int8 values (rows * cols bytes)
+         * @param dst_col_scales Destination for per-column scales (cols floats)
+         * @param dst_row_scales Destination for per-row scales (rows floats, optional)
+         * @return true if successful, false if tensor is not 2D or conversion not supported
+         *
+         * @note Uses IBlockDecoder interface to decode quantized formats directly to INT8
+         * @note Avoids double-quantization error (GGUF → FP32 → INT8)
+         * @note For weight matrices in INT8 GEMM operations
+         */
+        virtual bool to_int8_perchannel(int8_t *dst_int8,
+                                        float *dst_col_scales,
+                                        float *dst_row_scales = nullptr) const = 0;
+
+        /**
          * @brief Convert a single row to FP32 (efficient for row-wise access patterns)
          * @param row_idx Row index to convert
          * @param buffer Destination buffer (must be pre-allocated with row_size * sizeof(float))
@@ -351,6 +381,20 @@ namespace llaminar2
          * @note This leverages the existing decode_block_at() method for block-quantized formats
          */
         void to_fp32_via_blocks(float *dst) const;
+
+        /**
+         * @brief Helper method for quantized tensors that implement IBlockDecoder
+         *        Converts directly to INT8 with per-channel quantization
+         * @param dst_int8 Destination INT8 buffer
+         * @param dst_col_scales Destination for per-column scales
+         * @param dst_row_scales Destination for per-row scales (optional)
+         * @return true if successful, false if not 2D or not IBlockDecoder
+         * @note Avoids double-quantization by decoding blocks directly to FP32 temporarily,
+         *       then quantizing to INT8 with per-channel scales
+         */
+        bool to_int8_perchannel_via_blocks(int8_t *dst_int8,
+                                           float *dst_col_scales,
+                                           float *dst_row_scales = nullptr) const;
 
         /**
          * @brief Get total element count (product of all dimensions)
@@ -430,6 +474,7 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -509,6 +554,7 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -596,6 +642,7 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -643,6 +690,104 @@ namespace llaminar2
     // Forward declare for IBlockDecoder
     class IBlockDecoder;
 
+    // Implementation: INT8Tensor.cpp
+    /**
+     * @brief INT8 tensor for quantized compute (AVX512-VNNI, CUDA INT8 GEMM)
+     *
+     * INT8Tensor stores dequantized weights as 8-bit signed integers with per-tensor
+     * scaling factors. This format enables:
+     * - AVX512-VNNI instructions on Intel CPUs (Ice Lake+)
+     * - INT8×INT8 GEMM in CUDA via CUTLASS or cuBLAS
+     * - Reduced memory bandwidth vs FP32 (4× compression)
+     *
+     * Use case: When --precision int8 is set, all quantized tensors
+     * (IQ4_NL, Q6_K, Q8_0, etc.) are dequantized to this format at load time.
+     */
+    class INT8Tensor : public TensorBase
+    {
+    public:
+        explicit INT8Tensor(const std::vector<size_t> &shape);
+        INT8Tensor(const std::vector<size_t> &shape,
+                   const std::vector<int8_t> &data,
+                   float scale);
+        INT8Tensor(const std::vector<size_t> &shape,
+                   const std::vector<float> &fp32_data);
+        ~INT8Tensor() override = default;
+
+        // TensorBase interface
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::INT8; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override; // Dequantizes to cache
+        float *mutable_data() override;     // Not supported
+
+        bool copyFrom(const TensorBase *src) override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
+
+        // Format conversion
+        void to_fp32(float *dst) const override;
+        void to_bf16(uint16_t *dst) const override;
+        void to_fp16(uint16_t *dst) const override;
+        void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
+        void to_fp32_row(size_t row_idx, float *buffer) const override;
+        void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // View support (future)
+        bool is_view() const override { return false; }
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override;
+
+        // INT8-specific interface
+        const int8_t *int8_data() const { return host_int8_data_.data(); }
+        int8_t *mutable_int8_data() { return host_int8_data_.data(); }
+        float scale() const { return scale_; }
+        void set_scale(float s) { scale_ = s; }
+
+        // Per-column scales (for weight matrices)
+        const float *col_scales() const { return col_scales_.empty() ? nullptr : col_scales_.data(); }
+        bool has_col_scales() const { return !col_scales_.empty(); }
+        size_t num_col_scales() const { return col_scales_.size(); }
+        void set_col_scales(const std::vector<float> &scales) { col_scales_ = scales; }
+        void set_col_scales(const float *scales, size_t count)
+        {
+            col_scales_.assign(scales, scales + count);
+        }
+
+        // Per-row scales (computed on-demand for transpose operations)
+        const std::vector<float> &get_row_scales() const;
+        bool has_row_scales() const { return !row_scales_cache_.empty(); }
+        void set_row_scales(const std::vector<float> &scales) { row_scales_cache_ = scales; }
+        void set_row_scales(const float *scales, size_t count)
+        {
+            row_scales_cache_.assign(scales, scales + count);
+        }
+
+    private:
+        std::vector<size_t> shape_;
+        int device_idx_ = -1;
+        std::vector<int8_t> host_int8_data_;
+        float scale_ = 1.0f;                          ///< Global scale factor (fallback if col_scales_ empty)
+        std::vector<float> col_scales_;               ///< Per-column scales (for 2D weight matrices)
+        mutable std::vector<float> row_scales_cache_; ///< Cached per-row scales (computed on-demand)
+        void *device_data_ = nullptr;
+        mutable std::vector<float> dequant_cache_;
+
+        bool sync_to_device();
+        bool sync_from_device();
+    };
+
     // Implementation: IQ4_NLTensor.cpp
     /**
      * @brief IQ4_NL quantized tensor (4.5 bpw, 7.1× compression)
@@ -683,6 +828,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override { decode_to_bf16(dst); }
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override { decodeRow(row_idx, buffer); }
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override { decodeSpan(offset, count, buffer); }
 
@@ -826,6 +975,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -931,6 +1084,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1033,6 +1190,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1136,6 +1297,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1239,6 +1404,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1338,6 +1507,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1435,6 +1608,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1533,6 +1710,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1634,6 +1815,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1731,6 +1916,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1832,6 +2021,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1933,6 +2126,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2029,6 +2226,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2125,6 +2326,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2221,6 +2426,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2317,6 +2526,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2413,6 +2626,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2509,6 +2726,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -2605,6 +2826,10 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 

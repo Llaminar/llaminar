@@ -8,6 +8,7 @@
  *  - Core quantization formats (F32, F16, Q4_0, Q6_K, Q8_0, IQ4_NL)
  *  - Simple tensor loading API for pipeline integration
  *  - Device-aware tensor creation (CPU, CUDA, ROCm)
+ *  - INT8 dequantization mode (for AVX512-VNNI / CUDA INT8 GEMM)
  *
  * Simplified from V1 ModelLoader (3870 lines) to focus on:
  *  - Essential GGUF features (no MPI column slicing, no caching)
@@ -17,13 +18,13 @@
  * Key Differences from V1:
  *  - No MPI column sharding (V2 uses different distribution strategy)
  *  - No tensor caching (pipelines manage weight lifecycle)
- *  - No dequantization (V2 keeps weights quantized, uses IBlockDecoder)
- *  - Fewer quantization formats (F32, F16, Q4_0, Q6_K, Q8_0, IQ4_NL only)
+ *  - Optional dequantization to INT8 (when --precision int8 is set)
  *  - Returns V2 TensorBase (with device affinity, ITensor interfaces)
  */
 
 #pragma once
 
+#include "../pipelines/PipelineConfig.h" // for ComputePrecision
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -221,12 +222,17 @@ namespace llaminar2
          * @brief Load tensor from GGUF file
          * @param tensor_name Name of tensor (e.g., "token_embd.weight", "blk.0.attn_q.weight")
          * @param device_idx Device index for tensor placement (0 = CPU, 1+ = GPU)
-         * @return Tensor with appropriate type (FP32Tensor, IQ4_NLTensor, etc.) or nullptr on error
+         * @param precision Compute precision mode (if INT8, dequantize all formats to INT8)
+         * @return Tensor with appropriate type (FP32Tensor, IQ4_NLTensor, INT8Tensor, etc.) or nullptr on error
          *
-         * @note Returns tensors in native format (quantized weights stay quantized)
+         * @note When precision is INT8, all quantized tensors are dequantized to INT8 format
+         *       for AVX512-VNNI (CPU) or INT8×INT8 GEMM (CUDA/CUTLASS)
+         * @note Otherwise, returns tensors in native format (quantized weights stay quantized)
          * @note Tensor type determined by GGUF metadata (F32 → FP32Tensor, IQ4_NL → IQ4_NLTensor)
          */
-        std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name, int device_idx = 0);
+        std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name,
+                                               int device_idx = 0,
+                                               ComputePrecision precision = ComputePrecision::FP32);
 
     private:
         // Tensor factory (optional, for NUMA-aware allocation)
@@ -242,6 +248,28 @@ namespace llaminar2
         bool loadSplitFiles();
         std::string generateSplitPath(const std::string &base_path, uint16_t split_no, uint16_t split_count);
         bool parseSplitPath(const std::string &split_path, std::string &prefix, uint16_t &split_no, uint16_t &split_count);
+
+        // INT8 dequantization helpers
+        std::shared_ptr<TensorBase> dequantizeToINT8(
+            const GGUFTensorInfo *info,
+            const std::vector<size_t> &shape,
+            const std::vector<uint8_t> &raw);
+        void dequantizeIQ4_NLToFP32(
+            const std::vector<uint8_t> &raw,
+            std::vector<float> &fp32_buffer,
+            const std::vector<size_t> &shape);
+        void dequantizeQ8_0ToFP32(
+            const std::vector<uint8_t> &raw,
+            std::vector<float> &fp32_buffer,
+            const std::vector<size_t> &shape);
+        void dequantizeQ4_0ToFP32(
+            const std::vector<uint8_t> &raw,
+            std::vector<float> &fp32_buffer,
+            const std::vector<size_t> &shape);
+        void dequantizeQ6_KToFP32(
+            const std::vector<uint8_t> &raw,
+            std::vector<float> &fp32_buffer,
+            const std::vector<size_t> &shape);
 
         // Low-level readers
         template <typename T>

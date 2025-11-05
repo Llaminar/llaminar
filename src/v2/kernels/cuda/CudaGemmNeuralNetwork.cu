@@ -156,8 +156,8 @@ namespace llaminar2
             const CudaGemmConfig &config, int m, int n, int k)
         {
 
-            std::array<float, 101> features;  // 101 total (73 base + 28 zero-pad)
-            features.fill(0.0f);  // Initialize all to zero
+            std::array<float, 101> features; // 101 total (73 base + 28 zero-pad)
+            features.fill(0.0f);             // Initialize all to zero
             int idx = 0;
 
             // Raw features (13 total)

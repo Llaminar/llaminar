@@ -78,7 +78,7 @@ namespace llaminar2
                 }
                 return *this;
             }
-            
+
             /**
              * Check if kernel is valid (compiled successfully)
              */
@@ -143,7 +143,7 @@ namespace llaminar2
                 size_t memory_hits = 0;
                 size_t disk_hits = 0;
                 size_t compiles = 0;
-                size_t compilation_failures = 0;  // Count of kernels that failed due to resource constraints
+                size_t compilation_failures = 0; // Count of kernels that failed due to resource constraints
                 size_t cache_size_bytes = 0;
             };
 

@@ -1,0 +1,238 @@
+# Tensor Core Integration Plan - CUTLASS CuTe Approach
+
+## Current State
+- **Performance**: 33.5 GFLOPS (FP32 CUDA cores)
+- **Theoretical Peak**: 35.6 TFLOPS (FP32), ~142 TFLOPS (FP16 Tensor Cores)
+- **Utilization**: 0.09% of FP32 peak, **0.02% of Tensor Core peak**
+- **Bottleneck**: Not using Tensor Cores (4000× hardware capability unused)
+
+## Tensor Core Potential
+- **Tensor Core Peak**: ~142 TFLOPS (FP16→FP32 accumulate on RTX 3090 sm_86)
+- **Expected Speedup**: **10-100×** for compute-bound workloads
+- **Target Performance**: 300-3,000 GFLOPS on small matrices (1-2% of TC peak)
+- **Realistic Goal**: 500-1,500 GFLOPS (15-45× speedup over current)
+
+## Why CUTLASS CuTe (Not WMMA)
+
+**WMMA Status:**
+- ❌ Deprecated API (superseded by CuTe in CUTLASS 3.x+)
+- ❌ Previous attempts unsuccessful
+- ❌ Limited flexibility, no longer maintained by NVIDIA
+- ❌ Not recommended per project guidelines
+
+**CuTe Advantages:**
+- ✅ Modern CUTLASS 4.2.1 framework (installed at `/opt/cutlass`)
+- ✅ Maximum performance (closest to cuBLAS)
+- ✅ Active development and support
+- ✅ Flexible tile sizes, layouts, and optimizations
+- ✅ Aligns with `.github/instructions/cutlass.instructions.md`
+
+## Implementation Approaches
+
+### Approach 1: CUTLASS CuTe (Recommended - Production Quality)
+
+**Status:** CUTLASS 4.2.1 installed at `/opt/cutlass`  
+**Reference:** `.github/instructions/cutlass.instructions.md`  
+**Example:** `/opt/cutlass/examples/cute/tutorial/sgemm_sm80.cu`
+
+**Pros:**
+- Modern CUTLASS framework with active support
+- Maximum performance potential (closest to cuBLAS)
+- Flexible tile sizes and layouts
+- Better integration with advanced optimizations
+- Avoids deprecated WMMA API
+- Aligns with project guidelines
+
+**Cons:**
+- Steeper learning curve (CuTe abstractions)
+- More complex template metaprogramming
+- Longer development time (1-2 weeks for full integration)
+- Requires understanding Layout/Tensor/MMA concepts
+
+**Implementation Pattern (based on sgemm_sm80.cu):**
+```cpp
+// CuTe-based Tensor Core GEMM (FP16→FP32 on SM80/86)
+#include <cute/tensor.hpp>
+#include <cute/atom/mma_atom.hpp>
+
+using namespace cute;
+
+// 1. Define MMA atom (16×8×16 for Ampere FP16 Tensor Cores)
+using MMA_Atom = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
+
+// 2. Define tiled MMA with thread layout
+using TiledMMA = TiledMMA<
+    MMA_Atom,
+    Layout<Shape<_4,_2,_1>>  // 4M×2N×1K thread arrangement
+>;
+
+// 3. Create per-thread MMA operator
+TiledMMA tiled_mma;
+auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+
+// 4. Partition global memory into thread-local views
+auto tCrA = thr_mma.partition_fragment_A(gA);
+auto tCrB = thr_mma.partition_fragment_B(gB);
+auto tCrC = thr_mma.partition_fragment_C(gC);
+
+// 5. Execute Tensor Core GEMM
+cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
+```
+
+**Key CuTe Concepts:**
+- **MMA_Atom**: Fundamental Tensor Core operation (16×8×16, 16×8×8 for Ampere)
+- **TiledMMA**: Composition of atoms across thread blocks
+- **Partitioning**: Distributes data across threads automatically
+- **Layouts**: Abstract description of memory access patterns
+- **Tensors**: Multi-dimensional views of memory
+
+**Integration with IQ4_NL:**
+```cpp
+// Decode IQ4_NL blocks to FP16 in shared memory
+__shared__ __half s_B_fp16[TILE_N][TILE_K];
+
+// Decode quantized weights
+for (int k = 0; k < TILE_K; k += 32) {  // IQ4_NL block size
+    const IQ4_NLBlock* block = &B_blocks[...];
+    decode_iq4nl_to_fp16(block, &s_B_fp16[...][k]);
+}
+
+// Create CuTe tensor view
+auto gB = make_tensor(make_gmem_ptr(s_B_fp16), 
+                      make_shape(Int<TILE_N>{}, Int<TILE_K>{}));
+```
+
+### Approach 2: WMMA (NOT Recommended - Deprecated)
+
+**Status:** Previously attempted without success  
+**NVIDIA Recommendation:** Use CuTe instead of WMMA
+
+**Why NOT to use WMMA:**
+- Deprecated API (superseded by CuTe in CUTLASS 3.x+)
+- Previous implementation attempts failed
+- Less flexible than CuTe
+- No longer actively maintained by NVIDIA
+- Limited tile size options
+
+**Do NOT pursue WMMA path.**
+
+### Approach 3: Direct PTX (Expert Level - Future Consideration)
+
+**When to consider:**
+- After CuTe implementation working
+- If profiling shows CuTe overhead
+- For specialized use cases (unlikely)
+
+**Complexity:** Very high - requires assembly programming
+
+## Technical Requirements
+
+### 1. Activation Format Conversion
+```cpp
+// Current: FP32 activations
+const float* A;
+
+// Tensor Core: FP16 activations (convert in smem)
+__shared__ __half s_A[TILE_M][TILE_K];
+for (...) {
+    s_A[i][j] = __float2half(A[...]);
+}
+```
+
+### 2. Weight Decoder Modification
+```cpp
+// Current: IQ4_NL → FP32
+void decode_block(const IQ4_NLBlock* block, float* output);
+
+// Tensor Core: IQ4_NL → FP16
+void decode_block_fp16(const IQ4_NLBlock* block, __half* output);
+```
+
+### 3. Template Parameters Addition
+```cpp
+// New template parameters:
+- USE_TENSOR_CORES: bool (enable/disable)
+- WMMA_M, WMMA_N, WMMA_K: Tensor Core tile (16×8×16 for Ampere)
+- Constraints: TILE_M % 16 == 0, TILE_N % 8 == 0, TILE_K % 16 == 0
+```
+
+### 4. Autotuner Extension
+```python
+# Add Tensor Core configs to autotuner
+TENSOR_CORE_CONFIGS = [
+    # Small
+    {'tile_m': 16, 'tile_n': 16, 'tile_k': 16, 'use_tensor_cores': True},
+    # Medium  
+    {'tile_m': 32, 'tile_n': 32, 'tile_k': 16, 'use_tensor_cores': True},
+    # Large
+    {'tile_m': 64, 'tile_n': 64, 'tile_k': 16, 'use_tensor_cores': True},
+]
+```
+
+## Expected Performance Impact
+
+| Workload | Current (FP32) | With Tensor Cores (FP16→FP32) | Speedup |
+|----------|----------------|-------------------------------|---------|
+| SingleToken (1×896×896) | 33.5 GFLOPS | **300-500 GFLOPS** | 9-15× |
+| Batch32 (32×896×896) | 905.7 GFLOPS | **8,000-15,000 GFLOPS** | 9-17× |
+| FFN Gate (1×4864×896) | 128.3 GFLOPS | **1,200-2,000 GFLOPS** | 9-16× |
+
+Conservative estimate: **10× speedup** across the board.
+
+Optimistic estimate: **20-50× speedup** on larger batches/models.
+
+## Risks & Mitigations
+
+### Risk 1: Numerical Precision
+- **Issue**: FP16 has less precision than FP32
+- **Mitigation**: Use FP32 accumulation (standard practice)
+- **Validation**: Add FP32 vs FP16 parity tests
+
+### Risk 2: Small Matrix Performance
+- **Issue**: Tensor Core overhead on tiny matrices
+- **Mitigation**: Use backend selection (FP32 for M<16, FP16 for M≥16)
+- **Autotuner**: Test both paths, pick faster one
+
+### Risk 3: Integration Complexity
+- **Issue**: JIT compilation with WMMA harder than CUDA cores
+- **Mitigation**: Start with simple template, iterate
+- **Fallback**: Keep FP32 path working
+
+## Implementation Steps (This Session)
+
+1. **Create WMMA Template** ✅ (Already started in CudaGemmKernelTemplateTensorCore.h)
+2. **Test Compilation**: Verify WMMA template compiles via NVRTC
+3. **Add Backend Selection**: Extend CudaGemmJIT to support tensor_core flag
+4. **Simple Benchmark**: Run on 1×896×896 to validate correctness
+5. **Performance Test**: Measure actual speedup
+
+## Next Session Goals
+
+1. **Extend Autotuner**: Add Tensor Core config space (~50 new configs)
+2. **Full Benchmark Suite**: Test on all Qwen models (0.5B-72B)
+3. **ML Model Retraining**: Include tensor_core as feature
+4. **Production Deployment**: Deploy if >5× speedup validated
+
+## Decision Point
+
+**Proceed with WMMA implementation now?**
+- Time investment: 2-4 hours this session
+- Expected outcome: Working Tensor Core prototype
+- Risk: Medium (WMMA is well-documented)
+
+**Alternative: Defer to next sprint?**
+- Current kernels are "good enough" for FP32
+- Focus on other optimizations (fusion, batching)
+- Tensor Cores as separate major feature
+
+## Recommendation
+
+✅ **Proceed with WMMA Phase 1 now**
+
+Rationale:
+- 10× speedup is transformative
+- WMMA is tractable in one session
+- De-risks Tensor Core integration early
+- Provides data for planning Phase 2
+
+Let's build the WMMA template and test it!

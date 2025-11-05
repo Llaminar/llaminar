@@ -1,10 +1,12 @@
 # CUTLASS and CuTe Development Guide
 
-**Last Updated**: November 1, 2025  
+**Last Updated**: November 4, 2025  
 **CUTLASS Version**: 4.2.1  
 **Target Architectures**: SM 75+ (Turing), SM 80+ (Ampere), SM 86 (RTX 3090)
 
 **Recent Updates** (November 2025):
+- ✅ **CuTe Swizzle Implementation**: Complete guide (+13% perf gain, bank conflict elimination)
+- ✅ **Critical Performance Pattern**: `partition_fragment_A/B` discovered (52× speedup, 361 GFLOPS)
 - ✅ **Layout Algebra Refactoring**: Complete guide with coalesce, MMA-derived partitioning, +6.1% perf gain
 - ✅ **Thread Count Bug Fix**: Critical async copy fix (256 → 128 threads), prevents undefined behavior
 - ✅ **CuTe Predication Pattern**: Complete guide with identity tensors, `elem_less()`, and best practices
@@ -23,6 +25,8 @@
 - [Critical Kernel Bugs and Fixes](#critical-kernel-bugs-and-fixes)
 - [CuTe Layout Algebra](#cute-layout-algebra) ⭐ **NEW** (November 2025)
 - [Tensor Core Implementation Patterns](#tensor-core-implementation-patterns)
+  - [⭐ CRITICAL: `partition_fragment_A/B` Pattern](#-critical-partition_fragment_ab-pattern-november-2025) **52× speedup**
+- [Jitify and NVRTC JIT Compilation](#jitify-and-nvrtc-jit-compilation) ⭐ **NEW** (November 2025)
 - [Performance Optimization Roadmap](#performance-optimization-roadmap)
 - [Build System Integration](#build-system-integration)
 - [Debugging and Validation](#debugging-and-validation)
@@ -83,6 +87,10 @@
    - Complete walkthrough of `sgemm_1.cu` example
    - **Critical**: Shows correct `local_tile()` signature with `Step<>` parameter
    - Partitioning strategies
+   - **IMPORTANT** Full working sgemm kernel example!! **IMPORTANT**:
+   ```
+   https://raw.githubusercontent.com/NVIDIA/cutlass/refs/heads/main/examples/cute/tutorial/sgemm_sm80.cu
+   ```
 
 3. **CUTLASS GitHub Repository**:
    ```
@@ -1447,6 +1455,188 @@ for (int k = 0; k < num_k_tiles; ++k) {
 
 ---
 
+### ⭐ CRITICAL: `partition_fragment_A/B` Pattern (November 2025)
+
+**Status**: ✅ **PRODUCTION VALIDATED** - 52× performance improvement discovered  
+**Performance Impact**: 6.86 GFLOPS → 361.29 GFLOPS (RTX 3090, 1×896×896 GEMM)
+
+#### The Problem: Wrong Register Layout
+
+**Common mistake** (results in 0.5% of peak performance):
+```cpp
+// ❌ WRONG: Duplicates shared memory layout to registers
+auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+auto tCsA = thr_mma.partition_A(sA_tensor);  // Partition shared memory
+auto tCrA = make_fragment_like(tCsA);        // ❌ Wrong layout!
+auto tCrB = make_fragment_like(tCsB);        // ❌ Wrong layout!
+
+cute::copy(tCsA, tCrA);  // Generic scalar copy (SLOW!)
+cute::gemm(tiled_mma, tCrA, tCrB, tCrC);  // MMA expects different layout
+```
+
+**Why this is wrong**:
+- `make_fragment_like` creates register layout matching **shared memory**
+- MMA atom needs **specific register layout** for Tensor Core instructions
+- Generic `copy()` uses scalar loads (no vectorization)
+- MMA may reorder data internally (additional overhead)
+
+**Measured performance**: 6.86 GFLOPS (0.48% of RTX 3090 peak)
+
+#### The Solution: MMA-Optimized Register Layout
+
+**Correct pattern** (achieves 25.5% of peak):
+```cpp
+// ✅ CORRECT: Create MMA-optimized register layout FIRST
+auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+
+// Step 1: Create fragments with MMA atom's expected layout
+auto tCrA = thr_mma.partition_fragment_A(sA_tensor);  // ✅ MMA layout!
+auto tCrB = thr_mma.partition_fragment_B(sB_tensor);  // ✅ MMA layout!
+auto tCrC = thr_mma.make_fragment_C(tCgC);
+
+// Step 2: Clear accumulator
+clear(tCrC);
+
+// Step 3: Partition shared memory to match fragments
+auto tCsA = thr_mma.partition_A(sA_tensor);  // Source view
+auto tCsB = thr_mma.partition_B(sB_tensor);  // Source view
+
+// Step 4: Copy (CuTe dispatches optimized instructions)
+cute::copy(tCsA, tCrA);  // Hardware-accelerated!
+cute::copy(tCsB, tCrB);  // Hardware-accelerated!
+
+// Step 5: Execute MMA
+cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
+```
+
+**Measured performance**: 361.29 GFLOPS (25.5% of RTX 3090 peak)  
+**Speedup**: **52× faster** than `make_fragment_like` approach
+
+#### Why This Works
+
+**Key insight**: `partition_fragment_A/B` queries the MMA atom's traits to create the **exact register layout** the Tensor Core instruction expects.
+
+**MMA Atom traits encode**:
+- Thread-to-data mapping (which thread owns which elements)
+- Register file arrangement (how data is laid out in registers)
+- Instruction requirements (alignment, ordering for PTX instruction)
+
+**From NVIDIA's sgemm_sm80.cu** (line 157):
+```cpp
+// This is the CANONICAL pattern from NVIDIA examples
+Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));  // (MMA,MMA_M,MMA_K)
+Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));  // (MMA,MMA_N,MMA_K)
+```
+
+**What happens**:
+1. **Fragment creation**: Queries `SM80_16x8x16_F32F16F16F32_TN` traits
+2. **Layout optimization**: Creates register layout matching Tensor Core expectations
+3. **Copy dispatch**: CuTe sees matching layouts → dispatches LDSM-like instructions
+4. **MMA execution**: Data already in correct format → zero reordering overhead
+
+#### Order Matters!
+
+**CRITICAL**: Fragment must be created **before** partitioning shared memory.
+
+**Correct order**:
+1. `partition_fragment_A/B` → defines **goal state** (where data needs to be)
+2. `partition_A/B` → defines **current state** (where data is now)
+3. `copy()` → CuTe figures out **optimal path** between them
+
+**Wrong order** (compiles but slow):
+```cpp
+// ❌ Partitioning shared memory first
+auto tCsA = thr_mma.partition_A(sA_tensor);
+auto tCrA = make_fragment_like(tCsA);  // Locks in shared memory layout
+// Now copy() can't optimize - layouts don't match MMA expectations
+```
+
+#### Performance Analysis
+
+**Timeline of discovery**:
+```
+Phase 1 (Correctness):
+  - make_fragment_like approach
+  - Performance: 6.86 GFLOPS
+  - Status: ✅ Numerically correct
+  - Problem: 99.5% performance left on table
+
+Phase 2 (Optimization):
+  - partition_fragment_A/B approach
+  - Performance: 361.29 GFLOPS
+  - Status: ✅ Correct AND fast
+  - Result: 52× speedup from single API change
+```
+
+**Theoretical analysis**:
+- RTX 3090 peak (FP32 Tensor Core): ~1,417 GFLOPS
+- Achieved: 361.29 GFLOPS (25.5%)
+- Remaining bottlenecks:
+  - Small tile size (32×32×32)
+  - No K-dimension blocking
+  - No multi-stage pipelining
+  - Single CTA per SM
+- Expected with optimizations: 800-1,200 GFLOPS (56-85%)
+
+#### Code Location
+
+**File**: `src/v2/kernels/cuda/CudaGemmKernelTemplateCuTe.h`  
+**Lines**: 188-220 (register fragment allocation)
+
+**Changelog**:
+- `changelog/2025-11-03-cute-phase1-correctness-complete.md` - Phase 1 (6.86 GFLOPS)
+- `changelog/2025-11-03-cute-phase2-performance-complete.md` - Phase 2 (361.29 GFLOPS)
+
+#### When to Use Each Pattern
+
+| Function | Use Case | Performance |
+|----------|----------|-------------|
+| `partition_fragment_A/B` | **MMA inputs** (A, B tensors) | ✅ Optimal (52× faster) |
+| `make_fragment_C` | **MMA accumulator** (C tensor) | ✅ Always correct |
+| `make_fragment_like` | **Non-MMA tensors** (e.g., bias) | ⚠️ Avoid for MMA! |
+
+**Rule of thumb**: If the tensor goes into `cute::gemm()`, use `partition_fragment_A/B`.
+
+#### Testing
+
+**Test suite**: `tests/v2/Test__CudaGemmCuTe.cpp`
+
+**Test results**:
+```
+SmallMatrixCorrectness (32×32×32):
+  Status: ✅ PASSED
+  Max diff: 2.28e-05
+  Relative L2: 0.000207
+
+Qwen05B_SingleToken_QKV (1×896×896):
+  Status: ✅ PASSED
+  Performance: 361.29 GFLOPS
+  Time: 0.00444416 ms
+```
+
+**Validation command**:
+```bash
+cmake --build build_v2 --target v2_test_cuda_gemm_cute --parallel
+ctest --test-dir build_v2 -R V2_Unit_CudaGemmCuTe --output-on-failure
+```
+
+#### References
+
+**Primary documentation**:
+- NVIDIA sgemm_sm80.cu example (lines 157-159, 175-182)
+- CuTe MMA Atom docs: https://docs.nvidia.com/cutlass/media/docs/cpp/cute/0t_mma_atom.html
+- CuTe GEMM tutorial: https://docs.nvidia.com/cutlass/media/docs/cpp/cute/0x_gemm_tutorial.html
+
+**Key quote from docs**:
+> "Allocate registers for pipelining" using `partition_fragment_A/B`  
+> — sgemm_sm80.cu line 156 comment
+
+**Lesson**: Always read NVIDIA's example kernels - they encode critical patterns not in API docs.
+
+---
+
+---
+
 ## Performance Optimization Roadmap
 
 ### Expected Performance Progression
@@ -1819,6 +2009,748 @@ Step<_1, X, _1>{}  // Tile M and K, broadcast/iterate N
 Step< X,_1, _1>{}  // Tile N and K, broadcast/iterate M  
 Step<_1,_1, X>{}   // Tile M and N, broadcast/iterate K
 ```
+
+---
+
+## CuTe Swizzle: Bank Conflict Elimination ⭐ **NEW** (November 2025)
+
+### Overview
+
+**Swizzle** is a CuTe layout transformation that eliminates **shared memory bank conflicts** during column-wise access patterns. Critical for Tensor Core kernels where threads access shared memory in strided patterns.
+
+**Performance Impact**: +10-15% throughput by eliminating 32-way bank conflicts during MMA column access.
+
+### What is Swizzle?
+
+Swizzle applies an **XOR pattern** to shared memory addresses to distribute accesses across banks:
+
+```cpp
+// Swizzle formula (from layout offset)
+swizzled_offset = offset ^ shiftr(offset & mask, shift_amount)
+
+// Template definition
+template <int BBits, int MBase, int SShift>
+struct Swizzle;
+
+// Example: Swizzle<3, 3, 3>
+// - BBits = 3:  XOR with bits [3:5]
+// - MBase = 3:  Affects vectorization (2^3 = 8 elements)
+// - SShift = 3: Right shift by 3 bits before XOR
+```
+
+**Key Insight**: Swizzle is a **bijection** (one-to-one mapping) → guarantees no out-of-bounds access and preserves all data.
+
+### When to Use Swizzle
+
+**✅ Use swizzle when**:
+- Threads access shared memory in **column-major** patterns
+- Using Tensor Cores (MMA operations read columns from shared memory)
+- Shared memory tile width ≥ 64 elements (bank conflicts likely)
+- Profiler shows `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld` > 10%
+
+**❌ Don't use swizzle when**:
+- Memory bandwidth is the primary bottleneck (swizzle won't help)
+- Tile sizes are small (<32 elements wide)
+- Access patterns are already bank-conflict-free
+- Code complexity outweighs 5-10% performance gain
+
+### Universal Swizzle Formula
+
+**From Lei Mao's blog** (https://leimao.github.io/blog/CuTe-Swizzle/):
+
+```cpp
+// Given:
+// - S = element size in bytes (e.g., 2 for FP16)
+// - N = vector size in elements (e.g., 8 for 128-bit vectorization)
+// - X = fast dimension (row width, e.g., 64 for TILE_K=64)
+
+// Formula:
+MBase = log2(N)                    // Vector size bits
+BBits = log2(128 / S) - MBase      // Bank distribution bits
+SShift = log2(X) - MBase           // Shift amount
+
+// Example: FP16 (S=2), 64-wide (X=64), 128-bit vector (N=8)
+MBase = log2(8) = 3
+BBits = log2(128/2) - 3 = log2(64) - 3 = 6 - 3 = 3
+SShift = log2(64) - 3 = 6 - 3 = 3
+
+// Result: Swizzle<3, 3, 3>
+```
+
+**Common Configurations**:
+
+| Element Type | Tile Width | Vector Size | Swizzle Pattern |
+|--------------|------------|-------------|-----------------|
+| FP16         | 64         | 128-bit (8) | `Swizzle<3,3,3>` |
+| FP16         | 128        | 128-bit (8) | `Swizzle<3,3,4>` |
+| FP32         | 64         | 128-bit (4) | `Swizzle<3,2,4>` |
+| BF16         | 64         | 128-bit (8) | `Swizzle<3,3,3>` |
+
+### Critical Implementation Pattern
+
+**⚠️ CRITICAL**: Swizzle is a **layout transformation**, not physical memory rearrangement!
+
+**❌ WRONG** (write linear, read swizzled):
+```cpp
+// Write with linear indexing
+for (int m = 0; m < TILE_M; m++) {
+    for (int k = 0; k < TILE_K; k++) {
+        s_A[stage][m][k] = value;  // Linear array indexing
+    }
+}
+
+// Read with swizzled layout
+auto sA = make_tensor(
+    make_smem_ptr(s_A[stage][0]),
+    SmemLayoutA_Swizzled{}  // Swizzle<3,3,3>
+);
+auto tCrA = thr_mma.partition_fragment_A(sA);
+cute::copy(tCsA, tCrA);  // Reads from swizzled addresses
+
+// RESULT: Data mismatch! Element (0,0) written to address 0,
+//         but swizzle maps (0,0) to address X → wrong data!
+```
+
+**✅ CORRECT** (swizzle for both write and read):
+```cpp
+// Step 1: Create swizzled layout
+using SmemLayoutA_Swizzled = decltype(composition(
+    Swizzle<3, 3, 3>{},
+    Layout<Shape<Int<TILE_M>, Int<TILE_K>>,
+           Stride<Int<TILE_K>, Int<1>>>{}
+));
+
+// Step 2: Create swizzled tensor for WRITES
+auto sA_write = make_tensor(
+    make_smem_ptr(s_A[stage][0]),
+    SmemLayoutA_Swizzled{}  // Swizzled layout
+);
+
+// Step 3: Write using tensor indexing (respects swizzle)
+for (int m = 0; m < TILE_M; m++) {
+    for (int k = 0; k < TILE_K; k++) {
+        sA_write(m, k) = value;  // CuTe applies swizzle automatically!
+    }
+}
+
+// Step 4: Create swizzled tensor for READS (same layout)
+auto sA_read = make_tensor(
+    make_smem_ptr(s_A[stage][0]),
+    SmemLayoutA_Swizzled{}  // Same swizzle
+);
+
+// Step 5: Read using cute::copy() (respects swizzle)
+auto tCrA = thr_mma.partition_fragment_A(sA_read);
+cute::copy(tCsA, tCrA);  // Bank-conflict-free column access!
+```
+
+**Why This Works**:
+1. `sA_write(m, k)` computes swizzled address: `swizzle(m, k)`
+2. Value stored at swizzled physical address
+3. `sA_read(m, k)` computes **same** swizzled address
+4. Value retrieved from correct location
+5. Column-wise reads during MMA distribute across banks → no conflicts!
+
+### Real-World Example: Phase 4 Swizzle Implementation
+
+**Context**: IQ4_NL quantized GEMM kernel with FP16 shared memory tiles (64×64).
+
+```cpp
+// File: CudaGemmKernelPhase4QuickWins.cu
+
+// Define swizzled layout (FP16, 64-wide, 128-bit vector)
+using SmemLayoutA_Swizzled = decltype(composition(
+    Swizzle<3, 3, 3>{},  // MBase=3, BBits=3, SShift=3
+    Layout<Shape<Int<TILE_M>, Int<TILE_K>>,
+           Stride<Int<TILE_K>, Int<1>>>{}
+));
+
+using SmemLayoutB_Swizzled = decltype(composition(
+    Swizzle<3, 3, 3>{},
+    Layout<Shape<Int<TILE_N>, Int<TILE_K>>,
+           Stride<Int<TILE_K>, Int<1>>>{}
+));
+
+// Allocate shared memory (static, row-major)
+__shared__ __half s_A[2][TILE_M][TILE_K];  // Double-buffered
+__shared__ __half s_B[2][TILE_N][TILE_K];
+
+// PROLOGUE: Load first tile with swizzle
+auto sA_write = make_tensor(
+    make_smem_ptr(s_A[0][0]),
+    SmemLayoutA_Swizzled{}
+);
+
+// Write A matrix (FP32→FP16 conversion)
+for (int idx = tid; idx < TILE_M * TILE_K; idx += num_threads) {
+    int m = idx / TILE_K;
+    int k = idx % TILE_K;
+    sA_write(m, k) = __float2half(A[gm * K + gk]);  // Swizzled!
+}
+
+// Write B matrix (IQ4_NL→FP16 decode)
+auto sB_write = make_tensor(
+    make_smem_ptr(s_B[0][0]),
+    SmemLayoutB_Swizzled{}
+);
+
+for (int n = tid; n < TILE_N; n += num_threads) {
+    __half decoded[32];
+    decode_iq4nl(block, decoded);
+    
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        sB_write(n, i) = decoded[i];  // Swizzled!
+    }
+}
+
+__syncthreads();
+
+// COMPUTE: Read from swizzled tensors
+auto sA_read = make_tensor(
+    make_smem_ptr(s_A[read_stage][0]),
+    SmemLayoutA_Swizzled{}  // Same swizzle as write
+);
+
+auto sB_read = make_tensor(
+    make_smem_ptr(s_B[read_stage][0]),
+    SmemLayoutB_Swizzled{}
+);
+
+// MMA operations (bank-conflict-free column access)
+auto tCrA = thr_mma.partition_fragment_A(sA_read);
+auto tCrB = thr_mma.partition_fragment_B(sB_read);
+auto tCsA = thr_mma.partition_A(sA_read);
+auto tCsB = thr_mma.partition_B(sB_read);
+
+cute::copy(tCsA, tCrA);  // Swizzled read
+cute::copy(tCsB, tCrB);  // Swizzled read
+
+cute::gemm(tiled_mma, tCrA, tCrB, tCrC);  // Tensor Core execution
+```
+
+**Performance Results** (RTX 3090, M=1024, N=896, K=896):
+- **Without swizzle**: 6.56 TFLOPS (18.45% of peak)
+- **With swizzle**: **7.42 TFLOPS** (20.86% of peak)
+- **Speedup**: **1.13× (+13%)**
+
+### Type Conversion with Swizzle
+
+**Challenge**: What if source and destination have different types?
+
+**Example**: Global memory A (FP32) → Shared memory sA (FP16)
+
+**❌ WRONG** (naive approach):
+```cpp
+auto gA = make_tensor(make_gmem_ptr(A), ...);  // FP32
+auto sA = make_tensor(make_smem_ptr(...), SmemLayoutA_Swizzled{});  // FP16
+
+cute::copy(gA, sA);  // ❌ Type mismatch! Requires custom Copy_Atom
+```
+
+**✅ CORRECT** (manual loop with swizzled indexing):
+```cpp
+auto sA_write = make_tensor(
+    make_smem_ptr(s_A[stage][0]),
+    SmemLayoutA_Swizzled{}
+);
+
+// Manual loop handles FP32→FP16 conversion
+for (int idx = tid; idx < TILE_M * TILE_K; idx += num_threads) {
+    int m = idx / TILE_K;
+    int k = idx % TILE_K;
+    
+    // Read FP32 from global memory
+    float val = A[gm * K + gk];
+    
+    // Write FP16 to swizzled shared memory
+    sA_write(m, k) = __float2half(val);  // Swizzle applied automatically!
+}
+```
+
+**Alternative** (advanced, requires CUTLASS internals):
+```cpp
+// Define custom Copy_Atom with FP32→FP16 conversion
+struct FP32_to_FP16_Copy {
+    template <typename SrcEngine, typename DstEngine>
+    CUTLASS_DEVICE void operator()(
+        SrcEngine const& src,
+        DstEngine& dst) const {
+        dst = __float2half(src);
+    }
+};
+
+// Use with cute::copy() (more complex, not always necessary)
+```
+
+### Debugging Swizzle
+
+**Common Symptom**: Huge numerical error (10-100× worse than expected)
+
+**Diagnosis**:
+```cpp
+// Check if write/read layouts match
+auto sA_write = make_tensor(..., SmemLayoutA_Swizzled{});
+auto sA_read = make_tensor(..., SmemLayoutA_Swizzled{});
+
+// Print layouts to verify they're identical
+if (threadIdx.x == 0) {
+    printf("Write layout: ");
+    print(sA_write.layout());
+    printf("\nRead layout: ");
+    print(sA_read.layout());
+}
+```
+
+**Profiling Bank Conflicts**:
+```bash
+# Use NVIDIA Nsight Compute to measure bank conflicts
+ncu --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum \
+    --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
+    ./your_kernel
+
+# Without swizzle: Expect 1000s-10000s conflicts
+# With swizzle: Expect <100 conflicts (near zero)
+```
+
+### Swizzle Best Practices
+
+1. **Always use same layout for write and read**
+   - Create layout type once: `using SmemLayoutA_Swizzled = ...`
+   - Reuse for all tensor creations
+
+2. **Use tensor indexing `tensor(m,k)`, not array indexing `array[m][k]`**
+   - `tensor(m,k)` applies swizzle transform
+   - `array[m][k]` bypasses swizzle (linear access)
+
+3. **Validate swizzle pattern with formula**
+   - Double-check MBase, BBits, SShift calculations
+   - Incorrect swizzle pattern → still has bank conflicts
+
+4. **Test correctness before performance**
+   - Swizzle bugs manifest as numerical errors (10-100× worse)
+   - Always compare swizzled vs non-swizzled output first
+
+5. **Profile to verify bank conflict reduction**
+   - Don't assume swizzle helps without measuring
+   - Use `ncu` to confirm bank conflict metrics drop
+
+### References
+
+- **Lei Mao's CuTe Swizzle Blog**: https://leimao.github.io/blog/CuTe-Swizzle/
+  - Comprehensive swizzle theory
+  - Universal formula derivation
+  - Bank conflict proof
+  - Multiple worked examples
+
+- **CUTLASS Swizzle Implementation**: `include/cute/swizzle.hpp`
+  - Template implementation details
+  - Bijection guarantees
+
+- **Llaminar Phase 4 Implementation**: `src/v2/kernels/cuda/CudaGemmKernelPhase4QuickWins.cu`
+  - Real-world swizzle usage
+  - FP32→FP16 + IQ4_NL→FP16 with swizzle
+  - 13% performance gain validated
+
+---
+
+## Jitify and NVRTC JIT Compilation
+
+**Added**: November 4, 2025  
+**Context**: Lessons learned from Phase 5 JIT auto-tuning implementation
+
+### Overview
+
+**Jitify** is a single-header C++ library that wraps NVIDIA's NVRTC (Runtime Compilation) API to enable Just-In-Time (JIT) compilation of CUDA kernels. This allows runtime configuration and optimization without pre-compiling every possible kernel variant.
+
+### When to Use JIT Compilation
+
+**✅ Use JIT when**:
+- Large configuration space (>100 variants)
+- Runtime-dependent optimal parameters
+- Auto-tuning required (search best config per GPU/workload)
+- Deployment without pre-compiling all architectures
+
+**❌ Don't use JIT when**:
+- Small fixed set of kernels (<10 variants)
+- Startup latency is critical (JIT adds compilation time)
+- Binary size is not a concern
+- Configuration is known at build time
+
+### Jitify vs Raw NVRTC
+
+| Feature | Raw NVRTC | Jitify |
+|---------|-----------|--------|
+| API Complexity | Manual PTX handling | Automatic wrapper |
+| Header Support | Manual inclusion | Built-in system headers |
+| Error Handling | Manual checking | Exception-based |
+| Code Volume | ~200 lines/kernel | ~50 lines/kernel |
+| Compilation Time | Same (~10-20 ms) | Same (~10-20 ms) |
+| Launch Overhead | ~4 μs | ~4 μs (negligible) |
+
+**Key Finding** (November 2025): Both NVRTC and Jitify have **minimal runtime overhead** (~4 μs per launch). The Driver API (`cuLaunchKernel`) is just as fast as Runtime API (`<<<>>>`).
+
+### Jitify Integration with CuTe
+
+**Critical Pattern**: Jitify can compile CuTe kernels but requires careful header management.
+
+#### 1. Embed CuTe Headers in Template String
+
+```cpp
+const char* CUTE_HEADERS = R"(
+#include <cuda_fp16.h>
+#include <cutlass/half.h>
+#include <cute/tensor.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/algorithm/gemm.hpp>
+
+using namespace cute;
+using cutlass::half_t;
+)";
+```
+
+**Why**: NVRTC can't access external headers; embed required includes.
+
+#### 2. Template Substitution for Configuration
+
+```cpp
+const char* KERNEL_TEMPLATE = R"(
+${CUTE_HEADERS}
+
+#define TILE_M ${TILE_M}
+#define TILE_N ${TILE_N}
+#define TILE_K ${TILE_K}
+
+extern "C" __global__ void my_kernel(...) {
+    using tiled_mma = decltype(make_tiled_mma(
+        MMA_Atom<...>{},
+        make_layout(Shape<Int<${MMA_M}>, Int<${MMA_N}>, Int<1>>{}),
+        ...
+    ));
+    // ... kernel code ...
+}
+)";
+
+// Runtime substitution
+std::string source = KERNEL_TEMPLATE;
+source = std::regex_replace(source, std::regex("\\$\\{TILE_M\\}"), std::to_string(config.tile_m));
+// ... etc for other parameters
+```
+
+#### 3. Compilation with Proper Flags
+
+```cpp
+std::vector<std::string> opts = {
+    "--gpu-architecture=sm_86",           // Target architecture
+    "-std=c++17",                          // C++17 required for CuTe
+    "--use_fast_math",                     // Enable fast math (important!)
+    "--extra-device-vectorization",        // Better codegen
+    "-default-device",                     // Treat unannotated functions as __device__
+    " -I/opt/cutlass/include",            // CuTe headers (note leading space!)
+    " -I/usr/local/cuda/include"          // CUDA headers (note leading space!)
+};
+
+static jitify::JitCache kernel_cache;
+jitify::Program program = kernel_cache.program(source, {}, opts);
+auto kernel_inst = program.kernel("my_kernel").instantiate();
+```
+
+**⚠️ Critical**: Leading space in `-I` paths prevents Jitify from treating them as filenames!
+
+### Jitify API Reference
+
+**Key Methods**:
+
+```cpp
+// Compilation
+jitify::Program program = cache.program(
+    source_code,           // Kernel source string
+    headers,               // Additional headers (usually empty {})
+    compile_options        // std::vector<std::string>
+);
+
+// Kernel instantiation
+auto kernel_inst = program.kernel("kernel_name").instantiate(
+    template_args...       // Optional template arguments
+);
+
+// Get PTX (Jitify only provides PTX, not CUBIN!)
+const std::string& ptx = kernel_inst.ptx();
+
+// Get mangled name (for extern "C", same as kernel name)
+const std::string& mangled_name = kernel_inst.mangled_name();
+
+// Launch kernel (use Driver API)
+CUmodule module;
+cuModuleLoadDataEx(&module, ptx.data(), 0, nullptr, nullptr);
+
+CUfunction function;
+cuModuleGetFunction(&function, module, mangled_name.c_str());
+
+void* args[] = {&arg1, &arg2, ...};
+cuLaunchKernel(function, grid.x, grid.y, grid.z,
+               block.x, block.y, block.z,
+               shared_mem_bytes, stream, args, nullptr);
+```
+
+### Two-Level Caching Strategy
+
+**Critical Pattern** (Phase 5 implementation):
+
+```cpp
+class CudaGemmJIT {
+    // Level 1: Memory cache (JitCache - fast lookup)
+    static jitify::JitCache jit_cache_;
+    
+    // Level 2: Disk cache (persistent across runs)
+    std::unordered_map<std::string, CompiledKernel> memory_cache_;
+    std::string cache_dir_;  // ~/.cache/llaminar/cuda_kernels/
+    
+    CompiledKernel getOrCompile(Config config) {
+        // 1. Check memory cache (fastest)
+        if (auto it = memory_cache_.find(key); it != memory_cache_.end()) {
+            return it->second;  // ~1 μs
+        }
+        
+        // 2. Check disk cache (fast)
+        if (auto cached = loadFromDisk(config)) {
+            memory_cache_[key] = *cached;
+            return *cached;  // ~1-5 ms (PTX load + driver JIT)
+        }
+        
+        // 3. JIT compile (slow)
+        auto compiled = compileKernel(config);  // ~10-20 ms
+        saveToDisk(config, compiled);
+        memory_cache_[key] = compiled;
+        return compiled;
+    }
+};
+```
+
+**Cache Timing** (Phase 5 measurements):
+- Memory cache hit: ~1 μs
+- Disk cache hit: ~1-5 ms (PTX load)
+- Fresh compilation: ~10-20 ms (for 64×64×64 tile)
+
+### PTX vs CUBIN Caching
+
+**⚠️ CRITICAL LESSON** (November 4, 2025):
+
+**Jitify only provides PTX, NOT CUBIN!**
+
+```cpp
+// ❌ WRONG: Jitify doesn't have cubin() method
+const std::string& cubin = kernel_inst.cubin();  // COMPILATION ERROR!
+
+// ✅ CORRECT: Jitify only provides PTX
+const std::string& ptx = kernel_inst.ptx();
+```
+
+**Why PTX not CUBIN**:
+- PTX is portable (works across minor arch versions)
+- Driver performs final PTX→SASS compilation (~1-5 ms)
+- Driver caches SASS internally (subsequent loads fast)
+
+**Cache File Naming**:
+```cpp
+std::string cache_path = cache_dir_ + "/" + config_key + ".ptx";  // Correct!
+// NOT .cubin!
+```
+
+### Cache Invalidation (Critical!)
+
+**Problem Encountered** (November 4, 2025):
+- Stale cache files from old implementation
+- Performance degraded 6× (1.42 TFLOPS → 8.84 TFLOPS after cache clear)
+- Cache key didn't include compilation flags
+
+**Solution - Cache Versioning**:
+
+```cpp
+const int CACHE_VERSION = 1;
+
+std::string getCacheKey(const Config& config) {
+    std::stringstream ss;
+    ss << "v" << CACHE_VERSION << "_"
+       << "p5_" << config.tile_m << "_" << config.tile_n << "_" << config.tile_k
+       << "_sub" << config.sub_k
+       << "_mma" << config.mma_m << "x" << config.mma_n
+       << "_buf" << config.buffer_stages
+       << "_thr" << config.threads_per_block
+       << "_swz" << config.swizzle_b << config.swizzle_m << config.swizzle_s;
+    return ss.str();
+}
+```
+
+**Cache Validation**:
+
+```cpp
+std::optional<CompiledKernel> loadFromDiskCache(const Config& config) {
+    std::string ptx_path = getCachePath(config);
+    std::ifstream ptx_file(ptx_path, std::ios::binary);
+    
+    if (!ptx_file.good()) {
+        return std::nullopt;  // No cache
+    }
+    
+    // Load PTX
+    std::vector<char> ptx = readFile(ptx_file);
+    
+    // Load module
+    CUmodule module;
+    if (cuModuleLoadDataEx(&module, ptx.data(), 0, nullptr, nullptr) != CUDA_SUCCESS) {
+        fs::remove(ptx_path);  // Delete corrupted cache
+        return std::nullopt;
+    }
+    
+    // Validate function exists
+    CUfunction function;
+    if (cuModuleGetFunction(&function, module, "kernel_name") != CUDA_SUCCESS) {
+        cuModuleUnload(module);
+        fs::remove(ptx_path);  // Delete stale cache
+        return std::nullopt;
+    }
+    
+    return CompiledKernel(module, function);
+}
+```
+
+### Debugging JIT Kernels
+
+#### 1. Dump Generated Source
+
+```cpp
+// Enable with environment variable
+static bool debug_dump = std::getenv("CUDA_JIT_DEBUG_DUMP") != nullptr;
+if (debug_dump) {
+    std::string debug_path = cache_dir_ + "/debug_source_" + config_key + ".cu";
+    std::ofstream debug_file(debug_path);
+    debug_file << generated_source;
+    std::cout << "[DEBUG] Saved source to " << debug_path << std::endl;
+}
+```
+
+```bash
+# Run with debug dump enabled
+CUDA_JIT_DEBUG_DUMP=1 ./my_test
+
+# Inspect generated source
+cat ~/.cache/llaminar/cuda_kernels/debug_source_*.cu
+```
+
+#### 2. Profile JIT Kernels
+
+```bash
+# Nsight Systems timeline (CPU + GPU)
+nsys profile --trace=cuda,nvtx --output=jit_profile.nsys-rep ./my_test
+
+# Nsight Compute metrics (requires admin permissions)
+ncu --kernel-name my_jit_kernel --set full ./my_test
+
+# Key metrics to check:
+# - Kernel execution time (vs expected)
+# - Occupancy (should match pre-compiled)
+# - Memory throughput
+# - Register usage
+```
+
+#### 3. Compare Fresh vs Cached
+
+```cpp
+// Test both paths
+void testCaching() {
+    // Fresh compilation
+    clearCache();
+    auto t0 = now();
+    auto kernel1 = getOrCompile(config);
+    auto compile_ms = elapsed(t0);
+    
+    // Cached lookup
+    auto t1 = now();
+    auto kernel2 = getOrCompile(config);
+    auto cached_ms = elapsed(t1);
+    
+    std::cout << "Fresh: " << compile_ms << " ms\n";
+    std::cout << "Cached: " << cached_ms << " ms\n";
+    std::cout << "Speedup: " << (compile_ms / cached_ms) << "x\n";
+    
+    // Verify same performance
+    float tflops1 = benchmark(kernel1);
+    float tflops2 = benchmark(kernel2);
+    assert(abs(tflops1 - tflops2) < 0.1);  // Within 0.1 TFLOPS
+}
+```
+
+### Common JIT Pitfalls
+
+#### 1. Stale Cache Files
+
+**Problem**: Cache doesn't invalidate on flag changes
+**Solution**: Include compilation flags in cache key or add cache version
+
+#### 2. Missing Headers
+
+**Problem**: NVRTC can't find system headers
+**Solution**: Embed headers in template string or use `-I` flags with leading space
+
+#### 3. Template Substitution Errors
+
+**Problem**: Regex replacement breaks on edge cases
+**Solution**: Use simple placeholders like `${VAR}` and validate substitution
+
+#### 4. Driver API vs Runtime API Confusion
+
+**Problem**: Mixing `cuLaunchKernel` with `<<<>>>`
+**Solution**: Stick to Driver API for JIT kernels, Runtime API for pre-compiled
+
+#### 5. Memory Leaks
+
+**Problem**: Not unloading CUmodule
+**Solution**: Proper RAII wrapper or explicit `cuModuleUnload()` in destructor
+
+### Performance Validation
+
+**From Phase 5 Investigation** (November 4, 2025):
+
+```
+Configuration: 64×64×64 tile, SUB_K=16, MMA 2×2, Double buffer
+Matrix: 1024×896×896 (FP32 × IQ4_NL → FP32)
+
+Launch Overhead:
+  Driver API (cuLaunchKernel):  4.26 μs  ✓
+  Runtime API (<<<>>>):         4.26 μs  ✓
+  Jitify overhead:              ~0 μs    ✓
+
+Compilation Time:
+  Fresh compile:                12.9 s   (includes optimization)
+  Disk cache load:              14.4 ms  (PTX→SASS JIT)
+  Memory cache hit:             <0.001 ms
+
+Kernel Performance:
+  Pre-compiled Phase 5A:        8.86 TFLOPS
+  JIT (fresh):                  8.84 TFLOPS  (-0.23%)
+  JIT (cached):                 8.89 TFLOPS  (+0.34%)
+  
+Conclusion: JIT achieves parity with pre-compiled when cache is clean!
+```
+
+### Best Practices Summary
+
+1. **Always use two-level caching** (memory + disk)
+2. **Include compilation flags in cache key**
+3. **Validate cached kernels on load** (delete if corrupted)
+4. **Use PTX, not CUBIN** (Jitify only provides PTX)
+5. **Add cache versioning** (invalidate on code changes)
+6. **Debug with source dumps** (`CUDA_JIT_DEBUG_DUMP=1`)
+7. **Profile both fresh and cached paths** (ensure consistency)
+8. **Clear cache when changing flags** (prevent stale cache bugs)
+
+### References
+
+- **Jitify GitHub**: https://github.com/NVIDIA/jitify
+- **NVRTC Documentation**: https://docs.nvidia.com/cuda/nvrtc/index.html
+- **Phase 5 JIT Implementation**: `src/v2/kernels/cuda/CudaGemmJITPhase5.cu`
+- **Investigation Report**: `changelog/2025-11-04-phase5-jit-performance-solved.md`
 
 ---
 

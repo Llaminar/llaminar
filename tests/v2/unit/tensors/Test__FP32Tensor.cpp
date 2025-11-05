@@ -323,3 +323,324 @@ TEST(Test__FP32Tensor, GemmLargerMatrix)
         EXPECT_FALSE(std::isinf(C_data[i]));
     }
 }
+
+/**
+ * @brief Test FP32 to INT8 block quantization
+ *
+ * Validates that FP32Tensor::to_int8_blocked() produces correct INT8
+ * quantization with reasonable accuracy.
+ */
+TEST(Test__FP32Tensor, ToINT8BlockedConversion)
+{
+    const size_t rows = 8;
+    const size_t cols = 256;
+    const size_t block_size = 32;
+
+    // Create FP32 tensor with known values
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{rows, cols});
+    float *data = tensor->mutable_data();
+
+    // Fill with predictable pattern (range: -10.0 to +10.0)
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = -10.0f + (20.0f * i) / (rows * cols);
+    }
+
+    // Quantize to INT8 with block scales
+    const size_t total_elements = rows * cols;
+    const size_t num_blocks = (total_elements + block_size - 1) / block_size;
+    std::vector<int8_t> int8_data(total_elements);
+    std::vector<float> scales(num_blocks);
+
+    tensor->to_int8_blocked(int8_data.data(), scales.data(), block_size);
+
+    // Verify all int8 values are in valid range [-127, 127]
+    for (size_t i = 0; i < total_elements; ++i)
+    {
+        EXPECT_GE(int8_data[i], -127);
+        EXPECT_LE(int8_data[i], 127);
+    }
+
+    // Verify all scales are positive and reasonable
+    for (size_t i = 0; i < num_blocks; ++i)
+    {
+        EXPECT_GT(scales[i], 0.0f) << "Scale at block " << i << " should be positive";
+        EXPECT_LT(scales[i], 1e6f) << "Scale at block " << i << " should be reasonable";
+    }
+
+    // Dequantize and verify accuracy
+    std::vector<float> dequantized(total_elements);
+    for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
+    {
+        const size_t offset = block_idx * block_size;
+        const size_t count = std::min(block_size, total_elements - offset);
+        const float scale = scales[block_idx];
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            dequantized[offset + i] = static_cast<float>(int8_data[offset + i]) * scale;
+        }
+    }
+
+    // Calculate relative L2 error
+    float sum_sq_diff = 0.0f;
+    float sum_sq_orig = 0.0f;
+    for (size_t i = 0; i < total_elements; ++i)
+    {
+        float diff = data[i] - dequantized[i];
+        sum_sq_diff += diff * diff;
+        sum_sq_orig += data[i] * data[i];
+    }
+    float rel_l2_error = std::sqrt(sum_sq_diff / (sum_sq_orig + 1e-10f));
+
+    // INT8 quantization should have <5% relative error for this range
+    EXPECT_LT(rel_l2_error, 0.05f) << "Relative L2 error too high: " << rel_l2_error;
+
+    // Calculate max absolute difference
+    float max_abs_diff = 0.0f;
+    for (size_t i = 0; i < total_elements; ++i)
+    {
+        max_abs_diff = std::max(max_abs_diff, std::abs(data[i] - dequantized[i]));
+    }
+
+    // Max error should be reasonable (< 0.5 for range -10 to +10)
+    EXPECT_LT(max_abs_diff, 0.5f) << "Max absolute difference too high: " << max_abs_diff;
+}
+
+/**
+ * @brief Test to<float>() template method (FP32 conversion)
+ */
+TEST(Test__FP32Tensor, ToFloat_TemplateMethod)
+{
+    const size_t rows = 4;
+    const size_t cols = 8;
+    std::vector<size_t> shape = {rows, cols};
+
+    // Create FP32 tensor with known values
+    auto tensor = std::make_shared<FP32Tensor>(shape);
+    float *data = tensor->mutable_data();
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = static_cast<float>(i) * 0.5f - 5.0f; // Range: -5.0 to +10.5
+    }
+
+    // Convert using to<float>() template method
+    std::vector<float> fp32_output(rows * cols);
+    tensor->to<float>(fp32_output.data());
+
+    // Verify exact match (FP32 -> FP32 should be identity)
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        EXPECT_FLOAT_EQ(fp32_output[i], data[i]) << "Mismatch at index " << i;
+    }
+
+    // Verify equivalence with legacy to_fp32() method
+    std::vector<float> fp32_legacy(rows * cols);
+    tensor->to_fp32(fp32_legacy.data());
+
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        EXPECT_FLOAT_EQ(fp32_output[i], fp32_legacy[i])
+            << "to<float>() and to_fp32() differ at index " << i;
+    }
+}
+
+/**
+ * @brief Test to<uint16_t>() template method for BF16 conversion
+ */
+TEST(Test__FP32Tensor, ToBF16_TemplateMethod)
+{
+    const size_t rows = 4;
+    const size_t cols = 8;
+    std::vector<size_t> shape = {rows, cols};
+
+    // Create FP32 tensor with known values
+    auto tensor = std::make_shared<FP32Tensor>(shape);
+    float *data = tensor->mutable_data();
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = static_cast<float>(i) * 0.25f; // Range: 0.0 to 7.75
+    }
+
+    // Convert using to<uint16_t>() with BF16 format
+    std::vector<uint16_t> bf16_output(rows * cols);
+    tensor->to<uint16_t>(bf16_output.data(), TensorType::BF16);
+
+    // Verify equivalence with legacy to_bf16() method
+    std::vector<uint16_t> bf16_legacy(rows * cols);
+    tensor->to_bf16(bf16_legacy.data());
+
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        EXPECT_EQ(bf16_output[i], bf16_legacy[i])
+            << "to<uint16_t>(BF16) and to_bf16() differ at index " << i;
+    }
+
+    // Verify BF16 values are reasonable (not all zeros)
+    bool has_nonzero = false;
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        if (bf16_output[i] != 0)
+        {
+            has_nonzero = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_nonzero) << "BF16 output should contain non-zero values";
+}
+
+/**
+ * @brief Test to<uint16_t>() template method for FP16 conversion
+ */
+TEST(Test__FP32Tensor, ToFP16_TemplateMethod)
+{
+    const size_t rows = 3;
+    const size_t cols = 5;
+    std::vector<size_t> shape = {rows, cols};
+
+    // Create FP32 tensor with known values
+    auto tensor = std::make_shared<FP32Tensor>(shape);
+    float *data = tensor->mutable_data();
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = static_cast<float>(i) * 0.1f; // Range: 0.0 to 1.4
+    }
+
+    // Convert using to<uint16_t>() with FP16 format
+    std::vector<uint16_t> fp16_output(rows * cols);
+    tensor->to<uint16_t>(fp16_output.data(), TensorType::FP16);
+
+    // Verify equivalence with legacy to_fp16() method
+    std::vector<uint16_t> fp16_legacy(rows * cols);
+    tensor->to_fp16(fp16_legacy.data());
+
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        EXPECT_EQ(fp16_output[i], fp16_legacy[i])
+            << "to<uint16_t>(FP16) and to_fp16() differ at index " << i;
+    }
+}
+
+/**
+ * @brief Test to<int8_t>() template method (INT8 blocked quantization)
+ */
+TEST(Test__FP32Tensor, ToINT8_TemplateMethod)
+{
+    const size_t rows = 8;
+    const size_t cols = 16;
+    std::vector<size_t> shape = {rows, cols};
+
+    // Create FP32 tensor with known values
+    auto tensor = std::make_shared<FP32Tensor>(shape);
+    float *data = tensor->mutable_data();
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = static_cast<float>(i % 64) - 32.0f; // Range: -32 to +31
+    }
+
+    // Convert using to<int8_t>() template method
+    std::vector<int8_t> int8_output(rows * cols);
+    tensor->to<int8_t>(int8_output.data());
+
+    // Verify all values are in valid INT8 range
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        EXPECT_GE(int8_output[i], -127);
+        EXPECT_LE(int8_output[i], 127);
+    }
+
+    // Verify at least some non-zero values (not all quantized to zero)
+    bool has_nonzero = false;
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        if (int8_output[i] != 0)
+        {
+            has_nonzero = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_nonzero) << "INT8 output should contain non-zero values";
+}
+
+/**
+ * @brief Test to<int32_t>() template method (INT32 scaled conversion)
+ */
+TEST(Test__FP32Tensor, ToINT32_TemplateMethod)
+{
+    const size_t rows = 4;
+    const size_t cols = 6;
+    std::vector<size_t> shape = {rows, cols};
+
+    // Create FP32 tensor with known values
+    auto tensor = std::make_shared<FP32Tensor>(shape);
+    float *data = tensor->mutable_data();
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = static_cast<float>(i) * 0.01f - 0.1f; // Range: -0.1 to +0.13
+    }
+
+    // Convert using to<int32_t>() template method
+    std::vector<int32_t> int32_output(rows * cols);
+    tensor->to<int32_t>(int32_output.data());
+
+    // Verify values are in INT32 range (no overflow)
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        // Values should be scaled to ~2^30 range
+        EXPECT_NE(int32_output[i], 0) << "INT32 values should not all be zero";
+    }
+
+    // Verify at least some positive and negative values
+    bool has_positive = false, has_negative = false;
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        if (int32_output[i] > 0)
+            has_positive = true;
+        if (int32_output[i] < 0)
+            has_negative = true;
+    }
+    EXPECT_TRUE(has_positive) << "INT32 output should contain positive values";
+    EXPECT_TRUE(has_negative) << "INT32 output should contain negative values";
+}
+
+/**
+ * @brief Test round-trip conversion: FP32 -> BF16 -> FP32
+ */
+TEST(Test__FP32Tensor, RoundTripFP32_BF16_FP32)
+{
+    const size_t rows = 2;
+    const size_t cols = 4;
+    std::vector<size_t> shape = {rows, cols};
+
+    // Create FP32 tensor with known values
+    auto tensor_fp32 = std::make_shared<FP32Tensor>(shape);
+    float *data = tensor_fp32->mutable_data();
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        data[i] = static_cast<float>(i) * 1.5f; // 0.0, 1.5, 3.0, 4.5, ...
+    }
+
+    // Convert FP32 -> BF16
+    std::vector<uint16_t> bf16_data(rows * cols);
+    tensor_fp32->to<uint16_t>(bf16_data.data(), TensorType::BF16);
+
+    // Create BF16 tensor
+    auto tensor_bf16 = std::make_shared<BF16Tensor>(shape, bf16_data);
+
+    // Convert BF16 -> FP32
+    std::vector<float> fp32_roundtrip(rows * cols);
+    tensor_bf16->to<float>(fp32_roundtrip.data());
+
+    // Verify round-trip accuracy (BF16 has ~3 decimal digits of precision)
+    for (size_t i = 0; i < rows * cols; ++i)
+    {
+        float original = data[i];
+        float roundtrip = fp32_roundtrip[i];
+        float rel_error = std::abs(original - roundtrip) / (std::abs(original) + 1e-6f);
+
+        // BF16 should preserve ~0.8% relative accuracy
+        EXPECT_LT(rel_error, 0.01f)
+            << "Round-trip error too high at index " << i
+            << ": original=" << original << ", roundtrip=" << roundtrip;
+    }
+}

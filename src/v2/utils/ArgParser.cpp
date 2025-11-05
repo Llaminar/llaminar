@@ -284,10 +284,11 @@ namespace llaminar2
         std::cout << "Performance:\n";
         std::cout << "  --threads N               Thread count (-1 = auto)\n";
         std::cout << "  --precision MODE          Compute precision:\n";
-        std::cout << "                              fp32  - Full 32-bit float (default)\n";
-        std::cout << "                              bf16  - Brain Float 16 (Intel Sapphire Rapids+)\n";
-        std::cout << "                              fp16  - IEEE Float 16 (ARM/mobile)\n";
-        std::cout << "                              int8  - 8-bit quantization (future)\n";
+        std::cout << "                              mixed - Keep weights quantized, compute in FP32 (default)\n";
+        std::cout << "                              fp32  - Dequantize all weights to FP32 at load\n";
+        std::cout << "                              bf16  - Dequantize all weights to BF16 at load\n";
+        std::cout << "                              fp16  - Dequantize all weights to FP16 at load\n";
+        std::cout << "                              int8  - Dequantize all weights to INT8 at load\n";
         std::cout << "                              auto  - Hardware-based selection\n\n";
 
         std::cout << "Other:\n";

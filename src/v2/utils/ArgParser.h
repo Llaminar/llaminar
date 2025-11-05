@@ -64,7 +64,7 @@ namespace llaminar2
         int n_threads = -1; // -1 = auto-detect
 
         // Compute precision
-        std::string precision = "fp32"; // "fp32", "bf16", "fp16", "int8", "auto"
+        std::string precision = "mixed"; // "mixed" (default), "fp32", "bf16", "fp16", "int8", "auto"
     };
 
     /**

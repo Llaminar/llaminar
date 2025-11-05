@@ -30,6 +30,9 @@ option(AUTO_RETRAIN_ML_HEURISTIC "Automatically retrain ML heuristic if CSV chan
 # ONNX Runtime option for neural network heuristic
 option(USE_ONNX_HEURISTIC "Enable ONNX Runtime for neural network heuristic" ON)
 
+# OneDNN option for optimized INT8 GEMM
+option(USE_ONEDNN "Enable OneDNN for INT8 GEMM acceleration" ON)
+
 # =============================================================================
 # GPU Backend Mutual Exclusion Check (Phase 3)
 # =============================================================================
@@ -141,10 +144,17 @@ if(HAVE_CUDA)
         kernels/cuda/IQ4_NL_BlockDecoder.cu
         kernels/cuda/CudaGemmVariantsBaseline.cu      # Template definitions + JIT launcher
         kernels/cuda/CudaGemmVariantsMemoryOpt.cu     # Memory-optimized kernels (Phase 1)
-        kernels/cuda/CudaGemmVariantsTensorCore.cu    # Tensor Core kernels (Phase 2+)
+        # kernels/cuda/CudaGemmVariantsTensorCore.cu  # OBSOLETE: Unused CuTe-based Tensor Core kernels (replaced by JIT)
         kernels/cuda/CudaGemmJIT.cu                   # JIT compiler implementation (NVRTC)
         kernels/cuda/CudaGemmAutoTuner.cu
         kernels/cuda/CudaGemmFactory.cu
+        kernels/cuda/CudaGemmCuTeWrapper.cu           # CuTe Tensor Core wrapper (Phase 1)
+        kernels/cuda/CudaGemmKernelPhase3.cu          # Phase 3 Part 1: Large tiles (128×128×64)
+        kernels/cuda/CudaGemmKernelPhase3Pipelined.cu # Phase 3 Part 2: Pipelined (900-1,000 GFLOPS target)
+        kernels/cuda/CudaGemmKernelPhase4QuickWins.cu # Phase 4: Swizzled + cp.async (7.6 TFLOPS target)
+        kernels/cuda/CudaGemmKernelPhase5ASimple.cu   # Phase 5A: Streaming dequant (10.0 TFLOPS target)
+        kernels/cuda/CudaGemmJITPhase5.cu             # Phase 5 JIT: Auto-tuning infrastructure
+        kernels/cuda/CudaGemmKernelPhase7_CUTLASS.cu  # Phase 7: CUTLASS int8 GEMM (50-100+ TFLOPS target)
     )
     
     # Add neural network if ONNX Runtime enabled
@@ -246,17 +256,142 @@ if(HAVE_ROCM)
     message(STATUS "V2: ROCm backend library configured")
 endif()
 
+# =============================================================================
+# OneDNN Configuration for INT8/BF16 GEMM Acceleration
+# =============================================================================
+# OneDNN provides optimized matmul primitives for:
+#   - INT8: s8s8s32 with post-ops (used by INT8GemmKernel)
+#   - BF16: bf16bf16f32 (used by BF16GemmKernel, replaces MKL)
+#   - FP32: Baseline handled by OpenBLAS
+if(USE_ONEDNN)
+    # First, check if OneDNN exists in external/ and clone if needed
+    # Note: Repository root is two levels up from src/v2
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
+    set(ONEDNN_VERSION "v3.9.2")
+    
+    if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}/include/oneapi/dnnl/dnnl.hpp")
+        message(STATUS "V2: OneDNN not found in external/, cloning version ${ONEDNN_VERSION}...")
+        
+        find_package(Git REQUIRED)
+        
+        # Ensure external directory exists
+        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
+        
+        # Clone OneDNN repository
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${ONEDNN_VERSION} 
+                    https://github.com/uxlfoundation/oneDNN.git
+                    onednn
+            WORKING_DIRECTORY ${REPO_ROOT}/external
+            RESULT_VARIABLE GIT_CLONE_RESULT
+            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
+            ERROR_VARIABLE GIT_CLONE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+        
+        if(NOT GIT_CLONE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to clone OneDNN: ${GIT_CLONE_ERROR}")
+        endif()
+        
+        message(STATUS "V2: OneDNN ${ONEDNN_VERSION} cloned successfully")
+    else()
+        message(STATUS "V2: OneDNN already exists in external/onednn")
+    endif()
+    
+    # Now check if OneDNN is built
+    set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build")
+    if(NOT EXISTS "${ONEDNN_BUILD_DIR}/include/oneapi/dnnl/dnnl.hpp")
+        message(STATUS "V2: Building OneDNN ${ONEDNN_VERSION} from source...")
+        
+        # Configure OneDNN
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -B ${ONEDNN_BUILD_DIR} -S ${ONEDNN_EXTERNAL_DIR}
+                    -DCMAKE_BUILD_TYPE=Release
+                    -DCMAKE_INSTALL_PREFIX=${ONEDNN_BUILD_DIR}
+                    -DDNNL_CPU_RUNTIME=OMP
+                    -DDNNL_BUILD_TESTS=OFF
+                    -DDNNL_BUILD_EXAMPLES=OFF
+                    -DCMAKE_CXX_FLAGS=-march=native
+                    -DCMAKE_C_FLAGS=-march=native
+            RESULT_VARIABLE ONEDNN_CONFIG_RESULT
+            OUTPUT_VARIABLE ONEDNN_CONFIG_OUTPUT
+            ERROR_VARIABLE ONEDNN_CONFIG_ERROR
+        )
+        
+        if(NOT ONEDNN_CONFIG_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to configure OneDNN: ${ONEDNN_CONFIG_ERROR}")
+        endif()
+        
+        # Build OneDNN
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} --build ${ONEDNN_BUILD_DIR} --parallel --target install
+            RESULT_VARIABLE ONEDNN_BUILD_RESULT
+            OUTPUT_VARIABLE ONEDNN_BUILD_OUTPUT
+            ERROR_VARIABLE ONEDNN_BUILD_ERROR
+        )
+        
+        if(NOT ONEDNN_BUILD_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to build OneDNN: ${ONEDNN_BUILD_ERROR}")
+        endif()
+        
+        message(STATUS "V2: OneDNN built and installed to ${ONEDNN_BUILD_DIR}")
+    else()
+        message(STATUS "V2: OneDNN already built in ${ONEDNN_BUILD_DIR}")
+    endif()
+    
+    # Look for OneDNN in standard locations + our build dir
+    set(ONEDNN_SEARCH_PATHS
+        "${ONEDNN_BUILD_DIR}"           # Our freshly built version (highest priority)
+        "/opt/onednn"
+        "/usr/local"
+        "/usr"
+        "$ENV{HOME}/onednn"
+    )
+    
+    set(ONEDNN_FOUND FALSE)
+    foreach(SEARCH_PATH ${ONEDNN_SEARCH_PATHS})
+        if(EXISTS "${SEARCH_PATH}/include/oneapi/dnnl/dnnl.hpp")
+            set(ONEDNN_ROOT "${SEARCH_PATH}")
+            set(ONEDNN_INCLUDE_DIR "${SEARCH_PATH}/include")
+            set(ONEDNN_FOUND TRUE)
+            
+            # Look for library
+            find_library(ONEDNN_LIB
+                NAMES dnnl
+                PATHS "${SEARCH_PATH}/lib" "${SEARCH_PATH}/lib64"
+                NO_DEFAULT_PATH
+            )
+            
+            if(ONEDNN_LIB)
+                message(STATUS "V2: OneDNN found at ${ONEDNN_ROOT}")
+                message(STATUS "V2: OneDNN include: ${ONEDNN_INCLUDE_DIR}")
+                message(STATUS "V2: OneDNN library: ${ONEDNN_LIB}")
+                message(STATUS "V2: OneDNN provides: INT8 s8s8s32, BF16 bf16bf16f32 matmul")
+                add_compile_definitions(HAVE_ONEDNN)
+                break()
+            endif()
+        endif()
+    endforeach()
+    
+    if(NOT ONEDNN_FOUND)
+        message(WARNING "V2: OneDNN build failed or library not found - INT8/BF16 GEMM will use fallback paths")
+        message(WARNING "V2: INT8: Falls back to AVX512-VNNI or scalar")
+        message(WARNING "V2: BF16: Falls back to FP32 expansion + OpenBLAS")
+        set(USE_ONEDNN OFF)
+    endif()
+endif()
+
 # Find Python3 for code generation scripts
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 
-# CPU BLAS backend: Auto-select based on CPU vendor, or manual override
-# Note: MKL and OpenBLAS cannot be linked together due to symbol conflicts
-# We select one at CMake configure time based on CPU detection
-set(BLAS_BACKEND "AUTO" CACHE STRING "BLAS backend: AUTO, MKL, or OPENBLAS")
-set_property(CACHE BLAS_BACKEND PROPERTY STRINGS AUTO MKL OPENBLAS)
+# CPU BLAS backend: OpenBLAS for FP32 GEMM
+# Note: OneDNN handles INT8/BF16 optimizations, OpenBLAS for FP32 baseline
+message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
 
-# Generate microkernel instantiations (auto-run Python script at configure time)
+# Define GEMM script path for microkernel generation
 set(GENERATE_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generate_gemm_microkernel_instantiations.py")
 set(GENERATED_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake")
 
@@ -322,6 +457,7 @@ add_library(llaminar2_core STATIC
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
+    tensors/INT8Tensor.cpp
     tensors/TensorFactory.cpp
     tensors/KVCache.cpp
     tensors/IQ4_NLTensor.cpp
@@ -360,6 +496,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/FP32GemmKernel.cpp
     kernels/cpu/FP32StandaloneGemm.cpp
     kernels/cpu/BF16GemmKernel.cpp
+    kernels/cpu/INT8GemmKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
     kernels/cpu/CPURMSNormKernel.cpp
     kernels/cpu/CPUSoftmaxKernel.cpp
@@ -389,70 +526,9 @@ target_compile_features(llaminar2_core PUBLIC cxx_std_17)
 # Dependencies
 find_package(MPI REQUIRED)
 find_package(OpenMP REQUIRED)
+message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
 
-# ============================================================================
-# BLAS Backend Selection (MKL vs OpenBLAS)
-# ============================================================================
-# Detect CPU vendor to choose optimal BLAS backend
-if(BLAS_BACKEND STREQUAL "AUTO")
-    # Detect CPU vendor at configure time
-    execute_process(
-        COMMAND bash -c "lscpu | grep 'Vendor ID:' | awk '{print $3}'"
-        OUTPUT_VARIABLE CPU_VENDOR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    
-    if(CPU_VENDOR STREQUAL "GenuineIntel")
-        message(STATUS "V2: Detected Intel CPU - preferring Intel MKL")
-        set(BLAS_BACKEND_SELECTED "MKL")
-    else()
-        message(STATUS "V2: Detected non-Intel CPU (${CPU_VENDOR}) - preferring OpenBLAS")
-        set(BLAS_BACKEND_SELECTED "OPENBLAS")
-    endif()
-else()
-    set(BLAS_BACKEND_SELECTED ${BLAS_BACKEND})
-    message(STATUS "V2: Manual BLAS backend selection: ${BLAS_BACKEND_SELECTED}")
-endif()
-
-# Find and link the selected BLAS backend
-if(BLAS_BACKEND_SELECTED STREQUAL "MKL")
-    # Try to find Intel MKL
-    find_package(MKL CONFIG QUIET)
-    if(MKL_FOUND)
-        message(STATUS "V2: Intel MKL found - using MKL backend")
-        target_compile_definitions(llaminar2_core PUBLIC HAVE_MKL)
-        target_include_directories(llaminar2_core PUBLIC ${MKL_INCLUDE})
-        target_link_libraries(llaminar2_core PUBLIC MKL::MKL)
-        set(BLAS_LIBRARIES_SELECTED ${MKL_LIBRARIES})
-    else()
-        message(WARNING "V2: Intel MKL requested but not found - falling back to OpenBLAS")
-        message(WARNING "V2: Install MKL with: sudo apt install intel-oneapi-mkl-devel")
-        set(BLAS_BACKEND_SELECTED "OPENBLAS")
-    endif()
-endif()
-
-if(BLAS_BACKEND_SELECTED STREQUAL "OPENBLAS" OR NOT MKL_FOUND)
-    # Find OpenBLAS
-    if(NOT DEFINED OPENBLAS_LIBRARIES)
-        find_package(BLAS REQUIRED)
-        find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include /usr/include/x86_64-linux-gnu)
-        if(CBLAS_INCLUDE_DIR)
-            message(STATUS "V2: Found CBLAS include: ${CBLAS_INCLUDE_DIR}")
-            target_include_directories(llaminar2_core PUBLIC ${CBLAS_INCLUDE_DIR})
-        else()
-            message(WARNING "V2: CBLAS header not found - using fallback")
-        endif()
-        set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
-        message(STATUS "V2: Using OpenBLAS: ${BLAS_LIBRARIES}")
-    endif()
-    target_compile_definitions(llaminar2_core PUBLIC HAVE_OPENBLAS)
-    target_link_libraries(llaminar2_core PUBLIC ${OPENBLAS_LIBRARIES})
-    set(BLAS_LIBRARIES_SELECTED ${OPENBLAS_LIBRARIES})
-endif()
-
-message(STATUS "V2: Selected BLAS backend: ${BLAS_BACKEND_SELECTED}")
-
-# Try to find libnuma (optional, for NUMA-aware allocation)
+# Generate microkernel instantiations (auto-run Python script at configure time)
 find_library(NUMA_LIBRARY NAMES numa)
 if(NUMA_LIBRARY)
     message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
@@ -466,6 +542,13 @@ target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
 )
+
+# OneDNN for INT8 GEMM acceleration
+if(USE_ONEDNN AND ONEDNN_FOUND)
+    target_include_directories(llaminar2_core PUBLIC ${ONEDNN_INCLUDE_DIR})
+    target_link_libraries(llaminar2_core PUBLIC ${ONEDNN_LIB})
+    message(STATUS "V2: Linked OneDNN library for INT8 GEMM")
+endif()
 
 # BLAS libraries are linked above in the backend selection section
 
@@ -515,8 +598,33 @@ if(HAVE_VULKAN)
     target_link_libraries(llaminar2_core PUBLIC Vulkan::Vulkan)
 endif()
 
-if(HAVE_MKL)
-    target_compile_definitions(llaminar2_core PUBLIC HAVE_MKL)
+# =============================================================================
+# OpenBLAS Configuration (FP32 GEMM baseline)
+# =============================================================================
+if(NOT DEFINED OPENBLAS_LIBRARIES)
+    find_package(BLAS REQUIRED)
+    find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include /usr/include/x86_64-linux-gnu)
+    if(CBLAS_INCLUDE_DIR)
+        message(STATUS "V2: Found CBLAS include: ${CBLAS_INCLUDE_DIR}")
+        target_include_directories(llaminar2_core PUBLIC ${CBLAS_INCLUDE_DIR})
+    else()
+        message(WARNING "V2: CBLAS header not found - using fallback")
+    endif()
+    set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
+    message(STATUS "V2: Using OpenBLAS: ${BLAS_LIBRARIES}")
+endif()
+target_compile_definitions(llaminar2_core PUBLIC HAVE_OPENBLAS)
+target_link_libraries(llaminar2_core PUBLIC ${OPENBLAS_LIBRARIES})
+message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
+
+# =============================================================================
+# OneDNN Configuration (INT8/BF16 optimization, replaces MKL)
+# =============================================================================
+# Link OneDNN if found
+if(USE_ONEDNN AND ONEDNN_FOUND)
+    target_include_directories(llaminar2_core PUBLIC ${ONEDNN_INCLUDE_DIR})
+    target_link_libraries(llaminar2_core PUBLIC ${ONEDNN_LIB})
+    message(STATUS "V2: Linked OneDNN for INT8/BF16 GEMM acceleration")
 endif()
 
 # Main executable
@@ -567,3 +675,16 @@ install(FILES
     pipelines/QwenPipeline.h
     DESTINATION include/llaminar2/pipelines
 )
+
+# =============================================================================
+# CUDA GEMM Retraining Pipeline
+# =============================================================================
+if(HAVE_CUDA AND USE_ONNX_HEURISTIC)
+    # Path relative to workspace root (CMAKE_SOURCE_DIR points to src/v2)
+    set(PIPELINE_FILE "${CMAKE_SOURCE_DIR}/../../cmake/CudaGemmPipeline.cmake")
+    if(EXISTS "${PIPELINE_FILE}")
+        include("${PIPELINE_FILE}")
+    else()
+        message(WARNING "CUDA GEMM Pipeline file not found: ${PIPELINE_FILE}")
+    endif()
+endif()

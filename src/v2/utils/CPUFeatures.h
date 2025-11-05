@@ -158,6 +158,20 @@ namespace llaminar2
     }
 
     /**
+     * @brief Check if CPU supports AVX512-VNNI
+     * @note AVX512-VNNI is supported on Intel Ice Lake (2nd gen Xeon) and later
+     */
+    inline bool cpu_supports_avx512_vnni()
+    {
+        if (!cpu_supports_avx512())
+            return false;
+
+        uint32_t regs[4];
+        cpuid(7, 0, regs);
+        return (regs[2] & (1 << 11)) != 0; // ECX bit 11 = AVX512_VNNI
+    }
+
+    /**
      * @brief Check if CPU supports AMX-BF16
      * @note AMX-BF16 is supported on Intel Sapphire Rapids (4th gen Xeon) and later
      */
@@ -223,6 +237,7 @@ namespace llaminar2
     inline bool cpu_supports_sse41() { return false; }
     inline bool cpu_supports_avx512_fp16() { return false; }
     inline bool cpu_supports_avx512_bf16() { return false; }
+    inline bool cpu_supports_avx512_vnni() { return false; }
     inline bool cpu_supports_amx_bf16() { return false; }
     inline bool cpu_supports_amx_int8() { return false; }
     inline const char *cpu_vendor() { return "Unknown"; }

@@ -13,7 +13,8 @@
 #include "generated/cuda_heuristic_weights.h"
 #include "generated/cuda_heuristic_lookup.h"
 #include "../../tensors/FP16Utils.h"
-#include "../../../../build_v2/autotuner_models/GemmAutoTunerML.h" // ML-based predictor
+// COMMENTED OUT: ML-based predictor requires generated file (not yet available)
+// #include "../../../../build_v2/autotuner_models/GemmAutoTunerML.h" // ML-based predictor
 #ifdef HAVE_ONNX_RUNTIME
 #include "CudaGemmNeuralNetwork.h"
 #endif
@@ -286,11 +287,12 @@ namespace llaminar2
             // Layout 1×1×1 = 1 atom → 16×8 output tile (smaller for tiny matrices)
             // Layout 4×4×1 = 16 atoms → 64×32 output tile (larger for big matrices)
             //
-            // PRACTICAL SUBSET: Using 3 representative layouts to keep config count manageable
-            // Full space would be 648 × 2 atom_types × 9 layouts = 11,664 configs (too many)
-            // Current space: 648 × 2 atom_types × 3 layouts = 3,888 configs (good balance)
-            const std::vector<int> atom_layout_m_values = {1, 2, 4}; // Representative: small, medium, large
-            const std::vector<int> atom_layout_n_values = {1, 2, 4}; // Representative: small, medium, large
+            // FULL EXPLORATION: Testing all 9 atom layout combinations (3×3×1)
+            // Including asymmetric layouts like 1×2, 2×4, 4×1, etc.
+            // This may help non-square shapes like FFN (1×896×4864, 1×4864×896)
+            // Config count: 648 base × 2 atom_types × 9 layouts = ~11,664 configs
+            const std::vector<int> atom_layout_m_values = {1, 2, 4}; // Small, medium, large
+            const std::vector<int> atom_layout_n_values = {1, 2, 4}; // Small, medium, large
             const std::vector<int> atom_layout_k_values = {1};       // Always 1 for SM80
 
             // Explode parameter space (must match Python generator's nested loop order if used)
@@ -302,13 +304,10 @@ namespace llaminar2
                     {
                         for (int atom_k : atom_layout_k_values)
                         {
-                            // FILTER: Only use square/balanced atom layouts for practical subset
-                            // 1×1×1 (tiny), 2×2×1 (medium), 4×4×1 (large)
-                            // Skip asymmetric layouts like 1×2, 2×4, etc. to keep config count manageable
-                            if (atom_m != atom_n)
-                            {
-                                continue; // Skip non-square layouts
-                            }
+                            // NOTE: Testing ALL atom layouts (including asymmetric)
+                            // This allows exploration of 1×2, 2×4, 4×1, etc. for non-square shapes
+                            // May find better configs for highly rectangular matrices (e.g., 1×896×4864)
+                            // Previously filtered to only square layouts (1×1, 2×2, 4×4) for speed
 
                             for (int tm : tile_m_values)
                             {
@@ -663,6 +662,11 @@ namespace llaminar2
             const char *use_old = std::getenv("LLAMINAR_USE_OLD_HEURISTIC");
             bool use_old_heuristic = use_old && std::atoi(use_old) != 0;
 
+            // COMMENTED OUT: ML-based predictor requires generated model files (not yet available)
+            // Force fallback to old heuristic for now
+            use_old_heuristic = true;
+
+            /*
             if (!use_old_heuristic)
             {
                 // ML-based predictor (Phase 3)
@@ -708,9 +712,10 @@ namespace llaminar2
 
                 return config;
             }
+            */
 
             // Fallback to old size-based heuristic
-            LOG_DEBUG("[CUDA AutoTuner] Using old heuristic (LLAMINAR_USE_OLD_HEURISTIC=1)");
+            LOG_DEBUG("[CUDA AutoTuner] Using old heuristic (ML predictor not available)");
             if (m < 128 || n < 128)
             {
                 return presets::small();

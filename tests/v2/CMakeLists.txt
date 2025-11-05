@@ -224,6 +224,32 @@ add_v2_test(V2_Unit_BF16Tensor
     LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM;ViewSupport"
 )
 
+# Test: INT8GemmKernel (OneDNN per-channel quantization)
+add_executable(v2_test_int8_gemm unit/Test__INT8GemmKernel.cpp)
+target_link_libraries(v2_test_int8_gemm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8GemmKernel 
+    COMMAND $<TARGET_FILE:v2_test_int8_gemm>
+    LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;OneDNN;CPU"
+    MPI_PROCS 1  # INT8 GEMM is CPU-only, single rank
+)
+
+# Test: INT8GemmKernel INT32 Output (full INT8 pipeline foundation)
+add_executable(v2_test_int8_gemm_int32 unit/Test__INT8GemmKernel__INT32Output.cpp)
+target_link_libraries(v2_test_int8_gemm_int32 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8GemmKernel_INT32Output 
+    COMMAND $<TARGET_FILE:v2_test_int8_gemm_int32>
+    LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;OneDNN;CPU;INT32;Pipeline"
+    MPI_PROCS 1  # INT8 GEMM is CPU-only, single rank
+)
+
 # Test: TensorBase Conversion Interface
 add_executable(v2_test_tensor_conversion unit/tensors/Test__TensorConversion.cpp)
 target_link_libraries(v2_test_tensor_conversion 
@@ -647,6 +673,15 @@ add_v2_test(V2_Unit_PipelineDeviceDetection
     LABELS "V2;Unit;PipelineExecution;DeviceManagement;MoE;Phase3"
 )
 
+# Test: PipelineBase Precision Mode
+# Tests ComputePrecision configuration flow through PipelineBase
+add_executable(v2_test_pipeline_precision_mode unit/pipelines/Test__PipelineBase_PrecisionMode.cpp)
+target_link_libraries(v2_test_pipeline_precision_mode llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_PipelinePrecisionMode
+    COMMAND $<TARGET_FILE:v2_test_pipeline_precision_mode>
+    LABELS "V2;Unit;PipelineExecution;ComputePrecision;Configuration"
+)
+
 # Test: ModelLoader
 add_executable(v2_test_model_loader unit/loaders/Test__ModelLoader.cpp)
 target_link_libraries(v2_test_model_loader 
@@ -966,6 +1001,451 @@ if(HAVE_CUDA)
         MPI_PROCS 1
     )
     
+    # Test: CUDA CuTe Tensor Core GEMM
+    # Phase 1: Minimal template using CUTLASS CuTe for FP16 Tensor Cores
+    add_executable(v2_test_cuda_gemm_cute unit/Test__CudaGemmCuTe.cpp)
+    target_include_directories(v2_test_cuda_gemm_cute PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_cuda_gemm_cute 
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CudaGemmCuTe 
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm_cute>
+        LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;TensorCores;CuTe"
+        MPI_PROCS 1
+    )
+    
+    # Phase 3: Large tile optimization (128×128×64) for 2-3× speedup
+    add_executable(v2_test_cuda_gemm_phase3 unit/Test__CudaGemmPhase3.cpp)
+    target_include_directories(v2_test_cuda_gemm_phase3 PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_cuda_gemm_phase3 
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CudaGemmPhase3 
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm_phase3>
+        LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;TensorCores;CuTe;LargeTiles;Performance"
+        MPI_PROCS 1
+    )
+    
+    # Phase 3 Part 2: Pipelined large tiles for 900-1,000 GFLOPS
+    add_executable(v2_test_cuda_gemm_phase3_pipelined unit/Test__CudaGemmPhase3Pipelined.cpp)
+    target_include_directories(v2_test_cuda_gemm_phase3_pipelined PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_cuda_gemm_phase3_pipelined 
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CudaGemmPhase3Pipelined 
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm_phase3_pipelined>
+        LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;TensorCores;CuTe;LargeTiles;Pipelining;Performance"
+        MPI_PROCS 1
+    )
+    
+    # Phase 4: Quick wins (swizzled shared memory + cp.async) for 7.6 TFLOPS target
+    add_executable(v2_test_cuda_gemm_phase4_quickwins unit/Test__CudaGemmPhase4QuickWins.cpp)
+    target_include_directories(v2_test_cuda_gemm_phase4_quickwins PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_cuda_gemm_phase4_quickwins 
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CudaGemmPhase4QuickWins 
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm_phase4_quickwins>
+        LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;TensorCores;CuTe;SwizzledMemory;AsyncCopy;Performance"
+        MPI_PROCS 1
+    )
+    
+    # Phase 4: Profiling (manual timing breakdown)
+    add_executable(v2_test_phase4_profiling unit/Test__Phase4Profiling.cpp)
+    target_include_directories(v2_test_phase4_profiling PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/v2/tensors
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase4_profiling 
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_Phase4Profiling
+        COMMAND $<TARGET_FILE:v2_test_phase4_profiling>
+        LABELS "V2;Unit;Profiling;Performance;CUDA"
+        MPI_PROCS 1
+    )
+    
+    # Phase 5A: Streaming dequantization (overlap decode with MMA)
+    add_executable(v2_test_cuda_gemm_phase5a unit/Test__CudaGemmPhase5A.cpp)
+    target_include_directories(v2_test_cuda_gemm_phase5a PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_cuda_gemm_phase5a 
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CudaGemmPhase5A
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm_phase5a>
+        LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;TensorCores;CuTe;StreamingDequant;InstructionParallelism;Performance"
+        MPI_PROCS 1
+    )
+    
+    # Phase 5: JIT Auto-Tuning Sweep
+    # Configuration space exploration for Phase 5 streaming dequant
+    # Tests hypothesis that single buffering may outperform double buffering
+    add_executable(v2_test_phase5_sweep cuda/Test__Phase5Sweep.cpp)
+    target_include_directories(v2_test_phase5_sweep PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_sweep 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5Sweep
+        COMMAND $<TARGET_FILE:v2_test_phase5_sweep>
+        LABELS "V2;Performance;AutoTuning;JIT;CUDA;ConfigSpaceSweep;OccupancyOptimization"
+        MPI_PROCS 1
+    )
+    
+    # Test: Phase 5 JIT Parity
+    # Validates JIT-compiled Phase 5A achieves same performance as nvcc baseline
+    add_executable(v2_test_phase5_parity cuda/Test__Phase5Parity.cpp)
+    target_include_directories(v2_test_phase5_parity PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_parity 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5Parity
+        COMMAND $<TARGET_FILE:v2_test_phase5_parity>
+        LABELS "V2;Performance;Parity;JIT;CUDA;Baseline;Phase5A"
+        MPI_PROCS 1
+    )
+    
+    # Test: Phase 5 SUB_K Sweep
+    # Sweeps SUB_K values (16, 32, 64) to find optimal configuration for memory coalescing
+    add_executable(v2_test_phase5_sub_k_sweep cuda/Test__Phase5_SUB_K_Sweep.cpp)
+    target_include_directories(v2_test_phase5_sub_k_sweep PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_sub_k_sweep 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5_SUB_K_Sweep
+        COMMAND $<TARGET_FILE:v2_test_phase5_sub_k_sweep>
+        LABELS "V2;Performance;Sweep;SUB_K;CUDA;Phase5;Coalescing"
+        MPI_PROCS 1
+    )
+    
+    # Test: Phase 5 SUB_K=64 Profiling
+    # Single-configuration test optimized for NCU profiling of SUB_K=64 coalescing
+    add_executable(v2_test_phase5_sub_k_64_profile cuda/Test__Phase5_SUB_K_64_Profile.cpp)
+    target_include_directories(v2_test_phase5_sub_k_64_profile PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_sub_k_64_profile 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5_SUB_K_64_Profile
+        COMMAND $<TARGET_FILE:v2_test_phase5_sub_k_64_profile>
+        LABELS "V2;Performance;Profile;SUB_K;CUDA;Phase5;Coalescing"
+        MPI_PROCS 1
+    )
+    
+    # Test: Phase 5 Transpose B Layout Benchmark
+    # Validates NCU-guided hypothesis that transposing B from [N][K_blocks] to [K_blocks][N]
+    # improves memory coalescing from 27% to 87-100% utilization (62% speedup potential)
+    add_executable(v2_test_phase5_transpose_benchmark cuda/Test__Phase5_Transpose_Benchmark.cpp)
+    target_include_directories(v2_test_phase5_transpose_benchmark PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_transpose_benchmark 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5_Transpose_Benchmark
+        COMMAND $<TARGET_FILE:v2_test_phase5_transpose_benchmark>
+        LABELS "V2;Performance;CUDA;Phase5;Coalescing;Transpose;MemoryLayout"
+        MPI_PROCS 1
+    )
+    
+    # Test: Phase 5 Transpose Large Problem
+    # Larger problem size (2048×2048) for accurate timing of transpose benefit
+    add_executable(v2_test_phase5_transpose_large cuda/Test__Phase5_Transpose_Large.cpp)
+    target_include_directories(v2_test_phase5_transpose_large PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_transpose_large 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5_Transpose_Large
+        COMMAND $<TARGET_FILE:v2_test_phase5_transpose_large>
+        LABELS "V2;Performance;CUDA;Phase5;Coalescing;Transpose;LargeProblem"
+        MPI_PROCS 1
+    )
+    
+    # Test: Phase 5 Direct NVRTC (bypass Jitify)
+    # Tests Phase 5 kernel compiled directly with NVRTC to isolate Jitify overhead
+    add_executable(v2_test_phase5_direct_nvrtc cuda/Test__Phase5DirectNVRTC.cpp)
+    target_include_directories(v2_test_phase5_direct_nvrtc PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase5_direct_nvrtc 
+        llaminar2_core
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase5DirectNVRTC
+        COMMAND $<TARGET_FILE:v2_test_phase5_direct_nvrtc>
+        LABELS "V2;Performance;NVRTC;CUDA;Phase5;Debug"
+        MPI_PROCS 1
+    )
+    
+    # Phase 6: Int8 DP4A Kernel (llama.cpp-inspired) - Minimal compilation test
+    # Replaces Tensor Cores with int8 DP4A for better memory coalescing
+    # Expected: 50-90 TFLOPS (2.9-5.1× improvement over Phase 5's 17.5 TFLOPS)
+    add_executable(v2_test_phase6_int8_minimal cuda/Test__Phase6_Int8_Minimal.cpp)
+    target_include_directories(v2_test_phase6_int8_minimal PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase6_int8_minimal 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_Phase6_Int8_Minimal
+        COMMAND $<TARGET_FILE:v2_test_phase6_int8_minimal>
+        LABELS "V2;Unit;CUDA;Phase6;Int8;DP4A;CompilationTest"
+        MPI_PROCS 1
+    )
+    
+    # Phase 6: Int8 DP4A Kernel - Functional correctness tests
+    # Tests kernel correctness with CPU reference implementation
+    # Validates: small matrices (4×4), medium matrices (64×64), identity patterns
+    add_executable(v2_test_phase6_int8_functional cuda/Test__Phase6_Int8_Functional.cpp)
+    target_include_directories(v2_test_phase6_int8_functional PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase6_int8_functional 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_Phase6_Int8_Functional
+        COMMAND $<TARGET_FILE:v2_test_phase6_int8_functional>
+        LABELS "V2;Unit;CUDA;Phase6;Int8;DP4A;FunctionalTest;Correctness"
+        MPI_PROCS 1
+    )
+    
+    # Phase 6: Int8 DP4A Kernel - Debug test with intermediate value printing
+    # Helps diagnose why GPU results differ from CPU reference
+    add_executable(v2_test_phase6_int8_debug cuda/Test__Phase6_Int8_Debug.cpp)
+    target_include_directories(v2_test_phase6_int8_debug PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase6_int8_debug 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_Phase6_Int8_Debug
+        COMMAND $<TARGET_FILE:v2_test_phase6_int8_debug>
+        LABELS "V2;Unit;CUDA;Phase6;Int8;DP4A;Debug"
+        MPI_PROCS 1
+    )
+
+    # Phase 6: Int8 DP4A Kernel - Performance benchmark
+    # Measures TFLOPS on large matrices (2048×2048) and compares against Phase 5 baseline
+    add_executable(v2_test_phase6_int8_performance cuda/Test__Phase6_Int8_Performance.cpp)
+    target_include_directories(v2_test_phase6_int8_performance PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase6_int8_performance 
+        llaminar2_core
+        cuda_backend
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase6_Int8_Performance
+        COMMAND $<TARGET_FILE:v2_test_phase6_int8_performance>
+        LABELS "V2;Performance;CUDA;Phase6;Int8;DP4A;Benchmark"
+        MPI_PROCS 1
+    )
+
+    # Phase 7: CUTLASS Int8 GEMM - Functional correctness tests (simplified)
+    # COMMENTED OUT: API has changed, needs update
+    # Uses NVIDIA CUTLASS library with direct IQ4_NL→INT8 conversion (no dequant/requant)
+    # Expected performance: 50-100+ TFLOPS (vs Phase 6's 0.34 TFLOPS)
+    # add_executable(v2_test_phase7_cutlass_functional cuda/Test__Phase7_CUTLASS_Functional_Simple.cpp)
+    # target_include_directories(v2_test_phase7_cutlass_functional PRIVATE
+    #     ${CMAKE_SOURCE_DIR}/kernels/cuda
+    #     /opt/cutlass/include
+    # )
+    # target_link_libraries(v2_test_phase7_cutlass_functional 
+    #     llaminar2_core
+    #     cuda_backend
+    #     CUDA::cudart
+    #     CUDA::cuda_driver
+    #     GTest::gtest
+    #     GTest::gtest_main
+    # )
+    # add_v2_test(V2_Unit_Phase7_CUTLASS_Functional
+    #     COMMAND $<TARGET_FILE:v2_test_phase7_cutlass_functional>
+    #     LABELS "V2;Unit;CUDA;Phase7;CUTLASS;Int8;GEMM;Functional;DirectConversion"
+    #     MPI_PROCS 1
+    # )
+
+    # Phase 7: CUTLASS Int8 GEMM - Simple correctness test (no IQ4_NL)
+    # Direct int8×int8→int32 GEMM to verify CUTLASS integration works
+    add_executable(v2_test_phase7_cutlass_simple cuda/Test__Phase7_CUTLASS_Simple.cu)
+    target_include_directories(v2_test_phase7_cutlass_simple PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_test_phase7_cutlass_simple 
+        CUDA::cudart
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_Phase7_CUTLASS_Simple
+        COMMAND $<TARGET_FILE:v2_test_phase7_cutlass_simple>
+        LABELS "V2;Unit;CUDA;Phase7;CUTLASS;Int8;GEMM;Simple"
+        MPI_PROCS 1
+    )
+
+    # Phase 7: CUTLASS Int8 GEMM - Performance benchmark
+    # Measures throughput (GFLOPS) for various matrix sizes
+    # Expected: 50-100+ TFLOPS (vs Phase 6's 0.34 TFLOPS disaster)
+    add_executable(v2_perf_phase7_cutlass cuda/Perf__Phase7_CUTLASS.cu)
+    target_include_directories(v2_perf_phase7_cutlass PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+        /opt/cutlass/include
+    )
+    target_link_libraries(v2_perf_phase7_cutlass 
+        llaminar2_core
+        cuda_backend
+        CUDA::cudart
+        CUDA::cuda_driver
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_Phase7_CUTLASS
+        COMMAND $<TARGET_FILE:v2_perf_phase7_cutlass>
+        LABELS "V2;Performance;CUDA;Phase7;CUTLASS;Int8;GEMM;Throughput"
+        MPI_PROCS 1
+    )
+
+    # Test: Driver API Launch Overhead
+    # Measures the overhead difference between Driver API (cuLaunchKernel) and Runtime API (<<<>>>)
+    # This test confirms that JIT kernels have higher launch overhead (~900 μs) due to Driver API
+    add_executable(v2_test_driver_api_launch_overhead cuda/Test__DriverAPILaunchOverhead.cu)
+    target_link_libraries(v2_test_driver_api_launch_overhead 
+        CUDA::cudart
+        CUDA::cuda_driver
+        CUDA::nvrtc
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_DriverAPILaunchOverhead
+        COMMAND $<TARGET_FILE:v2_test_driver_api_launch_overhead>
+        LABELS "V2;Performance;CUDA;DriverAPI;LaunchOverhead"
+        MPI_PROCS 1
+    )
+    
+    # Test: Jitify Overhead Analysis
+    # Measures overhead at each stage: raw NVRTC, Jitify compilation, cached launch, parameter setup
+    add_executable(v2_test_jitify_overhead cuda/Test__JitifyOverhead.cu)
+    target_include_directories(v2_test_jitify_overhead PRIVATE
+        ${CMAKE_SOURCE_DIR}/kernels/cuda
+    )
+    target_link_libraries(v2_test_jitify_overhead 
+        llaminar2_core 
+        cuda_backend
+        CUDA::cudart
+        CUDA::cuda_driver
+        CUDA::nvrtc
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_JitifyOverhead
+        COMMAND $<TARGET_FILE:v2_test_jitify_overhead>
+        LABELS "V2;Performance;CUDA;Jitify;JIT;Overhead;LaunchPerformance"
+        MPI_PROCS 1
+    )
+    
     # Test: IQ4_NL BF16 Decoder Correctness
     # Tests BF16 decoder method for IQ4_NL quantized tensors on Ampere+ GPUs
     add_executable(v2_test_iq4nl_bf16_decoder unit/Test__IQ4_NL_BF16_Decoder.cu)
@@ -1089,17 +1569,18 @@ add_v2_test(V2_Unit_GemmAutoTunerCorrectness
 )
 
 # Test: ML-Based Tile Autotuner (Phase 3, November 2025)
-add_executable(v2_test_gemm_autotuner_ml unit/Test__GemmAutoTunerML.cpp)
-target_link_libraries(v2_test_gemm_autotuner_ml 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_GemmAutoTunerML 
-    COMMAND $<TARGET_FILE:v2_test_gemm_autotuner_ml>
-    LABELS "V2;Unit;Kernels;AutoTuning;MachineLearning;TilePrediction;Phase3"
-    MPI_PROCS 1
-)
+# COMMENTED OUT: Requires generated ML model files (GemmAutoTunerML.h) that don't exist yet
+# add_executable(v2_test_gemm_autotuner_ml unit/Test__GemmAutoTunerML.cpp)
+# target_link_libraries(v2_test_gemm_autotuner_ml 
+#     llaminar2_core 
+#     GTest::gtest
+#     GTest::gtest_main
+# )
+# add_v2_test(V2_Unit_GemmAutoTunerML 
+#     COMMAND $<TARGET_FILE:v2_test_gemm_autotuner_ml>
+#     LABELS "V2;Unit;Kernels;AutoTuning;MachineLearning;TilePrediction;Phase3"
+#     MPI_PROCS 1
+# )
 
 # Test: GEMM Template Infrastructure (Phase 1 validation)
 add_executable(v2_test_gemm_template_infrastructure unit/Test__GemmTemplateInfrastructure.cpp)
@@ -1377,25 +1858,26 @@ add_v2_test(V2_Integration_DequantEquivalency
 )
 
 # Test: ML AutoTuner E2E - Validate ML-based tile predictor integration (November 2025)
-if(HAVE_CUDA)
-    add_executable(v2_test_ml_autotuner_e2e
-        integration/Test__MLAutoTunerE2E.cpp
-    )
-    
-    target_link_libraries(v2_test_ml_autotuner_e2e
-        llaminar2_core
-        cuda_backend
-        GTest::gtest
-        GTest::gtest_main
-        CUDA::cudart
-    )
-    
-    add_v2_test(V2_Integration_MLAutoTuner
-        COMMAND $<TARGET_FILE:v2_test_ml_autotuner_e2e>
-        MPI_PROCS 1
-        LABELS "V2;Integration;AutoTuner;MachineLearning;GEMM;Performance;Correctness"
-    )
-endif()
+# COMMENTED OUT: Requires generated ML model files (not yet available)
+# if(HAVE_CUDA)
+#     add_executable(v2_test_ml_autotuner_e2e
+#         integration/Test__MLAutoTunerE2E.cpp
+#     )
+#     
+#     target_link_libraries(v2_test_ml_autotuner_e2e
+#         llaminar2_core
+#         cuda_backend
+#         GTest::gtest
+#         GTest::gtest_main
+#         CUDA::cudart
+#     )
+#     
+#     add_v2_test(V2_Integration_MLAutoTuner
+#         COMMAND $<TARGET_FILE:v2_test_ml_autotuner_e2e>
+#         MPI_PROCS 1
+#         LABELS "V2;Integration;AutoTuner;MachineLearning;GEMM;Performance;Correctness"
+#     )
+# endif()
 
 # Placeholder for integration test executables (to be added)
 # Example:
@@ -1628,61 +2110,64 @@ if(HAVE_CUDA)
     
     # Performance Test: Phase 2 Tensor Core - wmma API with FP16 compute
     # Validates 3-4× speedup over Phase 1 using Tensor Cores
-    add_executable(v2_perf_phase2_tensorcore performance/Perf__Phase2_TensorCore.cu)
-    target_link_libraries(v2_perf_phase2_tensorcore
-        cuda_backend
-        GTest::gtest
-        GTest::gtest_main
-        CUDA::cudart
-    )
-    set_target_properties(v2_perf_phase2_tensorcore PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        CUDA_SEPARABLE_COMPILATION ON
-    )
-    
-    add_v2_perf_test(V2_Perf_Phase2_TensorCore
-        COMMAND $<TARGET_FILE:v2_perf_phase2_tensorcore>
-        LABELS "V2;Performance;CUDA;Phase2;TensorCore;FP32Input;GEMM"
-        MPI_PROCS 1  # Single GPU, no MPI
-    )
+    # COMMENTED OUT: Depends on obsolete CudaGemmVariantsTensorCore.h file
+    # add_executable(v2_perf_phase2_tensorcore performance/Perf__Phase2_TensorCore.cu)
+    # target_link_libraries(v2_perf_phase2_tensorcore
+    #     cuda_backend
+    #     GTest::gtest
+    #     GTest::gtest_main
+    #     CUDA::cudart
+    # )
+    # set_target_properties(v2_perf_phase2_tensorcore PROPERTIES
+    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    #     CUDA_SEPARABLE_COMPILATION ON
+    # )
+    # 
+    # add_v2_perf_test(V2_Perf_Phase2_TensorCore
+    #     COMMAND $<TARGET_FILE:v2_perf_phase2_tensorcore>
+    #     LABELS "V2;Performance;CUDA;Phase2;TensorCore;FP32Input;GEMM"
+    #     MPI_PROCS 1  # Single GPU, no MPI
+    # )
     
     # Phase 2.5: FP16 input with async copy
-    add_executable(v2_perf_phase2_5_tensorcore_fp16 performance/Perf__Phase2_5_TensorCore_FP16.cu)
-    target_link_libraries(v2_perf_phase2_5_tensorcore_fp16
-        cuda_backend
-        GTest::gtest
-        GTest::gtest_main
-        CUDA::cudart
-    )
-    set_target_properties(v2_perf_phase2_5_tensorcore_fp16 PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        CUDA_SEPARABLE_COMPILATION ON
-    )
+    # COMMENTED OUT: Depends on obsolete CudaGemmKernel.cuh file
+    # add_executable(v2_perf_phase2_5_tensorcore_fp16 performance/Perf__Phase2_5_TensorCore_FP16.cu)
+    # target_link_libraries(v2_perf_phase2_5_tensorcore_fp16
+    #     cuda_backend
+    #     GTest::gtest
+    #     GTest::gtest_main
+    #     CUDA::cudart
+    # )
+    # set_target_properties(v2_perf_phase2_5_tensorcore_fp16 PROPERTIES
+    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    #     CUDA_SEPARABLE_COMPILATION ON
+    # )
     
-    add_v2_perf_test(V2_Perf_Phase2_5_TensorCore_FP16
-        COMMAND $<TARGET_FILE:v2_perf_phase2_5_tensorcore_fp16>
-        LABELS "V2;Performance;CUDA;Phase2_5;TensorCore;FP16Input;AsyncCopy;GEMM"
-        MPI_PROCS 1  # Single GPU, no MPI
-    )
+    # add_v2_perf_test(V2_Perf_Phase2_5_TensorCore_FP16
+    #     COMMAND $<TARGET_FILE:v2_perf_phase2_5_tensorcore_fp16>
+    #     LABELS "V2;Performance;CUDA;Phase2_5;TensorCore;FP16Input;AsyncCopy;GEMM"
+    #     MPI_PROCS 1  # Single GPU, no MPI
+    # )
     
     # Phase 3: Tile size tuning sweep
-    add_executable(v2_perf_phase3_tile_sweep performance/Perf__Phase3_TileSizeSweep.cu)
-    target_link_libraries(v2_perf_phase3_tile_sweep
-        cuda_backend
-        GTest::gtest
-        GTest::gtest_main
-        CUDA::cudart
-    )
-    set_target_properties(v2_perf_phase3_tile_sweep PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        CUDA_SEPARABLE_COMPILATION ON
-    )
+    # COMMENTED OUT: Depends on obsolete CudaGemmKernel.cuh file
+    # add_executable(v2_perf_phase3_tile_sweep performance/Perf__Phase3_TileSizeSweep.cu)
+    # target_link_libraries(v2_perf_phase3_tile_sweep
+    #     cuda_backend
+    #     GTest::gtest
+    #     GTest::gtest_main
+    #     CUDA::cudart
+    # )
+    # set_target_properties(v2_perf_phase3_tile_sweep PROPERTIES
+    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    #     CUDA_SEPARABLE_COMPILATION ON
+    # )
     
-    add_v2_perf_test(V2_Perf_Phase3_TileSizeSweep
-        COMMAND $<TARGET_FILE:v2_perf_phase3_tile_sweep>
-        LABELS "V2;Performance;CUDA;Phase3;TensorCore;TileSizeTuning;Optimization;GEMM"
-        MPI_PROCS 1  # Single GPU, no MPI
-    )
+    # add_v2_perf_test(V2_Perf_Phase3_TileSizeSweep
+    #     COMMAND $<TARGET_FILE:v2_perf_phase3_tile_sweep>
+    #     LABELS "V2;Performance;CUDA;Phase3;TensorCore;TileSizeTuning;Optimization;GEMM"
+    #     MPI_PROCS 1  # Single GPU, no MPI
+    # )
 endif()
 
 # Performance Test: 64×32 Tile Size Comparison
@@ -1854,22 +2339,23 @@ if(HAVE_CUDA)
     # Tests 0.5B, 4B, 7B, 14B model sizes with batch sizes 1, 8, 32, 128
     # Exports data for ML heuristic training: tensorcore_benchmark_data.csv
     # Validates Phase 3 optimization (32×64×16 for m=32)
-    add_executable(v2_perf_tensorcore_heuristic_validation 
-        performance/Perf__TensorCoreHeuristicValidation.cpp
-    )
-    target_link_libraries(v2_perf_tensorcore_heuristic_validation 
-        llaminar2_core 
-        GTest::gtest
-    )
-    set_target_properties(v2_perf_tensorcore_heuristic_validation PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-    )
-    
-    add_v2_perf_test(V2_Perf_TensorCoreHeuristicValidation
-        COMMAND $<TARGET_FILE:v2_perf_tensorcore_heuristic_validation>
-        LABELS "V2;Performance;CUDA;TensorCore;AutoTuning;HeuristicValidation;ModelSizes;Comprehensive"
-        MPI_PROCS 1  # Single rank GPU benchmark
-    )
+    # COMMENTED OUT: Depends on obsolete CudaGemmVariantsTensorCore.h file
+    # add_executable(v2_perf_tensorcore_heuristic_validation 
+    #     performance/Perf__TensorCoreHeuristicValidation.cpp
+    # )
+    # target_link_libraries(v2_perf_tensorcore_heuristic_validation 
+    #     llaminar2_core 
+    #     GTest::gtest
+    # )
+    # set_target_properties(v2_perf_tensorcore_heuristic_validation PROPERTIES
+    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    # )
+    # 
+    # add_v2_perf_test(V2_Perf_TensorCoreHeuristicValidation
+    #     COMMAND $<TARGET_FILE:v2_perf_tensorcore_heuristic_validation>
+    #     LABELS "V2;Performance;CUDA;TensorCore;AutoTuning;HeuristicValidation;ModelSizes;Comprehensive"
+    #     MPI_PROCS 1  # Single rank GPU benchmark
+    # )
     
     # Custom target: Train ML heuristic from Tensor Core benchmark data
     # This regenerates tensorcore_heuristic_weights.h in the source tree
@@ -1887,7 +2373,8 @@ if(HAVE_CUDA)
     )
     
     # Make training depend on the benchmark executable
-    add_dependencies(train_tensorcore_heuristic v2_perf_tensorcore_heuristic_validation)
+    # COMMENTED OUT: v2_perf_tensorcore_heuristic_validation is disabled
+    # add_dependencies(train_tensorcore_heuristic v2_perf_tensorcore_heuristic_validation)
 endif()
 
 # Performance Test: Qwen2 E2E Pipeline Throughput

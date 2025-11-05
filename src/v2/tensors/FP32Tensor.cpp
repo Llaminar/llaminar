@@ -401,6 +401,71 @@ namespace llaminar2
         }
     }
 
+    bool FP32Tensor::to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales) const
+    {
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            LOG_ERROR("[FP32Tensor] to_int8_perchannel() requires 2D tensor, got " << shp.size() << "D");
+            return false;
+        }
+
+        const size_t rows = shp[0];
+        const size_t cols = shp[1];
+        const float *src = data();
+
+        // Compute per-column scales
+        for (size_t j = 0; j < cols; ++j)
+        {
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                float abs_val = std::fabs(src[i * cols + j]);
+                if (abs_val > max_abs)
+                    max_abs = abs_val;
+            }
+            dst_col_scales[j] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        }
+
+        // Compute per-row scales (if requested)
+        if (dst_row_scales != nullptr)
+        {
+            for (size_t i = 0; i < rows; ++i)
+            {
+                float max_abs = 0.0f;
+                for (size_t j = 0; j < cols; ++j)
+                {
+                    float abs_val = std::fabs(src[i * cols + j]);
+                    if (abs_val > max_abs)
+                        max_abs = abs_val;
+                }
+                dst_row_scales[i] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            }
+        }
+
+        // Quantize to INT8 using per-column scales
+        for (size_t i = 0; i < rows; ++i)
+        {
+            for (size_t j = 0; j < cols; ++j)
+            {
+                const size_t idx = i * cols + j;
+                const float inv_scale = 1.0f / dst_col_scales[j];
+                float scaled = src[idx] * inv_scale;
+                int32_t quantized = static_cast<int32_t>(std::round(scaled));
+
+                // Clamp to INT8 range
+                if (quantized > 127)
+                    quantized = 127;
+                else if (quantized < -127)
+                    quantized = -127;
+
+                dst_int8[idx] = static_cast<int8_t>(quantized);
+            }
+        }
+
+        return true;
+    }
+
     void FP32Tensor::to_fp32_row(size_t row_idx, float *buffer) const
     {
         const auto &shp = shape();

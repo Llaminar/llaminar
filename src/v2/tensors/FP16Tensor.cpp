@@ -432,6 +432,68 @@ namespace llaminar2
         }
     }
 
+    bool FP16Tensor::to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales) const
+    {
+        // FP16 → FP32 → INT8 per-channel quantization
+        // Use the generic conversion path since FP16 doesn't implement IBlockDecoder
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[FP16Tensor::to_int8_perchannel] Only 2D tensors supported");
+            return false;
+        }
+
+        const size_t rows = shape_[0];
+        const size_t cols = shape_[1];
+
+        // Decode entire tensor to FP32
+        std::vector<float> temp_fp32(rows * cols);
+        to_fp32(temp_fp32.data());
+
+        // Compute per-column scales
+        std::fill(dst_col_scales, dst_col_scales + cols, 0.0f);
+        for (size_t j = 0; j < cols; ++j)
+        {
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(temp_fp32[i * cols + j]));
+            }
+            dst_col_scales[j] = (max_abs > 1e-10f) ? (max_abs / 127.0f) : 1.0f;
+        }
+
+        // Compute per-row scales if requested
+        if (dst_row_scales)
+        {
+            for (size_t i = 0; i < rows; ++i)
+            {
+                float max_abs = 0.0f;
+                for (size_t j = 0; j < cols; ++j)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp_fp32[i * cols + j]));
+                }
+                dst_row_scales[i] = (max_abs > 1e-10f) ? (max_abs / 127.0f) : 1.0f;
+            }
+        }
+
+        // Quantize using per-column scales
+        for (size_t i = 0; i < rows; ++i)
+        {
+            for (size_t j = 0; j < cols; ++j)
+            {
+                const size_t idx = i * cols + j;
+                const float inv_scale = 1.0f / dst_col_scales[j];
+                const float scaled = temp_fp32[idx] * inv_scale;
+                const int32_t quantized = static_cast<int32_t>(std::round(scaled));
+
+                // Clamp to INT8 range
+                dst_int8[idx] = static_cast<int8_t>(std::max(-127, std::min(127, quantized)));
+            }
+        }
+
+        return true;
+    }
+
     void FP16Tensor::to_fp32_row(size_t row_idx, float *buffer) const
     {
         const auto &shp = shape();

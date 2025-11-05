@@ -329,6 +329,7 @@ protected:
                 << "threads_m,threads_n,"
                 << "work_m,work_n,"
                 << "prefetch_stages,transpose_smem,vectorize_load,"
+                << "atom_type,atom_layout_m,atom_layout_n,atom_layout_k,"
                 << "gflops,time_ms,iterations\n";
         }
 
@@ -342,6 +343,7 @@ protected:
                 << cfg.threads_m << "," << cfg.threads_n << ","
                 << cfg.work_per_thread_m << "," << cfg.work_per_thread_n << ","
                 << cfg.prefetch_stages << "," << (cfg.transpose_smem ? 1 : 0) << "," << cfg.vectorize_load << ","
+                << cfg.atom_type << "," << cfg.atom_layout_m << "," << cfg.atom_layout_n << "," << cfg.atom_layout_k << ","
                 << std::fixed << std::setprecision(4) << result.gflops << ","
                 << std::fixed << std::setprecision(6) << result.time_ms << ","
                 << result.iterations << "\n";

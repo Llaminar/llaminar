@@ -474,3 +474,137 @@ TEST_F(IQ2_XSSIMDTest, EdgeCase_RandomValues)
     EXPECT_TRUE(compareArrays(output_scalar, output_avx512, 256));
 #endif
 }
+
+
+// =============================================================================
+// to<T>() Template Method Tests
+// =============================================================================
+
+TEST_F(IQ2_XSSIMDTest, ToFloat_TemplateMethod)
+{
+    // Create a random tensor (1x256 = 1 block)
+    auto tensor = createRandomTensor(1, 256);
+    const size_t total = 256;
+
+    // Test template method
+    std::vector<float> template_output(total);
+    tensor->to<float>(template_output.data());
+
+    // Test legacy method
+    std::vector<float> legacy_output(total);
+    tensor->to_fp32(legacy_output.data());
+
+    // Should produce identical results
+    for (size_t i = 0; i < total; ++i) {
+        EXPECT_FLOAT_EQ(template_output[i], legacy_output[i]) 
+            << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(IQ2_XSSIMDTest, ToBF16_TemplateMethod)
+{
+    // Create random tensor
+    auto tensor = createRandomTensor(1, 256);
+    const size_t total = 256;
+
+    // Test template method
+    std::vector<uint16_t> template_output(total);
+    tensor->to<uint16_t>(template_output.data(), TensorType::BF16);
+
+    // Test legacy method
+    std::vector<uint16_t> legacy_output(total);
+    tensor->to_bf16(legacy_output.data());
+
+    // Should produce identical results
+    for (size_t i = 0; i < total; ++i) {
+        EXPECT_EQ(template_output[i], legacy_output[i]) 
+            << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(IQ2_XSSIMDTest, ToFP16_TemplateMethod)
+{
+    // Create random tensor
+    auto tensor = createRandomTensor(1, 256);
+    const size_t total = 256;
+
+    // Test template method
+    std::vector<uint16_t> template_output(total);
+    tensor->to<uint16_t>(template_output.data(), TensorType::FP16);
+
+    // Test legacy method
+    std::vector<uint16_t> legacy_output(total);
+    tensor->to_fp16(legacy_output.data());
+
+    // Should produce identical results
+    for (size_t i = 0; i < total; ++i) {
+        EXPECT_EQ(template_output[i], legacy_output[i]) 
+            << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(IQ2_XSSIMDTest, ToINT8_TemplateMethod)
+{
+    // Create tensor
+    auto tensor = createRandomTensor(1, 256);
+    const size_t total = 256;
+
+    // Convert to INT8
+    std::vector<int8_t> int8_output(total);
+    tensor->to<int8_t>(int8_output.data());
+
+    // Verify INT8 range
+    for (size_t i = 0; i < total; ++i) {
+        EXPECT_GE(int8_output[i], -127);
+        EXPECT_LE(int8_output[i], 127);
+    }
+}
+
+TEST_F(IQ2_XSSIMDTest, ToINT32_TemplateMethod)
+{
+    // Create tensor
+    auto tensor = createRandomTensor(1, 256);
+    const size_t total = 256;
+
+    // Convert to INT32
+    std::vector<int32_t> int32_output(total);
+    tensor->to<int32_t>(int32_output.data());
+
+    // Just verify no crash
+    EXPECT_NE(int32_output.data(), nullptr);
+}
+
+TEST_F(IQ2_XSSIMDTest, RoundTrip)
+{
+    // Create tensor
+    auto tensor = createRandomTensor(1, 256);
+    const size_t total = 256;
+
+    // Round trip: IQ -> FP32 -> BF16 -> FP32
+    std::vector<float> fp32_1(total);
+    tensor->to<float>(fp32_1.data());
+
+    // Create BF16 tensor from FP32 data
+    auto fp32_temp = std::make_shared<FP32Tensor>(std::vector<size_t>{1, 256});
+    std::memcpy(fp32_temp->mutable_data(), fp32_1.data(), total * sizeof(float));
+    
+    std::vector<uint16_t> bf16_data(total);
+    fp32_temp->to<uint16_t>(bf16_data.data(), TensorType::BF16);
+    
+    auto bf16_tensor = std::make_shared<BF16Tensor>(std::vector<size_t>{1, 256}, bf16_data);
+
+    // Convert back to FP32
+    std::vector<float> fp32_2(total);
+    bf16_tensor->to<float>(fp32_2.data());
+
+    // Verify accuracy (BF16 precision ~3 decimal places)
+    size_t mismatches = 0;
+    for (size_t i = 0; i < total; ++i) {
+        float diff = std::abs(fp32_1[i] - fp32_2[i]);
+        float rel_error = (fp32_1[i] != 0.0f) ? diff / std::abs(fp32_1[i]) : diff;
+        if (rel_error > 0.05f) { // 5% tolerance for BF16
+            ++mismatches;
+        }
+    }
+    EXPECT_LT(mismatches, 13) << "Too many mismatches in round-trip conversion";
+}

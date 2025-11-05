@@ -41,12 +41,13 @@ namespace llaminar2
     public:
         /**
          * @brief Create model context from GGUF file
-         *
+        /**
          * @param model_path Path to GGUF model file
          * @param mpi_ctx MPI context for distributed weight management (nullptr = single rank)
          * @param placement_map Fine-grained weight placement decisions (nullptr = default all to device 0)
          * @param factory Optional TensorFactory for NUMA-aware allocation
          * @param strategy Weight distribution strategy (default: REPLICATED)
+         * @param precision Compute precision mode (affects INT8 dequantization, default: FP32)
          * @return Shared pointer to context, or nullptr on error
          */
         static std::shared_ptr<ModelContext> create(
@@ -54,7 +55,8 @@ namespace llaminar2
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
             std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
             TensorFactory *factory = nullptr,
-            WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
+            WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
+            ComputePrecision precision = ComputePrecision::FP32);
 
         /**
          * @brief Create test-only model context (doesn't load actual model)

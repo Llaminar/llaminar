@@ -128,7 +128,11 @@ typedef unsigned int uint32_t;
 ${DECODER_SOURCE}
 
 // Kernel implementation
-extern "C" __global__ void quantized_gemm_kernel_iq4nl(
+// __launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)
+// Hint to compiler: optimize for 4 blocks/SM to maximize occupancy
+extern "C" __global__ void
+__launch_bounds__(${THREADS_M} * ${THREADS_N}, 4)
+quantized_gemm_kernel_iq4nl(
     const float* __restrict__ A,
     const IQ4_NLBlock* __restrict__ B_blocks,
     float* __restrict__ C,

@@ -1,0 +1,10 @@
+==PROF== Connected to process 7946 (/workspaces/llaminar/profile_best_configs)
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0. For instructions on enabling permissions and to get more information see https://developer.nvidia.com/ERR_NVGPUCTRPERM
+
+=== Profiling: Qwen_0_5B_SingleToken_QKV ===
+Shape: [1 × 896 × 896]
+Config: tile=16x16x32 threads=8x8
+
+Average time: 17.5145 ms
+Performance: 0.0916742 GFLOPS
+==PROF== Disconnected from process 7946

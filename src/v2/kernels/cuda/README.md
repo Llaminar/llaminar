@@ -16,7 +16,8 @@
 6. [ML Model Training Pipeline](#ml-model-training-pipeline)
 7. [Performance Test & Profiling System](#performance-test--profiling-system)
 8. [Usage Examples](#usage-examples)
-9. [Performance Results](#performance-results)
+9. [CMake Retraining Pipeline](#cmake-retraining-pipeline)
+10. [Performance Results](#performance-results)
 
 ---
 
@@ -1260,6 +1261,148 @@ ctest -R "V2_Perf_CudaHeuristicCanary" --verbose
 - **Thread Efficiency**: Warp divergence ratio
 
 See `python/collect_profiling_data.py` for full metric list.
+
+---
+
+## CMake Retraining Pipeline
+
+**Status**: ✅ Production-ready (November 2025)  
+**Location**: `cmake/CudaGemmPipeline.cmake`
+
+### Quick Start
+
+The complete model retraining workflow is available as a single CMake target:
+
+```bash
+# Build the project first (Release mode recommended)
+cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --parallel
+
+# Run the complete pipeline (10-20 minutes)
+cmake --build build_v2_release --target cuda_gemm_retrain_pipeline
+```
+
+This automatically:
+1. **Profiles** 0.5B, 4B, and 7B Qwen models (selects top/bottom 10 configs per shape)
+2. **Trains** neural network with collected data (10 epochs, AdamW optimizer)
+3. **Validates** on unseen shapes (requires ≥95% top-30 hit rate to proceed)
+4. **Deploys** new model files (with automatic backup of current model)
+5. **Rebuilds** CUDA backend to use the new model
+
+### Individual Pipeline Stages
+
+Run stages independently for debugging or iterative development:
+
+```bash
+# Stage 1: Profile kernel configurations
+cmake --build build_v2_release --target cuda_gemm_profile
+
+# Stage 2: Train neural network  
+cmake --build build_v2_release --target cuda_gemm_train
+
+# Stage 3: Validate on unseen shapes
+cmake --build build_v2_release --target cuda_gemm_validate
+
+# Stage 4: Deploy model and rebuild backend
+cmake --build build_v2_release --target cuda_gemm_deploy
+```
+
+### Pipeline Management
+
+```bash
+# Check pipeline status (shows which files exist)
+cmake --build build_v2_release --target cuda_gemm_pipeline_status
+
+# Clean pipeline artifacts (preserves production model)
+cmake --build build_v2_release --target cuda_gemm_clean_pipeline
+```
+
+### Configuration
+
+The pipeline uses sensible defaults but can be customized by editing `cmake/CudaGemmPipeline.cmake`:
+
+```cmake
+# Model sizes to profile
+set(CUDA_GEMM_MODEL_SIZES "0.5B" "4B" "7B")  # Add "14B", "32B", etc.
+
+# Selection diversity
+set(CUDA_GEMM_TOP_N 10)     # Top performers per shape
+set(CUDA_GEMM_BOTTOM_N 10)  # Worst performers (for contrast)
+
+# Validation threshold
+# Pipeline aborts if top-30 hit rate < 95%
+```
+
+### Pipeline Outputs
+
+**Production Files** (deployed after validation):
+- `src/v2/kernels/cuda/cuda_heuristic_nn.onnx` - ONNX model (~265KB)
+- `src/v2/kernels/cuda/cuda_heuristic_scaler.txt` - Feature normalization (~3.5KB)
+
+**Pipeline Artifacts** (intermediate results):
+- `cuda_gemm_profiling_data.csv` - Profiling results (top/bottom configs)
+- `training_metrics.json` - Training loss, accuracy, validation metrics
+- `validation_results.json` - Hit rates on unseen shapes
+
+**Backups** (automatic before deployment):
+- `cuda_heuristic_nn.onnx.backup.YYYYMMDD_HHMMSS`
+- `cuda_heuristic_scaler.txt.backup.YYYYMMDD_HHMMSS`
+
+### When to Retrain
+
+Retrain the model when:
+- **Adding new model architectures** (e.g., Mistral, Gemma shapes)
+- **Significant performance degradation** on new workloads
+- **Hardware changes** (new GPU architecture, different SM count)
+- **Algorithm improvements** (new profiling features, better training strategy)
+
+### Safety Features
+
+1. **Validation Gating**: Pipeline aborts if new model performs worse than threshold
+2. **Automatic Backups**: Previous model saved with timestamp before replacement
+3. **Incremental Execution**: Resume from any stage if interrupted
+4. **Status Reporting**: Clear feedback about which files exist and when created
+
+### Example Session
+
+```bash
+# Check current status
+$ cmake --build build_v2_release --target cuda_gemm_pipeline_status
+=========================================
+CUDA GEMM Pipeline Status
+=========================================
+
+Production Files:
+-rw-r--r-- 1 user user 265K Nov  3 15:37 cuda_heuristic_nn.onnx
+-rw-r--r-- 1 user user 3.5K Nov  3 15:38 cuda_heuristic_scaler.txt
+
+Pipeline Artifacts:
+  Profiling data: Not found
+  Training metrics: Not found
+  Validation results: Not found
+
+# Run complete pipeline
+$ cmake --build build_v2_release --target cuda_gemm_retrain_pipeline
+[Stage 1/4] Profiling configurations... (5 min)
+[Stage 2/4] Training neural network... (2 min)
+[Stage 3/4] Validating on unseen shapes... (3 min)
+  ✓ Top-30 hit rate: 97.2% (threshold: 95%)
+[Stage 4/4] Deploying model and rebuilding... (1 min)
+  ✓ Backup: cuda_heuristic_nn.onnx.backup.20251103_163042
+  ✓ Model deployed successfully
+
+# Verify new model
+$ export LLAMINAR_USE_NN_HEURISTIC=1
+$ ctest -R "V2_Perf_CudaHeuristicCanary" --verbose
+```
+
+### Documentation
+
+See `docs/cuda-gemm-retraining-pipeline.md` for comprehensive documentation including:
+- Detailed stage descriptions
+- Troubleshooting guide
+- CI/CD integration examples
+- Performance expectations
 
 ---
 

@@ -2477,5 +2477,119 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensorWithFactory)
 }
 
 // =============================================================================
+// PRECISION MODE TESTS
+// =============================================================================
+
+/**
+ * @brief Test MIXED precision mode (default) keeps weights quantized
+ */
+TEST_F(Test__ModelLoader, PrecisionModeMixed_KeepsWeightsQuantized)
+{
+    // Use real IQ4_NL model
+    std::string path = "models/Qwen2-0.5B.IQ4_NL.gguf";
+
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+    ModelLoader loader(&factory);
+
+    ASSERT_TRUE(loader.loadModel(path));
+
+    // Load attention weight (these are typically quantized, not embeddings)
+    auto tensor = loader.loadTensor("blk.0.attn_q.weight", 0, ComputePrecision::MIXED);
+    ASSERT_NE(tensor, nullptr);
+
+    // Should remain in original quantized format (IQ4_NL)
+    EXPECT_EQ(tensor->native_type(), TensorType::IQ4_NL);
+}
+
+/**
+ * @brief Test INT8 precision mode dequantizes weights
+ */
+TEST_F(Test__ModelLoader, PrecisionModeINT8_DequantizesWeights)
+{
+    // Use real IQ4_NL model
+    std::string path = "models/Qwen2-0.5B.IQ4_NL.gguf";
+
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+    ModelLoader loader(&factory);
+
+    ASSERT_TRUE(loader.loadModel(path));
+
+    // Load with INT8 precision - should dequantize
+    auto tensor = loader.loadTensor("token_embd.weight", 0, ComputePrecision::INT8);
+    ASSERT_NE(tensor, nullptr);
+
+    // Should be dequantized to INT8
+    EXPECT_EQ(tensor->native_type(), TensorType::INT8);
+}
+
+/**
+ * @brief Test FP32 precision mode (currently not implemented, should keep quantized with warning)
+ */
+TEST_F(Test__ModelLoader, PrecisionModeFP32_NotImplemented)
+{
+    // Use real IQ4_NL model
+    std::string path = "models/Qwen2-0.5B.IQ4_NL.gguf";
+
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+    ModelLoader loader(&factory);
+
+    ASSERT_TRUE(loader.loadModel(path));
+
+    // Load attention weight with FP32 precision - not yet implemented, should keep quantized
+    auto tensor = loader.loadTensor("blk.0.attn_q.weight", 0, ComputePrecision::FP32);
+    ASSERT_NE(tensor, nullptr);
+
+    // Should remain quantized (FP32 dequantization not yet implemented)
+    EXPECT_EQ(tensor->native_type(), TensorType::IQ4_NL);
+}
+
+/**
+ * @brief Test that FP32 tensors are not affected by precision mode
+ */
+TEST_F(Test__ModelLoader, PrecisionMode_FP32Tensors_Unchanged)
+{
+    // Use FP32 model (Gemini-Distill has fp32 suffix)
+    std::string path = "models/Gemini-Distill-Qwen2.5-0.5B-ead-fp32.gguf";
+
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+    ModelLoader loader(&factory);
+
+    ASSERT_TRUE(loader.loadModel(path));
+
+    // Load with INT8 precision mode
+    auto tensor = loader.loadTensor("token_embd.weight", 0, ComputePrecision::INT8);
+    ASSERT_NE(tensor, nullptr);
+
+    // FP32 tensors should remain FP32 (not dequantized since already float)
+    EXPECT_EQ(tensor->native_type(), TensorType::FP32);
+}
+
+/**
+ * @brief Test INT8 dequantization with multiple quantized formats
+ */
+TEST_F(Test__ModelLoader, PrecisionModeINT8_MultipleFormats)
+{
+    // Use real Q4_0 model
+    std::string path = "models/Qwen2.5-7B-Instruct-Q4_0.gguf";
+
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+    ModelLoader loader(&factory);
+
+    ASSERT_TRUE(loader.loadModel(path));
+
+    // Load Q4_0 tensor with INT8 precision - should dequantize
+    auto tensor = loader.loadTensor("blk.0.attn_q.weight", 0, ComputePrecision::INT8);
+    ASSERT_NE(tensor, nullptr);
+
+    // Should be dequantized to INT8
+    EXPECT_EQ(tensor->native_type(), TensorType::INT8);
+}
+
+// =============================================================================
 // MAIN (not needed when using gtest_main, but included for completeness)
 // =============================================================================

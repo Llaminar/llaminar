@@ -1,0 +1,473 @@
+/**
+ * @file INT8Tensor.cpp
+ * @brief INT8 tensor implementation
+ * @author David Sanftenberg
+ * @date 2025-11-05
+ */
+
+#include "Tensors.h"
+#include "../utils/Logger.h"
+#include "../kernels/cpu/INT8GemmKernel.h"
+#include <cmath>
+#include <algorithm>
+#include <limits>
+#include <cstring>
+
+namespace llaminar2
+{
+    // =============================================================================
+    // QUANTIZATION HELPERS (Forward declarations)
+    // =============================================================================
+
+    /**
+     * @brief Quantize FP32 data to INT8 with scale factor
+     *
+     * Computes:
+     *   scale = max_abs / 127.0
+     *   int8_val = round(fp32_val / scale)
+     *
+     * @param fp32_data Input FP32 data
+     * @param int8_data Output INT8 data
+     * @param scale Output scale factor
+     * @param count Number of elements
+     */
+    static void quantizeFP32ToINT8(const float *fp32_data, int8_t *int8_data,
+                                   float &scale, size_t count);
+
+    /**
+     * @brief Quantize FP32 2D matrix to INT8 with per-column and per-row scales
+     *
+     * For weight matrices [rows, cols], computes:
+     * - Per-column scales: Used for normal (transpose_B=false) operations
+     * - Per-row scales: Used for transposed (transpose_B=true) operations
+     *
+     * This ensures transpose operations maintain per-channel quantization accuracy.
+     *
+     * @param fp32_data Input FP32 data (row-major)
+     * @param int8_data Output INT8 data (row-major)
+     * @param col_scales Output per-column scales [cols]
+     * @param row_scales Output per-row scales [rows]
+     * @param rows Number of rows
+     * @param cols Number of columns
+     */
+    static void quantizeFP32ToINT8_PerColumn(const float *fp32_data, int8_t *int8_data,
+                                             std::vector<float> &col_scales,
+                                             std::vector<float> &row_scales,
+                                             size_t rows, size_t cols);
+
+    INT8Tensor::INT8Tensor(const std::vector<size_t> &shape)
+        : shape_(shape), device_idx_(-1), scale_(1.0f), device_data_(nullptr)
+    {
+        size_t total = 1;
+        for (auto dim : shape)
+            total *= dim;
+        host_int8_data_.resize(total, 0);
+    }
+
+    INT8Tensor::INT8Tensor(const std::vector<size_t> &shape,
+                           const std::vector<int8_t> &data,
+                           float scale)
+        : shape_(shape), device_idx_(-1), scale_(scale), device_data_(nullptr)
+    {
+        size_t total = 1;
+        for (auto dim : shape)
+            total *= dim;
+
+        if (data.size() != total)
+        {
+            LOG_ERROR("[INT8Tensor] Data size mismatch: got " << data.size()
+                                                              << ", expected " << total);
+            host_int8_data_.resize(total, 0);
+        }
+        else
+        {
+            host_int8_data_ = data;
+        }
+    }
+
+    INT8Tensor::INT8Tensor(const std::vector<size_t> &shape,
+                           const std::vector<float> &fp32_data)
+        : shape_(shape), device_idx_(-1), device_data_(nullptr)
+    {
+        size_t total = 1;
+        for (auto dim : shape)
+            total *= dim;
+
+        if (fp32_data.size() != total)
+        {
+            LOG_ERROR("[INT8Tensor] FP32 data size mismatch: got " << fp32_data.size()
+                                                                   << ", expected " << total);
+            host_int8_data_.resize(total, 0);
+            scale_ = 1.0f;
+            return;
+        }
+
+        host_int8_data_.resize(total);
+
+        // For 2D tensors (weight matrices), use per-column quantization
+        // Also compute per-row scales for transpose operations
+        if (shape_.size() == 2)
+        {
+            quantizeFP32ToINT8_PerColumn(fp32_data.data(), host_int8_data_.data(),
+                                         col_scales_, row_scales_cache_, shape_[0], shape_[1]);
+            // Set global scale to max of column scales for backward compatibility
+            scale_ = col_scales_.empty() ? 1.0f : *std::max_element(col_scales_.begin(), col_scales_.end());
+        }
+        else
+        {
+            // Non-2D tensors use global quantization
+            quantizeFP32ToINT8(fp32_data.data(), host_int8_data_.data(), scale_, total);
+        }
+    }
+
+    bool INT8Tensor::set_device(int device_idx)
+    {
+        // TODO: Implement device upload for INT8
+        LOG_WARN("[INT8Tensor] Device upload not yet implemented");
+        device_idx_ = device_idx;
+        return false;
+    }
+
+    const float *INT8Tensor::data() const
+    {
+        // Dequantize to cache on demand
+        size_t total = 1;
+        for (auto dim : shape_)
+            total *= dim;
+
+        if (dequant_cache_.size() != total)
+        {
+            dequant_cache_.resize(total);
+        }
+
+        // Dequantize: fp32 = int8 * scale
+        for (size_t i = 0; i < total; ++i)
+        {
+            dequant_cache_[i] = static_cast<float>(host_int8_data_[i]) * scale_;
+        }
+
+        return dequant_cache_.data();
+    }
+
+    float *INT8Tensor::mutable_data()
+    {
+        LOG_ERROR("[INT8Tensor] mutable_data() not supported (read-only tensor)");
+        return nullptr;
+    }
+
+    bool INT8Tensor::copyFrom(const TensorBase *src)
+    {
+        // TODO: Implement cross-tensor copy
+        LOG_ERROR("[INT8Tensor] copyFrom not yet implemented");
+        return false;
+    }
+
+    std::unique_ptr<ITensorGemm> INT8Tensor::createGemm()
+    {
+        // CPU: AVX512-VNNI INT8 GEMM kernel
+        return std::make_unique<INT8GemmKernel>(this);
+    }
+
+    std::unique_ptr<ITensorRoPE> INT8Tensor::createRoPE()
+    {
+        LOG_ERROR("[INT8Tensor] RoPE not supported for INT8 tensors");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorSwiGLU> INT8Tensor::createSwiGLU()
+    {
+        LOG_ERROR("[INT8Tensor] SwiGLU not supported for INT8 tensors");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorSoftmax> INT8Tensor::createSoftmax()
+    {
+        LOG_ERROR("[INT8Tensor] Softmax not supported for INT8 tensors");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorRMSNorm> INT8Tensor::createRMSNorm()
+    {
+        LOG_ERROR("[INT8Tensor] RMSNorm not supported for INT8 tensors");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorAttention> INT8Tensor::createAttention()
+    {
+        LOG_ERROR("[INT8Tensor] Attention not supported for INT8 tensors");
+        return nullptr;
+    }
+
+    void INT8Tensor::to_fp32(float *dst) const
+    {
+        size_t total = 1;
+        for (auto dim : shape_)
+            total *= dim;
+
+        for (size_t i = 0; i < total; ++i)
+        {
+            dst[i] = static_cast<float>(host_int8_data_[i]) * scale_;
+        }
+    }
+
+    void INT8Tensor::to_bf16(uint16_t *dst) const
+    {
+        // TODO: Implement INT8 → BF16 conversion
+        LOG_ERROR("[INT8Tensor] to_bf16 not yet implemented");
+    }
+
+    void INT8Tensor::to_fp16(uint16_t *dst) const
+    {
+        // TODO: Implement INT8 → FP16 conversion
+        LOG_ERROR("[INT8Tensor] to_fp16 not yet implemented");
+    }
+
+    void INT8Tensor::to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size) const
+    {
+        // Already in INT8 format, just copy
+        size_t total = 1;
+        for (auto dim : shape_)
+            total *= dim;
+
+        std::memcpy(dst_int8, host_int8_data_.data(), total * sizeof(int8_t));
+
+        // Store scale factors (one per block)
+        size_t num_blocks = (total + block_size - 1) / block_size;
+        for (size_t i = 0; i < num_blocks; ++i)
+        {
+            dst_scales[i] = scale_;
+        }
+    }
+
+    bool INT8Tensor::to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales) const
+    {
+        // Already in INT8 format with per-channel scales
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            LOG_ERROR("[INT8Tensor] to_int8_perchannel() requires 2D tensor, got " << shp.size() << "D");
+            return false;
+        }
+
+        const size_t rows = shp[0];
+        const size_t cols = shp[1];
+
+        // Copy INT8 data directly
+        std::memcpy(dst_int8, host_int8_data_.data(), rows * cols * sizeof(int8_t));
+
+        // Copy or generate per-column scales
+        if (!col_scales_.empty())
+        {
+            std::memcpy(dst_col_scales, col_scales_.data(), cols * sizeof(float));
+        }
+        else
+        {
+            // Use global scale for all columns
+            for (size_t j = 0; j < cols; ++j)
+            {
+                dst_col_scales[j] = scale_;
+            }
+        }
+
+        // Copy or generate per-row scales
+        if (dst_row_scales != nullptr)
+        {
+            if (!row_scales_cache_.empty())
+            {
+                std::memcpy(dst_row_scales, row_scales_cache_.data(), rows * sizeof(float));
+            }
+            else
+            {
+                // Use global scale for all rows
+                for (size_t i = 0; i < rows; ++i)
+                {
+                    dst_row_scales[i] = scale_;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    void INT8Tensor::to_fp32_row(size_t row_idx, float *buffer) const
+    {
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[INT8Tensor] to_fp32_row requires 2D tensor");
+            return;
+        }
+
+        size_t cols = shape_[1];
+        size_t offset = row_idx * cols;
+
+        for (size_t i = 0; i < cols; ++i)
+        {
+            buffer[i] = static_cast<float>(host_int8_data_[offset + i]) * scale_;
+        }
+    }
+
+    void INT8Tensor::to_fp32_span(size_t offset, size_t count, float *buffer) const
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            buffer[i] = static_cast<float>(host_int8_data_[offset + i]) * scale_;
+        }
+    }
+
+    std::shared_ptr<TensorBase> INT8Tensor::create_view(
+        const std::vector<size_t> &new_shape,
+        size_t offset)
+    {
+        // TODO: Implement INT8 view support
+        LOG_ERROR("[INT8Tensor] View not yet implemented");
+        return nullptr;
+    }
+
+    bool INT8Tensor::sync_to_device()
+    {
+        // TODO: Implement device sync
+        return false;
+    }
+
+    bool INT8Tensor::sync_from_device()
+    {
+        // TODO: Implement device sync
+        return false;
+    }
+
+    // =============================================================================
+    // QUANTIZATION HELPERS
+    // =============================================================================
+
+    void quantizeFP32ToINT8(const float *fp32_data,
+                            int8_t *int8_data,
+                            float &scale,
+                            size_t count)
+    {
+        if (count == 0)
+        {
+            scale = 1.0f;
+            return;
+        }
+
+        // Find max absolute value for scale calculation
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < count; ++i)
+        {
+            float abs_val = std::fabs(fp32_data[i]);
+            if (abs_val > max_abs)
+                max_abs = abs_val;
+        }
+
+        // Compute scale factor
+        // int8 range: [-127, 127] (we avoid -128 for symmetry)
+        if (max_abs == 0.0f)
+        {
+            scale = 1.0f;
+            std::fill_n(int8_data, count, 0);
+            return;
+        }
+
+        scale = max_abs / 127.0f;
+        float inv_scale = 1.0f / scale;
+
+        // Quantize with rounding
+        for (size_t i = 0; i < count; ++i)
+        {
+            float scaled = fp32_data[i] * inv_scale;
+            int32_t quantized = static_cast<int32_t>(std::round(scaled));
+
+            // Clamp to int8 range
+            if (quantized > 127)
+                quantized = 127;
+            else if (quantized < -127)
+                quantized = -127;
+
+            int8_data[i] = static_cast<int8_t>(quantized);
+        }
+    }
+
+    void quantizeFP32ToINT8_PerColumn(const float *fp32_data,
+                                      int8_t *int8_data,
+                                      std::vector<float> &col_scales,
+                                      std::vector<float> &row_scales,
+                                      size_t rows,
+                                      size_t cols)
+    {
+        if (rows == 0 || cols == 0)
+        {
+            col_scales.clear();
+            row_scales.clear();
+            return;
+        }
+
+        col_scales.resize(cols);
+        row_scales.resize(rows);
+
+        // Compute per-column scales
+        for (size_t j = 0; j < cols; ++j)
+        {
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                float abs_val = std::fabs(fp32_data[i * cols + j]);
+                if (abs_val > max_abs)
+                    max_abs = abs_val;
+            }
+
+            col_scales[j] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        }
+
+        // Compute per-row scales (for transpose operations)
+        for (size_t i = 0; i < rows; ++i)
+        {
+            float max_abs = 0.0f;
+            for (size_t j = 0; j < cols; ++j)
+            {
+                float abs_val = std::fabs(fp32_data[i * cols + j]);
+                if (abs_val > max_abs)
+                    max_abs = abs_val;
+            }
+
+            row_scales[i] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        }
+
+        // Quantize each element using its column's scale
+        for (size_t i = 0; i < rows; ++i)
+        {
+            for (size_t j = 0; j < cols; ++j)
+            {
+                const size_t idx = i * cols + j;
+                const float inv_scale = 1.0f / col_scales[j];
+                float scaled = fp32_data[idx] * inv_scale;
+                int32_t quantized = static_cast<int32_t>(std::round(scaled));
+
+                // Clamp to int8 range
+                if (quantized > 127)
+                    quantized = 127;
+                else if (quantized < -127)
+                    quantized = -127;
+
+                int8_data[idx] = static_cast<int8_t>(quantized);
+            }
+        }
+    }
+
+    /**
+     * @brief Get per-row scales (computed during quantization)
+     *
+     * For transpose operations (transpose_B=true), we need per-row scales instead of per-column.
+     * These are computed from the original FP32 data during quantization and cached.
+     *
+     * @return Reference to cached per-row scales
+     */
+    const std::vector<float> &INT8Tensor::get_row_scales() const
+    {
+        if (row_scales_cache_.empty())
+        {
+            LOG_WARN("[INT8Tensor] get_row_scales() called but row scales not computed during quantization");
+        }
+        return row_scales_cache_;
+    }
+
+} // namespace llaminar2

@@ -238,48 +238,6 @@ int main(int argc, char *argv[])
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_shared, mpi_ctx, orch_config);
 
-    // Create model context (loads metadata but not weights yet)
-    auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr);
-    if (!model_ctx)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_ERROR("Error: Failed to load model: " << args.model_path);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-
-    // Create placement map from orchestrator
-    auto placement_map = orchestrator->createPlacementMap(model_ctx);
-
-    // Re-create model context with placement map (this creates WeightManager)
-    model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map);
-    if (!model_ctx)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_ERROR("Error: Failed to load model with placement map: " << args.model_path);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-
-    const auto &model = model_ctx->model();
-    std::string architecture = model_ctx->architecture();
-
-    if (mpi_ctx->rank() == 0)
-    {
-        const auto &devices = dm.devices();
-        LOG_INFO("\n=== Llaminar v2 ===");
-        LOG_INFO("Model: " << args.model_path);
-        LOG_INFO("Architecture: " << architecture);
-        LOG_INFO("Device: " << device_idx << " (" << devices[device_idx].name << ")");
-        LOG_INFO("Strategy: " << args.strategy);
-        LOG_INFO("MPI ranks: " << mpi_ctx->world_size());
-        LOG_INFO("");
-    }
-
     // Create runtime configuration from parsed arguments
     PipelineConfig pipeline_config;
     pipeline_config.max_seq_len = args.max_seq_len;
@@ -288,8 +246,12 @@ int main(int argc, char *argv[])
     pipeline_config.use_mmap = args.use_mmap;
     pipeline_config.seed = args.seed;
 
-    // Parse precision mode
-    if (args.precision == "fp32")
+    // Parse precision mode (MUST be done before ModelContext::create!)
+    if (args.precision == "mixed")
+    {
+        pipeline_config.precision = ComputePrecision::MIXED;
+    }
+    else if (args.precision == "fp32")
     {
         pipeline_config.precision = ComputePrecision::FP32;
     }
@@ -315,10 +277,45 @@ int main(int argc, char *argv[])
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_WARN("Unknown precision mode '" << args.precision << "', defaulting to fp32");
+            LOG_WARN("Unknown precision mode '" << args.precision << "', defaulting to MIXED");
         }
-        pipeline_config.precision = ComputePrecision::FP32;
+        pipeline_config.precision = ComputePrecision::MIXED;
     }
+
+    // Create model context (loads metadata but not weights yet)
+    // NOTE: precision is passed here for INT8 dequantization at load time
+    auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr, nullptr,
+                                          WeightDistributionStrategy::REPLICATED,
+                                          pipeline_config.precision);
+    if (!model_ctx)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_ERROR("Error: Failed to load model: " << args.model_path);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    // Create placement map from orchestrator
+    auto placement_map = orchestrator->createPlacementMap(model_ctx);
+
+    // Re-create model context with placement map (this creates WeightManager)
+    model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map, nullptr,
+                                     WeightDistributionStrategy::REPLICATED,
+                                     pipeline_config.precision);
+    if (!model_ctx)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_ERROR("Error: Failed to load model with placement map: " << args.model_path);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    const auto &model = model_ctx->model();
+    std::string architecture = model_ctx->architecture();
 
     // Log selected precision mode
     if (mpi_ctx->rank() == 0)
@@ -326,17 +323,20 @@ int main(int argc, char *argv[])
         const char *precision_name = "Unknown";
         switch (pipeline_config.precision)
         {
+        case ComputePrecision::MIXED:
+            precision_name = "MIXED (weights quantized, compute FP32)";
+            break;
         case ComputePrecision::FP32:
-            precision_name = "FP32 (full precision)";
+            precision_name = "FP32 (all weights dequantized to FP32)";
             break;
         case ComputePrecision::BF16:
-            precision_name = "BF16 (brain float 16)";
+            precision_name = "BF16 (all weights dequantized to BF16)";
             break;
         case ComputePrecision::FP16:
-            precision_name = "FP16 (half precision)";
+            precision_name = "FP16 (all weights dequantized to FP16)";
             break;
         case ComputePrecision::INT8:
-            precision_name = "INT8 (8-bit quantization)";
+            precision_name = "INT8 (all weights dequantized to INT8)";
             break;
         case ComputePrecision::AUTO:
             precision_name = "AUTO (should have been resolved!)";

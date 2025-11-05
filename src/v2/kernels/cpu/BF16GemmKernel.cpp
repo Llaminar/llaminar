@@ -3,8 +3,8 @@
  * @brief CPU BF16 GEMM kernel implementation
  *
  * Supports:
- * - Intel MKL cblas_gemm_bf16bf16f32 (native BF16, Ice Lake+)
- * - Fallback: BF16→FP32 expansion + cblas_sgemm (OpenBLAS, older CPUs)
+ * - OneDNN bf16bf16f32 matmul (preferred, hardware-accelerated on AVX-512 BF16)
+ * - Fallback: BF16→FP32 expansion + cblas_sgemm (OpenBLAS, portable)
  *
  * @author David Sanftenberg
  */
@@ -13,12 +13,11 @@
 #include "../../utils/BFloat16.h"
 #include "../../tensors/SIMDHelpers.h"
 
-#ifdef HAVE_MKL
-#include <mkl_cblas.h>
-#else
-#include <cblas.h>
+#ifdef HAVE_ONEDNN
+#include <oneapi/dnnl/dnnl.hpp>
 #endif
 
+#include <cblas.h>
 #include <vector>
 
 namespace llaminar2
@@ -90,54 +89,81 @@ namespace llaminar2
             }
         }
 
-#ifdef HAVE_MKL
-        // Intel MKL: Use native BF16 GEMM (cblas_gemm_bf16bf16f32)
-        // This is hardware-accelerated on Ice Lake (AVX-512 BF16) and newer
+        // Try OneDNN first if available
+#ifdef HAVE_ONEDNN
+        using namespace dnnl;
 
-        // Convert A from FP32 to BF16
-        std::vector<uint16_t> A_bf16(m * k);
-        fp32_to_bf16(A, A_bf16.data(), m * k);
-
-        // MKL BF16 GEMM: C (FP32) = alpha * A (BF16) @ B (BF16) + beta * C (FP32)
-        // Note: MKL uses MKL_BF16 type, which is compatible with uint16_t representation
-
-        if (transpose_B)
+        try
         {
-            // B stored as [n, k], we want to compute A @ B^T
-            cblas_gemm_bf16bf16f32(
-                CblasRowMajor,
-                CblasNoTrans, CblasTrans,
-                m, n, k,
-                alpha,
-                reinterpret_cast<const MKL_BF16 *>(A_bf16.data()), k, // A is [m, k]
-                reinterpret_cast<const MKL_BF16 *>(B_bf16), k,        // B is [n, k]
-                beta,
-                C, n // C is [m, n]
-            );
-        }
-        else
-        {
-            // B stored as [k, n], we want to compute A @ B
-            cblas_gemm_bf16bf16f32(
-                CblasRowMajor,
-                CblasNoTrans, CblasNoTrans,
-                m, n, k,
-                alpha,
-                reinterpret_cast<const MKL_BF16 *>(A_bf16.data()), k, // A is [m, k]
-                reinterpret_cast<const MKL_BF16 *>(B_bf16), n,        // B is [k, n]
-                beta,
-                C, n // C is [m, n]
-            );
-        }
-#else
-        // OpenBLAS or non-MKL: Expand BF16 to FP32 then use standard SGEMM
-        // This is slower but works on any CPU
+            // Create OneDNN engine (CPU)
+            engine eng(engine::kind::cpu, 0);
+            stream s(eng);
 
+            // Convert A from FP32 to BF16
+            std::vector<uint16_t> A_bf16(m * k);
+            fp32_to_bf16(A, A_bf16.data(), m * k);
+
+            // Define memory descriptors
+            memory::dims a_dims = {m, k};
+            memory::dims b_dims = transpose_B ? memory::dims{n, k} : memory::dims{k, n};
+            memory::dims c_dims = {m, n};
+
+            auto a_md = memory::desc(a_dims, memory::data_type::bf16, memory::format_tag::ab);
+            auto b_md = transpose_B
+                            ? memory::desc(b_dims, memory::data_type::bf16, memory::format_tag::ba)
+                            : memory::desc(b_dims, memory::data_type::bf16, memory::format_tag::ab);
+            auto c_md = memory::desc(c_dims, memory::data_type::f32, memory::format_tag::ab);
+
+            // Create memory objects
+            auto a_mem = memory(a_md, eng, A_bf16.data());
+            auto b_mem = memory(b_md, eng, const_cast<uint16_t *>(B_bf16));
+            auto c_mem = memory(c_md, eng, C);
+
+            // Create matmul primitive
+            matmul::primitive_desc matmul_pd(eng, a_md, b_md, c_md);
+            auto matmul_prim = matmul(matmul_pd);
+
+            // Execute (note: OneDNN doesn't support alpha/beta directly in bf16 matmul)
+            // We'll handle scaling manually if needed
+            if (alpha != 1.0f || beta != 0.0f)
+            {
+                // Compute into temp buffer, then scale
+                std::vector<float> C_temp(m * n);
+                auto c_temp_mem = memory(c_md, eng, C_temp.data());
+
+                matmul_prim.execute(s, {{DNNL_ARG_SRC, a_mem},
+                                        {DNNL_ARG_WEIGHTS, b_mem},
+                                        {DNNL_ARG_DST, c_temp_mem}});
+                s.wait();
+
+                // Scale: C = alpha * C_temp + beta * C
+                for (int i = 0; i < m * n; ++i)
+                {
+                    C[i] = alpha * C_temp[i] + beta * C[i];
+                }
+            }
+            else
+            {
+                matmul_prim.execute(s, {{DNNL_ARG_SRC, a_mem},
+                                        {DNNL_ARG_WEIGHTS, b_mem},
+                                        {DNNL_ARG_DST, c_mem}});
+                s.wait();
+            }
+
+            return true; // OneDNN succeeded
+        }
+        catch (const dnnl::error &e)
+        {
+            // OneDNN failed, fall through to OpenBLAS
+        }
+#endif
+
+        // OpenBLAS fallback (used when OneDNN unavailable or fails)
         size_t B_size = static_cast<size_t>(B_rows) * B_cols;
         std::vector<float> B_fp32(B_size);
         bf16_to_fp32(B_bf16, B_fp32.data(), B_size);
 
-        // Standard FP32 GEMM
+        // Standard FP32 GEMM (A is already FP32)
         if (transpose_B)
         {
             cblas_sgemm(
@@ -164,7 +190,6 @@ namespace llaminar2
                 C, n // C is [m, n]
             );
         }
-#endif
 
         return true;
     }
@@ -199,38 +224,68 @@ namespace llaminar2
         std::vector<uint16_t> B_bf16(B_size);
         fp32_to_bf16(B, B_bf16.data(), B_size);
 
-#ifdef HAVE_MKL
-        // Intel MKL: Use native BF16 GEMM (hardware-accelerated on Ice Lake+)
-        if (transpose_B)
+        // Try OneDNN first if available
+#ifdef HAVE_ONEDNN
+        using namespace dnnl;
+
+        try
         {
-            // B stored as [n, k], compute A @ B^T
-            cblas_gemm_bf16bf16f32(
-                CblasRowMajor,
-                CblasNoTrans, CblasTrans,
-                m, n, k,
-                alpha,
-                reinterpret_cast<const MKL_BF16 *>(A_bf16.data()), k, // A is [m, k]
-                reinterpret_cast<const MKL_BF16 *>(B_bf16.data()), k, // B is [n, k]
-                beta,
-                C, n // C is [m, n]
-            );
+            engine eng(engine::kind::cpu, 0);
+            stream s(eng);
+
+            // Define memory descriptors
+            memory::dims a_dims = {m, k};
+            memory::dims b_dims = transpose_B ? memory::dims{n, k} : memory::dims{k, n};
+            memory::dims c_dims = {m, n};
+
+            auto a_md = memory::desc(a_dims, memory::data_type::bf16, memory::format_tag::ab);
+            auto b_md = transpose_B
+                            ? memory::desc(b_dims, memory::data_type::bf16, memory::format_tag::ba)
+                            : memory::desc(b_dims, memory::data_type::bf16, memory::format_tag::ab);
+            auto c_md = memory::desc(c_dims, memory::data_type::f32, memory::format_tag::ab);
+
+            // Create memory objects
+            auto a_mem = memory(a_md, eng, A_bf16.data());
+            auto b_mem = memory(b_md, eng, B_bf16.data());
+            auto c_mem = memory(c_md, eng, C);
+
+            // Create matmul primitive
+            matmul::primitive_desc matmul_pd(eng, a_md, b_md, c_md);
+            auto matmul_prim = matmul(matmul_pd);
+
+            // Execute with scaling
+            if (alpha != 1.0f || beta != 0.0f)
+            {
+                std::vector<float> C_temp(m * n);
+                auto c_temp_mem = memory(c_md, eng, C_temp.data());
+
+                matmul_prim.execute(s, {{DNNL_ARG_SRC, a_mem},
+                                        {DNNL_ARG_WEIGHTS, b_mem},
+                                        {DNNL_ARG_DST, c_temp_mem}});
+                s.wait();
+
+                for (int i = 0; i < m * n; ++i)
+                {
+                    C[i] = alpha * C_temp[i] + beta * C[i];
+                }
+            }
+            else
+            {
+                matmul_prim.execute(s, {{DNNL_ARG_SRC, a_mem},
+                                        {DNNL_ARG_WEIGHTS, b_mem},
+                                        {DNNL_ARG_DST, c_mem}});
+                s.wait();
+            }
+
+            return true; // OneDNN succeeded
         }
-        else
+        catch (const dnnl::error &e)
         {
-            // B stored as [k, n], compute A @ B
-            cblas_gemm_bf16bf16f32(
-                CblasRowMajor,
-                CblasNoTrans, CblasNoTrans,
-                m, n, k,
-                alpha,
-                reinterpret_cast<const MKL_BF16 *>(A_bf16.data()), k, // A is [m, k]
-                reinterpret_cast<const MKL_BF16 *>(B_bf16.data()), n, // B is [k, n]
-                beta,
-                C, n // C is [m, n]
-            );
+            // OneDNN failed, fall through to OpenBLAS
         }
-#else
-        // Fallback: Expand BF16 to FP32 and use standard SGEMM
+#endif
+
+        // OpenBLAS fallback: Expand to FP32 and use SGEMM
         std::vector<float> A_fp32(m * k);
         std::vector<float> B_fp32(B_size);
 
@@ -261,7 +316,6 @@ namespace llaminar2
                 beta,
                 C, n);
         }
-#endif
 
         return true;
     }
@@ -312,50 +366,63 @@ namespace llaminar2
             }
         }
 
-#ifdef HAVE_MKL
-        // Intel MKL BF16 GEMM with strided output
-        // Note: MKL BF16 GEMM doesn't support input strides, so we use contiguous A/B
-        // But we write output with stride ldc
+        // Try OneDNN first if available
+#ifdef HAVE_ONEDNN
+        using namespace dnnl;
 
-        // Allocate temporary contiguous output buffer
-        std::vector<float> C_temp(m * n);
+        try
+        {
+            engine eng(engine::kind::cpu, 0);
+            stream s(eng);
 
-        if (transpose_B)
-        {
-            cblas_gemm_bf16bf16f32(
-                CblasRowMajor,
-                CblasNoTrans, CblasTrans,
-                m, n, k,
-                alpha,
-                reinterpret_cast<const MKL_BF16 *>(A_bf16.data()), k,
-                reinterpret_cast<const MKL_BF16 *>(B_bf16.data()), k,
-                0.0f, // beta=0 for temp buffer
-                C_temp.data(), n);
-        }
-        else
-        {
-            cblas_gemm_bf16bf16f32(
-                CblasRowMajor,
-                CblasNoTrans, CblasNoTrans,
-                m, n, k,
-                alpha,
-                reinterpret_cast<const MKL_BF16 *>(A_bf16.data()), k,
-                reinterpret_cast<const MKL_BF16 *>(B_bf16.data()), n,
-                0.0f, // beta=0 for temp buffer
-                C_temp.data(), n);
-        }
+            // Define memory descriptors
+            memory::dims a_dims = {m, k};
+            memory::dims b_dims = transpose_B ? memory::dims{n, k} : memory::dims{k, n};
+            memory::dims c_dims = {m, n};
 
-        // Copy result to strided output with beta scaling
-        for (int i = 0; i < m; ++i)
-        {
-            for (int j = 0; j < n; ++j)
+            auto a_md = memory::desc(a_dims, memory::data_type::bf16, memory::format_tag::ab);
+            auto b_md = transpose_B
+                            ? memory::desc(b_dims, memory::data_type::bf16, memory::format_tag::ba)
+                            : memory::desc(b_dims, memory::data_type::bf16, memory::format_tag::ab);
+            auto c_md = memory::desc(c_dims, memory::data_type::f32, memory::format_tag::ab);
+
+            // Create memory objects
+            auto a_mem = memory(a_md, eng, A_bf16.data());
+            auto b_mem = memory(b_md, eng, B_bf16.data());
+
+            // Allocate temporary contiguous output buffer
+            std::vector<float> C_temp(m * n);
+            auto c_temp_mem = memory(c_md, eng, C_temp.data());
+
+            // Create matmul primitive
+            matmul::primitive_desc matmul_pd(eng, a_md, b_md, c_md);
+            auto matmul_prim = matmul(matmul_pd);
+
+            // Execute
+            matmul_prim.execute(s, {{DNNL_ARG_SRC, a_mem},
+                                    {DNNL_ARG_WEIGHTS, b_mem},
+                                    {DNNL_ARG_DST, c_temp_mem}});
+            s.wait();
+
+            // Copy result to strided output with beta scaling
+            for (int i = 0; i < m; ++i)
             {
-                int dst_idx = i * ldc + j;
-                C[dst_idx] = alpha * C_temp[i * n + j] + beta * C[dst_idx];
+                for (int j = 0; j < n; ++j)
+                {
+                    int dst_idx = i * ldc + j;
+                    C[dst_idx] = alpha * C_temp[i * n + j] + beta * C[dst_idx];
+                }
             }
+
+            return true; // OneDNN succeeded
         }
-#else
-        // OpenBLAS: Expand to FP32 and use strided SGEMM
+        catch (const dnnl::error &e)
+        {
+            // OneDNN failed, fall through to OpenBLAS
+        }
+#endif
+
+        // OpenBLAS fallback: Expand to FP32 and use strided SGEMM
         std::vector<float> A_fp32(m * k);
         std::vector<float> B_fp32(transpose_B ? n * k : k * n);
 
@@ -399,7 +466,6 @@ namespace llaminar2
                 C[dst_idx] = C_temp[i * n + j] + beta * C[dst_idx];
             }
         }
-#endif
 
         return true;
     }

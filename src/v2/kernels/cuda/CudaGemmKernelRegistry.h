@@ -39,9 +39,10 @@ namespace llaminar2
         /**
          * @brief Configuration key for registry lookup
          *
-         * (tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, prefetch, transpose, vectorize)
+         * (tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n,
+         *  prefetch, transpose, vectorize, atom_type, atom_layout_m, atom_layout_n, atom_layout_k)
          */
-        using CudaKernelKey = std::tuple<int, int, int, int, int, int, int, int, bool, int>;
+        using CudaKernelKey = std::tuple<int, int, int, int, int, int, int, int, bool, int, int, int, int, int>;
 
         /**
          * @brief CUDA kernel registry singleton
@@ -70,10 +71,12 @@ namespace llaminar2
                 int threads_m, int threads_n,
                 int work_m, int work_n,
                 int prefetch, bool transpose, int vectorize,
+                int atom_type, int atom_layout_m, int atom_layout_n, int atom_layout_k,
                 CudaKernelLauncher launcher)
             {
                 CudaKernelKey key{tile_m, tile_n, tile_k, threads_m, threads_n,
-                                  work_m, work_n, prefetch, transpose, vectorize};
+                                  work_m, work_n, prefetch, transpose, vectorize,
+                                  atom_type, atom_layout_m, atom_layout_n, atom_layout_k};
                 kernels_[key] = launcher;
             }
 
@@ -88,7 +91,8 @@ namespace llaminar2
                     config.tile_m, config.tile_n, config.tile_k,
                     config.threads_m, config.threads_n,
                     config.work_per_thread_m, config.work_per_thread_n,
-                    config.prefetch_stages, config.transpose_smem, config.vectorize_load};
+                    config.prefetch_stages, config.transpose_smem, config.vectorize_load,
+                    config.atom_type, config.atom_layout_m, config.atom_layout_n, config.atom_layout_k};
 
                 auto it = kernels_.find(key);
                 if (it != kernels_.end())

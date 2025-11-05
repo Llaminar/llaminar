@@ -18,19 +18,28 @@ namespace llaminar2
 {
 
     /**
-     * @brief Compute precision mode for activations
+     * @brief Compute precision mode for weights and activations
      *
-     * Determines the precision used for attention and other compute-intensive operations.
-     * Lower precision modes reduce memory bandwidth and may accelerate computation on
-     * supported hardware, but introduce quantization error.
+     * Determines how weights are loaded and what precision is used for computation.
+     *
+     * MIXED (default): Keep weights in original quantized format, compute in FP32
+     *   - Memory efficient (weights stay compressed)
+     *   - Dequantization happens on-the-fly in GEMM kernels
+     *   - Best balance of speed and accuracy for most use cases
+     *
+     * FP32/BF16/FP16/INT8: Dequantize ALL weights to target format at load time
+     *   - Higher memory usage (weights decompressed)
+     *   - Potential compute benefits from specialized kernels
+     *   - Use when you have specific hardware acceleration (e.g., BF16 on Sapphire Rapids)
      */
     enum class ComputePrecision
     {
-        FP32, ///< Full 32-bit floating point (default, highest accuracy)
-        BF16, ///< Brain Float 16 (7-bit mantissa, 8-bit exponent, ~2-3 decimal digits)
-        FP16, ///< IEEE Float 16 (10-bit mantissa, 5-bit exponent, ~3-4 decimal digits)
-        INT8, ///< 8-bit integer quantization (future: block floating point)
-        AUTO  ///< Automatic selection based on hardware capabilities
+        MIXED, ///< Keep weights quantized, compute in FP32 (default, memory efficient)
+        FP32,  ///< Dequantize all weights to FP32 at load (highest accuracy, high memory)
+        BF16,  ///< Dequantize all weights to BF16 at load (Intel Sapphire Rapids+)
+        FP16,  ///< Dequantize all weights to FP16 at load (ARM/mobile optimization)
+        INT8,  ///< Dequantize all weights to INT8 at load (AVX512-VNNI, CUDA Tensor Cores)
+        AUTO   ///< Automatic selection based on hardware capabilities
     };
 
     /**
@@ -101,20 +110,32 @@ namespace llaminar2
         int seed = -1;
 
         /**
-         * @brief Compute precision for activations
+         * @brief Compute precision for activations and weight handling
          *
-         * Determines precision used for attention and other operations:
-         * - FP32: Full precision (default, highest accuracy)
-         * - BF16: Reduced memory bandwidth, 1.5-2× faster on Ice Lake+ CPUs
-         * - FP16: Reduced memory bandwidth, faster on ARM/mobile hardware
-         * - INT8: Future block floating point quantization
-         * - AUTO: Select based on hardware (BF16 if AMX-BF16, else FP32)
+         * Determines precision mode for model execution:
+         * - MIXED: Keep weights in original format, compute in FP32 (default, memory-efficient)
+         * - FP32: Dequantize all weights to FP32 at load time (highest accuracy, high memory)
+         * - BF16: Reduced memory bandwidth, 1.5-2× faster on Ice Lake+ CPUs (not yet implemented)
+         * - FP16: Reduced memory bandwidth, faster on ARM/mobile hardware (not yet implemented)
+         * - INT8: Dequantize to INT8 for AVX512-VNNI/CUDA acceleration (not yet implemented)
+         * - AUTO: Select based on hardware (MIXED for CPU, optimized for GPU)
          *
-         * Note: Lower precision reduces memory bandwidth but introduces quantization error.
-         * Attention is typically robust to BF16/FP16 (relative differences matter),
-         * but operations like softmax/RMSNorm may require FP32 for stability.
+         * MIXED mode (default):
+         * - Weights stay in original quantized format (IQ4_NL, Q6_K, etc.)
+         * - Dequantization happens on-the-fly in GEMM kernels
+         * - Compute happens in FP32 for accuracy
+         * - Lowest memory footprint, good performance
+         *
+         * INT8 mode (future):
+         * - Dequantizes all weights to INT8 at model load time
+         * - Enables AVX512-VNNI (CPU) and CUTLASS INT8 GEMM (CUDA)
+         * - Requires INT8 GEMM kernel implementation
+         *
+         * Note: Lower precision modes reduce memory bandwidth but may introduce error.
+         * Attention is typically robust to BF16/FP16, but operations like softmax/RMSNorm
+         * may require FP32 for numerical stability.
          */
-        ComputePrecision precision = ComputePrecision::FP32;
+        ComputePrecision precision = ComputePrecision::MIXED;
 
         /**
          * @brief Default constructor with standard settings

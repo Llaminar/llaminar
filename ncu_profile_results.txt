@@ -1,0 +1,41 @@
+================================================================
+PROFILING BEST GEMM CONFIGURATIONS WITH NCU
+================================================================
+
+=== Test 1: SingleToken_QKV (1×896×896) ===
+Expected: ~33-38 GFLOPS, 64 threads, atom layout 1×4×1
+
+=== Profiling: Qwen_0_5B_SingleToken_QKV ===
+Shape: [1 × 896 × 896]
+Config: tile=16x16x32 threads=8x8
+Average time: 16.3947 ms
+Performance: 0.097936 GFLOPS
+
+=== Test 2: Batch32_QKV (32×896×896) ===
+Expected: ~900 GFLOPS, 64 threads, atom layout 4×2×1
+
+=== Profiling: Qwen_0_5B_Batch32_QKV ===
+Shape: [32 × 896 × 896]
+Config: tile=16x16x32 threads=8x8
+Average time: 18.4452 ms
+Performance: 2.78555 GFLOPS
+
+=== Test 3: FFN_Gate (1×4864×896) ===
+Expected: ~128 GFLOPS, 64 threads, atom layout 1×1×1
+
+=== Profiling: Qwen_0_5B_FFN_Gate ===
+Shape: [1 × 4864 × 896]
+Config: tile=16x32x32 threads=8x8
+Average time: 18.4544 ms
+Performance: 0.472315 GFLOPS
+
+================================================================
+PROFILING COMPLETE
+================================================================
+
+Key metrics to analyze:
+  - SM throughput: Should be >50% for good utilization
+  - Memory throughput: Indicates bandwidth bottleneck
+  - Warp activity: Low % indicates poor occupancy
+  - FMA instructions: Should dominate (indicates compute-bound)
+

@@ -14,8 +14,10 @@ namespace llaminar2
     WeightManager::WeightManager(ModelLoader &loader,
                                  std::shared_ptr<MPIContext> mpi_ctx,
                                  std::shared_ptr<WeightPlacementMap> placement_map,
-                                 WeightDistributionStrategy strategy)
-        : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map), strategy_(strategy)
+                                 WeightDistributionStrategy strategy,
+                                 ComputePrecision precision)
+        : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map),
+          strategy_(strategy), precision_(precision)
     {
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
@@ -35,6 +37,31 @@ namespace llaminar2
                 break;
             }
             LOG_INFO("[WeightManager] Initialized with strategy: " << strategy_name);
+
+            // Log precision mode
+            const char *precision_name = "UNKNOWN";
+            switch (precision_)
+            {
+            case ComputePrecision::MIXED:
+                precision_name = "MIXED (weights quantized, compute FP32)";
+                break;
+            case ComputePrecision::FP32:
+                precision_name = "FP32 (all weights dequantized)";
+                break;
+            case ComputePrecision::BF16:
+                precision_name = "BF16 (all weights dequantized)";
+                break;
+            case ComputePrecision::FP16:
+                precision_name = "FP16 (all weights dequantized)";
+                break;
+            case ComputePrecision::INT8:
+                precision_name = "INT8 (all weights dequantized for AVX512-VNNI/CUDA)";
+                break;
+            case ComputePrecision::AUTO:
+                precision_name = "AUTO (should have been resolved!)";
+                break;
+            }
+            LOG_INFO("[WeightManager] Precision mode: " << precision_name);
         }
     }
 
@@ -94,7 +121,7 @@ namespace llaminar2
         // Phase 1: Simple replication - each rank loads independently
         // No MPI coordination needed
 
-        auto tensor = loader_.loadTensor(name, device_idx);
+        auto tensor = loader_.loadTensor(name, device_idx, precision_);
         if (!tensor)
         {
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;

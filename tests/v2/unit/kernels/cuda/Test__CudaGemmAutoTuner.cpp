@@ -218,10 +218,10 @@ TEST_F(Test__CudaGemmAutoTuner, NNRankingIsConsistent)
     // Use explicitly different configs
     auto &tuner = CudaGemmAutoTuner::instance();
     tuner.setAutoTuningEnabled(false);
-    
+
     // Get configs for very different problem sizes
-    auto config_small = tuner.getOptimalConfig(1, 896, 896);       // Small single token
-    auto config_batch = tuner.getOptimalConfig(128, 5120, 5120);   // Large batch
+    auto config_small = tuner.getOptimalConfig(1, 896, 896);     // Small single token
+    auto config_batch = tuner.getOptimalConfig(128, 5120, 5120); // Large batch
 
     // Verify configs are actually different
     ASSERT_NE(config_small.id(), config_batch.id()) << "Should have different configs for test";
@@ -297,10 +297,10 @@ TEST_F(Test__CudaGemmAutoTuner, ConfigsRespectHardwareConstraints)
     tuner.setAutoTuningEnabled(false);
 
     std::vector<std::tuple<int, int, int>> test_shapes = {
-        {1, 896, 896},      // 0.5B single token
-        {1, 1280, 1280},    // 1.5B single token
-        {32, 2048, 2048},   // 4B batch
-        {128, 5120, 5120},  // 14B batch
+        {1, 896, 896},     // 0.5B single token
+        {1, 1280, 1280},   // 1.5B single token
+        {32, 2048, 2048},  // 4B batch
+        {128, 5120, 5120}, // 14B batch
     };
 
     for (const auto &[m, n, k] : test_shapes)
@@ -340,7 +340,7 @@ TEST_F(Test__CudaGemmAutoTuner, ConfigsAreValid)
     // tile_m must equal threads_m * work_per_thread_m
     EXPECT_EQ(config.tile_m, config.threads_m * config.work_per_thread_m)
         << "tile_m must equal threads_m × work_per_thread_m";
-    
+
     // tile_n must equal threads_n * work_per_thread_n
     EXPECT_EQ(config.tile_n, config.threads_n * config.work_per_thread_n)
         << "tile_n × work_per_thread_n";

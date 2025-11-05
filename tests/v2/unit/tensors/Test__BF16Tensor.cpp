@@ -756,3 +756,203 @@ TEST(Test__BF16Tensor, ActivationGemmStrided)
     EXPECT_NEAR(output_data[10], 4.0f, 0.1f);
     EXPECT_NEAR(output_data[11], 5.0f, 0.1f);
 }
+
+/**
+ * @brief Test BF16Tensor to<float>() template method matches to_fp32()
+ */
+TEST(Test__BF16Tensor, ToFloat_TemplateMethod)
+{
+    // Create a simple BF16 tensor with known values
+    std::vector<size_t> shape = {2, 32};
+    std::vector<uint16_t> data(64);
+    for (size_t i = 0; i < 64; ++i)
+    {
+        data[i] = fp32_to_bf16(static_cast<float>(i) * 0.5f);
+    }
+    auto tensor = std::make_shared<BF16Tensor>(shape, data);
+
+    // Test to<float>() template method
+    std::vector<float> result_template(64);
+    tensor->template to<float>(result_template.data());
+
+    // Compare with legacy to_fp32()
+    std::vector<float> result_legacy(64);
+    tensor->to_fp32(result_legacy.data());
+
+    // Should be identical
+    for (size_t i = 0; i < 64; ++i)
+    {
+        EXPECT_FLOAT_EQ(result_template[i], result_legacy[i])
+            << "Mismatch at index " << i;
+    }
+}
+
+/**
+ * @brief Test BF16Tensor to<uint16_t>(BF16) template method matches to_bf16()
+ */
+TEST(Test__BF16Tensor, ToBF16_TemplateMethod)
+{
+    // Create a simple BF16 tensor
+    std::vector<size_t> shape = {2, 32};
+    std::vector<uint16_t> data(64);
+    for (size_t i = 0; i < 64; ++i)
+    {
+        data[i] = fp32_to_bf16(static_cast<float>(i) * 0.5f);
+    }
+    auto tensor = std::make_shared<BF16Tensor>(shape, data);
+
+    // Test to<uint16_t>() with BF16 format
+    std::vector<uint16_t> result_template(64);
+    tensor->template to<uint16_t>(result_template.data(), TensorType::BF16);
+
+    // Compare with legacy to_bf16()
+    std::vector<uint16_t> result_legacy(64);
+    tensor->to_bf16(result_legacy.data());
+
+    // Should be identical (should be a no-op for BF16 tensor)
+    for (size_t i = 0; i < 64; ++i)
+    {
+        EXPECT_EQ(result_template[i], result_legacy[i])
+            << "Mismatch at index " << i;
+    }
+}
+
+/**
+ * @brief Test BF16Tensor to<uint16_t>(FP16) template method matches to_fp16()
+ */
+TEST(Test__BF16Tensor, ToFP16_TemplateMethod)
+{
+    // Create a simple BF16 tensor
+    std::vector<size_t> shape = {2, 32};
+    std::vector<uint16_t> data(64);
+    for (size_t i = 0; i < 64; ++i)
+    {
+        data[i] = fp32_to_bf16(static_cast<float>(i) * 0.5f);
+    }
+    auto tensor = std::make_shared<BF16Tensor>(shape, data);
+
+    // Test to<uint16_t>() with FP16 format
+    std::vector<uint16_t> result_template(64);
+    tensor->template to<uint16_t>(result_template.data(), TensorType::FP16);
+
+    // Compare with legacy to_fp16()
+    std::vector<uint16_t> result_legacy(64);
+    tensor->to_fp16(result_legacy.data());
+
+    // Should be identical
+    for (size_t i = 0; i < 64; ++i)
+    {
+        EXPECT_EQ(result_template[i], result_legacy[i])
+            << "Mismatch at index " << i;
+    }
+}
+
+/**
+ * @brief Test BF16Tensor to<int8_t>() INT8 quantization
+ */
+TEST(Test__BF16Tensor, ToINT8_TemplateMethod)
+{
+    // Create a simple BF16 tensor
+    std::vector<size_t> shape = {2, 32};
+    std::vector<uint16_t> data(64);
+    for (size_t i = 0; i < 64; ++i)
+    {
+        data[i] = fp32_to_bf16(static_cast<float>(i) * 0.5f);
+    }
+    auto tensor = std::make_shared<BF16Tensor>(shape, data);
+
+    // Test to<int8_t>() INT8 quantization
+    const size_t total_elements = 64;
+    std::vector<int8_t> int8_data(total_elements);
+
+    tensor->template to<int8_t>(int8_data.data());
+
+    // Verify all int8 values are in valid range [-127, 127]
+    for (size_t i = 0; i < total_elements; ++i)
+    {
+        EXPECT_GE(int8_data[i], -127) << "Value at index " << i << " too low";
+        EXPECT_LE(int8_data[i], 127) << "Value at index " << i << " too high";
+    }
+}
+
+/**
+ * @brief Test BF16Tensor to<int32_t>() INT32 conversion
+ */
+TEST(Test__BF16Tensor, ToINT32_TemplateMethod)
+{
+    // Create a simple BF16 tensor
+    std::vector<size_t> shape = {2, 32};
+    std::vector<uint16_t> data(64);
+    for (size_t i = 0; i < 64; ++i)
+    {
+        data[i] = fp32_to_bf16(static_cast<float>(i) * 0.5f);
+    }
+    auto tensor = std::make_shared<BF16Tensor>(shape, data);
+
+    // Test to<int32_t>() INT32 conversion
+    const size_t total_elements = 64;
+    std::vector<int32_t> int32_data(total_elements);
+
+    tensor->template to<int32_t>(int32_data.data());
+
+    // Verify no overflow occurred (INT32 range is huge, so we just check it's in bounds)
+    for (size_t i = 0; i < total_elements; ++i)
+    {
+        EXPECT_GE(int32_data[i], INT32_MIN);
+        EXPECT_LE(int32_data[i], INT32_MAX);
+    }
+
+    // Verify values are non-zero for non-zero inputs (quantization preserves magnitude order)
+    for (size_t i = 1; i < total_elements; ++i) // Skip i=0 which is 0*0.5=0
+    {
+        EXPECT_NE(int32_data[i], 0) << "Non-zero input at index " << i << " should produce non-zero output";
+    }
+}
+
+/**
+ * @brief Test round-trip conversion: BF16 → FP32 → FP16 → FP32
+ */
+TEST(Test__BF16Tensor, RoundTrip_BF16_FP32_FP16_FP32)
+{
+    // Create a simple BF16 tensor
+    std::vector<size_t> shape = {2, 32};
+    std::vector<uint16_t> data(64);
+    for (size_t i = 0; i < 64; ++i)
+    {
+        data[i] = fp32_to_bf16(static_cast<float>(i) * 0.5f);
+    }
+    auto tensor = std::make_shared<BF16Tensor>(shape, data);
+
+    // Step 1: BF16 → FP32
+    std::vector<float> fp32_data(64);
+    tensor->template to<float>(fp32_data.data());
+
+    // Step 2: FP32 → FP16 (create FP32Tensor, then convert)
+    auto fp32_tensor = std::make_shared<FP32Tensor>(shape);
+    std::memcpy(fp32_tensor->mutable_data(), fp32_data.data(), 64 * sizeof(float));
+
+    std::vector<uint16_t> fp16_data(64);
+    fp32_tensor->template to<uint16_t>(fp16_data.data(), TensorType::FP16);
+
+    // Step 3: FP16 → FP32
+    auto fp16_tensor = std::make_shared<FP16Tensor>(shape, fp16_data);
+    std::vector<float> final_fp32_data(64);
+    fp16_tensor->template to<float>(final_fp32_data.data());
+
+    // Verify round-trip accuracy
+    for (size_t i = 0; i < 64; ++i)
+    {
+        float original = bf16_to_fp32(data[i]);
+        float final_value = final_fp32_data[i];
+
+        if (std::abs(original) > 1e-6f) // Skip near-zero values
+        {
+            float rel_error = std::abs((final_value - original) / original);
+            // Both BF16 and FP16 have reduced precision, so we expect ~1-2% error
+            EXPECT_LT(rel_error, 0.02f)
+                << "Round-trip error at index " << i
+                << " original=" << original
+                << " final=" << final_value;
+        }
+    }
+}

@@ -309,7 +309,9 @@ namespace llaminar2
         return true;
     }
 
-    std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name, int device_idx)
+    std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
+                                                        int device_idx,
+                                                        ComputePrecision precision)
     {
         if (!loaded_)
         {
@@ -376,7 +378,36 @@ namespace llaminar2
         // TODO: Use device_idx for device placement when V2 supports it
         (void)device_idx; // Suppress unused parameter warning
 
-        // Create typed tensor based on GGUF type
+        // PRECISION MODE HANDLING:
+        // - MIXED (default): Keep weights quantized, no dequantization
+        // - FP32/BF16/FP16/INT8: Dequantize all weights to target format at load
+
+        bool should_dequantize = (precision != ComputePrecision::MIXED) && info->isQuantized();
+
+        if (should_dequantize)
+        {
+            switch (precision)
+            {
+            case ComputePrecision::INT8:
+                return dequantizeToINT8(info, shape, raw);
+            case ComputePrecision::FP32:
+                // TODO: Implement dequantizeToFP32()
+                LOG_WARN("[ModelLoader] FP32 dequantization not yet implemented, keeping quantized");
+                break;
+            case ComputePrecision::BF16:
+                // TODO: Implement dequantizeToBF16()
+                LOG_WARN("[ModelLoader] BF16 dequantization not yet implemented, keeping quantized");
+                break;
+            case ComputePrecision::FP16:
+                // TODO: Implement dequantizeToFP16()
+                LOG_WARN("[ModelLoader] FP16 dequantization not yet implemented, keeping quantized");
+                break;
+            default:
+                break;
+            }
+        }
+
+        // STANDARD MODE (MIXED precision): Create typed tensor based on GGUF type
         std::shared_ptr<TensorBase> tensor;
 
         switch (info->type)
@@ -1318,6 +1349,228 @@ namespace llaminar2
 
         LOG_INFO("[ModelLoader] Total tensors across all splits: " << model_.tensors.size());
         return true;
+    }
+
+    // =============================================================================
+    // INT8 DEQUANTIZATION HELPERS
+    // =============================================================================
+
+    std::shared_ptr<TensorBase> ModelLoader::dequantizeToINT8(
+        const GGUFTensorInfo *info,
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw)
+    {
+        // Step 1: Create temporary quantized tensor using factory
+        std::unique_ptr<TensorBase> temp_unique;
+
+        if (factory_)
+        {
+            // Use factory for NUMA-aware allocation
+            switch (info->type)
+            {
+            case GGUFTensorType::IQ4_NL:
+                temp_unique = factory_->createQuantized(TensorType::IQ4_NL, shape, raw);
+                break;
+            case GGUFTensorType::IQ4_XS:
+                temp_unique = factory_->createQuantized(TensorType::IQ4_XS, shape, raw);
+                break;
+            case GGUFTensorType::Q8_0:
+                temp_unique = factory_->createQuantized(TensorType::Q8_0, shape, raw);
+                break;
+            case GGUFTensorType::Q4_0:
+                temp_unique = factory_->createQuantized(TensorType::Q4_0, shape, raw);
+                break;
+            case GGUFTensorType::Q4_1:
+                temp_unique = factory_->createQuantized(TensorType::Q4_1, shape, raw);
+                break;
+            case GGUFTensorType::Q5_0:
+                temp_unique = factory_->createQuantized(TensorType::Q5_0, shape, raw);
+                break;
+            case GGUFTensorType::Q5_1:
+                temp_unique = factory_->createQuantized(TensorType::Q5_1, shape, raw);
+                break;
+            case GGUFTensorType::Q6_K:
+                temp_unique = factory_->createQuantized(TensorType::Q6_K, shape, raw);
+                break;
+            case GGUFTensorType::Q2_K:
+                temp_unique = factory_->createQuantized(TensorType::Q2_K, shape, raw);
+                break;
+            case GGUFTensorType::Q3_K:
+                temp_unique = factory_->createQuantized(TensorType::Q3_K, shape, raw);
+                break;
+            case GGUFTensorType::Q4_K:
+                temp_unique = factory_->createQuantized(TensorType::Q4_K, shape, raw);
+                break;
+            case GGUFTensorType::Q5_K:
+                temp_unique = factory_->createQuantized(TensorType::Q5_K, shape, raw);
+                break;
+            case GGUFTensorType::Q8_K:
+                temp_unique = factory_->createQuantized(TensorType::Q8_K, shape, raw);
+                break;
+            case GGUFTensorType::IQ2_XXS:
+                temp_unique = factory_->createQuantized(TensorType::IQ2_XXS, shape, raw);
+                break;
+            case GGUFTensorType::IQ2_XS:
+                temp_unique = factory_->createQuantized(TensorType::IQ2_XS, shape, raw);
+                break;
+            case GGUFTensorType::IQ3_XXS:
+                temp_unique = factory_->createQuantized(TensorType::IQ3_XXS, shape, raw);
+                break;
+            case GGUFTensorType::IQ2_S:
+                temp_unique = factory_->createQuantized(TensorType::IQ2_S, shape, raw);
+                break;
+            case GGUFTensorType::IQ3_S:
+                temp_unique = factory_->createQuantized(TensorType::IQ3_S, shape, raw);
+                break;
+            case GGUFTensorType::IQ1_S:
+                temp_unique = factory_->createQuantized(TensorType::IQ1_S, shape, raw);
+                break;
+            case GGUFTensorType::IQ1_M:
+                temp_unique = factory_->createQuantized(TensorType::IQ1_M, shape, raw);
+                break;
+            default:
+                LOG_ERROR("[ModelLoader] INT8 dequantization not supported for type: "
+                          << static_cast<int>(info->type));
+                return nullptr;
+            }
+        }
+        else
+        {
+            // Fallback: create without factory
+            switch (info->type)
+            {
+            case GGUFTensorType::IQ4_NL:
+                temp_unique = std::make_unique<IQ4_NLTensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ4_XS:
+                temp_unique = std::make_unique<IQ4_XSTensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q8_0:
+                temp_unique = std::make_unique<Q8_0Tensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q4_0:
+                temp_unique = std::make_unique<Q4_0Tensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q4_1:
+                temp_unique = std::make_unique<Q4_1Tensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q5_0:
+                temp_unique = std::make_unique<Q5_0Tensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q5_1:
+                temp_unique = std::make_unique<Q5_1Tensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q6_K:
+                temp_unique = std::make_unique<Q6_KTensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q2_K:
+                temp_unique = std::make_unique<Q2_KTensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q3_K:
+                temp_unique = std::make_unique<Q3_KTensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q4_K:
+                temp_unique = std::make_unique<Q4_KTensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q5_K:
+                temp_unique = std::make_unique<Q5_KTensor>(shape, raw);
+                break;
+            case GGUFTensorType::Q8_K:
+                temp_unique = std::make_unique<Q8_KTensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ2_XXS:
+                temp_unique = std::make_unique<IQ2_XXSTensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ2_XS:
+                temp_unique = std::make_unique<IQ2_XSTensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ3_XXS:
+                temp_unique = std::make_unique<IQ3_XXSTensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ2_S:
+                temp_unique = std::make_unique<IQ2_STensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ3_S:
+                temp_unique = std::make_unique<IQ3_STensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ1_S:
+                temp_unique = std::make_unique<IQ1_STensor>(shape, raw);
+                break;
+            case GGUFTensorType::IQ1_M:
+                temp_unique = std::make_unique<IQ1_MTensor>(shape, raw);
+                break;
+            default:
+                LOG_ERROR("[ModelLoader] INT8 dequantization not supported for type: "
+                          << static_cast<int>(info->type));
+                return nullptr;
+            }
+        }
+
+        if (!temp_unique)
+        {
+            LOG_ERROR("[ModelLoader] Failed to create temporary tensor for INT8 dequantization");
+            return nullptr;
+        }
+
+        // Step 2: Use tensor's built-in to_int8_blocked() method
+        TensorBase *temp_tensor = temp_unique.get();
+        size_t total_elements = 1;
+        for (auto dim : shape)
+            total_elements *= dim;
+
+        // Use per-tensor quantization (single scale for entire tensor)
+        constexpr size_t BLOCK_SIZE = 256; // Standard block size
+        size_t num_blocks = (total_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        std::vector<int8_t> int8_data(total_elements);
+        std::vector<float> scales(num_blocks);
+
+        temp_tensor->to_int8_blocked(int8_data.data(), scales.data(), BLOCK_SIZE);
+
+        // Step 3: Create INT8Tensor with per-tensor scale (average of block scales)
+        float avg_scale = 0.0f;
+        for (auto scale : scales)
+            avg_scale += scale;
+        avg_scale /= static_cast<float>(num_blocks);
+
+        return std::make_shared<INT8Tensor>(shape, int8_data, avg_scale);
+    }
+
+    void ModelLoader::dequantizeIQ4_NLToFP32(
+        const std::vector<uint8_t> &raw,
+        std::vector<float> &fp32_buffer,
+        const std::vector<size_t> &shape)
+    {
+        // Use IQ4_NLTensor to do the decoding
+        auto temp_tensor = std::make_shared<IQ4_NLTensor>(shape, raw);
+        temp_tensor->to_fp32(fp32_buffer.data());
+    }
+
+    void ModelLoader::dequantizeQ8_0ToFP32(
+        const std::vector<uint8_t> &raw,
+        std::vector<float> &fp32_buffer,
+        const std::vector<size_t> &shape)
+    {
+        auto temp_tensor = std::make_shared<Q8_0Tensor>(shape, raw);
+        temp_tensor->to_fp32(fp32_buffer.data());
+    }
+
+    void ModelLoader::dequantizeQ4_0ToFP32(
+        const std::vector<uint8_t> &raw,
+        std::vector<float> &fp32_buffer,
+        const std::vector<size_t> &shape)
+    {
+        auto temp_tensor = std::make_shared<Q4_0Tensor>(shape, raw);
+        temp_tensor->to_fp32(fp32_buffer.data());
+    }
+
+    void ModelLoader::dequantizeQ6_KToFP32(
+        const std::vector<uint8_t> &raw,
+        std::vector<float> &fp32_buffer,
+        const std::vector<size_t> &shape)
+    {
+        auto temp_tensor = std::make_shared<Q6_KTensor>(shape, raw);
+        temp_tensor->to_fp32(fp32_buffer.data());
     }
 
 } // namespace llaminar2
