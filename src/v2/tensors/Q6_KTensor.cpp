@@ -5,10 +5,12 @@
  */
 
 #include "Tensors.h"
-#include "Tensors.h"
+#include "SIMDHelpers.h"
 #include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include "../utils/Logger.h"
@@ -19,10 +21,6 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-#include "SIMDHelpers.h"
-#include "FP16Utils.h"
-#include <algorithm>
-#include <cmath>
 #endif
 
 namespace llaminar2
@@ -321,16 +319,6 @@ namespace llaminar2
         throw std::runtime_error("Q6_KTensor::mutable_data: quantized tensors are immutable");
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
     bool Q6_KTensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed
@@ -452,6 +440,30 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    // ========== Q8_0 Decode (for Integer GEMM) ==========
+
+    void Q6_KTensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        // Q6_K format: 256 elements per super-block, organized as 8 sub-blocks of 32 elements
+        // Each element is 6-bit quantized (4 low bits + 2 high bits)
+        // Hierarchical scaling: super-block scale (FP16) × sub-block scale (4-bit)
+
+        constexpr size_t Q6K_SUPERBLOCK_SIZE = 256;
+        constexpr size_t Q6K_SUBBLOCKS = 8; // 8 sub-blocks of 32 elements each
+
+        // Calculate super-block index and sub-block index
+        const size_t superblock_idx = (k_block_offset * 32) / Q6K_SUPERBLOCK_SIZE;
+        const size_t sub_idx = k_block_offset % Q6K_SUBBLOCKS;
+
+        // Get Q6_K super-block
+        const size_t superblocks_per_row = (shape_[1] + Q6K_SUPERBLOCK_SIZE - 1) / Q6K_SUPERBLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
+        const Q6_KBlock &q6k_block = blocks[row_idx * superblocks_per_row + superblock_idx];
+
+        simd::decode_q6_k_to_q8_0(q6k_block, sub_idx, output->qs, &output->d);
     }
 
 } // namespace llaminar2

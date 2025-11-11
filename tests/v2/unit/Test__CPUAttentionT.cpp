@@ -634,3 +634,94 @@ TEST(CPUAttentionT_INT32, InstantiationWorks)
     EXPECT_TRUE(attention.supports_device(-1));
     EXPECT_FALSE(attention.supports_device(0)); // CPU only
 }
+
+// ============================================================================
+// Q8_0Tensor Tests
+// ============================================================================
+
+TEST(CPUAttentionT_Q8_0, InstantiationWorks)
+{
+    CPUAttentionT<Q8_0Tensor> attention;
+    EXPECT_TRUE(attention.supports_device(-1)) << "Should support CPU (device_idx=-1)";
+    EXPECT_FALSE(attention.supports_device(0)) << "Should NOT support GPU";
+}
+
+TEST(CPUAttentionT_Q8_0, BasicAttentionComputation)
+{
+    // Small test: 2 tokens, 1 head, 4 dims (head_dim must be multiple of 32 for Q8_0 block alignment)
+    const int seq_len = 2;
+    const int n_heads = 1;
+    const int n_kv_heads = 1;
+    const int head_dim = 32; // Changed from 4 to 32 for Q8_0 block alignment
+
+    // Create FP32 data for quantization
+    std::vector<float> Q_fp32(seq_len * n_heads * head_dim);
+    std::vector<float> K_fp32(seq_len * n_kv_heads * head_dim);
+    std::vector<float> V_fp32(seq_len * n_kv_heads * head_dim);
+    init_sequential(Q_fp32.data(), Q_fp32.size());
+    init_sequential(K_fp32.data(), K_fp32.size());
+    init_sequential(V_fp32.data(), V_fp32.size());
+
+    // Quantize to Q8_0 using FP32Tensor conversion (with 2D shape for to_fp32_via_blocks)
+    FP32Tensor Q_fp32_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    FP32Tensor K_fp32_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    FP32Tensor V_fp32_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+
+    std::memcpy(Q_fp32_tensor.mutable_data(), Q_fp32.data(), Q_fp32.size() * sizeof(float));
+    std::memcpy(K_fp32_tensor.mutable_data(), K_fp32.data(), K_fp32.size() * sizeof(float));
+    std::memcpy(V_fp32_tensor.mutable_data(), V_fp32.data(), V_fp32.size() * sizeof(float));
+
+    // Convert to Q8_0
+    size_t Q_n_blocks = (Q_fp32.size() + 31) / 32;
+    size_t K_n_blocks = (K_fp32.size() + 31) / 32;
+    size_t V_n_blocks = (V_fp32.size() + 31) / 32;
+
+    std::vector<Q8_0Block> Q_blocks(Q_n_blocks);
+    std::vector<Q8_0Block> K_blocks(K_n_blocks);
+    std::vector<Q8_0Block> V_blocks(V_n_blocks);
+
+    Q_fp32_tensor.to_q8_0(Q_blocks.data());
+    K_fp32_tensor.to_q8_0(K_blocks.data());
+    V_fp32_tensor.to_q8_0(V_blocks.data());
+
+    // Convert blocks to raw bytes for Q8_0Tensor construction
+    std::vector<uint8_t> Q_raw(reinterpret_cast<uint8_t *>(Q_blocks.data()),
+                               reinterpret_cast<uint8_t *>(Q_blocks.data()) + Q_n_blocks * 34);
+    std::vector<uint8_t> K_raw(reinterpret_cast<uint8_t *>(K_blocks.data()),
+                               reinterpret_cast<uint8_t *>(K_blocks.data()) + K_n_blocks * 34);
+    std::vector<uint8_t> V_raw(reinterpret_cast<uint8_t *>(V_blocks.data()),
+                               reinterpret_cast<uint8_t *>(V_blocks.data()) + V_n_blocks * 34);
+
+    // Create Q8_0Tensors with 2D shape (required by to_fp32_via_blocks)
+    Q8_0Tensor Q_q8({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)}, Q_raw);
+    Q8_0Tensor K_q8({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, K_raw);
+    Q8_0Tensor V_q8({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)}, V_raw);
+
+    // Allocate output (Q8_0 attention should write FP32 output, but we'll test with raw data pointer)
+    std::vector<float> output(seq_len * n_heads * head_dim, 0.0f);
+
+    // NOTE: CPUAttentionT::compute expects float* interface (reinterprets to ElementType* internally)
+    // For Q8_0: ElementType=int8_t, but we must pass float* pointers
+    // Cast the raw Q8_0 block data to float* for the interface
+    const float *Q_ptr = reinterpret_cast<const float *>(Q_raw.data());
+    const float *K_ptr = reinterpret_cast<const float *>(K_raw.data());
+    const float *V_ptr = reinterpret_cast<const float *>(V_raw.data());
+
+    // Create attention kernel
+    CPUAttentionT<Q8_0Tensor> attention;
+
+    // Compute attention
+    bool success = attention.compute(
+        Q_ptr, K_ptr, V_ptr, output.data(),
+        seq_len, n_heads, n_kv_heads, head_dim,
+        false,                              // causal
+        -1,                                 // window_size
+        nullptr, nullptr, nullptr, nullptr, // workspaces (auto-allocate)
+        false,                              // use_bf16
+        nullptr, -1);
+
+    EXPECT_TRUE(success) << "Q8_0 attention computation should succeed";
+    EXPECT_TRUE(has_nonzero(output.data(), output.size())) << "Output should be non-zero";
+
+    // NOTE: We don't validate exact values due to quantization error, just that it runs
+}

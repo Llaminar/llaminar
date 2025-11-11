@@ -14,6 +14,7 @@
 
 #include "TensorKernels.h"
 #include "FP16Utils.h"
+#include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
 #include "SIMDHelpers.h"
 #include "AlignedVector.h"
 #include <vector>
@@ -22,219 +23,8 @@
 
 namespace llaminar2
 {
-    /**
-     * @brief IQ4_NL block structure (exactly 18 bytes) representing 32 quantized elements.
-     *
-     * Layout mirrors GGML's block_iq4_nl. Two 4-bit indices per byte in @p qs select entries
-     * in kvalues_iq4nl, scaled by FP16 value @p d.
-     */
-    struct IQ4_NLBlock
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint8_t qs[16]; ///< Packed 4-bit indices (2 per byte)
-
-        static constexpr size_t BLOCK_SIZE = 32; ///< Elements per block
-    };
-
-    static_assert(sizeof(IQ4_NLBlock) == 18, "IQ4_NLBlock must be 18 bytes");
-
-    /** @brief Q8_0 block: 8-bit quantization (32 elements per block, 34 bytes) */
-    struct Q8_0Block
-    {
-        uint16_t d;    ///< FP16 scale factor
-        int8_t qs[32]; ///< 32 quantized int8 values
-        static constexpr size_t BLOCK_SIZE = 32;
-    };
-    static_assert(sizeof(Q8_0Block) == 34, "Q8_0Block must be 34 bytes");
-
-    /** @brief Q4_0 block: 4-bit quantization (32 elements per block, 18 bytes) */
-    struct Q4_0Block
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint8_t qs[16]; ///< 32 4-bit values packed (2 per byte)
-        static constexpr size_t BLOCK_SIZE = 32;
-    };
-    static_assert(sizeof(Q4_0Block) == 18, "Q4_0Block must be 18 bytes");
-
-    /** @brief Q4_1 block: 4-bit quantization with min (32 elements per block, 20 bytes) */
-    struct Q4_1Block
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint16_t m;     ///< FP16 minimum value
-        uint8_t qs[16]; ///< 32 4-bit values packed (2 per byte)
-        static constexpr size_t BLOCK_SIZE = 32;
-    };
-    static_assert(sizeof(Q4_1Block) == 20, "Q4_1Block must be 20 bytes");
-
-    /** @brief Q5_0 block: 5-bit quantization (32 elements per block, 22 bytes) */
-    struct Q5_0Block
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint8_t qh[4];  ///< High bits (5th bit) for all 32 elements (32 bits = 4 bytes)
-        uint8_t qs[16]; ///< Lower 4 bits of 32 5-bit values packed (2 per byte)
-        static constexpr size_t BLOCK_SIZE = 32;
-    };
-    static_assert(sizeof(Q5_0Block) == 22, "Q5_0Block must be 22 bytes");
-
-    /** @brief Q5_1 block: 5-bit quantization with min (32 elements per block, 24 bytes) */
-    struct Q5_1Block
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint16_t m;     ///< FP16 minimum value
-        uint8_t qh[4];  ///< High bits (5th bit) for all 32 elements (32 bits = 4 bytes)
-        uint8_t qs[16]; ///< Lower 4 bits of 32 5-bit values packed (2 per byte)
-        static constexpr size_t BLOCK_SIZE = 32;
-    };
-    static_assert(sizeof(Q5_1Block) == 24, "Q5_1Block must be 24 bytes");
-
-    /** @brief Q6_K block: 6-bit K-quant (256 elements per super-block, 210 bytes) */
-    struct Q6_KBlock
-    {
-        uint8_t ql[128];   ///< Lower 4 bits of 6-bit values
-        uint8_t qh[64];    ///< Upper 2 bits of 6-bit values (packed)
-        int8_t scales[16]; ///< Per-block scales
-        uint16_t d;        ///< FP16 super-block scale
-        static constexpr size_t BLOCK_SIZE = 256;
-    };
-    static_assert(sizeof(Q6_KBlock) == 210, "Q6_KBlock must be 210 bytes");
-
-    /** @brief Q2_K block: 2-bit K-quant (256 elements per super-block, 84 bytes) */
-    struct Q2_KBlock
-    {
-        uint8_t scales[16]; ///< Scales and mins (packed)
-        uint8_t qs[64];     ///< 2-bit values packed (4 per byte)
-        uint16_t d;         ///< FP16 super-block scale for scales
-        uint16_t dmin;      ///< FP16 super-block scale for mins
-        static constexpr size_t BLOCK_SIZE = 256;
-    };
-    static_assert(sizeof(Q2_KBlock) == 84, "Q2_KBlock must be 84 bytes");
-
-    /** @brief Q5_K block: 5-bit K-quant (256 elements per super-block, 176 bytes) */
-    struct Q5_KBlock
-    {
-        uint16_t d;         ///< FP16 super-block scale
-        uint16_t dmin;      ///< FP16 super-block min scale
-        uint8_t scales[12]; ///< 8 6-bit scales packed
-        uint8_t qh[32];     ///< High bits (5th bit of 5-bit values)
-        uint8_t qs[128];    ///< Lower 4 bits of 5-bit values
-        static constexpr size_t BLOCK_SIZE = 256;
-    };
-    static_assert(sizeof(Q5_KBlock) == 176, "Q5_KBlock must be 176 bytes");
-
-    /** @brief Q3_K block: 3-bit K-quant (256 elements per super-block, 110 bytes) */
-    struct Q3_KBlock
-    {
-        uint8_t hmask[32];  ///< High bit masks (1 bit per element)
-        uint8_t qs[64];     ///< Lower 2 bits of 3-bit values
-        uint8_t scales[12]; ///< 16 scales packed (6 bits each)
-        uint16_t d;         ///< FP16 super-block scale
-        static constexpr size_t BLOCK_SIZE = 256;
-    };
-    static_assert(sizeof(Q3_KBlock) == 110, "Q3_KBlock must be 110 bytes");
-
-    /** @brief Q4_K block: 4-bit K-quant (256 elements per super-block, 144 bytes) */
-    struct Q4_KBlock
-    {
-        uint16_t d;         ///< FP16 super-block scale
-        uint16_t dmin;      ///< FP16 super-block min scale
-        uint8_t scales[12]; ///< 12 6-bit scales packed
-        uint8_t qs[128];    ///< Lower 4 bits of 4-bit values
-        static constexpr size_t BLOCK_SIZE = 256;
-    };
-    static_assert(sizeof(Q4_KBlock) == 144, "Q4_KBlock must be 144 bytes");
-
-    /** @brief Q8_K block: 8-bit K-quant (256 elements per super-block, 288 bytes) */
-    /** @brief Q8_K block: 8-bit K-quant super-block (256 elements, 288 bytes) */
-    struct Q8_KBlock
-    {
-        int8_t qs[256];    ///< 8-bit quantized values
-        int16_t bsums[16]; ///< Block sums for fast dot products
-        static constexpr size_t BLOCK_SIZE = 256;
-    };
-    static_assert(sizeof(Q8_KBlock) == 288, "Q8_KBlock must be 288 bytes");
-
-    /** @brief IQ4_XS block: 4-bit extra-small IQ (32 elements per block, 18 bytes) */
-    /** @brief IQ4_XS block: 4-bit extra-small IQ (256 elements per super-block, 136 bytes) */
-    struct IQ4_XSBlock
-    {
-        uint16_t d;          ///< FP16 scale factor
-        uint16_t scales_h;   ///< High bits of scales
-        uint8_t scales_l[4]; ///< Low bits of scales (QK_K/64 = 256/64 = 4)
-        uint8_t qs[128];     ///< Grid indices (QK_K/2 = 256/2 = 128)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ4_XSBlock) == 136, "IQ4_XSBlock must be 136 bytes");
-
-    /** @brief IQ2_XXS block: 2-bit extra-extra-small IQ (256 elements per super-block, 66 bytes) */
-    struct IQ2_XXSBlock
-    {
-        uint16_t d;      ///< FP16 scale factor
-        uint16_t qs[32]; ///< Grid indices packed (QK_K/8 = 256/8 = 32 uint16_t)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ2_XXSBlock) == 66, "IQ2_XXSBlock must be 66 bytes");
-
-    /** @brief IQ2_XS block: 2-bit extra-small IQ (256 elements per super-block, 74 bytes) */
-    struct IQ2_XSBlock
-    {
-        uint16_t d;        ///< FP16 scale factor
-        uint16_t qs[32];   ///< Grid indices (QK_K/8 = 32 uint16_t)
-        uint8_t scales[8]; ///< Per-block scales (QK_K/32 = 8)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ2_XSBlock) == 74, "IQ2_XSBlock must be 74 bytes");
-
-    /** @brief IQ3_XXS block: 3-bit extra-extra-small IQ (256 elements per super-block, 98 bytes) */
-    struct IQ3_XXSBlock
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint8_t qs[96]; ///< Grid indices (3*QK_K/8 = 3*256/8 = 96)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ3_XXSBlock) == 98, "IQ3_XXSBlock must be 98 bytes");
-
-    /** @brief IQ2_S block: 2-bit small IQ (256 elements per super-block) */
-    struct IQ2_SBlock
-    {
-        uint16_t d;        ///< FP16 scale factor
-        uint8_t qs[64];    ///< Quantized values (QK_K/4)
-        uint8_t qh[8];     ///< High bits (QK_K/32)
-        uint8_t scales[8]; ///< Scales (QK_K/32)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ2_SBlock) == 82, "IQ2_SBlock must be 82 bytes");
-
-    /** @brief IQ3_S block: 3-bit small IQ (256 elements per super-block) */
-    struct IQ3_SBlock
-    {
-        uint16_t d;        ///< FP16 scale factor
-        uint8_t qs[64];    ///< Quantized values (QK_K/4)
-        uint8_t qh[8];     ///< High bits (QK_K/32)
-        uint8_t signs[32]; ///< Sign patterns (QK_K/8)
-        uint8_t scales[4]; ///< Scales (IQ3S_N_SCALE = QK_K/64)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ3_SBlock) == 110, "IQ3_SBlock must be 110 bytes");
-
-    /** @brief IQ1_S block: 1-bit small IQ (256 elements per super-block) */
-    struct IQ1_SBlock
-    {
-        uint16_t d;     ///< FP16 scale factor
-        uint8_t qs[32]; ///< Grid indices (QK_K/8 = 256/8 = 32 bytes)
-        uint16_t qh[8]; ///< High bits and scales (QK_K/32 = 256/32 = 8 uint16_t values)
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ1_SBlock) == 50, "IQ1_SBlock must be 50 bytes");
-
-    /** @brief IQ1_M block: 1-bit medium IQ (256 elements per super-block, 56 bytes) */
-    struct IQ1_MBlock
-    {
-        uint8_t qs[32];    ///< Grid indices (QK_K/8 = 256/8 = 32 bytes)
-        uint8_t qh[16];    ///< High bits and scale info (packed)
-        uint8_t scales[8]; ///< Per-block scale adjustments
-        static constexpr size_t BLOCK_SIZE = 256;
-    } __attribute__((packed));
-    static_assert(sizeof(IQ1_MBlock) == 56, "IQ1_MBlock must be 56 bytes");
+    // All block structures are now defined in BlockStructures.h
+    // This eliminates circular dependencies between Tensors.h and SIMDHelpers.h
 
     /**
      * @brief Tensor data type
@@ -356,6 +146,30 @@ namespace llaminar2
     };
 
     /**
+     * @brief Interface for tensors that can be decoded to Q8_0 format
+     *
+     * This interface is implemented by quantized tensor types (IQ4_NL, Q6_K, Q4_K, etc.)
+     * that support block-level decoding to Q8_0 format for integer GEMM operations.
+     *
+     * Used by CachedQ8Provider to constrain which tensor types can be used with
+     * the Q8_0 weight cache, avoiding template instantiation errors for types
+     * like FP16Tensor and BF16Tensor that don't support Q8_0 decoding.
+     */
+    class IQ8_0Decodable
+    {
+    public:
+        virtual ~IQ8_0Decodable() = default;
+
+        /**
+         * @brief Decode a single Q8_0 block from this tensor
+         * @param row_idx Row index in the tensor
+         * @param k_block_offset Block offset along K dimension (32 elements per block)
+         * @param output Pointer to output Q8_0Block (32 int8 values + 1 FP16 scale)
+         */
+        virtual void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const = 0;
+    };
+
+    /**
      * @brief Abstract tensor interface
      */
     class TensorBase : public std::enable_shared_from_this<TensorBase>
@@ -460,6 +274,14 @@ namespace llaminar2
          */
         virtual void to_fp32_span(size_t offset, size_t count, float *buffer) const = 0;
 
+        /**
+         * @brief Convert tensor to Q8_0 format (blocked int8 with FP16 scales)
+         * @param dst Destination buffer (must be pre-allocated with element_count()/32 * sizeof(Q8_0Block))
+         * @note Implemented in TensorBase for all tensor types using ITensorGemmTileDataProvider or FP32 fallback
+         * @note OpenMP parallelized for efficiency
+         */
+        void to_q8_0(Q8_0Block *dst) const;
+
     protected:
         /**
          * @brief Helper method for quantized tensors that implement ITensorGemmTileDataProvider
@@ -529,7 +351,7 @@ namespace llaminar2
     /**
      * @brief FP32 tensor with optional device storage
      */
-    class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
+    class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
@@ -629,6 +451,9 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return FP32_BLOCK_SIZE; }
 
+        // Q8_0 decode (for integer GEMM) - NOTE: to_q8_0() is now in TensorBase
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
     private:
         // Private constructor for creating views
         FP32Tensor(const std::vector<size_t> &shape,
@@ -667,7 +492,7 @@ namespace llaminar2
      * - Precision: ~3-4 decimal digits
      * - 2× memory reduction vs FP32
      */
-    class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
+    class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         explicit FP16Tensor(const std::vector<size_t> &shape);
@@ -770,6 +595,9 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return FP16_BLOCK_SIZE; }
 
+        // Q8_0 decode (for integer GEMM)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
         // FP16-specific interface
         const uint16_t *fp16_data() const
         {
@@ -820,7 +648,7 @@ namespace llaminar2
      * - 2× memory reduction vs FP32
      * - Hardware acceleration on Ice Lake+, Zen 4+
      */
-    class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
+    class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         explicit BF16Tensor(const std::vector<size_t> &shape);
@@ -922,6 +750,9 @@ namespace llaminar2
         }
         void from_fp32(const float *fp32_data, size_t count);
         void to_fp32(float *fp32_data, size_t count) const; // Deprecated overload
+
+        // Q8_0 decode (for integer GEMM)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
     private:
         // Private constructor for creating views
@@ -1190,7 +1021,7 @@ namespace llaminar2
      *
      * Also implements ITensorGemmTileDataProvider to enable generic QuantizedGemmKernel.
      */
-    class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1256,6 +1087,7 @@ namespace llaminar2
         void decode_to_bf16(uint16_t *dst) const;
         void decodeRow(size_t row_idx, float *buffer) const;
         void decodeSpan(size_t offset, size_t count, float *buffer) const;
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // Fused kernel helpers (non-virtual versions for backward compatibility)
         const IQ4_NLBlock &get_block_at(size_t row_idx, size_t k_block_offset) const;
@@ -1332,7 +1164,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + int8[32] values
      * Compression: 4× vs FP32
      */
-    class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1364,6 +1196,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // IQ8_0Decodable interface - Q8_0 to Q8_0 is a direct copy (no conversion needed)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -1437,7 +1272,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + 4-bit packed values
      * Compression: 8× vs FP32
      */
-    class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1468,6 +1303,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -1538,7 +1376,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + FP16 min + 4-bit packed values
      * Compression: ~7.1× vs FP32
      */
-    class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1569,6 +1407,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -1640,7 +1481,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~6.4× vs FP32
      */
-    class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1671,6 +1512,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -1742,7 +1586,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~5.7× vs FP32
      */
-    class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1773,6 +1617,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -1840,7 +1687,7 @@ namespace llaminar2
     /**
      * @brief Q6_K tensor (6-bit K-quant super-block)
      */
-    class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1899,6 +1746,9 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return Q6_KBlock::BLOCK_SIZE; }
 
+        // Q8_0 decode (for integer GEMM)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
+
         // SIMD decode methods (public for unit testing)
         static void decodeBlock(const Q6_KBlock &block, float *output);
         static void decodeBlockScalar(const Q6_KBlock &block, float *output);
@@ -1936,7 +1786,7 @@ namespace llaminar2
     /**
      * @brief Q2_K tensor (2-bit K-quant super-block)
      */
-    class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1967,6 +1817,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only, preserves 256-element super-block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -2033,7 +1886,7 @@ namespace llaminar2
     /**
      * @brief Q5_K tensor (5-bit K-quant super-block)
      */
-    class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2064,6 +1917,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Q8_0 quantization (for quantized GEMM)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice views for MPI partitioning)
         std::shared_ptr<TensorBase> create_view(
@@ -2133,7 +1989,7 @@ namespace llaminar2
     /**
      * @brief Q3_K tensor (3-bit K-quant super-block)
      */
-    class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2164,6 +2020,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only, preserves 256-element super-block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -2229,7 +2088,7 @@ namespace llaminar2
     /**
      * @brief Q4_K tensor (4-bit K-quant super-block)
      */
-    class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2260,6 +2119,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // Q8_0 quantization (for quantized GEMM)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice views for MPI partitioning)
         std::shared_ptr<TensorBase> create_view(
@@ -2329,7 +2191,7 @@ namespace llaminar2
     /**
      * @brief Q8_K tensor (8-bit K-quant super-block)
      */
-    class Q8_KTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class Q8_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2360,6 +2222,9 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // IQ8_0Decodable interface - per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
         // View support (row-slice views for MPI partitioning)
         std::shared_ptr<TensorBase> create_view(
@@ -2429,7 +2294,7 @@ namespace llaminar2
     /**
      * @brief IQ4_XS tensor (4-bit extra-small IQ)
      */
-    class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2460,6 +2325,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -2524,7 +2391,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
      */
-    class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2555,6 +2422,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -2619,7 +2488,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XS tensor (2-bit extra-small IQ)
      */
-    class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2650,6 +2519,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -2714,7 +2585,7 @@ namespace llaminar2
     /**
      * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
      */
-    class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2745,6 +2616,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -2809,7 +2682,7 @@ namespace llaminar2
     /**
      * @brief IQ2_S tensor (2-bit small IQ)
      */
-    class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2840,6 +2713,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -2904,7 +2779,7 @@ namespace llaminar2
     /**
      * @brief IQ3_S tensor (3-bit small IQ)
      */
-    class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2935,6 +2810,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -2999,7 +2876,7 @@ namespace llaminar2
     /**
      * @brief IQ1_S tensor (1-bit small IQ)
      */
-    class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3030,6 +2907,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -3094,7 +2973,7 @@ namespace llaminar2
     /**
      * @brief IQ1_M tensor (1-bit medium IQ)
      */
-    class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider
+    class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3125,6 +3004,8 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        // Q8_0 conversion API (for GEMM kernel compatibility)
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }

@@ -316,16 +316,6 @@ namespace llaminar2
         throw std::runtime_error("Q4_0Tensor::mutable_data: quantized tensors are immutable");
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
     bool Q4_0Tensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed
@@ -447,6 +437,47 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    void Q4_0Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q4_0Tensor::decode_to_q8_0: output must not be null");
+        }
+
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q4_0Tensor::decode_to_q8_0: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q4_0Tensor::decode_to_q8_0: row index out of bounds");
+        }
+
+        const size_t cols = shape_[1];
+        const size_t blocks_per_row = (cols + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
+
+        if (k_block_offset >= blocks_per_row)
+        {
+            throw std::out_of_range("Q4_0Tensor::decode_to_q8_0: block offset out of bounds");
+        }
+
+        // Get Q4_0 block
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
+        const Q4_0Block &q4_block = blocks[row_idx * blocks_per_row + k_block_offset];
+
+        // Use SIMD helper to decode Q4_0 → Q8_0
+        uint16_t q8_scale_fp16;
+        simd::decode_q4_0_to_q8_0(
+            q4_block.qs,     // Q4 packed values
+            q4_block.d,      // Q4 scale (FP16)
+            output->qs,      // Q8 output values
+            &q8_scale_fp16); // Q8 output scale (FP16)
+
+        output->d = q8_scale_fp16;
     }
 
 } // namespace llaminar2

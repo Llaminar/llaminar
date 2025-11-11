@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <cblas.h> // For cblas_sgemm (strided FP32 GEMM fallback)
 
 namespace llaminar
 {
@@ -478,23 +479,34 @@ namespace llaminar
                     const llaminar2::MPIContext *mpi_ctx,
                     int device_idx) override
                 {
-                    // TODO: Implement quantized strided activation-activation GEMM
-                    // For now, unsupported (quantized tensors only support weight GEMM)
-                    (void)A;
-                    (void)B;
-                    (void)C;
-                    (void)m;
-                    (void)n;
-                    (void)k;
-                    (void)lda;
-                    (void)ldb;
-                    (void)ldc;
-                    (void)transpose_B;
-                    (void)alpha;
-                    (void)beta;
-                    (void)mpi_ctx;
-                    (void)device_idx;
-                    return false;
+                    // Fallback: use OpenBLAS cblas_sgemm for strided FP32×FP32 GEMM
+                    // This is used by CPUAttentionT for Q@K^T and weights@V computations
+                    (void)mpi_ctx;    // Unused (single-node attention)
+                    (void)device_idx; // CPU only
+
+                    if (device_idx != -1)
+                    {
+                        return false; // Only CPU supported
+                    }
+
+                    // cblas_sgemm signature:
+                    // void cblas_sgemm(Order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)
+                    // C = alpha * op(A) * op(B) + beta * C
+                    // where op(X) = X or X^T based on Trans flags
+
+                    const CBLAS_ORDER order = CblasRowMajor;
+                    const CBLAS_TRANSPOSE trans_a = CblasNoTrans; // A is not transposed
+                    const CBLAS_TRANSPOSE trans_b = transpose_B ? CblasTrans : CblasNoTrans;
+
+                    cblas_sgemm(order, trans_a, trans_b,
+                                m, n, k,
+                                alpha,
+                                A, lda,
+                                B, ldb,
+                                beta,
+                                C, ldc);
+
+                    return true;
                 }
 
                 bool supports_device(int device_idx) const override

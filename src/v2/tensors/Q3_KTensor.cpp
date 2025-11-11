@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "Tensors.h"
+#include "SIMDHelpers.h"
 #include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
@@ -13,7 +13,6 @@
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
-#include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include <algorithm>
 #include <cmath>
@@ -417,15 +416,41 @@ namespace llaminar2
         throw std::runtime_error("Q3_KTensor::mutable_data: quantized tensors are immutable");
     }
 
-    
+    void Q3_KTensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        if (output == nullptr)
+        {
+            throw std::invalid_argument("Q3_KTensor::decode_to_q8_0: output must not be null");
+        }
 
-    
+        if (shape_.size() < 2)
+        {
+            throw std::runtime_error("Q3_KTensor::decode_to_q8_0: tensor shape is invalid");
+        }
 
-    
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q3_KTensor::decode_to_q8_0: row index out of bounds");
+        }
 
-    
+        const size_t blocks_per_row = (shape_[1] + Q3_KBlock::BLOCK_SIZE - 1) / Q3_KBlock::BLOCK_SIZE;
+        const size_t sub_blocks_per_super = Q3_KBlock::BLOCK_SIZE / Q8_0Block::BLOCK_SIZE; // 256 / 32 = 8
+        const size_t total_q8_blocks = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
 
-    
+        if (k_block_offset >= total_q8_blocks)
+        {
+            throw std::out_of_range("Q3_KTensor::decode_to_q8_0: block offset exceeds row length");
+        }
+
+        const size_t superblock_idx = k_block_offset / sub_blocks_per_super;
+        const size_t subblock_idx = k_block_offset % sub_blocks_per_super;
+
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q3_KBlock *blocks = reinterpret_cast<const Q3_KBlock *>(data_ptr);
+        const Q3_KBlock &block = blocks[row_idx * blocks_per_row + superblock_idx];
+
+        simd::decode_q3_k_to_q8_0(block, subblock_idx, output->qs, &output->d);
+    }
 
     bool Q3_KTensor::copyFrom(const TensorBase *src)
     {

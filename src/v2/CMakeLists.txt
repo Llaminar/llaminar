@@ -429,6 +429,34 @@ endif()
 # Include generated microkernel instantiations
 include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/generated/sources.cmake)
 
+# Define Integer GEMM script path for microkernel generation
+set(GENERATE_INTEGER_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/python/generate_integer_gemm_instantiations.py")
+set(GENERATED_INTEGER_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/int8/generated/sources.cmake")
+
+# Check if integer GEMM generation is needed (script newer than output, or output doesn't exist)
+if(NOT EXISTS ${GENERATED_INTEGER_SOURCES_CMAKE} OR 
+   ${GENERATE_INTEGER_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_INTEGER_SOURCES_CMAKE})
+    message(STATUS "V2: Generating Integer GEMM kernel instantiations...")
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} ${GENERATE_INTEGER_GEMM_SCRIPT}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        RESULT_VARIABLE GENERATE_INTEGER_RESULT
+        OUTPUT_VARIABLE GENERATE_INTEGER_OUTPUT
+        ERROR_VARIABLE GENERATE_INTEGER_ERROR
+    )
+    
+    if(NOT GENERATE_INTEGER_RESULT EQUAL 0)
+        message(FATAL_ERROR "V2: Failed to generate Integer GEMM kernels:\n${GENERATE_INTEGER_ERROR}")
+    endif()
+    
+    message(STATUS "V2: Generated 64 integer GEMM files with 8000 variants")
+else()
+    message(STATUS "V2: Integer GEMM kernel instantiations are up-to-date")
+endif()
+
+# Include generated integer GEMM kernel instantiations
+include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/int8/generated/sources.cmake)
+
 # =============================================================================
 # llama.cpp Integration (for dequant parity testing)
 # =============================================================================
@@ -516,7 +544,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/CPUSoftmaxKernel.cpp
     kernels/cpu/CPUSwiGLUKernel.cpp
     kernels/cpu/CPUAttention.cpp
-    # kernels/cpu/CPUAttentionT.cpp  # DISABLED: Uses obsolete FusedGemmSoftmax API (needs migration to TiledGemmSoftmax)
+    kernels/cpu/CPUAttentionT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp
     testing/AttentionTestHarness.cpp
@@ -530,6 +558,9 @@ add_library(llaminar2_core STATIC
     # Generated GEMM microkernel template instantiations (1225 total across 64 files)
     kernels/cpu/gemm/GemmMicroKernelInit.cpp
     ${MICROKERNEL_INSTANTIATION_SOURCES}
+    # Generated Integer GEMM kernel template instantiations (8000 total across 64 files)
+    # Fixed: Added IQ8_0Decodable interface constraint via std::is_base_of static_assert
+    ${INTEGER_GEMM_INSTANTIATION_SOURCES}
 )
 
 target_include_directories(llaminar2_core PUBLIC 
@@ -653,6 +684,15 @@ endif()
 target_compile_definitions(llaminar2_core PUBLIC HAVE_OPENBLAS)
 target_link_libraries(llaminar2_core PUBLIC ${OPENBLAS_LIBRARIES})
 message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
+
+# =============================================================================
+# libmvec (GCC Vector Math Library for vectorized exp/log/sin/cos)
+# =============================================================================
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # libmvec is part of glibc, link with -lmvec
+    target_link_libraries(llaminar2_core PUBLIC mvec)
+    message(STATUS "V2: Linked libmvec for vectorized math (exp, log, sin, cos)")
+endif()
 
 # =============================================================================
 # OneDNN Configuration (INT8/BF16 optimization, replaces MKL)

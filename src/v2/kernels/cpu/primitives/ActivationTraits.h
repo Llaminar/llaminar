@@ -255,6 +255,65 @@ namespace llaminar2::primitives
     };
 
     // ============================================================================
+    // Q8_0Tensor Specialization
+    // ============================================================================
+
+    template <>
+    struct ActivationTraits<Q8_0Tensor>
+    {
+        using ElementType = int8_t; // Q8_0 stores int8_t quantized values
+
+        /**
+         * @brief Apply softmax to Q8_0 activation scores
+         *
+         * Q8_0 activations must be dequantized to FP32 for softmax.
+         * Softmax operates on probabilities (0-1 range), not quantized values.
+         */
+        static void apply_softmax(int8_t *scores, int rows, int cols, bool causal, float scale)
+        {
+            // NOTE: This should never be called directly on Q8_0 quantized data!
+            // CPUAttentionT should dequantize to FP32 workspace before softmax.
+            // If you hit this, the attention kernel has a bug.
+            throw std::runtime_error("Q8_0 softmax requires FP32 workspace - must dequantize first!");
+        }
+
+        /**
+         * @brief Create Q8_0 GEMM kernel for activations
+         *
+         * Returns INT8×IQ4_NL VNNI GEMM kernel.
+         * NOTE: This assumes weights are IQ4_NL quantized!
+         */
+        static std::unique_ptr<ITensorGemm> create_activation_gemm()
+        {
+            // For Q8_0 activations, use INT8 GEMM kernel
+            // NOTE: Requires weights to be quantized format (IQ4_NL, Q6_K, etc.)
+            Q8_0Tensor dummy({1, 1}, std::vector<uint8_t>(34)); // Minimal valid Q8_0 block
+            return dummy.createGemm();
+        }
+
+        /**
+         * @brief Allocate Q8_0 workspace tensor
+         *
+         * NOTE: For attention, workspaces are typically FP32 (scores, softmax output).
+         * Q8_0 workspaces are only used for activation storage, not intermediate results.
+         */
+        static std::shared_ptr<TensorBase> allocate_workspace(const std::vector<size_t> &shape)
+        {
+            // Calculate required bytes for Q8_0 format
+            size_t n_elems = 1;
+            for (auto dim : shape)
+            {
+                n_elems *= dim;
+            }
+            size_t n_blocks = (n_elems + 31) / 32; // 32 elements per Q8_0Block
+            size_t n_bytes = n_blocks * 34;        // 34 bytes per Q8_0Block
+
+            std::vector<uint8_t> raw_data(n_bytes, 0);
+            return std::make_shared<Q8_0Tensor>(shape, raw_data);
+        }
+    };
+
+    // ============================================================================
     // Helper: Detect Tensor Type from Pointer (Optional Utility)
     // ============================================================================
 

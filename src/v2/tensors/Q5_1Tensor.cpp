@@ -119,16 +119,6 @@ namespace llaminar2
         return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
     std::shared_ptr<TensorBase> Q5_1Tensor::create_view(
         const std::vector<size_t> &new_shape,
         size_t offset)
@@ -455,6 +445,49 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    void Q5_1Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q5_1Tensor::decode_to_q8_0: output must not be null");
+        }
+
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q5_1Tensor::decode_to_q8_0: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q5_1Tensor::decode_to_q8_0: row index out of bounds");
+        }
+
+        const size_t cols = shape_[1];
+        const size_t blocks_per_row = (cols + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
+
+        if (k_block_offset >= blocks_per_row)
+        {
+            throw std::out_of_range("Q5_1Tensor::decode_to_q8_0: block offset out of bounds");
+        }
+
+        // Get Q5_1 block
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
+        const Q5_1Block &q5_block = blocks[row_idx * blocks_per_row + k_block_offset];
+
+        // Use SIMD helper to decode Q5_1 → Q8_0
+        uint16_t q8_scale_fp16;
+        simd::decode_q5_1_to_q8_0(
+            q5_block.qs,     // Q5 lower 4 bits
+            q5_block.qh,     // Q5 high bits
+            q5_block.d,      // Q5 scale (FP16)
+            q5_block.m,      // Q5 min (FP16)
+            output->qs,      // Q8 output values
+            &q8_scale_fp16); // Q8 output scale (FP16)
+
+        output->d = q8_scale_fp16;
     }
 
 } // namespace llaminar2

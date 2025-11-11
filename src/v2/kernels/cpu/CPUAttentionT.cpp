@@ -19,5 +19,6 @@ namespace llaminar2
     template class CPUAttentionT<BF16Tensor>;
     template class CPUAttentionT<FP16Tensor>;
     template class CPUAttentionT<INT32Tensor>;
+    template class CPUAttentionT<Q8_0Tensor>;
 
 } // namespace llaminar2

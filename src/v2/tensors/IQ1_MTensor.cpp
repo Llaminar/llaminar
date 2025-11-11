@@ -225,17 +225,7 @@ namespace llaminar2
         throw std::runtime_error("IQ1_MTensor::mutable_data: quantized tensors are immutable");
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
-    bool IQ1_MTensor::copyFrom(const TensorBase *src)
+        bool IQ1_MTensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
@@ -356,6 +346,28 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    void IQ1_MTensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        // Get raw data pointer (view-aware)
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
+
+        // Calculate super-block index (8 Q8_0 blocks per IQ1_M super-block)
+        size_t blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
+        size_t super_block_idx = k_block_offset / 8;
+
+        const IQ1_MBlock &super_block = blocks[row_idx * blocks_per_row + super_block_idx];
+
+        // Extract global scale once (shared across all sub-blocks)
+        float global_scale = simd::extract_iq1m_global_scale(super_block);
+
+        // Decode all 8 sub-blocks (each sub-block = 32 elements = 1 Q8_0 block)
+        for (size_t sub_idx = 0; sub_idx < 8; ++sub_idx)
+        {
+            simd::decode_iq1m_to_q8_0(super_block, sub_idx, global_scale, output[sub_idx].qs, &output[sub_idx].d);
+        }
     }
 
 } // namespace llaminar2

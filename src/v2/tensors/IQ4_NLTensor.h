@@ -64,7 +64,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
-#include <stdexpr>
+#include <cstddef>
 #include <algorithm>
 
 // V2 utilities (minimal portable implementations)

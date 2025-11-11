@@ -185,16 +185,6 @@ namespace llaminar2
         throw std::runtime_error("Q8_0Tensor::mutable_data: quantized tensors are immutable");
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
         // Use generic QuantizedGemmKernel with ITensorGemmTileDataProvider interface
@@ -393,6 +383,30 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    void Q8_0Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        // Q8_0 is already in Q8_0 format - just copy the block directly
+        const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
+
+        // Bounds check
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q8_0Tensor::decode_to_q8_0: row_idx out of range");
+        }
+        if (k_block_offset >= blocks_per_row)
+        {
+            throw std::out_of_range("Q8_0Tensor::decode_to_q8_0: k_block_offset exceeds blocks per row");
+        }
+
+        // Get pointer to source Q8_0 block
+        const uint8_t *data_ptr = is_view_ ? raw_data_ptr_ + view_byte_offset_ : raw_data_.data();
+        const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
+        const Q8_0Block &source_block = blocks[row_idx * blocks_per_row + k_block_offset];
+
+        // Direct copy - Q8_0 to Q8_0 (no conversion needed)
+        *output = source_block;
     }
 
 } // namespace llaminar2

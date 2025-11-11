@@ -9,10 +9,15 @@
  * Functions are inline and header-only for zero-cost abstraction.
  */
 
+#include "BlockStructures.h" // Must be included FIRST (defines all block structures)
+#include "IQQuantTables.h"   // Lookup tables: kvalues_iq4nl, iq2xxs_grid, etc.
 #include "../utils/CPUFeatures.h"
 #include "FP16Utils.h"
 #include <cstdint>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <stdexcept>
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -680,6 +685,3458 @@ namespace llaminar2
             {
                 dst[i] = fp32_to_fp16(src[i]);
             }
+        }
+
+        // ==========================================
+        // FP32 to Q8_0 Quantization (for TensorBase::to_q8_0())
+        // ==========================================
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_0 format (scalar)
+         * @param src Source FP32 values (must be at least 32 elements)
+         * @param count Number of elements (ignored - always processes 32 for Q8_0)
+         * @param dst_qs Destination for int8 quantized values
+         * @param dst_scale_fp16 Destination for FP16 scale
+         */
+        inline void quantize_fp32_to_q8_0_scalar(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16)
+        {
+            // Q8_0 blocks are always 32 elements - ignore count parameter
+            (void)count;
+
+            // Find max absolute value
+            float max_abs = 0.0f;
+            for (int i = 0; i < 32; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(src[i]));
+            }
+
+            // Handle zero input - scale of 0 means all quantized values are 0
+            if (max_abs == 0.0f)
+            {
+                *dst_scale_fp16 = 0;
+                std::memset(dst_qs, 0, 32);
+                return;
+            }
+
+            // Calculate scale (clamp to avoid overflow in FP16)
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+            { // Max FP16 value
+                scale = 65504.0f;
+            }
+            float inv_scale = 1.0f / scale;
+
+            // Quantize to int8
+            for (int i = 0; i < 32; ++i)
+            {
+                float val = src[i] * inv_scale;
+                dst_qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, val))));
+            }
+
+            // Store FP16 scale
+            *dst_scale_fp16 = fp32_to_fp16(scale);
+        }
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_0 format (AVX-512)
+         */
+        inline void quantize_fp32_to_q8_0_avx512(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16)
+        {
+#if defined(__AVX512F__)
+            (void)count; // Always 32 for Q8_0
+
+            // Load 32 FP32 values
+            __m512 v0 = _mm512_loadu_ps(src);
+            __m512 v1 = _mm512_loadu_ps(src + 16);
+
+            // Compute absolute values
+            __m512 abs0 = _mm512_abs_ps(v0);
+            __m512 abs1 = _mm512_abs_ps(v1);
+
+            // Find max across both vectors
+            __m512 max_vec = _mm512_max_ps(abs0, abs1);
+            float max_abs = _mm512_reduce_max_ps(max_vec);
+
+            // Handle zero input
+            if (max_abs == 0.0f)
+            {
+                *dst_scale_fp16 = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_qs), _mm256_setzero_si256());
+                return;
+            }
+
+            // Calculate scale
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+            {
+                scale = 65504.0f;
+            }
+            float inv_scale = 1.0f / scale;
+            __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+
+            // Quantize: multiply by inv_scale, round, clamp to [-127, 127]
+            __m512 scaled0 = _mm512_mul_ps(v0, inv_scale_vec);
+            __m512 scaled1 = _mm512_mul_ps(v1, inv_scale_vec);
+
+            // Round to nearest
+            __m512 rounded0 = _mm512_roundscale_ps(scaled0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512 rounded1 = _mm512_roundscale_ps(scaled1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            // Clamp to [-127, 127]
+            __m512 min_val = _mm512_set1_ps(-127.0f);
+            __m512 max_val = _mm512_set1_ps(127.0f);
+            __m512 clamped0 = _mm512_min_ps(_mm512_max_ps(rounded0, min_val), max_val);
+            __m512 clamped1 = _mm512_min_ps(_mm512_max_ps(rounded1, min_val), max_val);
+
+            // Convert to int32
+            __m512i i32_0 = _mm512_cvtps_epi32(clamped0);
+            __m512i i32_1 = _mm512_cvtps_epi32(clamped1);
+
+            // Convert int32 → int8 (pack 16+16 → 32 int8)
+            __m256i i16_0 = _mm512_cvtepi32_epi16(i32_0);
+            __m256i i16_1 = _mm512_cvtepi32_epi16(i32_1);
+            __m256i i8_result = _mm256_packs_epi16(i16_0, i16_1);
+
+            // Permute to correct order (packs interleaves 128-bit lanes)
+            const __m256i perm_idx = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+            i8_result = _mm256_permutevar8x32_epi32(i8_result, perm_idx);
+
+            // Store result
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_qs), i8_result);
+            *dst_scale_fp16 = fp32_to_fp16(scale);
+#else
+            quantize_fp32_to_q8_0_scalar(src, count, dst_qs, dst_scale_fp16);
+#endif
+        }
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_0 format (AVX2)
+         */
+        inline void quantize_fp32_to_q8_0_avx2(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16)
+        {
+#ifdef __AVX2__
+            (void)count; // Always 32 for Q8_0
+
+            // Load 32 FP32 values (4 x 8 elements)
+            __m256 v0 = _mm256_loadu_ps(src);
+            __m256 v1 = _mm256_loadu_ps(src + 8);
+            __m256 v2 = _mm256_loadu_ps(src + 16);
+            __m256 v3 = _mm256_loadu_ps(src + 24);
+
+            // Compute absolute values
+            __m256 sign_mask = _mm256_set1_ps(-0.0f);
+            __m256 abs0 = _mm256_andnot_ps(sign_mask, v0);
+            __m256 abs1 = _mm256_andnot_ps(sign_mask, v1);
+            __m256 abs2 = _mm256_andnot_ps(sign_mask, v2);
+            __m256 abs3 = _mm256_andnot_ps(sign_mask, v3);
+
+            // Find max across all vectors
+            __m256 max01 = _mm256_max_ps(abs0, abs1);
+            __m256 max23 = _mm256_max_ps(abs2, abs3);
+            __m256 max_all = _mm256_max_ps(max01, max23);
+
+            // Horizontal max within 256-bit vector
+            __m128 max_high = _mm256_extractf128_ps(max_all, 1);
+            __m128 max_low = _mm256_castps256_ps128(max_all);
+            __m128 max_hl = _mm_max_ps(max_high, max_low);
+            max_hl = _mm_max_ps(max_hl, _mm_movehl_ps(max_hl, max_hl));
+            max_hl = _mm_max_ss(max_hl, _mm_movehdup_ps(max_hl));
+            float max_abs = _mm_cvtss_f32(max_hl);
+
+            // Handle zero input
+            if (max_abs == 0.0f)
+            {
+                *dst_scale_fp16 = 0;
+                std::memset(dst_qs, 0, 32);
+                return;
+            }
+
+            // Calculate scale
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+            {
+                scale = 65504.0f;
+            }
+            float inv_scale = 1.0f / scale;
+            __m256 inv_scale_vec = _mm256_set1_ps(inv_scale);
+
+            // Quantize: multiply, round, clamp
+            __m256 scaled0 = _mm256_mul_ps(v0, inv_scale_vec);
+            __m256 scaled1 = _mm256_mul_ps(v1, inv_scale_vec);
+            __m256 scaled2 = _mm256_mul_ps(v2, inv_scale_vec);
+            __m256 scaled3 = _mm256_mul_ps(v3, inv_scale_vec);
+
+            // Round to nearest
+            __m256 rounded0 = _mm256_round_ps(scaled0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 rounded1 = _mm256_round_ps(scaled1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 rounded2 = _mm256_round_ps(scaled2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 rounded3 = _mm256_round_ps(scaled3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            // Clamp to [-127, 127]
+            __m256 min_val = _mm256_set1_ps(-127.0f);
+            __m256 max_val = _mm256_set1_ps(127.0f);
+            __m256 clamped0 = _mm256_min_ps(_mm256_max_ps(rounded0, min_val), max_val);
+            __m256 clamped1 = _mm256_min_ps(_mm256_max_ps(rounded1, min_val), max_val);
+            __m256 clamped2 = _mm256_min_ps(_mm256_max_ps(rounded2, min_val), max_val);
+            __m256 clamped3 = _mm256_min_ps(_mm256_max_ps(rounded3, min_val), max_val);
+
+            // Convert to int32
+            __m256i i32_0 = _mm256_cvtps_epi32(clamped0);
+            __m256i i32_1 = _mm256_cvtps_epi32(clamped1);
+            __m256i i32_2 = _mm256_cvtps_epi32(clamped2);
+            __m256i i32_3 = _mm256_cvtps_epi32(clamped3);
+
+            // Store as int32 arrays and pack manually (AVX2 pack is tricky with lane ordering)
+            int32_t temp_i32[32];
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(&temp_i32[0]), i32_0);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(&temp_i32[8]), i32_1);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(&temp_i32[16]), i32_2);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(&temp_i32[24]), i32_3);
+
+            // Pack to int8
+            for (int i = 0; i < 32; ++i)
+            {
+                dst_qs[i] = static_cast<int8_t>(temp_i32[i]);
+            }
+
+            *dst_scale_fp16 = fp32_to_fp16(scale);
+#else
+            quantize_fp32_to_q8_0_scalar(src, count, dst_qs, dst_scale_fp16);
+#endif
+        }
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_0 format (auto-dispatch)
+         */
+        inline void quantize_fp32_to_q8_0(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16)
+        {
+#if defined(__AVX512F__)
+            quantize_fp32_to_q8_0_avx512(src, count, dst_qs, dst_scale_fp16);
+#elif defined(__AVX2__)
+            quantize_fp32_to_q8_0_avx2(src, count, dst_qs, dst_scale_fp16);
+#else
+            quantize_fp32_to_q8_0_scalar(src, count, dst_qs, dst_scale_fp16);
+#endif
+        }
+
+        // ==========================================
+        // Q6_K to Q8_0 Decode (32-element sub-blocks)
+        // ==========================================
+
+        /**
+         * @brief Decode one Q6_K sub-block (32 elements) to Q8_0 format (scalar)
+         */
+        inline void decode_q6_k_to_q8_0_scalar(
+            const Q6_KBlock &q6k_block,
+            size_t sub_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (sub_idx > 7)
+            {
+                throw std::out_of_range("decode_q6_k_to_q8_0_scalar: sub_idx must be 0-7");
+            }
+
+            // Decode Q6_K → FP32 (using existing logic from Q6_KTensor)
+            float fp32_values[32];
+
+            // Hierarchical scaling: super-block d, then sub-block scale
+            const float d = fp16_to_fp32(q6k_block.d);
+            const int8_t sc = q6k_block.scales[sub_idx];
+            const float block_scale = d * sc;
+
+            const uint8_t *ql = q6k_block.ql + (sub_idx * 16); // 16 bytes for 32× 4-bit low
+            const uint8_t *qh = q6k_block.qh + (sub_idx * 8);  // 8 bytes for 32× 2-bit high
+
+            for (int j = 0; j < 32; ++j)
+            {
+                const int byte_idx = j / 2;
+                const int shift = (j % 2) * 4;
+                const uint8_t q4_low = (ql[byte_idx] >> shift) & 0x0F;
+
+                const int qh_byte = j / 4;
+                const int qh_shift = (j % 4) * 2;
+                const uint8_t q2_high = (qh[qh_byte] >> qh_shift) & 0x03;
+
+                const uint8_t q6 = (q2_high << 4) | q4_low;
+                const int8_t q_signed = static_cast<int8_t>(q6) - 32;
+
+                fp32_values[j] = block_scale * q_signed;
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_values, 32, q8_qs, q8_scale);
+        }
+
+        /**
+         * @brief Q6_K to Q8_0 decode (AVX2 - currently aliased to scalar)
+         */
+        inline void decode_q6_k_to_q8_0_avx2(
+            const Q6_KBlock &q6k_block,
+            size_t sub_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            decode_q6_k_to_q8_0_scalar(q6k_block, sub_idx, q8_qs, q8_scale);
+        }
+
+        /**
+         * @brief Q6_K to Q8_0 decode (AVX-512 - currently aliased to scalar)
+         */
+        inline void decode_q6_k_to_q8_0_avx512(
+            const Q6_KBlock &q6k_block,
+            size_t sub_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            decode_q6_k_to_q8_0_scalar(q6k_block, sub_idx, q8_qs, q8_scale);
+        }
+
+        /**
+         * @brief Q6_K to Q8_0 decode (auto-dispatch wrapper)
+         */
+        inline void decode_q6_k_to_q8_0(
+            const Q6_KBlock &q6k_block,
+            size_t sub_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            decode_q6_k_to_q8_0_scalar(q6k_block, sub_idx, q8_qs, q8_scale);
+        }
+
+        // ==========================================
+        // Stub decode functions for other formats
+        // ==========================================
+
+        /**
+         * @brief Decode Q4_0 block to Q8_0 format (scalar)
+         * Q4_0: 32 elements, 4-bit quantization, 1 scale
+         */
+        inline void decode_q4_0_to_q8_0_scalar(
+            const uint8_t *qs,      // 16 bytes: packed 4-bit values
+            uint16_t d_fp16,        // FP16 scale
+            int8_t *output_qs,      // 32 bytes: Q8_0 quantized output
+            uint16_t *output_d_fp16 // FP16 scale for Q8_0
+        )
+        {
+            // Decode 4-bit → FP32 (32 elements)
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                // Extract low and high nibbles, shift to [-8, 7] range
+                int8_t v0 = static_cast<int8_t>((qs[i] & 0xF) - 8);
+                int8_t v1 = static_cast<int8_t>((qs[i] >> 4) - 8);
+
+                fp32_vals[2 * i] = v0 * scale;
+                fp32_vals[2 * i + 1] = v1 * scale;
+            }
+
+            // Quantize to Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_vals, 32, output_qs, output_d_fp16);
+        }
+
+        /**
+         * @brief Decode Q4_0 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_q4_0_to_q8_0_avx512(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__)
+            // Decode to FP32 (scalar - nibble extraction is complex to vectorize)
+            // The speedup comes from quantize_fp32_to_q8_0_avx512
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                int8_t v0 = (qs[i] & 0xF) - 8;
+                int8_t v1 = (qs[i] >> 4) - 8;
+                fp32_vals[2 * i] = v0 * scale;
+                fp32_vals[2 * i + 1] = v1 * scale;
+            }
+
+            // Quantize to Q8_0 using AVX-512
+            quantize_fp32_to_q8_0_avx512(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q4_0_to_q8_0_scalar(qs, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q4_0 block to Q8_0 format (AVX2)
+         */
+        inline void decode_q4_0_to_q8_0_avx2(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#ifdef __AVX2__
+            // Decode to FP32 (scalar - nibble extraction is complex to vectorize)
+            // The speedup comes from quantize_fp32_to_q8_0_avx2
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                int8_t v0 = (qs[i] & 0xF) - 8;
+                int8_t v1 = (qs[i] >> 4) - 8;
+                fp32_vals[2 * i] = v0 * scale;
+                fp32_vals[2 * i + 1] = v1 * scale;
+            }
+
+            // Quantize to Q8_0 using AVX2
+            quantize_fp32_to_q8_0_avx2(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q4_0_to_q8_0_scalar(qs, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q4_0 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_q4_0_to_q8_0(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_q4_0_to_q8_0_avx512(qs, d_fp16, output_qs, output_d_fp16);
+#elif defined(__AVX2__)
+            decode_q4_0_to_q8_0_avx2(qs, d_fp16, output_qs, output_d_fp16);
+#else
+            decode_q4_0_to_q8_0_scalar(qs, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q4_1 block to Q8_0 format (scalar)
+         * Q4_1: 32 elements, 4-bit quantization, 1 scale + 1 offset
+         */
+        inline void decode_q4_1_to_q8_0_scalar(
+            const uint8_t *qs,      // 16 bytes: packed 4-bit values
+            uint16_t d_fp16,        // FP16 scale
+            uint16_t m_fp16,        // FP16 offset (min value)
+            int8_t *output_qs,      // 32 bytes: Q8_0 quantized output
+            uint16_t *output_d_fp16 // FP16 scale for Q8_0
+        )
+        {
+            // Decode 4-bit → FP32 with offset (32 elements)
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+            float offset = fp16_to_fp32(m_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                // Extract nibbles [0,15] (no subtraction like Q4_0)
+                uint8_t v0 = qs[i] & 0x0F;
+                uint8_t v1 = qs[i] >> 4;
+
+                fp32_vals[2 * i] = v0 * scale + offset;
+                fp32_vals[2 * i + 1] = v1 * scale + offset;
+            }
+
+            // Quantize to Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_vals, 32, output_qs, output_d_fp16);
+        }
+
+        /**
+         * @brief Decode Q4_1 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_q4_1_to_q8_0_avx512(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__)
+            // Decode to FP32 (scalar - nibble extraction is complex to vectorize)
+            // The speedup comes from quantize_fp32_to_q8_0_avx512
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+            float offset = fp16_to_fp32(m_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                uint8_t v0 = qs[i] & 0xF; // [0, 15]
+                uint8_t v1 = qs[i] >> 4;  // [0, 15]
+                fp32_vals[2 * i] = v0 * scale + offset;
+                fp32_vals[2 * i + 1] = v1 * scale + offset;
+            }
+
+            // Quantize to Q8_0 using AVX-512
+            quantize_fp32_to_q8_0_avx512(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q4_1_to_q8_0_scalar(qs, d_fp16, m_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q4_1 block to Q8_0 format (AVX2)
+         */
+        inline void decode_q4_1_to_q8_0_avx2(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#ifdef __AVX2__
+            // Decode to FP32 (scalar - nibble extraction is complex to vectorize)
+            // The speedup comes from quantize_fp32_to_q8_0_avx2
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+            float offset = fp16_to_fp32(m_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                uint8_t v0 = qs[i] & 0xF; // [0, 15]
+                uint8_t v1 = qs[i] >> 4;  // [0, 15]
+                fp32_vals[2 * i] = v0 * scale + offset;
+                fp32_vals[2 * i + 1] = v1 * scale + offset;
+            }
+
+            // Quantize to Q8_0 using AVX2
+            quantize_fp32_to_q8_0_avx2(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q4_1_to_q8_0_scalar(qs, d_fp16, m_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q4_1 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_q4_1_to_q8_0(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_q4_1_to_q8_0_avx512(qs, d_fp16, m_fp16, output_qs, output_d_fp16);
+#elif defined(__AVX2__)
+            decode_q4_1_to_q8_0_avx2(qs, d_fp16, m_fp16, output_qs, output_d_fp16);
+#else
+            decode_q4_1_to_q8_0_scalar(qs, d_fp16, m_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q5_0 block to Q8_0 format (scalar)
+         * Q5_0: 32 elements, 5-bit quantization (4 low + 1 high), 1 scale
+         */
+        inline void decode_q5_0_to_q8_0_scalar(
+            const uint8_t *qs, // 16 bytes: 4 low bits
+            const uint8_t *qh, // 4 bytes: 1 high bit per element
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                // Extract 4 low bits from qs
+                uint8_t nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
+
+                // Extract 1 high bit from qh
+                uint8_t high_bit = (qh[i / 8] >> (i % 8)) & 1;
+
+                // Combine: 5-bit value in [-16, 15]
+                int8_t val = static_cast<int8_t>((nibble | (high_bit << 4)) - 16);
+
+                fp32_vals[i] = val * scale;
+            }
+
+            quantize_fp32_to_q8_0_scalar(fp32_vals, 32, output_qs, output_d_fp16);
+        }
+
+        /**
+         * @brief Decode Q5_0 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_q5_0_to_q8_0_avx512(
+            const uint8_t *qs,
+            const uint8_t *qh,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            // Scalar unpacking (simpler and avoids lane ordering bugs)
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                uint8_t nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
+                uint8_t high_bit = (qh[i / 8] >> (i % 8)) & 1;
+                int8_t val = static_cast<int8_t>((nibble | (high_bit << 4)) - 16);
+                fp32_vals[i] = val * scale;
+            }
+
+            quantize_fp32_to_q8_0_avx512(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q5_0_to_q8_0_scalar(qs, qh, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q5_0 block to Q8_0 format (AVX2)
+         */
+        inline void decode_q5_0_to_q8_0_avx2(
+            const uint8_t *qs,
+            const uint8_t *qh,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#ifdef __AVX2__
+            // Scalar unpacking (simpler and avoids lane ordering bugs)
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                uint8_t nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
+                uint8_t high_bit = (qh[i / 8] >> (i % 8)) & 1;
+                int8_t val = static_cast<int8_t>((nibble | (high_bit << 4)) - 16);
+                fp32_vals[i] = val * scale;
+            }
+
+            quantize_fp32_to_q8_0_avx2(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q5_0_to_q8_0_scalar(qs, qh, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q5_0 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_q5_0_to_q8_0(
+            const uint8_t *qs,
+            const uint8_t *qh,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_q5_0_to_q8_0_avx512(qs, qh, d_fp16, output_qs, output_d_fp16);
+#elif defined(__AVX2__)
+            decode_q5_0_to_q8_0_avx2(qs, qh, d_fp16, output_qs, output_d_fp16);
+#else
+            decode_q5_0_to_q8_0_scalar(qs, qh, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q5_1 block to Q8_0 format (scalar)
+         * Q5_1: 32 elements, 5-bit quantization (4 low + 1 high), 1 scale + 1 offset
+         */
+        inline void decode_q5_1_to_q8_0_scalar(
+            const uint8_t *qs, // 16 bytes: 4 low bits
+            const uint8_t *qh, // 4 bytes: 1 high bit per element
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+            float offset = fp16_to_fp32(m_fp16);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                // Extract 4 low bits
+                uint8_t nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
+
+                // Extract 1 high bit
+                uint8_t high_bit = (qh[i / 8] >> (i % 8)) & 1;
+
+                // Combine: 5-bit value in [0, 31] (no -16 offset like Q5_0)
+                uint8_t val = nibble | (high_bit << 4);
+
+                fp32_vals[i] = val * scale + offset;
+            }
+
+            quantize_fp32_to_q8_0_scalar(fp32_vals, 32, output_qs, output_d_fp16);
+        }
+
+        /**
+         * @brief Decode Q5_1 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_q5_1_to_q8_0_avx512(
+            const uint8_t *qs,
+            const uint8_t *qh,
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            // Scalar unpacking (simpler and avoids lane ordering bugs)
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+            float offset = fp16_to_fp32(m_fp16);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                uint8_t nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
+                uint8_t high_bit = (qh[i / 8] >> (i % 8)) & 1;
+                uint8_t val = nibble | (high_bit << 4);
+                fp32_vals[i] = val * scale + offset;
+            }
+
+            quantize_fp32_to_q8_0_avx512(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q5_1_to_q8_0_scalar(qs, qh, d_fp16, m_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q5_1 block to Q8_0 format (AVX2)
+         */
+        inline void decode_q5_1_to_q8_0_avx2(
+            const uint8_t *qs,
+            const uint8_t *qh,
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#ifdef __AVX2__
+            // Scalar unpacking (simpler and avoids lane ordering bugs)
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+            float offset = fp16_to_fp32(m_fp16);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                uint8_t nibble = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
+                uint8_t high_bit = (qh[i / 8] >> (i % 8)) & 1;
+                uint8_t val = nibble | (high_bit << 4);
+                fp32_vals[i] = val * scale + offset;
+            }
+
+            quantize_fp32_to_q8_0_avx2(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_q5_1_to_q8_0_scalar(qs, qh, d_fp16, m_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode Q5_1 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_q5_1_to_q8_0(
+            const uint8_t *qs,
+            const uint8_t *qh,
+            uint16_t d_fp16,
+            uint16_t m_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_q5_1_to_q8_0_avx512(qs, qh, d_fp16, m_fp16, output_qs, output_d_fp16);
+#elif defined(__AVX2__)
+            decode_q5_1_to_q8_0_avx2(qs, qh, d_fp16, m_fp16, output_qs, output_d_fp16);
+#else
+            decode_q5_1_to_q8_0_scalar(qs, qh, d_fp16, m_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode IQ4_NL block to Q8_0 format (scalar)
+         * IQ4_NL: 32 elements, 4-bit indices → lookup table → scale
+         */
+        inline void decode_iq4nl_to_q8_0_scalar(
+            const uint8_t *qs, // 16 bytes: packed 4-bit indices
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+            // IQ4_NL lookup table (from IQQuantTables.h)
+            static constexpr float kvalues_iq4nl[16] = {
+                -127.0f, -104.0f, -83.0f, -65.0f,
+                -49.0f, -35.0f, -22.0f, -10.0f,
+                1.0f, 13.0f, 25.0f, 38.0f,
+                53.0f, 69.0f, 89.0f, 113.0f};
+
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            // Decode 32 values via lookup table
+            for (int i = 0; i < 16; ++i)
+            {
+                uint8_t qbyte = qs[i];
+                uint8_t idx_low = qbyte & 0x0F;
+                uint8_t idx_high = qbyte >> 4;
+
+                fp32_vals[i] = scale * kvalues_iq4nl[idx_low];
+                fp32_vals[i + 16] = scale * kvalues_iq4nl[idx_high];
+            }
+
+            quantize_fp32_to_q8_0_scalar(fp32_vals, 32, output_qs, output_d_fp16);
+        }
+
+        /**
+         * @brief Decode IQ4_NL block to Q8_0 format (AVX-512)
+         */
+        inline void decode_iq4nl_to_q8_0_avx512(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            // IQ4_NL lookup table
+            static constexpr float kvalues_iq4nl[16] = {
+                -127.0f, -104.0f, -83.0f, -65.0f,
+                -49.0f, -35.0f, -22.0f, -10.0f,
+                1.0f, 13.0f, 25.0f, 38.0f,
+                53.0f, 69.0f, 89.0f, 113.0f};
+
+            // Scalar unpacking with lookup table
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                uint8_t qbyte = qs[i];
+                uint8_t idx_low = qbyte & 0x0F;
+                uint8_t idx_high = qbyte >> 4;
+
+                fp32_vals[i] = scale * kvalues_iq4nl[idx_low];
+                fp32_vals[i + 16] = scale * kvalues_iq4nl[idx_high];
+            }
+
+            quantize_fp32_to_q8_0_avx512(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_iq4nl_to_q8_0_scalar(qs, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode IQ4_NL block to Q8_0 format (AVX2)
+         */
+        inline void decode_iq4nl_to_q8_0_avx2(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#ifdef __AVX2__
+            // IQ4_NL lookup table
+            static constexpr float kvalues_iq4nl[16] = {
+                -127.0f, -104.0f, -83.0f, -65.0f,
+                -49.0f, -35.0f, -22.0f, -10.0f,
+                1.0f, 13.0f, 25.0f, 38.0f,
+                53.0f, 69.0f, 89.0f, 113.0f};
+
+            // Scalar unpacking with lookup table
+            float fp32_vals[32];
+            float scale = fp16_to_fp32(d_fp16);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                uint8_t qbyte = qs[i];
+                uint8_t idx_low = qbyte & 0x0F;
+                uint8_t idx_high = qbyte >> 4;
+
+                fp32_vals[i] = scale * kvalues_iq4nl[idx_low];
+                fp32_vals[i + 16] = scale * kvalues_iq4nl[idx_high];
+            }
+
+            quantize_fp32_to_q8_0_avx2(fp32_vals, 32, output_qs, output_d_fp16);
+#else
+            decode_iq4nl_to_q8_0_scalar(qs, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        /**
+         * @brief Decode IQ4_NL block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_iq4nl_to_q8_0(
+            const uint8_t *qs,
+            uint16_t d_fp16,
+            int8_t *output_qs,
+            uint16_t *output_d_fp16)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_iq4nl_to_q8_0_avx512(qs, d_fp16, output_qs, output_d_fp16);
+#elif defined(__AVX2__)
+            decode_iq4nl_to_q8_0_avx2(qs, d_fp16, output_qs, output_d_fp16);
+#else
+            decode_iq4nl_to_q8_0_scalar(qs, d_fp16, output_qs, output_d_fp16);
+#endif
+        }
+
+        // =====================================================================
+        // IQ4_XS → Q8_0 (256-element super-blocks with per-sub-block scales)
+        // =====================================================================
+
+        /**
+         * @brief Scalar decode IQ4_XS to Q8_0 (one 32-element sub-block from 256-element super-block)
+         * @param block IQ4_XS super-block (256 elements, 136 bytes)
+         * @param subblock_idx Which 32-element sub-block to decode (0-7)
+         * @param q8_qs Output Q8_0 quantized values (32 int8_t)
+         * @param q8_scale Output Q8_0 scale (FP16)
+         */
+        inline void decode_iq4xs_to_q8_0_scalar(
+            const IQ4_XSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq4xs_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 16; // 16 bytes = 32 nibbles
+
+            // Extract 6-bit scale: 4 bits from scales_l + 2 bits from scales_h
+            const size_t ib = subblock_idx;
+            const int ls = ((block.scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) |
+                           (((block.scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+
+            // Decode 16 pairs of 4-bit values using kvalues_iq4nl lookup
+            for (size_t j = 0; j < 16; ++j)
+            {
+                tmp[j] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                tmp[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief AVX-512 decode IQ4_XS to Q8_0
+         */
+        inline void decode_iq4xs_to_q8_0_avx512(
+            const IQ4_XSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq4xs_to_q8_0_avx512: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 16;
+
+            // Extract 6-bit scale
+            const size_t ib = subblock_idx;
+            const int ls = ((block.scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) |
+                           (((block.scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+
+            // Scalar unpacking + SIMD quantization pattern
+            for (size_t j = 0; j < 16; ++j)
+            {
+                tmp[j] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                tmp[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+
+            quantize_fp32_to_q8_0_avx512(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+#ifdef __AVX2__
+        /**
+         * @brief AVX2 decode IQ4_XS to Q8_0
+         */
+        inline void decode_iq4xs_to_q8_0_avx2(
+            const IQ4_XSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq4xs_to_q8_0_avx2: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 16;
+
+            // Extract 6-bit scale
+            const size_t ib = subblock_idx;
+            const int ls = ((block.scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) |
+                           (((block.scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+
+            // Scalar unpacking + SIMD quantization
+            for (size_t j = 0; j < 16; ++j)
+            {
+                tmp[j] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                tmp[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+
+            quantize_fp32_to_q8_0_avx2(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ4_XS to Q8_0 decode
+         */
+        inline void decode_iq4xs_to_q8_0(
+            const IQ4_XSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_iq4xs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            decode_iq4xs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+#else
+            decode_iq4xs_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // =====================================================================
+        // IQ2_XXS → Q8_0 (256-element super-blocks with grid lookup)
+        // =====================================================================
+
+        /**
+         * @brief Scalar decode IQ2_XXS to Q8_0 (one 32-element sub-block from 256-element super-block)
+         * @param block IQ2_XXS super-block (256 elements, 66 bytes)
+         * @param subblock_idx Which 32-element sub-block to decode (0-7)
+         * @param q8_qs Output Q8_0 quantized values (32 int8_t)
+         * @param q8_scale Output Q8_0 scale (FP16)
+         */
+        inline void decode_iq2xxs_to_q8_0_scalar(
+            const IQ2_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq2xxs_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+
+            // Extract 8 bytes (4 uint16_t) for this sub-block
+            uint32_t aux32[2];
+            const uint8_t *aux8 = reinterpret_cast<const uint8_t *>(aux32);
+            std::memcpy(aux32, &block.qs[4 * subblock_idx], 2 * sizeof(uint32_t));
+
+            // Sub-block scale: d * (0.5 + (aux32[1] >> 28)) * 0.25
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+
+            // Decode 4 groups of 8 elements using grid lookup
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint64_t grid_value = iq2xxs_grid[aux8[l]];
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(&grid_value);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    tmp[l * 8 + j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief AVX-512 decode IQ2_XXS to Q8_0
+         */
+        inline void decode_iq2xxs_to_q8_0_avx512(
+            const IQ2_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq2xxs_to_q8_0_avx512: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+
+            uint32_t aux32[2];
+            const uint8_t *aux8 = reinterpret_cast<const uint8_t *>(aux32);
+            std::memcpy(aux32, &block.qs[4 * subblock_idx], 2 * sizeof(uint32_t));
+
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+
+            // Scalar unpacking + SIMD quantization
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint64_t grid_value = iq2xxs_grid[aux8[l]];
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(&grid_value);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    tmp[l * 8 + j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+            }
+
+            quantize_fp32_to_q8_0_avx512(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+#ifdef __AVX2__
+        /**
+         * @brief AVX2 decode IQ2_XXS to Q8_0
+         */
+        inline void decode_iq2xxs_to_q8_0_avx2(
+            const IQ2_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq2xxs_to_q8_0_avx2: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+
+            uint32_t aux32[2];
+            const uint8_t *aux8 = reinterpret_cast<const uint8_t *>(aux32);
+            std::memcpy(aux32, &block.qs[4 * subblock_idx], 2 * sizeof(uint32_t));
+
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+
+            // Scalar unpacking + SIMD quantization
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint64_t grid_value = iq2xxs_grid[aux8[l]];
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(&grid_value);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    tmp[l * 8 + j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+            }
+
+            quantize_fp32_to_q8_0_avx2(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ2_XXS to Q8_0 decode
+         */
+        inline void decode_iq2xxs_to_q8_0(
+            const IQ2_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_iq2xxs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            decode_iq2xxs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+#else
+            decode_iq2xxs_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // ===================================================================
+        // IQ2_XS: 2-bit extra-small IQ with grid lookup and scales
+        // ===================================================================
+        // Algorithm: 256-element super-block → 8 sub-blocks of 32 elements
+        // Each sub-block: scale from scales[] array (two 4-bit scales per byte)
+        // 4 groups of 8 elements: 9-bit grid lookup + 7-bit sign pattern
+        // qs[]: 16-bit values, lower 9 bits = grid index, upper 7 bits = sign index
+
+        /**
+         * @brief Decode one IQ2_XS sub-block to Q8_0 format (scalar reference)
+         * @param block IQ2_XS super-block (256 elements)
+         * @param subblock_idx Sub-block index within super-block (0-7)
+         * @param q8_qs Output: 32 quantized int8 values
+         * @param q8_scale Output: Q8_0 scale factor (FP16 format)
+         */
+        inline void decode_iq2xs_to_q8_0_scalar(const IQ2_XSBlock &block, size_t subblock_idx,
+                                                int8_t *q8_qs, uint16_t *q8_scale)
+        {
+            // Decode to FP32 intermediate buffer
+            float fp32_buffer[32];
+
+            const float d = fp16_to_fp32(block.d);
+            const size_t ib32 = subblock_idx; // Each sub-block is 32 elements
+
+            // Two sub-scales per iteration (4-bit each from scales byte)
+            const float db0 = d * (0.5f + (block.scales[ib32] & 0xf)) * 0.25f;
+            const float db1 = d * (0.5f + (block.scales[ib32] >> 4)) * 0.25f;
+
+            // Process 4 groups of 8 elements
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const size_t qs_idx = 4 * ib32 + l;
+                const uint16_t qs_val = block.qs[qs_idx];
+
+                // Extract 9-bit grid index (lower 9 bits)
+                const uint16_t grid_idx = qs_val & 511;
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2xs_grid + grid_idx);
+
+                // Extract 7-bit sign pattern (upper 7 bits)
+                const uint8_t signs = ksigns_iq2xs[qs_val >> 9];
+
+                // Select scale (db0 for l=0,1, db1 for l=2,3)
+                const float db = (l < 2) ? db0 : db1;
+
+                // Decode 8 elements with grid lookup and sign application
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    fp32_buffer[l * 8 + j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+            }
+
+            // Quantize FP32 buffer to Q8_0 format
+            quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+
+#ifdef __AVX2__
+        /**
+         * @brief Decode one IQ2_XS sub-block to Q8_0 format (AVX2 optimized)
+         */
+        inline void decode_iq2xs_to_q8_0_avx2(const IQ2_XSBlock &block, size_t subblock_idx,
+                                              int8_t *q8_qs, uint16_t *q8_scale)
+        {
+            // Decode to FP32 intermediate buffer
+            alignas(32) float fp32_buffer[32];
+
+            const float d = fp16_to_fp32(block.d);
+            const size_t ib32 = subblock_idx;
+
+            // Two sub-scales per iteration
+            const float db0 = d * (0.5f + (block.scales[ib32] & 0xf)) * 0.25f;
+            const float db1 = d * (0.5f + (block.scales[ib32] >> 4)) * 0.25f;
+
+            // Process 4 groups of 8 elements
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const size_t qs_idx = 4 * ib32 + l;
+                const uint16_t qs_val = block.qs[qs_idx];
+
+                const uint16_t grid_idx = qs_val & 511;
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2xs_grid + grid_idx);
+                const uint8_t signs = ksigns_iq2xs[qs_val >> 9];
+                const float db = (l < 2) ? db0 : db1;
+
+                // Load grid values and broadcast scale
+                __m256 grid_vec = _mm256_set_ps(
+                    grid[7], grid[6], grid[5], grid[4],
+                    grid[3], grid[2], grid[1], grid[0]);
+                __m256 scale_vec = _mm256_set1_ps(db);
+                __m256 values = _mm256_mul_ps(grid_vec, scale_vec);
+
+                // Apply signs using mask
+                __m256 sign_mask = _mm256_set_ps(
+                    (signs & kmask_iq2xs[7]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[6]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[5]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[4]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[3]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[2]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[1]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[0]) ? -1.0f : 1.0f);
+                values = _mm256_mul_ps(values, sign_mask);
+
+                _mm256_store_ps(&fp32_buffer[l * 8], values);
+            }
+
+            // Quantize FP32 buffer to Q8_0 format using AVX2
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+#ifdef __AVX512F__
+        /**
+         * @brief Decode one IQ2_XS sub-block to Q8_0 format (AVX-512 optimized)
+         */
+        inline void decode_iq2xs_to_q8_0_avx512(const IQ2_XSBlock &block, size_t subblock_idx,
+                                                int8_t *q8_qs, uint16_t *q8_scale)
+        {
+            // Decode to FP32 intermediate buffer
+            alignas(64) float fp32_buffer[32];
+
+            const float d = fp16_to_fp32(block.d);
+            const size_t ib32 = subblock_idx;
+
+            const float db0 = d * (0.5f + (block.scales[ib32] & 0xf)) * 0.25f;
+            const float db1 = d * (0.5f + (block.scales[ib32] >> 4)) * 0.25f;
+
+            // Process 4 groups of 8 elements
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const size_t qs_idx = 4 * ib32 + l;
+                const uint16_t qs_val = block.qs[qs_idx];
+
+                const uint16_t grid_idx = qs_val & 511;
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2xs_grid + grid_idx);
+                const uint8_t signs = ksigns_iq2xs[qs_val >> 9];
+                const float db = (l < 2) ? db0 : db1;
+
+                // Load grid values using AVX-512 (8 elements)
+                __m256 grid_vec = _mm256_set_ps(
+                    grid[7], grid[6], grid[5], grid[4],
+                    grid[3], grid[2], grid[1], grid[0]);
+                __m256 scale_vec = _mm256_set1_ps(db);
+                __m256 values = _mm256_mul_ps(grid_vec, scale_vec);
+
+                // Apply signs
+                __m256 sign_mask = _mm256_set_ps(
+                    (signs & kmask_iq2xs[7]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[6]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[5]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[4]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[3]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[2]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[1]) ? -1.0f : 1.0f,
+                    (signs & kmask_iq2xs[0]) ? -1.0f : 1.0f);
+                values = _mm256_mul_ps(values, sign_mask);
+
+                _mm256_store_ps(&fp32_buffer[l * 8], values);
+            }
+
+            // Quantize FP32 buffer to Q8_0 format using AVX-512
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ2_XS decode based on CPU features
+         */
+        inline void decode_iq2xs_to_q8_0(const IQ2_XSBlock &block, size_t subblock_idx,
+                                         int8_t *q8_qs, uint16_t *q8_scale)
+        {
+#ifdef __AVX512F__
+            if (cpu_supports_avx512())
+            {
+                decode_iq2xs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+#ifdef __AVX2__
+            if (cpu_supports_avx2())
+            {
+                decode_iq2xs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#else
+            decode_iq2xs_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // ============================================================================
+        // IQ3_XXS SIMD Helpers
+        // ============================================================================
+        // IQ3_XXS: 256 elements per super-block, grid-based with iq3xxs_grid[256]
+        // Block structure: d (FP16 scale), qs[96] (grid indices + scales/signs)
+        // Each super-block has 8 sub-blocks of 32 elements
+        // Layout: qs[64] are grid indices, qs[64..96] are scales+signs (32 bytes)
+
+        /**
+         * @brief Scalar decode IQ3_XXS sub-block to Q8_0
+         * @param block IQ3_XXS super-block
+         * @param subblock_idx Sub-block index (0-7)
+         * @param q8_qs Output Q8_0 quantized values (32 int8_t)
+         * @param q8_scale Output Q8_0 FP16 scale (pointer)
+         */
+        inline void decode_iq3xxs_to_q8_0_scalar(
+            const IQ3_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            // IQ3_XXS decode algorithm (llama.cpp dequantize_row_iq3_xxs):
+            // - Super-block: 256 elements
+            // - Sub-blocks: 8 × 32 elements
+            // - qs[0..63]: grid indices (8 bytes per sub-block)
+            // - qs[64..95]: scales+signs (4 bytes per sub-block)
+            // - Each sub-block has 4 groups of 8 elements
+
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + 8 * subblock_idx;                    // 8 grid indices
+            const uint8_t *scales_and_signs = block.qs + 64 + 4 * subblock_idx; // 4 bytes
+
+            // Extract scale (top 4 bits of uint32)
+            uint32_t aux32;
+            std::memcpy(&aux32, scales_and_signs, sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+            // Decode 4 groups of 8 elements each
+            float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                // Extract sign pattern (7 bits)
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+
+                // Grid lookups (2 indices → 2 × 4 elements = 8 elements)
+                const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + qs[2 * l + 1]);
+
+                // Decode 8 elements (4 from grid1, 4 from grid2)
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 0] = db * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                    output[j + 4] = db * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+                output += 8;
+            }
+
+            // Quantize to Q8_0
+#if defined(__AVX512F__)
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
+#else
+            quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, q8_qs, q8_scale);
+#endif
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief AVX2 decode IQ3_XXS sub-block to Q8_0
+         */
+        inline void decode_iq3xxs_to_q8_0_avx2(
+            const IQ3_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            // Same algorithm as scalar, but use AVX2 for final quantization
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + 8 * subblock_idx;
+            const uint8_t *scales_and_signs = block.qs + 64 + 4 * subblock_idx;
+
+            uint32_t aux32;
+            std::memcpy(&aux32, scales_and_signs, sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+            float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + qs[2 * l + 1]);
+
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 0] = db * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                    output[j + 4] = db * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+                output += 8;
+            }
+
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+#if defined(__AVX512F__)
+        /**
+         * @brief AVX-512 decode IQ3_XXS sub-block to Q8_0
+         */
+        inline void decode_iq3xxs_to_q8_0_avx512(
+            const IQ3_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            // Same algorithm as scalar, but use AVX-512 for final quantization
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + 8 * subblock_idx;
+            const uint8_t *scales_and_signs = block.qs + 64 + 4 * subblock_idx;
+
+            uint32_t aux32;
+            std::memcpy(&aux32, scales_and_signs, sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+            float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + qs[2 * l + 1]);
+
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 0] = db * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                    output[j + 4] = db * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+                output += 8;
+            }
+
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ3_XXS decode based on CPU features
+         */
+        inline void decode_iq3xxs_to_q8_0(
+            const IQ3_XXSBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                decode_iq3xxs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                decode_iq3xxs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+            decode_iq3xxs_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+        }
+
+        // ====================================================================
+        // IQ2_S: 2-bit Small IQ with High Bits and Scales
+        // ====================================================================
+
+        /**
+         * @brief Scalar decode IQ2_S to Q8_0 (baseline implementation)
+         *
+         * IQ2_S format: 256 elements per super-block, 8 sub-blocks of 32 elements each
+         * - d: FP16 scale factor
+         * - qs[64]: Quantized values (4 bytes per sub-block)
+         * - qh[8]: High bits (1 byte per sub-block)
+         * - scales[8]: Scales (1 byte per sub-block)
+         *
+         * Algorithm per sub-block (32 elements):
+         * - scales[ib32] contains 2 scales (low 4 bits, high 4 bits)
+         * - Each scale corresponds to 16 elements
+         * - Grid lookup: iq2s_grid[qs[l] | (qh[ib32] << (8 - 2*l) & 0x300)]
+         * - Signs from qs[32..63] (signs pointer offset)
+         */
+        inline void decode_iq2s_to_q8_0_scalar(
+            const IQ2_SBlock &block,
+            size_t subblock_idx, // 0-7
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;         // 4 bytes per sub-block
+            const uint8_t *signs = block.qs + 32 + subblock_idx * 4; // Signs in qs[32..63]
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t scale_byte = block.scales[subblock_idx];
+
+            // Two scales per sub-block (16 elements each)
+            float db[2];
+            db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
+
+            // Decode to FP32 buffer
+            alignas(32) float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const float dl = db[l / 2]; // First 2 iterations use db[0], next 2 use db[1]
+
+                // Construct 10-bit grid index from qs and qh high bits
+                const uint16_t grid_idx = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2s_grid + grid_idx);
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    output[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+                output += 8;
+            }
+
+            // Quantize FP32 -> Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+
+#ifdef __AVX2__
+        /**
+         * @brief AVX2 decode IQ2_S to Q8_0
+         */
+        inline void decode_iq2s_to_q8_0_avx2(
+            const IQ2_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint8_t *signs = block.qs + 32 + subblock_idx * 4;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t scale_byte = block.scales[subblock_idx];
+
+            float db[2];
+            db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
+
+            alignas(32) float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const float dl = db[l / 2];
+                const uint16_t grid_idx = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2s_grid + grid_idx);
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    output[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+                output += 8;
+            }
+
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+#ifdef __AVX512F__
+        /**
+         * @brief AVX-512 decode IQ2_S to Q8_0
+         */
+        inline void decode_iq2s_to_q8_0_avx512(
+            const IQ2_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint8_t *signs = block.qs + 32 + subblock_idx * 4;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t scale_byte = block.scales[subblock_idx];
+
+            float db[2];
+            db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
+
+            alignas(64) float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const float dl = db[l / 2];
+                const uint16_t grid_idx = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
+                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2s_grid + grid_idx);
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    output[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                }
+                output += 8;
+            }
+
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ2_S decode based on CPU features
+         */
+        inline void decode_iq2s_to_q8_0(
+            const IQ2_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                decode_iq2s_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                decode_iq2s_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+            decode_iq2s_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+        }
+
+        // ========================================================================
+        // IQ3_S: 3-bit small IQ with signs[] array and scales[]
+        // ========================================================================
+        // Block: 110 bytes (d: FP16, qs[64], qh[8], signs[32], scales[4])
+        // Structure: 256 elements → 8 sub-blocks of 32 elements
+        // Grid: iq3s_grid[512] (uint32_t entries)
+        // Algorithm: Process in pairs (ib32 = 0,2,4,6) with db1/db2 scales
+        //   - db1 = d * (1 + 2 * (scales[ib32/2] & 0xf))
+        //   - db2 = d * (1 + 2 * (scales[ib32/2] >> 4))
+        //   - Each pair: 4 groups of 8 elements (2 grids × 4 elements each)
+        //   - Grid index: qs[2*l+i] | ((qh[offset] << shift) & 256)
+        //   - Signs from signs[] array using kmask_iq2xs[]
+
+        /**
+         * @brief Scalar decode IQ3_S sub-block to Q8_0
+         *
+         * IQ3_S uses iq3s_grid[512] with:
+         * - qs[64]: Quantized values (8 bits per grid index)
+         * - qh[8]: High bits (1 extra bit per grid index for 9-bit total)
+         * - signs[32]: Sign patterns (8 sub-blocks × 4 bytes)
+         * - scales[4]: Scales (2 scales per sub-block pair, 4 bits each)
+         *
+         * Algorithm per sub-block (32 elements):
+         * - scales[ib32/2] contains 2 scales (low 4 bits, high 4 bits)
+         * - Each scale: db = d * (1 + 2 * scale_nibble)
+         * - 4 groups of 8 elements: 2 grids × 4 elements each
+         * - Grid lookup: iq3s_grid[qs | (qh << shift & 256)]
+         * - Signs from signs[] using kmask_iq2xs[]
+         */
+        inline void decode_iq3s_to_q8_0_scalar(
+            const IQ3_SBlock &block,
+            size_t subblock_idx, // 0-7
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+
+            // Sub-blocks processed in pairs: (0,1), (2,3), (4,5), (6,7)
+            const size_t pair_idx = subblock_idx / 2;    // 0-3
+            const size_t within_pair = subblock_idx % 2; // 0 or 1
+
+            // Get scale for this sub-block within the pair
+            const uint8_t scale_byte = block.scales[pair_idx];
+            const float db = within_pair == 0
+                                 ? d * (1.0f + 2.0f * (scale_byte & 0xf))
+                                 : d * (1.0f + 2.0f * (scale_byte >> 4));
+
+            // Offset into arrays
+            const size_t qs_offset = subblock_idx * 8;    // 8 bytes per sub-block
+            const size_t qh_offset = subblock_idx;        // 1 byte per sub-block
+            const size_t signs_offset = subblock_idx * 4; // 4 bytes per sub-block
+
+            const uint8_t *qs = block.qs + qs_offset;
+            const uint8_t qh_byte = block.qh[qh_offset];
+            const uint8_t *signs = block.signs + signs_offset;
+
+            // Decode to FP32 buffer (32 elements)
+            alignas(32) float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            // 4 groups of 8 elements (2 grids × 4 elements each)
+            for (size_t l = 0; l < 4; ++l)
+            {
+                // Grid index with high bit
+                const uint16_t grid_idx1 = qs[2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
+                const uint16_t grid_idx2 = qs[2 * l + 1] | ((qh_byte << (7 - 2 * l)) & 256);
+
+                const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(iq3s_grid + grid_idx1);
+                const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(iq3s_grid + grid_idx2);
+
+                // First 4 elements from grid1
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 0] = db * grid1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                }
+
+                // Next 4 elements from grid2
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 4] = db * grid2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+
+                output += 8;
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief AVX2 decode IQ3_S to Q8_0
+         */
+        inline void decode_iq3s_to_q8_0_avx2(
+            const IQ3_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            // Same algorithm as scalar, but use AVX2 for final quantization
+            const float d = fp16_to_fp32(block.d);
+
+            const size_t pair_idx = subblock_idx / 2;
+            const size_t within_pair = subblock_idx % 2;
+
+            const uint8_t scale_byte = block.scales[pair_idx];
+            const float db = within_pair == 0
+                                 ? d * (1.0f + 2.0f * (scale_byte & 0xf))
+                                 : d * (1.0f + 2.0f * (scale_byte >> 4));
+
+            const size_t qs_offset = subblock_idx * 8;
+            const size_t qh_offset = subblock_idx;
+            const size_t signs_offset = subblock_idx * 4;
+
+            const uint8_t *qs = block.qs + qs_offset;
+            const uint8_t qh_byte = block.qh[qh_offset];
+            const uint8_t *signs = block.signs + signs_offset;
+
+            alignas(32) float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint16_t grid_idx1 = qs[2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
+                const uint16_t grid_idx2 = qs[2 * l + 1] | ((qh_byte << (7 - 2 * l)) & 256);
+
+                const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(iq3s_grid + grid_idx1);
+                const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(iq3s_grid + grid_idx2);
+
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 0] = db * grid1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                    output[j + 4] = db * grid2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+
+                output += 8;
+            }
+
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+#if defined(__AVX512F__)
+        /**
+         * @brief AVX-512 decode IQ3_S to Q8_0
+         */
+        inline void decode_iq3s_to_q8_0_avx512(
+            const IQ3_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            // Same algorithm as scalar, but use AVX-512 for final quantization
+            const float d = fp16_to_fp32(block.d);
+
+            const size_t pair_idx = subblock_idx / 2;
+            const size_t within_pair = subblock_idx % 2;
+
+            const uint8_t scale_byte = block.scales[pair_idx];
+            const float db = within_pair == 0
+                                 ? d * (1.0f + 2.0f * (scale_byte & 0xf))
+                                 : d * (1.0f + 2.0f * (scale_byte >> 4));
+
+            const size_t qs_offset = subblock_idx * 8;
+            const size_t qh_offset = subblock_idx;
+            const size_t signs_offset = subblock_idx * 4;
+
+            const uint8_t *qs = block.qs + qs_offset;
+            const uint8_t qh_byte = block.qh[qh_offset];
+            const uint8_t *signs = block.signs + signs_offset;
+
+            alignas(64) float fp32_buffer[32];
+            float *output = fp32_buffer;
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint16_t grid_idx1 = qs[2 * l + 0] | ((qh_byte << (8 - 2 * l)) & 256);
+                const uint16_t grid_idx2 = qs[2 * l + 1] | ((qh_byte << (7 - 2 * l)) & 256);
+
+                const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(iq3s_grid + grid_idx1);
+                const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(iq3s_grid + grid_idx2);
+
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    output[j + 0] = db * grid1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                    output[j + 4] = db * grid2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+
+                output += 8;
+            }
+
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ3_S decode based on CPU features
+         */
+        inline void decode_iq3s_to_q8_0(
+            const IQ3_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                decode_iq3s_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                decode_iq3s_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+            decode_iq3s_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+        }
+
+        // ============================================================================
+        // IQ1_S Decode Functions (1-bit quantization with IQ1S_DELTA offset)
+        // ============================================================================
+
+        /**
+         * @brief Decode one sub-block (32 elements) from IQ1_S to Q8_0 format (scalar)
+         *
+         * IQ1_S Format:
+         * - 256 elements per super-block (8 sub-blocks of 32 elements each)
+         * - Grid lookup table: iq1s_grid[2048] (uint64_t, accessed as int8_t*)
+         * - Per iteration (ib=0..7, 32 elements each):
+         *   - Scale: 3 bits from qh[ib] bits 12-14
+         *   - Delta: Sign bit from qh[ib] bit 15 (±IQ1S_DELTA = ±0.125f)
+         *   - 4 groups of 8 elements:
+         *     - Grid index: qs[l] (8 bits) + qh[ib] bits (3*l to 3*l+2) → 11-bit (0-2047)
+         *     - Decode: output[j] = dl * (grid[j] + delta)
+         *
+         * @param block IQ1_S block (50 bytes)
+         * @param subblock_idx Sub-block index (0-7)
+         * @param q8_qs Output quantized values (32 int8_t)
+         * @param q8_scale Output scale (FP16 pointer)
+         */
+        __attribute__((always_inline)) inline void decode_iq1s_to_q8_0_scalar(
+            const IQ1_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4; // 4 bytes per sub-block
+            const uint16_t qh_val = block.qh[subblock_idx];
+
+            // Scale: 3 bits from qh bits 12-14
+            const float dl = d * (2.0f * ((qh_val >> 12) & 7) + 1.0f);
+
+            // Delta: sign bit from qh bit 15
+            const float delta = (qh_val & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            // Decode 4 groups of 8 elements (32 elements total)
+            float fp32_output[32];
+            for (size_t l = 0; l < 4; ++l)
+            {
+                // Grid index: 11 bits (qs[l] + 3 bits from qh)
+                const uint16_t grid_idx = qs[l] | (((qh_val >> (3 * l)) & 7) << 8);
+
+                // Grid lookup: iq1s_grid is uint64_t[2048], access as int8_t*
+                const int8_t *grid = reinterpret_cast<const int8_t *>(iq1s_grid + grid_idx);
+
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    fp32_output[l * 8 + j] = dl * (static_cast<float>(grid[j]) + delta);
+                }
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_output, 32, q8_qs, q8_scale);
+        }
+
+#ifdef __AVX2__
+        /**
+         * @brief Decode one sub-block (32 elements) from IQ1_S to Q8_0 format (AVX2)
+         */
+        __attribute__((always_inline)) inline void decode_iq1s_to_q8_0_avx2(
+            const IQ1_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint16_t qh_val = block.qh[subblock_idx];
+
+            const float dl = d * (2.0f * ((qh_val >> 12) & 7) + 1.0f);
+            const float delta = (qh_val & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            // Broadcast dl and delta for SIMD
+            __m256 vdl = _mm256_set1_ps(dl);
+            __m256 vdelta = _mm256_set1_ps(delta);
+
+            // Decode 4 groups of 8 elements
+            float fp32_output[32];
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint16_t grid_idx = qs[l] | (((qh_val >> (3 * l)) & 7) << 8);
+                const int8_t *grid = reinterpret_cast<const int8_t *>(iq1s_grid + grid_idx);
+
+                // Load 8 int8_t values
+                __m128i vgrid_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid));
+
+                // Convert int8 → int32
+                __m128i vgrid_i16 = _mm_cvtepi8_epi16(vgrid_i8);
+                __m128i vgrid_lo_i32 = _mm_cvtepi16_epi32(vgrid_i16);
+                __m128i vgrid_hi_i32 = _mm_cvtepi16_epi32(_mm_shuffle_epi32(vgrid_i16, _MM_SHUFFLE(3, 2, 3, 2)));
+
+                // Convert int32 → float
+                __m256 vgrid_f32 = _mm256_set_m128(
+                    _mm_cvtepi32_ps(vgrid_hi_i32),
+                    _mm_cvtepi32_ps(vgrid_lo_i32));
+
+                // Compute: dl * (grid[j] + delta)
+                __m256 vresult = _mm256_mul_ps(vdl, _mm256_add_ps(vgrid_f32, vdelta));
+
+                _mm256_storeu_ps(&fp32_output[l * 8], vresult);
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_avx2(fp32_output, 32, q8_qs, q8_scale);
+        }
+#endif
+
+#ifdef __AVX512F__
+        /**
+         * @brief Decode one sub-block (32 elements) from IQ1_S to Q8_0 format (AVX-512)
+         */
+        __attribute__((always_inline)) inline void decode_iq1s_to_q8_0_avx512(
+            const IQ1_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint16_t qh_val = block.qh[subblock_idx];
+
+            const float dl = d * (2.0f * ((qh_val >> 12) & 7) + 1.0f);
+            const float delta = (qh_val & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            // Broadcast dl and delta for SIMD
+            __m512 vdl = _mm512_set1_ps(dl);
+            __m512 vdelta = _mm512_set1_ps(delta);
+
+            // Decode 4 groups of 8 elements → 32 elements total (2 AVX-512 vectors)
+            float fp32_output[32];
+            for (size_t l = 0; l < 4; l += 2)
+            {
+                // Process 2 groups (16 elements) at once
+                uint16_t grid_idx1 = qs[l + 0] | (((qh_val >> (3 * (l + 0))) & 7) << 8);
+                uint16_t grid_idx2 = qs[l + 1] | (((qh_val >> (3 * (l + 1))) & 7) << 8);
+
+                const int8_t *grid1 = reinterpret_cast<const int8_t *>(iq1s_grid + grid_idx1);
+                const int8_t *grid2 = reinterpret_cast<const int8_t *>(iq1s_grid + grid_idx2);
+
+                // Load 16 int8_t values (8 from each grid)
+                __m128i vgrid1_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid1));
+                __m128i vgrid2_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid2));
+                __m128i vgrid_i8 = _mm_unpacklo_epi64(vgrid1_i8, vgrid2_i8);
+
+                // Convert int8 → int32 → float
+                __m512i vgrid_i32 = _mm512_cvtepi8_epi32(vgrid_i8);
+                __m512 vgrid_f32 = _mm512_cvtepi32_ps(vgrid_i32);
+
+                // Compute: dl * (grid[j] + delta)
+                __m512 vresult = _mm512_mul_ps(vdl, _mm512_add_ps(vgrid_f32, vdelta));
+
+                _mm512_storeu_ps(&fp32_output[l * 8], vresult);
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_avx512(fp32_output, 32, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ1_S decode based on CPU features
+         */
+        __attribute__((always_inline)) inline void decode_iq1s_to_q8_0(
+            const IQ1_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                decode_iq1s_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                decode_iq1s_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+            decode_iq1s_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+        }
+
+        // ============================================================================
+        // IQ1_M Decode Functions (1-bit quantization with multiple scales)
+        // ============================================================================
+
+        /**
+         * @brief Decode one sub-block (32 elements) from IQ1_M to Q8_0 format (scalar)
+         *
+         * IQ1_M Format:
+         * - 256 elements per super-block (8 sub-blocks of 32 elements each)
+         * - Grid lookup table: iq1s_grid[2048] (uint64_t, accessed as int8_t*)
+         * - Global scale: FP16 constructed from 4 bits across scales[0-3]
+         * - Per iteration (ib=0..7, 32 elements each):
+         *   - Two sub-scales: dl1, dl2 (first 2 groups use dl1, last 2 use dl2)
+         *   - 4 groups of 8 elements:
+         *     - Grid index: qs[l] (8 bits) + qh bits → 11-bit (0-2047)
+         *     - Delta: Sign bit from qh → ±IQ1S_DELTA (0.125f)
+         *     - Decode: output[j] = dl1/dl2 * (grid[j] + delta[l])
+         *
+         * @param block IQ1_M block (56 bytes)
+         * @param subblock_idx Sub-block index (0-7)
+         * @param global_scale Global FP16 scale (pre-extracted)
+         * @param q8_qs Output quantized values (32 int8_t)
+         * @param q8_scale Output scale (FP16 pointer)
+         */
+        __attribute__((always_inline)) inline void decode_iq1m_to_q8_0_scalar(
+            const IQ1_MBlock &block,
+            size_t subblock_idx,
+            float global_scale,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const uint16_t *sc = reinterpret_cast<const uint16_t *>(block.scales);
+            const uint8_t *qs = block.qs + subblock_idx * 4; // 4 bytes per sub-block
+            const uint8_t *qh = block.qh + subblock_idx * 2; // 2 bytes per sub-block
+
+            // Two sub-scales per iteration
+            const float dl1 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 0)) & 0x7) + 1.0f);
+            const float dl2 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 3)) & 0x7) + 1.0f);
+
+            // Grid indices for 4 groups of 8
+            uint16_t idx[4];
+            idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+            idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+            idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+            idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+
+            // Delta signs for 4 groups
+            float delta[4];
+            delta[0] = (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[1] = (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[2] = (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[3] = (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            // Decode 4 groups of 8 elements (32 elements total)
+            float fp32_output[32];
+
+            // First two groups use dl1
+            for (size_t l = 0; l < 2; ++l)
+            {
+                const int8_t *grid = reinterpret_cast<const int8_t *>(iq1s_grid + idx[l]);
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    fp32_output[l * 8 + j] = dl1 * (static_cast<float>(grid[j]) + delta[l]);
+                }
+            }
+
+            // Last two groups use dl2
+            for (size_t l = 2; l < 4; ++l)
+            {
+                const int8_t *grid = reinterpret_cast<const int8_t *>(iq1s_grid + idx[l]);
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    fp32_output[l * 8 + j] = dl2 * (static_cast<float>(grid[j]) + delta[l]);
+                }
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_output, 32, q8_qs, q8_scale);
+        }
+
+        /**
+         * @brief Extract global scale from IQ1_M block
+         */
+        __attribute__((always_inline)) inline float extract_iq1m_global_scale(const IQ1_MBlock &block)
+        {
+            const uint16_t *sc = reinterpret_cast<const uint16_t *>(block.scales);
+            uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                 ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            return fp16_to_fp32(scale_u16);
+        }
+
+#ifdef __AVX2__
+        /**
+         * @brief Decode one sub-block (32 elements) from IQ1_M to Q8_0 format (AVX2)
+         */
+        __attribute__((always_inline)) inline void decode_iq1m_to_q8_0_avx2(
+            const IQ1_MBlock &block,
+            size_t subblock_idx,
+            float global_scale,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const uint16_t *sc = reinterpret_cast<const uint16_t *>(block.scales);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint8_t *qh = block.qh + subblock_idx * 2;
+
+            const float dl1 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 0)) & 0x7) + 1.0f);
+            const float dl2 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 3)) & 0x7) + 1.0f);
+
+            // Grid indices
+            uint16_t idx[4];
+            idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+            idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+            idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+            idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+
+            // Delta signs
+            float delta[4];
+            delta[0] = (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[1] = (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[2] = (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[3] = (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            float fp32_output[32];
+
+            // First two groups use dl1
+            __m256 vdl1 = _mm256_set1_ps(dl1);
+            for (size_t l = 0; l < 2; ++l)
+            {
+                const int8_t *grid = reinterpret_cast<const int8_t *>(iq1s_grid + idx[l]);
+                __m256 vdelta = _mm256_set1_ps(delta[l]);
+
+                // Load 8 int8_t values
+                __m128i vgrid_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid));
+
+                // Convert int8 → int32
+                __m128i vgrid_i16 = _mm_cvtepi8_epi16(vgrid_i8);
+                __m128i vgrid_lo_i32 = _mm_cvtepi16_epi32(vgrid_i16);
+                __m128i vgrid_hi_i32 = _mm_cvtepi16_epi32(_mm_shuffle_epi32(vgrid_i16, _MM_SHUFFLE(3, 2, 3, 2)));
+
+                // Convert int32 → float
+                __m256 vgrid_f32 = _mm256_set_m128(
+                    _mm_cvtepi32_ps(vgrid_hi_i32),
+                    _mm_cvtepi32_ps(vgrid_lo_i32));
+
+                // Compute: dl1 * (grid[j] + delta)
+                __m256 vresult = _mm256_mul_ps(vdl1, _mm256_add_ps(vgrid_f32, vdelta));
+                _mm256_storeu_ps(&fp32_output[l * 8], vresult);
+            }
+
+            // Last two groups use dl2
+            __m256 vdl2 = _mm256_set1_ps(dl2);
+            for (size_t l = 2; l < 4; ++l)
+            {
+                const int8_t *grid = reinterpret_cast<const int8_t *>(iq1s_grid + idx[l]);
+                __m256 vdelta = _mm256_set1_ps(delta[l]);
+
+                __m128i vgrid_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid));
+                __m128i vgrid_i16 = _mm_cvtepi8_epi16(vgrid_i8);
+                __m128i vgrid_lo_i32 = _mm_cvtepi16_epi32(vgrid_i16);
+                __m128i vgrid_hi_i32 = _mm_cvtepi16_epi32(_mm_shuffle_epi32(vgrid_i16, _MM_SHUFFLE(3, 2, 3, 2)));
+
+                __m256 vgrid_f32 = _mm256_set_m128(
+                    _mm_cvtepi32_ps(vgrid_hi_i32),
+                    _mm_cvtepi32_ps(vgrid_lo_i32));
+
+                __m256 vresult = _mm256_mul_ps(vdl2, _mm256_add_ps(vgrid_f32, vdelta));
+                _mm256_storeu_ps(&fp32_output[l * 8], vresult);
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_avx2(fp32_output, 32, q8_qs, q8_scale);
+        }
+#endif
+
+#ifdef __AVX512F__
+        /**
+         * @brief Decode one sub-block (32 elements) from IQ1_M to Q8_0 format (AVX-512)
+         */
+        __attribute__((always_inline)) inline void decode_iq1m_to_q8_0_avx512(
+            const IQ1_MBlock &block,
+            size_t subblock_idx,
+            float global_scale,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            const uint16_t *sc = reinterpret_cast<const uint16_t *>(block.scales);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint8_t *qh = block.qh + subblock_idx * 2;
+
+            const float dl1 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 0)) & 0x7) + 1.0f);
+            const float dl2 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 3)) & 0x7) + 1.0f);
+
+            // Grid indices
+            uint16_t idx[4];
+            idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+            idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+            idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+            idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+
+            // Delta signs
+            float delta[4];
+            delta[0] = (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[1] = (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[2] = (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            delta[3] = (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            float fp32_output[32];
+
+            // Process first two groups (16 elements) with dl1
+            {
+                const int8_t *grid0 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[0]);
+                const int8_t *grid1 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[1]);
+
+                // Load 16 int8_t values (8 from each grid)
+                __m128i vgrid0_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid0));
+                __m128i vgrid1_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid1));
+                __m128i vgrid_i8 = _mm_unpacklo_epi64(vgrid0_i8, vgrid1_i8);
+
+                // Convert int8 → int32 → float
+                __m512i vgrid_i32 = _mm512_cvtepi8_epi32(vgrid_i8);
+                __m512 vgrid_f32 = _mm512_cvtepi32_ps(vgrid_i32);
+
+                // Apply deltas (first 8 elements use delta[0], next 8 use delta[1])
+                __m512 vdelta = _mm512_set_ps(
+                    delta[1], delta[1], delta[1], delta[1], delta[1], delta[1], delta[1], delta[1],
+                    delta[0], delta[0], delta[0], delta[0], delta[0], delta[0], delta[0], delta[0]);
+
+                // Compute: dl1 * (grid[j] + delta)
+                __m512 vdl1 = _mm512_set1_ps(dl1);
+                __m512 vresult = _mm512_mul_ps(vdl1, _mm512_add_ps(vgrid_f32, vdelta));
+                _mm512_storeu_ps(&fp32_output[0], vresult);
+            }
+
+            // Process last two groups (16 elements) with dl2
+            {
+                const int8_t *grid2 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[2]);
+                const int8_t *grid3 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[3]);
+
+                __m128i vgrid2_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid2));
+                __m128i vgrid3_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid3));
+                __m128i vgrid_i8 = _mm_unpacklo_epi64(vgrid2_i8, vgrid3_i8);
+
+                __m512i vgrid_i32 = _mm512_cvtepi8_epi32(vgrid_i8);
+                __m512 vgrid_f32 = _mm512_cvtepi32_ps(vgrid_i32);
+
+                __m512 vdelta = _mm512_set_ps(
+                    delta[3], delta[3], delta[3], delta[3], delta[3], delta[3], delta[3], delta[3],
+                    delta[2], delta[2], delta[2], delta[2], delta[2], delta[2], delta[2], delta[2]);
+
+                __m512 vdl2 = _mm512_set1_ps(dl2);
+                __m512 vresult = _mm512_mul_ps(vdl2, _mm512_add_ps(vgrid_f32, vdelta));
+                _mm512_storeu_ps(&fp32_output[16], vresult);
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_avx512(fp32_output, 32, q8_qs, q8_scale);
+        }
+#endif
+
+        /**
+         * @brief Auto-dispatch IQ1_M decode based on CPU features
+         */
+        __attribute__((always_inline)) inline void decode_iq1m_to_q8_0(
+            const IQ1_MBlock &block,
+            size_t subblock_idx,
+            float global_scale,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                decode_iq1m_to_q8_0_avx512(block, subblock_idx, global_scale, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                decode_iq1m_to_q8_0_avx2(block, subblock_idx, global_scale, q8_qs, q8_scale);
+                return;
+            }
+#endif
+
+            decode_iq1m_to_q8_0_scalar(block, subblock_idx, global_scale, q8_qs, q8_scale);
+        }
+
+        // =====================================================================
+        // K-Quant Decode Functions (merged from SIMDKQuantHelpers.h)
+        // =====================================================================
+
+        // =====================================================================
+        // Q2_K → Q8_0
+        // =====================================================================
+
+        inline void decode_q2_k_to_q8_0_scalar(
+            const Q2_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q2_k_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const size_t half = subblock_idx / 4;
+            const size_t group = subblock_idx % 4;
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const uint8_t *scales = block.scales + half * 8;
+            const uint8_t sc0 = scales[group * 2 + 0];
+            const uint8_t sc1 = scales[group * 2 + 1];
+
+            const float dl0 = d * static_cast<float>(sc0 & 0x0F);
+            const float ml0 = dmin * static_cast<float>(sc0 >> 4);
+            const float dl1 = d * static_cast<float>(sc1 & 0x0F);
+            const float ml1 = dmin * static_cast<float>(sc1 >> 4);
+
+            const uint8_t *q = block.qs + half * 32;
+            const int shift = static_cast<int>(group * 2);
+
+            for (size_t i = 0; i < 16; ++i)
+            {
+                const uint8_t packed0 = q[i];
+                const uint8_t val0 = (packed0 >> shift) & 0x03;
+                tmp[i] = dl0 * static_cast<float>(static_cast<int>(val0)) - ml0;
+
+                const uint8_t packed1 = q[i + 16];
+                const uint8_t val1 = (packed1 >> shift) & 0x03;
+                tmp[i + 16] = dl1 * static_cast<float>(static_cast<int>(val1)) - ml1;
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+
+#if defined(__AVX2__)
+        inline void decode_q2_k_to_q8_0_avx2(
+            const Q2_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q2_k_to_q8_0_avx2: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const size_t half = subblock_idx / 4;
+            const size_t group = subblock_idx % 4;
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const uint8_t *scales = block.scales + half * 8;
+            const uint8_t sc0 = scales[group * 2 + 0];
+            const uint8_t sc1 = scales[group * 2 + 1];
+
+            const float dl0 = d * static_cast<float>(sc0 & 0x0F);
+            const float ml0 = dmin * static_cast<float>(sc0 >> 4);
+            const float dl1 = d * static_cast<float>(sc1 & 0x0F);
+            const float ml1 = dmin * static_cast<float>(sc1 >> 4);
+
+            const uint8_t *q = block.qs + half * 32;
+            const int shift = static_cast<int>(group * 2);
+            const __m256i mask3 = _mm256_set1_epi32(0x3);
+
+            auto process_half = [&](size_t base, float dl, float ml)
+            {
+                const __m256 vdl = _mm256_set1_ps(dl);
+                const __m256 vml = _mm256_set1_ps(ml);
+
+                for (size_t off = 0; off < 16; off += 8)
+                {
+                    const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q + base + off));
+                    __m256i vals = _mm256_cvtepu8_epi32(bytes);
+                    vals = _mm256_and_si256(_mm256_srlv_epi32(vals, _mm256_set1_epi32(shift)), mask3);
+                    const __m256 vf = _mm256_cvtepi32_ps(vals);
+                    const __m256 res = _mm256_sub_ps(_mm256_mul_ps(vdl, vf), vml);
+                    _mm256_storeu_ps(tmp + base + off, res);
+                }
+            };
+
+            process_half(0, dl0, ml0);
+            process_half(16, dl1, ml1);
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        inline void decode_q2_k_to_q8_0_avx512(
+            const Q2_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q2_k_to_q8_0_avx512: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const size_t half = subblock_idx / 4;
+            const size_t group = subblock_idx % 4;
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const uint8_t *scales = block.scales + half * 8;
+            const uint8_t sc0 = scales[group * 2 + 0];
+            const uint8_t sc1 = scales[group * 2 + 1];
+
+            const float dl0 = d * static_cast<float>(sc0 & 0x0F);
+            const float ml0 = dmin * static_cast<float>(sc0 >> 4);
+            const float dl1 = d * static_cast<float>(sc1 & 0x0F);
+            const float ml1 = dmin * static_cast<float>(sc1 >> 4);
+
+            const uint8_t *q = block.qs + half * 32;
+            const int shift = static_cast<int>(group * 2);
+
+            auto process_half = [&](size_t base, float dl, float ml)
+            {
+                const __m512 vdl = _mm512_set1_ps(dl);
+                const __m512 vml = _mm512_set1_ps(ml);
+
+                const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q + base));
+                __m512i vals = _mm512_cvtepu8_epi32(bytes);
+                vals = _mm512_and_si512(_mm512_srlv_epi32(vals, _mm512_set1_epi32(shift)), _mm512_set1_epi32(0x3));
+                const __m512 vf = _mm512_cvtepi32_ps(vals);
+                const __m512 res = _mm512_sub_ps(_mm512_mul_ps(vdl, vf), vml);
+                _mm512_storeu_ps(tmp + base, res);
+            };
+
+            process_half(0, dl0, ml0);
+            process_half(16, dl1, ml1);
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+        inline void decode_q2_k_to_q8_0(
+            const Q2_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_q2_k_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            decode_q2_k_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+#else
+            decode_q2_k_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // =====================================================================
+        // Q3_K → Q8_0
+        // =====================================================================
+
+        /**
+         * @brief Scalar decode Q3_K to Q8_0 (one 32-element sub-block from 256-element super-block)
+         * @param block Q3_K super-block (256 elements, 110 bytes)
+         * @param subblock_idx Which 32-element sub-block to decode (0-7)
+         * @param q8_qs Output Q8_0 quantized values (32 int8_t)
+         * @param q8_scale Output Q8_0 scale (FP16)
+         */
+        inline void decode_q3_k_to_q8_0_scalar(
+            const Q3_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q3_k_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d_all = fp16_to_fp32(block.d);
+
+            // Unpack 16 6-bit scales from 12 bytes
+            const uint32_t kmask1 = 0x03030303;
+            const uint32_t kmask2 = 0x0f0f0f0f;
+
+            uint32_t aux[4];
+            std::memcpy(aux, block.scales, 12);
+            uint32_t tmp_scale = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp_scale >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp_scale >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp_scale >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp_scale >> 2) & kmask1) << 4);
+
+            const int8_t *scales = reinterpret_cast<const int8_t *>(aux);
+
+            // Each sub-block corresponds to specific qs and hmask regions
+            const size_t chunk = subblock_idx / 4; // 0 or 1 (first or second 128 elements)
+            const size_t group = subblock_idx % 4; // 0-3 (which 32-element group within chunk)
+
+            const uint8_t *q = block.qs + chunk * 32 + group * 8; // Simplified offset
+            const uint8_t *hm = block.hmask + chunk * 16 + group * 4;
+            uint8_t m = 1 << (group % 4);
+
+            const size_t scale_offset = chunk * 8 + group * 2;
+            const float dl0 = d_all * (scales[scale_offset] - 32);
+            const float dl1 = d_all * (scales[scale_offset + 1] - 32);
+
+            const int shift = 0;
+
+            // First 16 elements
+            for (size_t l = 0; l < 16; ++l)
+            {
+                tmp[l] = dl0 * (static_cast<int8_t>((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+            }
+
+            // Second 16 elements
+            for (size_t l = 0; l < 16; ++l)
+            {
+                tmp[l + 16] = dl1 * (static_cast<int8_t>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+
+        inline void decode_q3_k_to_q8_0(
+            const Q3_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            // Currently only scalar implementation
+            // AVX2/AVX512 would need careful handling of complex bit layout
+            decode_q3_k_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+        }
+
+        // =====================================================================
+        // Q8_K → Q8_0
+        // =====================================================================
+
+        inline void decode_q8_k_to_q8_0_scalar(
+            const Q8_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q8_k_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            const int8_t *src = block.qs + subblock_idx * Q8_0Block::BLOCK_SIZE;
+            std::memcpy(q8_qs, src, Q8_0Block::BLOCK_SIZE * sizeof(int8_t));
+            *q8_scale = fp32_to_fp16(1.0f);
+        }
+
+#if defined(__AVX2__)
+        inline void decode_q8_k_to_q8_0_avx2(
+            const Q8_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q8_k_to_q8_0_avx2: subblock_idx out of range");
+            }
+
+            const int8_t *src = block.qs + subblock_idx * Q8_0Block::BLOCK_SIZE;
+            const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), data);
+            *q8_scale = fp32_to_fp16(1.0f);
+        }
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        inline void decode_q8_k_to_q8_0_avx512(
+            const Q8_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q8_k_to_q8_0_avx512: subblock_idx out of range");
+            }
+
+            const int8_t *src = block.qs + subblock_idx * Q8_0Block::BLOCK_SIZE;
+            const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), data);
+            *q8_scale = fp32_to_fp16(1.0f);
+        }
+#endif
+
+        inline void decode_q8_k_to_q8_0(
+            const Q8_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_q8_k_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            decode_q8_k_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+#else
+            decode_q8_k_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // =====================================================================
+        // Q4_K and Q5_K Helper: Extract 6-bit scales and mins
+        // =====================================================================
+
+        /**
+         * @brief Extract 6-bit scale and min values from packed Q4_K/Q5_K scales
+         * Matches llama.cpp's get_scale_min_k4() function
+         * @param j Scale index (0-7)
+         * @param q Pointer to packed 12-byte scales array
+         * @param d Output: extracted scale value (6 bits)
+         * @param m Output: extracted min value (6 bits)
+         */
+        inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m)
+        {
+            if (j < 4)
+            {
+                *d = q[j] & 63;
+                *m = q[j + 4] & 63;
+            }
+            else
+            {
+                *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+                *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+            }
+        }
+
+        // =====================================================================
+        // Q4_K → Q8_0
+        // =====================================================================
+
+        /**
+         * @brief Scalar decode Q4_K to Q8_0 (one 32-element sub-block from 256-element super-block)
+         * @param block Q4_K super-block (256 elements, 144 bytes)
+         * @param subblock_idx Which 32-element sub-block to decode (0-7)
+         * @param q8_qs Output Q8_0 quantized values (32 int8_t)
+         * @param q8_scale Output Q8_0 scale (FP16)
+         */
+        inline void decode_q4_k_to_q8_0_scalar(
+            const Q4_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q4_k_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            // Q4_K processes 256 elements in 8 groups of 32 elements
+            // Each group has 2 sub-groups of 16 elements with their own scale/min
+            const size_t group_idx = subblock_idx / 2;      // 0-3 (which 64-element group)
+            const size_t is_second_half = subblock_idx % 2; // 0 or 1 (first or second 32 within group)
+
+            const size_t is = group_idx * 2 + is_second_half; // Scale index 0-7
+            const uint8_t *q = block.qs + group_idx * 32;     // Pointer to packed 4-bit values
+
+            uint8_t sc, m;
+            get_scale_min_k4(is, block.scales, &sc, &m);
+            const float dl = d * sc;
+            const float ml = dmin * m;
+
+            if (is_second_half == 0)
+            {
+                // First 32 elements: lower 4 bits
+                for (size_t l = 0; l < 32; ++l)
+                {
+                    tmp[l] = dl * (q[l] & 0xF) - ml;
+                }
+            }
+            else
+            {
+                // Second 32 elements: upper 4 bits
+                for (size_t l = 0; l < 32; ++l)
+                {
+                    tmp[l] = dl * (q[l] >> 4) - ml;
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+
+#if defined(__AVX2__)
+        inline void decode_q4_k_to_q8_0_avx2(
+            const Q4_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q4_k_to_q8_0_avx2: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const size_t group_idx = subblock_idx / 2;
+            const size_t is_second_half = subblock_idx % 2;
+            const size_t is = group_idx * 2 + is_second_half;
+            const uint8_t *q = block.qs + group_idx * 32;
+
+            uint8_t sc, m;
+            get_scale_min_k4(is, block.scales, &sc, &m);
+            const float dl = d * sc;
+            const float ml = dmin * m;
+
+            const __m256 dl_vec = _mm256_set1_ps(dl);
+            const __m256 ml_vec = _mm256_set1_ps(ml);
+
+            if (is_second_half == 0)
+            {
+                // Lower 4 bits: process 8 at a time
+                for (size_t l = 0; l < 32; l += 8)
+                {
+                    __m128i q_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q + l));
+                    __m256i q_32 = _mm256_cvtepu8_epi32(q_bytes);
+                    __m256i low_bits = _mm256_and_si256(q_32, _mm256_set1_epi32(0xF));
+                    __m256 q_float = _mm256_cvtepi32_ps(low_bits);
+                    __m256 result = _mm256_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm256_storeu_ps(tmp + l, result);
+                }
+            }
+            else
+            {
+                // Upper 4 bits: process 8 at a time
+                for (size_t l = 0; l < 32; l += 8)
+                {
+                    __m128i q_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q + l));
+                    __m256i q_32 = _mm256_cvtepu8_epi32(q_bytes);
+                    __m256i high_bits = _mm256_srli_epi32(q_32, 4);
+                    __m256 q_float = _mm256_cvtepi32_ps(high_bits);
+                    __m256 result = _mm256_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm256_storeu_ps(tmp + l, result);
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+#if defined(__AVX512F__)
+        inline void decode_q4_k_to_q8_0_avx512(
+            const Q4_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q4_k_to_q8_0_avx512: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const size_t group_idx = subblock_idx / 2;
+            const size_t is_second_half = subblock_idx % 2;
+            const size_t is = group_idx * 2 + is_second_half;
+            const uint8_t *q = block.qs + group_idx * 32;
+
+            uint8_t sc, m;
+            get_scale_min_k4(is, block.scales, &sc, &m);
+            const float dl = d * sc;
+            const float ml = dmin * m;
+
+            const __m512 dl_vec = _mm512_set1_ps(dl);
+            const __m512 ml_vec = _mm512_set1_ps(ml);
+
+            if (is_second_half == 0)
+            {
+                // Lower 4 bits: process 16 at a time
+                for (size_t l = 0; l < 32; l += 16)
+                {
+                    __m128i q_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q + l));
+                    __m512i q_32 = _mm512_cvtepu8_epi32(q_bytes);
+                    __m512i low_bits = _mm512_and_si512(q_32, _mm512_set1_epi32(0xF));
+                    __m512 q_float = _mm512_cvtepi32_ps(low_bits);
+                    __m512 result = _mm512_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm512_storeu_ps(tmp + l, result);
+                }
+            }
+            else
+            {
+                // Upper 4 bits: process 16 at a time
+                for (size_t l = 0; l < 32; l += 16)
+                {
+                    __m128i q_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q + l));
+                    __m512i q_32 = _mm512_cvtepu8_epi32(q_bytes);
+                    __m512i high_bits = _mm512_srli_epi32(q_32, 4);
+                    __m512 q_float = _mm512_cvtepi32_ps(high_bits);
+                    __m512 result = _mm512_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm512_storeu_ps(tmp + l, result);
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+        inline void decode_q4_k_to_q8_0(
+            const Q4_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            decode_q4_k_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            decode_q4_k_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+#else
+            decode_q4_k_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // =====================================================================
+        // Q5_K → Q8_0
+        // =====================================================================
+
+        /**
+         * @brief Scalar decode Q5_K to Q8_0 (one 32-element sub-block from 256-element super-block)
+         * @param block Q5_K super-block (256 elements, 176 bytes)
+         * @param subblock_idx Which 32-element sub-block to decode (0-7)
+         * @param q8_qs Output Q8_0 quantized values (32 int8_t)
+         * @param q8_scale Output Q8_0 scale (FP16)
+         */
+        inline void decode_q5_k_to_q8_0_scalar(
+            const Q5_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q5_k_to_q8_0_scalar: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            // Q5_K processes 256 elements in 8 groups of 32 elements
+            // Each group has 2 sub-groups of 16 elements with their own scale/min
+            const size_t group_idx = subblock_idx / 2;      // 0-3 (which 64-element group)
+            const size_t is_second_half = subblock_idx % 2; // 0 or 1 (first or second 32 within group)
+
+            const size_t is = group_idx * 2 + is_second_half; // Scale index 0-7
+            const uint8_t *ql = block.qs + group_idx * 32;    // Pointer to packed 4-bit low values
+            const uint8_t *qh = block.qh + group_idx * 8;     // Pointer to high bits
+
+            // High bit masks rotate through groups
+            uint8_t u_mask = (1 << (group_idx * 2)) << is_second_half;
+
+            uint8_t sc, m;
+            get_scale_min_k4(is, block.scales, &sc, &m);
+            const float dl = d * sc;
+            const float ml = dmin * m;
+
+            if (is_second_half == 0)
+            {
+                // First 32 elements: lower 4 bits + high bit from u_mask
+                for (size_t l = 0; l < 32; ++l)
+                {
+                    const uint8_t q_low = ql[l] & 0xF;
+                    const uint8_t q_high = (qh[l] & u_mask) ? 16 : 0;
+                    tmp[l] = dl * (q_low + q_high) - ml;
+                }
+            }
+            else
+            {
+                // Second 32 elements: upper 4 bits + high bit from u_mask
+                for (size_t l = 0; l < 32; ++l)
+                {
+                    const uint8_t q_low = ql[l] >> 4;
+                    const uint8_t q_high = (qh[l] & u_mask) ? 16 : 0;
+                    tmp[l] = dl * (q_low + q_high) - ml;
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+
+#if defined(__AVX2__)
+        inline void decode_q5_k_to_q8_0_avx2(
+            const Q5_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q5_k_to_q8_0_avx2: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const size_t group_idx = subblock_idx / 2;
+            const size_t is_second_half = subblock_idx % 2;
+            const size_t is = group_idx * 2 + is_second_half;
+            const uint8_t *ql = block.qs + group_idx * 32;
+            const uint8_t *qh = block.qh + group_idx * 8;
+
+            uint8_t u_mask = (1 << (group_idx * 2)) << is_second_half;
+
+            uint8_t sc, m;
+            get_scale_min_k4(is, block.scales, &sc, &m);
+            const float dl = d * sc;
+            const float ml = dmin * m;
+
+            const __m256 dl_vec = _mm256_set1_ps(dl);
+            const __m256 ml_vec = _mm256_set1_ps(ml);
+            const __m256i u_mask_vec = _mm256_set1_epi32(u_mask);
+            const __m256i high_bit_val = _mm256_set1_epi32(16);
+
+            if (is_second_half == 0)
+            {
+                // Lower 4 bits: process 8 at a time
+                for (size_t l = 0; l < 32; l += 8)
+                {
+                    __m128i ql_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(ql + l));
+                    __m256i ql_32 = _mm256_cvtepu8_epi32(ql_bytes);
+                    __m256i q_low = _mm256_and_si256(ql_32, _mm256_set1_epi32(0xF));
+
+                    __m128i qh_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qh + l));
+                    __m256i qh_32 = _mm256_cvtepu8_epi32(qh_bytes);
+                    __m256i masked = _mm256_and_si256(qh_32, u_mask_vec);
+                    __m256i q_high = _mm256_and_si256(
+                        _mm256_cmpgt_epi32(masked, _mm256_setzero_si256()),
+                        high_bit_val);
+
+                    __m256i q_total = _mm256_add_epi32(q_low, q_high);
+                    __m256 q_float = _mm256_cvtepi32_ps(q_total);
+                    __m256 result = _mm256_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm256_storeu_ps(tmp + l, result);
+                }
+            }
+            else
+            {
+                // Upper 4 bits: process 8 at a time
+                for (size_t l = 0; l < 32; l += 8)
+                {
+                    __m128i ql_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(ql + l));
+                    __m256i ql_32 = _mm256_cvtepu8_epi32(ql_bytes);
+                    __m256i q_low = _mm256_srli_epi32(ql_32, 4);
+
+                    __m128i qh_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qh + l));
+                    __m256i qh_32 = _mm256_cvtepu8_epi32(qh_bytes);
+                    __m256i masked = _mm256_and_si256(qh_32, u_mask_vec);
+                    __m256i q_high = _mm256_and_si256(
+                        _mm256_cmpgt_epi32(masked, _mm256_setzero_si256()),
+                        high_bit_val);
+
+                    __m256i q_total = _mm256_add_epi32(q_low, q_high);
+                    __m256 q_float = _mm256_cvtepi32_ps(q_total);
+                    __m256 result = _mm256_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm256_storeu_ps(tmp + l, result);
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+#if defined(__AVX512F__)
+        inline void decode_q5_k_to_q8_0_avx512(
+            const Q5_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_q5_k_to_q8_0_avx512: subblock_idx out of range");
+            }
+
+            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
+
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            const size_t group_idx = subblock_idx / 2;
+            const size_t is_second_half = subblock_idx % 2;
+            const size_t is = group_idx * 2 + is_second_half;
+            const uint8_t *ql = block.qs + group_idx * 32;
+            const uint8_t *qh = block.qh + group_idx * 8;
+
+            uint8_t u_mask = (1 << (group_idx * 2)) << is_second_half;
+
+            uint8_t sc, m;
+            get_scale_min_k4(is, block.scales, &sc, &m);
+            const float dl = d * sc;
+            const float ml = dmin * m;
+
+            const __m512 dl_vec = _mm512_set1_ps(dl);
+            const __m512 ml_vec = _mm512_set1_ps(ml);
+            const __m512i u_mask_vec = _mm512_set1_epi32(u_mask);
+            const __m512i high_bit_val = _mm512_set1_epi32(16);
+
+            if (is_second_half == 0)
+            {
+                // Lower 4 bits: process 16 at a time
+                for (size_t l = 0; l < 32; l += 16)
+                {
+                    __m128i ql_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ql + l));
+                    __m512i ql_32 = _mm512_cvtepu8_epi32(ql_bytes);
+                    __m512i q_low = _mm512_and_si512(ql_32, _mm512_set1_epi32(0xF));
+
+                    __m128i qh_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qh + l));
+                    __m512i qh_32 = _mm512_cvtepu8_epi32(qh_bytes);
+                    __mmask16 test_mask = _mm512_test_epi32_mask(
+                        _mm512_and_si512(qh_32, u_mask_vec),
+                        _mm512_and_si512(qh_32, u_mask_vec));
+                    __m512i q_high = _mm512_mask_blend_epi32(test_mask, _mm512_setzero_si512(), high_bit_val);
+
+                    __m512i q_total = _mm512_add_epi32(q_low, q_high);
+                    __m512 q_float = _mm512_cvtepi32_ps(q_total);
+                    __m512 result = _mm512_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm512_storeu_ps(tmp + l, result);
+                }
+            }
+            else
+            {
+                // Upper 4 bits: process 16 at a time
+                for (size_t l = 0; l < 32; l += 16)
+                {
+                    __m128i ql_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ql + l));
+                    __m512i ql_32 = _mm512_cvtepu8_epi32(ql_bytes);
+                    __m512i q_low = _mm512_srli_epi32(ql_32, 4);
+
+                    __m128i qh_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qh + l));
+                    __m512i qh_32 = _mm512_cvtepu8_epi32(qh_bytes);
+                    __mmask16 test_mask = _mm512_test_epi32_mask(
+                        _mm512_and_si512(qh_32, u_mask_vec),
+                        _mm512_and_si512(qh_32, u_mask_vec));
+                    __m512i q_high = _mm512_mask_blend_epi32(test_mask, _mm512_setzero_si512(), high_bit_val);
+
+                    __m512i q_total = _mm512_add_epi32(q_low, q_high);
+                    __m512 q_float = _mm512_cvtepi32_ps(q_total);
+                    __m512 result = _mm512_fmsub_ps(dl_vec, q_float, ml_vec);
+                    _mm512_storeu_ps(tmp + l, result);
+                }
+            }
+
+            quantize_fp32_to_q8_0(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+        }
+#endif
+
+        inline void decode_q5_k_to_q8_0(
+            const Q5_KBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            decode_q5_k_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
+#elif defined(__AVX2__)
+            decode_q5_k_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
+#else
+            decode_q5_k_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
+        }
+
+        // =====================================================================
+        // FP32 → Q8_0 (direct quantization, already in FP32 format)
+        // =====================================================================
+
+        /**
+         * @brief Decode FP32 block to Q8_0 format (scalar)
+         * @param fp32_data Source FP32 data (32 elements)
+         * @param output_qs Output Q8_0 quantized values (32 int8_t)
+         * @param output_scale Output Q8_0 scale (FP16)
+         *
+         * FP32 is already fully decoded - just quantize to Q8_0.
+         * This is used for converting activation tensors to Q8_0 for integer GEMM.
+         */
+        inline void decode_fp32_to_q8_0_scalar(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+            quantize_fp32_to_q8_0_scalar(fp32_data, 32, output_qs, output_scale);
+        }
+
+        /**
+         * @brief Decode FP32 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_fp32_to_q8_0_avx512(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#if defined(__AVX512F__)
+            quantize_fp32_to_q8_0_avx512(fp32_data, 32, output_qs, output_scale);
+#else
+            decode_fp32_to_q8_0_scalar(fp32_data, output_qs, output_scale);
+#endif
+        }
+
+        /**
+         * @brief Decode FP32 block to Q8_0 format (AVX2)
+         */
+        inline void decode_fp32_to_q8_0_avx2(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#ifdef __AVX2__
+            quantize_fp32_to_q8_0_avx2(fp32_data, 32, output_qs, output_scale);
+#else
+            decode_fp32_to_q8_0_scalar(fp32_data, output_qs, output_scale);
+#endif
+        }
+
+        /**
+         * @brief Decode FP32 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_fp32_to_q8_0(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#if defined(__AVX512F__)
+            decode_fp32_to_q8_0_avx512(fp32_data, output_qs, output_scale);
+#elif defined(__AVX2__)
+            decode_fp32_to_q8_0_avx2(fp32_data, output_qs, output_scale);
+#else
+            decode_fp32_to_q8_0_scalar(fp32_data, output_qs, output_scale);
+#endif
+        }
+
+        // =====================================================================
+        // FP16 → Q8_0 (decode FP16 to FP32, then quantize to Q8_0)
+        // =====================================================================
+
+        /**
+         * @brief Decode FP16 block to Q8_0 format (scalar)
+         * @param fp16_data Source FP16 data (32 elements)
+         * @param output_qs Output Q8_0 quantized values (32 int8_t)
+         * @param output_scale Output Q8_0 scale (FP16)
+         *
+         * First converts FP16 → FP32, then quantizes to Q8_0.
+         */
+        inline void decode_fp16_to_q8_0_scalar(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+            // Decode FP16 → FP32
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = fp16_to_fp32(fp16_data[i]);
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, output_qs, output_scale);
+        }
+
+        /**
+         * @brief Decode FP16 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_fp16_to_q8_0_avx512(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512FP16__)
+            // TODO: Use native FP16 intrinsics when available
+            // For now, fall back to scalar decode + AVX512 quantize
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = fp16_to_fp32(fp16_data[i]);
+            }
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, output_qs, output_scale);
+#else
+            decode_fp16_to_q8_0_scalar(fp16_data, output_qs, output_scale);
+#endif
+        }
+
+        /**
+         * @brief Decode FP16 block to Q8_0 format (AVX2)
+         */
+        inline void decode_fp16_to_q8_0_avx2(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#ifdef __AVX2__
+            // Scalar decode FP16 → FP32, then AVX2 quantize
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = fp16_to_fp32(fp16_data[i]);
+            }
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, output_qs, output_scale);
+#else
+            decode_fp16_to_q8_0_scalar(fp16_data, output_qs, output_scale);
+#endif
+        }
+
+        /**
+         * @brief Decode FP16 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_fp16_to_q8_0(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512FP16__)
+            decode_fp16_to_q8_0_avx512(fp16_data, output_qs, output_scale);
+#elif defined(__AVX2__)
+            decode_fp16_to_q8_0_avx2(fp16_data, output_qs, output_scale);
+#else
+            decode_fp16_to_q8_0_scalar(fp16_data, output_qs, output_scale);
+#endif
+        }
+
+        // =====================================================================
+        // BF16 → Q8_0 (decode BF16 to FP32, then quantize to Q8_0)
+        // =====================================================================
+
+        /**
+         * @brief Decode BF16 block to Q8_0 format (scalar)
+         * @param bf16_data Source BF16 data (32 elements)
+         * @param output_qs Output Q8_0 quantized values (32 int8_t)
+         * @param output_scale Output Q8_0 scale (FP16)
+         *
+         * First converts BF16 → FP32, then quantizes to Q8_0.
+         */
+        inline void decode_bf16_to_q8_0_scalar(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+            // Decode BF16 → FP32
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = bf16_to_fp32(bf16_data[i]);
+            }
+
+            // Quantize FP32 → Q8_0
+            quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, output_qs, output_scale);
+        }
+
+        /**
+         * @brief Decode BF16 block to Q8_0 format (AVX-512)
+         */
+        inline void decode_bf16_to_q8_0_avx512(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            // Use vectorized BF16 → FP32 conversion
+            float fp32_buffer[32];
+            convert_bf16_to_fp32_avx512(bf16_data, fp32_buffer, 32);
+            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, output_qs, output_scale);
+#else
+            decode_bf16_to_q8_0_scalar(bf16_data, output_qs, output_scale);
+#endif
+        }
+
+        /**
+         * @brief Decode BF16 block to Q8_0 format (AVX2)
+         */
+        inline void decode_bf16_to_q8_0_avx2(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#ifdef __AVX2__
+            // Use vectorized BF16 → FP32 conversion
+            float fp32_buffer[32];
+            convert_bf16_to_fp32_avx2(bf16_data, fp32_buffer, 32);
+            quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, output_qs, output_scale);
+#else
+            decode_bf16_to_q8_0_scalar(bf16_data, output_qs, output_scale);
+#endif
+        }
+
+        /**
+         * @brief Decode BF16 block to Q8_0 format (auto-dispatch)
+         */
+        inline void decode_bf16_to_q8_0(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_bf16_to_q8_0_avx512(bf16_data, output_qs, output_scale);
+#elif defined(__AVX2__)
+            decode_bf16_to_q8_0_avx2(bf16_data, output_qs, output_scale);
+#else
+            decode_bf16_to_q8_0_scalar(bf16_data, output_qs, output_scale);
+#endif
         }
 
     } // namespace simd

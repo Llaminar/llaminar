@@ -255,16 +255,6 @@ namespace llaminar2
         }
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
     // ========== Decode API ==========
 
     void IQ4_NLTensor::decode_to_fp32(float *dst) const
@@ -644,6 +634,24 @@ namespace llaminar2
         (void)src;
         LOG_ERROR("[IQ4_NLTensor::copyFrom] Not implemented");
         return false;
+    }
+
+    // ========== Q8_0 Decode (for Integer GEMM) ==========
+
+    void IQ4_NLTensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        // Get IQ4_NL block
+        const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
+        const IQ4_NLBlock &iq4_block = blocks[row_idx * blocks_per_row + k_block_offset];
+
+        // Use vectorized decode (auto-dispatches to AVX512/AVX2/scalar)
+        simd::decode_iq4nl_to_q8_0(
+            iq4_block.qs, // Input: packed 4-bit indices
+            iq4_block.d,  // Input: IQ4_NL FP16 scale
+            output->qs,   // Output: Q8_0 int8 values
+            &output->d);  // Output: Q8_0 FP16 scale
     }
 
 } // namespace llaminar2

@@ -13,7 +13,7 @@
  * @date November 2025
  */
 
-#include "kernels/cpu/INT8GemmImpl.h"
+#include "kernels/cpu/gemm/int8/INT8GemmImpl.h"
 #include "utils/Logger.h"
 #include <gtest/gtest.h>
 #include <vector>

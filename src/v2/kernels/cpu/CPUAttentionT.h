@@ -18,6 +18,7 @@
 
 #include "../../tensors/TensorKernels.h"
 #include "../../tensors/Tensors.h"
+#include "../../tensors/SIMDHelpers.h"
 #include "primitives/ActivationTraits.h"
 #include "primitives/SoftmaxPrimitives_New.h"
 #include "../../pipelines/AttentionUtils.h"
@@ -213,30 +214,132 @@ namespace llaminar2
             // Only final output gets converted to BF16/FP16 if needed.
             float *scores = workspace_scores->mutable_data();
 
-            // 1. Broadcast K/V heads if needed (GQA/MQA)
-            // CRITICAL: Broadcast buffers MUST be float* (broadcast_kv_heads writes FP32)
+            // 1. Convert Q, K, V to FP32 (required for multiply_activations_strided)
+            // CRITICAL: ITensorGemm::multiply_activations_strided expects float* inputs!
+            std::vector<float> Q_fp32(seq_len * n_heads * head_dim);
+            std::vector<float> K_fp32(seq_len * n_kv_heads * head_dim);
+            std::vector<float> V_fp32(seq_len * n_kv_heads * head_dim);
+
+            // Convert ElementType → FP32 using type-specific conversion
+            if constexpr (std::is_same_v<ElementType, float>)
+            {
+                // FP32: direct copy
+                std::memcpy(Q_fp32.data(), Q, Q_fp32.size() * sizeof(float));
+                std::memcpy(K_fp32.data(), K, K_fp32.size() * sizeof(float));
+                std::memcpy(V_fp32.data(), V, V_fp32.size() * sizeof(float));
+            }
+            else if constexpr (std::is_same_v<TensorType, BF16Tensor>)
+            {
+                // BF16: convert using simd::bf16_to_fp32
+                for (size_t i = 0; i < Q_fp32.size(); ++i)
+                {
+                    Q_fp32[i] = simd::bf16_to_fp32(Q[i]);
+                }
+                for (size_t i = 0; i < K_fp32.size(); ++i)
+                {
+                    K_fp32[i] = simd::bf16_to_fp32(K[i]);
+                }
+                for (size_t i = 0; i < V_fp32.size(); ++i)
+                {
+                    V_fp32[i] = simd::bf16_to_fp32(V[i]);
+                }
+            }
+            else if constexpr (std::is_same_v<TensorType, FP16Tensor>)
+            {
+                // FP16: convert using simd::fp16_to_fp32
+                for (size_t i = 0; i < Q_fp32.size(); ++i)
+                {
+                    Q_fp32[i] = simd::fp16_to_fp32(Q[i]);
+                }
+                for (size_t i = 0; i < K_fp32.size(); ++i)
+                {
+                    K_fp32[i] = simd::fp16_to_fp32(K[i]);
+                }
+                for (size_t i = 0; i < V_fp32.size(); ++i)
+                {
+                    V_fp32[i] = simd::fp16_to_fp32(V[i]);
+                }
+            }
+            else if constexpr (std::is_same_v<TensorType, INT32Tensor>)
+            {
+                // INT32: convert using static_cast
+                for (size_t i = 0; i < Q_fp32.size(); ++i)
+                {
+                    Q_fp32[i] = static_cast<float>(Q[i]);
+                }
+                for (size_t i = 0; i < K_fp32.size(); ++i)
+                {
+                    K_fp32[i] = static_cast<float>(K[i]);
+                }
+                for (size_t i = 0; i < V_fp32.size(); ++i)
+                {
+                    V_fp32[i] = static_cast<float>(V[i]);
+                }
+            }
+            else if constexpr (std::is_same_v<TensorType, Q8_0Tensor>)
+            {
+                // Q8_0: dequantize blocks to FP32
+                // Q8_0Tensor stores int8_t* but we need to cast through TensorBase to call to_fp32()
+                // CRITICAL: Q is actually const int8_t*, but we need to treat the whole tensor
+                // Create temporary Q8_0Tensor wrappers to use to_fp32() method
+
+                // Calculate raw data size (34 bytes per block of 32 elements)
+                size_t Q_n_elems = Q_fp32.size();
+                size_t K_n_elems = K_fp32.size();
+                size_t V_n_elems = V_fp32.size();
+
+                size_t Q_n_blocks = (Q_n_elems + 31) / 32;
+                size_t K_n_blocks = (K_n_elems + 31) / 32;
+                size_t V_n_blocks = (V_n_elems + 31) / 32;
+
+                size_t Q_n_bytes = Q_n_blocks * 34; // 34 bytes per Q8_0Block
+                size_t K_n_bytes = K_n_blocks * 34;
+                size_t V_n_bytes = V_n_blocks * 34;
+
+                // Wrap raw Q8_0 data in Q8_0Tensor for dequantization
+                std::vector<uint8_t> Q_raw(reinterpret_cast<const uint8_t *>(Q), reinterpret_cast<const uint8_t *>(Q) + Q_n_bytes);
+                std::vector<uint8_t> K_raw(reinterpret_cast<const uint8_t *>(K), reinterpret_cast<const uint8_t *>(K) + K_n_bytes);
+                std::vector<uint8_t> V_raw(reinterpret_cast<const uint8_t *>(V), reinterpret_cast<const uint8_t *>(V) + V_n_bytes);
+
+                // CRITICAL: Q8_0Tensor requires 2D shape for to_fp32_via_blocks()
+                // Shape: [seq_len * n_heads, head_dim] for Q, [seq_len * n_kv_heads, head_dim] for K/V
+                Q8_0Tensor Q_tensor({static_cast<size_t>(seq_len * n_heads), static_cast<size_t>(head_dim)}, Q_raw);
+                Q8_0Tensor K_tensor({static_cast<size_t>(seq_len * n_kv_heads), static_cast<size_t>(head_dim)}, K_raw);
+                Q8_0Tensor V_tensor({static_cast<size_t>(seq_len * n_kv_heads), static_cast<size_t>(head_dim)}, V_raw);
+
+                Q_tensor.to_fp32(Q_fp32.data());
+                K_tensor.to_fp32(K_fp32.data());
+                V_tensor.to_fp32(V_fp32.data());
+            }
+            else
+            {
+                // Unknown type - should never happen with proper ActivationTraits
+                throw std::runtime_error("Unsupported tensor type for CPUAttentionT");
+            }
+
+            // 2. Broadcast K/V heads if needed (GQA/MQA)
             std::vector<float> K_broadcast, V_broadcast;
-            const float *K_expanded = reinterpret_cast<const float *>(K);
-            const float *V_expanded = reinterpret_cast<const float *>(V);
+            const float *K_expanded = K_fp32.data();
+            const float *V_expanded = V_fp32.data();
 
             if (n_heads != n_kv_heads)
             {
                 K_broadcast.resize(seq_len * n_heads * head_dim);
                 V_broadcast.resize(seq_len * n_heads * head_dim);
 
-                // broadcast_kv_heads expects float*, performs BF16→FP32 conversion internally
+                // broadcast_kv_heads: FP32 → FP32 broadcast (no conversion)
                 attention_utils::broadcast_kv_heads(
-                    reinterpret_cast<const float *>(K), K_broadcast.data(),
+                    K_fp32.data(), K_broadcast.data(),
                     seq_len, n_heads, n_kv_heads, head_dim);
                 attention_utils::broadcast_kv_heads(
-                    reinterpret_cast<const float *>(V), V_broadcast.data(),
+                    V_fp32.data(), V_broadcast.data(),
                     seq_len, n_heads, n_kv_heads, head_dim);
 
                 K_expanded = K_broadcast.data();
                 V_expanded = V_broadcast.data();
             }
 
-            // 2. Compute attention scores per head: Q @ K^T with fused scaling
+            // 3. Compute attention scores per head: Q @ K^T with fused scaling
             // Optimization 1: Use GEMM alpha parameter for attention scaling (1/sqrt(d_k))
             // Optimization 2: Use strided GEMM to eliminate Q/K head extraction (zero-copy)
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -252,19 +355,19 @@ namespace llaminar2
                 // Strided Q@K^T with fused scaling
                 // Q layout: [seq_len, n_heads, head_dim] (head dimension interleaved)
                 // K layout: [seq_len, n_heads, head_dim] (head dimension interleaved)
-                const ElementType *Q_h = Q + h * head_dim;    // First element of head h
-                const float *K_h = K_expanded + h * head_dim; // K_expanded is float* after broadcast
+                const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
+                const float *K_h = K_expanded + h * head_dim;    // K_expanded: already FP32
 
                 const int lda = n_heads * head_dim; // Q: stride between rows (skip other heads)
                 const int ldb = n_heads * head_dim; // K: stride between rows (skip other heads)
                 const int ldc = seq_len;            // scores: contiguous [seq_len, seq_len]
 
                 // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
-                // Note: ITensorGemm interface uses float*, GEMM kernel handles precision internally
+                // Note: Q_h and K_h are already FP32, no type conversion needed
                 gemm->multiply_activations_strided(
-                    reinterpret_cast<const float *>(Q_h),
-                    K_h,                        // Already float*, no cast needed
-                    scores_h,                   // Already float*, no cast needed
+                    Q_h,                        // FP32 Q head
+                    K_h,                        // FP32 K head (after broadcast if GQA)
+                    scores_h,                   // FP32 scores output
                     seq_len, seq_len, head_dim, // m=seq_len, n=seq_len, k=head_dim
                     lda, ldb, ldc,
                     true,    // transpose_B=true (K^T)

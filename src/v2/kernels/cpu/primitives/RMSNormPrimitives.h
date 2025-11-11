@@ -27,6 +27,7 @@ namespace llaminar2::primitives
         bool allow_parallel = true;                  // Permit OpenMP parallelization
         std::size_t parallel_threshold_elems = 2048; // Threshold for parallelization
         bool t5_compat_mode = false;                 // Use float32 accumulation for T5 parity
+        bool force_scalar = false;                   // Force scalar path (for testing)
     };
 
     /**

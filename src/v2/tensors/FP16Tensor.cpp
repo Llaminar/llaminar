@@ -635,4 +635,30 @@ namespace llaminar2
             device_idx);
     }
 
+    void FP16Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        // Calculate source offset in FP16 data
+        const size_t cols = shape_[1];
+        const size_t k_start = k_block_offset * Q8_0Block::BLOCK_SIZE;
+
+        // Bounds check
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("FP16Tensor::decode_to_q8_0: row_idx out of range");
+        }
+        if (k_start + Q8_0Block::BLOCK_SIZE > cols)
+        {
+            throw std::out_of_range("FP16Tensor::decode_to_q8_0: k_block_offset exceeds tensor width");
+        }
+
+        // Get pointer to source FP16 data
+        const uint16_t *fp16_ptr = host_fp16_data_.data() + row_idx * cols + k_start;
+
+        // Use vectorized decode + quantize (auto-dispatches to AVX512/AVX2/scalar)
+        simd::decode_fp16_to_q8_0(
+            fp16_ptr,    // Input: FP16 values
+            output->qs,  // Output: Q8_0 int8 values
+            &output->d); // Output: Q8_0 FP16 scale
+    }
+
 } // namespace llaminar2

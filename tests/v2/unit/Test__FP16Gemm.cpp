@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  */
 
-#include "../../../src/v2/kernels/cpu/FP16GemmImpl.h"
+#include "../../../src/v2/kernels/cpu/gemm/fp16/FP16GemmImpl.h"
 #include "../../../src/v2/tensors/FP16Utils.h"
 #include <gtest/gtest.h>
 #include <vector>

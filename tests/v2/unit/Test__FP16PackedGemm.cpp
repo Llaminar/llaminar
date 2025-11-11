@@ -11,9 +11,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/kernels/cpu/FP16PackedGemm.h"
-#include "../../../src/v2/kernels/cpu/FP16GemmImpl.h"
-#include "../../../src/v2/kernels/cpu/GemmAutoTuner.h"
+#include "../../../src/v2/kernels/cpu/gemm/fp16/FP16PackedGemm.h"
+#include "../../../src/v2/kernels/cpu/gemm/fp16/FP16GemmImpl.h"
+#include "../../../src/v2/kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../../../src/v2/tensors/FP16Utils.h"
 #include <vector>
 #include <cmath>

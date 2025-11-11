@@ -7,10 +7,14 @@
 
 #include "Tensors.h"
 #include "TensorKernels.h"
+#include "SIMDHelpers.h"
 #include "../utils/Logger.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
+#include <vector>
+#include <omp.h>
 
 namespace llaminar2
 {
@@ -220,6 +224,144 @@ namespace llaminar2
         for (size_t i = 0; i < total; ++i)
         {
             dst[i] = static_cast<int32_t>(std::round(temp_fp32[i] * scale));
+        }
+    }
+
+    // Helper to convert TensorType enum to string
+    static const char *tensorTypeToString(TensorType type)
+    {
+        switch (type)
+        {
+        case TensorType::FP32:
+            return "FP32";
+        case TensorType::BF16:
+            return "BF16";
+        case TensorType::FP16:
+            return "FP16";
+        case TensorType::INT8:
+            return "INT8";
+        case TensorType::INT32:
+            return "INT32";
+        case TensorType::IQ4_NL:
+            return "IQ4_NL";
+        case TensorType::IQ4_XS:
+            return "IQ4_XS";
+        case TensorType::Q8_0:
+            return "Q8_0";
+        case TensorType::Q4_0:
+            return "Q4_0";
+        case TensorType::Q4_1:
+            return "Q4_1";
+        case TensorType::Q5_0:
+            return "Q5_0";
+        case TensorType::Q5_1:
+            return "Q5_1";
+        case TensorType::Q6_K:
+            return "Q6_K";
+        case TensorType::Q2_K:
+            return "Q2_K";
+        case TensorType::Q5_K:
+            return "Q5_K";
+        case TensorType::Q3_K:
+            return "Q3_K";
+        case TensorType::Q4_K:
+            return "Q4_K";
+        case TensorType::Q8_K:
+            return "Q8_K";
+        case TensorType::IQ2_XXS:
+            return "IQ2_XXS";
+        case TensorType::IQ2_XS:
+            return "IQ2_XS";
+        case TensorType::IQ3_XXS:
+            return "IQ3_XXS";
+        case TensorType::IQ2_S:
+            return "IQ2_S";
+        case TensorType::IQ3_S:
+            return "IQ3_S";
+        case TensorType::IQ1_S:
+            return "IQ1_S";
+        case TensorType::IQ1_M:
+            return "IQ1_M";
+        default:
+            return "Unknown";
+        }
+    }
+
+    // Default Q8_0 conversion (throws error for read-only quantized weight tensors)
+    void TensorBase::to_q8_0(Q8_0Block *dst) const
+    {
+        // Get tensor dimensions and block configuration
+        const size_t total_elements = element_count();
+        constexpr size_t Q8_BLOCK_SIZE = 32;
+        const size_t num_blocks = (total_elements + Q8_BLOCK_SIZE - 1) / Q8_BLOCK_SIZE;
+
+        // For 2D tensors with ITensorGemmTileDataProvider, use optimized block decode
+        if (shape().size() == 2)
+        {
+            const auto *provider = dynamic_cast<const ITensorGemmTileDataProvider *>(this);
+            if (provider)
+            {
+                const size_t rows = shape()[0];
+                const size_t cols = shape()[1];
+                const size_t src_block_size = provider->block_size();
+                const size_t blocks_per_row = (cols + src_block_size - 1) / src_block_size;
+
+// OpenMP parallelize over rows
+#pragma omp parallel for schedule(static)
+                for (size_t r = 0; r < rows; ++r)
+                {
+                    for (size_t kb = 0; kb < blocks_per_row; ++kb)
+                    {
+                        // Decode source block to FP32
+                        alignas(64) float fp32_block[256]; // Max block size (Q6_K = 256)
+                        provider->decode_block_at(r, kb, fp32_block);
+
+                        // Determine how many elements in this block
+                        const size_t k_start = kb * src_block_size;
+                        const size_t elements_remaining = cols - k_start;
+                        const size_t elements_in_block = std::min(src_block_size, elements_remaining);
+
+                        // Quantize to Q8_0 in chunks of 32 elements
+                        for (size_t offset = 0; offset < elements_in_block; offset += Q8_BLOCK_SIZE)
+                        {
+                            const size_t chunk_size = std::min(Q8_BLOCK_SIZE, elements_in_block - offset);
+                            const size_t global_block_idx = (r * cols + k_start + offset) / Q8_BLOCK_SIZE;
+
+                            // Quantize this 32-element chunk
+                            simd::quantize_fp32_to_q8_0(fp32_block + offset, chunk_size,
+                                                        dst[global_block_idx].qs,
+                                                        &dst[global_block_idx].d);
+
+                            // Zero-pad if needed
+                            if (chunk_size < Q8_BLOCK_SIZE)
+                            {
+                                std::memset(dst[global_block_idx].qs + chunk_size, 0, Q8_BLOCK_SIZE - chunk_size);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Fallback: Decode to FP32 first, then quantize to Q8_0
+        std::vector<float> fp32_buffer(total_elements);
+        to_fp32(fp32_buffer.data());
+
+#pragma omp parallel for schedule(static)
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const size_t offset = b * Q8_BLOCK_SIZE;
+            const size_t chunk_size = std::min(Q8_BLOCK_SIZE, total_elements - offset);
+
+            simd::quantize_fp32_to_q8_0(fp32_buffer.data() + offset, chunk_size,
+                                        dst[b].qs, &dst[b].d);
+
+            // Zero-pad if needed
+            if (chunk_size < Q8_BLOCK_SIZE)
+            {
+                std::memset(dst[b].qs + chunk_size, 0, Q8_BLOCK_SIZE - chunk_size);
+            }
         }
     }
 

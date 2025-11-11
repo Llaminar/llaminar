@@ -197,17 +197,7 @@ namespace llaminar2
         throw std::runtime_error("IQ2_STensor::mutable_data: quantized tensors are immutable");
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
-    bool IQ2_STensor::copyFrom(const TensorBase *src)
+        bool IQ2_STensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
@@ -328,6 +318,25 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    void IQ2_STensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
+    {
+        // IQ2_S: 256 elements per super-block → 8 Q8_0 sub-blocks of 32 elements
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
+
+        size_t blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
+        size_t super_block_idx = k_block_offset / 8; // 8 Q8_0 blocks per IQ2_S super-block
+        size_t sub_block_idx = k_block_offset % 8;   // Which Q8_0 sub-block within super-block
+
+        const IQ2_SBlock &super_block = blocks[row_idx * blocks_per_row + super_block_idx];
+
+        // Decode all 8 sub-blocks from the super-block
+        for (size_t sub_idx = 0; sub_idx < 8; ++sub_idx)
+        {
+            simd::decode_iq2s_to_q8_0(super_block, sub_idx, output[sub_idx].qs, &output[sub_idx].d);
+        }
     }
 
 } // namespace llaminar2
