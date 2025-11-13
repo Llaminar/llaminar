@@ -827,8 +827,10 @@ namespace llaminar2
 
             // CORRECTED: Store per-block accumulations (not summed across blocks)
             // accum[ir][jr][kb] = dot product for row ir, col jr, K-block kb
-            // sum_qs[ir][kb] = Σ(qs[i]) as INT32 for row ir, K-block kb (extracted from Q8_1 FP16 sum)
-            //                  OPTIMIZATION: Convert FP16→INT32 in K-loop (eliminates post-processing overhead)
+            // sum_qs[kb][ir] = Σ(qs[i]) as INT16 for row ir, K-block kb (extracted from Q8_1 FP16 sum)
+            //                  OPTIMIZATION: Convert FP16→INT16 in K-loop (eliminates post-processing overhead)
+            //                  LAYOUT: TRANSPOSED to [K_blocks][MR] for contiguous vector stores (eliminates scatter!)
+            //                  STORAGE: INT16 (range [-4096, 4096]) - halves memory bandwidth vs INT32
 
             auto t_buffer_init_start = std::chrono::high_resolution_clock::now();
 
@@ -839,11 +841,11 @@ namespace llaminar2
 
             // Allocate buffers dynamically based on actual K_blocks needed
             std::vector<int32_t> accum_vec(MR * NR * K_blocks, 0);
-            std::vector<int32_t> sum_qs_vec(MR * K_blocks, 0); // INT32: extracted Σ(qs) from Q8_1 blocks
+            std::vector<int16_t> sum_qs_vec(K_blocks * MR, 0); // INT16: TRANSPOSED layout [K_blocks][MR], halves bandwidth
             std::vector<uint16_t> a_scales_vec(MR * K_blocks);
 
             int32_t *accum_storage = accum_vec.data();
-            int32_t *sum_qs_storage = sum_qs_vec.data();
+            int16_t *sum_qs_storage = sum_qs_vec.data();
             uint16_t *a_scales_storage = a_scales_vec.data();
 
             auto t_buffer_init_end = std::chrono::high_resolution_clock::now();
@@ -864,9 +866,11 @@ namespace llaminar2
             {
                 return accum_storage[ir * NR * K_blocks + jr * K_blocks + kb];
             };
-            auto sum_qs = [&](int ir, int kb) -> int32_t &
+            auto sum_qs = [&](int kb, int ir) -> int16_t &
             {
-                return sum_qs_storage[ir * K_blocks + kb];
+                // TRANSPOSED layout: [K_blocks][MR] for contiguous vector stores
+                // INT16 storage: range [-4096, 4096] for 32 signed int8 values
+                return sum_qs_storage[kb * MR + ir];
             };
             auto a_scales = [&](int ir, int kb) -> uint16_t &
             {
@@ -991,15 +995,13 @@ namespace llaminar2
                     // Convert to INT32
                     __m512i sum_qs_i32 = _mm512_cvtps_epi32(sum_qs_rounded);
 
-                    // Store to sum_qs array (need to scatter - not consecutive in memory!)
-                    // sum_qs is row-major [MR, K_blocks], so sum_qs(i, kb) and sum_qs(i+1, kb) are K_blocks apart
-                    // Extract and store individually
-                    alignas(64) int32_t sum_qs_tmp[16];
-                    _mm512_storeu_si512(sum_qs_tmp, sum_qs_i32);
-                    for (int i = 0; i < VEC_WIDTH; ++i)
-                    {
-                        sum_qs(ir + i, kb) = sum_qs_tmp[i];
-                    }
+                    // Convert INT32 to INT16 (pack with saturation for safety)
+                    // Range check: 32 signed int8 values sum to [-4096, 4096], well within INT16 range
+                    __m256i sum_qs_i16 = _mm512_cvtsepi32_epi16(sum_qs_i32);
+
+                    // Store to sum_qs array - TRANSPOSED layout enables contiguous vector store!
+                    // sum_qs is [K_blocks, MR] (INT16), so sum_qs(kb, ir) through sum_qs(kb, ir+15) are consecutive
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(&sum_qs(kb, ir)), sum_qs_i16);
                 }
 
                 // 8-wide vectorized tail (AVX2-compatible)
@@ -1029,13 +1031,15 @@ namespace llaminar2
                     // Convert to INT32
                     __m256i sum_qs_i32 = _mm256_cvtps_epi32(sum_qs_rounded);
 
-                    // Store to sum_qs array (need to scatter - not consecutive!)
-                    alignas(32) int32_t sum_qs_tmp[8];
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(sum_qs_tmp), sum_qs_i32);
-                    for (int i = 0; i < 8; ++i)
-                    {
-                        sum_qs(ir + i, kb) = sum_qs_tmp[i];
-                    }
+                    // Convert INT32 to INT16 (pack with saturation)
+                    // AVX2: Pack two __m256i (8 int32 each) into one __m256i (16 int16)
+                    // We only have 8 values, so zero the upper half
+                    __m256i zero = _mm256_setzero_si256();
+                    __m256i sum_qs_i16 = _mm256_packs_epi32(sum_qs_i32, zero); // [8 int16, 8 zeros]
+
+                    // Extract lower 128 bits (8 int16 values) and store
+                    __m128i sum_qs_i16_lo = _mm256_castsi256_si128(sum_qs_i16);
+                    _mm_storeu_si128(reinterpret_cast<__m128i *>(&sum_qs(kb, ir)), sum_qs_i16_lo);
                 }
 
                 // 4-wide vectorized tail (AVX2-compatible)
@@ -1065,13 +1069,13 @@ namespace llaminar2
                     // Convert to INT32
                     __m128i sum_qs_i32 = _mm_cvtps_epi32(sum_qs_rounded);
 
-                    // Store to sum_qs array (need to scatter - not consecutive!)
-                    alignas(16) int32_t sum_qs_tmp[4];
-                    _mm_storeu_si128(reinterpret_cast<__m128i *>(sum_qs_tmp), sum_qs_i32);
-                    for (int i = 0; i < 4; ++i)
-                    {
-                        sum_qs(ir + i, kb) = sum_qs_tmp[i];
-                    }
+                    // Convert INT32 to INT16 (pack with saturation)
+                    // SSE: Pack two __m128i (4 int32 each) into one __m128i (8 int16)
+                    __m128i zero = _mm_setzero_si128();
+                    __m128i sum_qs_i16 = _mm_packs_epi32(sum_qs_i32, zero); // [4 int16, 4 zeros]
+
+                    // Store lower 64 bits (4 int16 values)
+                    _mm_storel_epi64(reinterpret_cast<__m128i *>(&sum_qs(kb, ir)), sum_qs_i16);
                 }
 
                 // Scalar tail (if MR not multiple of 4)
@@ -1080,7 +1084,17 @@ namespace llaminar2
                     float sum_a_fp32 = fp16_to_fp32(sum_a_fp16[ir]);
                     float a_scale_fp32 = fp16_to_fp32(a_scale_fp16[ir]);
                     float sum_qs_fp32 = sum_a_fp32 / std::max(a_scale_fp32, 1e-10f);
-                    sum_qs(ir, kb) = static_cast<int32_t>(std::round(sum_qs_fp32));
+                    int32_t sum_qs_i32 = static_cast<int32_t>(std::round(sum_qs_fp32));
+
+// Range check in debug builds (32 signed int8: [-128,127] × 32 = [-4096, 4096])
+#ifndef NDEBUG
+                    if (sum_qs_i32 < -4096 || sum_qs_i32 > 4096)
+                    {
+                        std::cerr << "WARNING: sum_qs out of range: " << sum_qs_i32 << " at ir=" << ir << ", kb=" << kb << std::endl;
+                    }
+#endif
+
+                    sum_qs(kb, ir) = static_cast<int16_t>(sum_qs_i32);
                 }
 
                 auto t_load_a_end = std::chrono::high_resolution_clock::now();
@@ -1250,10 +1264,26 @@ namespace llaminar2
                     int kb = 0;
                     for (; kb + VECTOR_WIDTH <= K_blocks; kb += VECTOR_WIDTH)
                     {
-                        // Load VECTOR_WIDTH sum_qs values (INT32) and convert to FP32
-                        // OPTIMIZATION: sum_qs pre-extracted as INT32 in K-loop (no FP16 conversion, no division!)
-                        __m512i sum_qs_i32 = _mm512_loadu_si512(&sum_qs(ir, kb));
-                        __m512 sum_qs_f32 = _mm512_cvtepi32_ps(sum_qs_i32); // 3 cycles (same as Q8_0!)
+                        // Load VECTOR_WIDTH sum_qs values (INT16) and convert to INT32, then FP32
+                        // OPTIMIZATION: sum_qs stored as INT16 in K-loop (halves memory bandwidth!)
+                        // NOTE: With transposed layout [K_blocks][MR], we need to gather across K-blocks for same row
+                        // AVX-512 has no native int16 gather, so we use two int32 gathers with scale=2
+                        __m256i gather_indices_256 = _mm256_setr_epi32(
+                            0 * MR, 1 * MR, 2 * MR, 3 * MR, 4 * MR, 5 * MR, 6 * MR, 7 * MR);
+
+                        // Gather first 8 int32 values (each contains 2 int16s, we want lower 16 bits)
+                        __m256i sum_qs_i32_lo_raw = _mm256_i32gather_epi32(
+                            reinterpret_cast<const int *>(&sum_qs(kb, ir)), gather_indices_256, 2);
+                        __m256i sum_qs_i32_lo = _mm256_srai_epi32(_mm256_slli_epi32(sum_qs_i32_lo_raw, 16), 16);
+
+                        // Gather second 8 int32 values
+                        __m256i sum_qs_i32_hi_raw = _mm256_i32gather_epi32(
+                            reinterpret_cast<const int *>(&sum_qs(kb + 8, ir)), gather_indices_256, 2);
+                        __m256i sum_qs_i32_hi = _mm256_srai_epi32(_mm256_slli_epi32(sum_qs_i32_hi_raw, 16), 16);
+
+                        // Combine into 512-bit (16 int32 values)
+                        __m512i sum_qs_i32 = _mm512_inserti64x4(_mm512_castsi256_si512(sum_qs_i32_lo), sum_qs_i32_hi, 1);
+                        __m512 sum_qs_f32 = _mm512_cvtepi32_ps(sum_qs_i32);
 
                         // Convert VECTOR_WIDTH A scales fp16→fp32 (vectorized, amortized across JR_BATCH columns)
                         __m256i a_scales_fp16 = _mm256_loadu_si256(
@@ -1299,9 +1329,15 @@ namespace llaminar2
                     constexpr int TAIL_VEC_WIDTH = 8;
                     for (; kb + TAIL_VEC_WIDTH <= K_blocks; kb += TAIL_VEC_WIDTH)
                     {
-                        // Load 8 sum_qs values (INT32) and convert to FP32
-                        __m256i sum_qs_i32 = _mm256_loadu_si256(
-                            reinterpret_cast<const __m256i *>(&sum_qs(ir, kb)));
+                        // Load 8 sum_qs values (INT16) and convert to INT32, then FP32
+                        // NOTE: With transposed layout, use AVX2 gather with scale=2 for int16
+                        __m256i gather_indices = _mm256_setr_epi32(
+                            0 * MR, 1 * MR, 2 * MR, 3 * MR, 4 * MR, 5 * MR, 6 * MR, 7 * MR);
+                        // Gather 8 int32 values (each contains 2 int16s, we want lower 16 bits)
+                        __m256i sum_qs_i32_raw = _mm256_i32gather_epi32(
+                            reinterpret_cast<const int *>(&sum_qs(kb, ir)), gather_indices, 2);
+                        // Extract lower 16 bits and sign-extend to 32-bit
+                        __m256i sum_qs_i32 = _mm256_srai_epi32(_mm256_slli_epi32(sum_qs_i32_raw, 16), 16);
                         __m256 sum_qs_f32 = _mm256_cvtepi32_ps(sum_qs_i32);
 
                         // Load 8 A scales (FP16) and convert to FP32
@@ -1350,8 +1386,15 @@ namespace llaminar2
 
                     for (; kb + TAIL_VEC_WIDTH_4 <= K_blocks; kb += TAIL_VEC_WIDTH_4)
                     {
-                        // Load 4 sum_qs (INT32) and convert to FP32
-                        __m128i sum_qs_i32 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&sum_qs(ir, kb)));
+                        // Load 4 sum_qs (INT16) and convert to FP32
+                        // NOTE: With transposed layout, use AVX gather intrinsic
+                        // Indices: [0*MR, 1*MR, 2*MR, 3*MR] in int16 (multiply by 2 for byte offset)
+                        __m128i gather_indices = _mm_setr_epi32(0 * MR, 1 * MR, 2 * MR, 3 * MR);
+                        // AVX gather for 4 int32 values (each contains 2 int16s, we want lower 16 bits)
+                        __m128i sum_qs_i32_raw = _mm_i32gather_epi32(
+                            reinterpret_cast<const int *>(&sum_qs(kb, ir)), gather_indices, 2);
+                        // Extract lower 16 bits and sign-extend to 32-bit
+                        __m128i sum_qs_i32 = _mm_srai_epi32(_mm_slli_epi32(sum_qs_i32_raw, 16), 16);
                         __m128 sum_qs_f32 = _mm_cvtepi32_ps(sum_qs_i32);
 
                         // Load 4 A scales (FP16) and convert to FP32
@@ -1392,7 +1435,9 @@ namespace llaminar2
                     {
                         // Load pre-extracted sum_qs (INT32) and A scale (FP16)
                         // OPTIMIZATION: sum_qs pre-extracted as INT32 in K-loop (no FP16 conversion, no division!)
-                        int32_t sum_qs_val = sum_qs(ir, kb);
+                        // Load sum_qs (INT16), convert to INT32 for computation
+                        int16_t sum_qs_val_i16 = sum_qs(kb, ir);
+                        int32_t sum_qs_val = static_cast<int32_t>(sum_qs_val_i16);
                         float a_scale = fp16_to_fp32(a_scales(ir, kb));
 
                         for (int jj = 0; jj < JR_BATCH; ++jj)
