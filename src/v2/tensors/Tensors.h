@@ -38,7 +38,8 @@ namespace llaminar2
         INT32,   // 32-bit integer accumulator (for INT8 GEMM results)
         IQ4_NL,  // 4-bit quantized (non-linear)
         IQ4_XS,  // 4-bit quantized (extra-small IQ)
-        Q8_0,    // 8-bit quantized
+        Q8_0,    // 8-bit quantized (weights)
+        Q8_1,    // 8-bit quantized with pre-computed sum (intermediate activation format)
         Q4_0,    // 4-bit quantized
         Q4_1,    // 4-bit quantized with min
         Q5_0,    // 5-bit quantized
@@ -167,6 +168,35 @@ namespace llaminar2
          * @param output Pointer to output Q8_0Block (32 int8 values + 1 FP16 scale)
          */
         virtual void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const = 0;
+    };
+
+    /**
+     * @brief Interface for tensors that can be decoded to Q8_1 format
+     *
+     * This interface is implemented by activation tensor types (FP32, FP16, BF16, INT32)
+     * that support on-the-fly quantization to Q8_1 format for integer GEMM operations.
+     *
+     * Q8_1 is used as an intermediate activation format (matching CUDA pattern):
+     * - Pre-computes sum during quantization (s = d × sum(qs[i]))
+     * - Eliminates expensive horizontal reductions in GEMM K-loop
+     * - "Quantize once, use many times" amortization
+     */
+    class IQ8_1Decodable
+    {
+    public:
+        virtual ~IQ8_1Decodable() = default;
+
+        /**
+         * @brief Get a pointer to a Q8_1 block from this tensor
+         *
+         * For Q8_1Tensor: Returns direct pointer (zero-cost)
+         * For FP32/FP16/BF16: Quantizes on-the-fly into thread-local buffer, returns pointer to it
+         *
+         * @param row_idx Row index in the tensor
+         * @param k_block_offset Block offset along K dimension (32 elements per block)
+         * @return const Q8_1Block* Pointer to the Q8_1 block (valid until next call on same thread)
+         */
+        virtual const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const = 0;
     };
 
     /**
@@ -351,7 +381,7 @@ namespace llaminar2
     /**
      * @brief FP32 tensor with optional device storage
      */
-    class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
     public:
         explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
@@ -451,8 +481,11 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return FP32_BLOCK_SIZE; }
 
-        // Q8_0 decode (for integer GEMM) - NOTE: to_q8_0() is now in TensorBase
+        // IQ8_0Decodable interface
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        // IQ8_1Decodable interface
+        const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
     private:
         // Private constructor for creating views
@@ -492,7 +525,7 @@ namespace llaminar2
      * - Precision: ~3-4 decimal digits
      * - 2× memory reduction vs FP32
      */
-    class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
     public:
         explicit FP16Tensor(const std::vector<size_t> &shape);
@@ -595,8 +628,11 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return FP16_BLOCK_SIZE; }
 
-        // Q8_0 decode (for integer GEMM)
+        // IQ8_0Decodable interface
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        // IQ8_1Decodable interface
+        const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
         // FP16-specific interface
         const uint16_t *fp16_data() const
@@ -648,7 +684,7 @@ namespace llaminar2
      * - 2× memory reduction vs FP32
      * - Hardware acceleration on Ice Lake+, Zen 4+
      */
-    class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
     public:
         explicit BF16Tensor(const std::vector<size_t> &shape);
@@ -751,8 +787,11 @@ namespace llaminar2
         void from_fp32(const float *fp32_data, size_t count);
         void to_fp32(float *fp32_data, size_t count) const; // Deprecated overload
 
-        // Q8_0 decode (for integer GEMM)
+        // IQ8_0Decodable interface
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        // IQ8_1Decodable interface - returns pointer to thread-local block
+        const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
     private:
         // Private constructor for creating views
@@ -1258,6 +1297,164 @@ namespace llaminar2
 
         // Private view constructor
         Q8_0Tensor(const std::vector<size_t> &shape,
+                   const uint8_t *parent_raw_data,
+                   size_t byte_offset,
+                   std::shared_ptr<TensorBase> parent);
+    };
+
+    // ===== Q8_1 Tensor (8-bit quantization with pre-computed sum) =====
+
+    // Implementation: Q8_1Tensor.cpp
+    /**
+     * @brief Q8_1 quantized tensor (8-bit uniform quantization with pre-computed sum)
+     *
+     * Block format: 32 elements per block, FP16 scale + FP16 sum + int8[32] values
+     * Compression: 4× vs FP32 (slight overhead vs Q8_0 for pre-computed sum)
+     *
+     * This format is used as an intermediate activation format (matching CUDA pattern):
+     * - Pre-computes sum during quantization: s = d × sum(qs[i])
+     * - Eliminates expensive horizontal reductions in GEMM K-loop
+     * - "Quantize once, use many times" amortization
+     *
+     * Typical usage:
+     *   FP32/FP16/BF16 activations → Q8_1 (quantize once per panel)
+     *   → Q8_1 activations × quantized weights (many dot products, no sum computation!)
+     */
+    class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable
+    {
+    public:
+        Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q8_1Tensor() override;
+
+        // TensorBase interface
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q8_1; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        bool copyFrom(const TensorBase *src) override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Format conversion (TensorBase interface)
+        void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
+        void to_bf16(uint16_t *dst) const override;
+        void to_fp16(uint16_t *dst) const override;
+        void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
+        void to_fp32_row(size_t row_idx, float *buffer) const override;
+        void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // IQ8_1Decodable interface - Q8_1 to Q8_1 returns direct pointer (zero-cost)
+        const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
+
+        // IActivationTensor interface
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRoPE(
+            float *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        // View support (row-slice only - preserves K dimension)
+        bool is_view() const override { return is_view_; }
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override;
+
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
+        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
+            const Q8_1Block &block = blocks[row_idx * blocks_per_row + k_block_offset];
+            decodeBlock(block, output);
+        }
+
+        __attribute__((always_inline))
+        const void *
+        get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
+            return &blocks[row_idx * blocks_per_row + k_block_offset];
+        }
+
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q8_1Block::BLOCK_SIZE; }
+
+        // Public decode methods for testing
+        static void decodeBlock(const Q8_1Block &block, float *output);
+        static void decodeBlockScalar(const Q8_1Block &block, float *output);
+
+#if defined(__AVX512F__)
+        static void decodeBlockAVX512(const Q8_1Block &block, float *output);
+#endif
+
+#if defined(__AVX2__)
+        static void decodeBlockAVX2(const Q8_1Block &block, float *output);
+#endif
+
+        /**
+         * @brief Quantize FP32 data to Q8_1 format with pre-computed sum
+         *
+         * This is the key method that implements the CUDA-style "quantize once, use many times" pattern.
+         * It computes the sum during quantization (essentially free since we're touching the data anyway).
+         *
+         * @param src Source FP32 data
+         * @param shape Tensor shape [rows, cols]
+         * @return Q8_1Tensor with pre-computed sums
+         */
+        static std::shared_ptr<Q8_1Tensor> quantize_from_fp32(
+            const float *src,
+            const std::vector<size_t> &shape);
+
+    private:
+        std::vector<size_t> shape_;
+
+        // Data ownership
+        bool is_view_;
+        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
+        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
+        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+
+        // Private view constructor
+        Q8_1Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
                    std::shared_ptr<TensorBase> parent);

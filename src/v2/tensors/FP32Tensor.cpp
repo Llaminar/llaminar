@@ -579,4 +579,36 @@ namespace llaminar2
             &output->d); // Output: Q8_0 FP16 scale
     }
 
+    const Q8_1Block *FP32Tensor::decode_to_q8_1(size_t row_idx, size_t k_block_offset) const
+    {
+        // Calculate source offset in FP32 data
+        const size_t cols = shape_[1];
+        const size_t k_start = k_block_offset * Q8_1Block::BLOCK_SIZE;
+
+        // Bounds check
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("FP32Tensor::decode_to_q8_1: row_idx out of range");
+        }
+        if (k_start + Q8_1Block::BLOCK_SIZE > cols)
+        {
+            throw std::out_of_range("FP32Tensor::decode_to_q8_1: k_block_offset exceeds tensor width");
+        }
+
+        // Get pointer to source FP32 data
+        const float *fp32_data = data() + row_idx * cols + k_start;
+
+        // Use thread-local storage to avoid heap allocation
+        thread_local Q8_1Block q8_1_block;
+
+        // Use vectorized quantization with pre-computed sum (auto-dispatches to AVX512/AVX2/scalar)
+        simd::decode_fp32_to_q8_1(
+            fp32_data,      // Input: FP32 values
+            q8_1_block.qs,  // Output: Q8_1 int8 values
+            &q8_1_block.d,  // Output: Q8_1 FP16 scale
+            &q8_1_block.s); // Output: Q8_1 FP16 pre-computed sum
+
+        return &q8_1_block;
+    }
+
 } // namespace llaminar2

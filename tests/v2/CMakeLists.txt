@@ -470,6 +470,32 @@ add_v2_test(V2_Unit_Q8_0_SIMD_Accuracy
     MPI_PROCS 1  # CPU-only SIMD accuracy testing, single rank
 )
 
+# Test: IQ8_1Decodable (Q8_1 quantization SIMD accuracy and performance)
+add_executable(v2_test_iq8_1_decodable unit/Test__IQ8_1Decodable.cpp)
+target_link_libraries(v2_test_iq8_1_decodable
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ8_1Decodable
+    COMMAND $<TARGET_FILE:v2_test_iq8_1_decodable>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q8_1;FP32;FP16;BF16;SIMD;AVX2;AVX512;AccuracyTest;PerformanceTest;PreComputedSum"
+    MPI_PROCS 1  # CPU-only Q8_1 quantization testing, single rank
+)
+
+# Test: Q8_1GemmKernel (Q8_1 × Q8_0 → FP32 GEMM mathematical correctness)
+add_executable(v2_test_q8_1_gemm_kernel unit/Test__Q8_1GemmKernel.cpp)
+target_link_libraries(v2_test_q8_1_gemm_kernel
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1GemmKernel
+    COMMAND $<TARGET_FILE:v2_test_q8_1_gemm_kernel>
+    LABELS "V2;Unit;Kernels;GEMM;Q8_1;Q8_0;FP32;FP16;BF16;IQ8_1Decodable;AccuracyTest;PreComputedSum;Correctness"
+    MPI_PROCS 1  # CPU-only GEMM correctness testing, single rank
+)
+
 # Test: Q6_K_DecodeVectorization (SIMD correctness for Q6_K→Q8_0 decode)
 add_executable(v2_test_q6_k_decode_vectorization unit/Test__Q6_K_DecodeVectorization.cpp)
 target_link_libraries(v2_test_q6_k_decode_vectorization
@@ -2794,6 +2820,47 @@ set_target_properties(v2_perf_q8_0_gemm PROPERTIES
 add_v2_perf_test(V2_Perf_Q8_0_GEMM
     COMMAND $<TARGET_FILE:v2_perf_q8_0_gemm>
     LABELS "V2;Performance;GEMM;Q8_0;Quantization;Throughput"
+    MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
+)
+
+# Performance Test: Q8_1 × Q8_0 GEMM (32×64 microkernel with dpbusd + compensation)
+# Benchmarks Q8_1 activations × Q8_0 weights using dpbusd instruction
+# Test cases: LargeBatchedPrefill (4096 tokens)
+# Measures: Time, GFLOPS, comparison with Q8_0×Q8_0 baseline
+add_executable(v2_perf_q8_1_gemm performance/Perf__Q8_1Gemm.cpp)
+target_link_libraries(v2_perf_q8_1_gemm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_q8_1_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Q8_1_GEMM
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm>
+    LABELS "V2;Performance;GEMM;Q8_1;Quantization;Throughput;dpbusd"
+    MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
+)
+
+# Performance Test: Q8_1 GEMM Kernel Parameter Sweep (MR × NR tuning)
+# Sweeps microkernel parameters from 8 to 128 to find optimal configuration
+# Test cases: All combinations of MR/NR in {8,16,24,32,48,64,96,128} (64 configs)
+# Measures: GFLOPS for each config, identifies best parameters
+# Exports: CSV file with full results for analysis
+add_executable(v2_perf_q8_1_kernel_sweep performance/Perf__Q8_1KernelSweep.cpp)
+target_link_libraries(v2_perf_q8_1_kernel_sweep 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_q8_1_kernel_sweep PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Q8_1_KernelSweep
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_kernel_sweep>
+    LABELS "V2;Performance;GEMM;Q8_1;Quantization;KernelTuning;ParameterSweep"
     MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
 )
 

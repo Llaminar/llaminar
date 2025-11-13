@@ -46,6 +46,27 @@ namespace llaminar2
     };
     static_assert(sizeof(Q8_0Block) == 34, "Q8_0Block must be 34 bytes");
 
+    /**
+     * @brief Q8_1 block: 8-bit quantization with pre-computed sum (36 bytes)
+     *
+     * Like Q8_0 but stores the pre-computed sum for asymmetric quantization compensation.
+     * This format is used as an intermediate format for activations (matching CUDA pattern):
+     * - FP32/FP16/BF16 activations → Q8_1 (quantize once per panel)
+     * - Q8_1 activations × quantized weights (many dot products)
+     * - Pre-computed sum eliminates expensive horizontal reductions in K-loop
+     *
+     * Formula: output = d * sum(qs[i])
+     * The 's' field stores d × sum(qs[i]) for fast compensation.
+     */
+    struct Q8_1Block
+    {
+        uint16_t d;    ///< FP16 scale factor
+        uint16_t s;    ///< FP16 pre-computed sum: d × sum(qs[i])
+        int8_t qs[32]; ///< 32 quantized int8 values
+        static constexpr size_t BLOCK_SIZE = 32;
+    };
+    static_assert(sizeof(Q8_1Block) == 36, "Q8_1Block must be 36 bytes");
+
     /** @brief Q4_0 block: 4-bit quantization (32 elements per block, 18 bytes) */
     struct Q4_0Block
     {

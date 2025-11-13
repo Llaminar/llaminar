@@ -500,8 +500,9 @@ add_library(llaminar2_core STATIC
     tensors/TensorFactory.cpp
     tensors/KVCache.cpp
     tensors/IQ4_NLTensor.cpp
-    # Simple quantization formats (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1)
+    # Simple quantization formats (Q8_0, Q8_1, Q4_0, Q4_1, Q5_0, Q5_1)
     tensors/Q8_0Tensor.cpp
+    tensors/Q8_1Tensor.cpp
     tensors/Q4_0Tensor.cpp
     tensors/Q4_1Tensor.cpp
     tensors/Q5_0Tensor.cpp

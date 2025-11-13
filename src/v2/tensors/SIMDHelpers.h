@@ -930,6 +930,234 @@ namespace llaminar2
         }
 
         // ==========================================
+        // Q8_1 Quantization (with pre-computed sum)
+        // ==========================================
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_1 format with pre-computed sum (scalar)
+         * @param src Source FP32 values (must be at least 32 elements)
+         * @param count Number of elements (ignored - always processes 32 for Q8_1)
+         * @param dst_qs Destination for int8 quantized values
+         * @param dst_scale_fp16 Destination for FP16 scale (d)
+         * @param dst_sum_fp16 Destination for FP16 pre-computed sum (s = d × sum(values))
+         */
+        inline void quantize_fp32_to_q8_1_scalar(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16, uint16_t *dst_sum_fp16)
+        {
+            // Q8_1 blocks are always 32 elements - ignore count parameter
+            (void)count;
+
+            // Find max absolute value
+            float max_abs = 0.0f;
+            for (int i = 0; i < 32; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(src[i]));
+            }
+
+            // Use threshold to avoid numerical issues with very small values
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+
+            // Handle zero input or extremely small values
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                *dst_scale_fp16 = 0;
+                *dst_sum_fp16 = 0;
+                std::memset(dst_qs, 0, 32);
+                return;
+            }
+
+            // Calculate scale (clamp to avoid overflow in FP16)
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+            { // Max FP16 value
+                scale = 65504.0f;
+            }
+            float inv_scale = 1.0f / scale;
+
+            // Quantize to int8 AND compute sum simultaneously
+            float sum = 0.0f;
+            for (int i = 0; i < 32; ++i)
+            {
+                float val = src[i];
+                float scaled = val * inv_scale;
+                dst_qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+                sum += static_cast<float>(dst_qs[i]); // Sum quantized int8 values (CRITICAL!)
+            }
+
+            // Store FP16 scale and pre-computed sum
+            *dst_scale_fp16 = fp32_to_fp16(scale);
+            *dst_sum_fp16 = fp32_to_fp16(scale * sum); // s = d × Σ(qs[i])
+        }
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_1 format with pre-computed sum (AVX-512)
+         */
+        inline void quantize_fp32_to_q8_1_avx512(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16, uint16_t *dst_sum_fp16)
+        {
+#if defined(__AVX512F__)
+            // Find max absolute value using AVX-512
+            __m512 vmax0 = _mm512_abs_ps(_mm512_loadu_ps(src));
+            __m512 vmax1 = _mm512_abs_ps(_mm512_loadu_ps(src + 16));
+            __m512 vmax = _mm512_max_ps(vmax0, vmax1);
+            float max_abs = _mm512_reduce_max_ps(vmax);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                *dst_scale_fp16 = 0;
+                *dst_sum_fp16 = 0;
+                std::memset(dst_qs, 0, 32);
+                return;
+            }
+
+            // Calculate scale
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+            {
+                scale = 65504.0f;
+            }
+            const float inv_scale = 1.0f / scale;
+            const __m512 vinv_scale = _mm512_set1_ps(inv_scale);
+
+            // Load and quantize first 16 elements
+            __m512 v0 = _mm512_loadu_ps(src);
+            __m512 vscaled0 = _mm512_mul_ps(v0, vinv_scale);
+
+            // Load and quantize second 16 elements
+            __m512 v1 = _mm512_loadu_ps(src + 16);
+            __m512 vscaled1 = _mm512_mul_ps(v1, vinv_scale);
+
+            // Convert to int32 with rounding and clamping
+            __m512i vi32_0 = _mm512_cvtps_epi32(vscaled0);
+            __m512i vi32_1 = _mm512_cvtps_epi32(vscaled1);
+
+            // Clamp to [-127, 127]
+            const __m512i vmin = _mm512_set1_epi32(-127);
+            const __m512i vmax_val = _mm512_set1_epi32(127);
+            vi32_0 = _mm512_max_epi32(vi32_0, vmin);
+            vi32_0 = _mm512_min_epi32(vi32_0, vmax_val);
+            vi32_1 = _mm512_max_epi32(vi32_1, vmin);
+            vi32_1 = _mm512_min_epi32(vi32_1, vmax_val);
+
+            // Pack int32 → int16 → int8
+            // Note: We need to properly pack 16+16 int32 → 32 int8
+            __m256i vi16_0 = _mm512_cvtepi32_epi16(vi32_0); // 16 int32 → 16 int16 (indices 0-15)
+            __m256i vi16_1 = _mm512_cvtepi32_epi16(vi32_1); // 16 int32 → 16 int16 (indices 16-31)
+
+            // Pack 16 int16 → 16 int8 for each half
+            // vi16_0: [0-7 (low), 8-15 (high)] → pack together for indices 0-15
+            // vi16_1: [16-23 (low), 24-31 (high)] → pack together for indices 16-31
+            __m128i vi8_first16 = _mm_packs_epi16(_mm256_castsi256_si128(vi16_0), _mm256_extracti128_si256(vi16_0, 1));
+            __m128i vi8_second16 = _mm_packs_epi16(_mm256_castsi256_si128(vi16_1), _mm256_extracti128_si256(vi16_1, 1));
+
+            // Store indices 0-15 and 16-31 sequentially
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs), vi8_first16);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs + 16), vi8_second16);
+
+            // Compute sum of QUANTIZED int8 values (CRITICAL!)
+            // Convert quantized int32 back to float and sum
+            __m512 vq0 = _mm512_cvtepi32_ps(vi32_0);
+            __m512 vq1 = _mm512_cvtepi32_ps(vi32_1);
+            float sum = _mm512_reduce_add_ps(_mm512_add_ps(vq0, vq1));
+
+            // Store scale and pre-computed sum
+            *dst_scale_fp16 = fp32_to_fp16(scale);
+            *dst_sum_fp16 = fp32_to_fp16(scale * sum); // s = d × Σ(qs[i])
+#else
+            quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
+#endif
+        }
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_1 format with pre-computed sum (AVX2)
+         */
+        inline void quantize_fp32_to_q8_1_avx2(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16, uint16_t *dst_sum_fp16)
+        {
+#ifdef __AVX2__
+            // Find max absolute value using AVX2
+            __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src));
+            __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src + 8));
+            __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src + 16));
+            __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(src + 24));
+
+            vmax0 = _mm256_max_ps(vmax0, vmax1);
+            vmax2 = _mm256_max_ps(vmax2, vmax3);
+            __m256 vmax = _mm256_max_ps(vmax0, vmax2);
+
+            // Horizontal max reduction
+            __m128 vmax_hi = _mm256_extractf128_ps(vmax, 1);
+            __m128 vmax_lo = _mm256_castps256_ps128(vmax);
+            vmax_lo = _mm_max_ps(vmax_lo, vmax_hi);
+            vmax_lo = _mm_max_ps(vmax_lo, _mm_movehl_ps(vmax_lo, vmax_lo));
+            vmax_lo = _mm_max_ps(vmax_lo, _mm_shuffle_ps(vmax_lo, vmax_lo, 1));
+            float max_abs = _mm_cvtss_f32(vmax_lo);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                *dst_scale_fp16 = 0;
+                *dst_sum_fp16 = 0;
+                std::memset(dst_qs, 0, 32);
+                return;
+            }
+
+            // Calculate scale
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+            {
+                scale = 65504.0f;
+            }
+            const float inv_scale = 1.0f / scale;
+            const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+
+            // Quantize AND compute sum (4 iterations for 32 elements)
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i)
+            {
+                __m256 vf = _mm256_loadu_ps(src + i * 8);
+                __m256 vscaled = _mm256_mul_ps(vf, vinv_scale);
+
+                // Convert to int32 with rounding
+                __m256i vi32 = _mm256_cvtps_epi32(vscaled);
+
+                // Clamp to [-127, 127]
+                __m256i vmin = _mm256_set1_epi32(-127);
+                __m256i vmax_val = _mm256_set1_epi32(127);
+                vi32 = _mm256_max_epi32(vi32, vmin);
+                vi32 = _mm256_min_epi32(vi32, vmax_val);
+
+                // Pack to int8 (manual packing for 8 elements)
+                alignas(32) int32_t temp[8];
+                _mm256_store_si256(reinterpret_cast<__m256i *>(temp), vi32);
+                for (int j = 0; j < 8; ++j)
+                {
+                    dst_qs[i * 8 + j] = static_cast<int8_t>(temp[j]);
+                    sum += static_cast<float>(dst_qs[i * 8 + j]); // Sum quantized int8 (CRITICAL!)
+                }
+            }
+
+            // Store scale and pre-computed sum
+            *dst_scale_fp16 = fp32_to_fp16(scale);
+            *dst_sum_fp16 = fp32_to_fp16(scale * sum); // s = d × Σ(qs[i])
+#else
+            quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
+#endif
+        }
+
+        /**
+         * @brief Quantize 32 FP32 values to Q8_1 format with pre-computed sum (auto-dispatch)
+         */
+        inline void quantize_fp32_to_q8_1(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16, uint16_t *dst_sum_fp16)
+        {
+#if defined(__AVX512F__)
+            quantize_fp32_to_q8_1_avx512(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
+#elif defined(__AVX2__)
+            quantize_fp32_to_q8_1_avx2(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
+#else
+            quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
+#endif
+        }
+
+        // ==========================================
         // Q6_K to Q8_0 Decode (32-element sub-blocks)
         // ==========================================
 
@@ -3981,6 +4209,75 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // FP32 → Q8_1 (quantize FP32 to Q8_1 with pre-computed sum)
+        // =====================================================================
+
+        /**
+         * @brief Decode FP32 block to Q8_1 format (scalar)
+         *
+         * FP32 is already fully decoded - just quantize to Q8_1 with pre-computed sum.
+         * This is used for converting activation tensors to Q8_1 for integer GEMM.
+         */
+        inline void decode_fp32_to_q8_1_scalar(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+            quantize_fp32_to_q8_1_scalar(fp32_data, 32, output_qs, output_scale, output_sum);
+        }
+
+        /**
+         * @brief Decode FP32 block to Q8_1 format (AVX-512)
+         */
+        inline void decode_fp32_to_q8_1_avx512(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#if defined(__AVX512F__)
+            quantize_fp32_to_q8_1_avx512(fp32_data, 32, output_qs, output_scale, output_sum);
+#else
+            decode_fp32_to_q8_1_scalar(fp32_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        /**
+         * @brief Decode FP32 block to Q8_1 format (AVX2)
+         */
+        inline void decode_fp32_to_q8_1_avx2(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#ifdef __AVX2__
+            quantize_fp32_to_q8_1_avx2(fp32_data, 32, output_qs, output_scale, output_sum);
+#else
+            decode_fp32_to_q8_1_scalar(fp32_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        /**
+         * @brief Decode FP32 block to Q8_1 format (auto-dispatch)
+         */
+        inline void decode_fp32_to_q8_1(
+            const float *fp32_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#if defined(__AVX512F__)
+            decode_fp32_to_q8_1_avx512(fp32_data, output_qs, output_scale, output_sum);
+#elif defined(__AVX2__)
+            decode_fp32_to_q8_1_avx2(fp32_data, output_qs, output_scale, output_sum);
+#else
+            decode_fp32_to_q8_1_scalar(fp32_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        // =====================================================================
         // FP16 → Q8_0 (decode FP16 to FP32, then quantize to Q8_0)
         // =====================================================================
 
@@ -4069,6 +4366,99 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // FP16 → Q8_1 (decode FP16 to FP32, then quantize to Q8_1)
+        // =====================================================================
+
+        /**
+         * @brief Decode FP16 block to Q8_1 format (scalar)
+         * @param fp16_data Source FP16 data (32 elements)
+         * @param output_qs Output Q8_1 quantized values (32 int8_t)
+         * @param output_scale Output Q8_1 scale (FP16)
+         * @param output_sum Output Q8_1 pre-computed sum (FP16)
+         *
+         * First converts FP16 → FP32, then quantizes to Q8_1 with pre-computed sum.
+         */
+        inline void decode_fp16_to_q8_1_scalar(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+            // Decode FP16 → FP32
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = fp16_to_fp32(fp16_data[i]);
+            }
+
+            // Quantize FP32 → Q8_1
+            quantize_fp32_to_q8_1_scalar(fp32_buffer, 32, output_qs, output_scale, output_sum);
+        }
+
+        /**
+         * @brief Decode FP16 block to Q8_1 format (AVX-512)
+         */
+        inline void decode_fp16_to_q8_1_avx512(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#if defined(__AVX512F__) && defined(__AVX512FP16__)
+            // TODO: Use native FP16 intrinsics when available
+            // For now, fall back to scalar decode + AVX512 quantize
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = fp16_to_fp32(fp16_data[i]);
+            }
+            quantize_fp32_to_q8_1_avx512(fp32_buffer, 32, output_qs, output_scale, output_sum);
+#else
+            decode_fp16_to_q8_1_scalar(fp16_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        /**
+         * @brief Decode FP16 block to Q8_1 format (AVX2)
+         */
+        inline void decode_fp16_to_q8_1_avx2(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#ifdef __AVX2__
+            // Scalar decode FP16 → FP32, then AVX2 quantize
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = fp16_to_fp32(fp16_data[i]);
+            }
+            quantize_fp32_to_q8_1_avx2(fp32_buffer, 32, output_qs, output_scale, output_sum);
+#else
+            decode_fp16_to_q8_1_scalar(fp16_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        /**
+         * @brief Decode FP16 block to Q8_1 format (auto-dispatch)
+         */
+        inline void decode_fp16_to_q8_1(
+            const uint16_t *fp16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#if defined(__AVX512F__) && defined(__AVX512FP16__)
+            decode_fp16_to_q8_1_avx512(fp16_data, output_qs, output_scale, output_sum);
+#elif defined(__AVX2__)
+            decode_fp16_to_q8_1_avx2(fp16_data, output_qs, output_scale, output_sum);
+#else
+            decode_fp16_to_q8_1_scalar(fp16_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        // =====================================================================
         // BF16 → Q8_0 (decode BF16 to FP32, then quantize to Q8_0)
         // =====================================================================
 
@@ -4146,6 +4536,98 @@ namespace llaminar2
             decode_bf16_to_q8_0_avx2(bf16_data, output_qs, output_scale);
 #else
             decode_bf16_to_q8_0_scalar(bf16_data, output_qs, output_scale);
+#endif
+        }
+
+        // =====================================================================
+        // BF16 → Q8_1 (decode BF16 to FP32, then quantize to Q8_1)
+        // =====================================================================
+
+        /**
+         * @brief Decode BF16 block to Q8_1 format (scalar)
+         * @param bf16_data Source BF16 data (32 elements)
+         * @param output_qs Output Q8_1 quantized values (32 int8_t)
+         * @param output_scale Output Q8_1 scale (FP16)
+         * @param output_sum Output Q8_1 pre-computed sum (FP16)
+         *
+         * First converts BF16 → FP32, then quantizes to Q8_1 with pre-computed sum.
+         */
+        inline void decode_bf16_to_q8_1_scalar(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+            // Decode BF16 → FP32
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = bf16_to_fp32(bf16_data[i]);
+            }
+
+            // Quantize FP32 → Q8_1
+            quantize_fp32_to_q8_1_scalar(fp32_buffer, 32, output_qs, output_scale, output_sum);
+        }
+
+        /**
+         * @brief Decode BF16 block to Q8_1 format (AVX-512)
+         */
+        inline void decode_bf16_to_q8_1_avx512(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            // Scalar decode BF16 → FP32, then AVX512 quantize
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = bf16_to_fp32(bf16_data[i]);
+            }
+            quantize_fp32_to_q8_1_avx512(fp32_buffer, 32, output_qs, output_scale, output_sum);
+#else
+            decode_bf16_to_q8_1_scalar(bf16_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        /**
+         * @brief Decode BF16 block to Q8_1 format (AVX2)
+         */
+        inline void decode_bf16_to_q8_1_avx2(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#ifdef __AVX2__
+            // Scalar decode BF16 → FP32, then AVX2 quantize
+            float fp32_buffer[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_buffer[i] = bf16_to_fp32(bf16_data[i]);
+            }
+            quantize_fp32_to_q8_1_avx2(fp32_buffer, 32, output_qs, output_scale, output_sum);
+#else
+            decode_bf16_to_q8_1_scalar(bf16_data, output_qs, output_scale, output_sum);
+#endif
+        }
+
+        /**
+         * @brief Decode BF16 block to Q8_1 format (auto-dispatch)
+         */
+        inline void decode_bf16_to_q8_1(
+            const uint16_t *bf16_data,
+            int8_t *output_qs,
+            uint16_t *output_scale,
+            uint16_t *output_sum)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            decode_bf16_to_q8_1_avx512(bf16_data, output_qs, output_scale, output_sum);
+#elif defined(__AVX2__)
+            decode_bf16_to_q8_1_avx2(bf16_data, output_qs, output_scale, output_sum);
+#else
+            decode_bf16_to_q8_1_scalar(bf16_data, output_qs, output_scale, output_sum);
 #endif
         }
 

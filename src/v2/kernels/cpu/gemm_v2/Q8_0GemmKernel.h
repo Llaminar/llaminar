@@ -467,6 +467,12 @@ namespace llaminar2
                 perf_stats.t_buffer_init_ms += std::chrono::duration<double, std::milli>(t_buffer_init_end - t_buffer_init_start).count();
             }
 
+            // OPTIMIZATION: Allocate fp32 B scale storage for fused conversion
+            // Convert B scales from fp16→fp32 ONCE (eliminates post-processing conversions)
+            // Note: NOT converting A scales - doing so in K-loop adds 60% overhead to Load A phase
+            std::vector<float> b_scales_f32_vec(NR * K_blocks);
+            float *b_scales_f32_storage = b_scales_f32_vec.data();
+
             // Helper lambdas for 3D indexing
             auto accum = [&](int ir, int jr, int kb) -> int32_t &
             {
@@ -479,6 +485,10 @@ namespace llaminar2
             auto a_scales = [&](int ir, int kb) -> uint16_t &
             {
                 return a_scales_storage[ir * K_blocks + kb];
+            };
+            auto b_scales_f32 = [&](int jr, int kb) -> float &
+            {
+                return b_scales_f32_storage[jr * K_blocks + kb];
             };
 
             const __m512i ones_u8 = _mm512_set1_epi8(1);
@@ -602,90 +612,123 @@ namespace llaminar2
                 perf_stats.t_k_loop_compute_ms += t_compute_accum;
             }
 
+            // FUSED CONVERSION: Convert B scales fp16→fp32 (vectorized, eliminates post-processing conversions)
+            // B scales layout: [jr][kb] (transposed for post-processing)
+            // B_scales already declared above, use B_K_blocks for correct dimension
+            const int B_K_blocks = B_packed.K_blocks;
+
+            for (int jr = 0; jr < NR; ++jr)
+            {
+                int kb = 0;
+                // Vectorized conversion: process 16 scales at a time
+                for (; kb + 16 <= K_blocks; kb += 16)
+                {
+                    __m256i scales_fp16 = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(&B_scales[jr * B_K_blocks + kb]));
+                    __m512 scales_fp32 = _mm512_cvtph_ps(scales_fp16);
+                    _mm512_storeu_ps(&b_scales_f32(jr, kb), scales_fp32);
+                }
+
+                // Scalar tail
+                for (; kb < K_blocks; ++kb)
+                {
+                    b_scales_f32(jr, kb) = fp16_to_fp32(B_scales[jr * B_K_blocks + kb]);
+                }
+            }
+
             auto t_postprocess_start = std::chrono::high_resolution_clock::now();
 
-            // Post-processing: vectorized compensation, scaling, and accumulation to C
-            // Correct formula: C[i,j] = Σ_kb (a_scale[kb] * b_scale[kb] * (dot_kb - sum_a[kb] * 128))
+            // Post-processing: OPTIMIZED with batched reductions and B scale pre-conversion
+            // Key optimizations:
+            // 1. FUSED B CONVERSIONS: B scales already converted to fp32 once (eliminates NR cvtph_ps calls)
+            // 2. VECTORIZED A CONVERSIONS: Convert VECTOR_WIDTH A scales per iteration (amortized cost)
+            // 3. BATCHED REDUCTIONS: Process jr in chunks of 8, reducing 1024→128 horizontal sums
             //
-            // Vectorization strategy: Process K_blocks in chunks of 16 using AVX-512
-            // - Load 16 int32 accumulators → convert to float
-            // - Load 16 int32 sum_a values → convert to float
-            // - Gather 16 fp16 a_scales (from Q8_0Block.d) → convert to float
-            // - Load 16 fp16 b_scales (packed contiguously) → convert to float
-            // - Compute: (accum - sum_a * 128) * a_scale * b_scale
-            // - Horizontal sum across all K_blocks
+            // Formula: C[i,j] = Σ_kb (a_scale_f32[kb] * b_scale_f32[kb] * (dot_kb - sum_a[kb] * 128))
 
             const __m512 compensation_const = _mm512_set1_ps(128.0f);
 
-            // CRITICAL: Use B_packed.K_blocks for B_scales indexing (not K_blocks parameter)
-            // With KC blocking, B_packed was created with kc_size < total K_blocks
-            // Using wrong stride causes buffer overflow
-            const int B_K_blocks = B_packed.K_blocks;
-
+            // Process ir rows sequentially (cache-friendly for accum access)
             for (int ir = 0; ir < MR; ++ir)
             {
-                for (int jr = 0; jr < NR; ++jr)
-                {
-                    __m512 result_vec = _mm512_setzero_ps();
+                // BATCHED REDUCTION: Process jr columns in chunks of 8
+                constexpr int JR_BATCH = 8;
 
-                    // Process K_blocks in chunks of VECTOR_WIDTH (template parameter)
-                    // VECTOR_WIDTH ∈ {8, 16, 32}: balance ILP vs loop overhead vs register pressure
+                for (int jr_base = 0; jr_base < NR; jr_base += JR_BATCH)
+                {
+                    // Accumulate results for 8 columns simultaneously
+                    __m512 result_vecs[JR_BATCH];
+                    for (int jj = 0; jj < JR_BATCH; ++jj)
+                    {
+                        result_vecs[jj] = _mm512_setzero_ps();
+                    }
+
+                    // Process K_blocks in chunks of VECTOR_WIDTH
                     int kb = 0;
                     for (; kb + VECTOR_WIDTH <= K_blocks; kb += VECTOR_WIDTH)
                     {
-                        // Load VECTOR_WIDTH int32 accumulators and convert to float
-                        __m512i accum_i32 = _mm512_loadu_si512(&accum(ir, jr, kb));
-                        __m512 accum_f32 = _mm512_cvtepi32_ps(accum_i32);
-
-                        // Load VECTOR_WIDTH int32 sum_a values and convert to float
+                        // Load once: VECTOR_WIDTH int32 sum_a values and convert to float
                         __m512i sum_a_i32 = _mm512_loadu_si512(&sum_a(ir, kb));
                         __m512 sum_a_f32 = _mm512_cvtepi32_ps(sum_a_i32);
 
-                        // OPTIMIZATION: Load VECTOR_WIDTH fp16 a_scales sequentially (not gather!)
-                        // Scales were extracted during K-loop, now contiguous in memory
+                        // Convert VECTOR_WIDTH A scales fp16→fp32 (vectorized, amortized across JR_BATCH columns)
                         __m256i a_scales_fp16 = _mm256_loadu_si256(
                             reinterpret_cast<const __m256i *>(&a_scales(ir, kb)));
-                        __m512 a_scales_f32 = _mm512_cvtph_ps(a_scales_fp16);
+                        __m512 a_scales_vec = _mm512_cvtph_ps(a_scales_fp16);
 
-                        // OPTIMIZATION: Load VECTOR_WIDTH fp16 b_scales sequentially (not gather!)
-                        // B scales transposed to [jr][kb] layout for stride-1 access
-                        // CRITICAL: Use B_K_blocks (from packed panel) not K_blocks parameter!
-                        __m256i b_scales_fp16 = _mm256_loadu_si256(
-                            reinterpret_cast<const __m256i *>(&B_scales[jr * B_K_blocks + kb]));
-                        __m512 b_scales = _mm512_cvtph_ps(b_scales_fp16);
-
-                        // PHASE 2 OPTIMIZATION: Prefetch B scales 4 chunks (64 elements) ahead
-                        // Unit stride access pattern makes prefetching more effective than A scales
-                        if (kb + 64 < K_blocks)
+                        // Process all 8 columns in the batch
+                        for (int jj = 0; jj < JR_BATCH; ++jj)
                         {
-                            _mm_prefetch(reinterpret_cast<const char *>(&B_scales[jr * B_K_blocks + kb + 64]), _MM_HINT_T0);
+                            int jr = jr_base + jj;
+
+                            // Load VECTOR_WIDTH int32 accumulators and convert to float
+                            __m512i accum_i32 = _mm512_loadu_si512(&accum(ir, jr, kb));
+                            __m512 accum_f32 = _mm512_cvtepi32_ps(accum_i32);
+
+                            // Load VECTOR_WIDTH fp32 b_scales (already converted!)
+                            __m512 b_scales_vec = _mm512_loadu_ps(&b_scales_f32(jr, kb));
+
+                            // Compute: compensated = accum - sum_a * 128
+                            __m512 compensated = _mm512_fnmadd_ps(sum_a_f32, compensation_const, accum_f32);
+
+                            // Compute: compensated * a_scale * b_scale
+                            __m512 scaled = _mm512_mul_ps(compensated, a_scales_vec);
+                            scaled = _mm512_mul_ps(scaled, b_scales_vec);
+
+                            // Accumulate to result
+                            result_vecs[jj] = _mm512_add_ps(result_vecs[jj], scaled);
                         }
-
-                        // Compute: compensated = accum - sum_a * 128
-                        __m512 compensated = _mm512_fnmadd_ps(sum_a_f32, compensation_const, accum_f32);
-
-                        // Compute: compensated * a_scale * b_scale
-                        __m512 scaled = _mm512_mul_ps(compensated, a_scales_f32);
-                        scaled = _mm512_mul_ps(scaled, b_scales);
-
-                        // Accumulate to result
-                        result_vec = _mm512_add_ps(result_vec, scaled);
                     }
 
-                    // Horizontal sum of VECTOR_WIDTH floats
-                    float result = _mm512_reduce_add_ps(result_vec);
+                    // Horizontal reductions for the batch (128 reductions instead of 1024!)
+                    float results[JR_BATCH];
+                    for (int jj = 0; jj < JR_BATCH; ++jj)
+                    {
+                        results[jj] = _mm512_reduce_add_ps(result_vecs[jj]);
+                    }
 
                     // Scalar tail for remaining K_blocks (< VECTOR_WIDTH)
                     for (; kb < K_blocks; ++kb)
                     {
                         float a_scale = fp16_to_fp32(a_scales(ir, kb));
-                        float b_scale = fp16_to_fp32(B_scales[jr * B_K_blocks + kb]); // Transposed layout, use B_K_blocks!
+                        int32_t sum_a_val = sum_a(ir, kb);
 
-                        int32_t compensated = accum(ir, jr, kb) - sum_a(ir, kb) * 128;
-                        result += static_cast<float>(compensated) * a_scale * b_scale;
+                        for (int jj = 0; jj < JR_BATCH; ++jj)
+                        {
+                            int jr = jr_base + jj;
+                            float b_scale = b_scales_f32(jr, kb); // Already fp32!
+
+                            int32_t compensated = accum(ir, jr, kb) - sum_a_val * 128;
+                            results[jj] += static_cast<float>(compensated) * a_scale * b_scale;
+                        }
                     }
 
-                    C[ir * ldc + jr] = result;
+                    // Write results to C
+                    for (int jj = 0; jj < JR_BATCH; ++jj)
+                    {
+                        int jr = jr_base + jj;
+                        C[ir * ldc + jr] = results[jj];
+                    }
                 }
             }
 
