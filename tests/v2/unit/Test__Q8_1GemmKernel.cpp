@@ -26,6 +26,7 @@
 #include "v2/kernels/cpu/gemm_v2/Q8_1GemmKernel.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/SIMDHelpers.h"
+#include "utils/DebugEnv.h"
 
 namespace llaminar2
 {
@@ -2693,7 +2694,18 @@ namespace llaminar2
 
         std::cout << "Manual vs Kernel: " << (manual_vs_kernel_err * 100.0f) << "%, Kernel vs FP32: " << (kernel_vs_fp32_err * 100.0f) << "%" << std::endl;
 
-        EXPECT_NEAR(manual_result, C_test[ir * N + jr], 1e-4f);
+        // Manual computation uses sum_qs quantization, which differs slightly from sA approach
+        // sA approach is more accurate (no quantization), so we expect small differences
+        if (debugEnv().gemm.use_sa_compensation)
+        {
+            // sA mode: relaxed tolerance due to avoiding sum_qs quantization
+            EXPECT_NEAR(manual_result, C_test[ir * N + jr], 0.005f); // 0.5% tolerance
+        }
+        else
+        {
+            // sum_qs mode: strict tolerance (original test)
+            EXPECT_NEAR(manual_result, C_test[ir * N + jr], 1e-4f);
+        }
         EXPECT_LT(kernel_vs_fp32_err, 0.01f);
     }
 
@@ -2761,7 +2773,15 @@ namespace llaminar2
 
         std::cout << "Manual vs Kernel: " << (manual_vs_kernel_err * 100.0f) << "%, Kernel vs FP32: " << (kernel_vs_fp32_err * 100.0f) << "%" << std::endl;
 
-        EXPECT_NEAR(manual_result, C_test[ir * N + jr], 1e-4f);
+        // Manual computation uses sum_qs quantization, which differs slightly from sA approach
+        if (debugEnv().gemm.use_sa_compensation)
+        {
+            EXPECT_NEAR(manual_result, C_test[ir * N + jr], 0.005f); // 0.5% tolerance for sA mode
+        }
+        else
+        {
+            EXPECT_NEAR(manual_result, C_test[ir * N + jr], 1e-4f);
+        }
         EXPECT_LT(kernel_vs_fp32_err, 0.03f); // Relax to 3% for quantization error
     }
 
@@ -2866,8 +2886,17 @@ namespace llaminar2
         float kernel_vs_fp32_err = std::abs(C_test[31 * N + 127] - C_ref[31 * N + 127]) / std::max(std::abs(C_ref[31 * N + 127]), 1e-6f);
         std::cout << "Kernel vs FP32 error: " << (kernel_vs_fp32_err * 100.0f) << "%" << std::endl;
 
-        EXPECT_NEAR(manual_result, C_test[31 * N + 127], 1e-4f)
-            << "Manual computation should match kernel for C[31,127]";
+        // Manual computation uses sum_qs quantization, which differs slightly from sA approach
+        if (debugEnv().gemm.use_sa_compensation)
+        {
+            EXPECT_NEAR(manual_result, C_test[31 * N + 127], 0.005f) // 0.5% tolerance for sA mode
+                << "Manual computation should match kernel for C[31,127]";
+        }
+        else
+        {
+            EXPECT_NEAR(manual_result, C_test[31 * N + 127], 1e-4f)
+                << "Manual computation should match kernel for C[31,127]";
+        }
 
         EXPECT_LT(kernel_vs_fp32_err, 0.01f)
             << "Kernel should match FP32 within 1% for C[31,127]";
@@ -3041,8 +3070,17 @@ namespace llaminar2
         float kernel_vs_fp32_err = std::abs(C_test[0] - C_ref[0]) / std::max(std::abs(C_ref[0]), 1e-6f);
         std::cout << "Kernel vs FP32 error: " << (kernel_vs_fp32_err * 100.0f) << "%" << std::endl;
 
-        EXPECT_NEAR(manual_result, C_test[0], 1e-4f)
-            << "Manual 4-wide tail computation should match kernel";
+        // Manual computation uses sum_qs quantization, which differs slightly from sA approach
+        if (debugEnv().gemm.use_sa_compensation)
+        {
+            EXPECT_NEAR(manual_result, C_test[0], 0.005f) // 0.5% tolerance for sA mode
+                << "Manual 4-wide tail computation should match kernel";
+        }
+        else
+        {
+            EXPECT_NEAR(manual_result, C_test[0], 1e-4f)
+                << "Manual 4-wide tail computation should match kernel";
+        }
 
         EXPECT_LT(kernel_vs_fp32_err, 0.01f)
             << "Kernel should match FP32 within 1%";

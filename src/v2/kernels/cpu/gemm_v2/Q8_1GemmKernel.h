@@ -42,6 +42,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
+#include "utils/DebugEnv.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -792,7 +793,10 @@ namespace llaminar2
          *    e. Accumulate to C
          */
         /**
-         * @brief Full MR×NR microkernel (fast path)
+         * @brief Full MR×NR microkernel with sum_qs-based compensation (ORIGINAL)
+         *
+         * This is the current production implementation using sum_qs = sA/dA reconstruction.
+         * K-loop computes sum_qs as INT16, post-processing applies compensation in quantized space.
          *
          * @param K_blocks Number of K blocks to process
          * @param i_base Row offset in A matrix
@@ -802,7 +806,7 @@ namespace llaminar2
          * @param C Output matrix pointer
          * @param ldc Leading dimension of C
          */
-        static void microkernel_full(
+        __attribute__((always_inline)) static void microkernel_full_sumqs(
             int K_blocks,
             int i_base,   // Row offset in A matrix
             int kc_start, // K-block offset
@@ -1516,6 +1520,248 @@ namespace llaminar2
                                   << (perf_stats.t_postprocess_ms / perf_stats.call_count) << " ms/call" << std::endl;
                     }
                 }
+            }
+        } // End microkernel_full_sumqs
+
+        /**
+         * @brief Full MR×NR microkernel with sA-based compensation (EXPERIMENTAL)
+         *
+         * This is an experimental implementation using direct sA (dA * sum_qs) metadata.
+         * K-loop stores sA as FP16, post-processing applies compensation in real space.
+         *
+         * Mathematical equivalence:
+         *   OLD: result = (accum - 128*sum_qs) * dA * dB  where sum_qs = sA/dA
+         *   NEW: result = accum*dA*dB - 128*sA*dB
+         *
+         * Expected benefits:
+         *   - Eliminates division (sA/dA) from K-loop
+         *   - Eliminates int16 gather (4-5 cycle latency) → aligned FP16 load (1 cycle)
+         *   - Better numerical properties (no FP→int→FP conversion chain)
+         *   - Estimated +8-15% performance improvement
+         *
+         * @param K_blocks Number of K blocks to process
+         * @param i_base Row offset in A matrix
+         * @param kc_start K-block offset
+         * @param A_decodable Pointer to IQ8_1Decodable interface for A matrix
+         * @param B_packed Packed B panel
+         * @param C Output matrix pointer
+         * @param ldc Leading dimension of C
+         */
+        __attribute__((always_inline)) static void microkernel_full_sa(
+            int K_blocks,
+            int i_base,
+            int kc_start,
+            const IQ8_1Decodable *A_decodable,
+            const PackedBPanel &B_packed,
+            float *C, int ldc)
+        {
+            // ===== STREAMING APPROACH: No accum_vec! =====
+            // Only allocate metadata buffers (sA, dA for A; dB_f32 for B)
+            // This saves 2MB of memory traffic (MR * NR * K_blocks * 4 bytes)
+            std::vector<uint16_t> a_sums_vec(MR * K_blocks); // Store sA directly as FP16
+            std::vector<uint16_t> a_scales_vec(MR * K_blocks);
+            std::vector<float> b_scales_f32_vec(NR * K_blocks);
+
+            uint16_t *a_sums_storage = a_sums_vec.data();
+            uint16_t *a_scales_storage = a_scales_vec.data();
+            float *b_scales_f32_storage = b_scales_f32_vec.data();
+
+            // Helper lambdas for 2D indexing (no accum!)
+            auto a_sums = [&](int ir, int kb) -> uint16_t &
+            {
+                return a_sums_storage[ir * K_blocks + kb];
+            };
+            auto a_scales = [&](int ir, int kb) -> uint16_t &
+            {
+                return a_scales_storage[ir * K_blocks + kb];
+            };
+            auto b_scales_f32 = [&](int jr, int kb) -> float &
+            {
+                return b_scales_f32_storage[jr * K_blocks + kb];
+            };
+
+            const uint8_t *B_quants = B_packed.quants.data();
+            const uint16_t *B_scales = B_packed.scales.data();
+            const int B_K_blocks = B_packed.K_blocks;
+
+            // ===== OPTIMIZED K-LOOP: Load A/B once per kb, immediately accumulate to C =====
+            // Key insight from GPT 5.1: Keep original K-loop structure (good data reuse),
+            // but replace "store to accum_vec" with immediate compensation and C accumulation.
+            //
+            // Benefits:
+            //   - No 2MB accum_vec buffer
+            //   - A blocks decoded ONCE per (ir, kb) - not NR/JR_BATCH times
+            //   - B blocks loaded ONCE per kb - not MR times
+            //   - Maintains dpbusd ILP (2-way unrolling)
+            //   - Compensation applied immediately after dpbusd
+
+            // Pre-convert B scales from FP16 to FP32 (vectorized, one-time cost)
+            for (int jr = 0; jr < NR; ++jr)
+            {
+                int kb = 0;
+                // AVX-512 16-wide vectorized conversion
+                for (; kb + 16 <= K_blocks; kb += 16)
+                {
+                    __m256i scales_fp16 = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(&B_scales[jr * B_K_blocks + kb]));
+                    __m512 scales_fp32 = _mm512_cvtph_ps(scales_fp16);
+                    _mm512_storeu_ps(&b_scales_f32(jr, kb), scales_fp32);
+                }
+
+                // AVX2 8-wide vectorized tail
+                for (; kb + 8 <= K_blocks; kb += 8)
+                {
+                    __m128i scales_fp16 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(&B_scales[jr * B_K_blocks + kb]));
+                    __m256 scales_fp32 = _mm256_cvtph_ps(scales_fp16);
+                    _mm256_storeu_ps(&b_scales_f32(jr, kb), scales_fp32);
+                }
+
+                // SSE 4-wide vectorized tail
+                for (; kb + 4 <= K_blocks; kb += 4)
+                {
+                    __m128i scales_fp16 = _mm_loadl_epi64(
+                        reinterpret_cast<const __m128i *>(&B_scales[jr * B_K_blocks + kb]));
+                    __m128 scales_fp32 = _mm_cvtph_ps(scales_fp16);
+                    _mm_storeu_ps(&b_scales_f32(jr, kb), scales_fp32);
+                }
+
+                // Scalar tail (0-3 blocks)
+                for (; kb < K_blocks; ++kb)
+                {
+                    b_scales_f32(jr, kb) = fp16_to_fp32(B_scales[jr * B_K_blocks + kb]);
+                }
+            }
+
+            // Main K-loop: Process one K-block at a time
+            for (int kb = 0; kb < K_blocks; ++kb)
+            {
+                // PHASE 1: Decode A blocks ONCE per (ir, kb) and keep in a_vec[MR]
+                __m512i a_vec[MR];
+                for (int ir = 0; ir < MR; ++ir)
+                {
+                    const Q8_1Block *a_block_ptr = A_decodable->decode_to_q8_1(i_base + ir, kc_start + kb);
+                    const Q8_1Block &a_block = *a_block_ptr;
+
+                    // Store FP16 metadata (sA, dA) for later use
+                    a_scales(ir, kb) = a_block.d;
+                    a_sums(ir, kb) = a_block.s;
+
+                    // Load qs[] into a_vec[ir] (reused across all NR columns)
+                    __m256i a_ymm = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_block.qs));
+                    a_vec[ir] = _mm512_castsi256_si512(a_ymm);
+                }
+
+                // PHASE 2: Load B blocks ONCE per kb into b_vec[NR]
+                __m512i b_vec[NR];
+                const uint8_t *B_block_base = B_quants + kb * (NR / 2) * 64;
+
+                for (int jr_pair = 0; jr_pair < NR / 2; ++jr_pair)
+                {
+                    const uint8_t *pair_base = B_block_base + jr_pair * 64;
+                    __m256i col0_ymm = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pair_base));
+                    __m256i col1_ymm = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pair_base + 32));
+                    b_vec[jr_pair * 2] = _mm512_castsi256_si512(col0_ymm);
+                    b_vec[jr_pair * 2 + 1] = _mm512_castsi256_si512(col1_ymm);
+                }
+
+                // PHASE 3: dpbusd for all MR×NR and immediately accumulate into C
+                for (int ir = 0; ir < MR; ++ir)
+                {
+                    // Load A metadata for this (ir, kb) ONCE
+                    float sA = fp16_to_fp32(a_sums(ir, kb));
+                    float dA = fp16_to_fp32(a_scales(ir, kb));
+
+                    int jr = 0;
+                    // Process 2 columns per iteration (exploit ILP - 2 dpbusd in parallel)
+                    for (; jr + 1 < NR; jr += 2)
+                    {
+                        // Issue 2 dpbusd operations before any reductions (ILP!)
+                        __m512i acc_vec0 = _mm512_setzero_si512();
+                        __m512i acc_vec1 = _mm512_setzero_si512();
+
+                        acc_vec0 = _mm512_dpbusd_epi32(acc_vec0, b_vec[jr], a_vec[ir]);
+                        acc_vec1 = _mm512_dpbusd_epi32(acc_vec1, b_vec[jr + 1], a_vec[ir]);
+
+                        // Parallel horizontal reductions
+                        int32_t dp0 = _mm512_reduce_add_epi32(acc_vec0);
+                        int32_t dp1 = _mm512_reduce_add_epi32(acc_vec1);
+
+                        // Load B scales (already FP32)
+                        float dB0 = b_scales_f32(jr, kb);
+                        float dB1 = b_scales_f32(jr + 1, kb);
+
+                        // Compensation formula: (dp*dA - 128*sA) * dB
+                        // Compute main and compensation terms
+                        float main0 = static_cast<float>(dp0) * dA * dB0;
+                        float comp0 = 128.0f * sA * dB0;
+                        float main1 = static_cast<float>(dp1) * dA * dB1;
+                        float comp1 = 128.0f * sA * dB1;
+
+                        // Accumulate directly to C (no intermediate buffer!)
+                        C[ir * ldc + jr] += main0 - comp0;
+                        C[ir * ldc + jr + 1] += main1 - comp1;
+                    }
+
+                    // Scalar tail for odd NR
+                    for (; jr < NR; ++jr)
+                    {
+                        __m512i acc_vec = _mm512_setzero_si512();
+                        acc_vec = _mm512_dpbusd_epi32(acc_vec, b_vec[jr], a_vec[ir]);
+
+                        int32_t dp = _mm512_reduce_add_epi32(acc_vec);
+                        float dB = b_scales_f32(jr, kb);
+
+                        float main = static_cast<float>(dp) * dA * dB;
+                        float comp = 128.0f * sA * dB;
+
+                        C[ir * ldc + jr] += main - comp;
+                    }
+                }
+            } // End K-loop
+        } // End microkernel_full_sa
+
+        /**
+         * @brief Dispatcher: Full MR×NR microkernel (selects implementation based on debugEnv)
+         *
+         * @param K_blocks Number of K blocks to process
+         * @param i_base Row offset in A matrix
+         * @param kc_start K-block offset
+         * @param A_decodable Pointer to IQ8_1Decodable interface for A matrix
+         * @param B_packed Packed B panel
+         * @param C Output matrix pointer
+         * @param ldc Leading dimension of C
+         */
+        static void microkernel_full(
+            int K_blocks,
+            int i_base,
+            int kc_start,
+            const IQ8_1Decodable *A_decodable,
+            const PackedBPanel &B_packed,
+            float *C, int ldc)
+        {
+            // Print compensation mode once at first call (for verification)
+            static bool mode_logged = false;
+            if (!mode_logged)
+            {
+                if (debugEnv().gemm.use_sa_compensation)
+                {
+                    std::cerr << "[Q8_1 GEMM] Using sA-based compensation (optimized, no quantization)" << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[Q8_1 GEMM] Using sum_qs compensation (baseline, with quantization)" << std::endl;
+                }
+                mode_logged = true;
+            }
+
+            if (debugEnv().gemm.use_sa_compensation)
+            {
+                microkernel_full_sa(K_blocks, i_base, kc_start, A_decodable, B_packed, C, ldc);
+            }
+            else
+            {
+                microkernel_full_sumqs(K_blocks, i_base, kc_start, A_decodable, B_packed, C, ldc);
             }
         }
 

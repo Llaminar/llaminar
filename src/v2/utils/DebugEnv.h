@@ -82,11 +82,30 @@ namespace llaminar2
     };
 
     /**
+     * @brief GEMM kernel configuration group
+     */
+    struct GemmConfig
+    {
+        // Q8_1 GEMM compensation strategy
+        bool use_sa_compensation = false; ///< Use sA-based compensation (vs sum_qs-based, experimental)
+
+        GemmConfig()
+        {
+            const char *sa_comp_env = std::getenv("LLAMINAR_USE_SA_COMPENSATION");
+            if (sa_comp_env)
+            {
+                use_sa_compensation = (std::atoi(sa_comp_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
     {
         DequantConfig dequant;
+        GemmConfig gemm;
 
         // Add more config groups as needed:
         // AttentionConfig attention;
