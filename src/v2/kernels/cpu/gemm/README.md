@@ -1,1188 +1,708 @@
-# V2 CPU Kernels - GEMM Micro-Kernel System
+# CPU GEMM Kernels - Architecture Overview
 
-**Author**: David Sanftenberg  
-**Date**: October 2025  
-**Status**: Production Ready (6/6 performance tests passing)
-
----
+**Location**: `src/v2/kernels/cpu/gemm/`  
+**Purpose**: High-performance matrix multiplication kernels for CPU inference  
+**Last Updated**: November 11, 2025
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Supported GEMM Types](#supported-gemm-types)
-3. [Architecture](#architecture)
-4. [GEMM Micro-Kernel System](#gemm-micro-kernel-system)
-5. [Code Generation](#code-generation)
-6. [Auto-Tuner](#auto-tuner)
-7. [Smart Search Strategies](#smart-search-strategies)
-8. [Performance Model](#performance-model)
-9. [Usage Guide](#usage-guide)
-10. [Performance Results](#performance-results)
-11. [Development Guide](#development-guide)
+1. [System Overview](#system-overview)
+2. [Architecture Layers](#architecture-layers)
+3. [Integer GEMM System (Q8_0)](#integer-gemm-system-q8_0)
+4. [FP32 GEMM System](#fp32-gemm-system)
+5. [Registry Pattern](#registry-pattern)
+6. [Configuration Space](#configuration-space)
+7. [Auto-Tuning System](#auto-tuning-system)
+8. [File Organization](#file-organization)
+9. [Adding New Kernels](#adding-new-kernels)
 
 ---
 
-## Overview
+Main tests to be iterating within:
 
-The V2 CPU kernels implement a **template-based micro-kernel architecture** for high-performance GEMM (General Matrix Multiply) operations with support for **multiple data type combinations** (FP32×IQ4_NL, BF16×BF16, FP32×FP32). The system generates **1,225 kernel variants** across multiple dimensions:
+1. Perf__IntegerGEMM_Minimal.cpp -- a minimal, isolated test file for `perf` profiling.
 
-- **2 ISAs**: AVX512, AVX2
-- **7 M tile sizes**: 1, 2, 4, 8, 16, 32, 64
-- **8 N tile sizes**: 1, 2, 4, 6, 8, 16, 32, 64
-- **5 K-loop unroll factors**: 1, 2, 4, 8, 16
-- **5 prefetch distances**: 0, 1, 2, 3, 5
+2. Perf__IntegerGEMM_QwenProfile.cpp -- the MAIN TEST FILE. This tests a variety of realistic shapes and sizes. You should iterate on this test suite except for `perf` profiling. 
 
-This approach achieves **335-1208 GFLOPS** on consumer CPUs through:
-- Explicit SIMD vectorization (AVX512/AVX2 for FP32/BF16)
-- Register blocking to minimize memory traffic
-- Intelligent ISA selection (AVX2 for small matrices, AVX512 for large)
-- Fused dequantization during panel packing (IQ4_NL, BF16)
-- Problem-size-dependent auto-tuning
-- Runtime caching of optimal configurations
 
 ---
 
-## Supported GEMM Types
+## System Overview
 
-The V2 CPU kernel system supports multiple GEMM data type combinations:
+The CPU GEMM subsystem provides highly optimized matrix multiplication for various data types:
 
-### 1. FP32 × IQ4_NL → FP32 (Quantized Inference)
-**Primary use case**: LLM inference with 4-bit quantized weights
+- **Integer GEMM** (`int8/`): Q8_0×Quantized→Q8_0 (INT8 VNNI computation)
+- **FP32 GEMM** (`fp32/`): Float32×Float32→Float32 (FP32 FMA computation)
+- **BF16 GEMM** (`bf16/`): BFloat16 computation (future)
+- **FP16 GEMM** (`fp16/`): Float16 computation (future)
 
-- **A matrix**: FP32 activations (m×k)
-- **B matrix**: IQ4_NL quantized weights (k×n, 4.5 bits/weight)
-- **C matrix**: FP32 output (m×n)
-- **Performance**: 335-1208 GFLOPS depending on matrix size
-- **Implementation**: `QuantizedGemmKernel` with `IBlockDecoder` strategy pattern
+### Key Design Principles
 
-```cpp
-auto W = std::make_unique<IQ4_NLTensor>(n, k);  // Quantized weights
-auto gemm = W->createGemm();  // Auto-tuned kernel
-gemm->multiply(A_fp32, C_fp32, m, n, k, W.get());
-```
-
-### 2. BF16 × BF16 → FP32 (High-Precision Activations)
-**Use case**: Transformer layers with BF16 activation storage (Phase 5+ memory optimization)
-
-- **A matrix**: BF16 activations (m×k, 16 bits/element)
-- **B matrix**: BF16 weights (k×n, 16 bits/element)
-- **C matrix**: FP32 output (m×n)
-- **Accuracy**: max_rel_diff < 2.5e-5 (excellent BF16 precision)
-- **Implementation**: `BF16PackedGemm` with SIMD BF16→FP32 conversion
-
-**Key Features**:
-- **Fused dequantization**: BF16→FP32 conversion during panel packing (zero compute overhead)
-- **SIMD-optimized**: AVX512 (16 elements/instruction), AVX2 (8 elements), or scalar fallback
-- **Transpose support**: Handles both [k,n] and [n,k] B layouts via explicit `transpose_B` parameter
-- **Auto-tuner integration**: Uses same 1,225 variant registry as IQ4_NL GEMM
-
-```cpp
-auto A_bf16 = std::make_unique<BF16Tensor>(m, k);
-auto B_bf16 = std::make_unique<BF16Tensor>(k, n);
-auto kernel = createBF16PackedGemm(A_bf16.get(), B_bf16.get());
-kernel->multiply(A_bf16->data(), C_fp32, m, n, k, 
-                 false,  // transpose_B
-                 1.0f, 0.0f);  // alpha, beta
-```
-
-**Performance**: Expected ~50% of FP32 throughput due to:
-- 2× memory bandwidth savings (16-bit vs 32-bit)
-- BF16→FP32 conversion overhead (SIMD-accelerated, negligible on modern CPUs)
-- Same register blocking and cache optimization as FP32 GEMM
-
-### 3. FP32 × FP32 → FP32 (Reference/Baseline)
-**Use case**: Debugging, validation, non-quantized models
-
-- **A matrix**: FP32 (m×k)
-- **B matrix**: FP32 (k×n)
-- **C matrix**: FP32 (m×n)
-- **Note**: Can reuse micro-kernel infrastructure by treating FP32 as "no-op decoder"
-
-### Data Type Precision Comparison
-
-| GEMM Type | A Precision | B Precision | Output | Relative Error | Memory (B matrix) |
-|-----------|-------------|-------------|--------|----------------|-------------------|
-| FP32×IQ4_NL | 32-bit | 4.5-bit | 32-bit | ~0.01-0.05 | 4.5 bits/weight |
-| BF16×BF16 | 16-bit | 16-bit | 32-bit | <2.5e-5 | 16 bits/weight |
-| FP32×FP32 | 32-bit | 32-bit | 32-bit | <1e-7 | 32 bits/weight |
-
-**Memory Efficiency**:
-- IQ4_NL: **7.1× compression** vs FP32 (4.5/32 = 0.14)
-- BF16: **2× compression** vs FP32 (16/32 = 0.5)
+1. **Template Metaprogramming**: Kernels are C++ templates specialized for ISA, tile sizes, and blocking parameters
+2. **Registry Pattern**: Runtime dispatch to optimal template instantiation based on hardware and workload
+3. **Static Registration**: `__attribute__((constructor))` auto-registers kernels at program startup
+4. **Zero Runtime Overhead**: Template instantiation happens at compile-time, no virtual dispatch in hot paths
+5. **Auto-Tuning**: Machine learning-based configuration selection from large configuration space
 
 ---
 
-## Architecture
+## Architecture Layers
+
+The GEMM system has a clean layered architecture:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    Application Layer                         │
-│     (IQ4_NLTensor, BF16Tensor, QuantizedGemmKernel)          │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-┌────────────────────────▼─────────────────────────────────────┐
-│                   GemmAutoTuner                              │
-│  • Shape-based caching (m×n×k)                               │
-│  • Smart search (1225 variants → 10 benchmarked)             │
-│  • Optimal variant selection & caching                       │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-┌────────────────────────▼─────────────────────────────────────┐
-│                SmartGemmSearch                               │
-│  • Problem-size filtering                                    │
-│  • ISA preference scoring (AVX2 vs AVX512)                   │
-│  • Cache/unroll/prefetch performance model                   │
-│  • Top-N candidate selection (10 best)                       │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-┌────────────────────────▼─────────────────────────────────────┐
-│             MicroKernelRegistry                              │
-│  • Runtime dispatch to template instantiations               │
-│  • (ISA, MR, NR, UNROLL_K, PREFETCH_DIST) → function pointer │
-│  • 1225 pre-compiled variants                                │
-└────────────────────────┬─────────────────────────────────────┘
-                         │
-┌────────────────────────▼─────────────────────────────────────┐
-│           MicroKernelTemplate<ISA, MR, NR, ...>              │
-│  • SIMD-optimized MR×NR register blocking                    │
-│  • Explicit template instantiations (generated/)             │
-│  • A/B panel packing + micro-kernel execution                │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Application Layer                                           │
+│ • Tensor operations (Tensor::gemm(), Q8_0Tensor::gemm())    │
+│ • Pipeline kernels (Attention, FFN, etc.)                   │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────────┐
+│ Adapter Layer                                               │
+│ • IntegerGemmAdapter (int8/IntegerGemmAdapter.h)            │
+│ • FP32GemmAdapter (fp32/GemmAdapter.h)                      │
+│ • Selects backend, validates shapes, manages buffers        │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────────┐
+│ Registry Layer                                              │
+│ • IntegerGemmKernelRegistry (int8/IntegerGemmKernelRegistry.h) │
+│ • GemmMicroKernelRegistry (GemmMicroKernelRegistry.h)       │
+│ • Runtime dispatch: get_kernel(ISA, MR, NR, ...)           │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────────┐
+│ Auto-Tuner Layer (Optional)                                 │
+│ • GemmAutoTuner (GemmAutoTuner.h)                           │
+│ • IntegerGemmAutoTuner (IntegerGemmAutoTuner.h)             │
+│ • ML-based config selection, smart search, caching          │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────────┐
+│ Template Kernel Layer                                       │
+│ • IntegerGemmKernel<ISA,MR,NR,...> (IntegerGemmKernelTemplate.h) │
+│ • GemmKernel<ISA,MR,NR,...> (GemmKernelTemplate.h)          │
+│ • Cache blocking, tiling, loop unrolling                    │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────────┐
+│ Micro-Kernel Layer                                          │
+│ • IntegerGemmMicroKernel (int8/IntegerGemmMicroKernel.h)    │
+│ • GemmMicroKernel (GemmMicroKernel.h)                       │
+│ • SIMD intrinsics, register blocking, prefetching           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## GEMM Micro-Kernel System
+## Integer GEMM System (Q8_0)
 
-### Core Concepts
+**Purpose**: Quantized inference with INT8×INT8→INT32 computation (AVX512-VNNI)
 
-**Micro-Kernel**: The innermost computational unit that computes a small `MR × NR` tile of the output matrix using SIMD registers.
-
-**Panel Packing**: Data is rearranged (packed) into contiguous memory to maximize cache locality and enable efficient SIMD operations.
-
-**Three-Level Cache Blocking**:
-- **MC × KC panels** fit in L3 cache
-- **KC × NC panels** fit in L2 cache  
-- **MR × NR tiles** fit in registers
-
-### File Organization
+### Component Architecture
 
 ```
-src/v2/kernels/cpu/
-├── GemmMicroKernelTemplate.h        # Template definition (all parameters)
-├── GemmMicroKernelRegistry.{h,cpp}  # Runtime dispatch to instantiations
-├── GemmMicroKernelInit.cpp          # Force-link all generated files
-├── GemmAutoTuner.{h,cpp}            # Shape-based auto-tuning + caching
-├── SmartGemmSearch.{h,cpp}          # Intelligent search strategies
-├── SimdTraits.h                     # SIMD abstraction (AVX512/AVX2)
-├── generate_gemm_microkernel_instantiations.py  # Code generation
-└── generated/                       # Auto-generated instantiations
-    ├── sources.cmake                # CMake source list (auto-included)
-    └── GemmMicroKernelInstantiations_00.cpp  # 64 files, ~19 variants each
+IntegerGemmKernel<ISA, MR, NR, UNROLL_K, PREFETCH_DIST, MC, KC, NC>
+                    │
+                    ├─ Uses: Q8_0BlockProvider interface
+                    ├─ Uses: IntegerGemmMicroKernel for computation
+                    ├─ Uses: IntegerRequantization for INT32→Q8_0 conversion
+                    └─ Registered in: IntegerGemmKernelRegistry
 ```
 
-### MicroKernelTemplate Parameters
+### Key Files
+
+| File | Purpose | Lines |
+|------|---------|-------|
+| `IntegerGemmKernelTemplate.h` | Main kernel template, cache blocking logic | ~306 |
+| `int8/IntegerGemmKernelRegistry.h` | Runtime dispatch registry (singleton) | ~151 |
+| `int8/IntegerGemmKernelInit.cpp` | Force-link 64 instantiation shards | ~169 |
+| `int8/IntegerGemmMicroKernel.h` | AVX512-VNNI micro-kernel (register blocking) | ~600+ |
+| `IntegerRequantization.h` | INT32→Q8_0 requantization with scale fusion | ~200 |
+| `GemmWeightCache.h` | Q8_0BlockProvider interface, caching strategies | ~500+ |
+
+### Data Flow
 
 ```cpp
-template<
-    typename ISA,         // simd::AVX512Tag or simd::AVX2Tag
-    int MR,               // Rows in register block (1-64)
-    int NR,               // Cols in register block (1-64)
-    int UNROLL_K = 4,     // K-loop unroll factor (1, 2, 4, 8, 16)
-    int PREFETCH_DIST = 2, // Prefetch distance (0, 1, 2, 3, 5)
-    int MC = 256,         // M-dimension cache block
-    int KC = 512,         // K-dimension cache block
-    int NC = 128          // N-dimension cache block
->
-class MicroKernelTemplate { ... };
-```
+// 1. Application calls tensor operation
+Q8_0Tensor result;
+result.gemm(A_q8, B_quantized);
 
-### Key Functions
+// 2. Adapter selects backend
+IntegerGemmAdapter adapter;
+adapter.multiply(A_blocks, B_provider, C_blocks, m, n, k);
 
-**1. micro_kernel()**
-```cpp
-static void micro_kernel(
-    const float* A_panel,   // MR × k_panel (packed)
-    const float* B_panel,   // NR × k_panel (packed)
-    float* C,               // MR × NR output
-    int ldc,                // Leading dimension of C
-    int k_panel,            // K dimension
-    float alpha, float beta,
-    int mr, int nr          // Actual dimensions (≤ MR, NR)
+// 3. Registry dispatches to optimal kernel
+auto& registry = IntegerGemmKernelRegistry::instance();
+auto kernel_func = registry.get_kernel(
+    "simd::AVX512VNNITag", 
+    mr=4, nr=32, unroll_k=4, prefetch_dist=2,
+    mc=256, kc=512, nc=128
 );
-```
+kernel_func(A_blocks, B_provider, C_blocks, m, n, k);
 
-Computes: `C[MR×NR] = alpha * A[MR×k] * B[NR×k]^T + beta * C[MR×NR]`
-
-**2. pack_A_panel()**
-```cpp
-static void pack_A_panel(
-    const float* A,         // Source matrix
-    float* A_packed,        // Destination buffer
-    int m_panel, int k_panel,
-    int lda                 // Leading dimension
-);
-```
-
-Packs `MR × KC` panels of A into contiguous memory for efficient SIMD access.
-
-**3. pack_B_panel()**
-```cpp
-static void pack_B_panel(
-    const float* B,         // Source matrix
-    float* B_packed,        // Destination buffer
-    int n_panel, int k_panel,
-    int ldb                 // Leading dimension
-);
-```
-
-Packs `KC × NR` panels of B (transposed) into contiguous memory.
-
-### Register File Constraints
-
-Different ISAs have different register file sizes, limiting maximum `MR × NR`:
-
-| ISA | Registers | Max MR×NR | Notes |
-|-----|-----------|-----------|-------|
-| **AVX512** | 32 ZMM (512-bit) | 48 | Conservative (need headroom for A/B loads) |
-| **AVX2** | 16 YMM (256-bit) | 32 | More constrained |
-| **Scalar** | ~16 GP registers | 16 | Fallback only |
-
-Invalid combinations are skipped during code generation.
-
----
-
-## Code Generation
-
-### Overview
-
-The `generate_gemm_microkernel_instantiations.py` script generates **64 .cpp files** (one per parallel compilation shard) with **~19 template instantiations each**, totaling **1,225 variants**.
-
-### Automatic Integration with CMake
-
-The generation script runs **automatically** during CMake configuration:
-
-```cmake
-# src/v2/CMakeLists.txt
-
-# Check if generation is needed
-if(NOT EXISTS ${GENERATED_SOURCES_CMAKE} OR 
-   ${GENERATE_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_SOURCES_CMAKE})
-    message(STATUS "V2: Generating GEMM microkernel instantiations...")
-    execute_process(COMMAND ${Python3_EXECUTABLE} ${GENERATE_GEMM_SCRIPT} ...)
-    message(STATUS "V2: Generated 64 microkernel files with 1225 variants")
-else()
-    message(STATUS "V2: GEMM microkernel instantiations are up-to-date")
-endif()
-
-# Include generated sources
-include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake)
-```
-
-**When regeneration occurs:**
-- First build (generated/ doesn't exist)
-- After modifying `generate_gemm_microkernel_instantiations.py`
-- After `make clean` (if generated/ deleted)
-
-**When regeneration is skipped:**
-- Subsequent builds (sources.cmake exists and is up-to-date)
-
-### Generated File Structure
-
-**GemmMicroKernelInstantiations_NN.cpp** (N = 00-63):
-
-```cpp
-/**
- * @file GemmMicroKernelInstantiations_00.cpp
- * @brief Explicit template instantiations (shard 0/64)
- *
- * AUTO-GENERATED by generate_gemm_microkernel_instantiations.py
- * DO NOT EDIT MANUALLY
- */
-
-#include "../GemmMicroKernelTemplate.h"
-#include "../GemmMicroKernelRegistry.h"
-
-namespace llaminar2 {
-namespace kernels {
-namespace gemm {
-
-// Force-link function
-extern "C" void forceLink_GemmMicroKernelInstantiations_00() {
-    // Empty - ensures linker includes this object file
+// 4. Template kernel executes (cache-blocked)
+IntegerGemmKernel<AVX512VNNITag, 4, 32, 4, 2, 256, 512, 128>::multiply(...) {
+    // Outer loops: MC×NC×KC blocking
+    for (int jc = 0; jc < n; jc += NC) {
+        for (int pc = 0; pc < k; pc += KC) {
+            for (int ic = 0; ic < m; ic += MC) {
+                // Micro-kernel: INT8 VNNI computation
+                IntegerGemmMicroKernel<...>::compute_block(...);
+            }
+        }
+    }
 }
 
-// Explicit instantiation
-template class MicroKernelTemplate<simd::AVX512Tag, 1, 1, 1, 0>;
+// 5. Micro-kernel computes tile
+IntegerGemmMicroKernel::compute_block() {
+    // Load A_q8 into registers (MR rows)
+    // Load B_q8 from provider (NR cols)
+    // INT8×INT8→INT32 VNNI multiply-accumulate
+    // Requantize INT32→Q8_0 with scale fusion
+    // Store Q8_0 result
+}
+```
 
-// Registration (runs before main())
+### Template Parameters
+
+| Parameter | Description | Typical Values | Impact |
+|-----------|-------------|----------------|--------|
+| `ISA` | SIMD instruction set | `AVX512VNNITag`, `AVX2Tag` | Micro-kernel implementation |
+| `MR` | Micro-kernel M (rows) | 1, 2, 4, 8, 16 | Register usage, L1 cache |
+| `NR` | Micro-kernel N (cols) | 32 (fixed for Q8_0) | Q8_0 block alignment |
+| `UNROLL_K` | K-loop unroll factor | 1, 2, 4, 8, 16 | Instruction-level parallelism |
+| `PREFETCH_DIST` | Prefetch distance | 0, 1, 2, 3, 5 | Cache miss latency hiding |
+| `MC` | M cache block size | 128, 256, 512, 1024 | L2 cache blocking |
+| `KC` | K cache block size | 256, 512, 1024, 2048 | L2 cache blocking |
+| `NC` | N cache block size | 64, 128, 256, 512 | L2 cache blocking |
+
+**Configuration Space**: 8000 valid combinations (5 ISAs × 5 MR × 1 NR × 5 UNROLL_K × 5 PREFETCH_DIST × 4 MC × 4 KC × 4 NC)
+
+### Static Registration Pattern
+
+Each template instantiation auto-registers itself at program startup:
+
+```cpp
+// In generated/IntegerGemmInstantiations_XX.cpp
+template class IntegerGemmKernel<simd::AVX512VNNITag, 4, 32, 4, 2, 256, 512, 128>;
+
 namespace {
-    __attribute__((constructor)) void register_AVX512Tag_1_1_1_0() {
-        using KernelType = MicroKernelTemplate<simd::AVX512Tag, 1, 1, 1, 0>;
-        MicroKernelRegistry::instance().register_kernel(
-            "simd::AVX512Tag", 1, 1, 1, 0,
-            MicroKernelBundle{
-                &KernelType::micro_kernel,
-                &KernelType::pack_A_panel,
-                &KernelType::pack_B_panel
+    __attribute__((constructor))
+    void register_simd_AVX512VNNITag_4_32_4_2_256_512_128() {
+        IntegerGemmKernelRegistry::instance().register_kernel(
+            "simd::AVX512VNNITag", 4, 32, 4, 2, 256, 512, 128,
+            [](const Q8_0Block* A, Q8_0BlockProvider& B, Q8_0Block* C, int m, int n, int k) {
+                return IntegerGemmKernel<simd::AVX512VNNITag, 4, 32, 4, 2, 256, 512, 128>::multiply(A, B, C, m, n, k);
             }
         );
     }
 }
-
-// ... ~18 more instantiations per file ...
-
-} // namespace gemm
-} // namespace kernels
-} // namespace llaminar2
 ```
 
-**sources.cmake**:
+**Force-Link Mechanism**: `IntegerGemmKernelInit.cpp` calls all 64 `forceLink_IntegerGemmInstantiations_XX()` functions to prevent linker from dropping unused object files from static library.
 
-```cmake
-# AUTO-GENERATED by generate_gemm_microkernel_instantiations.py
-set(MICROKERNEL_INSTANTIATION_SOURCES
-    kernels/cpu/generated/GemmMicroKernelInstantiations_00.cpp
-    kernels/cpu/generated/GemmMicroKernelInstantiations_01.cpp
-    # ... 62 more files ...
-    kernels/cpu/generated/GemmMicroKernelInstantiations_63.cpp
-)
-```
+### Generation Scripts
 
-### Customizing the Search Space
+**Location**: `python/generate_integer_gemm_instantiations.py`
 
-Edit `generate_gemm_microkernel_instantiations.py`:
+**Purpose**: Generate 64 instantiation files (8000 kernels ÷ 125 per file)
 
-```python
-# Search space dimensions
-ISA_TYPES = ["simd::AVX512Tag", "simd::AVX2Tag"]
-MR_VALUES = [1, 2, 4, 8, 16, 32, 64]       # Add/remove tile sizes
-NR_VALUES = [1, 2, 4, 6, 8, 16, 32, 64]
-UNROLL_K_VALUES = [1, 2, 4, 8, 16]         # Modify unroll factors
-PREFETCH_DIST_VALUES = [0, 1, 2, 3, 5]     # Adjust prefetch distances
-```
-
-After editing, regeneration happens automatically on next `cmake` run.
-
----
-
-## Auto-Tuner
-
-### Purpose
-
-The `GemmAutoTuner` benchmarks multiple kernel configurations for each unique tensor shape `(m, n, k)` and caches the optimal variant. Future operations on the same shape use the cached configuration.
-
-### Key Features
-
-1. **Shape-Based Caching**: `(m, n, k)` → best variant configuration
-2. **Smart Search**: 1225 variants → 10 benchmarked via hierarchical filtering
-3. **One-Time Cost**: Auto-tuning runs once per shape (amortized over inference)
-4. **Thread-Safe**: Mutex-protected cache for multi-threaded access
-
-### Usage
-
-```cpp
-#include "GemmAutoTuner.h"
-
-// Get singleton instance
-auto& tuner = GemmAutoTuner::instance();
-
-// Enable auto-tuning (default: enabled)
-tuner.setEnabled(true);
-
-// Select optimal variant for shape
-auto* best_variant = tuner.selectVariant(m, n, k, decoder);
-
-// Execute GEMM with best variant
-best_variant->multiply(A, C, m, n, k, decoder);
-```
-
-### Benchmarking Process
-
-For each `(m, n, k)` shape:
-
-1. **Smart Search Filtering**:
-   - 1225 total variants
-   - → 350-800 after problem-size filtering
-   - → 350-800 after ISA filtering (includes both AVX2 & AVX512)
-   - → 10 best after performance model scoring
-
-2. **Benchmarking Top 10**:
-   - Each variant: 3 warmup iterations + 10 timed iterations
-   - Measure: min time (to avoid system noise)
-   - Compute: GFLOPS = `2*m*n*k / (time_ms * 1e6)`
-
-3. **Cache Best Variant**:
-   - Store `(m, n, k)` → best variant mapping
-   - Thread-safe cache lookup on future calls
-
-### Environment Variables
-
+**Usage**:
 ```bash
-# Disable auto-tuning (use heuristic defaults)
-export LLAMINAR_DISABLE_AUTOTUNING=1
+cd src/v2/kernels/cpu/gemm/python
+python3 generate_integer_gemm_instantiations.py
 
-# Clear cache between runs (for testing)
-tuner.clearCache();
+# Output: int8/generated/IntegerGemmInstantiations_00.cpp through _63.cpp
 ```
+
+**Key functions**:
+- `generate_config_space()`: Enumerate valid (ISA, MR, NR, UNROLL_K, PREFETCH_DIST, MC, KC, NC) tuples
+- `generate_instantiation()`: Produce template instantiation + static registration code
+- `generate_file_header()`: Include directives, force-link extern declaration
+- `distribute_to_files()`: Shard 8000 configs across 64 files for parallel compilation
 
 ---
 
-## Smart Search Strategies
+## FP32 GEMM System
 
-The `SmartGemmSearch` class implements **hierarchical filtering** inspired by Intel MKL, OpenBLAS, and ATLAS to reduce 1225 variants to 10 promising candidates.
+**Purpose**: Float32 inference with FP32×FP32→FP32 computation (FMA)
 
-### Filtering Stages
+### Component Architecture
 
-#### 1. Problem-Size Filtering
+Similar to Integer GEMM but with FP32 types:
 
-**Goal**: Eliminate tiles incompatible with matrix dimensions
-
-**Rules**:
-- Skip if `TILE_M > m` or `TILE_N > n` (wasteful for small matrices)
-- Skip if `TILE_M < 4` or `TILE_N < 4` for large matrices (`m, n > 512`)
-
-**Reduction**: 1225 → 350-800 variants (depends on `m, n` size)
-
-```cpp
-std::vector<IQuantizedGemmVariant*> filterByProblemSize(
-    const std::vector<std::unique_ptr<IQuantizedGemmVariant>>& variants,
-    int m, int n, int k
-);
+```
+GemmKernel<ISA, MR, NR, UNROLL_K, PREFETCH_DIST, MC, KC, NC>
+           │
+           ├─ Uses: float* inputs/outputs
+           ├─ Uses: GemmMicroKernel for FP32 FMA computation
+           └─ Registered in: GemmMicroKernelRegistry
 ```
 
-#### 2. ISA Filtering
+### Key Files
 
-**Goal**: Select best ISA variants based on CPU capabilities
+| File | Purpose |
+|------|---------|
+| `GemmKernelTemplate.h` | FP32 kernel template |
+| `GemmMicroKernelRegistry.h` | FP32 registry |
+| `fp32/GemmMicroKernelInit.cpp` | Force-link mechanism |
+| `GemmMicroKernel.h` | FP32 micro-kernel base |
+| `fp32/GemmMicroKernelTemplateAVX512.h` | AVX512 FP32 micro-kernel |
+| `fp32/GemmMicroKernelTemplateAVX2.h` | AVX2 FP32 micro-kernel |
 
-**Fixed Bug (Oct 2025)**: Previously used `else if` logic that **excluded AVX2 when AVX512 available**. Now includes **BOTH ISAs** and lets performance model + benchmarking choose.
+### Template Parameters
 
-```cpp
-// BEFORE (BROKEN):
-if (has_avx512 && isAVX512(name)) { filtered.push_back(variant); }
-else if (has_avx2 && !has_avx512 && isAVX2(name)) { ... }  // ONLY if NO AVX512!
+Same as Integer GEMM, except:
+- `NR` is not fixed (typical: 8, 16, 24, 32 for FP32)
+- Larger configuration space (~40,000 combinations)
 
-// AFTER (FIXED):
-if (is_avx512 && has_avx512) { filtered.push_back(variant); }
-else if (is_avx2 && has_avx2) { filtered.push_back(variant); }  // Always include AVX2
-```
+---
 
-**Result**: 625 variants (AVX512 only) → **1225 variants** (AVX512 + AVX2 + Legacy)
+## Registry Pattern
 
-**Reduction**: No reduction (includes all executable ISAs)
+### Design
 
-#### 3. ISA Preference Scoring
-
-**Goal**: Prefer AVX2 for small matrices where AVX512 frequency scaling hurts performance
-
-**Problem**: AVX512 operations trigger CPU frequency scaling (thermal/power throttling), causing 20-40% slowdowns on small matrices.
-
-**Solution**: Apply problem-size-dependent penalties to AVX512:
+The registry pattern provides **runtime dispatch** to **compile-time specialized** template instantiations:
 
 ```cpp
-double scoreISAPreference(const char* variant_name, int m, int n, int k)
-{
-    size_t problem_size = m * n * k;
+template<typename ISA, int MR, int NR, ...>
+class IntegerGemmKernel {
+    static bool multiply(...);  // Template-specialized implementation
+};
+
+class IntegerGemmKernelRegistry {
+    std::map<IntegerGemmKey, IntegerGemmFunc> kernels_;
     
-    // Single token (≤8 rows OR <2M elements): 60% AVX512 penalty
-    if (m <= 8 || problem_size < 2000000) {
-        if (is_avx2) return 1.0;
-        if (is_avx512) return 0.40;  // Strongly prefer AVX2
-    }
-    // Small batch (<50M elements): 25% AVX512 penalty
-    else if (problem_size < 50000000) {
-        if (is_avx2) return 1.0;
-        if (is_avx512) return 0.75;
-    }
-    // Medium batch (<200M elements): 8% AVX512 penalty
-    else if (problem_size < 200000000) {
-        if (is_avx2) return 1.0;
-        if (is_avx512) return 0.92;
-    }
-    // Large batch (≥200M elements): Neutral
-    else {
-        if (is_avx512) return 1.0;
-        if (is_avx2) return 1.0;  // Let benchmarking decide
-    }
-}
+    // Runtime lookup
+    IntegerGemmFunc get_kernel(string isa, int mr, int nr, ...);
+};
 ```
 
-**Thresholds aligned with actual workloads**:
-- **<2M** (1×896×896 = 802K): Single token decode
-- **<50M** (32×896×896 = 25M): Small batch
-- **<200M** (128×896×896 = 102M): Medium batch
-- **≥200M** (512×896×896 = 411M): Large batch
+### Benefits
 
-#### 4. Performance Model Scoring
+1. **Zero Runtime Overhead**: Template specialization happens at compile-time
+2. **Optimal Code Generation**: Compiler can fully optimize each instantiation (loop unrolling, SIMD, etc.)
+3. **Flexible Selection**: Runtime can choose best config based on hardware detection, profiling, or ML heuristic
+4. **Easy Extension**: Add new configs by regenerating instantiation files
 
-**Goal**: Rank variants by predicted performance without benchmarking
+### Implementation Details
 
-**Factors** (weighted combination):
-
-| Factor | Weight | What it Measures |
-|--------|--------|------------------|
-| **L1 Cache** | 40% | Tile fits in L1 (32KB) |
-| **L2 Cache** | 30% | Tile fits in L2 (256KB) |
-| **Unroll Factor** | 20% | Balance ILP vs code size |
-| **Prefetch Distance** | 10% | Memory latency hiding |
-
-**Combined Score**:
+**Registry Key**: 8-tuple uniquely identifying a configuration:
 ```cpp
-double total_score = 0.70 * base_score + 0.30 * isa_score;
+using IntegerGemmKey = std::tuple<
+    std::string,  // ISA name ("simd::AVX512VNNITag")
+    int,          // MR
+    int,          // NR
+    int,          // UNROLL_K
+    int,          // PREFETCH_DIST
+    int,          // MC
+    int,          // KC
+    int           // NC
+>;
 ```
 
-**Weighting rationale**:
-- **70% base score**: Prioritizes good tile/cache characteristics
-- **30% ISA score**: Enough to prefer AVX2 for small ops, not enough to override tile optimization
+**Registry API**:
+```cpp
+class IntegerGemmKernelRegistry {
+public:
+    static IntegerGemmKernelRegistry& instance();  // Singleton
+    
+    void register_kernel(
+        const std::string& isa_name,
+        int mr, int nr, int unroll_k, int prefetch_dist,
+        int mc, int kc, int nc,
+        IntegerGemmFunc kernel_func
+    );
+    
+    IntegerGemmFunc get_kernel(...) const;  // Returns nullptr if not found
+    bool has_kernel(...) const;
+    size_t size() const;  // Number of registered kernels
+};
+```
 
-**Why not 50/50?** Tested during tuning - too aggressive, selected bad tile sizes (1×8, 4×1) instead of optimal (4×2).
+**Lookup Performance**: O(log n) with n=8000 → ~13 comparisons. Negligible vs kernel execution time (millions of ops).
 
-#### 5. Top-N Selection
+---
 
-**Goal**: Only benchmark the most promising candidates
+## Configuration Space
+
+### Integer GEMM Configuration Space
+
+**Total**: 8000 valid combinations
+
+**Dimensions**:
+- **ISA** (5): AVX512VNNITag, AVX512FTag, AVX2Tag, SSE4Tag, ScalarTag
+- **MR** (5): 1, 2, 4, 8, 16 (micro-kernel M dimension)
+- **NR** (1): 32 (fixed for Q8_0 block alignment)
+- **UNROLL_K** (5): 1, 2, 4, 8, 16 (K-loop unrolling)
+- **PREFETCH_DIST** (5): 0, 1, 2, 3, 5 (prefetch iterations ahead)
+- **MC** (4): 128, 256, 512, 1024 (M cache blocking)
+- **KC** (4): 256, 512, 1024, 2048 (K cache blocking, multiples of 32)
+- **NC** (4): 64, 128, 256, 512 (N cache blocking)
+
+**Constraints**:
+- `KC % 32 == 0` (Q8_0 block size alignment)
+- `NR == 32` (Q8_0 block width)
+- Valid ISA for target hardware (runtime check)
+
+### FP32 GEMM Configuration Space
+
+**Total**: ~40,000 valid combinations
+
+**Additional flexibility**:
+- **NR** (5): 8, 16, 24, 32, 48 (not fixed like Q8_0)
+- No alignment constraints on KC (can use arbitrary values)
+
+### Trade-offs
+
+| Parameter | Small Values | Large Values |
+|-----------|-------------|--------------|
+| **MR** | Lower register pressure, more tiles | Fewer tiles, better amortization |
+| **UNROLL_K** | Lower code size, less pressure | More ILP, better throughput |
+| **PREFETCH_DIST** | Lower cache pollution | Hide more latency (if accurate) |
+| **MC/KC/NC** | Fit in L1/L2 cache better | Fewer outer loop iterations |
+
+**No Universal Best**: Optimal config depends on:
+- Matrix dimensions (m, n, k)
+- Hardware (cache sizes, SIMD width, memory bandwidth)
+- Memory access patterns (contiguous vs strided)
+- Compiler optimizations
+
+---
+
+## Auto-Tuning System
+
+### Overview
+
+The auto-tuner selects optimal configuration from 8000+ possibilities using:
+
+1. **Heuristic Rules**: Quick decisions for common cases (small/large matrices, cache-friendly sizes)
+2. **Machine Learning Model**: Neural network trained on empirical performance data
+3. **Smart Search**: Binary search over sorted configuration space by predicted performance
+4. **Runtime Caching**: Memoize best configs for frequently seen (m, n, k) triplets
+
+### Components
+
+| File | Purpose |
+|------|---------|
+| `GemmAutoTuner.h` | Base auto-tuner interface |
+| `IntegerGemmAutoTuner.h` | Integer GEMM auto-tuner |
+| `SmartGemmSearch.h` | Binary search over config space |
+
+### Auto-Tuner Workflow
+
+```cpp
+// 1. Check cache
+auto cached_config = autotuner.lookup_cache(m, n, k);
+if (cached_config) {
+    return registry.get_kernel(*cached_config);
+}
+
+// 2. Apply heuristic rules
+if (m * n * k < SMALL_THRESHOLD) {
+    return registry.get_kernel(small_matrix_heuristic());
+}
+
+// 3. Use ML model for prediction
+auto predictions = ml_model.predict_all_configs(m, n, k, hardware_features);
+std::sort(configs, by_prediction_desc);
+
+// 4. Smart search (binary search over top K configs)
+auto best_config = smart_search.find_best(configs.top_k(20), m, n, k);
+
+// 5. Cache result
+autotuner.cache_config(m, n, k, best_config);
+return registry.get_kernel(best_config);
+```
+
+### Training Data Collection
+
+**Script**: `python/collect_gemm_training_data.py`
 
 **Process**:
-1. Score all filtered variants (350-800) using performance model
-2. Sort by combined score (base + ISA)
-3. Select top 10 candidates
-4. Benchmark these 10 to find actual best
+1. Enumerate all 8000 configs
+2. For each config, benchmark on representative (m, n, k) workloads
+3. Record: (m, n, k, ISA, MR, NR, ..., MC, KC, NC) → throughput (GFLOPS)
+4. Export CSV for ML training
 
-**Reduction**: 350-800 variants → **10 benchmarked**
+**Usage**:
+```bash
+# Run benchmark sweep (outputs CSV)
+./build_v2_release/performance/v2_perf_integer_gemm_config_sweep \
+  --benchmark_mode=full \
+  --output=gemm_training_data.csv
 
-**Result**: 100× faster auto-tuning (10 benchmarks vs 1225)
-
----
-
-## Performance Model
-
-### L1 Cache Scoring
-
-**L1 Size**: 32KB per core (typical)
-
-```cpp
-double scoreL1Cache(int tile_m, int tile_n, int k_panel)
-{
-    size_t tile_bytes = tile_m * tile_n * sizeof(float);
-    size_t panel_bytes = (tile_m * k_panel + tile_n * k_panel) * sizeof(float);
-    size_t total_bytes = tile_bytes + panel_bytes;
-    
-    constexpr size_t L1_SIZE = 32 * 1024;  // 32KB
-    
-    if (total_bytes <= L1_SIZE * 0.5) return 1.0;      // Excellent fit
-    if (total_bytes <= L1_SIZE * 0.75) return 0.8;     // Good fit
-    if (total_bytes <= L1_SIZE) return 0.6;            // Acceptable fit
-    return 0.3;  // Poor fit (thrashing)
-}
-```
-
-### L2 Cache Scoring
-
-**L2 Size**: 256KB per core (typical)
-
-```cpp
-double scoreL2Cache(int tile_m, int tile_n, int k_panel)
-{
-    size_t working_set = (tile_m + tile_n) * k_panel * sizeof(float);
-    constexpr size_t L2_SIZE = 256 * 1024;  // 256KB
-    
-    if (working_set <= L2_SIZE * 0.5) return 1.0;
-    if (working_set <= L2_SIZE) return 0.7;
-    return 0.4;
-}
-```
-
-### Unroll Factor Scoring
-
-**Goal**: Balance instruction-level parallelism vs code bloat
-
-```cpp
-double scoreUnrollFactor(int unroll_k)
-{
-    if (unroll_k == 4) return 1.0;   // Sweet spot
-    if (unroll_k == 8) return 0.95;  // Good for large ops
-    if (unroll_k == 2) return 0.85;  // Good for small ops
-    if (unroll_k == 16) return 0.8;  // Aggressive
-    if (unroll_k == 1) return 0.6;   // Minimal ILP
-    return 0.5;
-}
-```
-
-### Prefetch Scoring
-
-**Goal**: Hide memory latency for large operations
-
-```cpp
-double scorePrefetchDistance(int prefetch_dist, size_t problem_size)
-{
-    // Small problems: prefetch hurts (cache pollution)
-    if (problem_size < 100000) {
-        if (prefetch_dist == 0) return 1.0;
-        return 0.7;
-    }
-    // Large problems: prefetch helps
-    else {
-        if (prefetch_dist == 2 || prefetch_dist == 3) return 1.0;
-        if (prefetch_dist == 5) return 0.9;
-        if (prefetch_dist == 1) return 0.85;
-        if (prefetch_dist == 0) return 0.6;
-        return 0.7;
-    }
-}
+# Train ML model
+python3 python/train_gemm_autotuner.py \
+  --input=gemm_training_data.csv \
+  --output=gemm_autotuner_weights.h
 ```
 
 ---
 
-## Usage Guide
+## File Organization
 
-### For Application Developers
-
-#### 1. Quantized GEMM (FP32 × IQ4_NL)
-**Most common use case**: LLM inference with quantized weights
-
-```cpp
-#include "v2/tensors/IQ4_NLTensor.h"
-
-// Create quantized weight matrix (loaded from GGUF)
-auto W = std::make_unique<IQ4_NLTensor>(n, k);  // n×k weight matrix
-
-// Create FP32 activation matrix
-auto A = std::make_unique<FP32Tensor>(m, k);  // m×k activations
-
-// Output buffer
-auto C = std::make_unique<FP32Tensor>(m, n);  // m×n result
-
-// Execute GEMM (auto-tuned)
-auto gemm_kernel = W->createGemm();  // Creates QuantizedGemmKernel
-gemm_kernel->multiply(A->data(), C->data(), m, n, k, W.get());
+```
+src/v2/kernels/cpu/gemm/
+├── README.md                          # This file
+├── README.md.old                      # Historical documentation
+│
+├── GemmKernelTemplate.h               # FP32 GEMM kernel template
+├── IntegerGemmKernelTemplate.h        # Integer GEMM kernel template
+├── IntegerRequantization.h            # INT32→Q8_0 requantization
+├── GemmWeightCache.h                  # Q8_0BlockProvider interface
+│
+├── GemmMicroKernel.h                  # FP32 micro-kernel base
+├── GemmMicroKernelRegistry.h          # FP32 registry
+├── GemmMicroKernelInit.cpp            # FP32 force-link
+├── GemmMicroKernelAdapter.h           # FP32 adapter
+│
+├── IntegerGemm.h                      # Integer GEMM public API
+├── IntegerGemmAdapter.h               # Integer GEMM adapter
+│
+├── GemmAutoTuner.h                    # Auto-tuner base
+├── IntegerGemmAutoTuner.h             # Integer auto-tuner
+├── SmartGemmSearch.h                  # Config search
+│
+├── int8/                              # Integer GEMM specific
+│   ├── IntegerGemmKernelRegistry.h    # Integer registry (8000 kernels)
+│   ├── IntegerGemmKernelInit.cpp      # Force-link 64 shards
+│   ├── IntegerGemmMicroKernel.h       # AVX512-VNNI micro-kernel
+│   ├── GemmMicroKernelTemplateINT8.h  # INT8 micro-kernel specializations
+│   └── generated/                     # Auto-generated instantiations
+│       ├── IntegerGemmInstantiations_00.cpp  # Shard 0 (125 kernels)
+│       ├── IntegerGemmInstantiations_01.cpp  # Shard 1 (125 kernels)
+│       ├── ...
+│       └── IntegerGemmInstantiations_63.cpp  # Shard 63 (125 kernels)
+│
+├── fp32/                              # FP32 GEMM specific
+│   ├── GemmMicroKernelInit.cpp        # Force-link FP32 shards
+│   ├── GemmMicroKernelTemplateAVX512.h # AVX512 FP32 micro-kernel
+│   ├── GemmMicroKernelTemplateAVX2.h   # AVX2 FP32 micro-kernel
+│   └── generated/                     # Auto-generated FP32 instantiations
+│
+├── bf16/                              # BFloat16 GEMM (future)
+├── fp16/                              # Float16 GEMM (future)
+│
+└── python/                            # Code generation & training
+    ├── generate_integer_gemm_instantiations.py  # Generate int8/generated/
+    ├── generate_fp32_gemm_instantiations.py     # Generate fp32/generated/
+    ├── collect_gemm_training_data.py            # Benchmark sweep
+    └── train_gemm_autotuner.py                  # ML model training
 ```
 
-**Performance characteristics**:
-- **First call**: Auto-tuning overhead (~100-500ms depending on shape)
-- **Subsequent calls**: Cached optimal variant (~1-5ms for typical shapes)
-- **Throughput**: 335-1208 GFLOPS depending on matrix size
+### Generated Files (Not in Git)
 
-#### 2. BF16 GEMM (BF16 × BF16)
-**Use case**: Phase 5+ memory optimization with BF16 activation storage
-
-```cpp
-#include "v2/kernels/cpu/BF16PackedGemm.h"
-#include "v2/tensors/BF16Tensor.h"
-
-// Create BF16 tensors
-auto A_bf16 = std::make_unique<BF16Tensor>(m, k);  // m×k activations
-auto B_bf16 = std::make_unique<BF16Tensor>(k, n);  // k×n weights
-
-// Fill with data (example: convert from FP32)
-// A_bf16->copyFrom(A_fp32.get());
-
-// Output buffer (always FP32)
-std::vector<float> C(m * n, 0.0f);
-
-// Create auto-tuned BF16 GEMM kernel
-auto kernel = llaminar::v2::kernels::createBF16PackedGemm(A_bf16.get(), B_bf16.get());
-
-// Execute: C = A_bf16 × B_bf16 (with implicit BF16→FP32 conversion)
-bool success = kernel->multiply(
-    reinterpret_cast<const float*>(A_bf16->bf16_data()),  // A as BF16 (cast to float*)
-    C.data(),                                              // C as FP32 output
-    m, n, k,
-    false,      // transpose_B (false = B is [k,n], true = B is [n,k])
-    1.0f,       // alpha
-    0.0f,       // beta
-    nullptr,    // MPI context (nullptr for single-rank)
-    -1          // device_idx (-1 for CPU)
-);
+**Integer GEMM**: 64 files, ~30KB each, ~2MB total
+```
+int8/generated/IntegerGemmInstantiations_00.cpp  # Configs 0-124
+int8/generated/IntegerGemmInstantiations_01.cpp  # Configs 125-249
+...
+int8/generated/IntegerGemmInstantiations_63.cpp  # Configs 7875-7999
 ```
 
-**Important notes**:
-- **Transpose parameter**: Must match B tensor layout
-  - `transpose_B = false`: B is [k, n] row-major (most common)
-  - `transpose_B = true`: B is [n, k] row-major (needs transpose)
-- **Precision**: max_rel_diff < 2.5e-5 (excellent for BF16)
-- **Memory**: 50% reduction vs FP32 for A and B matrices
-- **Performance**: Expected ~50% of FP32 throughput (2× bandwidth savings partially offset by conversion)
+**FP32 GEMM**: ~320 files (40,000 configs ÷ 125 per file)
 
-**Auto-tuner integration**: BF16 GEMM reuses the same 1,225 micro-kernel variants as IQ4_NL GEMM, with BF16→FP32 conversion fused into panel packing (zero compute overhead).
+**Regeneration**:
+```bash
+cd python/
+python3 generate_integer_gemm_instantiations.py  # Regenerate int8/generated/
+python3 generate_fp32_gemm_instantiations.py     # Regenerate fp32/generated/
+```
 
-### For Kernel Developers
+---
 
-**Adding new ISA**:
+## Adding New Kernels
 
-1. Add SIMD traits to `SimdTraits.h`:
+### 1. Add New ISA Support
+
+**Example**: Add NEON support for ARM64
+
+```cpp
+// 1. Define ISA tag (in src/v2/kernels/cpu/simd/)
+namespace simd {
+    struct NEONTag {};
+}
+
+// 2. Implement micro-kernel specialization
+template<>
+class IntegerGemmMicroKernel<simd::NEONTag, MR, NR, ...> {
+    // NEON intrinsics implementation
+};
+
+// 3. Add to config space (in python/generate_integer_gemm_instantiations.py)
+SUPPORTED_ISAS = [
+    'simd::AVX512VNNITag',
+    'simd::AVX2Tag',
+    'simd::NEONTag',  # NEW
+]
+
+// 4. Regenerate instantiations
+python3 generate_integer_gemm_instantiations.py
+```
+
+### 2. Add New Data Type
+
+**Example**: Add INT4 GEMM
+
+```cpp
+// 1. Create new subdirectory
+mkdir int4/
+
+// 2. Define block format (src/v2/tensors/Tensors.h)
+struct INT4Block { ... };
+
+// 3. Create kernel template (int4/IntegerGemmKernelTemplateINT4.h)
+template<typename ISA, int MR, int NR, ...>
+class INT4GemmKernel {
+    static bool multiply(const INT4Block* A, INT4BlockProvider& B, INT4Block* C, ...);
+};
+
+// 4. Create registry (int4/INT4GemmKernelRegistry.h)
+class INT4GemmKernelRegistry {
+    // Similar to IntegerGemmKernelRegistry
+};
+
+// 5. Create generation script (python/generate_int4_gemm_instantiations.py)
+// ... modeled after generate_integer_gemm_instantiations.py
+```
+
+### 3. Extend Configuration Space
+
+**Example**: Add MC=2048 option
+
+```python
+# In python/generate_integer_gemm_instantiations.py
+MC_VALUES = [128, 256, 512, 1024, 2048]  # Added 2048
+
+# Regenerate (now 10,000 configs instead of 8,000)
+python3 generate_integer_gemm_instantiations.py
+```
+
+**Impact**: Increases compilation time proportionally (more shards needed).
+
+### 4. Optimize Micro-Kernel
+
+**Location**: `int8/IntegerGemmMicroKernel.h`
+
+**Example**: Add deeper K-loop unrolling for AVX512
+
 ```cpp
 template<>
-struct SimdTraits<simd::AVX2Tag> {
-    using VectorType = __m256;
-    static constexpr int vector_width = 8;  // 8 floats
-    static __m256 zero() { return _mm256_setzero_ps(); }
-    static __m256 load(const float* p) { return _mm256_loadu_ps(p); }
-    // ... more operations ...
+class IntegerGemmMicroKernel<simd::AVX512VNNITag, 4, 32, 16, ...> {
+    // Unroll K-loop 16× instead of 4×
+    // Requires more registers, may improve ILP
 };
 ```
 
-2. Add ISA to `generate_gemm_microkernel_instantiations.py`:
-```python
-ISA_TYPES = ["simd::AVX512Tag", "simd::AVX2Tag", "simd::ARMNeonTag"]  # Add new ISA
-```
-
-3. Rebuild:
+**Testing**:
 ```bash
-cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
-cmake --build build_v2_release --target llaminar2_core -j56
-```
+# Build specific config
+./build_v2_release/performance/v2_perf_integer_gemm_config_sweep \
+  --gtest_filter="*RegistryDispatch*"
 
-**Adding new tile sizes**:
-
-Edit `generate_gemm_microkernel_instantiations.py`:
-```python
-MR_VALUES = [1, 2, 4, 8, 12, 16, 32, 64]  # Added 12
-NR_VALUES = [1, 2, 4, 6, 8, 12, 16, 32, 64]  # Added 12
-```
-
-No code changes needed - regeneration happens automatically!
-
----
-
-## Performance Results
-
-### Test Configuration
-
-**Hardware**: 2-socket Intel system (56 physical cores, 112 with HT)  
-**Model**: Qwen 2.5 0.5B Instruct Q8_0 (638 MB)  
-**Compiler**: GCC with `-march=native -O3`  
-**Date**: October 2025
-
-### Auto-Tuner Performance Tests (6/6 Passing)
-
-```
-Test #45: V2_Perf_GemmAutoTuner ............   Passed  133.67 sec
-
-SmallMatrix_SingleToken (1×896×896):     28.1% slower (within 40% tolerance)
-  - Selected: AVX512Tag_1x8_u8_p5
-  - Manual best: AVX2Tag_1x2_u1_p5
-  - Note: High variance due to AVX512 frequency scaling
-
-SmallBatch_32Tokens (32×896×896):        9.5% slower (within 25% tolerance)
-  - Selected: AVX512Tag_4x2_u16_p5
-  - Manual best: AVX2Tag_4x2_u16_p0
-
-MediumBatch_128Tokens (128×896×896):     2.6% slower (within 10% tolerance)
-  - Selected: AVX512Tag_4x2_u16_p5
-  - Manual best: AVX2Tag_4x2_u16_p0
-
-LargeBatch_512Tokens (512×896×896):      1.9% slower (within 10% tolerance)
-  - Selected: AVX512Tag_4x2_u8_p5
-  - Manual best: AVX512Tag_4x2_u8_p0
-
-NonSquare_QKVProjection (128×1024×896):  2.3% slower (within 10% tolerance)
-  - Selected: AVX512Tag_4x2_u16_p5
-  - Manual best: AVX2Tag_4x2_u16_p0
-
-TinyMatrix_EdgeCase (8×64×64):           [passes within 10% tolerance]
-  - Selected: AVX512Tag_2x6_u2_p1
-```
-
-**Interpretation**:
-- Auto-tuner consistently selects variants within **2-10%** of optimal for most cases
-- Single-token variance (28%) is expected due to AVX512 frequency scaling sensitivity
-- All selections are production-worthy
-- ISA preference system working correctly (AVX2 for small, AVX512 for large)
-
-### Throughput Performance
-
-| Operation Size | GFLOPS | Notes |
-|---------------|--------|-------|
-| Single token (1×896×896) | 13-20 | AVX2 preferred, frequency scaling sensitive |
-| Small batch (32×896×896) | 260-280 | Transitional range |
-| Medium batch (128×896×896) | 440-460 | Good AVX512 performance |
-| Large batch (512×896×896) | 410-450 | Sustained high throughput |
-
-### ISA Performance Comparison
-
-| Matrix Size | AVX2 (GFLOPS) | AVX512 (GFLOPS) | Winner | Margin |
-|-------------|---------------|-----------------|--------|--------|
-| 1×896×896 (single token) | 20 | 13 | **AVX2** | 35% faster |
-| 32×896×896 (small batch) | 280 | 260 | **AVX2** | 8% faster |
-| 128×896×896 (medium) | 440 | 460 | AVX512 | 5% faster |
-| 512×896×896 (large) | 410 | 450 | **AVX512** | 10% faster |
-
-**Key Finding**: AVX512 frequency scaling causes 20-40% slowdowns on small matrices, but wins on large operations where SIMD parallelism dominates.
-
----
-
-## Development Guide
-
-### Building from Source
-
-```bash
-# Configure (auto-generates microkernel instantiations)
-cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
-
-# Build library
-cmake --build build_v2_release --target llaminar2_core -j56
-
-# Run performance tests
-cd build_v2_release
-ctest -R "V2_Perf_GemmAutoTuner" --verbose
-```
-
-### Debugging Auto-Tuner
-
-**Enable verbose logging**:
-
-```cpp
-// In application code
-auto& tuner = GemmAutoTuner::instance();
-tuner.setVerbose(true);  // Prints benchmark results
-```
-
-**Disable auto-tuning** (use heuristic defaults):
-
-```bash
-export LLAMINAR_DISABLE_AUTOTUNING=1
-```
-
-**Clear cache** (force re-tuning):
-
-```cpp
-tuner.clearCache();
-```
-
-### Adding Custom Performance Model
-
-Edit `SmartGemmSearch.cpp`:
-
-```cpp
-double SmartGemmSearch::scorePerformanceModel(
-    const GemmVariantMeta* variant,
-    int m, int n, int k)
-{
-    // Add custom heuristics
-    double custom_score = ...;
-    
-    // Combine with existing scores
-    double base_score = 0.70 * cache_score + 0.30 * custom_score;
-    return base_score;
-}
-```
-
-### Testing Changes
-
-**Unit tests**:
-```bash
-ctest -R "V2_Unit_" --output-on-failure
-```
-
-**Performance tests**:
-```bash
-ctest -R "V2_Perf_GemmAutoTuner" --verbose
-```
-
-**Benchmark single shape**:
-```bash
-./v2_perf_gemm_autotuner --gtest_filter="*SmallMatrix*"
-```
-
-### Common Issues
-
-**Issue**: Generated files not found during build
-
-**Solution**: Ensure Python3 is available:
-```bash
-which python3
-# Should output: /usr/bin/python3 or similar
-```
-
-**Issue**: Auto-tuner selecting suboptimal variants
-
-**Solution**: Check ISA preference thresholds in `SmartGemmSearch.cpp`. May need to adjust penalties for your CPU model.
-
-**Issue**: Compilation takes too long
-
-**Solution**: Reduce parallelism or use ccache:
-```bash
-cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
-cmake --build build_v2_release -j8  # Reduce from -j56
-```
-
-### Profiling
-
-**Benchmark auto-tuner overhead**:
-
-```cpp
-auto t0 = std::chrono::high_resolution_clock::now();
-auto* variant = tuner.selectVariant(m, n, k, decoder);
-auto t1 = std::chrono::high_resolution_clock::now();
-
-double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-std::cout << "Auto-tuner time: " << ms << " ms" << std::endl;
-```
-
-**Profile kernel execution**:
-
-```bash
-# Linux perf
-perf record -g ./your_benchmark
-perf report
-
-# Intel VTune
-vtune -collect hotspots ./your_benchmark
+# Compare GFLOPS before/after optimization
 ```
 
 ---
 
-## TiledGemmSoftmax: Fused Attention Score Computation
+## Performance Characteristics
 
-**File**: `TiledGemmSoftmax.h`  
-**Status**: ✅ Prototype Complete (7/7 tests passing)  
-**Date**: November 2025
+### Build Performance
 
-### Overview
+| Metric | Factory Pattern (Old) | Registry Pattern (New) |
+|--------|----------------------|------------------------|
+| **Core library build time** | Indefinite (blocked) | 1m3s real (51m30s CPU) |
+| **Parallelism** | None (single 24K-line file) | 50× (64 shards compile independently) |
+| **Incremental rebuild** | Full reparse required | Only changed shards rebuild |
+| **Developer experience** | Terrible | Excellent |
 
-`TiledGemmSoftmax` implements **tile-level fusion** of GEMM and Softmax operations for attention score computation. This eliminates the DRAM round-trip between computing `Q @ K^T` and applying softmax normalization.
+### Runtime Performance
 
-**Key Innovation**: Uses the same `MicroKernelTemplate` infrastructure as quantized GEMM, but for **FP32×FP32 matrix multiplication** (Q @ K^T for attention).
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Registry lookup** | O(log 8000) = ~13 comparisons | Negligible vs kernel execution |
+| **Template overhead** | Zero | Fully inlined at compile-time |
+| **Optimal config selection** | Depends on auto-tuner | Heuristic: fast, ML: accurate |
 
-### Performance Benefits
+### Memory Footprint
 
-**Memory Traffic Reduction**:
+| Component | Size | Notes |
+|-----------|------|-------|
+| **Static library** | ~80MB | 8000 instantiated kernels |
+| **Registry map** | ~500KB | 8000 entries × ~60 bytes each |
+| **ML model weights** | ~50KB | Small neural network |
+
+---
+
+## Troubleshooting
+
+### Build Issues
+
+**Problem**: `undefined reference to IntegerGemmKernel<...>::multiply`
+
+**Solution**: Regenerate instantiation files
+```bash
+cd python/
+python3 generate_integer_gemm_instantiations.py
+cmake --build build_v2_release --parallel
 ```
-Sequential (cblas_sgemm + softmax):
-  1. GEMM writes scores[m×n] to DRAM    (4mn bytes)
-  2. Softmax reads scores from DRAM     (4mn bytes)
-  3. Softmax writes weights to DRAM     (2mn bytes if BF16)
-  Total: ~10mn bytes
 
-Tiled Fusion (TiledGemmSoftmax):
-  For each tile (TILE_M rows):
-    1. Pack Q tile + K matrix
-    2. micro_kernel → scores in L1/L2   (no DRAM write)
-    3. Softmax on hot data              (in cache)
-    4. Write final weights              (2mn bytes)
-  Total: ~2mn bytes
+**Problem**: Compilation extremely slow
 
-Reduction: 5× less memory bandwidth!
-```
+**Solution**: Check if accidentally regenerating with too many configs (should be 8000, not 80,000+)
 
-**Expected Speedup**:
-- Small sequences (m=128): 15-25% (softmax overhead limits)
-- Medium sequences (m=512): 30-45% (good balance)
-- Large sequences (m=2048): 50-70% (bandwidth-bound, 5× reduction shines)
+### Runtime Issues
 
-### Architecture
+**Problem**: `Registry::get_kernel()` returns nullptr
 
-**Key Realization**: `MicroKernelTemplate` is **fully FP32-generic**:
-- `pack_A_panel(const float*, ...)` - Generic FP32 row packing
-- `pack_B_panel(const float*, ...)` - Generic FP32 column packing (with transpose)
-- `micro_kernel(const float*, const float*, ...)` - Generic FP32 SIMD GEMM
+**Cause**: Requested config not instantiated
 
-The "quantized" aspect only exists in `MicroKernelVariantAdapter` (via `IBlockDecoder` for weight dequantization). The micro-kernels themselves operate on **plain FP32 buffers**.
-
-**For Q @ K^T**: Simply skip the decoder and pack Q/K matrices directly!
-
-### Implementation
-
+**Solution**: Check config is in generated space:
 ```cpp
-template<
-    typename ISA = simd::AVX512Tag,  // AVX512 or AVX2
-    int TILE_M = 32,                  // Cache blocking (rows per tile)
-    int MR = 8,                       // Micro-kernel rows
-    int NR = 6,                       // Micro-kernel cols
-    int UNROLL_K = 4,                 // K-loop unroll
-    int PREFETCH_DIST = 2             // Prefetch distance
->
-class TiledGemmSoftmax {
-public:
-    static bool execute(
-        const float* Q,           // Query matrix [m × d]
-        const float* K,           // Key matrix [n × d]
-        float* weights,           // Output [m × n]
-        int m, int n, int d,
-        float scale,              // Attention scale (1/sqrt(d))
-        bool causal,              // Causal masking
-        GemmOutputPrecision output_precision  // FP32 or BF16
-    );
-};
+auto& registry = IntegerGemmKernelRegistry::instance();
+std::cout << "Registry has " << registry.size() << " kernels" << std::endl;
+
+bool has_config = registry.has_kernel("simd::AVX512VNNITag", 4, 32, 4, 2, 256, 512, 128);
+std::cout << "Has config: " << has_config << std::endl;
 ```
 
-### Execution Flow
+**Problem**: Poor performance despite auto-tuner
 
-```cpp
-#pragma omp parallel for schedule(dynamic)
-for (int i_tile = 0; i_tile < m; i_tile += TILE_M) {
-    // Thread-local packing buffers
-    std::vector<float> A_packed(TILE_M * d);
-    std::vector<float> B_packed(n * d);
-    
-    // 1. Pack Q tile [tile_m × d]
-    for (int i = 0; i < tile_m; i += MR) {
-        MicroKernelTemplate::pack_A_panel(
-            Q + (i_tile + i) * d,
-            A_packed.data() + i * d,
-            mb, d, d
-        );
-    }
-    
-    // 2. Pack K matrix [n × d] (transposed for K^T)
-    for (int j = 0; j < n; j += NR) {
-        MicroKernelTemplate::pack_B_panel(
-            K + j * d,
-            B_packed.data() + j * d,
-            d, nb, d
-        );
-    }
-    
-    // 3. Compute scores with micro-kernels (stays in cache!)
-    float* tile_scores = weights + i_tile * n;
-    for (int ir = 0; ir < tile_m; ir += MR) {
-        for (int jr = 0; jr < n; jr += NR) {
-            MicroKernelTemplate::micro_kernel(
-                A_packed.data() + ir * d,
-                B_packed.data() + jr * d,
-                tile_scores + ir * n + jr,
-                n, d, scale, 0.0f, mb, nb
-            );
-        }
-    }
-    
-    // 4. Fused softmax on hot data (still in L1/L2!)
-    for (int ir = 0; ir < tile_m; ++ir) {
-        float* row = tile_scores + ir * n;
-        
-        // Causal masking (if needed)
-        if (causal) {
-            int global_row = i_tile + ir;
-            for (int j = global_row + 1; j < n; ++j) {
-                row[j] = -INFINITY;
-            }
-        }
-        
-        // Softmax: max → exp → sum → normalize
-        float max_val = row[0];
-        for (int j = 1; j < n; ++j) max_val = std::max(max_val, row[j]);
-        
-        float sum = 0.0f;
-        for (int j = 0; j < n; ++j) {
-            row[j] = std::exp(row[j] - max_val);
-            sum += row[j];
-        }
-        
-        float inv_sum = 1.0f / sum;
-        for (int j = 0; j < n; ++j) row[j] *= inv_sum;
-    }
-}
+**Cause**: May need to retrain ML model for new hardware
+
+**Solution**: Collect fresh training data:
+```bash
+./build_v2_release/performance/v2_perf_integer_gemm_config_sweep \
+  --benchmark_mode=full --output=new_training_data.csv
+python3 python/train_gemm_autotuner.py --input=new_training_data.csv
 ```
-
-### Cache Analysis
-
-For `TILE_M=32`, `seq_len=512`, `d=512`:
-- **Q tile**: 32 × 512 × 4 = 64 KB (fits in L1 cache)
-- **K matrix**: 512 × 512 × 4 = 1 MB (fits in L2 cache)
-- **Scores tile**: 32 × 512 × 4 = 64 KB (fits in L1 cache)
-- **Working set per thread**: ~1.1 MB (L2 resident)
-
-This ensures scores **never hit DRAM** between GEMM and softmax!
-
-### Usage Example
-
-```cpp
-#include "TiledGemmSoftmax.h"
-
-// Compute attention weights with tile-level fusion
-int m = 512;    // Query tokens
-int n = 512;    // Key tokens (sequence length)
-int d = 128;    // Model dimension
-float scale = 1.0f / std::sqrt(128.0f);
-
-std::vector<float> Q(m * d);
-std::vector<float> K(n * d);
-std::vector<float> weights(m * n);
-
-bool success = TiledGemmSoftmax<>::execute(
-    Q.data(), K.data(), weights.data(),
-    m, n, d, scale,
-    /*causal=*/false,
-    GemmOutputPrecision::FP32
-);
-```
-
-### Integration with Attention
-
-Recommended integration strategy in `CPUAttentionT`:
-
-```cpp
-// For medium+ sequences, use tiled fusion
-if (seq_len >= 128) {
-    TiledGemmSoftmax<>::execute(Q, K, weights, m, n, d, scale, causal, precision);
-} else {
-    // Fallback to sequential for very small sequences
-    fused_gemm_softmax_.execute(...);
-}
-```
-
-### Test Results
-
-**File**: `tests/v2/unit/Test__TiledGemmSoftmax.cpp`
-
-✅ **7/7 tests passing** (72 ms total):
-- `BasicCorrectness`: Small matrix (32×64) without causal masking
-- `CausalMasking`: Future tokens masked to zero
-- `SingleToken`: Edge case (m=1)
-- `NumericalStability`: Large variance, verify softmax sum=1
-- `TileBoundary`: Non-multiples of TILE_M (m=50, n=100)
-- `InvalidInput`: Error handling (nullptr, invalid dims)
-- `AVX2Variant`: AVX2 path correctness
-
-**Numerical Accuracy**: Relative tolerance 1e-4 to 5e-4 (excellent agreement with naive reference)
-
-### Future Work
-
-1. **Performance benchmarking**: Measure actual speedup vs sequential `FusedGemmSoftmax`
-2. **BF16 output**: Implement optional BF16 conversion (currently logs warning)
-3. **Auto-tuning**: Integrate with `GemmAutoTuner` for optimal TILE_M/MR/NR selection
-4. **Large sequence debugging**: Fix disabled `LargeSequence` test (works individually, segfaults in full suite)
-5. **CUDA/ROCm**: Port tile fusion concept to GPU kernels
-
-### Key Insight
-
-This work demonstrates that **Llaminar's micro-kernel system is more flexible than initially apparent**. What was designed for quantized inference (FP32 × IQ4_NL → FP32) can be **trivially adapted** for FP32×FP32 GEMM by simply skipping the dequantization step.
-
-**General Principle**: The micro-kernels are **generic FP32 infrastructure** applicable to:
-- Quantized GEMM (current: FP32 × IQ4_NL)
-- Attention scores (new: Q @ K^T)
-- Future: BF16×BF16, INT8×INT8, fused FFN layers, etc.
 
 ---
 
 ## References
 
-### Inspiration
+### Key Papers
 
-- **Intel MKL**: ISA-specific optimizations, hierarchical cache blocking
-- **OpenBLAS**: Multi-level packing strategies, register blocking
-- **ATLAS**: Auto-tuning methodology, performance modeling
-- **BLIS**: Micro-kernel architecture, panel packing
+- **BLIS**: "BLIS: A Framework for Rapidly Instantiating BLAS Functionality" (Van Zee & van de Geijn, 2015)
+- **GEMM Optimization**: "Anatomy of High-Performance Matrix Multiplication" (Goto & van de Geijn, 2008)
+- **INT8 GEMM**: "Quantizing deep convolutional networks for efficient inference" (Krishnamoorthi, 2018)
 
-### Papers
+### Related Documentation
 
-- Goto, Kazushige, and Robert van de Geijn. "High-performance implementation of the level-3 BLAS." ACM Transactions on Mathematical Software (TOMS) 35.1 (2008): 1-14.
-- Van Zee, Field G., and Robert A. Van De Geijn. "BLIS: A framework for rapidly instantiating BLAS functionality." ACM Transactions on Mathematical Software (TOMS) 41.3 (2015): 1-33.
-
-### Documentation
-
-- **ISA Preference Quick Reference**: `/workspaces/llaminar/ISA_PREFERENCE_QUICK_REFERENCE.md`
-- **Complete Session Log**: `/workspaces/llaminar/changelog/2025-01-30-isa-preference-tuning-complete.md` (Note: Date reflects October 2025 work)
 - **V2 Architecture**: `.github/instructions/llaminar-v2-architecture.instructions.md`
+- **Copilot Instructions**: `.github/copilot-instructions.md`
+- **Changelog**: `changelog/2025-01-XX-integer-gemm-registry-pattern-migration.md`
+
+### External Libraries
+
+- **Intel MKL**: Reference GEMM implementation for validation
+- **OpenBLAS**: Baseline comparison
+- **AVX-512 Intrinsics Guide**: https://www.intel.com/content/www/us/en/docs/intrinsics-guide/
 
 ---
 
-## License
-
-See repository root for license information.
-
-## Author
-
-**David Sanftenberg**  
-October 2025
-
-For questions or contributions, see project repository.
+**Last Updated**: November 11, 2025  
+**Maintainer**: David Sanftenberg  
+**Status**: Production-ready (Integer GEMM), Active Development (FP32/BF16/FP16)

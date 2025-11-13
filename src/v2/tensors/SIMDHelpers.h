@@ -710,8 +710,12 @@ namespace llaminar2
                 max_abs = std::max(max_abs, std::abs(src[i]));
             }
 
-            // Handle zero input - scale of 0 means all quantized values are 0
-            if (max_abs == 0.0f)
+            // Use threshold to avoid numerical issues with very small values
+            // Values smaller than 1e-6 are effectively zero in FP16 precision
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+
+            // Handle zero input or extremely small values - treat as zero
+            if (max_abs < MIN_SCALE_THRESHOLD)
             {
                 *dst_scale_fp16 = 0;
                 std::memset(dst_qs, 0, 32);
@@ -757,8 +761,11 @@ namespace llaminar2
             __m512 max_vec = _mm512_max_ps(abs0, abs1);
             float max_abs = _mm512_reduce_max_ps(max_vec);
 
-            // Handle zero input
-            if (max_abs == 0.0f)
+            // Use threshold to avoid numerical issues with very small values
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+
+            // Handle zero input or extremely small values - treat as zero
+            if (max_abs < MIN_SCALE_THRESHOLD)
             {
                 *dst_scale_fp16 = 0;
                 _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_qs), _mm256_setzero_si256());
@@ -843,8 +850,11 @@ namespace llaminar2
             max_hl = _mm_max_ss(max_hl, _mm_movehdup_ps(max_hl));
             float max_abs = _mm_cvtss_f32(max_hl);
 
-            // Handle zero input
-            if (max_abs == 0.0f)
+            // Use threshold to avoid numerical issues with very small values
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+
+            // Handle zero input or extremely small values - treat as zero
+            if (max_abs < MIN_SCALE_THRESHOLD)
             {
                 *dst_scale_fp16 = 0;
                 std::memset(dst_qs, 0, 32);

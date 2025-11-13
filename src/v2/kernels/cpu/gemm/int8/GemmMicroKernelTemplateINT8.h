@@ -143,6 +143,7 @@ namespace llaminar2
                     // Each dpbusd produces 16 int32 accumulators (one per 4-element dot product)
 
                     // Accumulators: one __m512i per (i,j) tile element, each holding 16 int32 lanes
+                    // Always zero SIMD accumulators (they accumulate within this K-panel)
                     Accum accumulators[MR][NR];
                     for (int i = 0; i < MR; ++i)
                         for (int j = 0; j < NR; ++j)
@@ -254,12 +255,18 @@ namespace llaminar2
                     }
 
                     // Reduce accumulators: sum all 16 lanes (each lane = one 4-element dot product)
+                    // CRITICAL FIX (Nov 11, 2025): Initialize c_scalar with existing C when beta != 0
+                    // This enables true accumulation across K-blocks without double buffering!
                     int32_t c_scalar[MR][NR];
                     for (int i = 0; i < MR; ++i)
                     {
                         for (int j = 0; j < NR; ++j)
                         {
-                            int32_t sum = 0;
+                            // When beta != 0, start with existing C value (accumulation mode)
+                            // When beta == 0, start from zero (overwrite mode)
+                            int32_t sum = (beta != 0) ? C[i * ldc + j] : 0;
+
+                            // Add horizontal reduction of SIMD lanes
                             for (int lane = 0; lane < kAccumWidth; ++lane)
                                 sum += Traits::extract_i32(accumulators[i][j], lane);
                             c_scalar[i][j] = sum;
@@ -293,13 +300,30 @@ namespace llaminar2
                     }
 
                     // Write results to output matrix C
+                    // CRITICAL FIX (Nov 11, 2025): c_scalar already includes beta*C when beta != 0!
+                    // Formula: c_scalar = beta*C_old + horizontal_sum(A*B)
+                    // We need: C_new = alpha * horizontal_sum(A*B) + beta * C_old
+                    //                = alpha * (c_scalar - beta*C_old) + beta * C_old
+                    // But when beta=1 and alpha=1: C_new = c_scalar (simple!)
                     for (int i = 0; i < mr; ++i)
                         for (int j = 0; j < nr; ++j)
                         {
                             if (beta == 0)
+                            {
+                                // c_scalar = horizontal_sum, no C_old
                                 C[i * ldc + j] = alpha * c_scalar[i][j];
+                            }
+                            else if (alpha == 1 && beta == 1)
+                            {
+                                // c_scalar = C_old + horizontal_sum, exactly what we want!
+                                C[i * ldc + j] = c_scalar[i][j];
+                            }
                             else
-                                C[i * ldc + j] = alpha * c_scalar[i][j] + beta * C[i * ldc + j];
+                            {
+                                // General case: extract horizontal_sum from c_scalar
+                                int32_t horizontal_sum = c_scalar[i][j] - beta * C[i * ldc + j];
+                                C[i * ldc + j] = alpha * horizontal_sum + beta * C[i * ldc + j];
+                            }
                         }
                 }
 

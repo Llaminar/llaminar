@@ -7,7 +7,7 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
-#include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"
+// #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -165,9 +165,10 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> INT8Tensor::createGemm()
     {
-        // CPU: Auto-tuned AVX512-VNNI INT8 GEMM kernel
-        // Pass this tensor as the weight tensor (B parameter)
-        return llaminar2::kernels::gemm::createINT8PackedGemm(nullptr, this);
+        // CPU: Use new IntegerGemm system (replaces deprecated INT8PackedGemm)
+        // This tensor serves as the weight tensor (B parameter) in INT8×INT8→INT8 operations
+        LOG_ERROR("[INT8Tensor] createGemm() not yet implemented for new IntegerGemm system");
+        return nullptr; // TODO: Integrate with IntegerGemmAdapter
     }
 
     void INT8Tensor::to_fp32(float *dst) const

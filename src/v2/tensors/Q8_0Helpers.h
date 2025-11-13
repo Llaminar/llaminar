@@ -191,11 +191,14 @@ namespace llaminar2
             const float max_abs = find_max_abs_fp32(src, count);
 
             // Compute scale and store as FP16
-            const float scale_fp32 = (max_abs > 1e-10f) ? (max_abs / 127.0f) : 1.0f;
+            // Use 1e-6 threshold to avoid numerical issues with very small values
+            // Values smaller than this are effectively zero in FP16 precision
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            const float scale_fp32 = (max_abs > MIN_SCALE_THRESHOLD) ? (max_abs / 127.0f) : 0.0f;
             block.d = fp32_to_fp16(scale_fp32);
 
             // Quantize to INT8 (vectorized)
-            const float inv_scale = (max_abs > 1e-10f) ? (127.0f / max_abs) : 0.0f;
+            const float inv_scale = (max_abs > MIN_SCALE_THRESHOLD) ? (127.0f / max_abs) : 0.0f;
             quantize_fp32_to_int8(src, block.qs, inv_scale, count);
 
             // Zero-fill tail

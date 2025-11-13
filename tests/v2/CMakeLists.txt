@@ -392,6 +392,19 @@ add_v2_test(V2_Unit_IntegerGemm
     MPI_PROCS 1  # CPU-only VNNI kernel, single rank
 )
 
+# Test: ParameterizedInt8Gemm (template-based microkernel with variable MR×NR, OneDNN-inspired)
+add_executable(v2_test_parameterized_int8_gemm unit/Test__ParameterizedInt8Gemm.cpp)
+target_link_libraries(v2_test_parameterized_int8_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ParameterizedInt8Gemm
+    COMMAND $<TARGET_FILE:v2_test_parameterized_int8_gemm>
+    LABELS "V2;Unit;Kernels;GEMM;Quantization;INT8;AVX512VNNI;ParameterizedKernel;OneDNN;Performance"
+    MPI_PROCS 1  # CPU-only VNNI kernel, single rank
+)
+
 # Test: FusedSoftmaxGemm (fused softmax+GEMM microkernel for attention mechanism)
 add_executable(v2_test_fused_softmax_gemm unit/Test__FusedSoftmaxGemm.cpp)
 target_link_libraries(v2_test_fused_softmax_gemm
@@ -2764,6 +2777,46 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
 )
 
+# Performance Test: Q8_0 × Q8_0 GEMM (8×8 microkernel with inline compensation)
+# Benchmarks Q8_0 quantized GEMM using standard Q8_0Tensor interface
+# Test cases: SingleToken, SmallBatch, LargePrefill
+# Measures: Time, GFLOPS, comparison with dense INT8 baseline
+add_executable(v2_perf_q8_0_gemm performance/Perf__Q8_0Gemm.cpp)
+target_link_libraries(v2_perf_q8_0_gemm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_q8_0_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Q8_0_GEMM
+    COMMAND $<TARGET_FILE:v2_perf_q8_0_gemm>
+    LABELS "V2;Performance;GEMM;Q8_0;Quantization;Throughput"
+    MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
+)
+
+# Performance Test: Q8_0 GEMM Microkernel Size Comparison
+# Benchmarks different microkernel sizes (8×8, 12×12, 16×16, 8×16)
+# Test cases: Large prefill workload (M=4096, N=896, K=896)
+# Measures: Time, GFLOPS, speedup vs 8×8 baseline
+add_executable(v2_perf_q8_0_gemm_microkernel_size performance/Perf__Q8_0Gemm_MicrokernelSize.cpp)
+target_link_libraries(v2_perf_q8_0_gemm_microkernel_size 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_q8_0_gemm_microkernel_size PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Q8_0_GEMM_MicrokernelSize
+    COMMAND $<TARGET_FILE:v2_perf_q8_0_gemm_microkernel_size>
+    LABELS "V2;Performance;GEMM;Q8_0;MicrokernelOptimization;Tuning"
+    MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
+)
+
 # Performance Test: Q8_0 Conversion with SIMD Variants
 # Benchmarks vectorized Q8_0 quantization (AVX512/AVX2/scalar) and OpenMP scaling
 # Test cases: SIMD variants, OpenMP thread scaling, all tensor types, large-scale conversion
@@ -2782,6 +2835,68 @@ add_v2_perf_test(V2_Perf_Q8_0_Conversion
     COMMAND $<TARGET_FILE:v2_perf_q8_0_conversion>
     LABELS "V2;Performance;Quantization;Q8_0;SIMD;AVX512;AVX2;OpenMP;Vectorization;Parallelization"
     MPI_PROCS 1  # Single rank (tests CPU SIMD + OpenMP)
+)
+
+# Performance Test: INT8 GEMM M-Scaling Analysis
+# Benchmarks how INT8 GEMM performance scales with increasing M dimension
+# Test cases: M from 128 to 4096, single-thread vs multi-thread, thread count scaling
+# Identifies: Parallelization breakpoint, optimal thread count, efficiency metrics
+add_executable(v2_perf_int8_gemm_m_scaling performance/Perf__Int8Gemm_MScaling.cpp)
+target_link_libraries(v2_perf_int8_gemm_m_scaling 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_int8_gemm_m_scaling PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Int8Gemm_MScaling
+    COMMAND $<TARGET_FILE:v2_perf_int8_gemm_m_scaling>
+    LABELS "V2;Performance;GEMM;INT8;Scaling;Parallelization;OpenMP;Efficiency"
+    MPI_PROCS 1  # Single rank (tests OpenMP scaling)
+)
+
+# Performance Test: INT8 GEMM Prefetch Distance Tuning
+# Benchmarks impact of OneDNN-style aggressive prefetching vs conservative vs none
+# Test cases: Prefetch distances (0,0,0), (64,64,32), (160,128,64), (256,192,96)
+# Expected: 2-4× improvement from OneDNN prefetch (160,128,64) over no prefetch
+# Validates: Memory bandwidth utilization improvement (3.6% → 10-15%)
+add_executable(v2_perf_int8_gemm_prefetch performance/Perf__Int8Gemm_Prefetch.cpp)
+target_link_libraries(v2_perf_int8_gemm_prefetch 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_int8_gemm_prefetch PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Int8Gemm_Prefetch
+    COMMAND $<TARGET_FILE:v2_perf_int8_gemm_prefetch>
+    LABELS "V2;Performance;GEMM;INT8;Prefetch;MemoryBandwidth;OneDNN;Optimization"
+    MPI_PROCS 1  # Single rank (tests prefetch impact)
+)
+
+# Performance Test: INT8 GEMM Microkernel Size Comparison
+# Compares different microkernel dimensions (48×8 vs 32×8 vs 16×8 vs 16×16)
+# Test cases: M-scaling (512, 2048, 8192), single-thread vs multi-thread
+# Expected: 48×8 (OneDNN's choice) provides 20-30% improvement over 16×16
+# Validates: Better M-dimension amortization and register utilization
+add_executable(v2_perf_int8_gemm_microkernel_size performance/Perf__Int8Gemm_MicrokernelSize.cpp)
+target_link_libraries(v2_perf_int8_gemm_microkernel_size 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_int8_gemm_microkernel_size PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Int8Gemm_MicrokernelSize
+    COMMAND $<TARGET_FILE:v2_perf_int8_gemm_microkernel_size>
+    LABELS "V2;Performance;GEMM;INT8;Microkernel;OneDNN;RegisterAllocation;MAmortization"
+    MPI_PROCS 1  # Single rank (tests microkernel sizes)
 )
 
 # Performance Test: IQ4_NL GEMM Implementation Comparison
@@ -2917,28 +3032,229 @@ add_v2_perf_test(V2_Perf_ExhaustiveAutotunerSweep
 # - Metrics: INT8 GFLOPS, time (ms)
 # - Top-K profiling: Re-run top 10 configs per workload with perf stats
 #   (L1/L2/L3 cache misses, instructions, cycles, IPC)
+# Performance Test: Integer GEMM Minimal Profiling Harness
+# Focused benchmark for iterative bug fixing and profiling.
+# Reproduces the catastrophic performance bug (1.1% efficiency).
 #
-# Output: integer_gemm_config_sweep_results.csv (for ML feature engineering)
+# Purpose:
+#   - Rapid iteration on performance fixes
+#   - Clean profiling with perf/vtune/gdb
+#   - Test individual configurations without full sweep overhead
 #
-# NOTE: This test is currently DISABLED pending resolution of template constraint
-# issues (CachedQ8Provider<FP16Tensor> instantiation). Once INTEGER_GEMM_INSTANTIATION_SOURCES
-# is re-enabled in src/v2/CMakeLists.txt, uncomment this test.
+# Usage:
+#   # Default (128×896×896, MR=16, shows bug)
+#   ./performance/v2_perf_integer_gemm_minimal
 #
-# add_executable(v2_perf_integer_gemm_config_sweep performance/cpu/kernels/gemm/Perf__IntegerGEMM_ConfigSweep.cpp)
-# target_link_libraries(v2_perf_integer_gemm_config_sweep
+#   # Test MR=1 (less overhead)
+#   ./performance/v2_perf_integer_gemm_minimal --mr 1
+#
+#   # Profile with perf
+#   perf record -g ./performance/v2_perf_integer_gemm_minimal --m 512 --iters 100
+#   perf report
+#
+#   # Large matrix for sustained profiling
+#   ./performance/v2_perf_integer_gemm_minimal --m 512 --n 4096 --k 4096 --iters 1000
+#
+add_executable(v2_perf_integer_gemm_minimal performance/cpu/kernels/gemm/Perf__IntegerGEMM_Minimal.cpp)
+target_link_libraries(v2_perf_integer_gemm_minimal
+    llaminar2_core
+)
+set_target_properties(v2_perf_integer_gemm_minimal PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+# NOTE: Not registered as CTest (no add_v2_perf_test) - this is a manual profiling tool
+# Run directly: ./build_v2_release/performance/v2_perf_integer_gemm_minimal
+
+# Performance Test: Qwen 0.5B Pipeline Profiling
+# Benchmarks representative operations from Qwen 0.5B across decode and prefill scenarios.
+# Tests 16 operations covering Q/K/V projections, attention output, and FFN layers
+# with appropriate kernel configurations per operation size.
+add_executable(v2_perf_integer_gemm_qwen_profile performance/cpu/kernels/gemm/Perf__IntegerGEMM_QwenProfile.cpp)
+target_link_libraries(v2_perf_integer_gemm_qwen_profile
+    llaminar2_core
+)
+set_target_properties(v2_perf_integer_gemm_qwen_profile PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+# Register as CTest with optimal OMP settings
+add_v2_perf_test(V2_Perf_IntegerGEMM_QwenProfile
+    COMMAND $<TARGET_FILE:v2_perf_integer_gemm_qwen_profile> --simd
+    LABELS "V2;Performance;Kernels;GEMM;IntegerGEMM;QwenProfile;AVX512VNNI"
+    MPI_PROCS 1  # Single rank for pure performance measurement
+)
+
+# Performance Test: Register-Blocked INT8 GEMM (Phase 1 - OneDNN Architecture)
+# Implements 6×16 microkernel with register blocking following OneDNN design
+# Target: 2,000-3,000 GOPS (4-6× speedup over baseline 472 GOPS)
+add_executable(v2_perf_register_blocked_int8_gemm performance/cpu/kernels/gemm/Perf__RegisterBlockedInt8Gemm.cpp)
+target_link_libraries(v2_perf_register_blocked_int8_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_register_blocked_int8_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+# Register as CTest with optimal OMP settings
+add_v2_perf_test(V2_Perf_RegisterBlockedInt8Gemm
+    COMMAND $<TARGET_FILE:v2_perf_register_blocked_int8_gemm>
+    LABELS "V2;Performance;Kernels;GEMM;RegisterBlocked;Phase1;OneDNN;AVX512VNNI"
+    MPI_PROCS 1  # Single rank for pure performance measurement
+)
+
+# ============================================================================
+# Phase 1: Register-Blocked Microkernel (6×16 tiles)
+# ============================================================================
+# OneDNN-inspired optimization: Register blocking for 31× reduction in memory traffic
+# Target: 2,000-3,000 GOPS (4-6× speedup over baseline 472 GOPS)
+# See: src/v2/kernels/cpu/gemm_v2/INT8_GEMM_QUICK_ACTION_PLAN.md
+add_executable(v2_perf_register_blocked_microkernel performance/cpu/kernels/gemm/Perf__RegisterBlockedMicroKernel.cpp)
+target_link_libraries(v2_perf_register_blocked_microkernel
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_register_blocked_microkernel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+# Register as CTest
+add_v2_perf_test(V2_Perf_RegisterBlockedMicroKernel
+    COMMAND $<TARGET_FILE:v2_perf_register_blocked_microkernel>
+    LABELS "V2;Performance;Kernels;GEMM;Phase1;RegisterBlocking;AVX512VNNI"
+    MPI_PROCS 1
+)
+
+# Performance Test: Simple INT8 GEMM Baseline (No Abstractions)
+# Clean-sheet design to establish baseline performance without microkernel complexity.
+# Tests pure VNNI performance on Qwen 0.5B operations with minimal overhead.
+add_executable(v2_perf_simple_int8_gemm performance/cpu/kernels/gemm/Perf__SimpleInt8Gemm.cpp)
+target_link_libraries(v2_perf_simple_int8_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_simple_int8_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_SimpleInt8Gemm
+    COMMAND $<TARGET_FILE:v2_perf_simple_int8_gemm>
+    LABELS "V2;Performance;Kernels;GEMM;IntegerGEMM;Baseline;SimpleDesign;AVX512VNNI"
+    MPI_PROCS 1
+)
+
+# Performance Test: Simple INT8 GEMM - FFN_down Prefill-4096 (Optimization Target)
+# Focused benchmark for cache blocking optimization.
+# Single test case: M=4096, N=896, K=4864 (35.6B ops)
+# Target: 6,610 GOPS (OneDNN baseline, 84% efficiency)
+add_executable(v2_perf_simple_int8_gemm_ffn_down_4096 performance/cpu/kernels/gemm/Perf__SimpleInt8Gemm_FFNDown4096.cpp)
+target_link_libraries(v2_perf_simple_int8_gemm_ffn_down_4096
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_simple_int8_gemm_ffn_down_4096 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_SimpleInt8Gemm_FFNDown4096
+    COMMAND $<TARGET_FILE:v2_perf_simple_int8_gemm_ffn_down_4096>
+    LABELS "V2;Performance;Kernels;GEMM;IntegerGEMM;FFNDown;Prefill4096;CacheBlocking;OptimizationTarget"
+    MPI_PROCS 1
+)
+
+# Performance Test: Packed INT8 GEMM - Pre-expansion Strategy
+# Tests whether pre-packing B matrix into plain INT8 format improves performance
+# vs decoding Q8 blocks on-the-fly.
+add_executable(v2_perf_packed_int8_gemm performance/cpu/kernels/gemm/Perf__PackedInt8Gemm.cpp)
+target_link_libraries(v2_perf_packed_int8_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_packed_int8_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_PackedInt8Gemm
+    COMMAND $<TARGET_FILE:v2_perf_packed_int8_gemm>
+    LABELS "V2;Performance;Kernels;GEMM;IntegerGEMM;DataPacking;PreExpansion;FFNDown"
+    MPI_PROCS 1
+)
+
+# Performance Test: Integer GEMM Tile Size Parameter Sweep
+# OBSOLETE: Comprehensive sweep of MR, UNROLL_K, PREFETCH_DIST, cache blocking params
+# Superseded by Perf__IntegerGEMM_FullSweep_Registry.cpp (registry-based, no template explosion)
+# Conclusion: MR=8 found optimal
+# add_executable(v2_perf_integer_gemm_tile_sweep performance/cpu/kernels/gemm/Perf__IntegerGEMM_TileSweep.cpp.old)
+# target_link_libraries(v2_perf_integer_gemm_tile_sweep
 #     llaminar2_core
 #     GTest::gtest
 #     GTest::gtest_main
 # )
-# set_target_properties(v2_perf_integer_gemm_config_sweep PROPERTIES
+# set_target_properties(v2_perf_integer_gemm_tile_sweep PROPERTIES
 #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
 # )
-#
-# add_v2_perf_test(V2_Perf_IntegerGEMM_ConfigSweep
-#     COMMAND $<TARGET_FILE:v2_perf_integer_gemm_config_sweep>
-#     LABELS "V2;Performance;GEMM;INT8;ConfigurationSweep;MLTraining;CacheProfiling;Qwen;Q8_0"
-#     MPI_PROCS 1  # Single rank for clean performance measurement (no MPI overhead)
-# )
+
+# NOTE: Not registered as CTest - outputs CSV for analysis
+# Run: ./build_v2_release/performance/v2_perf_integer_gemm_tile_sweep --gtest_filter="*QuickSweep" > sweep_results.csv
+
+# Complete configuration space sweep for autotuner training data
+# Tests all parameter combinations across all Qwen workloads
+# REGISTRY VERSION: Uses IntegerGemmKernelRegistry for fast compilation
+add_executable(v2_perf_integer_gemm_full_sweep performance/cpu/kernels/gemm/Perf__IntegerGEMM_FullSweep_Registry.cpp)
+target_link_libraries(v2_perf_integer_gemm_full_sweep
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_integer_gemm_full_sweep PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+# Register with CTest for proper OMP/MPI environment setup
+# Run modes (via CTest for correct environment):
+#   Full sweep:   ./run_integer_gemm_autotuner_data.sh  (uses CTest internally)
+#   Single token: ctest -R "V2_Perf_IntegerGEMM_FullSweep_SingleToken" --verbose
+#   For perf:     ctest -R "V2_Perf_IntegerGEMM_FullSweep_SingleConfig_M512" --verbose
+
+add_v2_perf_test(V2_Perf_IntegerGEMM_FullSweep_AllConfigs
+    COMMAND $<TARGET_FILE:v2_perf_integer_gemm_full_sweep> --gtest_filter=IntegerGEMM_FullSweep.AllConfigsAllWorkloads
+    LABELS "V2;Performance;GEMM;IntegerGEMM;Autotuner;DataCollection;FullSweep"
+    MPI_PROCS 1  # Single-rank pure CPU performance
+)
+
+add_v2_perf_test(V2_Perf_IntegerGEMM_FullSweep_SingleToken
+    COMMAND $<TARGET_FILE:v2_perf_integer_gemm_full_sweep> --gtest_filter=IntegerGEMM_FullSweep.AllConfigsSingleToken
+    LABELS "V2;Performance;GEMM;IntegerGEMM;Autotuner;QuickTest"
+    MPI_PROCS 1
+)
+
+# Individual configs for perf stat profiling (registered by autotuner script)
+# Example: V2_Perf_IntegerGEMM_FullSweep_SingleConfig_M512_N896_K896_MR8_KB4_UK2_P1_CB0
+
+# Unit Test: Integer GEMM V2 Basic Correctness
+# Tests new V2 Integer GEMM rewrite against scalar reference
+# Validates small, medium matrices before performance testing
+add_executable(v2_test_integer_gemm_v2_basic performance/cpu/kernels/gemm/Test__IntegerGEMM_V2_Basic.cpp)
+target_link_libraries(v2_test_integer_gemm_v2_basic
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_test_integer_gemm_v2_basic PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+)
+
+add_v2_test(V2_Unit_IntegerGEMM_V2_Basic
+    COMMAND v2_test_integer_gemm_v2_basic
+    LABELS "V2;Unit;Kernels;IntegerGEMM;Correctness"
+    MPI_PROCS 1
+)
 
 # Performance Test: CPU GEMM Heuristic Validation Suite
 # Comprehensive test suite for ML heuristic training data collection.
@@ -3480,3 +3796,13 @@ add_v2_perf_test(V2_Perf_IQ4NL_TileSweep
 #   LLAMINAR_FETCH_7B_IQ_MODELS=1     # Include large 7B IQ models
 #   LLAMINAR_ENFORCE_MODELS=1         # Fail if no models present after fetch
 
+
+# Debug test: 64-byte vs 128-byte comparison
+add_executable(v2_debug_integer_gemm_64vs128
+    performance/cpu/kernels/gemm/Debug__IntegerGEMM_64vs128.cpp
+)
+target_link_libraries(v2_debug_integer_gemm_64vs128
+    PRIVATE llaminar2_core
+    PRIVATE GTest::gtest
+    PRIVATE GTest::gtest_main
+)

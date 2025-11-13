@@ -6,7 +6,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "kernels/cpu/gemm/IntegerGemm.h"
+#include "kernels/cpu/gemm_v2/IntegerGemm.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/FP16Utils.h"
 #include "utils/CPUFeatures.h"

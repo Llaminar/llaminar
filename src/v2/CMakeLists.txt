@@ -534,9 +534,9 @@ add_library(llaminar2_core STATIC
     # kernels/cpu/GemmVariantGenerator.cpp  # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
     # kernels/cpu/GemmVariantGenerator_Generated.cpp # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
     kernels/cpu/gemm/bf16/BF16PackedGemm.cpp        # Phase 1: BF16×BF16→FP32 with auto-tuned micro-kernels
-    kernels/cpu/gemm/int8/INT8PackedGemm.cpp        # INT8×INT8→INT32 with AVX512 VNNI auto-tuned micro-kernels
+    # kernels/cpu/gemm/int8/INT8PackedGemm.cpp        # DEPRECATED: Replaced by IntegerGemmKernelTemplate (see int8/INT8PackedGemm.deprecated.cpp)
     kernels/cpu/gemm/fp16/FP16PackedGemm.cpp        # FP16×FP16→FP32 with AVX512F/AVX2+F16C auto-tuned micro-kernels
-    kernels/cpu/gemm/IntegerGemm.cpp                # Integer-domain quantized GEMM (llama.cpp strategy, AVX512-VNNI)
+    kernels/cpu/gemm_v2/IntegerGemm.cpp             # Integer-domain quantized GEMM (OneDNN-inspired optimization, gemm_v2/)
     kernels/cpu/INT8SwiGLUKernel.cpp
     kernels/cpu/FP32AttentionKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
@@ -559,8 +559,10 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gemm/GemmMicroKernelInit.cpp
     ${MICROKERNEL_INSTANTIATION_SOURCES}
     # Generated Integer GEMM kernel template instantiations (8000 total across 64 files)
-    # Fixed: Added IQ8_0Decodable interface constraint via std::is_base_of static_assert
+    # Uses registry pattern with __attribute__((constructor)) for auto-registration
     ${INTEGER_GEMM_INSTANTIATION_SOURCES}
+    # Integer GEMM registry init (forces linking of all instantiation shards)
+    kernels/cpu/gemm/int8/IntegerGemmKernelInit.cpp
 )
 
 target_include_directories(llaminar2_core PUBLIC 
