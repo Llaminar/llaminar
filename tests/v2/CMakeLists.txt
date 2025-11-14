@@ -2866,46 +2866,6 @@ set_tests_properties(V2_Perf_Q8_1_GEMM_NoMPI PROPERTIES
     ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO"
 )
 
-# Performance Test: Q8_1 GEMM JR_UNROLL Sweep
-# Tests JR_UNROLL values of 1, 2, 4, 6, 8 to find optimal column unrolling
-# Measures: GFLOPS across problem sizes M=512 to 16384
-add_executable(v2_perf_q8_1_gemm_jr_sweep performance/Perf__Q8_1Gemm_JR_Sweep.cpp)
-target_link_libraries(v2_perf_q8_1_gemm_jr_sweep 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_q8_1_gemm_jr_sweep PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_Q8_1_GEMM_JR_Sweep
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_jr_sweep>
-    LABELS "V2;Performance;GEMM;Q8_1;Quantization;ParameterSweep;JR_UNROLL"
-    MPI_PROCS 1
-)
-
-# Performance Test: Q8_1 GEMM Kernel Parameter Sweep (MR × NR tuning)
-# Sweeps microkernel parameters from 8 to 128 to find optimal configuration
-# Test cases: All combinations of MR/NR in {8,16,24,32,48,64,96,128} (64 configs)
-# Measures: GFLOPS for each config, identifies best parameters
-# Exports: CSV file with full results for analysis
-add_executable(v2_perf_q8_1_kernel_sweep performance/Perf__Q8_1KernelSweep.cpp)
-target_link_libraries(v2_perf_q8_1_kernel_sweep 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_q8_1_kernel_sweep PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_Q8_1_KernelSweep
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_kernel_sweep>
-    LABELS "V2;Performance;GEMM;Q8_1;Quantization;KernelTuning;ParameterSweep"
-    MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
-)
-
 # Performance Test: Q8_0 GEMM Microkernel Size Comparison
 # Benchmarks different microkernel sizes (8×8, 12×12, 16×16, 8×16)
 # Test cases: Large prefill workload (M=4096, N=896, K=896)
