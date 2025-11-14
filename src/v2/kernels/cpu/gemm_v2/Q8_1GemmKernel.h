@@ -36,6 +36,7 @@
 #include <vector>
 #include <stdexcept>
 #include <iostream>
+#include <iomanip>
 #include <chrono>
 #include <omp.h>
 
@@ -112,9 +113,17 @@ namespace llaminar2
      *     M=8192: JR=2: 452 GFLOPS, JR=4: 491 GFLOPS (+9%)
      *   Implementation: Template helper function with compile-time unrolling
      *     (eliminates code duplication - all unroll factors use same logic)
+     *
+     * @tparam JR_BATCH_PARAM Batch size for column reduction (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, or 20, default 18)
+     *   Range: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20] - Controls batched reduction parallelism
+     *   Trade-off: Larger = more vectorization in reduction, but higher register pressure
+     *   Performance impact:
+     *     JR_BATCH=8: Baseline (128 reductions instead of 1024)
+     *     JR_BATCH=16: +vectorization but +register pressure
+     *     JR_BATCH=4: -vectorization but better for small NR
      */
     template <int MR_PARAM = 32, int NR_PARAM = 128, int PREFETCH_A_PARAM = 4,
-              int NC_PARAM = 0, int KC_PARAM = 0, int JR_UNROLL_PARAM = 2>
+              int NC_PARAM = 0, int KC_PARAM = 0, int JR_UNROLL_PARAM = 2, int JR_BATCH_PARAM = 18>
     class Q8_1GemmKernelTemplate
     {
     public:
@@ -123,9 +132,27 @@ namespace llaminar2
         static constexpr int BLOCK_SIZE = 32;               // Q8_0Block::BLOCK_SIZE
         static constexpr int PREFETCH_A = PREFETCH_A_PARAM; // A prefetch distance
         static constexpr int VECTOR_WIDTH = 16;             // K-blocks per iteration (MUST be 16 for __m512)
-        static constexpr int NC = NC_PARAM;                 // N cache blocking (0=auto)
-        static constexpr int KC = KC_PARAM;                 // K cache blocking in blocks (0=auto)
-        static constexpr int JR_UNROLL = JR_UNROLL_PARAM;   // Column unrolling factor (2 or 4)
+        static constexpr int NC = NC_PARAM;                 // N cache blocking (see compute_nc_blocking)
+        static constexpr int KC = KC_PARAM;                 // K cache blocking (see compute_kc_blocking)
+        static constexpr int JR_UNROLL = JR_UNROLL_PARAM;   // Column unrolling factor (1, 2, 4, 6, or 8)
+        static constexpr int JR_BATCH = JR_BATCH_PARAM;     // Batched reduction size (1, 2, 4, 6, ..., 18, 20)
+
+        /**
+         * NC_PARAM semantics:
+         *   > 0: Explicit NC value (in columns)
+         *   < 0: -TARGET_B_SIZE_KB (e.g., -512 = 512KB target, -1024 = 1MB target)
+         *   = 0: Auto (default 512KB target)
+         *
+         * KC_PARAM semantics (POST-STREAMING, no accum_vec constraint):
+         *   > 0: Explicit KC value (in K-blocks)
+         *   < 0: -MAX_METADATA_KB (e.g., -256 = 256KB metadata limit)
+         *   = 0: Auto adaptive (128→256→512 based on K_blocks)
+         *
+         * Streaming metadata: ~640 bytes/K-block (was 16KB with accum_vec!)
+         *   - KC=128:  82KB (L1-fit)
+         *   - KC=256: 164KB (L2-fit)
+         *   - KC=512: 328KB (L2-friendly)
+         */
 
         /**
          * @brief Packed B panel structure (optimized for 64-byte ZMM loads)
@@ -540,6 +567,13 @@ namespace llaminar2
                               JR_UNROLL == 6 || JR_UNROLL == 8,
                           "JR_UNROLL must be 1, 2, 4, 6, or 8");
             static_assert(NR % JR_UNROLL == 0, "NR must be divisible by JR_UNROLL");
+            static_assert(JR_BATCH >= 1 && JR_BATCH <= 20, "JR_BATCH must be in range [1, 20]");
+            static_assert(JR_BATCH == 1 || JR_BATCH == 2 || JR_BATCH == 4 || JR_BATCH == 6 ||
+                              JR_BATCH == 8 || JR_BATCH == 10 || JR_BATCH == 12 || JR_BATCH == 14 ||
+                              JR_BATCH == 16 || JR_BATCH == 18 || JR_BATCH == 20,
+                          "JR_BATCH must be 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, or 20");
+            static_assert(JR_BATCH <= NR, "JR_BATCH must be less than or equal to NR");
+            // Note: NR no longer required to be divisible by JR_BATCH (tail handling added)
 
             // Validate dimensions
             if (K % BLOCK_SIZE != 0)
@@ -704,10 +738,15 @@ namespace llaminar2
          *
          * Target: Keep NC × KC block of B in L2/L3 cache
          * L2: ~1MB per core, L3: ~32MB shared
-         * For NC × KC: aim for ~512KB of B data per NC block
+         * For NC × KC: aim for ~512KB of B data per NC block (configurable via template)
          *
          * Each column × K_blocks = K_blocks × 34 bytes/block
-         * Target: NC × K_blocks × 34 ≈ 512KB → NC ≈ 512000 / (K_blocks × 34)
+         * Target: NC × K_blocks × 34 ≈ TARGET_B_SIZE → NC ≈ TARGET_B_SIZE / (K_blocks × 34)
+         *
+         * Template parameter NC_PARAM can override:
+         * - NC_PARAM > 0: Use explicit value (in columns, not bytes)
+         * - NC_PARAM < 0: Use as -TARGET_B_SIZE_KB (e.g., -512 = 512KB target)
+         * - NC_PARAM = 0: Use default 512KB target
          *
          * @param N Total N dimension
          * @param K_blocks Total K dimension in blocks
@@ -715,11 +754,22 @@ namespace llaminar2
          */
         static int compute_nc_blocking(int N, int K_blocks)
         {
-            // Target 512KB of B data per NC block
-            constexpr int TARGET_B_SIZE = 512 * 1024;
+            // Determine target B size based on NC_PARAM
+            int target_b_size;
+            if constexpr (NC_PARAM < 0)
+            {
+                // Negative NC_PARAM = -TARGET_B_SIZE_KB (e.g., -512 = 512KB)
+                target_b_size = (-NC_PARAM) * 1024;
+            }
+            else
+            {
+                // Default: 512KB target
+                target_b_size = 512 * 1024;
+            }
+
             constexpr int BYTES_PER_BLOCK = 34; // Q8_0Block size
 
-            int nc_target = TARGET_B_SIZE / (K_blocks * BYTES_PER_BLOCK);
+            int nc_target = target_b_size / (K_blocks * BYTES_PER_BLOCK);
 
             // Round down to multiple of NR
             nc_target = (nc_target / NR) * NR;
@@ -731,18 +781,66 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compute optimal KC blocking based on storage limits
+         * @brief Compute optimal KC blocking based on cache analysis
          *
-         * Microkernel uses thread-local storage with MAX_K_BLOCKS=128
-         * KC blocking allows processing K > 128 blocks in multiple passes
+         * CRITICAL CHANGE: Streaming implementation eliminated accum_vec buffer!
+         *
+         * OLD constraint (with accum_vec):
+         *   - accum_vec size = MR × NR × KC × 4 bytes = 16KB × KC
+         *   - At KC=128: 2MB per microkernel (too large!)
+         *   - MAX_K_BLOCKS=128 was the hard limit
+         *
+         * NEW constraint (streaming, metadata only):
+         *   - a_sums: MR × KC × 2 bytes = 64 × KC
+         *   - a_scales: MR × KC × 2 bytes = 64 × KC
+         *   - b_scales_f32: NR × KC × 4 bytes = 512 × KC
+         *   - Total: ~640 × KC bytes
+         *   - At KC=128: 82KB (fits in L1!)
+         *   - At KC=256: 164KB (L2-friendly)
+         *   - At KC=512: 328KB (still L2-friendly)
+         *
+         * Strategy:
+         *   - Small K (<128 blocks): No blocking (KC = K_blocks)
+         *   - Medium K (128-512 blocks): KC=256 (L2-optimal for metadata)
+         *   - Large K (>512 blocks): KC=512 (balance reuse vs passes)
+         *
+         * Template parameter KC_PARAM can override:
+         *   - KC_PARAM > 0: Use explicit value (in blocks)
+         *   - KC_PARAM < 0: Use as -MAX_METADATA_KB (e.g., -256 = 256KB metadata limit)
+         *   - KC_PARAM = 0: Use adaptive strategy above
          *
          * @param K_blocks Total K dimension in blocks
-         * @return KC blocking size (capped at MAX_K_BLOCKS)
+         * @return KC blocking size (optimized for cache)
          */
         static int compute_kc_blocking(int K_blocks)
         {
-            constexpr int MAX_K_BLOCKS = 128; // From microkernel storage
-            return std::min(MAX_K_BLOCKS, K_blocks);
+            if constexpr (KC_PARAM < 0)
+            {
+                // Negative KC_PARAM = -MAX_METADATA_KB
+                // Metadata: ~640 bytes per K-block
+                int max_metadata_kb = -KC_PARAM;
+                int kc_limit = (max_metadata_kb * 1024) / 640;
+                return std::min(kc_limit, K_blocks);
+            }
+
+            // Adaptive strategy (no hard limit, only cache optimization)
+            if (K_blocks <= 128)
+            {
+                // Small K: No blocking needed, process all at once
+                return K_blocks;
+            }
+            else if (K_blocks <= 512)
+            {
+                // Medium K: KC=256 (164KB metadata, fits in L2)
+                // Benefit: 2× larger than old limit, better A cache reuse
+                return std::min(256, K_blocks);
+            }
+            else
+            {
+                // Large K: KC=512 (328KB metadata, still L2-friendly)
+                // Benefit: 4× larger than old limit, even better A cache reuse
+                return std::min(512, K_blocks);
+            }
         }
 
     public:
@@ -898,7 +996,10 @@ namespace llaminar2
 
             // Allocate buffers dynamically based on actual K_blocks needed
             std::vector<int32_t> accum_vec(MR * NR * K_blocks, 0);
-            std::vector<int16_t> sum_qs_vec(K_blocks * MR, 0); // INT16: TRANSPOSED layout [K_blocks][MR], halves bandwidth
+            // CRITICAL FIX: Add padding for gather instruction overread
+            // The int32 gather reads 4 bytes (2 int16 values), so when ir=MR-1 it reads sum_qs(kb, MR-1) and sum_qs(kb, MR)
+            // We need space for K_blocks*MR elements PLUS MR extra elements for safe overread
+            std::vector<int16_t> sum_qs_vec(K_blocks * MR + MR, 0); // INT16: TRANSPOSED layout [K_blocks][MR], halves bandwidth
             std::vector<uint16_t> a_scales_vec(MR * K_blocks);
 
             int32_t *accum_storage = accum_vec.data();
@@ -915,7 +1016,13 @@ namespace llaminar2
             // OPTIMIZATION: Allocate fp32 B scale storage for fused conversion
             // Convert B scales from fp16→fp32 ONCE (eliminates post-processing conversions)
             // Note: NOT converting A scales - doing so in K-loop adds 60% overhead to Load A phase
-            std::vector<float> b_scales_f32_vec(NR * K_blocks);
+            // CRITICAL FIX: Add padding for AVX-512 vectorized load overread
+            // The _mm512_loadu_ps loads 16 floats, so when jr=NR-1 and kb>0,
+            // it reads b_scales_f32(jr, kb) through b_scales_f32(jr, kb+15),
+            // which crosses row boundaries: jr*K_blocks+kb+15 can exceed NR*K_blocks-1
+            // Example: NR=128, K_blocks=16, jr=127, kb=1 → index 127*16+1+15=2048 (out of bounds for size 2048)
+            // We need space for NR*K_blocks elements PLUS VECTOR_WIDTH-1 extra elements for safe overread
+            std::vector<float> b_scales_f32_vec(NR * K_blocks + VECTOR_WIDTH);
             float *b_scales_f32_storage = b_scales_f32_vec.data();
 
             // Helper lambdas for 3D indexing
@@ -1089,12 +1196,18 @@ namespace llaminar2
                     __m256i sum_qs_i32 = _mm256_cvtps_epi32(sum_qs_rounded);
 
                     // Convert INT32 to INT16 (pack with saturation)
-                    // AVX2: Pack two __m256i (8 int32 each) into one __m256i (16 int16)
-                    // We only have 8 values, so zero the upper half
+                    // AVX2: _mm256_packs_epi32 does lane-based packing, NOT sequential!
+                    // Layout: [a0 a1 a2 a3 | a4 a5 a6 a7] (int32) →
+                    //         [a0 a1 a2 a3 0 0 0 0 | a4 a5 a6 a7 0 0 0 0] (int16, interleaved)
+                    // We need: [a0 a1 a2 a3 a4 a5 a6 a7 | ...] (sequential int16)
                     __m256i zero = _mm256_setzero_si256();
-                    __m256i sum_qs_i16 = _mm256_packs_epi32(sum_qs_i32, zero); // [8 int16, 8 zeros]
+                    __m256i sum_qs_i16_lanes = _mm256_packs_epi32(sum_qs_i32, zero);
 
-                    // Extract lower 128 bits (8 int16 values) and store
+                    // Fix lane crossing: permute to get sequential layout
+                    // Permute control: 0b11011000 = 0xD8 = [0, 2, 1, 3] → brings lanes 0,2 together
+                    __m256i sum_qs_i16 = _mm256_permute4x64_epi64(sum_qs_i16_lanes, 0xD8);
+
+                    // Extract lower 128 bits (now contains all 8 int16 values sequentially)
                     __m128i sum_qs_i16_lo = _mm256_castsi256_si128(sum_qs_i16);
                     _mm_storeu_si128(reinterpret_cast<__m128i *>(&sum_qs(kb, ir)), sum_qs_i16_lo);
                 }
@@ -1303,16 +1416,18 @@ namespace llaminar2
             // Process ir rows sequentially (cache-friendly for accum access)
             for (int ir = 0; ir < MR; ++ir)
             {
-                // BATCHED REDUCTION: Process jr columns in chunks of 8
-                // Note: NR must be a multiple of JR_BATCH
-                constexpr int JR_BATCH = 8;
-                static_assert(NR % JR_BATCH == 0, "NR must be a multiple of JR_BATCH");
+                // BATCHED REDUCTION: Process jr columns in batches (parameterized via JR_BATCH template)
+                // Note: When NR % JR_BATCH != 0, last batch may be partial (handled by actual_batch_size)
 
                 for (int jr_base = 0; jr_base < NR; jr_base += JR_BATCH)
                 {
-                    // Accumulate results for 8 columns simultaneously
+                    // CRITICAL: Calculate actual batch size to avoid accessing jr >= NR
+                    // When jr_base + JR_BATCH > NR, we must limit iterations to prevent buffer overruns
+                    const int actual_batch_size = std::min(JR_BATCH, NR - jr_base);
+
+                    // Accumulate results for actual_batch_size columns simultaneously
                     __m512 result_vecs[JR_BATCH];
-                    for (int jj = 0; jj < JR_BATCH; ++jj)
+                    for (int jj = 0; jj < actual_batch_size; ++jj)
                     {
                         result_vecs[jj] = _mm512_setzero_ps();
                     }
@@ -1350,8 +1465,8 @@ namespace llaminar2
                         // Precompute compensation constant
                         const __m512 compensation_const = _mm512_set1_ps(128.0f);
 
-                        // Process all 8 columns in the batch
-                        for (int jj = 0; jj < JR_BATCH; ++jj)
+                        // Process all columns in the batch (respects actual_batch_size)
+                        for (int jj = 0; jj < actual_batch_size; ++jj)
                         {
                             int jr = jr_base + jj;
 
@@ -1375,9 +1490,9 @@ namespace llaminar2
                         }
                     }
 
-                    // Horizontal reductions for the batch (128 reductions instead of 1024!)
+                    // Horizontal reductions for the batch (reduced count vs non-batched)
                     float results[JR_BATCH];
-                    for (int jj = 0; jj < JR_BATCH; ++jj)
+                    for (int jj = 0; jj < actual_batch_size; ++jj)
                     {
                         results[jj] = _mm512_reduce_add_ps(result_vecs[jj]);
                     }
@@ -1405,8 +1520,8 @@ namespace llaminar2
                         // Precompute compensation constant
                         const __m256 compensation_const = _mm256_set1_ps(128.0f);
 
-                        // Process all 8 columns in the batch
-                        for (int jj = 0; jj < JR_BATCH; ++jj)
+                        // Process all columns in the batch (respects actual_batch_size)
+                        for (int jj = 0; jj < actual_batch_size; ++jj)
                         {
                             int jr = jr_base + jj;
 
@@ -1459,7 +1574,7 @@ namespace llaminar2
                         __m128i a_scales_fp16 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(&a_scales(ir, kb)));
                         __m128 a_scales_vec = _mm_cvtph_ps(a_scales_fp16);
 
-                        for (int jj = 0; jj < JR_BATCH; ++jj)
+                        for (int jj = 0; jj < actual_batch_size; ++jj)
                         {
                             int jr = jr_base + jj;
 
@@ -1497,7 +1612,7 @@ namespace llaminar2
                         int32_t sum_qs_val = static_cast<int32_t>(sum_qs_val_i16);
                         float a_scale = fp16_to_fp32(a_scales(ir, kb));
 
-                        for (int jj = 0; jj < JR_BATCH; ++jj)
+                        for (int jj = 0; jj < actual_batch_size; ++jj)
                         {
                             int jr = jr_base + jj;
                             float b_scale = b_scales_f32(jr, kb); // Already fp32!
@@ -1511,13 +1626,17 @@ namespace llaminar2
                         }
                     }
 
-                    // Write results to C
-                    for (int jj = 0; jj < JR_BATCH; ++jj)
+                    // Write results to C (only for columns actually processed)
+                    for (int jj = 0; jj < actual_batch_size; ++jj)
                     {
                         int jr = jr_base + jj;
                         C[ir * ldc + jr] = results[jj];
                     }
                 }
+
+                // NOTE: Tail handling for NR % JR_BATCH != 0 is now handled automatically
+                // by actual_batch_size calculation in the main loop above.
+                // No separate tail loop needed!
             }
 
             auto t_postprocess_end = std::chrono::high_resolution_clock::now();
@@ -1670,7 +1789,11 @@ namespace llaminar2
             // This saves 2MB of memory traffic (MR * NR * K_blocks * 4 bytes)
             std::vector<uint16_t> a_sums_vec(MR * K_blocks); // Store sA directly as FP16
             std::vector<uint16_t> a_scales_vec(MR * K_blocks);
-            std::vector<float> b_scales_f32_vec(NR * K_blocks);
+            // CRITICAL FIX: Add padding for AVX-512 vectorized load overread (same as microkernel_full_sumqs)
+            // The _mm512_storeu_ps writes 16 floats, and _mm512_loadu_ps reads 16 floats
+            // When jr=NR-1 and kb>0, accessing b_scales_f32(jr, kb) for 16 elements crosses row boundaries
+            // We need space for NR*K_blocks elements PLUS VECTOR_WIDTH extra elements for safe overread
+            std::vector<float> b_scales_f32_vec(NR * K_blocks + VECTOR_WIDTH);
 
             uint16_t *a_sums_storage = a_sums_vec.data();
             uint16_t *a_scales_storage = a_scales_vec.data();
@@ -1826,21 +1949,6 @@ namespace llaminar2
             const PackedBPanel &B_packed,
             float *C, int ldc)
         {
-            // Print compensation mode once at first call (for verification)
-            static bool mode_logged = false;
-            if (!mode_logged)
-            {
-                if (debugEnv().gemm.use_sa_compensation)
-                {
-                    std::cerr << "[Q8_1 GEMM] Using sA-based compensation (optimized, no quantization)" << std::endl;
-                }
-                else
-                {
-                    std::cerr << "[Q8_1 GEMM] Using sum_qs compensation (baseline, with quantization)" << std::endl;
-                }
-                mode_logged = true;
-            }
-
             if (debugEnv().gemm.use_sa_compensation)
             {
                 microkernel_full_sa(K_blocks, i_base, kc_start, A_decodable, B_packed, C, ldc);
@@ -2069,18 +2177,37 @@ namespace llaminar2
     // VECTOR_WIDTH is hardcoded to 16 (matches __m512 register capacity)
 
     // Default configuration: 2-column unrolling (balanced performance across all M)
-    using Q8_1GemmKernel = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 2>; // Default: JR_UNROLL=2 (optimal: 496 GFLOPS @ M=8192)
+    using Q8_1GemmKernel = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 2, 18>; // Default: JR_UNROLL=2, JR_BATCH=18 (testing)
 
     // Alternative unrolling configurations (for autotuner to explore)
-    using Q8_1GemmKernel_1col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 1>; // JR_UNROLL=1: Minimal ILP (baseline)
-    using Q8_1GemmKernel_4col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 4>; // JR_UNROLL=4: +5.5% @ M=4096, -20% @ M=512
-    using Q8_1GemmKernel_6col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 6>; // JR_UNROLL=6: High ILP (untested)
-    using Q8_1GemmKernel_8col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 8>; // JR_UNROLL=8: Maximum ILP (may hurt due to register spilling)
+    using Q8_1GemmKernel_1col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 1, 18>; // JR_UNROLL=1: Minimal ILP (baseline)
+    using Q8_1GemmKernel_4col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 4, 18>; // JR_UNROLL=4: +5.5% @ M=4096, -20% @ M=512
+    using Q8_1GemmKernel_6col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 6, 18>; // JR_UNROLL=6: High ILP (untested)
+    using Q8_1GemmKernel_8col = Q8_1GemmKernelTemplate<32, 128, 4, 0, 0, 8, 18>; // JR_UNROLL=8: Maximum ILP (may hurt due to register spilling)
+
+    // KC/NC blocking variants (for cache tuning)
+    // Format: Q8_1GemmKernel_KC{value}_NC{value}
+    //   KC > 0: Explicit K-blocks
+    //   KC < 0: -MAX_METADATA_KB (e.g., KC=-256 = 256KB metadata limit)
+    //   NC > 0: Explicit columns
+    //   NC < 0: -TARGET_B_SIZE_KB (e.g., NC=-512 = 512KB B target)
+
+    // Conservative: 128KB metadata (KC=200 blocks), 256KB B data
+    using Q8_1GemmKernel_KC200_NC256KB = Q8_1GemmKernelTemplate<32, 128, 4, -256, 200, 2, 18>;
+
+    // Balanced: 256KB metadata (KC=400 blocks), 512KB B data (default)
+    using Q8_1GemmKernel_KC400_NC512KB = Q8_1GemmKernelTemplate<32, 128, 4, -512, 400, 2, 18>;
+
+    // Aggressive: 512KB metadata (KC=800 blocks), 1MB B data
+    using Q8_1GemmKernel_KC800_NC1MB = Q8_1GemmKernelTemplate<32, 128, 4, -1024, 800, 2, 18>;
+
+    // Maximum: No KC limit (full K at once), 2MB B data
+    using Q8_1GemmKernel_KCFull_NC2MB = Q8_1GemmKernelTemplate<32, 128, 4, -2048, 0, 2, 18>;
 
     // Legacy microkernel size variants
-    using Q8_1GemmKernel_32x64 = Q8_1GemmKernelTemplate<32, 64, 4, 0, 0, 2>; // Previous default (439.2 GFLOPS)
-    using Q8_1GemmKernel_8x8 = Q8_1GemmKernelTemplate<8, 8, 2, 0, 0, 2>;     // Small baseline
-    using Q8_1GemmKernel_16x16 = Q8_1GemmKernelTemplate<16, 16, 2, 0, 0, 2>; // Medium microkernel
-    using Q8_1GemmKernel_32x32 = Q8_1GemmKernelTemplate<32, 32, 2, 0, 0, 2>; // Square microkernel
+    using Q8_1GemmKernel_32x64 = Q8_1GemmKernelTemplate<32, 64, 4, 0, 0, 2, 18>; // Previous default (439.2 GFLOPS)
+    using Q8_1GemmKernel_8x8 = Q8_1GemmKernelTemplate<8, 8, 2, 0, 0, 2, 8>;      // Small baseline (JR_BATCH=8 < NR=8)
+    using Q8_1GemmKernel_16x16 = Q8_1GemmKernelTemplate<16, 16, 2, 0, 0, 2, 16>; // Medium microkernel
+    using Q8_1GemmKernel_32x32 = Q8_1GemmKernelTemplate<32, 32, 2, 0, 0, 2, 18>; // Square microkernel
 
 } // namespace llaminar2

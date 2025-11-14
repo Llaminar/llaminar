@@ -454,8 +454,39 @@ else()
     message(STATUS "V2: Integer GEMM kernel instantiations are up-to-date")
 endif()
 
-# Include generated integer GEMM kernel instantiations
-include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/int8/generated/sources.cmake)
+# NOTE: Old Integer GEMM (v1) disabled - references deleted gemm_v2 files
+# include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/int8/generated/sources.cmake)
+
+# Define Q8_1 GEMM script path for kernel generation
+set(GENERATE_Q8_1_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/python/generate_q8_1_gemm_instantiations.py")
+set(GENERATED_Q8_1_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/generated/sources.cmake")
+
+# Check if Q8_1 GEMM generation is needed (script newer than output, or output doesn't exist)
+if(NOT EXISTS ${GENERATED_Q8_1_SOURCES_CMAKE} OR 
+   ${GENERATE_Q8_1_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_Q8_1_SOURCES_CMAKE})
+    message(STATUS "V2: Generating Q8_1 GEMM kernel instantiations...")
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} ${GENERATE_Q8_1_GEMM_SCRIPT}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/python
+        RESULT_VARIABLE GENERATE_Q8_1_RESULT
+        OUTPUT_VARIABLE GENERATE_Q8_1_OUTPUT
+        ERROR_VARIABLE GENERATE_Q8_1_ERROR
+    )
+    
+    if(NOT GENERATE_Q8_1_RESULT EQUAL 0)
+        message(FATAL_ERROR "V2: Failed to generate Q8_1 GEMM kernels:\n${GENERATE_Q8_1_ERROR}")
+    endif()
+    
+    message(STATUS "V2: Generated 64 Q8_1 GEMM files with 2340 variants")
+else()
+    message(STATUS "V2: Q8_1 GEMM kernel instantiations are up-to-date")
+endif()
+
+# Include generated Q8_1 GEMM kernel instantiations
+include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/generated/sources.cmake)
+message(STATUS "V2: Q8_1 GEMM instantiations: ${Q8_1_GEMM_INSTANTIATION_SOURCES}")
+list(LENGTH Q8_1_GEMM_INSTANTIATION_SOURCES Q8_1_COUNT)
+message(STATUS "V2: Q8_1 GEMM instantiation count: ${Q8_1_COUNT}")
 
 # =============================================================================
 # llama.cpp Integration (for dequant parity testing)
@@ -537,7 +568,8 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gemm/bf16/BF16PackedGemm.cpp        # Phase 1: BF16×BF16→FP32 with auto-tuned micro-kernels
     # kernels/cpu/gemm/int8/INT8PackedGemm.cpp        # DEPRECATED: Replaced by IntegerGemmKernelTemplate (see int8/INT8PackedGemm.deprecated.cpp)
     kernels/cpu/gemm/fp16/FP16PackedGemm.cpp        # FP16×FP16→FP32 with AVX512F/AVX2+F16C auto-tuned micro-kernels
-    kernels/cpu/gemm_v2/IntegerGemm.cpp             # Integer-domain quantized GEMM (OneDNN-inspired optimization, gemm_v2/)
+    # Q8_1 GEMM registry init (forces linking of all instantiation shards)
+    kernels/cpu/gemm_v2/Q8_1GemmKernelInit.cpp
     kernels/cpu/INT8SwiGLUKernel.cpp
     kernels/cpu/FP32AttentionKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
@@ -559,11 +591,12 @@ add_library(llaminar2_core STATIC
     # Generated GEMM microkernel template instantiations (1225 total across 64 files)
     kernels/cpu/gemm/GemmMicroKernelInit.cpp
     ${MICROKERNEL_INSTANTIATION_SOURCES}
-    # Generated Integer GEMM kernel template instantiations (8000 total across 64 files)
+    # NOTE: Old Integer GEMM (v1) disabled - references deleted gemm_v2 files
+    # ${INTEGER_GEMM_INSTANTIATION_SOURCES}
+    # kernels/cpu/gemm/int8/IntegerGemmKernelInit.cpp
+    # Generated Q8_1 GEMM kernel template instantiations (2340 total across 64 files)
     # Uses registry pattern with __attribute__((constructor)) for auto-registration
-    ${INTEGER_GEMM_INSTANTIATION_SOURCES}
-    # Integer GEMM registry init (forces linking of all instantiation shards)
-    kernels/cpu/gemm/int8/IntegerGemmKernelInit.cpp
+    ${Q8_1_GEMM_INSTANTIATION_SOURCES}
 )
 
 target_include_directories(llaminar2_core PUBLIC 

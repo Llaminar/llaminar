@@ -496,6 +496,19 @@ add_v2_test(V2_Unit_Q8_1GemmKernel
     MPI_PROCS 1  # CPU-only GEMM correctness testing, single rank
 )
 
+# Test: Q8_1GemmKernel_JRBatch (JR_BATCH parameterization correctness)
+add_executable(v2_test_q8_1_gemm_jr_batch unit/Test__Q8_1GemmKernel_JRBatch.cpp)
+target_link_libraries(v2_test_q8_1_gemm_jr_batch
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1GemmKernel_JRBatch
+    COMMAND $<TARGET_FILE:v2_test_q8_1_gemm_jr_batch>
+    LABELS "V2;Unit;Kernels;GEMM;Q8_1;Parameterization;JR_BATCH;Correctness;RegisterPressure;Vectorization"
+    MPI_PROCS 1  # CPU-only JR_BATCH validation, single rank
+)
+
 # Test: Q6_K_DecodeVectorization (SIMD correctness for Q6_K→Q8_0 decode)
 add_executable(v2_test_q6_k_decode_vectorization unit/Test__Q6_K_DecodeVectorization.cpp)
 target_link_libraries(v2_test_q6_k_decode_vectorization
@@ -2841,6 +2854,35 @@ add_v2_perf_test(V2_Perf_Q8_1_GEMM
     COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm>
     LABELS "V2;Performance;GEMM;Q8_1;Quantization;Throughput;dpbusd"
     MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
+)
+
+# Alternative non-MPI test for Q8_1 GEMM (for ComprehensiveParameterSweep)
+add_test(NAME V2_Perf_Q8_1_GEMM_NoMPI
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm> --gtest_filter=Q8_1GemmPerformance.ComprehensiveParameterSweep
+    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
+)
+set_tests_properties(V2_Perf_Q8_1_GEMM_NoMPI PROPERTIES
+    LABELS "V2;Performance;GEMM;Q8_1;ParameterSweep;NoMPI"
+    ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO"
+)
+
+# Performance Test: Q8_1 GEMM JR_UNROLL Sweep
+# Tests JR_UNROLL values of 1, 2, 4, 6, 8 to find optimal column unrolling
+# Measures: GFLOPS across problem sizes M=512 to 16384
+add_executable(v2_perf_q8_1_gemm_jr_sweep performance/Perf__Q8_1Gemm_JR_Sweep.cpp)
+target_link_libraries(v2_perf_q8_1_gemm_jr_sweep 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_q8_1_gemm_jr_sweep PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Q8_1_GEMM_JR_Sweep
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_jr_sweep>
+    LABELS "V2;Performance;GEMM;Q8_1;Quantization;ParameterSweep;JR_UNROLL"
+    MPI_PROCS 1
 )
 
 # Performance Test: Q8_1 GEMM Kernel Parameter Sweep (MR × NR tuning)

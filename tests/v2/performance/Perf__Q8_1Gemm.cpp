@@ -11,6 +11,7 @@
 #include <cmath>
 
 #include "kernels/cpu/gemm_v2/Q8_1GemmKernel.h"
+#include "kernels/cpu/gemm_v2/Q8_1GemmKernelRegistry.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
@@ -375,4 +376,240 @@ TEST_F(Q8_1GemmPerformance, ThroughputScalingWithM)
     std::cout << "  • Medium M (2048-4096): Good GFLOPS (amortized overhead)" << std::endl;
     std::cout << "  • Large M (8192-16384): Peak GFLOPS (compute-bound)" << std::endl;
     std::cout << "  • Speedup should plateau as M increases (approaching peak)" << std::endl;
+}
+
+/**
+ * @brief Comprehensive parameter sweep across MR/NR, JR_BATCH, JR_UNROLL, PREFETCH_A
+ *
+ * This test explores the full parameter space to find optimal configurations:
+ * - MR/NR: Powers of 2 from 8 to 128 (including asymmetric combinations)
+ * - JR_BATCH: 2, 4, 6, 8, 10, 12, 14, 16, 18
+ * - JR_UNROLL: 1, 2, 4, 8
+ * - PREFETCH_A: 1, 2, 4
+ * - M: 1, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
+ *
+ * Results are written to CSV for analysis. Progress is shown during execution.
+ */
+TEST_F(Q8_1GemmPerformance, ComprehensiveParameterSweep)
+{
+    // Load Q8_0 weight tensor
+    auto wq_template = loader_->loadTensor("blk.0.attn_q.weight", 0, WeightPrecision::NATIVE);
+    ASSERT_NE(wq_template, nullptr);
+    ASSERT_EQ(wq_template->native_type(), TensorType::Q8_0);
+
+    auto q8_0_template = std::dynamic_pointer_cast<Q8_0Tensor>(wq_template);
+    ASSERT_NE(q8_0_template, nullptr);
+
+    // Fixed dimensions (Qwen 2.5 0.5B)
+    const int N = 896;
+    const int K = 896;
+    const size_t K_blocks = K / 32;
+
+    // Test parameters
+    std::vector<int> MR_values = {8, 16, 32, 64, 128};
+    std::vector<int> NR_values = {8, 16, 32, 64, 128};
+    std::vector<int> JR_BATCH_values = {2, 4, 6, 8, 10, 12, 14, 16, 18};
+    std::vector<int> JR_UNROLL_values = {1, 2, 4, 8};
+    std::vector<int> PREFETCH_A_values = {1, 2, 4};
+    std::vector<int> M_values = {1, 128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+
+    // Open CSV file for results
+    std::ofstream csv_file("q8_1_parameter_sweep_results.csv");
+    csv_file << "MR,NR,JR_BATCH,JR_UNROLL,PREFETCH_A,M,N,K,Time_ms,GFLOPS,Status\n";
+
+    // Progress tracking
+    int total_configs = 0;
+    for (auto MR : MR_values)
+    {
+        for (auto NR : NR_values)
+        {
+            for (auto JR_BATCH : JR_BATCH_values)
+            {
+                for (auto JR_UNROLL : JR_UNROLL_values)
+                {
+                    for (auto PREFETCH_A : PREFETCH_A_values)
+                    {
+                        // Skip invalid combinations
+                        if (JR_BATCH > NR)
+                            continue; // JR_BATCH <= NR constraint
+                        if (NR % JR_UNROLL != 0)
+                            continue; // NR divisible by JR_UNROLL
+                        if (MR % 8 != 0 || NR % 8 != 0)
+                            continue; // Vectorization alignment
+                        total_configs++;
+                    }
+                }
+            }
+        }
+    }
+
+    int config_count = 0;
+    std::cout << "\n=== Q8_1 GEMM Comprehensive Parameter Sweep ===" << std::endl;
+    std::cout << "Total configurations to test: " << total_configs << std::endl;
+    std::cout << "M values: " << M_values.size() << " (1 to 16384)" << std::endl;
+    std::cout << "Results will be written to: q8_1_parameter_sweep_results.csv" << std::endl;
+    std::cout << "\nProgress:" << std::endl;
+
+    // Get template data for tiling
+    const void *q8_0_template_data = q8_0_template->get_raw_block_at(0, 0);
+    const size_t template_rows = q8_0_template->shape()[0];
+    const size_t blocks_per_row = K_blocks;
+
+    // Helper lambda to test a specific configuration
+    auto test_configuration = [&](int MR, int NR, int JR_BATCH, int JR_UNROLL, int PREFETCH_A, int M)
+    {
+        // Create Q8_0 A tensor by tiling template
+        const size_t num_tiles = (M + template_rows - 1) / template_rows;
+        std::vector<uint8_t> A_q8_0_data(M * blocks_per_row * sizeof(Q8_0Block));
+
+        for (size_t tile = 0; tile < num_tiles; ++tile)
+        {
+            const size_t dst_row_start = tile * template_rows;
+            const size_t rows_to_copy = std::min(template_rows, static_cast<size_t>(M - dst_row_start));
+            const size_t bytes_to_copy = rows_to_copy * blocks_per_row * sizeof(Q8_0Block);
+
+            std::memcpy(A_q8_0_data.data() + dst_row_start * blocks_per_row * sizeof(Q8_0Block),
+                        q8_0_template_data, bytes_to_copy);
+        }
+
+        auto q8_0_A = std::make_unique<Q8_0Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)}, A_q8_0_data);
+
+        // Convert Q8_0 → FP32 → Q8_1
+        std::vector<float> A_fp32(M * K);
+        for (int i = 0; i < M; ++i)
+        {
+            for (size_t kb = 0; kb < K_blocks; ++kb)
+            {
+                const Q8_0Block *block = reinterpret_cast<const Q8_0Block *>(
+                    q8_0_A->get_raw_block_at(i, kb));
+                float scale = fp16_to_fp32(block->d);
+                for (size_t k_in = 0; k_in < 32; ++k_in)
+                {
+                    A_fp32[i * K + kb * 32 + k_in] = static_cast<float>(block->qs[k_in]) * scale;
+                }
+            }
+        }
+
+        auto q8_1_A = Q8_1Tensor::quantize_from_fp32(A_fp32.data(),
+                                                     {static_cast<size_t>(M), static_cast<size_t>(K)});
+        EXPECT_NE(q8_1_A, nullptr);
+
+        // Allocate output
+        std::vector<float> C(M * N, 0.0f);
+
+        // Lookup kernel from registry
+        auto kernel_func = Q8_1GemmKernelRegistry::instance().get_kernel(
+            MR, NR, JR_BATCH, JR_UNROLL, PREFETCH_A);
+
+        if (!kernel_func)
+        {
+            // Configuration not registered (shouldn't happen with complete registry)
+            return -1.0;
+        }
+
+        // Warmup (fewer for small M, more for large M)
+        const int warmup = (M >= 4096) ? 2 : (M >= 1024) ? 3
+                                                         : 5;
+        for (int i = 0; i < warmup; ++i)
+        {
+            std::fill(C.begin(), C.end(), 0.0f);
+            kernel_func(M, N, K, *q8_1_A, *q8_0_template, C.data(), N);
+        }
+
+        // Benchmark iterations
+        const int iterations = (M >= 4096) ? 5 : (M >= 1024) ? 10
+                                                             : 20;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iterations; ++i)
+        {
+            std::fill(C.begin(), C.end(), 0.0f);
+            kernel_func(M, N, K, *q8_1_A, *q8_0_template, C.data(), N);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / iterations;
+    };
+
+    // Main sweep loop
+    for (auto MR : MR_values)
+    {
+        for (auto NR : NR_values)
+        {
+            for (auto JR_BATCH : JR_BATCH_values)
+            {
+                for (auto JR_UNROLL : JR_UNROLL_values)
+                {
+                    for (auto PREFETCH_A : PREFETCH_A_values)
+                    {
+                        // Skip invalid combinations
+                        if (JR_BATCH > NR)
+                            continue;
+                        if (NR % JR_UNROLL != 0)
+                            continue;
+                        if (MR % 8 != 0 || NR % 8 != 0)
+                            continue;
+
+                        config_count++;
+
+                        // Test across all M values
+                        for (auto M : M_values)
+                        {
+                            double avg_ms = test_configuration(MR, NR, JR_BATCH, JR_UNROLL, PREFETCH_A, M);
+
+                            if (avg_ms < 0)
+                            {
+                                // Configuration not implemented in macro expansion, skip
+                                continue;
+                            }
+
+                            // Calculate GFLOPS
+                            double flops = 2.0 * M * N * K;
+                            double gflops = (flops / 1e9) / (avg_ms / 1000.0);
+
+                            // Status classification
+                            std::string status;
+                            if (gflops >= 450)
+                                status = "Excellent";
+                            else if (gflops >= 400)
+                                status = "Good";
+                            else if (gflops >= 350)
+                                status = "Acceptable";
+                            else
+                                status = "Needs_work";
+
+                            // Write to CSV
+                            csv_file << MR << "," << NR << "," << JR_BATCH << ","
+                                     << JR_UNROLL << "," << PREFETCH_A << ","
+                                     << M << "," << N << "," << K << ","
+                                     << std::fixed << std::setprecision(3) << avg_ms << ","
+                                     << std::fixed << std::setprecision(1) << gflops << ","
+                                     << status << "\n";
+                        }
+
+                        // Progress update every 10 configurations
+                        if (config_count % 10 == 0 || config_count == total_configs)
+                        {
+                            std::cout << "  Tested " << config_count << "/" << total_configs
+                                      << " configurations ("
+                                      << std::fixed << std::setprecision(1)
+                                      << (100.0 * config_count / total_configs) << "%)"
+                                      << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    csv_file.close();
+
+    std::cout << "\n=== Parameter Sweep Complete ===" << std::endl;
+    std::cout << "Results written to: q8_1_parameter_sweep_results.csv" << std::endl;
+    std::cout << "Total configurations tested: " << config_count << std::endl;
+    std::cout << "\nTo analyze results:" << std::endl;
+    std::cout << "  1. Open q8_1_parameter_sweep_results.csv in a spreadsheet" << std::endl;
+    std::cout << "  2. Sort by GFLOPS (descending) to find best configurations" << std::endl;
+    std::cout << "  3. Filter by M value to see performance scaling" << std::endl;
+    std::cout << "  4. Pivot table on (MR, NR, JR_BATCH) to identify optimal parameters" << std::endl;
 }
