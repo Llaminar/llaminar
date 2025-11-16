@@ -240,7 +240,7 @@ namespace llaminar2
                               true, true, true>(
             A.data(), Bp, C_test.data(), bias.data(),
             act_scales.data(), wgt_scales.data(),
-            nullptr,  // No zero-point correction for signed A
+            nullptr, // No zero-point correction for signed A
             M, N, K);
 
         // Compare
@@ -319,7 +319,7 @@ namespace llaminar2
                               true, true, true>(
             A.data(), Bp, C_test.data(), bias.data(),
             act_scales.data(), wgt_scales.data(),
-            nullptr,  // No zero-point correction for signed A
+            nullptr, // No zero-point correction for signed A
             M, N, K);
 
         // Expected: C[m,n] = (m+1) * (n+1) * K

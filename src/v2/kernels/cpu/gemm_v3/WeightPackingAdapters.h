@@ -22,7 +22,6 @@
 
 #include "VNNIGemm.h"
 #include "tensors/Tensors.h"
-#include "utils/FP16.h"
 #include <cstdint>
 #include <vector>
 
