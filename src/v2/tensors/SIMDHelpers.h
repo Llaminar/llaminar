@@ -974,18 +974,18 @@ namespace llaminar2
             float inv_scale = 1.0f / scale;
 
             // Quantize to int8 AND compute sum simultaneously
-            float sum = 0.0f;
+            int32_t sum_i32 = 0;  // Nov 2024: Store raw integer sum, not scaled FP sum!
             for (int i = 0; i < 32; ++i)
             {
                 float val = src[i];
                 float scaled = val * inv_scale;
                 dst_qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
-                sum += static_cast<float>(dst_qs[i]); // Sum quantized int8 values (CRITICAL!)
+                sum_i32 += static_cast<int32_t>(dst_qs[i]); // Sum quantized int8 values (CRITICAL!)
             }
 
-            // Store FP16 scale and pre-computed sum
+            // Store FP16 scale and pre-computed INT16 sum
             *dst_scale_fp16 = fp32_to_fp16(scale);
-            *dst_sum_fp16 = fp32_to_fp16(scale * sum); // s = d × Σ(qs[i])
+            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32)); // Nov 2024: raw sum, not d × sum!
         }
 
         /**
@@ -1053,15 +1053,13 @@ namespace llaminar2
             _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs), vi8_first16);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_qs + 16), vi8_second16);
 
-            // Compute sum of QUANTIZED int8 values (CRITICAL!)
-            // Convert quantized int32 back to float and sum
-            __m512 vq0 = _mm512_cvtepi32_ps(vi32_0);
-            __m512 vq1 = _mm512_cvtepi32_ps(vi32_1);
-            float sum = _mm512_reduce_add_ps(_mm512_add_ps(vq0, vq1));
+            // Compute sum of QUANTIZED int8 values as INT32 (CRITICAL!)
+            // Horizontal reduction of int32 vectors
+            int32_t sum_i32 = _mm512_reduce_add_epi32(vi32_0) + _mm512_reduce_add_epi32(vi32_1);
 
-            // Store scale and pre-computed sum
+            // Store scale and pre-computed INT16 sum
             *dst_scale_fp16 = fp32_to_fp16(scale);
-            *dst_sum_fp16 = fp32_to_fp16(scale * sum); // s = d × Σ(qs[i])
+            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32)); // Nov 2024: raw sum, not d × sum!
 #else
             quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
 #endif
@@ -1110,7 +1108,7 @@ namespace llaminar2
             const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
 
             // Quantize AND compute sum (4 iterations for 32 elements)
-            float sum = 0.0f;
+            int32_t sum_i32 = 0;  // Nov 2024: Store raw integer sum, not scaled FP sum!
             for (int i = 0; i < 4; ++i)
             {
                 __m256 vf = _mm256_loadu_ps(src + i * 8);
@@ -1131,13 +1129,13 @@ namespace llaminar2
                 for (int j = 0; j < 8; ++j)
                 {
                     dst_qs[i * 8 + j] = static_cast<int8_t>(temp[j]);
-                    sum += static_cast<float>(dst_qs[i * 8 + j]); // Sum quantized int8 (CRITICAL!)
+                    sum_i32 += static_cast<int32_t>(dst_qs[i * 8 + j]); // Sum quantized int8 (CRITICAL!)
                 }
             }
 
-            // Store scale and pre-computed sum
+            // Store scale and pre-computed INT16 sum
             *dst_scale_fp16 = fp32_to_fp16(scale);
-            *dst_sum_fp16 = fp32_to_fp16(scale * sum); // s = d × Σ(qs[i])
+            *dst_sum_fp16 = static_cast<uint16_t>(static_cast<int16_t>(sum_i32)); // Nov 2024: raw sum, not d × sum!
 #else
             quantize_fp32_to_q8_1_scalar(src, count, dst_qs, dst_scale_fp16, dst_sum_fp16);
 #endif

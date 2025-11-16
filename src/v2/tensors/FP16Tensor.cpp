@@ -685,10 +685,10 @@ namespace llaminar2
 
         // Use vectorized decode + quantize with pre-computed sum (auto-dispatches to AVX512/AVX2/scalar)
         simd::decode_fp16_to_q8_1(
-            fp16_ptr,       // Input: FP16 values
-            q8_1_block.qs,  // Output: Q8_1 int8 values
-            &q8_1_block.d,  // Output: Q8_1 FP16 scale
-            &q8_1_block.s); // Output: Q8_1 FP16 pre-computed sum
+            fp16_ptr,                                          // Input: FP16 values
+            q8_1_block.qs,                                     // Output: Q8_1 int8 values
+            &q8_1_block.d,                                     // Output: Q8_1 FP16 scale
+            reinterpret_cast<uint16_t *>(&q8_1_block.sum_qs)); // Output: Q8_1 INT16 pre-computed sum (Nov 2024: changed from FP16 's')
 
         return &q8_1_block;
     }

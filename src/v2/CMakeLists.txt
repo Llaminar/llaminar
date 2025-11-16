@@ -489,6 +489,37 @@ list(LENGTH Q8_1_GEMM_INSTANTIATION_SOURCES Q8_1_COUNT)
 message(STATUS "V2: Q8_1 GEMM instantiation count: ${Q8_1_COUNT}")
 
 # =============================================================================
+# VNNI GEMM (gemm_v3) Kernel Instantiations - Registry Pattern
+# =============================================================================
+# Run Python generator if source files missing
+set(VNNI_GEMM_PYTHON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v3/python)
+set(VNNI_GEMM_GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v3/generated)
+set(VNNI_GEMM_SOURCES_CMAKE ${VNNI_GEMM_GENERATED_DIR}/sources.cmake)
+set(VNNI_GEMM_GENERATOR ${VNNI_GEMM_PYTHON_DIR}/generate_vnni_gemm_instantiations.py)
+
+if(NOT EXISTS ${VNNI_GEMM_SOURCES_CMAKE})
+    message(STATUS "V2: Generating VNNI GEMM kernel instantiations...")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${VNNI_GEMM_GENERATED_DIR}
+        COMMAND python3 ${VNNI_GEMM_GENERATOR}
+        WORKING_DIRECTORY ${VNNI_GEMM_PYTHON_DIR}
+        RESULT_VARIABLE VNNI_GEMM_GEN_RESULT
+    )
+    if(NOT VNNI_GEMM_GEN_RESULT EQUAL 0)
+        message(FATAL_ERROR "V2: Failed to generate VNNI GEMM kernel instantiations")
+    endif()
+    message(STATUS "V2: Generated VNNI GEMM files with 576 variants")
+else()
+    message(STATUS "V2: VNNI GEMM kernel instantiations are up-to-date")
+endif()
+
+# Include generated VNNI GEMM kernel instantiations
+include(${VNNI_GEMM_SOURCES_CMAKE})
+message(STATUS "V2: VNNI GEMM instantiations: ${VNNI_GEMM_INSTANTIATION_SOURCES}")
+list(LENGTH VNNI_GEMM_INSTANTIATION_SOURCES VNNI_GEMM_COUNT)
+message(STATUS "V2: VNNI GEMM instantiation count: ${VNNI_GEMM_COUNT}")
+
+# =============================================================================
 # llama.cpp Integration (for dequant parity testing)
 # =============================================================================
 message(STATUS "V2: Configuring llama.cpp submodule for dequant reference...")
@@ -570,6 +601,10 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gemm/fp16/FP16PackedGemm.cpp        # FP16×FP16→FP32 with AVX512F/AVX2+F16C auto-tuned micro-kernels
     # Q8_1 GEMM registry init (forces linking of all instantiation shards)
     kernels/cpu/gemm_v2/Q8_1GemmKernelInit.cpp
+    # VNNI GEMM (gemm_v3) - Pre-packed panel layout for maximum VNNI throughput
+    kernels/cpu/gemm_v3/VNNIGemm.cpp
+    # VNNI GEMM registry init (forces linking of all instantiation shards)
+    kernels/cpu/gemm_v3/VNNIGemmKernelInit.cpp
     kernels/cpu/INT8SwiGLUKernel.cpp
     kernels/cpu/FP32AttentionKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
@@ -597,6 +632,9 @@ add_library(llaminar2_core STATIC
     # Generated Q8_1 GEMM kernel template instantiations (2340 total across 64 files)
     # Uses registry pattern with __attribute__((constructor)) for auto-registration
     ${Q8_1_GEMM_INSTANTIATION_SOURCES}
+    # Generated VNNI GEMM kernel template instantiations (576 total across 16 files)
+    # Uses registry pattern with __attribute__((constructor)) for auto-registration
+    ${VNNI_GEMM_INSTANTIATION_SOURCES}
 )
 
 target_include_directories(llaminar2_core PUBLIC 

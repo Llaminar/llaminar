@@ -522,7 +522,8 @@ namespace llaminar2
             block.d = fp32_to_fp16(d);
 
             // Quantize AND compute sum simultaneously (CUDA pattern!)
-            float sum = 0.0f;
+            // CRITICAL (Nov 2024): Store RAW integer sum, not d × sum!
+            int32_t sum_i32 = 0;
             if (d > 1e-10f)
             {
                 const float inv_d = 1.0f / d;
@@ -532,7 +533,7 @@ namespace llaminar2
                     const float scaled = val * inv_d;
                     const float clamped = std::max(-127.0f, std::min(127.0f, scaled));
                     block.qs[i] = static_cast<int8_t>(std::round(clamped));
-                    sum += static_cast<float>(block.qs[i]); // Sum QUANTIZED values (CRITICAL!)
+                    sum_i32 += static_cast<int32_t>(block.qs[i]); // Sum QUANTIZED values (CRITICAL!)
                 }
             }
             else
@@ -550,8 +551,9 @@ namespace llaminar2
                 block.qs[i] = 0;
             }
 
-            // Store pre-computed sum: s = d × sum(values)
-            block.s = fp32_to_fp16(d * sum);
+            // Store pre-computed integer sum directly (INT16)
+            // Range check: 32 int8 values sum to [-4064, 4064], safe for INT16 [-32768, 32767]
+            block.sum_qs = static_cast<int16_t>(sum_i32);
         }
 
         // Create and return Q8_1Tensor

@@ -56,13 +56,20 @@ namespace llaminar2
      * - Pre-computed sum eliminates expensive horizontal reductions in K-loop
      *
      * Formula: output = d * sum(qs[i])
-     * The 's' field stores d × sum(qs[i]) for fast compensation.
+     *
+     * GEMM OPTIMIZATION (Nov 2024):
+     * The 'sum_qs' field now stores the raw integer sum of qs[i] values (INT16),
+     * NOT d × sum(qs[i]). This eliminates FP16→FP32 conversion and division from
+     * the GEMM K-loop, allowing pure VNNI compute followed by scaling in post-processing.
+     *
+     * Compensation formula in GEMM:
+     *   C[i,j] = Σ_kb ((accum[kb] - 128*sum_qs[kb]) * d_a[kb] * d_b[kb])
      */
     struct Q8_1Block
     {
-        uint16_t d;    ///< FP16 scale factor
-        uint16_t s;    ///< FP16 pre-computed sum: d × sum(qs[i])
-        int8_t qs[32]; ///< 32 quantized int8 values
+        uint16_t d;     ///< FP16 scale factor
+        int16_t sum_qs; ///< INT16 pre-computed sum: Σ(qs[i]) - raw integer sum!
+        int8_t qs[32];  ///< 32 quantized int8 values
         static constexpr size_t BLOCK_SIZE = 32;
     };
     static_assert(sizeof(Q8_1Block) == 36, "Q8_1Block must be 36 bytes");
