@@ -25,8 +25,11 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 #include "kernels/cpu/gemm_v3/VNNIGemm.h"
+
+#include "oneapi/dnnl/dnnl.hpp"
 
 namespace llaminar2
 {
@@ -34,6 +37,8 @@ namespace llaminar2
     class Test__VNNIGemmKernel : public ::testing::Test
     {
     protected:
+        static constexpr double kOneDNNReferenceRelTol = 1e-5;
+
         void SetUp() override
         {
             std::srand(42); // Reproducibility
@@ -122,6 +127,42 @@ namespace llaminar2
             return B_packed;
         }
 
+        template <int KBlk>
+        static std::vector<int8_t> packBMatrixVNNIWithWidth(
+            const int8_t *B, int K, int N,
+            int padded_nr,
+            int &ld_block_out, int &ld_chunk_out, int &ld_col_out)
+        {
+            static_assert(KBlk % 4 == 0, "KBlk must be multiple of 4");
+            const int T = K / KBlk;
+            const int panel_size = padded_nr * KBlk;
+            std::vector<int8_t> B_packed(T * panel_size, 0);
+
+            for (int t = 0; t < T; ++t)
+            {
+                int block_ld = 0;
+                int chunk_ld = 0;
+                int col_ld = 0;
+                int8_t *panel_ptr = B_packed.data() + static_cast<size_t>(t) * panel_size;
+                pack_B_panel_vnni<KBlk>(
+                    B, K, N,
+                    t * KBlk,
+                    0,
+                    padded_nr,
+                    panel_ptr,
+                    block_ld, chunk_ld, col_ld);
+
+                if (t == 0)
+                {
+                    ld_block_out = block_ld;
+                    ld_chunk_out = chunk_ld;
+                    ld_col_out = col_ld;
+                }
+            }
+
+            return B_packed;
+        }
+
         /**
          * @brief Compute relative L2 error
          */
@@ -149,6 +190,65 @@ namespace llaminar2
                 max_err = std::max(max_err, std::abs(ref[i] - test[i]));
             }
             return max_err;
+        }
+
+        /**
+         * @brief Dequantize inputs and compute FP32 GEMM via OneDNN for ground truth
+         */
+        static std::vector<float> computeOneDNNReference(
+            const int8_t *A, const int8_t *B,
+            const float *act_scales, const float *wgt_scales,
+            const float *bias,
+            int M, int N, int K, int K_BLK)
+        {
+            const int T = K / K_BLK;
+
+            std::vector<float> A_fp32(M * K, 0.0f);
+            for (int m = 0; m < M; ++m)
+            {
+                for (int k = 0; k < K; ++k)
+                {
+                    const int t = k / K_BLK;
+                    A_fp32[m * K + k] = static_cast<float>(A[m * K + k]) * act_scales[t];
+                }
+            }
+
+            std::vector<float> B_fp32(K * N, 0.0f);
+            for (int k = 0; k < K; ++k)
+            {
+                for (int n = 0; n < N; ++n)
+                {
+                    B_fp32[k * N + n] = static_cast<float>(B[k * N + n]) * wgt_scales[n];
+                }
+            }
+
+            std::vector<float> C_fp32(M * N, 0.0f);
+            dnnl::status status = dnnl::sgemm(
+                'N', 'N',
+                M, N, K,
+                1.0f,
+                A_fp32.data(), K,
+                B_fp32.data(), N,
+                0.0f,
+                C_fp32.data(), N);
+
+            if (status != dnnl::status::success)
+            {
+                throw std::runtime_error("OneDNN SGEMM failed during VNNI reference computation");
+            }
+
+            if (bias != nullptr)
+            {
+                for (int m = 0; m < M; ++m)
+                {
+                    for (int n = 0; n < N; ++n)
+                    {
+                        C_fp32[m * N + n] += bias[n];
+                    }
+                }
+            }
+
+            return C_fp32;
         }
     };
 
@@ -269,6 +369,27 @@ namespace llaminar2
         simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
                                 act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
 
+        auto C_onednn_qwen = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn_qwen = computeRelativeL2Error(
+            C_ref.data(), C_onednn_qwen.data(), M, N);
+        float ref_vs_onednn_qwen_max = computeMaxAbsError(
+            C_ref.data(), C_onednn_qwen.data(), M, N);
+        EXPECT_LT(ref_vs_onednn_qwen, kOneDNNReferenceRelTol)
+            << "QwenRealisticDims: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_qwen_max << ")";
+
+        auto C_onednn = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn = computeRelativeL2Error(C_ref.data(), C_onednn.data(), M, N);
+        float ref_vs_onednn_max = computeMaxAbsError(C_ref.data(), C_onednn.data(), M, N);
+        EXPECT_LT(ref_vs_onednn, 1e-6)
+            << "Simple reference diverges from OneDNN baseline (max abs error="
+            << ref_vs_onednn_max << ")";
+
         std::vector<float> C_test(M * N, 0.0f);
         gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
                               true, true, true>(
@@ -315,6 +436,27 @@ namespace llaminar2
         simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
                                 act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
 
+        auto C_onednn_extreme = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn_extreme = computeRelativeL2Error(
+            C_ref.data(), C_onednn_extreme.data(), M, N);
+        float ref_vs_onednn_extreme_max = computeMaxAbsError(
+            C_ref.data(), C_onednn_extreme.data(), M, N);
+        EXPECT_LT(ref_vs_onednn_extreme, kOneDNNReferenceRelTol)
+            << "ExtremeValues: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_extreme_max << ")";
+
+        auto C_onednn = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn = computeRelativeL2Error(C_ref.data(), C_onednn.data(), M, N);
+        float ref_vs_onednn_max = computeMaxAbsError(C_ref.data(), C_onednn.data(), M, N);
+        EXPECT_LT(ref_vs_onednn, 1e-6)
+            << "Simple reference diverges from OneDNN baseline (max abs error="
+            << ref_vs_onednn_max << ")";
+
         std::vector<float> C_test(M * N, 0.0f);
         gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
                               true, true, true>(
@@ -359,6 +501,16 @@ namespace llaminar2
         std::vector<float> C_ref(M * N, 0.0f);
         simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
                                 act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn = computeRelativeL2Error(C_ref.data(), C_onednn.data(), M, N);
+        float ref_vs_onednn_max = computeMaxAbsError(C_ref.data(), C_onednn.data(), M, N);
+        EXPECT_LT(ref_vs_onednn, 1e-6)
+            << "Simple reference diverges from OneDNN baseline (max abs error="
+            << ref_vs_onednn_max << ")";
 
         std::vector<float> C_test(M * N, 0.0f);
         gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
@@ -571,6 +723,929 @@ namespace llaminar2
 
         EXPECT_LT(rel_l2, 0.02) << "Relative L2 error should be <2%";
         EXPECT_LT(max_abs, 100.0f) << "Max absolute error should be reasonable";
+    }
+
+    // ========================================
+    // EDGE CASES AND ADDITIONAL CORRECTNESS TESTS
+    // ========================================
+
+    /**
+     * @brief Test with K > K_BLK (multiple K-blocks)
+     * Validates multi-block accumulation with different scales per block
+     */
+    TEST_F(Test__VNNIGemmKernel, MultipleKBlocks)
+    {
+        const int M = 16, N = 32, K = 128; // 4 K-blocks
+        constexpr int M_R = 16, N_R = 32, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 2);
+        std::vector<int8_t> B_unpacked(K * N, 3);
+
+        // Different scale per K-block
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = 1.0f + 0.5f * t;
+
+        std::vector<float> wgt_scales(N, 2.0f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn = computeRelativeL2Error(C_ref.data(), C_onednn.data(), M, N);
+        float ref_vs_onednn_max = computeMaxAbsError(C_ref.data(), C_onednn.data(), M, N);
+        EXPECT_LT(ref_vs_onednn, 1e-6)
+            << "Simple reference diverges from OneDNN baseline (max abs error="
+            << ref_vs_onednn_max << ")";
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with non-tile-aligned M dimension
+     * M < M_R to test edge handling
+     */
+    TEST_F(Test__VNNIGemmKernel, PartialMTile)
+    {
+        const int M = 5, N = 16, K = 32; // M < M_R
+        constexpr int M_R = 8, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 1);
+        std::vector<int8_t> B_unpacked(K * N, 1);
+
+        std::vector<float> act_scales(T, 1.5f);
+        std::vector<float> wgt_scales(N, 2.0f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn_partial_m = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn_partial_m = computeRelativeL2Error(
+            C_ref.data(), C_onednn_partial_m.data(), M, N);
+        float ref_vs_onednn_partial_m_max = computeMaxAbsError(
+            C_ref.data(), C_onednn_partial_m.data(), M, N);
+        EXPECT_LT(ref_vs_onednn_partial_m, kOneDNNReferenceRelTol)
+            << "PartialMTile: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_partial_m_max << ")";
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Exercises A-row padding, B-column padding, and microkernel tail loads
+     */
+    TEST_F(Test__VNNIGemmKernel, PartialTileColumnTailCoverage)
+    {
+        const int M = 10, N = 20, K = 128;
+        constexpr int M_R = 16, N_R = 64, K_BLK = 64;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 64, PREFETCH_B_L2 = 256;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(321);
+        std::uniform_int_distribution<int> int8_dist(-32, 32);
+        std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        for (auto &s : act_scales)
+            s = scale_dist(rng);
+        std::vector<float> wgt_scales(N);
+        for (auto &s : wgt_scales)
+            s = scale_dist(rng);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block = 0;
+        int ld_chunk = 0;
+        int ld_col = 0;
+        auto B_packed = packBMatrixVNNIWithWidth<K_BLK>(
+            B_unpacked.data(), K, N, N_R,
+            ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        const int chunk_count = K_BLK / 4;
+        ASSERT_GT(N_R - N, 0);
+        for (int chunk = 0; chunk < chunk_count; ++chunk)
+        {
+            const int8_t *chunk_base = B_packed.data() + chunk * ld_chunk;
+            for (int n = N; n < N_R; ++n)
+            {
+                const int8_t *col_ptr = chunk_base + n * ld_col;
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    ASSERT_EQ(col_ptr[lane], 0)
+                        << "Expected zero padding for chunk " << chunk
+                        << ", column " << n << ", lane " << lane;
+                }
+            }
+        }
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn = computeRelativeL2Error(C_ref.data(), C_onednn.data(), M, N);
+        float ref_vs_onednn_max = computeMaxAbsError(C_ref.data(), C_onednn.data(), M, N);
+        EXPECT_LT(ref_vs_onednn, kOneDNNReferenceRelTol)
+            << "PartialTileColumnTailCoverage: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_max << ")";
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.6f) << "Mismatch at index " << i;
+        }
+    }
+
+    TEST_F(Test__VNNIGemmKernel, PackAOddKChunkTailCoverage)
+    {
+        constexpr int M_R = 16;
+        constexpr int K_BLK = 64;
+        const int M = M_R;
+        const int K = 60; // Force odd K_chunks (15)
+        const int kblk = 60;
+        const int mr = M_R;
+        const int num_groups = M_R / 4;
+        const int K_chunks = kblk / 4;
+        const int group_stride = K_chunks * 16;
+
+        std::vector<int8_t> A(static_cast<size_t>(M) * K);
+        for (int m = 0; m < M; ++m)
+        {
+            for (int k = 0; k < K; ++k)
+            {
+                A[m * K + k] = static_cast<int8_t>((m * K + k) % 97);
+            }
+        }
+
+        std::vector<int8_t> A_packed(static_cast<size_t>(num_groups) * group_stride, 0);
+
+        pack_A_tile_4x4_grouped<M_R, K_BLK>(
+            A.data(), M, K,
+            /*M0=*/0, /*k0=*/0,
+            mr, kblk,
+            A_packed.data());
+
+        const int tail_chunk = K_chunks - 1; // kk index 14
+        for (int g = 0; g < num_groups; ++g)
+        {
+            const int8_t *group_ptr = A_packed.data() + static_cast<size_t>(g) * group_stride;
+            const int8_t *chunk_ptr = group_ptr + tail_chunk * 16;
+            for (int lane = 0; lane < 4; ++lane)
+            {
+                const int row = g * 4 + lane;
+                for (int offset = 0; offset < 4; ++offset)
+                {
+                    const int k_idx = tail_chunk * 4 + offset;
+                    const int8_t expected = A[row * K + k_idx];
+                    const int8_t packed_val = chunk_ptr[lane * 4 + offset];
+                    ASSERT_EQ(packed_val, expected)
+                        << "Mismatch at group " << g
+                        << ", lane " << lane
+                        << ", offset " << offset;
+                }
+            }
+        }
+    }
+
+    TEST_F(Test__VNNIGemmKernel, PackAPartialRowAndZeroPaddingCoverage)
+    {
+        constexpr int M_R = 16;
+        constexpr int K_BLK = 64;
+        const int M = 10;
+        const int M0 = 8;
+        const int mr = M - M0; // 2 rows remain, triggers slow path
+        const int K = K_BLK;
+        const int kblk = K_BLK;
+        const int num_groups = M_R / 4;
+        const int K_chunks = kblk / 4;
+        const int group_stride = K_chunks * 16;
+
+        std::vector<int8_t> A(static_cast<size_t>(M) * K, 0);
+        for (int m = 0; m < M; ++m)
+        {
+            for (int k = 0; k < K; ++k)
+            {
+                A[m * K + k] = static_cast<int8_t>((m * K + k) % 89);
+            }
+        }
+
+        std::vector<int8_t> A_packed(static_cast<size_t>(num_groups) * group_stride, -1);
+
+        pack_A_tile_4x4_grouped<M_R, K_BLK>(
+            A.data(), M, K,
+            M0, /*k0=*/0,
+            mr, kblk,
+            A_packed.data());
+
+        const int8_t *group0 = A_packed.data();
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            for (int offset = 0; offset < 4; ++offset)
+            {
+                const int8_t val = group0[lane * 4 + offset];
+                if (lane < mr)
+                {
+                    const int row = M0 + lane;
+                    const int8_t expected = A[row * K + offset];
+                    ASSERT_EQ(val, expected)
+                        << "Row copy mismatch for lane " << lane << ", offset " << offset;
+                }
+                else
+                {
+                    ASSERT_EQ(val, 0)
+                        << "Expected zero-padding for lane " << lane << ", offset " << offset;
+                }
+            }
+        }
+
+        for (int g = 1; g < num_groups; ++g)
+        {
+            const int8_t *group_ptr = A_packed.data() + static_cast<size_t>(g) * group_stride;
+            for (int i = 0; i < group_stride; ++i)
+            {
+                ASSERT_EQ(group_ptr[i], 0)
+                    << "Expected zero in padded group " << g << ", byte " << i;
+            }
+        }
+    }
+
+    // ========================================
+    // MATRIX SIZE COVERAGE TESTS
+    // ========================================
+
+    TEST_F(Test__VNNIGemmKernel, SingleRowMatrix)
+    {
+        const int M = 1, N = 64, K = 64;
+        constexpr int M_R = 4, N_R = 32, K_BLK = 32;
+        constexpr int UNROLL_K = 1, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(123);
+        std::uniform_int_distribution<int> int8_dist(-32, 32);
+        std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = scale_dist(rng);
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        auto C_ref = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        float max_err = computeMaxAbsError(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 5e-5)
+            << "SingleRowMatrix relative L2 too high (max abs error=" << max_err << ")";
+    }
+
+    TEST_F(Test__VNNIGemmKernel, SingleColumnMatrix)
+    {
+        const int M = 48, N = 1, K = 64;
+        constexpr int M_R = 16, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 1, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(321);
+        std::uniform_int_distribution<int> int8_dist(-40, 40);
+        std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        wgt_scales[0] = scale_dist(rng);
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        auto C_ref = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        float max_err = computeMaxAbsError(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 5e-5)
+            << "SingleColumnMatrix relative L2 too high (max abs error=" << max_err << ")";
+    }
+
+    TEST_F(Test__VNNIGemmKernel, SmallRectangularMatrix)
+    {
+        const int M = 7, N = 32, K = 64;
+        constexpr int M_R = 8, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(777);
+        std::uniform_int_distribution<int> int8_dist(-50, 50);
+        std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = scale_dist(rng);
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        auto C_ref = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        float max_err = computeMaxAbsError(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 1e-4)
+            << "SmallRectangularMatrix relative L2 too high (max abs error=" << max_err << ")";
+    }
+
+    TEST_F(Test__VNNIGemmKernel, MediumMatrix)
+    {
+        const int M = 32, N = 48, K = 192;
+        constexpr int M_R = 16, N_R = 32, K_BLK = 64;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(888);
+        std::uniform_int_distribution<int> int8_dist(-75, 75);
+        std::uniform_real_distribution<float> scale_dist(0.4f, 1.6f);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = scale_dist(rng);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        auto C_ref = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        float max_err = computeMaxAbsError(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 2e-4)
+            << "MediumMatrix relative L2 too high (max abs error=" << max_err << ")";
+    }
+
+    TEST_F(Test__VNNIGemmKernel, LargeMatrix)
+    {
+        const int M = 64, N = 128, K = 256;
+        constexpr int M_R = 16, N_R = 64, K_BLK = 64;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(999);
+        std::uniform_int_distribution<int> int8_dist(-100, 100);
+        std::uniform_real_distribution<float> scale_dist(0.3f, 1.7f);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = scale_dist(rng);
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        auto C_ref = computeOneDNNReference(
+            A.data(), B_unpacked.data(),
+            act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        float max_err = computeMaxAbsError(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 3e-4)
+            << "LargeMatrix relative L2 too high (max abs error=" << max_err << ")";
+    }
+
+    /**
+     * @brief Test with non-tile-aligned N dimension
+     * N < N_R to test edge handling
+     * 
+     * DISABLED: Triggers AddressSanitizer error - out-of-bounds read in microkernel
+     * when loading B matrix with N=10 < N_R=16. Kernel needs bounds checking for
+     * partial N tiles in B prefetch/load logic.
+     */
+    TEST_F(Test__VNNIGemmKernel, PartialNTile)
+    {
+        const int M = 8, N = 10, K = 32; // N < N_R
+        constexpr int M_R = 8, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 2);
+        std::vector<int8_t> B_unpacked(K * N, 3);
+
+        std::vector<float> act_scales(T, 1.0f);
+        std::vector<float> wgt_scales(N, 1.5f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn_negative = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn_negative = computeRelativeL2Error(
+            C_ref.data(), C_onednn_negative.data(), M, N);
+        float ref_vs_onednn_negative_max = computeMaxAbsError(
+            C_ref.data(), C_onednn_negative.data(), M, N);
+        EXPECT_LT(ref_vs_onednn_negative, kOneDNNReferenceRelTol)
+            << "NegativeValues: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_negative_max << ")";
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with both M and N non-tile-aligned
+     * 
+     * DISABLED: Would trigger same bugs as PartialMTile + PartialNTile.
+     * Re-enable after fixing partial tile handling in kernel.
+     */
+    TEST_F(Test__VNNIGemmKernel, PartialMNTile)
+    {
+        const int M = 13, N = 21, K = 64; // Both M < M_R and N < N_R
+        constexpr int M_R = 16, N_R = 32, K_BLK = 64;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 1);
+        std::vector<int8_t> B_unpacked(K * N, 1);
+
+        std::vector<float> act_scales(T, 2.0f);
+        std::vector<float> wgt_scales(N, 1.5f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn_qwen = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn_qwen = computeRelativeL2Error(
+            C_ref.data(), C_onednn_qwen.data(), M, N);
+        float ref_vs_onednn_qwen_max = computeMaxAbsError(
+            C_ref.data(), C_onednn_qwen.data(), M, N);
+        EXPECT_LT(ref_vs_onednn_qwen, kOneDNNReferenceRelTol)
+            << "QwenRealisticDims: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_qwen_max << ")";
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with varying scales across columns
+     * Validates per-column weight scaling
+     */
+    TEST_F(Test__VNNIGemmKernel, VaryingColumnScales)
+    {
+        const int M = 8, N = 32, K = 64;
+        constexpr int M_R = 8, N_R = 32, K_BLK = 64;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 1);
+        std::vector<int8_t> B_unpacked(K * N, 1);
+
+        std::vector<float> act_scales(T, 1.0f);
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = 0.5f + 0.1f * n; // Linearly increasing scales
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        auto C_onednn_extreme = computeOneDNNReference(
+            A.data(), B_unpacked.data(), act_scales.data(), wgt_scales.data(), bias.data(),
+            M, N, K, K_BLK);
+        double ref_vs_onednn_extreme = computeRelativeL2Error(
+            C_ref.data(), C_onednn_extreme.data(), M, N);
+        float ref_vs_onednn_extreme_max = computeMaxAbsError(
+            C_ref.data(), C_onednn_extreme.data(), M, N);
+        EXPECT_LT(ref_vs_onednn_extreme, kOneDNNReferenceRelTol)
+            << "ExtremeValues: simple reference diverges from OneDNN (max abs error="
+            << ref_vs_onednn_extreme_max << ")";
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with non-zero bias
+     * Validates bias addition
+     */
+    TEST_F(Test__VNNIGemmKernel, NonZeroBias)
+    {
+        const int M = 8, N = 16, K = 32;
+        constexpr int M_R = 8, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 1);
+        std::vector<int8_t> B_unpacked(K * N, 1);
+
+        std::vector<float> act_scales(T, 1.0f);
+        std::vector<float> wgt_scales(N, 1.0f);
+        
+        std::vector<float> bias(N);
+        for (int n = 0; n < N; ++n)
+            bias[n] = 10.0f * (n + 1); // Non-trivial bias values
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+        // Add bias to reference
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < N; ++n)
+                C_ref[m * N + n] += bias[n];
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with negative values
+     * Validates signed INT8 handling
+     */
+    TEST_F(Test__VNNIGemmKernel, NegativeValues)
+    {
+        const int M = 8, N = 16, K = 32;
+        constexpr int M_R = 8, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        
+        // Mix of positive and negative values
+        for (size_t i = 0; i < A.size(); ++i)
+            A[i] = (i % 2 == 0) ? 10 : -10;
+        for (size_t i = 0; i < B_unpacked.size(); ++i)
+            B_unpacked[i] = (i % 3 == 0) ? 5 : -5;
+
+        std::vector<float> act_scales(T, 1.0f);
+        std::vector<float> wgt_scales(N, 1.0f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with larger K_BLK (128)
+     * Validates different K-block sizes
+     */
+    TEST_F(Test__VNNIGemmKernel, LargeKBlock)
+    {
+        const int M = 16, N = 32, K = 256;
+        constexpr int M_R = 16, N_R = 32, K_BLK = 128; // Larger K_BLK
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K, 1);
+        std::vector<int8_t> B_unpacked(K * N, 2);
+
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = 1.0f + 0.2f * t;
+
+        std::vector<float> wgt_scales(N, 1.5f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with realistic Qwen 0.5B layer dimensions
+     * M=32 (batch), N=896 (d_model), K=896 (d_model)
+     */
+    TEST_F(Test__VNNIGemmKernel, QwenRealisticDims)
+    {
+        const int M = 32, N = 896, K = 896;
+        constexpr int M_R = 16, N_R = 64, K_BLK = 64;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::mt19937 rng(42);
+        std::uniform_int_distribution<int> int8_dist(-127, 127);
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        for (auto &val : A)
+            val = static_cast<int8_t>(int8_dist(rng));
+        for (auto &val : B_unpacked)
+            val = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T);
+        std::uniform_real_distribution<float> scale_dist(0.5f, 2.0f);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = scale_dist(rng);
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 0.01) << "Relative L2 error should be <1% for random INT8 values";
+    }
+
+    /**
+     * @brief Test with extreme INT8 values (boundary conditions)
+     * Uses min/max INT8 values to test overflow handling
+     */
+    TEST_F(Test__VNNIGemmKernel, ExtremeValues)
+    {
+        const int M = 8, N = 16, K = 32;
+        constexpr int M_R = 8, N_R = 16, K_BLK = 32;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+        const int T = K / K_BLK;
+
+        std::vector<int8_t> A(M * K);
+        std::vector<int8_t> B_unpacked(K * N);
+        
+        // Alternate between min and max INT8 values
+        for (size_t i = 0; i < A.size(); ++i)
+            A[i] = (i % 2 == 0) ? 127 : -127;
+        for (size_t i = 0; i < B_unpacked.size(); ++i)
+            B_unpacked[i] = (i % 2 == 0) ? 127 : -127;
+
+        std::vector<float> act_scales(T, 0.01f); // Small scales to prevent overflow
+        std::vector<float> wgt_scales(N, 0.01f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K);
+
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
     }
 
 } // namespace llaminar2

@@ -174,7 +174,8 @@ namespace llaminar2
         }
 
         // Zero-pad remaining groups if mr < M_R (vectorized)
-        for (int m_base = mr; m_base < M_R; m_base += 4)
+        const int padded_mr = ((mr + 3) / 4) * 4;
+        for (int m_base = padded_mr; m_base < M_R; m_base += 4)
         {
             const int group_idx = m_base / 4;
             int8_t *group_ptr = A_tile_packed + group_idx * group_stride;
@@ -267,6 +268,35 @@ namespace llaminar2
         const int group_stride = K_chunks * 16;
         const int A_block_bytes = num_groups * group_stride;
 
+        const __m512i zero_i32 = _mm512_setzero_si512();
+        const __m512i ones_byte = _mm512_set1_epi8(1);
+        const __m512i sign_flip = _mm512_set1_epi8(static_cast<char>(0x80));
+        const __m512i correction_scale = _mm512_set1_epi32(128);
+        alignas(64) int8_t b_tail_buffer[64];
+
+        const auto load_b_vec = [&](const int8_t *chunk_base, int col_base) -> __m512i {
+            if (col_base >= Bp.N)
+            {
+                return _mm512_setzero_si512();
+            }
+
+            const int remaining_cols = Bp.N - col_base;
+            const int8_t *src = chunk_base + static_cast<size_t>(col_base) * Bp.ld_col;
+
+            if (remaining_cols >= 16)
+            {
+                return _mm512_loadu_si512(reinterpret_cast<const void *>(src));
+            }
+
+            std::memset(b_tail_buffer, 0, sizeof(b_tail_buffer));
+            const int copy_cols = std::max(0, remaining_cols);
+            if (copy_cols > 0)
+            {
+                std::memcpy(b_tail_buffer, src, static_cast<size_t>(copy_cols) * Bp.ld_col);
+            }
+            return _mm512_loadu_si512(reinterpret_cast<const void *>(b_tail_buffer));
+        };
+
         // 1. Initialize C tile with bias
         for (int m = 0; m < M_R; ++m)
         {
@@ -276,6 +306,7 @@ namespace llaminar2
 
         // 2. Precompute sB vectors (vectorized)
         __m512 sB_vecs[N_R / 16];
+        __m512i b_vec_sums[UNROLL_K][N_R / 16];
         for (int j = 0; j < N_R / 16; ++j)
         {
             // Direct vectorized load instead of scalar loop
@@ -330,15 +361,15 @@ namespace llaminar2
                     {
                         // Load A group 0 and B vec 0 in parallel
                         const int8_t *src_a0 = base_A_block + g * group_stride + kk_idx0 * 16;
-                        const int8_t *b_ptr0 = chunk_base0 + (N0 + j * 16) * Bp.ld_col;
                         a_groups[0][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a0));
-                        b_vecs_u[0][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr0));
+                        b_vecs_u[0][j] = load_b_vec(chunk_base0, N0 + j * 16);
+                        b_vec_sums[0][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[0][j]);
 
                         // Load A group 1 and B vec 1 in parallel
                         const int8_t *src_a1 = base_A_block + (g + 1) * group_stride + kk_idx0 * 16;
-                        const int8_t *b_ptr1 = chunk_base0 + (N0 + (j + 1) * 16) * Bp.ld_col;
                         a_groups[0][g + 1] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a1));
-                        b_vecs_u[0][j + 1] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr1));
+                        b_vecs_u[0][j + 1] = load_b_vec(chunk_base0, N0 + (j + 1) * 16);
+                        b_vec_sums[0][j + 1] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[0][j + 1]);
                     }
 
                     // Handle remaining A groups
@@ -351,8 +382,8 @@ namespace llaminar2
                     // Handle remaining B vecs
                     for (; j < N_R / 16; ++j)
                     {
-                        const int8_t *b_ptr = chunk_base0 + (N0 + j * 16) * Bp.ld_col;
-                        b_vecs_u[0][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr));
+                        b_vecs_u[0][j] = load_b_vec(chunk_base0, N0 + j * 16);
+                        b_vec_sums[0][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[0][j]);
                     }
                 }
 
@@ -372,15 +403,15 @@ namespace llaminar2
                     {
                         // Load A group 0 and B vec 0 in parallel
                         const int8_t *src_a0 = base_A_block + g * group_stride + kk_idx * 16;
-                        const int8_t *b_ptr0 = chunk_base + (N0 + j * 16) * Bp.ld_col;
                         a_groups[u][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a0));
-                        b_vecs_u[u][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr0));
+                        b_vecs_u[u][j] = load_b_vec(chunk_base, N0 + j * 16);
+                        b_vec_sums[u][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[u][j]);
 
                         // Load A group 1 and B vec 1 in parallel
                         const int8_t *src_a1 = base_A_block + (g + 1) * group_stride + kk_idx * 16;
-                        const int8_t *b_ptr1 = chunk_base + (N0 + (j + 1) * 16) * Bp.ld_col;
                         a_groups[u][g + 1] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a1));
-                        b_vecs_u[u][j + 1] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr1));
+                        b_vecs_u[u][j + 1] = load_b_vec(chunk_base, N0 + (j + 1) * 16);
+                        b_vec_sums[u][j + 1] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[u][j + 1]);
                     }
 
                     // Handle remaining A groups
@@ -393,8 +424,8 @@ namespace llaminar2
                     // Handle remaining B vecs
                     for (; j < N_R / 16; ++j)
                     {
-                        const int8_t *b_ptr = chunk_base + (N0 + j * 16) * Bp.ld_col;
-                        b_vecs_u[u][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr));
+                        b_vecs_u[u][j] = load_b_vec(chunk_base, N0 + j * 16);
+                        b_vec_sums[u][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[u][j]);
                     }
 
                     // Compute with previous u-1
@@ -405,18 +436,23 @@ namespace llaminar2
                         {
                             const __m128i a32 = a_groups[prev_u][g];
                             const int m_base = g * 4;
-                            const __m512i a_vec0 = broadcast_row_vec<0>(a32);
-                            const __m512i a_vec1 = broadcast_row_vec<1>(a32);
-                            const __m512i a_vec2 = broadcast_row_vec<2>(a32);
-                            const __m512i a_vec3 = broadcast_row_vec<3>(a32);
+                            const __m512i a_vec0 = _mm512_xor_si512(broadcast_row_vec<0>(a32), sign_flip);
+                            const __m512i a_vec1 = _mm512_xor_si512(broadcast_row_vec<1>(a32), sign_flip);
+                            const __m512i a_vec2 = _mm512_xor_si512(broadcast_row_vec<2>(a32), sign_flip);
+                            const __m512i a_vec3 = _mm512_xor_si512(broadcast_row_vec<3>(a32), sign_flip);
 
                             for (int j = 0; j < N_R / 16; ++j)
                             {
                                 const __m512i b_vec = b_vecs_u[prev_u][j];
+                                const __m512i correction = _mm512_mullo_epi32(b_vec_sums[prev_u][j], correction_scale);
                                 acc[m_base + 0][j] = _mm512_dpbusd_epi32(acc[m_base + 0][j], a_vec0, b_vec);
+                                acc[m_base + 0][j] = _mm512_sub_epi32(acc[m_base + 0][j], correction);
                                 acc[m_base + 1][j] = _mm512_dpbusd_epi32(acc[m_base + 1][j], a_vec1, b_vec);
+                                acc[m_base + 1][j] = _mm512_sub_epi32(acc[m_base + 1][j], correction);
                                 acc[m_base + 2][j] = _mm512_dpbusd_epi32(acc[m_base + 2][j], a_vec2, b_vec);
+                                acc[m_base + 2][j] = _mm512_sub_epi32(acc[m_base + 2][j], correction);
                                 acc[m_base + 3][j] = _mm512_dpbusd_epi32(acc[m_base + 3][j], a_vec3, b_vec);
+                                acc[m_base + 3][j] = _mm512_sub_epi32(acc[m_base + 3][j], correction);
                             }
                         }
                     }
@@ -432,18 +468,23 @@ namespace llaminar2
                         {
                             const __m128i a32 = a_groups[max_u][g];
                             const int m_base = g * 4;
-                            const __m512i a_vec0 = broadcast_row_vec<0>(a32);
-                            const __m512i a_vec1 = broadcast_row_vec<1>(a32);
-                            const __m512i a_vec2 = broadcast_row_vec<2>(a32);
-                            const __m512i a_vec3 = broadcast_row_vec<3>(a32);
+                            const __m512i a_vec0 = _mm512_xor_si512(broadcast_row_vec<0>(a32), sign_flip);
+                            const __m512i a_vec1 = _mm512_xor_si512(broadcast_row_vec<1>(a32), sign_flip);
+                            const __m512i a_vec2 = _mm512_xor_si512(broadcast_row_vec<2>(a32), sign_flip);
+                            const __m512i a_vec3 = _mm512_xor_si512(broadcast_row_vec<3>(a32), sign_flip);
 
                             for (int j = 0; j < N_R / 16; ++j)
                             {
                                 const __m512i b_vec = b_vecs_u[max_u][j];
+                                const __m512i correction = _mm512_mullo_epi32(b_vec_sums[max_u][j], correction_scale);
                                 acc[m_base + 0][j] = _mm512_dpbusd_epi32(acc[m_base + 0][j], a_vec0, b_vec);
+                                acc[m_base + 0][j] = _mm512_sub_epi32(acc[m_base + 0][j], correction);
                                 acc[m_base + 1][j] = _mm512_dpbusd_epi32(acc[m_base + 1][j], a_vec1, b_vec);
+                                acc[m_base + 1][j] = _mm512_sub_epi32(acc[m_base + 1][j], correction);
                                 acc[m_base + 2][j] = _mm512_dpbusd_epi32(acc[m_base + 2][j], a_vec2, b_vec);
+                                acc[m_base + 2][j] = _mm512_sub_epi32(acc[m_base + 2][j], correction);
                                 acc[m_base + 3][j] = _mm512_dpbusd_epi32(acc[m_base + 3][j], a_vec3, b_vec);
+                                acc[m_base + 3][j] = _mm512_sub_epi32(acc[m_base + 3][j], correction);
                             }
                         }
                     }
@@ -576,8 +617,8 @@ namespace llaminar2
                     // Zero-pad remaining with vectorization
                     for (; n_idx + 15 < N_R; n_idx += 16)
                     {
-                        _mm512_store_ps(bias_tile + n_idx, _mm512_setzero_ps());
-                        _mm512_store_ps(wgt_scales_tile + n_idx, _mm512_setzero_ps());
+                        _mm512_storeu_ps(bias_tile + n_idx, _mm512_setzero_ps());
+                        _mm512_storeu_ps(wgt_scales_tile + n_idx, _mm512_setzero_ps());
                     }
                     for (; n_idx < N_R; ++n_idx)
                     {
