@@ -958,8 +958,8 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         auto A = generate_random_activations(m, k);
 
         // Allocate output buffers
-        std::vector<float> C_onednn(m * n, 0.0f);  // OneDNN reference
-        std::vector<float> C_vnni(m * n, 0.0f);    // VNNI kernel result
+        std::vector<float> C_onednn(m * n, 0.0f); // OneDNN reference
+        std::vector<float> C_vnni(m * n, 0.0f);   // VNNI kernel result
 
         // Get VNNI kernel
         auto &registry = VNNIGemmKernelRegistry::instance();
@@ -975,7 +975,7 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         // Note: GGUF stores weights as [out_features, in_features] = [4864, 896]
         // But GEMM needs B as [in_features, out_features] = [896, 4864]
         // Solution: Use CblasTrans for B in the GEMM call
-        std::vector<float> B_fp32(B_shape[0] * B_shape[1]);  // [4864, 896]
+        std::vector<float> B_fp32(B_shape[0] * B_shape[1]); // [4864, 896]
         B_q8->to_fp32(B_fp32.data());
 
         // OneDNN FP32 GEMM: C = A × B^T
@@ -985,13 +985,13 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         MPI_Barrier(MPI_COMM_WORLD);
         auto t0_onednn = high_resolution_clock::now();
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,  // Transpose B!
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, // Transpose B!
                     m, n, k,
-                    1.0f,                   // alpha
-                    A->data(), k,           // A (m×k)
-                    B_fp32.data(), k,       // B^T (n×k, stored as row-major)
-                    0.0f,                   // beta
-                    C_onednn.data(), n      // C (m×n)
+                    1.0f,              // alpha
+                    A->data(), k,      // A (m×k)
+                    B_fp32.data(), k,  // B^T (n×k, stored as row-major)
+                    0.0f,              // beta
+                    C_onednn.data(), n // C (m×n)
         );
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -1053,24 +1053,26 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         // Debug: Print a few sample values
         std::cout << "  Sample values (first 10 elements of C[0,:]):\n";
         std::cout << "    OneDNN: ";
-        for (int i = 0; i < 10; ++i) std::cout << C_onednn[i] << " ";
+        for (int i = 0; i < 10; ++i)
+            std::cout << C_onednn[i] << " ";
         std::cout << "\n    VNNI:   ";
-        for (int i = 0; i < 10; ++i) std::cout << C_vnni[i] << " ";
+        for (int i = 0; i < 10; ++i)
+            std::cout << C_vnni[i] << " ";
         std::cout << "\n";
 
         // Compare VNNI vs OneDNN
         double max_abs_diff = 0.0;
         double max_rel_diff = 0.0;
         size_t mismatch_count = 0;
-        const double abs_tol = 0.5;   // Absolute tolerance (Q8_0 quantization error)
-        const double rel_tol = 0.5;   // Relative tolerance (50% - quantization is lossy!)
+        const double abs_tol = 0.5; // Absolute tolerance (Q8_0 quantization error)
+        const double rel_tol = 0.5; // Relative tolerance (50% - quantization is lossy!)
 
         for (size_t i = 0; i < C_onednn.size(); ++i)
         {
             double ref = C_onednn[i];
             double test = C_vnni[i];
             double abs_diff = std::abs(test - ref);
-            double rel_diff = (std::abs(ref) > 1e-3) ? abs_diff / std::abs(ref) : 0.0;  // Avoid div by tiny numbers
+            double rel_diff = (std::abs(ref) > 1e-3) ? abs_diff / std::abs(ref) : 0.0; // Avoid div by tiny numbers
 
             max_abs_diff = std::max(max_abs_diff, abs_diff);
             max_rel_diff = std::max(max_rel_diff, rel_diff);
@@ -1119,7 +1121,7 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         std::cout << "Speedup vs OneDNN: " << std::fixed << std::setprecision(2) << (vnni_gops / onednn_gops) << "×\n";
         std::cout << "========================================================================================================\n";
 
-        // GTest assertions  
+        // GTest assertions
         // Note: Q8_0 quantization introduces error, so we use relaxed tolerances
         // Typical max absolute error: ~3.0 for large activations
         // Mismatch rate: ~0.2% is acceptable for quantized inference
