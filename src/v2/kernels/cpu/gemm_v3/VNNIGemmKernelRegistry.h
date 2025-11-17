@@ -171,17 +171,11 @@ namespace llaminar2
 
         void ensureInitialized()
         {
-            // Force-link mechanism will be added by Python generation script
-            // This ensures all instantiation object files are linked
             if (!initialized_)
             {
-                // Registration happens via __attribute__((constructor))
-                // If no kernels registered, log warning
-                if (kernels_.empty())
-                {
-                    std::cerr << "WARNING: VNNIGemmKernelRegistry is empty. "
-                              << "Ensure instantiation files are linked.\n";
-                }
+                extern void forceLink_VNNIGemmKernelRegistry();
+                forceLink_VNNIGemmKernelRegistry();
+                initialized_ = true;
             }
         }
 

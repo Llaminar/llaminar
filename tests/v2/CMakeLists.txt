@@ -2441,7 +2441,28 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM_Comparison
     MPI_PROCS 2  # Match baseline configuration
 )
 
-# Performance Test: VNNI GEMM Simple
+# Performance Test: VNNI GEMM Qwen Profile (gemm_v3)
+# Benchmarks VNNI GEMM kernel (AVX512VNNI INT8) with realistic Qwen 0.5B operations
+# Compares VNNIGemmAdapter vs direct registry calls to measure adapter overhead
+# Test cases: Single-token decode, batch=32, batch=128 (Q/K/V/O projections, FFN ops)
+# Uses real model weights loaded via ModelLoader
+# Measures: GOPS, adapter overhead %, efficiency vs theoretical peak
+add_executable(v2_perf_vnni_gemm_qwen_profile performance/cpu/kernels/gemm/gemm_v3/Perf__VNNIGemm_QwenProfile.cpp)
+target_link_libraries(v2_perf_vnni_gemm_qwen_profile 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_vnni_gemm_qwen_profile PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_VNNIGemm_QwenProfile
+    COMMAND $<TARGET_FILE:v2_perf_vnni_gemm_qwen_profile>
+    LABELS "V2;Performance;GEMM;VNNI;INT8;AVX512;Qwen;AdapterOverhead;gemm_v3"
+    MPI_PROCS 1  # Single rank for pure GEMM performance
+)
+
 # Performance Test: Fused GEMM+Softmax (Stage 1 Optimization) (DISABLED - missing FusedGemmSoftmax.h)
 # Validates Stage 1 fusion claims: 47% memory reduction, 5-15% speedup
 # Test cases: seq_len 128/256/512/1024/2048, causal masking, Qwen 7B config
