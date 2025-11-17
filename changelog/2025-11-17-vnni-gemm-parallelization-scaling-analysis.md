@@ -396,3 +396,17 @@ The VNNI GEMM kernel is **correctly implemented and efficiently parallelized**. 
 3. **Cache optimization**: Investigate M=16384 throughput drop (potential L3 cache thrashing)
 4. **Multi-rank testing**: Extend to MPI multi-rank for distributed batch processing
 5. **GPU comparison**: Benchmark against CUDA implementation when available
+
+107: ========================================================================================================
+107: Best Configuration Summary (All Batch Sizes)
+107: ========================================================================================================
+107: M       M_R     N_R     K_BLK     UNROLL_K    PREFETCH      GOPS        Efficiency%
+107: --------------------------------------------------------------------------------------------------------
+107: 32      64      64      128       4           256           14642.87    653.70      
+107: 128     8       16      128       1           64            79.63       3.55        
+107: 512     32      64      128       2           128           249.13      11.12       
+107: 1024    16      64      128       2           0             392.11      17.50       
+107: 4096    32      64      128       2           128           701.57      31.32       
+107: 8192    64      64      128       2           0             790.02      35.27       
+107: ========================================================================================================
+107: [       OK ] VNNIGemmPerformance.ParameterSweep (2261490 ms)
