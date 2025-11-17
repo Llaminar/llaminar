@@ -5,12 +5,12 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../utils/BFloat16.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include <cstring>
@@ -196,7 +196,7 @@ namespace llaminar2
             // Tensor is on CPU - use auto-tuned CPU kernel
             // BF16 implements ITensorGemmTileDataProvider interface (used generically for auto-tuner)
             LOG_DEBUG("[BF16Tensor] Creating CPU GEMM kernel with auto-tuner");
-            return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
         }
     }
 

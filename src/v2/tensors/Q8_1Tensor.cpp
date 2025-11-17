@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
@@ -192,7 +192,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
     {
         // Use generic QuantizedGemmKernel with ITensorGemmTileDataProvider interface
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()

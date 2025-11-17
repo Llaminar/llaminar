@@ -402,122 +402,10 @@ message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
 
 # Define GEMM script path for microkernel generation
-set(GENERATE_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/python/generate_gemm_microkernel_instantiations.py")
-set(GENERATED_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/generated/sources.cmake")
-
-# Check if generation is needed (script newer than output, or output doesn't exist)
-if(NOT EXISTS ${GENERATED_SOURCES_CMAKE} OR 
-   ${GENERATE_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_SOURCES_CMAKE})
-    message(STATUS "V2: Generating GEMM microkernel instantiations...")
-    execute_process(
-        COMMAND ${Python3_EXECUTABLE} ${GENERATE_GEMM_SCRIPT}
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu
-        RESULT_VARIABLE GENERATE_RESULT
-        OUTPUT_VARIABLE GENERATE_OUTPUT
-        ERROR_VARIABLE GENERATE_ERROR
-    )
-    
-    if(NOT GENERATE_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to generate GEMM microkernels:\n${GENERATE_ERROR}")
-    endif()
-    
-    message(STATUS "V2: Generated 64 microkernel files with 1225 variants")
-else()
-    message(STATUS "V2: GEMM microkernel instantiations are up-to-date")
-endif()
-
-# Include generated microkernel instantiations
-include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/generated/sources.cmake)
-
-# Define Integer GEMM script path for microkernel generation
-set(GENERATE_INTEGER_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/python/generate_integer_gemm_instantiations.py")
-set(GENERATED_INTEGER_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/int8/generated/sources.cmake")
-
-# Check if integer GEMM generation is needed (script newer than output, or output doesn't exist)
-if(NOT EXISTS ${GENERATED_INTEGER_SOURCES_CMAKE} OR 
-   ${GENERATE_INTEGER_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_INTEGER_SOURCES_CMAKE})
-    message(STATUS "V2: Generating Integer GEMM kernel instantiations...")
-    execute_process(
-        COMMAND ${Python3_EXECUTABLE} ${GENERATE_INTEGER_GEMM_SCRIPT}
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        RESULT_VARIABLE GENERATE_INTEGER_RESULT
-        OUTPUT_VARIABLE GENERATE_INTEGER_OUTPUT
-        ERROR_VARIABLE GENERATE_INTEGER_ERROR
-    )
-    
-    if(NOT GENERATE_INTEGER_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to generate Integer GEMM kernels:\n${GENERATE_INTEGER_ERROR}")
-    endif()
-    
-    message(STATUS "V2: Generated 64 integer GEMM files with 8000 variants")
-else()
-    message(STATUS "V2: Integer GEMM kernel instantiations are up-to-date")
-endif()
-
-# NOTE: Old Integer GEMM (v1) disabled - references deleted gemm_v2 files
-# include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/int8/generated/sources.cmake)
-
-# Define Q8_1 GEMM script path for kernel generation
-set(GENERATE_Q8_1_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/python/generate_q8_1_gemm_instantiations.py")
-set(GENERATED_Q8_1_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/generated/sources.cmake")
-
-# Check if Q8_1 GEMM generation is needed (script newer than output, or output doesn't exist)
-if(NOT EXISTS ${GENERATED_Q8_1_SOURCES_CMAKE} OR 
-   ${GENERATE_Q8_1_GEMM_SCRIPT} IS_NEWER_THAN ${GENERATED_Q8_1_SOURCES_CMAKE})
-    message(STATUS "V2: Generating Q8_1 GEMM kernel instantiations...")
-    execute_process(
-        COMMAND ${Python3_EXECUTABLE} ${GENERATE_Q8_1_GEMM_SCRIPT}
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/python
-        RESULT_VARIABLE GENERATE_Q8_1_RESULT
-        OUTPUT_VARIABLE GENERATE_Q8_1_OUTPUT
-        ERROR_VARIABLE GENERATE_Q8_1_ERROR
-    )
-    
-    if(NOT GENERATE_Q8_1_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to generate Q8_1 GEMM kernels:\n${GENERATE_Q8_1_ERROR}")
-    endif()
-    
-    message(STATUS "V2: Generated 64 Q8_1 GEMM files with 2340 variants")
-else()
-    message(STATUS "V2: Q8_1 GEMM kernel instantiations are up-to-date")
-endif()
-
-# Include generated Q8_1 GEMM kernel instantiations
-include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v2/generated/sources.cmake)
-message(STATUS "V2: Q8_1 GEMM instantiations: ${Q8_1_GEMM_INSTANTIATION_SOURCES}")
-list(LENGTH Q8_1_GEMM_INSTANTIATION_SOURCES Q8_1_COUNT)
-message(STATUS "V2: Q8_1 GEMM instantiation count: ${Q8_1_COUNT}")
-
 # =============================================================================
-# VNNI GEMM (gemm_v3) Kernel Instantiations - Registry Pattern
+# GEMM v1, v2, and v3 have been removed - only gemm_v4 (OneDNN-based) remains
+# All legacy GEMM microkernel generation and integer GEMM implementations are obsolete
 # =============================================================================
-# Run Python generator if source files missing
-set(VNNI_GEMM_PYTHON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v3/python)
-set(VNNI_GEMM_GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm_v3/generated)
-set(VNNI_GEMM_SOURCES_CMAKE ${VNNI_GEMM_GENERATED_DIR}/sources.cmake)
-set(VNNI_GEMM_GENERATOR ${VNNI_GEMM_PYTHON_DIR}/generate_vnni_gemm_instantiations.py)
-
-if(NOT EXISTS ${VNNI_GEMM_SOURCES_CMAKE})
-    message(STATUS "V2: Generating VNNI GEMM kernel instantiations...")
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${VNNI_GEMM_GENERATED_DIR}
-        COMMAND python3 ${VNNI_GEMM_GENERATOR}
-        WORKING_DIRECTORY ${VNNI_GEMM_PYTHON_DIR}
-        RESULT_VARIABLE VNNI_GEMM_GEN_RESULT
-    )
-    if(NOT VNNI_GEMM_GEN_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to generate VNNI GEMM kernel instantiations")
-    endif()
-    message(STATUS "V2: Generated VNNI GEMM files with 576 variants")
-else()
-    message(STATUS "V2: VNNI GEMM kernel instantiations are up-to-date")
-endif()
-
-# Include generated VNNI GEMM kernel instantiations
-include(${VNNI_GEMM_SOURCES_CMAKE})
-message(STATUS "V2: VNNI GEMM instantiations: ${VNNI_GEMM_INSTANTIATION_SOURCES}")
-list(LENGTH VNNI_GEMM_INSTANTIATION_SOURCES VNNI_GEMM_COUNT)
-message(STATUS "V2: VNNI GEMM instantiation count: ${VNNI_GEMM_COUNT}")
 
 # =============================================================================
 # llama.cpp Integration (for dequant parity testing)
@@ -591,19 +479,9 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/RMSNormPrimitives.cpp
     kernels/cpu/primitives/SoftmaxPrimitives.cpp
     # CPU GEMM kernels and auto-tuning infrastructure
-    kernels/cpu/gemm/GemmAutoTuner.cpp         # Auto-tuner singleton + factory function
-    kernels/cpu/gemm/SmartGemmSearch.cpp       # Intelligent hierarchical search strategies
-    kernels/cpu/gemm/quantized/QuantizedGemm.cpp  # Auto-tuned quantized GEMM factory
-    # kernels/cpu/GemmVariantGenerator.cpp  # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
-    # kernels/cpu/GemmVariantGenerator_Generated.cpp # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
-    kernels/cpu/gemm/bf16/BF16PackedGemm.cpp        # Phase 1: BF16×BF16→FP32 with auto-tuned micro-kernels
-    # kernels/cpu/gemm/int8/INT8PackedGemm.cpp        # DEPRECATED: Replaced by IntegerGemmKernelTemplate (see int8/INT8PackedGemm.deprecated.cpp)
-    kernels/cpu/gemm/fp16/FP16PackedGemm.cpp        # FP16×FP16→FP32 with AVX512F/AVX2+F16C auto-tuned micro-kernels
-    # Q8_1 GEMM registry init (forces linking of all instantiation shards)
-    kernels/cpu/gemm_v2/Q8_1GemmKernelInit.cpp
-    # VNNI GEMM (gemm_v3) - Pre-packed panel layout for maximum VNNI throughput
-    # VNNI GEMM registry init (forces linking of all instantiation shards)
-    kernels/cpu/gemm_v3/VNNIGemmKernelInit.cpp
+    # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm_v4 (OneDNN) remains
+    # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
+    # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
     kernels/cpu/INT8SwiGLUKernel.cpp
     kernels/cpu/FP32AttentionKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
@@ -622,18 +500,8 @@ add_library(llaminar2_core STATIC
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp
-    # Generated GEMM microkernel template instantiations (1225 total across 64 files)
-    kernels/cpu/gemm/GemmMicroKernelInit.cpp
-    ${MICROKERNEL_INSTANTIATION_SOURCES}
-    # NOTE: Old Integer GEMM (v1) disabled - references deleted gemm_v2 files
-    # ${INTEGER_GEMM_INSTANTIATION_SOURCES}
-    # kernels/cpu/gemm/int8/IntegerGemmKernelInit.cpp
-    # Generated Q8_1 GEMM kernel template instantiations (2340 total across 64 files)
-    # Uses registry pattern with __attribute__((constructor)) for auto-registration
-    ${Q8_1_GEMM_INSTANTIATION_SOURCES}
-    # Generated VNNI GEMM kernel template instantiations (576 total across 16 files)
-    # Uses registry pattern with __attribute__((constructor)) for auto-registration
-    ${VNNI_GEMM_INSTANTIATION_SOURCES}
+    # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
+    # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )
 
 target_include_directories(llaminar2_core PUBLIC 

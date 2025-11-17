@@ -5,8 +5,8 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "Tensors.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
 #include <cstring>
@@ -140,7 +140,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q4_1Tensor::createGemm()
     {
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     void Q4_1Tensor::decodeBlock(const Q4_1Block &block, float *output)

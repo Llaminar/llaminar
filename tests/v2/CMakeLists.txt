@@ -366,71 +366,11 @@ add_v2_test(V2_Unit_BF16_SIMD_Accuracy
     MPI_PROCS 1  # CPU-only SIMD tests, single rank
 )
 
-# Test: IntegerGemm (integer-domain quantized GEMM with AVX512-VNNI, llama.cpp strategy)
-add_executable(v2_test_q8_0_decode_vectorization unit/Test__Q8_0DecodeVectorization.cpp)
-target_link_libraries(v2_test_q8_0_decode_vectorization
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q8_0DecodeVectorization
-    COMMAND $<TARGET_FILE:v2_test_q8_0_decode_vectorization>
-    LABELS "V2;Unit;TensorOperations;Quantization;Q8_0;IQ4_NL;FP32;SIMD;AVX2;AVX512;VectorizationCorrectness"
-    MPI_PROCS 1  # CPU-only SIMD decode, single rank
-)
+# NOTE: Q8_0 decode vectorization test removed - depends on obsolete gemm implementations
 
-# Test: VNNIGemmKernel (comprehensive kernel-level VNNI GEMM correctness tests)
-# Consolidated from: Test__VNNIGemm_Focused, Test__VNNIGemm_Minimal, Test__VNNIGemm_Correctness, Test__VNNIGemm
-add_executable(v2_test_vnni_gemm_kernel unit/kernels/gemm/Test__VNNIGemmKernel.cpp)
-target_link_libraries(v2_test_vnni_gemm_kernel
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_VNNIGemmKernel
-    COMMAND $<TARGET_FILE:v2_test_vnni_gemm_kernel>
-    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;DirectKernel;PackedLayout;AVX512VNNI;CPU;Correctness"
-    MPI_PROCS 1  # CPU-only kernel test, single rank
-)
+# NOTE: VNNIGemmKernel and VNNIGemmAdapter tests removed - gemm_v3 is obsolete
 
-# Test: VNNIGemmAdapter (tensor adapter wrapping VNNI kernel - Q8_0 weights)
-add_executable(v2_test_vnni_gemm_adapter unit/kernels/gemm/Test__VNNIGemmAdapter.cpp)
-target_link_libraries(v2_test_vnni_gemm_adapter
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_VNNIGemmAdapter
-    COMMAND $<TARGET_FILE:v2_test_vnni_gemm_adapter>
-    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;Q8_0;TensorOperations;Quantization;SymmetricQuantization;CPU;AVX512VNNI;ActivationPacking;WeightPacking;AdapterLayer"
-    MPI_PROCS 1  # CPU-only adapter test, single rank
-)
-
-# Test: FP16GemmImpl (multi-ISA FP16×FP16→FP32 GEMM implementations - AVX512F/F16C/Scalar correctness)
-add_executable(v2_test_fp16_gemm_impl unit/Test__FP16Gemm.cpp)
-target_link_libraries(v2_test_fp16_gemm_impl
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FP16GemmImpl
-    COMMAND $<TARGET_FILE:v2_test_fp16_gemm_impl>
-    LABELS "V2;Unit;Kernels;GEMM;FP16;MultiISA;AVX512F;F16C;AVX2;Scalar;ImplementationParity;CPU;HalfPrecision"
-    MPI_PROCS 1  # CPU-only multi-ISA test, single rank
-)
-
-# Test: FP16PackedGemm (autotuner integration with micro-kernel variants)
-add_executable(v2_test_fp16_packed_gemm unit/Test__FP16PackedGemm.cpp)
-target_link_libraries(v2_test_fp16_packed_gemm
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FP16PackedGemm
-    COMMAND $<TARGET_FILE:v2_test_fp16_packed_gemm>
-    LABELS "V2;Unit;Kernels;GEMM;FP16;AutoTuner;MicroKernels;CacheBlocking;PackedGEMM;CPU;HalfPrecision"
-    MPI_PROCS 1  # CPU-only autotuner test, single rank
-)
+# NOTE: FP16 GEMM tests removed - depend on obsolete gemm implementations (FP16GemmImpl, FP16PackedGemm)
 
 # Test: RoPE primitives (scalar, AVX2, AVX512 parity)
 add_executable(v2_test_rope_primitives unit/Test__RoPEPrimitives.cpp)
@@ -1935,60 +1875,8 @@ add_v2_test(V2_Unit_GemmAutoTunerIntegration
 #     MPI_PROCS 1
 # )
 
-# Test: MicroKernel Adapter Packing (cache-blocked buffer management)
-add_executable(v2_test_microkernel_adapter_packing unit/Test__MicroKernelAdapter_Packing.cpp)
-target_link_libraries(v2_test_microkernel_adapter_packing 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MicroKernelAdapterPacking
-    COMMAND $<TARGET_FILE:v2_test_microkernel_adapter_packing>
-    LABELS "V2;Unit;Kernels;MicroKernel;CacheBlocking;Packing;BufferManagement"
-    MPI_PROCS 1
-)
-
-# Test: MicroKernel Padding (unit test for required buffer size)
-add_executable(v2_test_microkernel_padding unit/Test__MicroKernelPadding.cpp)
-target_link_libraries(v2_test_microkernel_padding 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MicroKernelPadding
-    COMMAND $<TARGET_FILE:v2_test_microkernel_padding>
-    LABELS "V2;Unit;Kernels;MicroKernel;Padding;BufferManagement;SIMD;BoundsChecking"
-    MPI_PROCS 1
-)
-
-# Test: Micro-Kernel Write Bounds Verification
-add_executable(v2_test_microkernel_bounds unit/Test__MicroKernelBounds.cpp)
-target_link_libraries(v2_test_microkernel_bounds 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MicroKernelBounds
-    COMMAND $<TARGET_FILE:v2_test_microkernel_bounds>
-    LABELS "V2;Unit;Kernels;MicroKernel;BoundsChecking;WriteVerification"
-    MPI_PROCS 1
-)
-
-# Test: Micro-Kernel Mathematical Correctness
-# Validates numerical correctness against reference implementations (naive GEMM, OpenBLAS)
-# Tests: identity, zero, diagonal, random matrices, edge cases, all tile variants
-add_executable(v2_test_microkernel_correctness unit/Test__MicroKernelCorrectness.cpp)
-target_link_libraries(v2_test_microkernel_correctness 
-    llaminar2_core 
-    ${OPENBLAS_LIBRARIES}
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MicroKernelCorrectness
-    COMMAND $<TARGET_FILE:v2_test_microkernel_correctness>
-    LABELS "V2;Unit;Kernels;MicroKernel;GEMM;Correctness;NumericalAccuracy;Parity"
-    MPI_PROCS 1
-)
+# NOTE: MicroKernel tests removed - depend on obsolete gemm implementations
+# (MicroKernelAdapter_Packing, MicroKernelPadding, MicroKernelBounds, MicroKernelCorrectness)
 
 # Test: GEMM Debug (minimal test to debug kernel issues)
 # NOTE: Commented out - Test__GemmDebug.cpp not found
@@ -2144,19 +2032,7 @@ add_v2_test(V2_Integration_BatchedAttention
     LABELS "V2;Integration;Batching;Attention;CausalMasking;PaddingMasking;GQA"
 )
 
-# Test: MicroKernel AutoTuner Integration (October 2025)
-add_executable(v2_test_microkernel_autotuner_integration 
-    integration/test_microkernel_autotuner_integration.cpp)
-target_link_libraries(v2_test_microkernel_autotuner_integration 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MicroKernelAutoTuner
-    COMMAND $<TARGET_FILE:v2_test_microkernel_autotuner_integration>
-    MPI_PROCS 1
-    LABELS "V2;Integration;MicroKernel;AutoTuner;GEMM;Performance"
-)
+# NOTE: MicroKernel AutoTuner Integration test removed - depends on obsolete gemm implementations
 
 # Test: Dequant Equivalency - Verify IBlockDecoder matches llama.cpp dequantization (October 2025)
 add_executable(v2_test_dequant_equivalency
@@ -2414,67 +2290,11 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
 )
 
-# Performance Test: Q8_0 Conversion with SIMD Variants
-# Benchmarks vectorized Q8_0 quantization (AVX512/AVX2/scalar) and OpenMP scaling
-# Test cases: SIMD variants, OpenMP thread scaling, all tensor types, large-scale conversion
-# Measures: Time, ops/sec, SIMD speedup, parallel efficiency, throughput (MB/s)
-add_executable(v2_perf_q8_0_conversion performance/Perf__Q8_0_Conversion.cpp)
-target_link_libraries(v2_perf_q8_0_conversion 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_q8_0_conversion PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
+# NOTE: Q8_0 Conversion performance test removed - gemm_v2 is obsolete
 
-add_v2_perf_test(V2_Perf_Q8_0_Conversion
-    COMMAND $<TARGET_FILE:v2_perf_q8_0_conversion>
-    LABELS "V2;Performance;Quantization;Q8_0;SIMD;AVX512;AVX2;OpenMP;Vectorization;Parallelization"
-    MPI_PROCS 1  # Single rank (tests CPU SIMD + OpenMP)
-)
+# NOTE: IQ4_NL GEMM comparison test removed - depends on obsolete QuantizedGemm
 
-# Performance Test: IQ4_NL GEMM Implementation Comparison
-# Compares IQ4_NLQuantizedGemm (specialized) vs AutoTunedQuantizedGemm (generic)
-# Test cases: Single token, small/medium/large batch, Q-projection and FFN shapes
-# Measures: Time, GFLOPS, relative speedup between implementations
-add_executable(v2_perf_iq4nl_gemm_comparison performance/Perf__IQ4_NL_GEMM_Comparison.cpp)
-target_link_libraries(v2_perf_iq4nl_gemm_comparison 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_iq4nl_gemm_comparison PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_IQ4NL_GEMM_Comparison
-    COMMAND $<TARGET_FILE:v2_perf_iq4nl_gemm_comparison>
-    LABELS "V2;Performance;GEMM;IQ4_NL;Comparison;AutoTuner"
-    MPI_PROCS 2  # Match baseline configuration
-)
-
-# Performance Test: VNNI GEMM Qwen Profile (gemm_v3)
-# Benchmarks VNNI GEMM kernel (AVX512VNNI INT8) with realistic Qwen 0.5B operations
-# Compares VNNIGemmAdapter vs direct registry calls to measure adapter overhead
-# Test cases: Single-token decode, batch=32, batch=128 (Q/K/V/O projections, FFN ops)
-# Uses real model weights loaded via ModelLoader
-# Measures: GOPS, adapter overhead %, efficiency vs theoretical peak
-add_executable(v2_perf_vnni_gemm_qwen_profile performance/cpu/kernels/gemm/gemm_v3/Perf__VNNIGemm_QwenProfile.cpp)
-target_link_libraries(v2_perf_vnni_gemm_qwen_profile 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_vnni_gemm_qwen_profile PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_VNNIGemm_QwenProfile
-    COMMAND $<TARGET_FILE:v2_perf_vnni_gemm_qwen_profile>
-    LABELS "V2;Performance;GEMM;VNNI;INT8;AVX512;Qwen;AdapterOverhead;gemm_v3"
-    MPI_PROCS 1  # Single rank for pure GEMM performance
-)
+# NOTE: VNNIGemm Qwen Profile test removed - gemm_v3 is obsolete
 
 # Performance Test: OneDNN GEMM Qwen Profile (gemm_v4)
 # Uses the new gemm_v4 adapters that wrap OneDNN matmul to gauge achievable throughput.
@@ -2555,46 +2375,9 @@ add_v2_perf_test(V2_Perf_BF16_Profile
     MPI_PROCS 2  # Match production configuration
 )
 
-# Performance Test: Auto-tuned GEMM Cache Profiling
-# Micro-benchmark for auto-tuned IQ4_NL GEMM with L1/L2/L3 cache profiling
-# Test cases: Prefill batch sizes 32/128/512/1024/2048/4096 tokens
-# Profiles: Cache miss rates, IPC/CPI, memory bandwidth, GFLOPS
-# Uses: Linux perf_event_open for hardware performance counters
-add_executable(v2_perf_autotuned_gemm_cache performance/Perf__AutoTunedGemm_CacheProfiling.cpp)
-target_link_libraries(v2_perf_autotuned_gemm_cache 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_autotuned_gemm_cache PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
+# NOTE: Auto-tuned GEMM cache profiling test removed - depends on obsolete GemmAutoTuner
 
-add_v2_perf_test(V2_Perf_AutoTunedGemm_CacheProfiling
-    COMMAND $<TARGET_FILE:v2_perf_autotuned_gemm_cache>
-    LABELS "V2;Performance;GEMM;AutoTuner;CacheProfiling;L1;L2;L3;IQ4_NL;Prefill"
-    MPI_PROCS 1  # Single rank for pure performance (no MPI overhead)
-)
-
-# Performance Test: Exhaustive Autotuner Sweep
-# Tests ALL 1225 microkernel configurations to find globally optimal settings
-# Sweeps entire parameter space: ISA × MR × NR × UNROLL_K × PREFETCH_DIST
-# Goal: Bypass autotuner heuristic and find true performance ceiling
-add_executable(v2_perf_exhaustive_autotuner_sweep performance/Perf__Exhaustive_Autotuner_Sweep.cpp)
-target_link_libraries(v2_perf_exhaustive_autotuner_sweep
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_exhaustive_autotuner_sweep PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_ExhaustiveAutotunerSweep
-    COMMAND $<TARGET_FILE:v2_perf_exhaustive_autotuner_sweep>
-    LABELS "V2;Performance;GEMM;IQ4_NL;AutoTuner;Optimization;ConfigurationSweep"
-    MPI_PROCS 2  # 2 ranks to distribute workload, each with OpenMP parallelization
-)
+# NOTE: Exhaustive autotuner sweep test removed - depends on obsolete GemmAutoTuner
 
 # Performance Test: CPU GEMM Heuristic Validation Suite
 # Comprehensive test suite for ML heuristic training data collection.
@@ -2997,33 +2780,7 @@ add_v2_perf_test(V2_Perf_IQ4NL_TileSweep
     MPI_PROCS 2
 )
 
-# Perf: Auto-tuner validation (verifies optimal kernel selection)
-add_executable(v2_perf_gemm_autotuner performance/Perf__GemmAutoTuner.cpp)
-target_link_libraries(v2_perf_gemm_autotuner 
-    llaminar2_core 
-    GTest::gtest
-)
-set_target_properties(v2_perf_gemm_autotuner PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-add_v2_perf_test(V2_Perf_GemmAutoTuner
-    COMMAND $<TARGET_FILE:v2_perf_gemm_autotuner>
-    LABELS "V2;Performance;Kernels;GEMM;AutoTuning;KernelSelection;TileSizeSweep"
-    MPI_PROCS 1
-)
-
-# Perf: Micro-Kernel Scaling (2 MPI ranks for multi-socket performance)
-add_executable(v2_perf_microkernel_scaling performance/Perf__MicroKernelScaling.cpp)
-target_link_libraries(v2_perf_microkernel_scaling 
-    llaminar2_core 
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_perf_test(V2_Perf_MicroKernelScaling
-    COMMAND $<TARGET_FILE:v2_perf_microkernel_scaling>
-    LABELS "V2;Performance;Kernels;GEMM;MicroKernel;MultiSocket;MPIScaling;Throughput"
-    MPI_PROCS 2
-)
+# NOTE: GemmAutoTuner and MicroKernelScaling performance tests removed - depend on obsolete gemm implementations
 
 # Future performance tests can be added here following the same pattern:
 # Example:

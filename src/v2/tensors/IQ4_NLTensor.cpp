@@ -6,6 +6,7 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
 #include "FP16Utils.h"
@@ -14,7 +15,6 @@
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #ifdef HAVE_CUDA
 #include "../kernels/cuda/CudaGemmFactory.h"
 #endif
@@ -251,7 +251,7 @@ namespace llaminar2
         {
             // Tensor is on CPU - use auto-tuned CPU kernel
             LOG_DEBUG("[IQ4_NLTensor] Creating CPU GEMM kernel");
-            return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
         }
     }
 

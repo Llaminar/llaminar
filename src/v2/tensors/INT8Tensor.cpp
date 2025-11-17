@@ -6,6 +6,7 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 // #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>

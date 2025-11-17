@@ -6,12 +6,12 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "TensorKernels.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
@@ -110,7 +110,7 @@ namespace llaminar2
     {
         // FP32 tensors use the auto-tuned GEMM kernel for optimal performance
         // FP32Tensor implements ITensorGemmTileDataProvider with block_size() = 32
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()

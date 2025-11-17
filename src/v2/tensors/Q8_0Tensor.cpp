@@ -5,8 +5,8 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "Tensors.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 #include <cmath>
@@ -188,7 +188,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
         // Use generic QuantizedGemmKernel with ITensorGemmTileDataProvider interface
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     void Q8_0Tensor::decodeBlockScalar(const Q8_0Block &block, float *output)

@@ -13,6 +13,7 @@
 #include <random>
 #include <vector>
 
+#include "kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "kernels/cpu/gemm_v4/OneDNNGemmAdapter.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"

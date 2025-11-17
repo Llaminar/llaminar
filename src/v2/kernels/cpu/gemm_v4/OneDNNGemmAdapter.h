@@ -1,7 +1,10 @@
 #pragma once
 
-#include "kernels/cpu/gemm_v4/OneDNNGemm.h"
-#include "tensors/Tensors.h"
+#ifndef HAVE_ONEDNN
+#error "OneDNN support is required to use gemm_v4"
+#endif
+
+#include <oneapi/dnnl/dnnl.hpp>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -9,8 +12,17 @@
 
 namespace llaminar2
 {
+    // Forward declarations
+    class TensorBase;
+    class IActivationTensor;
+
     namespace gemm_v4
     {
+        // Forward declare OneDNN primitives (defined in OneDNNGemmKernel.h)
+        dnnl::engine &onednn_engine();
+        dnnl::stream &onednn_stream();
+        bool run_onednn_int8_matmul(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K);
+        bool run_onednn_fp32_matmul(const float *A, const float *B, float *C, int M, int N, int K);
         struct WeightPack
         {
             std::vector<int8_t> data;

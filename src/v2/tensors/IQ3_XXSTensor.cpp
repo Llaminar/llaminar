@@ -5,9 +5,9 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -87,7 +87,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ3_XXSTensor::createGemm()
     {
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     void IQ3_XXSTensor::decodeBlock(const IQ3_XXSBlock &block, float *output)

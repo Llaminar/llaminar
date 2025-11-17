@@ -25,16 +25,17 @@ The OneDNN GEMM kernel (`gemm_v4`) provides high-performance INT8 matrix multipl
 ### Component Hierarchy
 
 ```
+OneDNNGemmKernel.h
+├── onednn_engine()               # Singleton oneDNN CPU engine
+├── onednn_stream()               # Singleton execution stream
+├── run_onednn_int8_matmul()      # Low-level s8×s8→s32 primitive
+├── run_onednn_fp32_matmul()      # FP32 reference GEMM (validation only)
+└── OneDNNGemmKernel              # ITensorGemm implementation
+
 OneDNNGemmAdapter.h
 ├── pack_weights_to_int8()        # Weight tensor → WeightPack (col-major INT8)
 ├── onednn_gemm_from_packed()     # Core INT8 GEMM + scale application
 └── onednn_gemm_adapter()         # High-level pipeline interface
-
-OneDNNGemm.h
-├── onednn_engine()               # Singleton oneDNN CPU engine
-├── onednn_stream()               # Singleton execution stream
-├── run_onednn_int8_matmul()      # Low-level s8×s8→s32 primitive
-└── run_onednn_fp32_matmul()      # FP32 reference GEMM (validation only)
 ```
 
 ### Data Flow
@@ -352,12 +353,26 @@ sudo make install
 pkg-config --modversion dnnl
 
 # Build llaminar with OneDNN
-cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Release
-cmake --build build_v2 --parallel
+cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --parallel
 
-# Run tests
-cd build_v2 && ctest -R V2_Perf_OneDNNGemm_QwenProfile -V
+# Run performance test (REQUIRED: use CTest for stable environment)
+cd /workspaces/llaminar
+ctest --test-dir build_v2_release -R "V2_Perf_OneDNNGemm_QwenProfile" --verbose
 ```
+
+**⚠️ IMPORTANT**: Performance tests **MUST** be run via `ctest` to ensure:
+- Proper CPU core binding (`--bind-to socket --map-by socket`)
+- Optimal OpenMP thread configuration (`OMP_NUM_THREADS=28`, `OMP_PLACES=sockets`)
+- Consistent BLAS library threading (`OPENBLAS_NUM_THREADS=28`)
+- MPI environment setup for memory access patterns
+
+Running the executable directly will produce **inconsistent and degraded performance** (e.g., 996-1182 GOPS) compared to CTest's stable environment (1456 GOPS, 65% efficiency).
+
+**Expected Performance** (via CTest):
+- **Throughput**: ~1456 GOPS on M=8192, N=4864, K=896 (Qwen 0.5B FFN)
+- **Efficiency**: 65% of 2240 GOPS theoretical peak
+- **Accuracy**: <0.00001 max absolute error vs FP32 reference
 
 ---
 

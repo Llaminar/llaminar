@@ -7,7 +7,6 @@
 #include "Tensors.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
-#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -87,7 +86,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ2_STensor::createGemm()
     {
-        return llaminar::v2::kernels::createAutoTunedGemm(this);
+        // TODO: Implement OneDNN-based GEMM (gemm_v4)
+        LOG_ERROR("[" << typeid(*this).name() << "] createGemm not yet implemented for gemm_v4");
+        return nullptr;
     }
 
     void IQ2_STensor::decodeBlock(const IQ2_SBlock &block, float *output)
