@@ -747,10 +747,10 @@ TEST_F(VNNIGemmPerformance, ParameterSweep)
         ASSERT_NE(B_q8, nullptr) << "FFN gate weights not Q8_0 format";
 
         // Batch sizes to sweep
-        // NOTE: Skipping M=1 because operations complete too fast for accurate timing
+        // NOTE: Skipping M=1 & M=32 because operations complete too fast for accurate timing
         //       Even with 10,000 iterations, total runtime ~1ms → unreliable per-iter measurements
-        //       M=32 is the smallest batch size we can reliably benchmark
-        std::vector<int> m_values = {32, 128, 512, 1024, 4096, 8192};
+        //       M=128 is the smallest batch size we can reliably benchmark
+        std::vector<int> m_values = {128, 512, 1024, 4096, 8192, 16384, 32768};
 
         // Store best configuration per M for final summary
         std::map<int, SweepResult> best_configs;
