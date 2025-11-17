@@ -19,11 +19,13 @@
 #pragma once
 
 #include "tensors/Tensors.h"
+#include "tensors/Q8_0Helpers.h"
 #include <cstdint>
 #include <cstring>
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <immintrin.h>
 
 namespace llaminar2
 {
@@ -64,6 +66,7 @@ namespace llaminar2
         // First pass: Quantize FP32 -> INT8 with per-row scaling
         std::vector<int8_t> A_int8(M_R * kblk, 0);
 
+#pragma omp parallel for schedule(static) if (mr * kblk >= 1024)
         for (int m = 0; m < mr; ++m)
         {
             const int global_row = M0 + m;
@@ -73,26 +76,16 @@ namespace llaminar2
                 continue;
             }
 
-            // Find max absolute value in this row
-            float max_abs = 0.0f;
             const float *src_row = A_fp32 + global_row * K + k0;
-            for (int k = 0; k < kblk; ++k)
-            {
-                max_abs = std::max(max_abs, std::abs(src_row[k]));
-            }
-
-            // Compute scale (symmetric quantization)
+            float max_abs = simd::find_max_abs_fp32(src_row, static_cast<size_t>(kblk));
             const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
             act_scales[m] = scale;
-
-            // Quantize row
-            const float inv_scale = 1.0f / scale;
+            const float inv_scale = scale > 0.0f ? 1.0f / scale : 1.0f;
             int8_t *dst_row = A_int8.data() + m * kblk;
-            for (int k = 0; k < kblk; ++k)
-            {
-                float val = src_row[k] * inv_scale;
-                dst_row[k] = static_cast<int8_t>(std::max(-128.0f, std::min(127.0f, std::round(val))));
-            }
+            simd::quantize_fp32_to_int8(src_row, dst_row, inv_scale, static_cast<size_t>(kblk));
+
+            const float *next_row = src_row + K;
+            _mm_prefetch(reinterpret_cast<const char *>(next_row), _MM_HINT_T0);
         }
 
         // Zero remaining scales
@@ -102,6 +95,7 @@ namespace llaminar2
         }
 
         // Second pass: Pack INT8 data to 4x4-grouped layout
+#pragma omp parallel for schedule(static)
         for (int m_base = 0; m_base < mr; m_base += 4)
         {
             const int group_idx = m_base / 4;
@@ -136,6 +130,7 @@ namespace llaminar2
         }
 
         // Zero-pad remaining groups if mr < M_R
+#pragma omp parallel for schedule(static)
         for (int m_base = mr; m_base < M_R; m_base += 4)
         {
             const int group_idx = m_base / 4;

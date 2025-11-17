@@ -566,6 +566,10 @@ ctest --test-dir build_v2 -R --output-on-failure
 
 # Just unit tests
 ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
+
+# Run a specific test in a single test file
+cd /workspaces/llaminar/build_v2
+GTEST_FILTER=The.Specific.GTest.Name ctest -R V2_My_Test_File -V
 ```
 
 ### Test Categories
