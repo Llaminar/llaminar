@@ -33,7 +33,7 @@ extern "C"
 }
 #endif
 
-#include "../../src/v2/kernels/cpu/FusedGemmSoftmax.h"
+#include "../../src/v2/kernels/cpu/gemm/int8/FusedSoftmaxGemmMicroKernel.h"
 #include "../../src/v2/kernels/cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../src/v2/utils/Logger.h"
 

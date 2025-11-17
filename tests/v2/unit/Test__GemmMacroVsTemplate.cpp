@@ -19,7 +19,7 @@
 #include <cmath>
 
 // Template variants
-#include "kernels/cpu/GemmKernelTemplate.h"
+#include "kernels/cpu/gemm/GemmKernelTemplate.h"
 #include "kernels/cpu/SimdTraits.h"
 
 using namespace llaminar2;

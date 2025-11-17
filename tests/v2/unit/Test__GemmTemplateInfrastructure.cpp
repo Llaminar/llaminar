@@ -13,9 +13,9 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/GemmMicroKernel.h"
+#include "../../src/v2/kernels/cpu/gemm/GemmMicroKernel.h"
 #include "../../src/v2/kernels/cpu/SimdTraits.h"
-#include "../../src/v2/kernels/cpu/GemmKernelTemplate.h"
+#include "../../src/v2/kernels/cpu/gemm/GemmKernelTemplate.h"
 #include <cmath>
 #include <vector>
 

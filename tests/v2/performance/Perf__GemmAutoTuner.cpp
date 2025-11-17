@@ -16,8 +16,8 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/tensors/TensorKernels.h" // For ITensorGemmTileDataProvider interface
-#include "../../../src/v2/kernels/cpu/GemmAutoTuner.h"
-#include "../../../src/v2/kernels/cpu/GemmMicroKernelAdapter.h"
+#include "../../../src/v2/kernels/cpu/gemm/GemmAutoTuner.h"
+#include "../../../src/v2/kernels/cpu/gemm/GemmMicroKernelAdapter.h"
 #include "../../../src/v2/utils/DebugEnv.h"
 #include <memory>
 #include <vector>

@@ -16,7 +16,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/BF16PackedGemm.h"
+#include "../../src/v2/kernels/cpu/gemm/bf16/BF16PackedGemm.h"
 #include "../../src/v2/tensors/Tensors.h"
 #include "../../src/v2/tensors/SIMDHelpers.h"
 #include "../../src/v2/utils/Logger.h"

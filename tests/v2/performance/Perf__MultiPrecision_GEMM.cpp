@@ -46,10 +46,10 @@
 #include "tensors/Tensors.h"
 #include "tensors/SIMDHelpers.h"
 #include "backends/ComputeBackend.h"
-#include "kernels/cpu/GemmKernelTemplate.h"
+#include "kernels/cpu/gemm/GemmKernelTemplate.h"
 #include "kernels/cpu/SimdTraits.h"
-#include "kernels/cpu/GemmAutoTuner.h"
-#include "kernels/cpu/GemmMicroKernelAdapter.h"
+#include "kernels/cpu/gemm/GemmAutoTuner.h"
+#include "kernels/cpu/gemm/GemmMicroKernelAdapter.h"
 
 using namespace llaminar2;
 

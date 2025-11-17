@@ -4,7 +4,7 @@
 #include <memory>
 #include <cblas.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/GemmAutoTuner.h"
+#include "kernels/cpu/gemm/GemmAutoTuner.h"
 
 using namespace llaminar2;
 using namespace llaminar::v2::kernels;

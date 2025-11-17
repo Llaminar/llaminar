@@ -13,7 +13,7 @@
  */
 
 #include "../../../src/v2/kernels/cpu/TiledGemmSoftmax.h"
-#include "../../../src/v2/kernels/cpu/FusedGemmSoftmax.h"
+#include "../../../src/v2/kernels/cpu/gemm/int8/FusedSoftmaxGemmMicroKernel.h"
 #include "../../../src/v2/kernels/cpu/SimdTraits.h"
 #include <gtest/gtest.h>
 #include <random>

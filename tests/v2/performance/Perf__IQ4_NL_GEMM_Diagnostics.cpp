@@ -26,7 +26,7 @@
 
 #include "../../src/v2/loaders/ModelLoader.h"
 #include "../../src/v2/tensors/Tensors.h"
-#include "../../src/v2/kernels/cpu/GemmAutoTuner.h"
+#include "../../src/v2/kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../../src/v2/utils/CPUFeatures.h"
 
 using namespace llaminar2;

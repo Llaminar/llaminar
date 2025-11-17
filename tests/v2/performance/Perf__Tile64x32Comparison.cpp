@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
-#include "kernels/cpu/GemmAutoTuner.h"
+#include "kernels/cpu/gemm/GemmAutoTuner.h"
 #include "utils/Logger.h"
 #include <chrono>
 #include <iostream>

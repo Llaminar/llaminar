@@ -13,9 +13,9 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include "kernels/cpu/GemmMicroKernelRegistry.h"
-#include "kernels/cpu/GemmAutoTuner.h"
-#include "kernels/cpu/GemmMicroKernelAdapter.h"
+#include "kernels/cpu/gemm/GemmMicroKernelRegistry.h"
+#include "kernels/cpu/gemm/GemmAutoTuner.h"
+#include "kernels/cpu/gemm/GemmMicroKernelAdapter.h"
 #include "tensors/TensorKernels.h"
 #include <iostream>
 #include <memory>

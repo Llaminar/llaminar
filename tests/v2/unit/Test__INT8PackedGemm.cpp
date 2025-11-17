@@ -10,8 +10,8 @@
  * @author David Sanftenberg
  */
 
-#include "kernels/cpu/INT8PackedGemm.h"
-#include "kernels/cpu/GemmAutoTuner.h"
+#include "kernels/cpu/gemm/int8/PackedInt8Gemm.h"
+#include "kernels/cpu/gemm/GemmAutoTuner.h"
 #include "kernels/cpu/SimdTraits.h"
 #include "kernels/cpu/GemmMicroKernelTemplateINT8.h"
 #include "tensors/Tensors.h"

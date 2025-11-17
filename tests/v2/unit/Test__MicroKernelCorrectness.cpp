@@ -29,8 +29,8 @@
 #include <random>
 #include <vector>
 
-#include "kernels/cpu/GemmAutoTuner.h"
-#include "kernels/cpu/GemmMicroKernelAdapter.h"
+#include "kernels/cpu/gemm/GemmAutoTuner.h"
+#include "kernels/cpu/gemm/GemmMicroKernelAdapter.h"
 #include "tensors/TensorKernels.h"
 
 using namespace llaminar2;

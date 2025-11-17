@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "SimdTraits.h"
+#include "../SimdTraits.h"
 #include <algorithm>
 #include <cstring>
 
@@ -82,14 +82,13 @@ namespace llaminar2
                  *
                  * Call this once before processing all K-blocks for a tile.
                  */
-                __attribute__((always_inline))
-                inline void zero()
+                __attribute__((always_inline)) inline void zero()
                 {
-                    // Force full unrolling for all tile sizes
-                    #pragma GCC unroll 256
+// Force full unrolling for all tile sizes
+#pragma GCC unroll 256
                     for (int i = 0; i < TILE_M; ++i)
                     {
-                        #pragma GCC unroll 256
+#pragma GCC unroll 256
                         for (int j = 0; j < TILE_N; ++j)
                         {
                             accumulators_[i][j] = Traits::zero();
@@ -116,14 +115,13 @@ namespace llaminar2
                  * - Load b0 = B_panel[0 * k_panel + 32..47] (column 0, rows 32-47)
                  * - Accumulate: accumulators[0][0] += a0 * b0 (element-wise FMA)
                  */
-                __attribute__((always_inline))
-                inline void accumulate(const float * __restrict__ A_panel, 
-                                      const float * __restrict__ B_panel,
-                                      int k_panel, int offset)
+                __attribute__((always_inline)) inline void accumulate(const float *__restrict__ A_panel,
+                                                                      const float *__restrict__ B_panel,
+                                                                      int k_panel, int offset)
                 {
                     // Load A rows into temporary vectors
                     VectorType a_vecs[TILE_M];
-                    #pragma GCC unroll 256
+#pragma GCC unroll 256
                     for (int i = 0; i < TILE_M; ++i)
                     {
                         a_vecs[i] = Traits::load(A_panel + i * k_panel + offset);
@@ -131,19 +129,19 @@ namespace llaminar2
 
                     // Load B columns into temporary vectors
                     VectorType b_vecs[TILE_N];
-                    #pragma GCC unroll 256
+#pragma GCC unroll 256
                     for (int j = 0; j < TILE_N; ++j)
                     {
                         b_vecs[j] = Traits::load(B_panel + j * k_panel + offset);
                     }
 
-                    // Outer product accumulation (TILE_M × TILE_N FMAs)
-                    // Force complete unrolling - this is the critical hot path!
-                    #pragma GCC ivdep  // Ignore vector dependencies (false deps from array indexing)
-                    #pragma GCC unroll 256
+// Outer product accumulation (TILE_M × TILE_N FMAs)
+// Force complete unrolling - this is the critical hot path!
+#pragma GCC ivdep // Ignore vector dependencies (false deps from array indexing)
+#pragma GCC unroll 256
                     for (int i = 0; i < TILE_M; ++i)
                     {
-                        #pragma GCC unroll 256
+#pragma GCC unroll 256
                         for (int j = 0; j < TILE_N; ++j)
                         {
                             // Use register keyword to hint keeping in registers
@@ -162,16 +160,15 @@ namespace llaminar2
                  * @param a_vecs Array of TILE_M loaded A row vectors
                  * @param b_vecs Array of TILE_N loaded B column vectors
                  */
-                __attribute__((always_inline))
-                inline void accumulate_vectors(const VectorType * __restrict__ a_vecs, 
-                                              const VectorType * __restrict__ b_vecs)
+                __attribute__((always_inline)) inline void accumulate_vectors(const VectorType *__restrict__ a_vecs,
+                                                                              const VectorType *__restrict__ b_vecs)
                 {
-                    // Critical hot path: force complete unrolling
-                    #pragma GCC ivdep  // Ignore vector dependencies
-                    #pragma GCC unroll 256
+// Critical hot path: force complete unrolling
+#pragma GCC ivdep // Ignore vector dependencies
+#pragma GCC unroll 256
                     for (int i = 0; i < TILE_M; ++i)
                     {
-                        #pragma GCC unroll 256
+#pragma GCC unroll 256
                         for (int j = 0; j < TILE_N; ++j)
                         {
                             // Register hint to avoid memory spills
@@ -194,13 +191,12 @@ namespace llaminar2
                  *
                  * Layout: C_tile[i * TILE_N + j] = reduced value for (i, j)
                  */
-                __attribute__((always_inline))
-                inline void reduce(float *C_tile) const
+                __attribute__((always_inline)) inline void reduce(float *C_tile) const
                 {
-                    #pragma GCC unroll 256
+#pragma GCC unroll 256
                     for (int i = 0; i < TILE_M; ++i)
                     {
-                        #pragma GCC unroll 256
+#pragma GCC unroll 256
                         for (int j = 0; j < TILE_N; ++j)
                         {
                             C_tile[i * TILE_N + j] = Traits::reduce_add(accumulators_[i][j]);
@@ -217,13 +213,12 @@ namespace llaminar2
                  * @param alpha Scaling factor for computed result (typically 1.0)
                  * @param beta Scaling factor for existing C values (typically 0.0 or 1.0)
                  */
-                __attribute__((always_inline))
-                inline void reduce_accumulate(float *C_tile, float alpha, float beta) const
+                __attribute__((always_inline)) inline void reduce_accumulate(float *C_tile, float alpha, float beta) const
                 {
-                    #pragma GCC unroll 256
+#pragma GCC unroll 256
                     for (int i = 0; i < TILE_M; ++i)
                     {
-                        #pragma GCC unroll 256
+#pragma GCC unroll 256
                         for (int j = 0; j < TILE_N; ++j)
                         {
                             const int idx = i * TILE_N + j;

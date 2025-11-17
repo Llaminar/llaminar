@@ -10,8 +10,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/kernels/cpu/GemmMicroKernelAdapter.h"
-#include "../../../src/v2/kernels/cpu/GemmMicroKernelRegistry.h"
+#include "../../../src/v2/kernels/cpu/gemm/GemmMicroKernelAdapter.h"
+#include "../../../src/v2/kernels/cpu/gemm/GemmMicroKernelRegistry.h"
 #include "../../../src/v2/tensors/Tensors.h"
 #include <vector>
 #include <cstring>
