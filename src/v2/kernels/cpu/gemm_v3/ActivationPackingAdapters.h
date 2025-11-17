@@ -30,6 +30,15 @@
 namespace llaminar2
 {
 
+    namespace detail
+    {
+        inline int8_t apply_sign_bias(int8_t value)
+        {
+            const uint8_t biased = static_cast<uint8_t>(static_cast<uint8_t>(value) ^ 0x80u);
+            return static_cast<int8_t>(biased);
+        }
+    }
+
     /**
      * @brief Pack FP32 activations to int8 4x4-grouped format with per-row quantization
      *
@@ -66,7 +75,7 @@ namespace llaminar2
         // First pass: Quantize FP32 -> INT8 with per-row scaling
         std::vector<int8_t> A_int8(M_R * kblk, 0);
 
-#pragma omp parallel for schedule(static) if (mr * kblk >= 1024)
+#pragma omp parallel for schedule(dynamic) if (mr * kblk >= 1024)
         for (int m = 0; m < mr; ++m)
         {
             const int global_row = M0 + m;
@@ -95,7 +104,7 @@ namespace llaminar2
         }
 
         // Second pass: Pack INT8 data to 4x4-grouped layout
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
         for (int m_base = 0; m_base < mr; m_base += 4)
         {
             const int group_idx = m_base / 4;
@@ -112,30 +121,31 @@ namespace llaminar2
                     if (row_in_tile < mr)
                     {
                         const int8_t *src_row = A_int8.data() + row_in_tile * kblk + kk * 4;
-                        dst[lane * 4 + 0] = src_row[0];
-                        dst[lane * 4 + 1] = src_row[1];
-                        dst[lane * 4 + 2] = src_row[2];
-                        dst[lane * 4 + 3] = src_row[3];
+                        dst[lane * 4 + 0] = detail::apply_sign_bias(src_row[0]);
+                        dst[lane * 4 + 1] = detail::apply_sign_bias(src_row[1]);
+                        dst[lane * 4 + 2] = detail::apply_sign_bias(src_row[2]);
+                        dst[lane * 4 + 3] = detail::apply_sign_bias(src_row[3]);
                     }
                     else
                     {
-                        // Zero-pad partial groups
-                        dst[lane * 4 + 0] = 0;
-                        dst[lane * 4 + 1] = 0;
-                        dst[lane * 4 + 2] = 0;
-                        dst[lane * 4 + 3] = 0;
+                        // Zero-pad partial groups (biased zero = 0x80)
+                        const int8_t biased_zero = detail::apply_sign_bias(0);
+                        dst[lane * 4 + 0] = biased_zero;
+                        dst[lane * 4 + 1] = biased_zero;
+                        dst[lane * 4 + 2] = biased_zero;
+                        dst[lane * 4 + 3] = biased_zero;
                     }
                 }
             }
         }
 
         // Zero-pad remaining groups if mr < M_R
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
         for (int m_base = mr; m_base < M_R; m_base += 4)
         {
             const int group_idx = m_base / 4;
             int8_t *group_ptr = A_tile_packed + group_idx * group_stride;
-            std::memset(group_ptr, 0, group_stride);
+            std::memset(group_ptr, 0x80, group_stride);
         }
     }
 
@@ -190,18 +200,19 @@ namespace llaminar2
                     if (row_in_tile < mr && global_row < M)
                     {
                         const int8_t *src_row = A_int8 + global_row * K + k0 + kk * 4;
-                        dst[lane * 4 + 0] = src_row[0];
-                        dst[lane * 4 + 1] = src_row[1];
-                        dst[lane * 4 + 2] = src_row[2];
-                        dst[lane * 4 + 3] = src_row[3];
+                        dst[lane * 4 + 0] = detail::apply_sign_bias(src_row[0]);
+                        dst[lane * 4 + 1] = detail::apply_sign_bias(src_row[1]);
+                        dst[lane * 4 + 2] = detail::apply_sign_bias(src_row[2]);
+                        dst[lane * 4 + 3] = detail::apply_sign_bias(src_row[3]);
                     }
                     else
                     {
-                        // Zero-pad boundaries
-                        dst[lane * 4 + 0] = 0;
-                        dst[lane * 4 + 1] = 0;
-                        dst[lane * 4 + 2] = 0;
-                        dst[lane * 4 + 3] = 0;
+                        // Zero-pad boundaries (biased zero)
+                        const int8_t biased_zero = detail::apply_sign_bias(0);
+                        dst[lane * 4 + 0] = biased_zero;
+                        dst[lane * 4 + 1] = biased_zero;
+                        dst[lane * 4 + 2] = biased_zero;
+                        dst[lane * 4 + 3] = biased_zero;
                     }
                 }
             }
@@ -212,7 +223,7 @@ namespace llaminar2
         {
             const int group_idx = m_base / 4;
             int8_t *group_ptr = A_tile_packed + group_idx * group_stride;
-            std::memset(group_ptr, 0, group_stride);
+            std::memset(group_ptr, 0x80, group_stride);
         }
     }
 

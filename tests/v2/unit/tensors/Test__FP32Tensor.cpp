@@ -122,8 +122,9 @@ TEST(Test__FP32Tensor, DeviceAffinity)
  * A = [[1, 2, 3],    B^T = [[1, 4],     C = [[22, 49],
  *      [4, 5, 6]]            [2, 5],          [28, 64]]
  *                            [3, 6]]
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__FP32Tensor, GemmCorrectnessTranspose)
+TEST(Test__FP32Tensor, DISABLED_GemmCorrectnessTranspose)
 {
     // Create activation matrix A [2, 3]
     std::vector<float> A_data = {
@@ -181,8 +182,9 @@ TEST(Test__FP32Tensor, GemmCorrectnessTranspose)
  * @brief Test FP32 GEMM with alpha and beta parameters
  *
  * Tests C = alpha * A @ B^T + beta * C
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__FP32Tensor, GemmAlphaBeta)
+TEST(Test__FP32Tensor, DISABLED_GemmAlphaBeta)
 {
     // Simple 2x2 matrices
     std::vector<float> A_data = {1.0f, 2.0f, 3.0f, 4.0f}; // [2, 2]
@@ -226,8 +228,9 @@ TEST(Test__FP32Tensor, GemmAlphaBeta)
 
 /**
  * @brief Test FP32 GEMM with non-transposed weight matrix
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__FP32Tensor, GemmNoTranspose)
+TEST(Test__FP32Tensor, DISABLED_GemmNoTranspose)
 {
     // A = [2, 3], B = [3, 2] (stored non-transposed)
     std::vector<float> A_data = {
@@ -272,8 +275,9 @@ TEST(Test__FP32Tensor, GemmNoTranspose)
 
 /**
  * @brief Test FP32 GEMM with larger matrix (stress test)
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__FP32Tensor, GemmLargerMatrix)
+TEST(Test__FP32Tensor, DISABLED_GemmLargerMatrix)
 {
     const int m = 16, n = 32, k = 24;
 
@@ -642,5 +646,75 @@ TEST(Test__FP32Tensor, RoundTripFP32_BF16_FP32)
         EXPECT_LT(rel_error, 0.01f)
             << "Round-trip error too high at index " << i
             << ": original=" << original << ", roundtrip=" << roundtrip;
+    }
+}
+
+/**
+ * @brief Validate that FP32Tensor::from_int32_with_scales applies row/column scales and bias.
+ */
+TEST(Test__FP32Tensor, FromInt32WithScalesAppliesAllFactors)
+{
+    const int rows = 2;
+    const int cols = 3;
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    const std::vector<int32_t> accum = {
+        10, -20, 30,
+        -40, 50, -60};
+    const std::vector<float> row_scales = {0.1f, 0.2f};
+    const std::vector<float> col_scales = {1.0f, 2.0f, 0.5f};
+    const std::vector<float> bias = {0.5f, -1.5f, 0.0f};
+
+    const bool ok = tensor->from_int32_with_scales(
+        accum.data(),
+        rows,
+        cols,
+        row_scales.data(),
+        col_scales.data(),
+        bias.data());
+
+    ASSERT_TRUE(ok);
+
+    const float *data = tensor->data();
+    const std::vector<float> expected = {
+        1.5f,  // 10 * 0.1 * 1.0 + 0.5
+        -5.5f, // -20 * 0.1 * 2.0 - 1.5
+        1.5f,  // 30 * 0.1 * 0.5 + 0.0
+        -7.5f, // -40 * 0.2 * 1.0 + 0.5
+        18.5f, // 50 * 0.2 * 2.0 - 1.5
+        -6.0f  // -60 * 0.2 * 0.5 + 0.0
+    };
+
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_FLOAT_EQ(data[i], expected[i]) << "Mismatch at index " << i;
+    }
+}
+
+/**
+ * @brief Ensure FP32Tensor::from_int32_with_scales gracefully handles nullptr scale/bias arrays.
+ */
+TEST(Test__FP32Tensor, FromInt32WithScalesDefaultsWhenPointersNull)
+{
+    const int rows = 2;
+    const int cols = 2;
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    const std::vector<int32_t> accum = {
+        3, -6,
+        9, -12};
+
+    ASSERT_TRUE(tensor->from_int32_with_scales(
+        accum.data(),
+        rows,
+        cols,
+        nullptr,
+        nullptr,
+        nullptr));
+
+    const float *data = tensor->data();
+    for (size_t i = 0; i < accum.size(); ++i)
+    {
+        EXPECT_FLOAT_EQ(data[i], static_cast<float>(accum[i])) << "Index " << i << " should remain unchanged";
     }
 }

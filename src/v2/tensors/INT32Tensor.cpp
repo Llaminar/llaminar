@@ -328,6 +328,51 @@ namespace llaminar2
         dequantizeINT32ToFP32(host_int32_data_.data(), dst, scale_, count);
     }
 
+    bool INT32Tensor::from_int32_with_scales(
+        const int32_t *accum,
+        int rows,
+        int cols,
+        const float *row_scales,
+        const float *col_scales,
+        const float *bias)
+    {
+        (void)col_scales;
+        (void)bias;
+
+        if (!accum)
+        {
+            LOG_ERROR("[INT32Tensor::from_int32_with_scales] accum buffer is null");
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[INT32Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
+            return false;
+        }
+        if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
+        {
+            LOG_ERROR("[INT32Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
+                                                                                       << ", " << shape_[1] << "] input=[" << rows << ", " << cols << "]");
+            return false;
+        }
+
+        const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        std::memcpy(host_int32_data_.data(), accum, total * sizeof(int32_t));
+
+        if (row_scales)
+        {
+            row_scales_.assign(row_scales, row_scales + rows);
+        }
+        else
+        {
+            row_scales_.clear();
+        }
+
+        dequant_cache_.clear();
+        return true;
+    }
+
     void INT32Tensor::to_bf16(uint16_t *dst) const
     {
         LOG_ERROR("[INT32Tensor] to_bf16 not yet implemented");
@@ -383,6 +428,11 @@ namespace llaminar2
         }
 
         dequantizeINT32ToFP32(host_int32_data_.data() + offset, buffer, scale_, count);
+    }
+
+    ActivationPack INT32Tensor::to_int8_activation_pack(int rows, int cols) const
+    {
+        return pack_activation_rows_to_int8(rows, cols);
     }
 
     std::shared_ptr<TensorBase> INT32Tensor::create_view(

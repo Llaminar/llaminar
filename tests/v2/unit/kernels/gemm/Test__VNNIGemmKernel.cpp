@@ -34,6 +34,16 @@
 namespace llaminar2
 {
 
+    namespace
+    {
+        inline int8_t apply_sign_bias(int8_t value)
+        {
+            return static_cast<int8_t>(static_cast<uint8_t>(value) ^ 0x80u);
+        }
+
+        constexpr int8_t kBiasedZero = static_cast<int8_t>(0x80);
+    }
+
     class Test__VNNIGemmKernel : public ::testing::Test
     {
     protected:
@@ -948,7 +958,7 @@ namespace llaminar2
                 for (int offset = 0; offset < 4; ++offset)
                 {
                     const int k_idx = tail_chunk * 4 + offset;
-                    const int8_t expected = A[row * K + k_idx];
+                    const int8_t expected = apply_sign_bias(A[row * K + k_idx]);
                     const int8_t packed_val = chunk_ptr[lane * 4 + offset];
                     ASSERT_EQ(packed_val, expected)
                         << "Mismatch at group " << g
@@ -998,13 +1008,13 @@ namespace llaminar2
                 if (lane < mr)
                 {
                     const int row = M0 + lane;
-                    const int8_t expected = A[row * K + offset];
+                    const int8_t expected = apply_sign_bias(A[row * K + offset]);
                     ASSERT_EQ(val, expected)
                         << "Row copy mismatch for lane " << lane << ", offset " << offset;
                 }
                 else
                 {
-                    ASSERT_EQ(val, 0)
+                    ASSERT_EQ(val, kBiasedZero)
                         << "Expected zero-padding for lane " << lane << ", offset " << offset;
                 }
             }
@@ -1015,7 +1025,7 @@ namespace llaminar2
             const int8_t *group_ptr = A_packed.data() + static_cast<size_t>(g) * group_stride;
             for (int i = 0; i < group_stride; ++i)
             {
-                ASSERT_EQ(group_ptr[i], 0)
+                ASSERT_EQ(group_ptr[i], kBiasedZero)
                     << "Expected zero in padded group " << g << ", byte " << i;
             }
         }

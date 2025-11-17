@@ -30,6 +30,15 @@ namespace llaminar2
     namespace simd
     {
 
+#if defined(__GNUC__) || defined(__clang__)
+        inline void prefetch_read(const void *addr)
+        {
+            __builtin_prefetch(addr, 0, 1);
+        }
+#else
+        inline void prefetch_read(const void *) {}
+#endif
+
         // Re-export CPU feature detection for compatibility
         using llaminar2::cpu_supports_avx;
         using llaminar2::cpu_supports_avx2;
@@ -314,6 +323,287 @@ namespace llaminar2
         }
 
         // ========================================================================
+        // Activation Packing Helpers (row-wise max/quantize with SIMD fallbacks)
+        // ========================================================================
+
+        inline float activation_row_max_abs_scalar(const float *row, int length)
+        {
+            float max_abs = 0.0f;
+            for (int i = 0; i < length; ++i)
+            {
+                max_abs = std::max(max_abs, std::fabs(row[i]));
+            }
+            return max_abs;
+        }
+
+#if defined(__AVX2__)
+        inline float activation_row_max_abs_avx2(const float *row, int length);
+#endif
+
+#if defined(__AVX512F__)
+        inline float activation_row_max_abs_avx512(const float *row, int length)
+        {
+            const __m512 sign_mask = _mm512_set1_ps(-0.0f);
+            __m512 max_vec0 = _mm512_setzero_ps();
+            __m512 max_vec1 = _mm512_setzero_ps();
+            int i = 0;
+
+            for (; i + 32 <= length; i += 32)
+            {
+                prefetch_read(row + i + 64);
+                __m512 v0 = _mm512_loadu_ps(row + i);
+                __m512 v1 = _mm512_loadu_ps(row + i + 16);
+                max_vec0 = _mm512_max_ps(max_vec0, _mm512_andnot_ps(sign_mask, v0));
+                max_vec1 = _mm512_max_ps(max_vec1, _mm512_andnot_ps(sign_mask, v1));
+            }
+
+            __m512 max_vec = _mm512_max_ps(max_vec0, max_vec1);
+
+            if (i + 16 <= length)
+            {
+                __m512 v = _mm512_loadu_ps(row + i);
+                max_vec = _mm512_max_ps(max_vec, _mm512_andnot_ps(sign_mask, v));
+                i += 16;
+            }
+
+            float max_abs = _mm512_reduce_max_ps(max_vec);
+            const int remaining = length - i;
+            if (remaining > 0)
+            {
+#if defined(__AVX2__)
+                if (cpu_supports_avx2())
+                {
+                    const float tail = activation_row_max_abs_avx2(row + i, remaining);
+                    return std::max(max_abs, tail);
+                }
+#endif
+                for (; i < length; ++i)
+                {
+                    max_abs = std::max(max_abs, std::fabs(row[i]));
+                }
+            }
+            return max_abs;
+        }
+#endif
+
+#if defined(__AVX2__)
+        inline float activation_row_max_abs_horizontal_max(__m256 vec)
+        {
+            alignas(32) float tmp[8];
+            _mm256_store_ps(tmp, vec);
+            float max_abs = 0.0f;
+            for (float val : tmp)
+            {
+                max_abs = std::max(max_abs, val);
+            }
+            return max_abs;
+        }
+
+        inline float activation_row_max_abs_avx2(const float *row, int length)
+        {
+            const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+            __m256 max_vec = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 8 <= length; i += 8)
+            {
+                prefetch_read(row + i + 32);
+                __m256 v = _mm256_loadu_ps(row + i);
+                __m256 abs_v = _mm256_andnot_ps(sign_mask, v);
+                max_vec = _mm256_max_ps(max_vec, abs_v);
+            }
+
+            float max_abs = activation_row_max_abs_horizontal_max(max_vec);
+            for (; i < length; ++i)
+            {
+                max_abs = std::max(max_abs, std::fabs(row[i]));
+            }
+            return max_abs;
+        }
+#endif
+
+        inline float activation_row_max_abs(const float *row, int length)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                return activation_row_max_abs_avx512(row, length);
+            }
+#endif
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                return activation_row_max_abs_avx2(row, length);
+            }
+#endif
+            return activation_row_max_abs_scalar(row, length);
+        }
+
+        inline void quantize_activation_row_scalar(const float *src, int length, float inv_scale, int8_t *dst)
+        {
+            if (inv_scale == 0.0f)
+            {
+                std::memset(dst, 0, static_cast<size_t>(length));
+                return;
+            }
+
+            for (int i = 0; i < length; ++i)
+            {
+                const float q = std::round(src[i] * inv_scale);
+                const float clamped = std::min(127.0f, std::max(-127.0f, q));
+                dst[i] = static_cast<int8_t>(clamped);
+            }
+        }
+
+#if defined(__AVX2__)
+        inline void quantize_activation_row_avx2(const float *src, int length, float inv_scale, int8_t *dst);
+#endif
+
+#if defined(__AVX512F__)
+        inline void quantize_activation_row_avx512(const float *src, int length, float inv_scale, int8_t *dst)
+        {
+            if (inv_scale == 0.0f)
+            {
+                std::memset(dst, 0, static_cast<size_t>(length));
+                return;
+            }
+
+            const __m512 scale_vec = _mm512_set1_ps(inv_scale);
+            const __m512i max_vec = _mm512_set1_epi32(127);
+            const __m512i min_vec = _mm512_set1_epi32(-127);
+            int i = 0;
+            alignas(64) int32_t tmp0[16];
+            alignas(64) int32_t tmp1[16];
+
+            for (; i + 32 <= length; i += 32)
+            {
+                prefetch_read(src + i + 64);
+                __m512 vals0 = _mm512_loadu_ps(src + i);
+                __m512 vals1 = _mm512_loadu_ps(src + i + 16);
+
+                __m512 scaled0 = _mm512_mul_ps(vals0, scale_vec);
+                __m512 scaled1 = _mm512_mul_ps(vals1, scale_vec);
+
+                __m512i rounded0 = _mm512_cvtps_epi32(scaled0);
+                __m512i rounded1 = _mm512_cvtps_epi32(scaled1);
+
+                __m512i clamped0 = _mm512_max_epi32(min_vec, _mm512_min_epi32(max_vec, rounded0));
+                __m512i clamped1 = _mm512_max_epi32(min_vec, _mm512_min_epi32(max_vec, rounded1));
+
+                _mm512_store_si512(reinterpret_cast<__m512i *>(tmp0), clamped0);
+                _mm512_store_si512(reinterpret_cast<__m512i *>(tmp1), clamped1);
+
+                for (int lane = 0; lane < 16; ++lane)
+                {
+                    dst[i + lane] = static_cast<int8_t>(tmp0[lane]);
+                    dst[i + lane + 16] = static_cast<int8_t>(tmp1[lane]);
+                }
+            }
+
+            if (i + 16 <= length)
+            {
+                alignas(64) int32_t tmp_tail[16];
+                __m512 vals = _mm512_loadu_ps(src + i);
+                __m512 scaled = _mm512_mul_ps(vals, scale_vec);
+                __m512i rounded = _mm512_cvtps_epi32(scaled);
+                __m512i clamped = _mm512_max_epi32(min_vec, _mm512_min_epi32(max_vec, rounded));
+                _mm512_store_si512(reinterpret_cast<__m512i *>(tmp_tail), clamped);
+                for (int lane = 0; lane < 16; ++lane)
+                {
+                    dst[i + lane] = static_cast<int8_t>(tmp_tail[lane]);
+                }
+                i += 16;
+            }
+
+            const int remaining = length - i;
+            if (remaining > 0)
+            {
+#if defined(__AVX2__)
+                if (cpu_supports_avx2())
+                {
+                    quantize_activation_row_avx2(src + i, remaining, inv_scale, dst + i);
+                    return;
+                }
+#endif
+                quantize_activation_row_scalar(src + i, remaining, inv_scale, dst + i);
+            }
+        }
+#endif
+
+#if defined(__AVX2__)
+        inline void quantize_activation_row_avx2(const float *src, int length, float inv_scale, int8_t *dst)
+        {
+            if (inv_scale == 0.0f)
+            {
+                std::memset(dst, 0, static_cast<size_t>(length));
+                return;
+            }
+
+            const __m256 scale_vec = _mm256_set1_ps(inv_scale);
+            const __m256i max_vec = _mm256_set1_epi32(127);
+            const __m256i min_vec = _mm256_set1_epi32(-127);
+            int i = 0;
+            alignas(32) int32_t tmp[8];
+
+            for (; i + 8 <= length; i += 8)
+            {
+                prefetch_read(src + i + 32);
+                __m256 vals = _mm256_loadu_ps(src + i);
+                __m256 scaled = _mm256_mul_ps(vals, scale_vec);
+                __m256i rounded = _mm256_cvtps_epi32(scaled);
+                __m256i clamped = _mm256_max_epi32(min_vec, _mm256_min_epi32(max_vec, rounded));
+                _mm256_store_si256(reinterpret_cast<__m256i *>(tmp), clamped);
+                for (int lane = 0; lane < 8; ++lane)
+                {
+                    dst[i + lane] = static_cast<int8_t>(tmp[lane]);
+                }
+            }
+
+            const __m128 scale_vec128 = _mm_set1_ps(inv_scale);
+            const __m128i max_vec128 = _mm_set1_epi32(127);
+            const __m128i min_vec128 = _mm_set1_epi32(-127);
+            alignas(16) int32_t tmp4[4];
+            for (; i + 4 <= length; i += 4)
+            {
+                __m128 vals = _mm_loadu_ps(src + i);
+                __m128 scaled = _mm_mul_ps(vals, scale_vec128);
+                __m128i rounded = _mm_cvtps_epi32(scaled);
+                __m128i clamped = _mm_max_epi32(min_vec128, _mm_min_epi32(max_vec128, rounded));
+                _mm_store_si128(reinterpret_cast<__m128i *>(tmp4), clamped);
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    dst[i + lane] = static_cast<int8_t>(tmp4[lane]);
+                }
+            }
+
+            for (; i < length; ++i)
+            {
+                const float q = std::round(src[i] * inv_scale);
+                const float clamped = std::min(127.0f, std::max(-127.0f, q));
+                dst[i] = static_cast<int8_t>(clamped);
+            }
+        }
+#endif
+
+        inline void quantize_activation_row(const float *src, int length, float inv_scale, int8_t *dst)
+        {
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                quantize_activation_row_avx512(src, length, inv_scale, dst);
+                return;
+            }
+#endif
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                quantize_activation_row_avx2(src, length, inv_scale, dst);
+                return;
+            }
+#endif
+            quantize_activation_row_scalar(src, length, inv_scale, dst);
+        }
+
+        // ========================================================================
         // AVX-512 Conversion Helpers (16 elements at a time)
         // ========================================================================
 
@@ -408,6 +698,122 @@ namespace llaminar2
             for (size_t i = 0; i < count; ++i)
             {
                 output[i] = static_cast<float>(input[i]) * scale;
+            }
+        }
+
+        // ========================================================================
+        // INT32 → FP32 Requantization Helpers
+        // ========================================================================
+
+        inline void requantize_int32_row_to_fp32_scalar(
+            const int32_t *src,
+            float *dst,
+            int cols,
+            float row_scale,
+            const float *col_scales,
+            const float *bias)
+        {
+            for (int c = 0; c < cols; ++c)
+            {
+                const float col_scale = col_scales ? col_scales[c] : 1.0f;
+                float value = static_cast<float>(src[c]) * row_scale * col_scale;
+                if (bias)
+                {
+                    value += bias[c];
+                }
+                dst[c] = value;
+            }
+        }
+
+        inline void requantize_int32_row_to_fp32(
+            const int32_t *src,
+            float *dst,
+            int cols,
+            float row_scale,
+            const float *col_scales,
+            const float *bias)
+        {
+            int c = 0;
+
+#if defined(__AVX512F__)
+            const __m512 vrow = _mm512_set1_ps(row_scale);
+            const __m512 vone512 = _mm512_set1_ps(1.0f);
+            for (; c + 16 <= cols; c += 16)
+            {
+                __m512i vsrc = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(src + c));
+                __m512 vfp = _mm512_cvtepi32_ps(vsrc);
+                __m512 vcol = col_scales ? _mm512_loadu_ps(col_scales + c) : vone512;
+                __m512 vout = _mm512_mul_ps(vfp, vcol);
+                vout = _mm512_mul_ps(vout, vrow);
+                if (bias)
+                {
+                    vout = _mm512_add_ps(vout, _mm512_loadu_ps(bias + c));
+                }
+                _mm512_storeu_ps(dst + c, vout);
+            }
+#endif
+
+#if defined(__AVX2__)
+            const __m256 vrow256 = _mm256_set1_ps(row_scale);
+            const __m256 vone256 = _mm256_set1_ps(1.0f);
+            for (; c + 8 <= cols; c += 8)
+            {
+                __m256i vsrc = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + c));
+                __m256 vfp = _mm256_cvtepi32_ps(vsrc);
+                __m256 vcol = col_scales ? _mm256_loadu_ps(col_scales + c) : vone256;
+                __m256 vout = _mm256_mul_ps(vfp, vcol);
+                vout = _mm256_mul_ps(vout, vrow256);
+                if (bias)
+                {
+                    vout = _mm256_add_ps(vout, _mm256_loadu_ps(bias + c));
+                }
+                _mm256_storeu_ps(dst + c, vout);
+            }
+#endif
+
+#if defined(__SSE2__)
+            const __m128 vrow128 = _mm_set1_ps(row_scale);
+            const __m128 vone128 = _mm_set1_ps(1.0f);
+            for (; c + 4 <= cols; c += 4)
+            {
+                __m128i vsrc = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + c));
+                __m128 vfp = _mm_cvtepi32_ps(vsrc);
+                __m128 vcol = col_scales ? _mm_loadu_ps(col_scales + c) : vone128;
+                __m128 vout = _mm_mul_ps(vfp, vcol);
+                vout = _mm_mul_ps(vout, vrow128);
+                if (bias)
+                {
+                    vout = _mm_add_ps(vout, _mm_loadu_ps(bias + c));
+                }
+                _mm_storeu_ps(dst + c, vout);
+            }
+#endif
+
+            const float *col_tail = col_scales ? (col_scales + c) : nullptr;
+            const float *bias_tail = bias ? (bias + c) : nullptr;
+            requantize_int32_row_to_fp32_scalar(src + c, dst + c, cols - c, row_scale, col_tail, bias_tail);
+        }
+
+        inline void requantize_int32_matrix_to_fp32(
+            const int32_t *src,
+            float *dst,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias)
+        {
+            for (int r = 0; r < rows; ++r)
+            {
+                const float row_scale = row_scales ? row_scales[r] : 1.0f;
+                const size_t offset = static_cast<size_t>(r) * static_cast<size_t>(cols);
+                requantize_int32_row_to_fp32(
+                    src + offset,
+                    dst + offset,
+                    cols,
+                    row_scale,
+                    col_scales,
+                    bias);
             }
         }
 
@@ -974,7 +1380,7 @@ namespace llaminar2
             float inv_scale = 1.0f / scale;
 
             // Quantize to int8 AND compute sum simultaneously
-            int32_t sum_i32 = 0;  // Nov 2024: Store raw integer sum, not scaled FP sum!
+            int32_t sum_i32 = 0; // Nov 2024: Store raw integer sum, not scaled FP sum!
             for (int i = 0; i < 32; ++i)
             {
                 float val = src[i];
@@ -1108,7 +1514,7 @@ namespace llaminar2
             const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
 
             // Quantize AND compute sum (4 iterations for 32 elements)
-            int32_t sum_i32 = 0;  // Nov 2024: Store raw integer sum, not scaled FP sum!
+            int32_t sum_i32 = 0; // Nov 2024: Store raw integer sum, not scaled FP sum!
             for (int i = 0; i < 4; ++i)
             {
                 __m256 vf = _mm256_loadu_ps(src + i * 8);

@@ -112,8 +112,9 @@ TEST(Test__BF16Tensor, ConversionAccuracy)
  * @brief Test BF16 GEMM correctness with small known matrix
  *
  * Same test as FP32 but with BF16 precision tolerance.
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, GemmCorrectnessTranspose)
+TEST(Test__BF16Tensor, DISABLED_GemmCorrectnessTranspose)
 {
     // Create activation matrix A [2, 3] in FP32
     std::vector<float> A_data = {
@@ -159,8 +160,9 @@ TEST(Test__BF16Tensor, GemmCorrectnessTranspose)
 
 /**
  * @brief Test BF16 GEMM with alpha and beta parameters
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, GemmAlphaBeta)
+TEST(Test__BF16Tensor, DISABLED_GemmAlphaBeta)
 {
     // Simple 2x2 identity-like operation
     std::vector<float> A_data = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -192,8 +194,9 @@ TEST(Test__BF16Tensor, GemmAlphaBeta)
 
 /**
  * @brief Test BF16 GEMM with non-transposed layout
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, GemmNoTranspose)
+TEST(Test__BF16Tensor, DISABLED_GemmNoTranspose)
 {
     std::vector<float> A_data = {
         1.0f, 2.0f, 3.0f,
@@ -227,11 +230,52 @@ TEST(Test__BF16Tensor, GemmNoTranspose)
 }
 
 /**
+ * @brief Ensure BF16Tensor::from_int32_with_scales applies scaling and bias correctly.
+ */
+TEST(Test__BF16Tensor, FromInt32WithScalesProducesExpectedValues)
+{
+    const int rows = 2;
+    const int cols = 2;
+    auto tensor = std::make_shared<BF16Tensor>(std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    const std::vector<int32_t> accum = {
+        64, -32,
+        16, -8};
+    const std::vector<float> row_scales = {0.5f, 0.25f};
+    const std::vector<float> col_scales = {1.0f, 2.0f};
+    const std::vector<float> bias = {0.0f, 1.0f};
+
+    ASSERT_TRUE(tensor->from_int32_with_scales(
+        accum.data(),
+        rows,
+        cols,
+        row_scales.data(),
+        col_scales.data(),
+        bias.data()));
+
+    const float *fp32_view = tensor->data();
+    ASSERT_NE(fp32_view, nullptr);
+
+    const std::vector<float> expected = {
+        32.0f,  // 64 * 0.5 * 1.0 + 0.0
+        -31.0f, // -32 * 0.5 * 2.0 + 1.0
+        4.0f,   // 16 * 0.25 * 1.0 + 0.0
+        -3.0f   // -8 * 0.25 * 2.0 + 1.0
+    };
+
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_FLOAT_EQ(fp32_view[i], expected[i]) << "Mismatch at index " << i;
+    }
+}
+
+/**
  * @brief Test BF16 GEMM with larger matrix
  *
  * Stress test to verify BF16 precision holds up with accumulation.
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, GemmLargerMatrix)
+TEST(Test__BF16Tensor, DISABLED_GemmLargerMatrix)
 {
     const int m = 16, n = 32, k = 24;
 
@@ -324,8 +368,9 @@ TEST(Test__BF16Tensor, PrecisionLoss)
 
 /**
  * @brief Test edge case: zero matrix GEMM
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, GemmZeroMatrix)
+TEST(Test__BF16Tensor, DISABLED_GemmZeroMatrix)
 {
     // A is all zeros
     std::vector<float> A_data(6, 0.0f); // [2, 3]
@@ -357,8 +402,9 @@ TEST(Test__BF16Tensor, GemmZeroMatrix)
 
 /**
  * @brief Test createGemm returns valid kernel
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, CreateGemmNotNull)
+TEST(Test__BF16Tensor, DISABLED_CreateGemmNotNull)
 {
     std::vector<uint16_t> data(10, fp32_to_bf16(1.0f));
     auto tensor = std::make_shared<BF16Tensor>(std::vector<size_t>{2, 5}, data);
@@ -643,8 +689,9 @@ TEST(Test__BF16Tensor, MultipleViews)
  *
  * Tests multiply_activations with both A and B as FP32 activation buffers,
  * converted to BF16 internally for computation.
+ * DEPRECATED: Uses old GEMM kernels (kernels/cpu/gemm). OneDNN v4 replaces this.
  */
-TEST(Test__BF16Tensor, ActivationGemmQKT)
+TEST(Test__BF16Tensor, DISABLED_ActivationGemmQKT)
 {
     // Small attention-like computation: Q @ K^T
     // Q: [4, 8] (seq_len=4, head_dim=8)

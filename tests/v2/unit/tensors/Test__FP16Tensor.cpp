@@ -113,6 +113,44 @@ TEST(Test__FP16Tensor, DataAccess)
     EXPECT_NEAR(fp32_data[5], 6.0f, 1e-3f);
 }
 
+/**
+ * @brief Verify FP16Tensor::from_int32_with_scales populates FP16 storage with scaled values.
+ */
+TEST(Test__FP16Tensor, FromInt32WithScalesWritesExpectedValues)
+{
+    const int rows = 1;
+    const int cols = 4;
+    auto tensor = std::make_shared<FP16Tensor>(std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    const std::vector<int32_t> accum = {5, -10, 15, -20};
+    const std::vector<float> row_scales = {0.25f};
+    const std::vector<float> col_scales = {1.0f, 0.5f, 2.0f, 1.0f};
+    const std::vector<float> bias = {0.0f, 1.0f, -2.0f, 0.5f};
+
+    ASSERT_TRUE(tensor->from_int32_with_scales(
+        accum.data(),
+        rows,
+        cols,
+        row_scales.data(),
+        col_scales.data(),
+        bias.data()));
+
+    const float *fp32_view = tensor->data();
+    ASSERT_NE(fp32_view, nullptr);
+
+    const std::vector<float> expected = {
+        1.25f,  // 5 * 0.25 * 1.0 + 0.0
+        -0.25f, // -10 * 0.25 * 0.5 + 1.0
+        5.5f,   // 15 * 0.25 * 2.0 - 2.0
+        -4.5f   // -20 * 0.25 * 1.0 + 0.5
+    };
+
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_NEAR(fp32_view[i], expected[i], 1e-3f) << "Mismatch at index " << i;
+    }
+}
+
 // ========== View Tests ==========
 
 /**

@@ -260,6 +260,118 @@ namespace llaminar2
         return false;
     }
 
+    bool Q8_1Tensor::from_int32_with_scales(
+        const int32_t *accum,
+        int rows,
+        int cols,
+        const float *row_scales,
+        const float *col_scales,
+        const float *bias)
+    {
+        if (!accum)
+        {
+            LOG_ERROR("[Q8_1Tensor::from_int32_with_scales] accum buffer is null");
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[Q8_1Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
+            return false;
+        }
+        if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
+        {
+            LOG_ERROR("[Q8_1Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
+                                                                                      << ", " << shape_[1] << "] input=[" << rows << ", " << cols << "]");
+            return false;
+        }
+
+        const size_t total_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        const size_t total_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+
+        uint8_t *dst_bytes = nullptr;
+        if (is_view_)
+        {
+            if (!raw_data_ptr_)
+            {
+                LOG_ERROR("[Q8_1Tensor::from_int32_with_scales] view has no parent data pointer");
+                return false;
+            }
+            dst_bytes = const_cast<uint8_t *>(raw_data_ptr_) + view_byte_offset_;
+        }
+        else
+        {
+            const size_t required_bytes = total_blocks * sizeof(Q8_1Block);
+            if (raw_data_.size() < required_bytes)
+            {
+                raw_data_.resize(required_bytes);
+            }
+            dst_bytes = raw_data_.data();
+        }
+
+        Q8_1Block *blocks = reinterpret_cast<Q8_1Block *>(dst_bytes);
+
+        thread_local std::vector<float> temp_fp32;
+        temp_fp32.resize(total_elements);
+        simd::requantize_int32_matrix_to_fp32(
+            accum,
+            temp_fp32.data(),
+            rows,
+            cols,
+            row_scales,
+            col_scales,
+            bias);
+
+#pragma omp parallel for if (total_blocks > 4)
+        for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+        {
+            const size_t offset = block_idx * Q8_1Block::BLOCK_SIZE;
+            const size_t count = std::min(Q8_1Block::BLOCK_SIZE, total_elements - offset);
+
+            Q8_1Block &block = blocks[block_idx];
+
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(temp_fp32[offset + i]));
+            }
+
+            const float d = (max_abs > 1e-10f) ? (max_abs / 127.0f) : 0.0f;
+            block.d = fp32_to_fp16(d);
+
+            int32_t sum_i32 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float scaled = temp_fp32[offset + i] * inv_d;
+                    const float clamped = std::max(-127.0f, std::min(127.0f, scaled));
+                    const int8_t quantized = static_cast<int8_t>(std::round(clamped));
+                    block.qs[i] = quantized;
+                    sum_i32 += static_cast<int32_t>(quantized);
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
+            }
+
+            for (size_t i = count; i < Q8_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            block.sum_qs = static_cast<int16_t>(sum_i32);
+        }
+
+        dequant_cache_.clear();
+        return true;
+    }
+
     void Q8_1Tensor::decodeBlockScalar(const Q8_1Block &block, float *output)
     {
         // Scalar implementation for Q8_1: scale * int8 value
@@ -452,6 +564,11 @@ namespace llaminar2
         std::vector<float> temp_fp32(element_count());
         to_fp32(temp_fp32.data());
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
+    }
+
+    ActivationPack Q8_1Tensor::to_int8_activation_pack(int rows, int cols) const
+    {
+        return pack_activation_rows_to_int8(rows, cols);
     }
 
     const Q8_1Block *Q8_1Tensor::decode_to_q8_1(size_t row_idx, size_t k_block_offset) const

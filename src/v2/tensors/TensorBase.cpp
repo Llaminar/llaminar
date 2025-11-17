@@ -8,6 +8,7 @@
 #include "Tensors.h"
 #include "TensorKernels.h"
 #include "SIMDHelpers.h"
+#include "../utils/CPUFeatures.h"
 #include "../utils/Logger.h"
 #include <stdexcept>
 #include <cmath>
@@ -159,6 +160,52 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    ActivationPack TensorBase::pack_activation_rows_to_int8(int rows, int cols) const
+    {
+        if (rows <= 0 || cols <= 0)
+        {
+            LOG_ERROR("[TensorBase] pack_activation_rows_to_int8 requires positive dimensions");
+            return {};
+        }
+
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            LOG_ERROR("[TensorBase] pack_activation_rows_to_int8 requires 2D tensor, got " << shp.size() << "D");
+            return {};
+        }
+        if (static_cast<size_t>(rows) > shp[0] || static_cast<size_t>(cols) != shp[1])
+        {
+            LOG_ERROR("[TensorBase] pack_activation_rows_to_int8 dimension mismatch: tensor is ["
+                      << shp[0] << ", " << shp[1] << "], requested " << rows << "x" << cols);
+            return {};
+        }
+
+        ActivationPack pack;
+        pack.rows = rows;
+        pack.cols = cols;
+        const size_t row_stride = static_cast<size_t>(cols);
+        const size_t total = row_stride * static_cast<size_t>(rows);
+        pack.data.resize(total, 0);
+        pack.row_scales.resize(static_cast<size_t>(rows), 1.0f);
+
+        std::vector<float> row_buffer(row_stride, 0.0f);
+        for (int m = 0; m < rows; ++m)
+        {
+            to_fp32_row(static_cast<size_t>(m), row_buffer.data());
+
+            const float max_abs = simd::activation_row_max_abs(row_buffer.data(), cols);
+            const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            pack.row_scales[static_cast<size_t>(m)] = scale;
+            const float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+            int8_t *row_dst = pack.data.data() + static_cast<size_t>(m) * row_stride;
+            simd::quantize_activation_row(row_buffer.data(), cols, inv_scale, row_dst);
+        }
+
+        return pack;
     }
 
     // ===== Template Specializations for to<T>() =====

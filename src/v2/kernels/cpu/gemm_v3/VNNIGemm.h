@@ -18,6 +18,18 @@
 
 namespace llaminar2
 {
+    namespace detail
+    {
+        [[gnu::cold]] inline __m512i load_b_vec_tail(const int8_t *src, int copy_cols, int ld_col, int8_t *buffer)
+        {
+            std::memset(buffer, 0, 64);
+            if (copy_cols > 0 && src != nullptr)
+            {
+                std::memcpy(buffer, src, static_cast<size_t>(copy_cols) * ld_col);
+            }
+            return _mm512_loadu_si512(reinterpret_cast<const void *>(buffer));
+        }
+    }
 
     template <int Lane>
     inline __m512i broadcast_row_vec(const __m128i &src)
@@ -76,6 +88,7 @@ namespace llaminar2
 
         const int K_chunks = kblk / 4;
         const int group_stride = K_chunks * 16;
+        const __m128i xor_mask = _mm_set1_epi8(static_cast<char>(0x80));
 
         // Pack real rows with vectorization and ILP
         for (int m_base = 0; m_base < mr; m_base += 4)
@@ -127,8 +140,12 @@ namespace llaminar2
                         *reinterpret_cast<int32_t *>(&temp1[(lane + 1) * 4]) = *reinterpret_cast<const int32_t *>(src1_chunk1);
                     }
 
-                    _mm_store_si128(reinterpret_cast<__m128i *>(dst0), _mm_load_si128(reinterpret_cast<const __m128i *>(temp0)));
-                    _mm_store_si128(reinterpret_cast<__m128i *>(dst1), _mm_load_si128(reinterpret_cast<const __m128i *>(temp1)));
+                    __m128i vec0 = _mm_load_si128(reinterpret_cast<const __m128i *>(temp0));
+                    __m128i vec1 = _mm_load_si128(reinterpret_cast<const __m128i *>(temp1));
+                    vec0 = _mm_xor_si128(vec0, xor_mask);
+                    vec1 = _mm_xor_si128(vec1, xor_mask);
+                    _mm_store_si128(reinterpret_cast<__m128i *>(dst0), vec0);
+                    _mm_store_si128(reinterpret_cast<__m128i *>(dst1), vec1);
                 }
 
                 // Tail handling for odd K_chunks
@@ -143,7 +160,9 @@ namespace llaminar2
                         const int8_t *src = A + m * K + (k0 + kk * 4);
                         *reinterpret_cast<int32_t *>(&temp[lane * 4]) = *reinterpret_cast<const int32_t *>(src);
                     }
-                    _mm_store_si128(reinterpret_cast<__m128i *>(dst), _mm_load_si128(reinterpret_cast<const __m128i *>(temp)));
+                    __m128i vec = _mm_load_si128(reinterpret_cast<const __m128i *>(temp));
+                    vec = _mm_xor_si128(vec, xor_mask);
+                    _mm_store_si128(reinterpret_cast<__m128i *>(dst), vec);
                 }
             }
             else
@@ -152,6 +171,7 @@ namespace llaminar2
                 for (int kk = 0; kk < K_chunks; ++kk)
                 {
                     int8_t *dst = group_ptr + kk * 16;
+                    alignas(16) int8_t temp[16];
 
                     for (int lane = 0; lane < 4; ++lane)
                     {
@@ -161,14 +181,18 @@ namespace llaminar2
                         if (row_in_tile < mr && m < M)
                         {
                             const int8_t *src = A + m * K + (k0 + kk * 4);
-                            *reinterpret_cast<int32_t *>(&dst[lane * 4]) = *reinterpret_cast<const int32_t *>(src);
+                            *reinterpret_cast<int32_t *>(&temp[lane * 4]) = *reinterpret_cast<const int32_t *>(src);
                         }
                         else
                         {
                             // Zero-pad partial rows
-                            *reinterpret_cast<int32_t *>(&dst[lane * 4]) = 0;
+                            *reinterpret_cast<int32_t *>(&temp[lane * 4]) = 0;
                         }
                     }
+
+                    __m128i vec = _mm_load_si128(reinterpret_cast<const __m128i *>(temp));
+                    vec = _mm_xor_si128(vec, xor_mask);
+                    _mm_store_si128(reinterpret_cast<__m128i *>(dst), vec);
                 }
             }
         }
@@ -180,11 +204,10 @@ namespace llaminar2
             const int group_idx = m_base / 4;
             int8_t *group_ptr = A_tile_packed + group_idx * group_stride;
 
-            // Use vector stores for zeroing (faster than memset for aligned data)
-            const __m128i zero = _mm_setzero_si128();
+            // Use vector stores for biased zero initialization
             for (int i = 0; i < group_stride; i += 16)
             {
-                _mm_store_si128(reinterpret_cast<__m128i *>(group_ptr + i), zero);
+                _mm_store_si128(reinterpret_cast<__m128i *>(group_ptr + i), xor_mask);
             }
         }
     }
@@ -395,14 +418,15 @@ namespace llaminar2
         static_assert(M_R % 4 == 0, "M_R must be multiple of 4");
         static_assert(K_BLK % 4 == 0, "K_BLK must be multiple of 4");
 
-        const int K_chunks = K_BLK / 4;
-        const int num_groups = M_R / 4;
-        const int group_stride = K_chunks * 16;
-        const int A_block_bytes = num_groups * group_stride;
+        constexpr int K_chunks = K_BLK / 4;
+        constexpr int num_groups = M_R / 4;
+        constexpr int group_stride = K_chunks * 16;
+        constexpr int A_block_bytes = num_groups * group_stride;
+        constexpr int nr_chunks = N_R / 16;
 
+        const __m512 zero_ps = _mm512_setzero_ps();
         const __m512i zero_i32 = _mm512_setzero_si512();
         const __m512i ones_byte = _mm512_set1_epi8(1);
-        const __m512i sign_flip = _mm512_set1_epi8(static_cast<char>(0x80));
         const __m512i correction_scale = _mm512_set1_epi32(128);
         alignas(64) int8_t b_tail_buffer[64];
 
@@ -421,42 +445,101 @@ namespace llaminar2
                 return _mm512_loadu_si512(reinterpret_cast<const void *>(src));
             }
 
-            std::memset(b_tail_buffer, 0, sizeof(b_tail_buffer));
             const int copy_cols = std::max(0, remaining_cols);
-            if (copy_cols > 0)
-            {
-                std::memcpy(b_tail_buffer, src, static_cast<size_t>(copy_cols) * Bp.ld_col);
-            }
-            return _mm512_loadu_si512(reinterpret_cast<const void *>(b_tail_buffer));
+            return detail::load_b_vec_tail(src, copy_cols, Bp.ld_col, b_tail_buffer);
         };
 
-        // 1. Initialize C tile with bias
-        for (int m = 0; m < M_R; ++m)
+        // 1. Initialize accumulation tile to zero (bias is added after accumulation)
+        for (int idx = 0; idx < M_R * N_R; idx += 16)
         {
-            float *row = C_tile + m * N_R;
-            std::memcpy(row, bias_tile, sizeof(float) * N_R);
+            _mm512_store_ps(C_tile + idx, zero_ps);
         }
 
         // 2. Precompute sB vectors (vectorized)
-        __m512 sB_vecs[N_R / 16];
-        __m512i b_vec_sums[UNROLL_K][N_R / 16];
-        for (int j = 0; j < N_R / 16; ++j)
+        __m512 sB_vecs[nr_chunks];
+        for (int j = 0; j < nr_chunks; ++j)
         {
-            // Direct vectorized load instead of scalar loop
-            sB_vecs[j] = _mm512_loadu_ps(wgt_scales + j * 16);
+            sB_vecs[j] = _mm512_load_ps(wgt_scales + j * 16);
         }
 
         // 3. Loop over K blocks
         for (int t = 0; t < T; ++t)
         {
             // Accumulators
-            __m512i acc[M_R][N_R / 16];
+            __m512i acc[M_R][nr_chunks];
             for (int m = 0; m < M_R; ++m)
-                for (int j = 0; j < N_R / 16; ++j)
+                for (int j = 0; j < nr_chunks; ++j)
                     acc[m][j] = _mm512_setzero_si512();
 
             const int8_t *base_A_block = A_tile_packed + t * A_block_bytes;
             const int8_t *base_B_block = Bp.block_ptr(t);
+
+            alignas(64) __m512i stage_a_vecs[UNROLL_K][num_groups][4];
+            alignas(64) __m512i stage_b_vecs[UNROLL_K][nr_chunks];
+            alignas(64) __m512i stage_corrections[UNROLL_K][nr_chunks];
+
+            const auto load_a_group = [&](int stage_idx, int group_idx, int kk_idx)
+            {
+                const int8_t *src = base_A_block + group_idx * group_stride + kk_idx * 16;
+                const __m128i a32 = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
+                stage_a_vecs[stage_idx][group_idx][0] = broadcast_row_vec<0>(a32);
+                stage_a_vecs[stage_idx][group_idx][1] = broadcast_row_vec<1>(a32);
+                stage_a_vecs[stage_idx][group_idx][2] = broadcast_row_vec<2>(a32);
+                stage_a_vecs[stage_idx][group_idx][3] = broadcast_row_vec<3>(a32);
+            };
+
+            const auto load_b_chunk = [&](int stage_idx, int chunk_idx, const int8_t *chunk_base)
+            {
+                const int col_base = N0 + chunk_idx * 16;
+                const __m512i vec = load_b_vec(chunk_base, col_base);
+                stage_b_vecs[stage_idx][chunk_idx] = vec;
+                const __m512i sum = _mm512_dpbusd_epi32(zero_i32, ones_byte, vec);
+                stage_corrections[stage_idx][chunk_idx] = _mm512_mullo_epi32(sum, correction_scale);
+            };
+
+            const auto compute_stage = [&](int stage_idx)
+            {
+                if constexpr (USE_VNNI)
+                {
+                    for (int g = 0; g < num_groups; ++g)
+                    {
+                        const int m_base = g * 4;
+                        const __m512i *a_vec = stage_a_vecs[stage_idx][g];
+                        for (int j = 0; j < nr_chunks; ++j)
+                        {
+                            const __m512i b_vec = stage_b_vecs[stage_idx][j];
+                            const __m512i correction = stage_corrections[stage_idx][j];
+                            for (int lane = 0; lane < 4; ++lane)
+                            {
+                                const int row = m_base + lane;
+                                acc[row][j] = _mm512_dpbusd_epi32(acc[row][j], a_vec[lane], b_vec);
+                                acc[row][j] = _mm512_sub_epi32(acc[row][j], correction);
+                            }
+                        }
+                    }
+                }
+            };
+
+            const auto load_stage = [&](int stage_idx, int kk_idx)
+            {
+                const int8_t *chunk_base = base_B_block + kk_idx * Bp.ld_chunk;
+                int g = 0, j = 0;
+                for (; g + 1 < num_groups && j + 1 < nr_chunks; g += 2, j += 2)
+                {
+                    load_a_group(stage_idx, g, kk_idx);
+                    load_b_chunk(stage_idx, j, chunk_base);
+                    load_a_group(stage_idx, g + 1, kk_idx);
+                    load_b_chunk(stage_idx, j + 1, chunk_base);
+                }
+                for (; g < num_groups; ++g)
+                {
+                    load_a_group(stage_idx, g, kk_idx);
+                }
+                for (; j < nr_chunks; ++j)
+                {
+                    load_b_chunk(stage_idx, j, chunk_base);
+                }
+            };
 
             // Prefetch next B block if desired
             if (t + 1 < T)
@@ -475,152 +558,26 @@ namespace llaminar2
             // Inner K loop with unroll and interleaving
             for (int kk = 0; kk < K_BLK; kk += 4 * UNROLL_K)
             {
-                __m128i a_groups[UNROLL_K][M_R / 4];
-                __m512i b_vecs_u[UNROLL_K][N_R / 16];
-
-                // Stage u=0 with interleaved A/B loads for dual load port exploitation
-                int k_off0 = kk;
-                if (k_off0 < K_BLK)
-                {
-                    const int kk_idx0 = k_off0 / 4;
-                    const int8_t *chunk_base0 = base_B_block + kk_idx0 * Bp.ld_chunk;
-
-                    // Interleave A group loads and B loads (2-way: load 1 A group, 1 B vec, repeat)
-                    const int num_pairs = std::min(num_groups, N_R / 16);
-
-                    // Load pairs of A groups and B vecs to exploit dual load ports
-                    int g = 0, j = 0;
-                    for (; g + 1 < num_groups && j + 1 < N_R / 16; g += 2, j += 2)
-                    {
-                        // Load A group 0 and B vec 0 in parallel
-                        const int8_t *src_a0 = base_A_block + g * group_stride + kk_idx0 * 16;
-                        a_groups[0][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a0));
-                        b_vecs_u[0][j] = load_b_vec(chunk_base0, N0 + j * 16);
-                        b_vec_sums[0][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[0][j]);
-
-                        // Load A group 1 and B vec 1 in parallel
-                        const int8_t *src_a1 = base_A_block + (g + 1) * group_stride + kk_idx0 * 16;
-                        a_groups[0][g + 1] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a1));
-                        b_vecs_u[0][j + 1] = load_b_vec(chunk_base0, N0 + (j + 1) * 16);
-                        b_vec_sums[0][j + 1] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[0][j + 1]);
-                    }
-
-                    // Handle remaining A groups
-                    for (; g < num_groups; ++g)
-                    {
-                        const int8_t *src = base_A_block + g * group_stride + kk_idx0 * 16;
-                        a_groups[0][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
-                    }
-
-                    // Handle remaining B vecs
-                    for (; j < N_R / 16; ++j)
-                    {
-                        b_vecs_u[0][j] = load_b_vec(chunk_base0, N0 + j * 16);
-                        b_vec_sums[0][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[0][j]);
-                    }
-                }
-
-// Unrolled pipeline for u=1..UNROLL_K-1
-#pragma unroll
-                for (int u = 1; u < UNROLL_K; ++u)
+                int stages_loaded = 0;
+                for (int u = 0; u < UNROLL_K; ++u)
                 {
                     const int k_off = kk + 4 * u;
                     if (k_off >= K_BLK)
+                    {
                         break;
+                    }
                     const int kk_idx = k_off / 4;
-                    const int8_t *chunk_base = base_B_block + kk_idx * Bp.ld_chunk;
-
-                    // Stage loads for current u with interleaved A/B to exploit dual load ports
-                    int g = 0, j = 0;
-                    for (; g + 1 < num_groups && j + 1 < N_R / 16; g += 2, j += 2)
+                    load_stage(u, kk_idx);
+                    ++stages_loaded;
+                    if (u > 0)
                     {
-                        // Load A group 0 and B vec 0 in parallel
-                        const int8_t *src_a0 = base_A_block + g * group_stride + kk_idx * 16;
-                        a_groups[u][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a0));
-                        b_vecs_u[u][j] = load_b_vec(chunk_base, N0 + j * 16);
-                        b_vec_sums[u][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[u][j]);
-
-                        // Load A group 1 and B vec 1 in parallel
-                        const int8_t *src_a1 = base_A_block + (g + 1) * group_stride + kk_idx * 16;
-                        a_groups[u][g + 1] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a1));
-                        b_vecs_u[u][j + 1] = load_b_vec(chunk_base, N0 + (j + 1) * 16);
-                        b_vec_sums[u][j + 1] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[u][j + 1]);
-                    }
-
-                    // Handle remaining A groups
-                    for (; g < num_groups; ++g)
-                    {
-                        const int8_t *src = base_A_block + g * group_stride + kk_idx * 16;
-                        a_groups[u][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src));
-                    }
-
-                    // Handle remaining B vecs
-                    for (; j < N_R / 16; ++j)
-                    {
-                        b_vecs_u[u][j] = load_b_vec(chunk_base, N0 + j * 16);
-                        b_vec_sums[u][j] = _mm512_dpbusd_epi32(zero_i32, ones_byte, b_vecs_u[u][j]);
-                    }
-
-                    // Compute with previous u-1
-                    const int prev_u = u - 1;
-                    if constexpr (USE_VNNI)
-                    {
-                        for (int g = 0; g < num_groups; ++g)
-                        {
-                            const __m128i a32 = a_groups[prev_u][g];
-                            const int m_base = g * 4;
-                            const __m512i a_vec0 = _mm512_xor_si512(broadcast_row_vec<0>(a32), sign_flip);
-                            const __m512i a_vec1 = _mm512_xor_si512(broadcast_row_vec<1>(a32), sign_flip);
-                            const __m512i a_vec2 = _mm512_xor_si512(broadcast_row_vec<2>(a32), sign_flip);
-                            const __m512i a_vec3 = _mm512_xor_si512(broadcast_row_vec<3>(a32), sign_flip);
-
-                            for (int j = 0; j < N_R / 16; ++j)
-                            {
-                                const __m512i b_vec = b_vecs_u[prev_u][j];
-                                const __m512i correction = _mm512_mullo_epi32(b_vec_sums[prev_u][j], correction_scale);
-                                acc[m_base + 0][j] = _mm512_dpbusd_epi32(acc[m_base + 0][j], a_vec0, b_vec);
-                                acc[m_base + 0][j] = _mm512_sub_epi32(acc[m_base + 0][j], correction);
-                                acc[m_base + 1][j] = _mm512_dpbusd_epi32(acc[m_base + 1][j], a_vec1, b_vec);
-                                acc[m_base + 1][j] = _mm512_sub_epi32(acc[m_base + 1][j], correction);
-                                acc[m_base + 2][j] = _mm512_dpbusd_epi32(acc[m_base + 2][j], a_vec2, b_vec);
-                                acc[m_base + 2][j] = _mm512_sub_epi32(acc[m_base + 2][j], correction);
-                                acc[m_base + 3][j] = _mm512_dpbusd_epi32(acc[m_base + 3][j], a_vec3, b_vec);
-                                acc[m_base + 3][j] = _mm512_sub_epi32(acc[m_base + 3][j], correction);
-                            }
-                        }
+                        compute_stage(u - 1);
                     }
                 }
 
-                // Final compute for last staged u
-                int max_u = std::min(UNROLL_K - 1, (K_BLK - kk) / 4 - 1);
-                if (max_u >= 0)
+                if (stages_loaded > 0)
                 {
-                    if constexpr (USE_VNNI)
-                    {
-                        for (int g = 0; g < num_groups; ++g)
-                        {
-                            const __m128i a32 = a_groups[max_u][g];
-                            const int m_base = g * 4;
-                            const __m512i a_vec0 = _mm512_xor_si512(broadcast_row_vec<0>(a32), sign_flip);
-                            const __m512i a_vec1 = _mm512_xor_si512(broadcast_row_vec<1>(a32), sign_flip);
-                            const __m512i a_vec2 = _mm512_xor_si512(broadcast_row_vec<2>(a32), sign_flip);
-                            const __m512i a_vec3 = _mm512_xor_si512(broadcast_row_vec<3>(a32), sign_flip);
-
-                            for (int j = 0; j < N_R / 16; ++j)
-                            {
-                                const __m512i b_vec = b_vecs_u[max_u][j];
-                                const __m512i correction = _mm512_mullo_epi32(b_vec_sums[max_u][j], correction_scale);
-                                acc[m_base + 0][j] = _mm512_dpbusd_epi32(acc[m_base + 0][j], a_vec0, b_vec);
-                                acc[m_base + 0][j] = _mm512_sub_epi32(acc[m_base + 0][j], correction);
-                                acc[m_base + 1][j] = _mm512_dpbusd_epi32(acc[m_base + 1][j], a_vec1, b_vec);
-                                acc[m_base + 1][j] = _mm512_sub_epi32(acc[m_base + 1][j], correction);
-                                acc[m_base + 2][j] = _mm512_dpbusd_epi32(acc[m_base + 2][j], a_vec2, b_vec);
-                                acc[m_base + 2][j] = _mm512_sub_epi32(acc[m_base + 2][j], correction);
-                                acc[m_base + 3][j] = _mm512_dpbusd_epi32(acc[m_base + 3][j], a_vec3, b_vec);
-                                acc[m_base + 3][j] = _mm512_sub_epi32(acc[m_base + 3][j], correction);
-                            }
-                        }
-                    }
+                    compute_stage(stages_loaded - 1);
                 }
             } // kk
 
@@ -628,7 +585,7 @@ namespace llaminar2
             const float sA_t = act_scales[t];
             const __m512 sA_vec = _mm512_set1_ps(sA_t);
 
-            for (int j = 0; j < N_R / 16; ++j)
+            for (int j = 0; j < nr_chunks; ++j)
             {
                 const __m512 sAB_vec = _mm512_mul_ps(sA_vec, sB_vecs[j]);
 
@@ -639,12 +596,24 @@ namespace llaminar2
                     const __m512 contrib = _mm512_mul_ps(acc_f32, sAB_vec);
 
                     float *c_row = C_tile + m * N_R;
-                    const __m512 c_old = _mm512_loadu_ps(c_row + j * 16);
+                    const __m512 c_old = _mm512_load_ps(c_row + j * 16);
                     const __m512 c_new = _mm512_add_ps(c_old, contrib);
-                    _mm512_storeu_ps(c_row + j * 16, c_new);
+                    _mm512_store_ps(c_row + j * 16, c_new);
                 }
             }
         } // t
+
+        // 4. Add bias once after accumulation
+        for (int m = 0; m < M_R; ++m)
+        {
+            float *row = C_tile + m * N_R;
+            for (int j = 0; j < nr_chunks; ++j)
+            {
+                const __m512 bias_vec = _mm512_load_ps(bias_tile + j * 16);
+                const __m512 acc_vec = _mm512_load_ps(row + j * 16);
+                _mm512_store_ps(row + j * 16, _mm512_add_ps(acc_vec, bias_vec));
+            }
+        }
     }
 
     // ---------- OUTER GEMM KERNEL ----------
@@ -679,7 +648,7 @@ namespace llaminar2
         const int A_block_bytes = num_groups * group_stride;
         const int A_tile_total_bytes = A_block_bytes * T;
 
-// OpenMP parallel over M dimension with dynamic scheduling for load balancing
+// OpenMP parallel over M dimension with static scheduling for predictable work distribution
 #pragma omp parallel
         {
             // Thread-private scratch buffers
@@ -688,7 +657,7 @@ namespace llaminar2
             alignas(64) float bias_tile[N_R];
             alignas(64) float wgt_scales_tile[N_R];
 
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(static, 1)
             for (int M0 = 0; M0 < M; M0 += M_R)
             {
                 const int mr = std::min(M_R, M - M0);

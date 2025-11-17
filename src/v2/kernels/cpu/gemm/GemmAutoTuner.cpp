@@ -358,9 +358,16 @@ namespace llaminar
 
                 if (!test_A_)
                 {
-                    // Allocate aligned memory
-                    test_A_ = static_cast<float *>(aligned_alloc(64, m * k * sizeof(float)));
-                    test_C_ = static_cast<float *>(aligned_alloc(64, m * n * sizeof(float)));
+                    // Allocate aligned memory (size must be multiple of alignment)
+                    constexpr size_t ALIGNMENT = 64;
+                    size_t size_A = m * k * sizeof(float);
+                    size_t size_C = m * n * sizeof(float);
+                    // Round up to multiple of alignment
+                    size_A = ((size_A + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+                    size_C = ((size_C + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+
+                    test_A_ = static_cast<float *>(aligned_alloc(ALIGNMENT, size_A));
+                    test_C_ = static_cast<float *>(aligned_alloc(ALIGNMENT, size_C));
 
                     // Initialize with random data (avoid cache prefetching patterns)
                     for (int i = 0; i < m * k; ++i)

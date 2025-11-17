@@ -495,6 +495,11 @@ namespace llaminar2
         std::memcpy(buffer, src + offset, count * sizeof(float));
     }
 
+    ActivationPack FP32Tensor::to_int8_activation_pack(int rows, int cols) const
+    {
+        return pack_activation_rows_to_int8(rows, cols);
+    }
+
     bool FP32Tensor::applyRMSNorm(
         const float *gamma,
         int seq_len,
@@ -519,6 +524,47 @@ namespace llaminar2
             false, // normalize_gamma
             mpi_ctx,
             device_idx);
+    }
+
+    bool FP32Tensor::from_int32_with_scales(
+        const int32_t *accum,
+        int rows,
+        int cols,
+        const float *row_scales,
+        const float *col_scales,
+        const float *bias)
+    {
+        if (!accum)
+        {
+            LOG_ERROR("[FP32Tensor::from_int32_with_scales] accum buffer is null");
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[FP32Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
+            return false;
+        }
+        if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
+        {
+            LOG_ERROR("[FP32Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
+                                                                                      << ", " << shape_[1] << "] input=[" << rows << ", " << cols << "]");
+            return false;
+        }
+
+        float *dst = is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_data_.data();
+        simd::requantize_int32_matrix_to_fp32(
+            accum,
+            dst,
+            rows,
+            cols,
+            row_scales,
+            col_scales,
+            bias);
+
+        host_dirty_ = true;
+        device_dirty_ = false;
+        return true;
     }
 
     bool FP32Tensor::applyRoPE(

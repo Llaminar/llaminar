@@ -982,26 +982,33 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         // A: [m, k] = [8192, 896]
         // B^T: [k, n] from B[n, k] = [4864, 896]^T = [896, 4864]
         // C: [m, n] = [8192, 4864]
+        const int onednn_iters = 50;
+        std::cout << "  Benchmark: " << onednn_iters << " iterations...\n";
+
         MPI_Barrier(MPI_COMM_WORLD);
         auto t0_onednn = high_resolution_clock::now();
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, // Transpose B!
-                    m, n, k,
-                    1.0f,              // alpha
-                    A->data(), k,      // A (m×k)
-                    B_fp32.data(), k,  // B^T (n×k, stored as row-major)
-                    0.0f,              // beta
-                    C_onednn.data(), n // C (m×n)
-        );
+        for (int i = 0; i < onednn_iters; ++i)
+        {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, // Transpose B!
+                        m, n, k,
+                        1.0f,              // alpha
+                        A->data(), k,      // A (m×k)
+                        B_fp32.data(), k,  // B^T (n×k, stored as row-major)
+                        0.0f,              // beta
+                        C_onednn.data(), n // C (m×n)
+            );
+        }
 
         MPI_Barrier(MPI_COMM_WORLD);
         auto t1_onednn = high_resolution_clock::now();
 
         double onednn_ns = duration_cast<nanoseconds>(t1_onednn - t0_onednn).count();
-        double onednn_ms = onednn_ns / 1e6;
-        double onednn_gops = (2.0 * m * n * k) / (onednn_ms * 1e6);
+        double onednn_ms_total = onednn_ns / 1e6;
+        double onednn_ms_per_iter = onednn_ms_total / onednn_iters;
+        double onednn_gops = (2.0 * m * n * k) / (onednn_ms_per_iter * 1e6);
 
-        std::cout << "  OneDNN time:       " << std::fixed << std::setprecision(2) << onednn_ms << " ms\n";
+        std::cout << "  OneDNN time (avg): " << std::fixed << std::setprecision(2) << onednn_ms_per_iter << " ms\n";
         std::cout << "  OneDNN throughput: " << std::fixed << std::setprecision(2) << onednn_gops << " GOPS\n";
         std::cout << "  ✅ Reference computed successfully\n\n";
 
@@ -1019,7 +1026,7 @@ TEST_F(VNNIGemmPerformance, IterativeDiagnostic_M8192_BestConfig)
         }
 
         // Timed runs
-        const int bench_iters = 20;
+        const int bench_iters = 50;
         std::cout << "  Benchmark: " << bench_iters << " iterations...\n";
 
         MPI_Barrier(MPI_COMM_WORLD);

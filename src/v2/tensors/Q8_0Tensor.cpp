@@ -8,6 +8,8 @@
 #include "Tensors.h"
 #include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/Logger.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -19,8 +21,6 @@
 #include <immintrin.h>
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
-#include <algorithm>
-#include <cmath>
 #endif
 
 namespace llaminar2
@@ -271,6 +271,97 @@ namespace llaminar2
     }
 
     // ===== Format Conversion Methods (TensorBase interface) =====
+
+    bool Q8_0Tensor::to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales) const
+    {
+        return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+    }
+
+    bool Q8_0Tensor::to_int8_rowmajor(int8_t *dst_int8, float *dst_row_scales) const
+    {
+        if (!dst_int8 || !dst_row_scales)
+        {
+            LOG_ERROR("[Q8_0Tensor] to_int8_rowmajor requires non-null output buffers");
+            return false;
+        }
+
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            LOG_ERROR("[Q8_0Tensor] to_int8_rowmajor requires 2D tensor, got " << shp.size() << "D");
+            return false;
+        }
+
+        const size_t rows = shp[0];
+        const size_t cols = shp[1];
+        if (rows == 0 || cols == 0)
+        {
+            return true;
+        }
+
+        const size_t blocks_per_row = (cols + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
+
+        // Pass 1: compute per-row max absolute value
+        for (size_t row = 0; row < rows; ++row)
+        {
+            const Q8_0Block *row_blocks = blocks + row * blocks_per_row;
+            float max_abs = 0.0f;
+            size_t processed_cols = 0;
+
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const Q8_0Block &block = row_blocks[b];
+                const float block_scale = fp16_to_fp32(block.d);
+                const size_t valid = std::min(static_cast<size_t>(Q8_0Block::BLOCK_SIZE), cols - processed_cols);
+
+                for (size_t i = 0; i < valid; ++i)
+                {
+                    const float abs_val = std::fabs(block_scale * static_cast<float>(block.qs[i]));
+                    max_abs = std::max(max_abs, abs_val);
+                }
+
+                processed_cols += valid;
+            }
+
+            dst_row_scales[row] = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        }
+
+        // Pass 2: quantize each row using its scale
+        for (size_t row = 0; row < rows; ++row)
+        {
+            const Q8_0Block *row_blocks = blocks + row * blocks_per_row;
+            int8_t *row_dst = dst_int8 + row * cols;
+            const float inv_scale = (dst_row_scales[row] > 0.0f) ? (1.0f / dst_row_scales[row]) : 0.0f;
+
+            if (inv_scale == 0.0f)
+            {
+                std::memset(row_dst, 0, cols);
+                continue;
+            }
+
+            size_t processed_cols = 0;
+            for (size_t b = 0; b < blocks_per_row; ++b)
+            {
+                const Q8_0Block &block = row_blocks[b];
+                const float block_scale = fp16_to_fp32(block.d) * inv_scale;
+                const size_t valid = std::min(static_cast<size_t>(Q8_0Block::BLOCK_SIZE), cols - processed_cols);
+
+                for (size_t i = 0; i < valid; ++i)
+                {
+                    const float scaled = static_cast<float>(block.qs[i]) * block_scale;
+                    int32_t quantized = static_cast<int32_t>(std::round(scaled));
+                    quantized = std::max(-127, std::min(127, quantized));
+                    row_dst[processed_cols + i] = static_cast<int8_t>(quantized);
+                }
+
+                processed_cols += valid;
+            }
+        }
+
+        return true;
+    }
 
     void Q8_0Tensor::to_bf16(uint16_t *dst) const
     {

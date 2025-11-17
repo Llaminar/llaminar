@@ -236,6 +236,19 @@ add_v2_test(V2_Unit_BF16Tensor
     LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM;ViewSupport"
 )
 
+# Test: Q8_1Tensor class
+add_executable(v2_test_q8_1_tensor unit/tensors/Test__Q8_1Tensor.cpp)
+target_link_libraries(v2_test_q8_1_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1Tensor 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_tensor>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Activations"
+    MPI_PROCS 1  # Quantized activation tests are CPU-only
+)
+
 # Test: INT32Tensor class (accumulator tensor for INT8 pipelines)
 add_executable(v2_test_int32_tensor unit/tensors/Test__INT32Tensor.cpp)
 target_link_libraries(v2_test_int32_tensor 
@@ -2461,6 +2474,24 @@ add_v2_perf_test(V2_Perf_VNNIGemm_QwenProfile
     COMMAND $<TARGET_FILE:v2_perf_vnni_gemm_qwen_profile>
     LABELS "V2;Performance;GEMM;VNNI;INT8;AVX512;Qwen;AdapterOverhead;gemm_v3"
     MPI_PROCS 1  # Single rank for pure GEMM performance
+)
+
+# Performance Test: OneDNN GEMM Qwen Profile (gemm_v4)
+# Uses the new gemm_v4 adapters that wrap OneDNN matmul to gauge achievable throughput.
+add_executable(v2_perf_onednn_gemm_qwen_profile performance/cpu/kernels/gemm/gemm_v4/Perf__OneDNNGemm_QwenProfile.cpp)
+target_link_libraries(v2_perf_onednn_gemm_qwen_profile 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_onednn_gemm_qwen_profile PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_OneDNNGemm_QwenProfile
+    COMMAND $<TARGET_FILE:v2_perf_onednn_gemm_qwen_profile>
+    LABELS "V2;Performance;GEMM;OneDNN;FP32;Qwen;AdapterOverhead;gemm_v4"
+    MPI_PROCS 1
 )
 
 # Performance Test: Fused GEMM+Softmax (Stage 1 Optimization) (DISABLED - missing FusedGemmSoftmax.h)

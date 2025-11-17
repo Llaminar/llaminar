@@ -447,6 +447,14 @@ namespace llaminar2
         }
     }
 
+    bool IQ4_NLTensor::to_int8_perchannel(
+        int8_t *dst_int8,
+        float *dst_col_scales,
+        float *dst_row_scales) const
+    {
+        return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+    }
+
     // ========== Fused Kernel Helpers ==========
 
     const IQ4_NLBlock &IQ4_NLTensor::get_block_at(size_t row_idx, size_t k_block_offset) const

@@ -20,6 +20,7 @@
 #include <vector>
 #include <memory>
 #include <cstddef>
+#include <cstdint>
 
 namespace llaminar2
 {
@@ -59,11 +60,21 @@ namespace llaminar2
         IQ1_M    // 1-bit medium IQ
     };
 
+    struct ActivationPack
+    {
+        std::vector<int8_t> data;
+        std::vector<float> row_scales;
+        int rows = 0;
+        int cols = 0;
+
+        size_t element_count() const { return data.size(); }
+    };
+
     /**
      * @brief Interface for activation tensors that support kernel creation
      *
-     * Only activation tensor types (FP32, BF16, FP16, INT32) should implement this.
-     * Quantized weight tensors (IQ4_NL, Q8_0, Q6_K, etc.) do NOT implement this interface.
+     * Only activation tensor types (FP32, BF16, FP16, INT32, Q8_1) should implement this.
+     * Quantized weight tensors (IQ4_NL, Q6_K, Q4_K, etc.) do NOT implement this interface.
      *
      * Rationale:
      * - Kernels operate on ACTIVATION buffers (hidden states, Q/K/V, etc.)
@@ -81,6 +92,14 @@ namespace llaminar2
         virtual std::unique_ptr<ITensorSoftmax> createSoftmax() = 0;
         virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
         virtual std::unique_ptr<ITensorAttention> createAttention() = 0;
+
+        /**
+         * @brief Quantize activations to INT8 with per-row scales
+         * @param rows Number of rows (M dimension)
+         * @param cols Number of columns (K dimension)
+         * @return Packed activation data and per-row scales
+         */
+        virtual ActivationPack to_int8_activation_pack(int rows, int cols) const = 0;
 
         /**
          * @brief Apply RMSNorm in-place (native precision, no conversion overhead)
@@ -144,6 +163,25 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Populate this activation tensor directly from INT32 accumulators
+         *
+         * @param accum Pointer to INT32 accumulator buffer in row-major order [rows, cols]
+         * @param rows Number of rows (M dimension)
+         * @param cols Number of columns (N dimension)
+         * @param row_scales Per-row scales (length = rows). May be nullptr to treat as 1.0f
+         * @param col_scales Per-column scales (length = cols). May be nullptr to treat as 1.0f
+         * @param bias Optional bias vector (length = cols). May be nullptr if no bias
+         * @return true on success, false if tensor cannot represent the requested shape/format
+         */
+        virtual bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr) = 0;
     };
 
     /**
@@ -313,6 +351,8 @@ namespace llaminar2
         void to_q8_0(Q8_0Block *dst) const;
 
     protected:
+        ActivationPack pack_activation_rows_to_int8(int rows, int cols) const;
+
         /**
          * @brief Helper method for quantized tensors that implement ITensorGemmTileDataProvider
          * @param dst Destination FP32 buffer
@@ -408,6 +448,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
         bool applyRMSNorm(
             const float *gamma,
@@ -428,6 +469,14 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr) override;
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -553,6 +602,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
         bool applyRMSNorm(
             const float *gamma,
@@ -573,6 +623,14 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr) override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override;
@@ -712,6 +770,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
         bool applyRMSNorm(
             const float *gamma,
@@ -732,6 +791,14 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr) override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override;
@@ -968,12 +1035,13 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // IActivationTensor interface - activation-only operations
+        // IActivationTensor interface - activation-only operations (INT32 activations)
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
         bool applyRMSNorm(
             const float *gamma,
@@ -994,6 +1062,14 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr) override;
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -1086,10 +1162,15 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override { decode_to_bf16(dst); }
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
-        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
-        {
-            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
-        }
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
+
+        /**
+         * @brief Convert tensor rows to INT8 with per-row scales (avoids FP32 round-trip)
+         * @param dst_int8 Destination buffer sized rows * cols (row-major)
+         * @param dst_row_scales Destination buffer sized rows (per-row scales)
+         * @return true on success, false otherwise
+         */
+        bool to_int8_rowmajor(int8_t *dst_int8, float *dst_row_scales) const;
         void to_fp32_row(size_t row_idx, float *buffer) const override { decodeRow(row_idx, buffer); }
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override { decodeSpan(offset, count, buffer); }
 
@@ -1229,10 +1310,8 @@ namespace llaminar2
         void to_bf16(uint16_t *dst) const override;
         void to_fp16(uint16_t *dst) const override;
         void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
-        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
-        {
-            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
-        }
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
+        bool to_int8_rowmajor(int8_t *dst_int8, float *dst_row_scales) const;
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
@@ -1356,12 +1435,13 @@ namespace llaminar2
         // IQ8_1Decodable interface - Q8_1 to Q8_1 returns direct pointer (zero-cost)
         const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
-        // IActivationTensor interface
+        // IActivationTensor interface (Q8_1 activations)
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
         bool applyRMSNorm(
             const float *gamma,
@@ -1382,6 +1462,14 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr) override;
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }

@@ -309,6 +309,56 @@ namespace llaminar2
         }
     }
 
+    bool FP16Tensor::from_int32_with_scales(
+        const int32_t *accum,
+        int rows,
+        int cols,
+        const float *row_scales,
+        const float *col_scales,
+        const float *bias)
+    {
+        if (!accum)
+        {
+            LOG_ERROR("[FP16Tensor::from_int32_with_scales] accum buffer is null");
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[FP16Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
+            return false;
+        }
+        if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
+        {
+            LOG_ERROR("[FP16Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
+                                                                                      << ", " << shape_[1] << "] input=[" << rows << ", " << cols << "]");
+            return false;
+        }
+
+        uint16_t *dst = is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_fp16_data_.data();
+        thread_local std::vector<float> row_buffer;
+        row_buffer.resize(static_cast<size_t>(cols));
+
+        for (int r = 0; r < rows; ++r)
+        {
+            const float row_scale = row_scales ? row_scales[r] : 1.0f;
+            const size_t offset = static_cast<size_t>(r) * static_cast<size_t>(cols);
+
+            simd::requantize_int32_row_to_fp32(
+                accum + offset,
+                row_buffer.data(),
+                cols,
+                row_scale,
+                col_scales,
+                bias);
+
+            simd::convert_fp32_to_fp16(row_buffer.data(), dst + offset, static_cast<size_t>(cols));
+        }
+
+        dequant_cache_.clear();
+        return true;
+    }
+
     bool FP16Tensor::sync_to_device()
     {
         // TODO: Implement device upload
@@ -578,6 +628,11 @@ namespace llaminar2
         {
             buffer[i] = fp16_to_fp32(src[offset + i]);
         }
+    }
+
+    ActivationPack FP16Tensor::to_int8_activation_pack(int rows, int cols) const
+    {
+        return pack_activation_rows_to_int8(rows, cols);
     }
 
     bool FP16Tensor::applyRMSNorm(

@@ -554,6 +554,11 @@ namespace llaminar2
         }
     }
 
+    ActivationPack BF16Tensor::to_int8_activation_pack(int rows, int cols) const
+    {
+        return pack_activation_rows_to_int8(rows, cols);
+    }
+
     bool BF16Tensor::applyRMSNorm(
         const float *gamma,
         int seq_len,
@@ -607,6 +612,56 @@ namespace llaminar2
             seq_len, n_heads, n_kv_heads, head_dim,
             rope_theta,
             device_idx);
+    }
+
+    bool BF16Tensor::from_int32_with_scales(
+        const int32_t *accum,
+        int rows,
+        int cols,
+        const float *row_scales,
+        const float *col_scales,
+        const float *bias)
+    {
+        if (!accum)
+        {
+            LOG_ERROR("[BF16Tensor::from_int32_with_scales] accum buffer is null");
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[BF16Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
+            return false;
+        }
+        if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
+        {
+            LOG_ERROR("[BF16Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
+                                                                                      << ", " << shape_[1] << "] input=[" << rows << ", " << cols << "]");
+            return false;
+        }
+
+        uint16_t *dst = is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
+        thread_local std::vector<float> row_buffer;
+        row_buffer.resize(static_cast<size_t>(cols));
+
+        for (int r = 0; r < rows; ++r)
+        {
+            const float row_scale = row_scales ? row_scales[r] : 1.0f;
+            const size_t offset = static_cast<size_t>(r) * static_cast<size_t>(cols);
+
+            simd::requantize_int32_row_to_fp32(
+                accum + offset,
+                row_buffer.data(),
+                cols,
+                row_scale,
+                col_scales,
+                bias);
+
+            simd::convert_fp32_to_bf16(row_buffer.data(), dst + offset, static_cast<size_t>(cols));
+        }
+
+        dequant_cache_.clear();
+        return true;
     }
 
     void BF16Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const

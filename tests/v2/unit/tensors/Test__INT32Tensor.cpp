@@ -186,6 +186,57 @@ TEST_F(Test__INT32Tensor, CreationFromFP32Data)
 }
 
 /**
+ * @brief Verify INT32Tensor::from_int32_with_scales copies accumulators and persists row scales.
+ */
+TEST_F(Test__INT32Tensor, FromInt32WithScalesCopiesDataAndStoresRowScales)
+{
+    const int rows = 2;
+    const int cols = 3;
+    auto tensor = std::make_shared<INT32Tensor>(std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    const std::vector<int32_t> accum = {
+        11, -22, 33,
+        -44, 55, -66};
+    const std::vector<float> row_scales = {0.25f, 0.5f};
+    const std::vector<float> col_scales = {10.0f, -3.0f, 0.25f}; // Should be ignored for INT32 tensors
+    const std::vector<float> bias = {5.0f, -7.0f, 9.0f};         // Should be ignored for INT32 tensors
+
+    ASSERT_TRUE(tensor->from_int32_with_scales(
+        accum.data(),
+        rows,
+        cols,
+        row_scales.data(),
+        col_scales.data(),
+        bias.data()));
+
+    const int32_t *int_data = tensor->int32_data();
+    ASSERT_NE(int_data, nullptr);
+    for (size_t i = 0; i < accum.size(); ++i)
+    {
+        EXPECT_EQ(int_data[i], accum[i]) << "Accumulator mismatch at index " << i;
+    }
+
+    ASSERT_TRUE(tensor->has_row_scales());
+    EXPECT_EQ(tensor->num_row_scales(), row_scales.size());
+    const float *stored_scales = tensor->row_scales();
+    ASSERT_NE(stored_scales, nullptr);
+    for (size_t i = 0; i < row_scales.size(); ++i)
+    {
+        EXPECT_FLOAT_EQ(stored_scales[i], row_scales[i]) << "Row scale mismatch at index " << i;
+    }
+
+    // A second call without row scales should clear the cache
+    ASSERT_TRUE(tensor->from_int32_with_scales(
+        accum.data(),
+        rows,
+        cols,
+        nullptr,
+        nullptr,
+        nullptr));
+    EXPECT_FALSE(tensor->has_row_scales());
+}
+
+/**
  * @brief Test various tensor shapes (1D, 2D, 3D)
  */
 TEST_F(Test__INT32Tensor, ShapeValidation)
