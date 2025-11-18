@@ -239,6 +239,73 @@ namespace llaminar2
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Activation-activation GEMM followed by Softmax.
+         *
+         * Executes C = Softmax(A @ B^T) (axis configurable).
+         * Default implementation falls back to false; kernels may override
+         * to provide fused implementations via backend-specific acceleration.
+         *
+         * @param A Left activation matrix [m, k] (FP32)
+         * @param B Right activation matrix [n, k] if transpose_B=true (FP32)
+         * @param C Output matrix [m, n] containing softmax-normalized scores
+         * @param m Number of rows in A and C
+         * @param n Number of rows in B (transpose_B=true) or cols (false)
+         * @param k Number of columns in A/B when transpose_B=true
+         * @param transpose_B Whether to transpose B before multiplication
+         * @param softmax_axis Axis over which to apply softmax (0=row-wise, 1=col-wise, -1=last axis)
+         * @param mpi_ctx MPI context (unused by most kernels)
+         * @param device_idx Device index (-1=CPU)
+         *
+         * @return true if fused execution succeeded, false otherwise
+         */
+        virtual bool multiply_activations_with_softmax(
+            const float *A, const float *B, float *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            int softmax_axis = 1,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)A;
+            (void)B;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)softmax_axis;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
+         * @brief Weight-tensor GEMM followed by Softmax (same signature as multiply)
+         *
+         * Executes C = Softmax(A @ B^T) where B is the tensor bound to this kernel.
+         * Default implementation returns false so backends can opt-in gradually.
+         */
+        virtual bool multiply_with_softmax(
+            const float *A, float *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            int softmax_axis = 1,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)A;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)softmax_axis;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
     };
 
     /**

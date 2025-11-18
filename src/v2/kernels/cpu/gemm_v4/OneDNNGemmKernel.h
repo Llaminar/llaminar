@@ -19,6 +19,10 @@
 #include <oneapi/dnnl/dnnl.hpp>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
@@ -153,6 +157,168 @@ namespace llaminar2
             }
 
             return true;
+        }
+
+        inline bool run_onednn_fp32_matmul_softmax(const float *A,
+                                                   const float *B,
+                                                   float *C,
+                                                   int M,
+                                                   int N,
+                                                   int K,
+                                                   int softmax_axis)
+        {
+            using dt = dnnl::memory::data_type;
+            using tag = dnnl::memory::format_tag;
+
+            const int ndims = 2;
+            int axis = softmax_axis;
+            if (axis < 0)
+            {
+                axis += ndims;
+            }
+            if (axis != ndims - 1)
+            {
+                // Current OneDNN softmax post-op implementation only supports the last dimension.
+                return false;
+            }
+
+            try
+            {
+                dnnl::memory::dims src_dims = {M, K};
+                dnnl::memory::dims weight_dims = {K, N};
+                dnnl::memory::dims dst_dims = {M, N};
+
+                auto src_md = dnnl::memory::desc(src_dims, dt::f32, tag::ab);
+                auto weight_md = dnnl::memory::desc(weight_dims, dt::f32, tag::ab);
+                auto dst_md = dnnl::memory::desc(dst_dims, dt::f32, tag::ab);
+
+                dnnl::primitive_attr attr;
+                dnnl::post_ops ops;
+                ops.append_softmax(axis, false);
+                attr.set_post_ops(ops);
+
+                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md, attr);
+
+                dnnl::memory src_mem(src_md, onednn_engine(), const_cast<float *>(A));
+                dnnl::memory weight_mem(weight_md, onednn_engine(), const_cast<float *>(B));
+                dnnl::memory dst_mem(dst_md, onednn_engine(), C);
+
+                dnnl::matmul(matmul_pd).execute(onednn_stream(),
+                                                {{DNNL_ARG_SRC, src_mem},
+                                                 {DNNL_ARG_WEIGHTS, weight_mem},
+                                                 {DNNL_ARG_DST, dst_mem}});
+                onednn_stream().wait();
+            }
+            catch (const dnnl::error &)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        inline bool apply_softmax_inplace(float *data,
+                                          int rows,
+                                          int cols,
+                                          int axis)
+        {
+            if (!data || rows <= 0 || cols <= 0)
+            {
+                return false;
+            }
+
+            int normalized_axis = axis;
+            if (normalized_axis < 0)
+            {
+                normalized_axis += 2; // Only 2D tensors supported here
+            }
+
+            auto exp_range = [](float value) -> float
+            {
+                return std::exp(value);
+            };
+
+            if (normalized_axis == 1)
+            {
+                for (int r = 0; r < rows; ++r)
+                {
+                    const size_t base = static_cast<size_t>(r) * static_cast<size_t>(cols);
+                    float max_val = -std::numeric_limits<float>::infinity();
+                    for (int c = 0; c < cols; ++c)
+                    {
+                        max_val = std::max(max_val, data[base + static_cast<size_t>(c)]);
+                    }
+
+                    float sum = 0.0f;
+                    for (int c = 0; c < cols; ++c)
+                    {
+                        float ex = exp_range(data[base + static_cast<size_t>(c)] - max_val);
+                        data[base + static_cast<size_t>(c)] = ex;
+                        sum += ex;
+                    }
+
+                    const float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+                    for (int c = 0; c < cols; ++c)
+                    {
+                        data[base + static_cast<size_t>(c)] *= inv_sum;
+                    }
+                }
+                return true;
+            }
+
+            if (normalized_axis == 0)
+            {
+                for (int c = 0; c < cols; ++c)
+                {
+                    float max_val = -std::numeric_limits<float>::infinity();
+                    for (int r = 0; r < rows; ++r)
+                    {
+                        max_val = std::max(max_val, data[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)]);
+                    }
+
+                    float sum = 0.0f;
+                    for (int r = 0; r < rows; ++r)
+                    {
+                        float ex = exp_range(data[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)] - max_val);
+                        data[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)] = ex;
+                        sum += ex;
+                    }
+
+                    const float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+                    for (int r = 0; r < rows; ++r)
+                    {
+                        data[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)] *= inv_sum;
+                    }
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        inline const float *prepare_rhs_for_matmul(const float *B,
+                                                   int n,
+                                                   int k,
+                                                   bool transpose_B)
+        {
+            if (!transpose_B)
+            {
+                return B;
+            }
+
+            thread_local std::vector<float> B_transposed;
+            B_transposed.resize(static_cast<size_t>(k) * static_cast<size_t>(n));
+
+            for (int i = 0; i < n; ++i)
+            {
+                for (int j = 0; j < k; ++j)
+                {
+                    B_transposed[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
+                        B[static_cast<size_t>(i) * static_cast<size_t>(k) + static_cast<size_t>(j)];
+                }
+            }
+
+            return B_transposed.data();
         }
 
         // ========== Lightweight Activation View ==========
@@ -401,6 +567,80 @@ namespace llaminar2
                                            nullptr); // No bias
             }
 
+            bool multiply_with_softmax(const float *A, float *C,
+                                       int m, int n, int k,
+                                       bool transpose_B = true,
+                                       int softmax_axis = 1,
+                                       const MPIContext *mpi_ctx = nullptr,
+                                       int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+
+                if (device_idx != -1)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Only CPU execution supported (device_idx="
+                              << device_idx << ")");
+                    return false;
+                }
+
+                if (!transpose_B)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Non-transposed B not yet supported");
+                    return false;
+                }
+
+                if (!weight_tensor_)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] No weight tensor bound to kernel");
+                    return false;
+                }
+
+                if (m <= 0 || n <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Invalid dimensions for fused multiply_with_softmax");
+                    return false;
+                }
+
+                int axis = softmax_axis;
+                if (axis < 0)
+                {
+                    axis += 2;
+                }
+                if (axis != 0 && axis != 1)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Softmax axis must be 0, 1, or -1 (rows/cols)");
+                    return false;
+                }
+
+                const auto &shape = weight_tensor_->shape();
+                if (shape.size() != 2 || static_cast<int>(shape[0]) != n || static_cast<int>(shape[1]) != k)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Weight tensor shape mismatch for fused softmax path");
+                    return false;
+                }
+
+                ActivationView activation_view(A, static_cast<size_t>(m), static_cast<size_t>(k));
+                ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
+
+                if (!onednn_gemm_adapter(m, n, k,
+                                         activation_view,
+                                         *weight_tensor_,
+                                         output_view,
+                                         nullptr))
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] OneDNN adapter matmul failed for fused softmax path");
+                    return false;
+                }
+
+                if (!apply_softmax_inplace(C, m, n, axis))
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Softmax application failed after matmul");
+                    return false;
+                }
+
+                return true;
+            }
+
             /**
              * @brief Activation-activation GEMM using OneDNN FP32
              *
@@ -424,6 +664,12 @@ namespace llaminar2
                     return false;
                 }
 
+                if (!A || !B || !C)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Null activation buffer in multiply_activations");
+                    return false;
+                }
+
                 // Check for unsupported parameters
                 if (alpha != 1.0f || beta != 0.0f)
                 {
@@ -432,32 +678,8 @@ namespace llaminar2
                 }
 
                 // For activation-activation, use FP32 matmul
-                // If transpose_B=true, we need to transpose B before calling OneDNN
-                // OneDNN expects B as [K, N] for C = A @ B
-                // With transpose_B=true, input B is [N, K] and we want A @ B^T
-
-                if (transpose_B)
-                {
-                    // Need to transpose B: input is [N, K], need [K, N]
-                    // Allocate temporary buffer for transposed B
-                    thread_local std::vector<float> B_transposed;
-                    B_transposed.resize(static_cast<size_t>(k) * static_cast<size_t>(n));
-
-                    for (int i = 0; i < n; ++i)
-                    {
-                        for (int j = 0; j < k; ++j)
-                        {
-                            B_transposed[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
-                                B[static_cast<size_t>(i) * static_cast<size_t>(k) + static_cast<size_t>(j)];
-                        }
-                    }
-
-                    return run_onednn_fp32_matmul(A, B_transposed.data(), C, m, n, k);
-                }
-                else
-                {
-                    return run_onednn_fp32_matmul(A, B, C, m, n, k);
-                }
+                const float *rhs_ptr = prepare_rhs_for_matmul(B, n, k, transpose_B);
+                return run_onednn_fp32_matmul(A, rhs_ptr, C, m, n, k);
             }
 
             /**
@@ -474,6 +696,62 @@ namespace llaminar2
             {
                 LOG_ERROR("[OneDNNGemmKernel] multiply_activations_strided not yet implemented");
                 return false;
+            }
+
+            bool multiply_activations_with_softmax(const float *A, const float *B, float *C,
+                                                   int m, int n, int k,
+                                                   bool transpose_B = true,
+                                                   int softmax_axis = 1,
+                                                   const MPIContext *mpi_ctx = nullptr,
+                                                   int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+
+                if (device_idx != -1)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Fused matmul+softmax only available on CPU");
+                    return false;
+                }
+
+                if (!A || !B || !C)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Null activation buffer in fused matmul+softmax");
+                    return false;
+                }
+
+                if (m <= 0 || n <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Invalid dimensions for fused matmul+softmax");
+                    return false;
+                }
+
+                int axis = softmax_axis;
+                if (axis < 0)
+                {
+                    axis += 2; // 2D tensor
+                }
+                if (axis != 0 && axis != 1)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Softmax axis must be 0, 1, or -1 (rows/cols)");
+                    return false;
+                }
+
+                const float *rhs_ptr = prepare_rhs_for_matmul(B, n, k, transpose_B);
+                if (!run_onednn_fp32_matmul_softmax(A, rhs_ptr, C, m, n, k, axis))
+                {
+                    LOG_WARN("[OneDNNGemmKernel] Falling back to unfused matmul + softmax path");
+                    if (!run_onednn_fp32_matmul(A, rhs_ptr, C, m, n, k))
+                    {
+                        return false;
+                    }
+                    if (!apply_softmax_inplace(C, m, n, axis))
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] Softmax fallback failed");
+                        return false;
+                    }
+                }
+
+                return true;
             }
 
         private:

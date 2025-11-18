@@ -327,6 +327,19 @@ add_v2_test(V2_Unit_SoftmaxPrimitives
     MPI_PROCS 1  # Softmax primitives are CPU-only, single rank
 )
 
+# Test: OneDNN GEMM kernel fused matmul + softmax path
+add_executable(v2_test_onednn_gemm_kernel unit/kernels/gemm/Test__OneDNNGemmKernel.cpp)
+target_link_libraries(v2_test_onednn_gemm_kernel
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OneDNNGemmKernel
+    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel>
+    LABELS "V2;Unit;Kernels;GEMM;Softmax;OneDNN;CPU"
+    MPI_PROCS 1  # OneDNN fused kernel executes on CPU only
+)
+
 # Test: ActivationTraits (trait dispatch to softmax primitives, GEMM, workspace allocation)
 add_executable(v2_test_activation_traits unit/Test__ActivationTraits.cpp)
 target_link_libraries(v2_test_activation_traits

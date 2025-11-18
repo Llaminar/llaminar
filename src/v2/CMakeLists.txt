@@ -278,10 +278,12 @@ if(USE_ONEDNN)
     # Note: Repository root is two levels up from src/v2
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
-    set(ONEDNN_VERSION "v3.9.2")
+    set(ONEDNN_GIT_URL "https://github.com/dbsanfte/oneDNN.git")
+    # Track dbsanfte fork main branch so fused softmax patches are always available
+    set(ONEDNN_GIT_REF "main")
     
     if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}/include/oneapi/dnnl/dnnl.hpp")
-        message(STATUS "V2: OneDNN not found in external/, cloning version ${ONEDNN_VERSION}...")
+        message(STATUS "V2: OneDNN not found in external/, cloning ${ONEDNN_GIT_URL} (${ONEDNN_GIT_REF})...")
         
         find_package(Git REQUIRED)
         
@@ -290,9 +292,9 @@ if(USE_ONEDNN)
         
         # Clone OneDNN repository
         execute_process(
-            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${ONEDNN_VERSION} 
-                    https://github.com/uxlfoundation/oneDNN.git
-                    onednn
+            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${ONEDNN_GIT_REF}
+                ${ONEDNN_GIT_URL}
+                onednn
             WORKING_DIRECTORY ${REPO_ROOT}/external
             RESULT_VARIABLE GIT_CLONE_RESULT
             OUTPUT_VARIABLE GIT_CLONE_OUTPUT
@@ -305,7 +307,7 @@ if(USE_ONEDNN)
             message(FATAL_ERROR "V2: Failed to clone OneDNN: ${GIT_CLONE_ERROR}")
         endif()
         
-        message(STATUS "V2: OneDNN ${ONEDNN_VERSION} cloned successfully")
+        message(STATUS "V2: OneDNN ${ONEDNN_GIT_REF} cloned successfully")
     else()
         message(STATUS "V2: OneDNN already exists in external/onednn")
     endif()
@@ -313,7 +315,7 @@ if(USE_ONEDNN)
     # Now check if OneDNN is built
     set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build")
     if(NOT EXISTS "${ONEDNN_BUILD_DIR}/include/oneapi/dnnl/dnnl.hpp")
-        message(STATUS "V2: Building OneDNN ${ONEDNN_VERSION} from source...")
+        message(STATUS "V2: Building OneDNN (${ONEDNN_GIT_URL}@${ONEDNN_GIT_REF}) from source...")
         
         # Configure OneDNN
         execute_process(
