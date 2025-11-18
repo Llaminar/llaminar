@@ -1,7 +1,7 @@
 # OneDNN GEMM Kernel (gemm_v4)
 
 **Location**: `src/v2/kernels/cpu/gemm_v4/`  
-**Status**: Production-ready INT8 GEMM with FP32 reference validation  
+**Status**: Production-ready INT8 GEMM with FP32 reference validation and fused softmax helpers  
 **Performance**: ~480 GOPS on Qwen 0.5B FFN (8192×896×4864), 21% of theoretical peak
 
 ---
@@ -14,9 +14,12 @@ The OneDNN GEMM kernel (`gemm_v4`) provides high-performance INT8 matrix multipl
 
 - ✅ **INT8 Compute**: Uses `dnnl::matmul` with `s8×s8→s32` accumulation
 - ✅ **Per-Channel Quantization**: Independent scales per activation row and weight column
-- ✅ **Zero-Copy Integration**: Direct tensor API without intermediate buffers
+- ✅ **Fused GEMM + Softmax**:
+    - INT8 path: `run_onednn_int8_matmul_with_softmax()` (INT8 matmul + numerically stable softmax)
+    - FP32 path: `run_onednn_fp32_matmul_softmax()` with softmax post-op, falling back to host softmax
+- ✅ **Zero-Copy Integration**: Direct tensor API without intermediate buffers (via `ActivationView`)
 - ✅ **FP32 Reference Validation**: Automated correctness checks in performance tests
-- ✅ **Adapter Pattern**: Seamless integration with V2 pipeline infrastructure
+- ✅ **Adapter Pattern**: Seamless integration with V2 pipeline infrastructure (`OneDNNGemmKernel` + `onednn_gemm_adapter`)
 
 ---
 
@@ -29,13 +32,18 @@ OneDNNGemmKernel.h
 ├── onednn_engine()               # Singleton oneDNN CPU engine
 ├── onednn_stream()               # Singleton execution stream
 ├── run_onednn_int8_matmul()      # Low-level s8×s8→s32 primitive
-├── run_onednn_fp32_matmul()      # FP32 reference GEMM (validation only)
-└── OneDNNGemmKernel              # ITensorGemm implementation
+├── run_onednn_fp32_matmul()      # FP32 matmul (activation-activation GEMM)
+├── run_onednn_fp32_matmul_softmax()
+│                                 # FP32 matmul + fused softmax post-op (row/col axis)
+├── run_onednn_int8_matmul_with_softmax()
+│                                 # INT8 matmul + host softmax (scores path)
+├── apply_softmax_inplace()       # Vectorized softmax for 2D [rows, cols]
+└── OneDNNGemmKernel              # ITensorGemm implementation (GEMM + GEMM+softmax)
 
 OneDNNGemmAdapter.h
 ├── pack_weights_to_int8()        # Weight tensor → WeightPack (col-major INT8)
 ├── onednn_gemm_from_packed()     # Core INT8 GEMM + scale application
-└── onednn_gemm_adapter()         # High-level pipeline interface
+└── onednn_gemm_adapter()         # High-level pipeline interface (INT8 GEMM)
 ```
 
 ### Data Flow
@@ -68,6 +76,29 @@ onednn_gemm_adapter(M, N, K, activation, weight, output)
 │                                  col_scales, bias)          │
 │    ✅ Preserves output tensor format (BF16/FP16/FP32/INT32) │
 └─────────────────────────────────────────────────────────────┘
+
+For **fused softmax** paths, the data flow extends with an additional step:
+
+```text
+// INT8 attention scores: QK^T with softmax
+run_onednn_int8_matmul_with_softmax(A_int8, B_int8, scores, params)
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3b. INT8 GEMM + Softmax                                      │
+│     - INT8 matmul → INT32 scores                            │
+│     - Row/column-wise scale + bias application              │
+│     - Numerically stable softmax (libmvec-accelerated)      │
+└─────────────────────────────────────────────────────────────┘
+
+// FP32 attention scores (fallback or non-INT8 path)
+run_onednn_fp32_matmul_softmax(A_fp32, B_fp32, scores, M, N, K, axis)
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3c. FP32 GEMM + oneDNN softmax post-op                      │
+│     - If unsupported axis, falls back to FP32 matmul +      │
+│       `apply_softmax_inplace()` on the host.                │
+└─────────────────────────────────────────────────────────────┘
+```
 ```
 
 ---
@@ -96,6 +127,66 @@ bool onednn_gemm_adapter(
 **Thread Safety**: Thread-safe (uses thread-local accumulator buffer)  
 **Memory**: No dynamic allocation per call (reuses static `accum_buffer`)  
 **Format Preservation**: Output tensor format is preserved (BF16→BF16, FP16→FP16, FP32→FP32, INT32→INT32)
+
+### ITensorGemm Interface (OneDNNGemmKernel)
+
+`OneDNNGemmKernel` implements `ITensorGemm` and routes its methods to the adapter and fused helpers:
+
+```cpp
+class OneDNNGemmKernel : public ITensorGemm {
+public:
+    // Bound to a specific weight tensor (B matrix)
+    explicit OneDNNGemmKernel(const TensorBase *weight_tensor);
+
+    // INT8 weight GEMM: C = A @ B^T
+    bool multiply(const float *A, float *C,
+                  int m, int n, int k,
+                  bool transpose_B = true,
+                  float alpha = 1.0f,
+                  float beta = 0.0f,
+                  const MPIContext *mpi_ctx = nullptr,
+                  int device_idx = -1) override;
+
+    // FP32 activation GEMM: C = A @ B^T
+    bool multiply_activations(const float *A, const float *B, float *C,
+                              int m, int n, int k,
+                              bool transpose_B = true,
+                              float alpha = 1.0f,
+                              float beta = 0.0f,
+                              const MPIContext *mpi_ctx = nullptr,
+                              int device_idx = -1) override;
+
+    // Strided variant (copies into contiguous buffers when needed)
+    bool multiply_activations_strided(const float *A, const float *B, float *C,
+                                      int m, int n, int k,
+                                      int lda, int ldb, int ldc,
+                                      bool transpose_B = true,
+                                      float alpha = 1.0f,
+                                      float beta = 0.0f,
+                                      const MPIContext *mpi_ctx = nullptr,
+                                      int device_idx = -1) override;
+
+    // Fused GEMM + softmax on weights: C = softmax(A @ B^T)
+    bool multiply_with_softmax(const float *A, float *C,
+                               int m, int n, int k,
+                               bool transpose_B = true,
+                               int softmax_axis = 1,
+                               const MPIContext *mpi_ctx = nullptr,
+                               int device_idx = -1) override;
+
+    // Fused GEMM + softmax on activations: C = softmax(A @ B^T)
+    bool multiply_activations_with_softmax(const float *A, const float *B, float *C,
+                                           int m, int n, int k,
+                                           bool transpose_B = true,
+                                           int softmax_axis = 1,
+                                           const MPIContext *mpi_ctx = nullptr,
+                                           int device_idx = -1) override;
+};
+```
+
+`multiply_with_softmax()` uses the INT8 adapter + `apply_softmax_inplace()`, while
+`multiply_activations_with_softmax()` uses the FP32 matmul+softmax primitive, falling
+back to FP32 matmul + host softmax when oneDNN cannot fuse for the requested axis.
 
 ### Tensor Conversion Methods
 
@@ -245,7 +336,7 @@ This enables memory-efficient pipelines (e.g., BF16 activations throughout) whil
 
 **Throughput**: 480 GOPS (21% of 2240 GOPS theoretical peak)  
 **Latency**: 148ms average (50 iterations)  
-**Accuracy**: Max abs diff vs FP32: `1.1e-5`, Relative L2: `<0.0001%`
+**Accuracy** (INT8 vs FP32): Max abs diff: `≈1e-5`, Relative L2: `<0.0001%`
 
 ### Scaling Characteristics
 
@@ -259,6 +350,8 @@ This enables memory-efficient pipelines (e.g., BF16 activations throughout) whil
 - **Prefill-optimized**: Best efficiency at M≥1024 (batch or long sequences)
 - **Cache-friendly**: K=896 fits in L2, minimizes memory bottleneck
 - **Thread scaling**: Near-linear up to 28 threads, diminishing returns beyond
+ - **Fused softmax**: INT8 + softmax path is competitive with FP32 scores,
+     while the FP32 fused primitive saves a separate softmax kernel launch.
 
 ---
 
