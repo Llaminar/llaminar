@@ -20,6 +20,7 @@
 #include <mpi.h>
 #include <memory>
 #include <iostream>
+#include "TestMPIUtils.h"
 
 using namespace llaminar2;
 
@@ -192,7 +193,7 @@ int main(int argc, char **argv)
 {
     // Initialize MPI
     int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    llaminar2::tests::mpi_init_thread_sanitizer_safe(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
     if (provided < MPI_THREAD_MULTIPLE)
     {
@@ -219,7 +220,7 @@ int main(int argc, char **argv)
 
     int result = RUN_ALL_TESTS();
 
-    MPI_Finalize();
+    llaminar2::tests::mpi_finalize_sanitizer_safe();
 
     return result;
 }

@@ -9,6 +9,7 @@
 #include "loaders/ModelContext.h"
 #include "backends/ComputeBackend.h"
 #include "utils/MPIContext.h"
+#include "TestMPIUtils.h"
 #include <gtest/gtest.h>
 #include <memory>
 
@@ -368,10 +369,10 @@ int main(int argc, char **argv)
 
     // Initialize MPI
     int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    llaminar2::tests::mpi_init_thread_sanitizer_safe(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
     int result = RUN_ALL_TESTS();
 
-    MPI_Finalize();
+    llaminar2::tests::mpi_finalize_sanitizer_safe();
     return result;
 }

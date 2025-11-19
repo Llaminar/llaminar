@@ -85,7 +85,7 @@ namespace llaminar2
 
             auto ctx = std::shared_ptr<ModelContext>(
                 new ModelContext(model_path, mpi_ctx, nullptr, factory, WeightDistributionStrategy::REPLICATED));
-            
+
             // Store owned factory so it lives as long as the context
             if (owned_factory)
             {
@@ -95,9 +95,9 @@ namespace llaminar2
             // Initialize minimal valid model structure to prevent accessing uninitialized memory
             ctx->loader_.initializeTestModel(block_count);
             return ctx;
-        }        /**
-         * @brief Get model file path
-         */
+        } /**
+           * @brief Get model file path
+           */
         const std::string &path() const { return model_path_; }
 
         /**
