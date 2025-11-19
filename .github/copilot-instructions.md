@@ -23,265 +23,24 @@ Most sections in this document apply to **V1**. For V2-specific guidance, see `.
 - [Code Quality Guidelines](#code-quality-guidelines)
 - [Documentation Standards](#documentation-standards)
 
-## Architecture Overview (V1 vs V2)
-
-### V1 Architecture (Production - `src/`)
-
-**Design Philosophy**: Operator-based MPI distributed inference
-
-**Key Characteristics**:
-- ✅ **Production Ready**: Fully functional Qwen inference with MPI distribution
-- ✅ **Operator Abstraction**: `MPILinearOperator`, `MPIAttentionOperator`, etc.
-- ✅ **Centralized Backend Selection**: MatMulBackendSelector for OpenBLAS/COSMA/MKL
-- ✅ **Parity Testing**: PyTorch ground truth validation
-- ✅ **Batch Processing**: BatchQwenPipeline for multi-sequence throughput
-
-**When to use V1**:
-- Production inference workloads
-- MPI multi-node distributed execution
-- Batch processing (multi-user serving)
-- When you need proven, tested code
+## Architecture Overview 
 
 ### V2 Architecture (Development - `src/v2/`)
 
-**Design Philosophy**: Operator-free kernel-centric design
+**Design Philosophy**: Operator-free Tensor-centric design
 
 **Key Characteristics**:
 - 🔄 **In Development**: Basic pipeline structure, not feature-complete
 - 🎯 **No Operator Layer**: Pipelines call kernels directly
 - 🎯 **Per-Tensor Device Affinity**: Each tensor knows its device placement
-- 🎯 **Heterogeneous Execution**: Mix CUDA, ROCm, Vulkan in single run
-- 🎯 **IBlockDecoder Pattern**: Generic quantized GEMM kernel (see V2 kernel development)
-
-**When to use V2**:
-- Experimenting with new architectures
-- Multi-GPU heterogeneous execution (future)
-- Learning the next-generation design
-- Contributing to V2 development
-
-**Migration Status**:
-- ✅ Basic infrastructure (tensors, kernels, backends)
-- ✅ IQ4_NL quantized tensor with fused GEMM
-- ✅ Generic QuantizedGemmKernel (IBlockDecoder pattern)
-- ❌ Full pipeline implementation (incomplete)
-- ❌ MPI distribution (not yet ported)
-- ❌ Production testing (not validated)
+- 🎯 **Heterogeneous Execution**: Mix CPU, CUDA, ROCm in single run
+- 🎯 **IActivationTensor / ITensorKernel Pattern**: Kernel ops are focused around the IActivationTensors which will accept computation results (GEMM, SwiGLU, RoPE, etc). Activation tensors instantiate kernels via ITensorKernel and take the weights or other activation tensors as arguments, and the kernels mutate the IActivationTensor buffer in-place.
 
 **See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for comprehensive V2 documentation.
 
 ---
 
-## Project Overview (V1)
-
-Llaminar is a high-performance, distributed LLM inference engine built on:
-- **Multi-Architecture Pipeline System**: Factory-based extensible architecture for Qwen, LLaMA, and future models
-- **Centralized Backend Selection**: Single decision point via MatMulBackendSelector for OpenBLAS, COSMA, and Intel MKL
-- **Hybrid Tensor System**: Zero-copy COSMA optimization with backward compatibility
-- **MPI Distribution**: Multi-node inference with NUMA-aware deployment
-- **Adaptive Backends**: OpenBLAS (baseline), COSMA (distributed), Intel MKL (BF16 acceleration)
-- **Comprehensive Observability**: Structured environment snapshot, performance counters, validation framework
-
-### Pipeline Architecture
-
-**Sequential vs Batch Execution Modes:**
-- **Sequential Pipelines**: Process one sequence at a time (QwenPipeline, LlamaPipelineAdapter)
-  - Lower memory footprint
-  - Simpler implementation
-  - Ideal for single-user inference
-  
-- **Batch Pipelines**: Process multiple sequences simultaneously (BatchQwenPipeline)
-  - Higher throughput for multi-user scenarios
-  - More complex tensor management (sequence padding, batch dimension handling)
-  - Requires careful attention to MPI aggregation and dimension ordering
-  - **Parity Testing**: Automated validation that batch and sequential paths produce identical results (see `.github/instructions/parity-test-framework.instructions.md`)
-
-**Operator-Based Architecture:**
-All transformer operations are implemented as MPI-aware operators in `src/operators/`:
-- `MPIEmbeddingOperator`: Token embedding lookup with vocabulary partitioning
-- `MPILinearOperator` / `MPILinearBatchOperator`: Matrix multiplication with weight sharding
-- `MPIAttentionOperator` / `MPIAttentionBatchOperator`: Multi-head attention with KV cache
-- `MPIRMSNormOperator`: RMS normalization
-- `MPIRoPEOperator`: Rotary position embeddings
-- `MPISwiGLUOperator` / `MPISwiGLUBatchOperator`: SwiGLU activation with gating
-- `MPIResidualOperator`: Residual connection
-
-Each operator handles:
-- Tensor partition specifications (which dimensions are sharded vs replicated)
-- MPI collective operations (Allreduce, broadcast, gather)
-- Backend selection (OpenBLAS, COSMA, or Intel MKL based on operation characteristics)
-- NUMA-aware memory allocation
-
-### Batch Processing Architecture
-
-**Batch processing** enables efficient multi-sequence inference by processing multiple prompts simultaneously:
-
-#### Key Differences: Sequential vs Batch
-
-| Aspect | Sequential Pipeline | Batch Pipeline |
-|--------|--------------------|-----------------|
-| **Throughput** | 1 sequence at a time | N sequences simultaneously |
-| **Memory** | Lower footprint | Higher (padded sequences) |
-| **Complexity** | Simpler tensor shapes | Complex dimension handling |
-| **MPI Aggregation** | Standard reduction | Requires careful batch-aware aggregation |
-| **Use Case** | Single-user inference | Multi-user serving, batch jobs |
-
-#### Batch Pipeline Implementation (`BatchQwenPipeline`)
-
-**Core challenges solved:**
-
-1. **Sequence Padding**: Variable-length sequences must be padded to uniform length
-   - Handled by `BatchPaddingUtils`: Pads to longest sequence in batch
-   - Tracks original lengths to avoid processing padding tokens
-
-2. **Dimension Ordering**: Batch dimension handling throughout pipeline
-   - Input: `[batch_size, max_seq_len]`
-   - Activations: `[batch_size, seq_len, d_model]`
-   - Attention: Special handling for batch dimension in score computation
-
-3. **MPI Aggregation**: Batch-aware collective operations
-   - Weight partitioning: Same as sequential (sharded across ranks)
-   - Activation gathering: Must preserve batch dimension
-   - Attention reduction: Per-sequence reduction within batch
-
-4. **Memory Management**: Efficient allocation for batched tensors
-   - Pre-allocated buffers sized for `batch_size × max_seq_len`
-   - NUMA-aware first-touch for large activations
-   - KV cache: Separate cache entries per sequence
-
-#### Batch Operators
-
-All operators have batch-aware variants:
-
-- `MPILinearBatchOperator`: Batched linear projections (Q/K/V, FFN)
-- `MPIAttentionBatchOperator`: Batched multi-head attention with per-sequence masking
-- `MPISwiGLUBatchOperator`: Batched SwiGLU activation
-- Shared operators: `MPIRMSNormOperator`, `MPIRoPEOperator` (dimension-agnostic)
-
-**Key implementation pattern:**
-```cpp
-// Sequential: [seq_len, d_model]
-auto output_seq = linear_op->forward(input, weight);
-
-// Batch: [batch_size, seq_len, d_model]
-auto output_batch = linear_batch_op->forward(input, weight, batch_size);
-```
-
-#### Parity Testing
-
-**Critical validation**: Batch and sequential paths must produce identical results for the same input.
-
-- **Test**: `tests/test_batch_correctness.cpp` (`BatchCorrectnessTest.BatchedAttentionStagesParity`)
-- **Status**: ✅ **17/17 stages passing** with excellent numerical agreement (completed Oct 17, 2025)
-- **Coverage**: Full pipeline validation from embedding through LM head
-  - Embedding layer
-  - 9 attention stages (norm, Q/K/V projections, RoPE, scores, weights, context, output, residual)
-  - 6 FFN stages (norm, gate, up, SwiGLU, down, residual)
-  - Final norm + LM head
-- **Methodology**: Snapshot-based comparison using `SnapshotRegistry` and `SnapshotComparator`
-- **Critical Bug Fixed**: Missing final RMSNorm in `BatchQwenPipeline::projectOutput()` (divergence reduced 470,000×)
-
-For details, see:
-- `.github/instructions/parity-test-framework.instructions.md` - Comprehensive parity testing guide
-- `changelog/2025-10-17-batch-parity-extended-to-ffn-lm-head.md` - Detailed test results and bug fix
-- `changelog/2025-10-17-batch-parity-and-performance-complete.md` - Complete session summary
-
-#### Performance Characteristics
-
-**When to use batch processing:**
-- ✅ Multi-user serving (requests can be batched)
-- ✅ Batch inference jobs (many prompts to process)
-- ✅ High-throughput scenarios (latency less critical)
-
-**When to use sequential:**
-- ✅ Single-user interactive inference (low latency)
-- ✅ Memory-constrained environments
-- ✅ Variable-length sequences with large variance
-
-**Benchmark scripts:**
-```bash
-# Compare batch vs sequential performance
-./run_batch_performance.sh
-
-# Shows:
-# - Throughput improvement (tokens/sec)
-# - Memory overhead
-# - Scaling with batch size
-
-# Run any benchmark with optimal MPI/OpenMP settings
-./run_benchmark.sh <benchmark_executable> [args...]
-
-# Examples:
-./run_benchmark.sh benchmark_iq4nl_gemm
-./run_benchmark.sh test_batch_performance --gtest_filter='*.Scaling'
-```
-
-### Key Architecture Components
-
-**Core Pipeline Infrastructure:**
-- `src/Main.cpp`: Application entry point with pipeline factory-based execution
-- `src/AbstractPipeline.{h,cpp}`: Pipeline interface defining prefill/decode lifecycle
-- `src/PipelineBase.{h,cpp}`: Base implementation for pipelines
-
-**Model Implementations:**
-- `src/QwenPipeline.{h,cpp}`: Sequential Qwen model implementation
-- `src/BatchQwenPipeline.{h,cpp}`: Batched Qwen model implementation (multi-sequence processing)
-- `src/QwenPipelineAdapter.{h,cpp}`: Qwen adapter implementing AbstractPipeline
-- `src/BatchQwenPipelineAdapter.{h,cpp}`: Batch Qwen adapter implementing AbstractPipeline
-- `src/LlamaPipelineAdapter.{h,cpp}`: LLaMA adapter (prototype)
-
-**Backend and Execution:**
-- `src/MatmulBackendSelection.{h,cpp}`: Centralized backend decision logic (OpenBLAS, COSMA, Intel MKL)
-- `src/BackendSelector.{h,cpp}`: Backend selection infrastructure
-- `src/AdaptiveMatmul.{h,cpp}`: Adaptive matrix multiplication with BF16 quantization support
-- `src/backends/MKLBackend.{h,cpp}`: Intel MKL BF16 GEMM backend (optional, enabled with -DUSE_MKL=ON)
-- `src/CosmaPrefillManager.{h,cpp}`: COSMA distributed prefill coordination
-- `src/CosmaPrefillProvider.{h,cpp}`: COSMA-specific prefill implementation
-- `src/OpenblasPrefillProvider.{h,cpp}`: OpenBLAS prefill implementation
-- `src/PrefillProvider.{h,cpp}`: Base prefill provider interface
-- `src/PrefillProviderBaseImpl.{h,cpp}`: Shared prefill provider implementation
-
-**Validation and Testing:**
-- `src/PrefillDiagnostics.{h,cpp}`: Modular prefill validation and comparison
-- `src/ParityHooks.{h,cpp}`: Snapshot capture hooks for parity testing
-- `src/PipelineSnapshotManager.{h,cpp}`: Pipeline-level snapshot management
-- `src/PipelineStages.h`: Stage enumeration for snapshot capture
-
-**Component Systems:**
-- `src/operators/`: MPI-aware operators (attention, linear, embedding, RMSNorm, RoPE, SwiGLU)
-- `src/tensors/`: Hybrid tensor system (SimpleTensor + COSMATensor)
-- `src/utils/`: Utilities (DebugEnv, logging, performance tracing)
-- `src/weights/`: Weight loading and management (ModelLoader, ModelWeightsProvider)
-- `src/backends/`: Backend-specific implementations
-
-**Batch Processing Utilities:**
-- `src/BatchPaddingUtils.{h,cpp}`: Sequence padding and alignment for batch processing
-- `src/SequentialBatchBenchmark.{h,cpp}`: Performance comparison between batch and sequential modes
-
 ## Build System
-
-### V1 Build Process
-
-```bash
-# Debug build (development)
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build build --parallel
-
-# Release build (production)
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-  -DCOSMA_WITH_PROFILING=OFF \
-  -DBUILD_SHARED_LIBS=OFF \
-  -DCOSMA_SCALAPACK=CUSTOM \
-  -DCOSMA_SCALAPACK_LINK_LIBRARIES=/usr/lib/x86_64-linux-gnu/libscalapack-openmpi.so
-cmake --build build --parallel
-
-# Intel MKL-enabled build (BF16 support)
-cmake -B build_mkl -S . -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="/opt/intel/oneapi/mkl/latest" \
-  -DUSE_MKL=ON \
-  -DCOSMA_WITH_PROFILING=OFF \
-  -DBUILD_SHARED_LIBS=OFF
-cmake --build build_mkl --parallel
-```
 
 ### V2 Build Process
 
@@ -301,32 +60,6 @@ cmake --build build_v2_release --parallel
 **V2 Build Targets**:
 - `llaminar2_core`: Core V2 library
 - `llaminar2`: V2 executable (minimal functionality)
-
-### Available Build Targets (V1)
-
-```bash
-# Core library only
-cmake --build build --target llaminar_core --parallel
-
-# Main executable
-cmake --build build --target llaminar --parallel
-
-# COSMA library
-cmake --build build --target cosma --parallel
-
-# Clean and rebuild
-cmake --build build --target clean
-cmake --build build --parallel
-```
-
-### Using VS Code Tasks
-
-The project includes predefined VS Code tasks:
-- `cmake: configure` - Configure with debug settings
-- `cmake: build` - Build entire project
-- `cmake: build core` - Build core library only
-- `cmake: configure Release` - Configure for optimized production build
-- `cmake: build Release` - Build in release mode
 
 ## Canonical Runtime Configuration
 
@@ -374,13 +107,13 @@ Llaminar provides a dedicated `--benchmark` mode for clean performance measureme
 ╔══════════════════════════════════════════════════════════════╗
 ║ PREFILL PHASE                                                ║
 ║   Tokens:              8 tokens                              ║
-║   Time:          1216.49 ms                                 ║
-║   Throughput:       6.58 tok/s                             ║
+║   Time:          1216.49 ms                                  ║
+║   Throughput:       6.58 tok/s                               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║ DECODE PHASE                                                 ║
 ║   Tokens:             50 tokens                              ║
-║   Time:         48095.52 ms                                 ║
-║   Throughput:       1.04 tok/s                             ║
+║   Time:         48095.52 ms                                  ║
+║   Throughput:       1.04 tok/s                               ║
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
@@ -425,13 +158,11 @@ Llaminar provides a dedicated `--benchmark` mode for clean performance measureme
 
 ```bash
 # 1. Use Release builds for accurate timing
-cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build_release --parallel
+cmake -B build_v2_release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --parallel
 
-# 2. Disable heavy instrumentation
-unset LLAMINAR_COSMA_VALIDATE_TILE
-unset LLAMINAR_DEQUANT_STATS
-unset LLAMINAR_EMBED_TRACE
+# 2. Disable snapshotting
+unset LLAMINAR_SNAPSHOT_STAGES
 
 # 3. Test various prompt lengths (prefill scales with tokens)
 ./run_llaminar.sh --benchmark -m model.gguf -p "Short" -n 50
@@ -444,10 +175,6 @@ unset LLAMINAR_EMBED_TRACE
 # 5. Use phase-specific modes to isolate performance
 ./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128  # Decode-only
 ./run_llaminar.sh --benchmark -m model.gguf -n 0          # Prefill-only
-
-# 6. For component benchmarks, use the generic benchmark runner
-./run_benchmark.sh benchmark_iq4nl_gemm         # IQ4_NL GEMM performance
-./run_benchmark.sh test_batch_performance       # Batch scaling tests
 ```
 
 ### Performance Notes
@@ -459,34 +186,6 @@ unset LLAMINAR_EMBED_TRACE
 - **NUMA optimization**: K/V cache and activations benefit from first-touch allocation (+10-40% on large models)
 
 ## Development Profiling (Advanced)
-
-### Performance Testing Scripts (V1)
-
-Llaminar V1 includes several specialized performance testing scripts:
-
-```bash
-# Batch vs Sequential Performance Comparison
-./run_batch_performance.sh
-
-# Production-style adaptive matmul demonstration
-./run_performance_demo.sh
-
-# PyTorch parity testing with performance metrics
-./run_pytorch_parity_test.sh
-```
-
-**Important Distinction:**
-- **`run_llaminar.sh --benchmark`**: Production inference benchmarking with real models
-  - Use this for: End-to-end performance measurement, model comparisons, user-facing benchmarks
-  - Outputs: Clean tok/s metrics for prefill/decode phases
-  
-- **Performance test executables**: Development profiling with GTest suite
-  - Use this for: Analyzing specific components, batch vs sequential comparison, parity testing
-  - Outputs: Detailed GTest metrics with component-level timing
-  
-- **`run_batch_performance.sh`**: Compares batch and sequential execution performance
-  - Validates throughput improvements from batching
-  - Measures memory overhead and scaling characteristics
 
 ### Canonical Environment Variables
 
@@ -536,63 +235,34 @@ mpirun -np 2 --bind-to socket --map-by socket \
   - Testing `Qwen2Pipeline` class → File: `Test__Qwen2Pipeline.cpp`, Suite: `Test__Qwen2Pipeline`
   - Testing `FP32Tensor` class → File: `Test__FP32Tensor.cpp`, Suite: `Test__FP32Tensor`
 - The double underscore `__` separates "Test" prefix from the class name
-- This convention applies ONLY to `tests/v2/` directory
-- V1 tests in `tests/` continue using snake_case (e.g., `test_batch_correctness.cpp`)
 
 **Rationale**: Clear association between test and the specific class being tested, matches V2's CamelCase conventions.
 
-### Test Organization
+### V2 Test Organization
 
-Llaminar V1 has a comprehensive test suite organized into several categories:
+Llaminar V2 has a comprehensive test suite organized into several categories:
 
-1. **Smoke Tests** (~5s): Fast sanity checks for core functionality
-2. **Unit Tests** (~2m30s): Individual component validation (no model loading)
-3. **Parity Tests** (~4m): Ground truth comparison against PyTorch and llama.cpp
-4. **Integration Tests** (~3m): Full pipeline tests with model loading
-5. **Batch Correctness Tests**: Validation that batch and sequential execution produce identical results
+1. **Unit Tests** in `tests/v2/unit/`: Individual component validation (no model loading, fast)
+2. **Integration Tests** in `tests/v2/integration/`: Full pipeline tests with model loading. These are longer running than unit tests. **NOTE**: Integration tests always run against the `build_v2_release` build when run via ctest!
+3. **E2E Tests** in `tests/v2/e2e/`: Ground truth parity comparison against PyTorch reference. Leverages helpers in `tests/v2/pytorch_parity/` to compare per-layer snapshots between llaminar and Pytorch reference at different stages of inferencing
+5. **Performance Tests** in `tests/v2/performance/`: Performance tests of various components of the llaminar stack, especially kernels
 
-**Key Testing Infrastructure:**
-- `src/ParityHooks.{h,cpp}`: Snapshot capture hooks for parity testing
-- `src/PipelineSnapshotManager.{h,cpp}`: Pipeline-level snapshot management
-- `tests/TestParityFramework.cpp`: PyTorch ground truth comparison tests
-- `tests/test_batch_correctness.cpp`: Batch vs sequential parity validation
-- **Comprehensive documentation**: See `.github/instructions/parity-test-framework.instructions.md`
+**PYTORCH SNAPSHOT FRAMEWORK:**
+- **Pytorch Parity - Python project sources**: See `python/reference/` in the workspace.
+- **Comprehensive documentation**: See `docs/v2/SNAPSHOT_FRAMEWORK_DESIGN.md`
 
 ### Running Tests
 
 ```bash
 # All tests
-ctest --test-dir build_v2 -R --output-on-failure
+cd /workspaces/llaminar && ctest --test-dir build_v2 -R --output-on-failure
 
 # Just unit tests
-ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
+cd /workspaces/llaminar && ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
 
 # Run a specific test in a single test file
-cd /workspaces/llaminar/build_v2
-GTEST_FILTER=The.Specific.GTest.Name ctest -R V2_My_Test_File -V
+cd /workspaces/llaminar && GTEST_FILTER=The.Specific.GTest.Name ctest --test-dir build_v2 -R V2_My_Test_File -V
 ```
-
-### Test Categories
-
-- **BasicTest**: MPI initialization and basic functionality
-- **NumaTest**: NUMA topology detection and affinity
-- **PipelineFactoryTest**: Pipeline factory registration and creation
-- **QwenPipelineTest**: Qwen pipeline functionality
-- **BatchCorrectnessTest**: Batch vs sequential execution parity (8/8 attention stages passing)
-- **AbstractPipelineParity**: Prefill vs incremental decode equivalence
-- **ParityFrameworkTest**: PyTorch ground truth comparison (OpenBLAS, COSMA, incremental decode)
-- **CosmaPrefillTests**: COSMA distributed prefill correctness
-- **AdaptiveMatmulTests**: Backend decision logic validation
-- **MPIOperatorTests**: MPI operator correctness (Linear, Attention, RMSNorm, Embedding, RoPE, SwiGLU)
-- **AttentionTests**: Attention mechanism validation (bias, sharding, output modes)
-- **RMSNormTests**: RMSNorm parity and edge cases
-- **KVCacheTests**: KV cache capacity and state management
-- **TPTests**: Tensor partition correctness
-- **WeightTests**: Weight loading, role classification, and verification
-
-**Removed Historical Tests:**
-- ❌ `test_graph.cpp`: Generic compute graph (architecture removed)
-- ❌ `LinearKernelTest`: Legacy non-MPI kernel (retired after MPI migration)
 
 ### CTest Label Best Practices
 
@@ -1277,323 +947,6 @@ if (success) {
     LOG_INFO("Operation: " << ms << "ms, " << gflops << " GFLOPS");
 }
 ```
-
-### Performance Baselines vs llama.cpp
-
-**Benchmark Configuration** (October 2025):
-- Model: Qwen 2.5 0.5B Instruct Q8_0 (638 MB)
-- Hardware: 2-socket system (56 physical cores, 112 with HT)
-- llama.cpp: Release build with `-march=native`, 28 threads (physical cores only)
-- Llaminar: Release build with MPI (2 ranks), OpenBLAS, 28 threads per rank
-
-**llama.cpp Performance Baseline (pp512 - 512 token prompts):**
-
-| Batch Size | Throughput | Speedup vs Batch=1 | Notes |
-|------------|------------|---------------------|-------|
-| 1 | 25.2 tok/s | 1.0× | Single sequence baseline |
-| 8 | 120.5 tok/s | 4.8× | |
-| 16 | 249.7 tok/s | 9.9× | ~10× scaling milestone |
-| 32 | 643.4 tok/s | 25.5× | **Exceeds 22× target** |
-| 64 | 854.3 tok/s | 33.9× | |
-| 128 | 1065.3 tok/s | 42.3× | Strong scaling continues |
-| 256 | 1148.2 tok/s | 45.5× | Approaching plateau |
-| 512 | 1210.1 tok/s | 48.0× | **Peak performance** |
-
-**Key Findings:**
-- **Short sequences (8 tokens) severely limit batch scaling**: Only ~6× speedup at batch=32
-- **Long sequences (512 tokens) unlock true batch potential**: 48× speedup at batch=512
-- **Performance plateaus around batch=256-512**: ~1150-1210 tok/s
-- **The 22× target is achievable**: Requires longer sequences (256+ tokens) and batch sizes ≥32
-
-**Reproducing llama.cpp Baseline:**
-
-```bash
-# Build llama.cpp with optimizations
-cd llama.cpp
-cmake -B build_v2 -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_FLAGS="-march=native" \
-  -DCMAKE_C_FLAGS="-march=native" \
-  -DGGML_NATIVE=ON -DGGML_OPENMP=ON
-cmake --build build --target llama-bench --parallel
-
-# Run benchmark (pp512 = 512 token prompt, n=0 means no generation)
-OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=close \
-  ./build/bin/llama-bench \
-  -m ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
-  -p 512 -n 0 -b 1,2,4,8,16,32,64,128,256,512 -t 28
-```
-
-**Llaminar Performance Goals:**
-- **Target**: Match or exceed llama.cpp's 1210 tok/s at batch=512, pp512
-- **Current Status** (as of Oct 2025):
-  - Short sequences (8 tokens): 415 tok/s @ batch=32 (3× speedup) - limited by sequence length
-  - Long sequences (512 tokens): **To be benchmarked**
-- **Advantages**: Llaminar shows 3.5-4× better single-sequence performance (136 vs 39 tok/s with 8 tokens)
-- **Next Steps**: Extend batch performance tests to 128-512 token sequences to measure true scaling potential
-
-**Running Llaminar Batch Performance Tests:**
-
-```bash
-# Build Release version
-cmake -B build_v2_release -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build_v2_release --target test_batch_performance --parallel
-
-# Run with proper environment configuration
-./run_batch_performance.sh
-
-# Or run specific test filters
-./run_batch_performance.sh --filter '*PrefillThroughputScaling'
-```
-
-## COSMA vs OpenBLAS Integration (V1)
-
-**Note**: This section applies to V1 architecture. V2 backend selection works differently (per-tensor device affinity).
-
-### When to Use Each Backend
-
-Based on our empirical performance testing:
-
-```cpp
-// OpenBLAS dominates for small operations
-// - Single token generation: 1x896x896 - OpenBLAS 134x faster
-// - Small batches: <64 tokens - OpenBLAS wins by large margins
-// - Communication overhead dominates COSMA performance
-
-// COSMA becomes competitive at scale
-// - Prefill operations: ≥8K tokens - COSMA starts showing advantages
-// - Very large operations: ≥64K tokens - COSMA can be 3.6x faster
-// - Memory-bound operations benefit from COSMA's optimized layout
-```
-
-### Backend Selection Logic
-
-```cpp
-MatMulBackend selectOptimalBackend(int m, int n, int k, bool is_prefill) {
-    size_t total_elements = static_cast<size_t>(m) * n * k;
-    
-    // Small operations: single-threaded for minimal overhead
-    if (total_elements < 8192) {
-        return MatMulBackend::SINGLE_THREADED_OPENBLAS;
-    }
-    
-    // Large prefill: consider distributed if beneficial
-    if (is_prefill && m >= 8192 && total_elements >= 8388608) {
-        return MatMulBackend::DISTRIBUTED_OPENBLAS;  // or COSMA in future
-    }
-    
-    // Medium operations: multi-threaded local
-    return MatMulBackend::MULTI_THREADED_OPENBLAS;
-}
-```
-
-### Integration Patterns
-
-```cpp
-// Hybrid execution with fallback
-bool execute_with_fallback(const TensorInputs& inputs) {
-    try {
-        // Try optimal backend first
-        if (should_use_cosma(inputs)) {
-            return execute_cosma_path(inputs);
-        }
-    } catch (const std::exception& e) {
-        LOG_WARN("COSMA execution failed, falling back to OpenBLAS: " << e.what());
-    }
-    
-    // Fallback to reliable OpenBLAS
-    return execute_openblas_path(inputs);
-}
-
-// BF16 quantized path with MKL default (OpenBLAS verified working)
-bool execute_bf16_matmul(const float* A, const bfloat16_t* B, float* C, int m, int n, int k) {
-    #ifdef HAVE_MKL
-        // Try Intel MKL cblas_sbgemm (default when MKL available - hardware accelerated on Ice Lake+)
-        try {
-            return MKLBackend::multiply_bf16(A, B, C, m, n, k);
-        } catch (const std::exception& e) {
-            LOG_WARN("MKL BF16 failed: " << e.what() << ", trying OpenBLAS");
-        }
-    #endif
-    
-    // Fallback to OpenBLAS BF16 (verified working in v0.3.26 - software emulation reliable)
-    if (debugEnv().quant.bf16_prefer_mkl == 0) {
-        try {
-            return OpenBLASBackend::multiply_bf16(A, B, C, m, n, k);
-        } catch (const std::exception& e) {
-            LOG_WARN("OpenBLAS BF16 failed: " << e.what() << ", expanding to FP32");
-        }
-    }
-    
-    // Final fallback: FP32 expansion (rarely needed - both backends work)
-    return multiply_fp32_fallback(A, B, C, m, n, k);
-}
-```
-
-## Parity Testing Framework
-
-Llaminar includes a comprehensive **parity testing framework** that validates correctness by comparing against ground truth implementations (PyTorch, llama.cpp) and between execution modes (batch vs sequential, prefill vs decode).
-
-### Framework Components
-
-**Infrastructure:**
-- `src/ParityHooks.{h,cpp}`: Hooks for capturing intermediate activations (snapshots)
-- `src/PipelineSnapshotManager.{h,cpp}`: Pipeline-level snapshot orchestration
-- `src/PipelineStages.h`: Enumeration of all capturable stages (18 stages per layer)
-- `tests/ParityTestFramework.{h,cpp}`: Test utilities and comparison framework
-- `tests/WeightVerifier.h`: Weight loading verification against ground truth
-
-**Test Suites:**
-- `tests/TestParityFramework.cpp`: PyTorch ground truth comparison (prefill, decode)
-- `tests/test_batch_correctness.cpp`: Batch vs sequential validation
-- Various operator-level parity tests in `tests/`
-
-### Snapshot Capture System
-
-**18 Pipeline Stages per Layer:**
-1. `EMBEDDING`: Token embedding lookup
-2. `ATTENTION_NORM`: Pre-attention RMSNorm
-3. `Q_PROJECTION`: Query projection
-4. `K_PROJECTION`: Key projection
-5. `V_PROJECTION`: Value projection
-6. `ROPE_APPLICATION`: Rotary position embeddings applied
-7. `ATTENTION_SCORES`: Q·K^T scores
-8. `ATTENTION_WEIGHTS`: Softmax attention weights
-9. `ATTENTION_CONTEXT`: Weighted sum of values
-10. `ATTENTION_OUTPUT`: Output projection
-11. `ATTENTION_RESIDUAL`: Post-attention residual connection
-12. `FFN_NORM`: Pre-FFN RMSNorm
-13. `FFN_GATE`: FFN gate projection
-14. `FFN_UP`: FFN up projection
-15. `FFN_SWIGLU`: SwiGLU activation output
-16. `FFN_DOWN`: FFN down projection
-17. `FFN_RESIDUAL`: Post-FFN residual connection
-18. `FINAL_NORM`: Final RMSNorm before LM head
-19. `LM_HEAD`: Logits over vocabulary
-
-**Usage Example:**
-```cpp
-// In pipeline code:
-captureSnapshot(PipelineStage::Q_PROJECTION, layer_idx, data_ptr, seq_len, d_model);
-
-// In test code:
-SnapshotRegistry& registry = SnapshotRegistry::instance();
-TensorSnapshot snapshot;
-std::string key = registry.make_key("OpenBLAS", "Q_PROJECTION", 0);
-if (registry.get_snapshot(key, snapshot)) {
-    // Compare against ground truth
-    auto result = SnapshotComparator::compare(snapshot, ground_truth, tolerance);
-    EXPECT_TRUE(result.passed());
-}
-```
-
-### Parity Test Types
-
-#### 1. PyTorch Parity (`ParityFrameworkTest`)
-
-**Purpose**: Validate Llaminar produces identical outputs to PyTorch reference implementation
-
-**Tests:**
-- `COSMAPrefillVsPyTorch`: COSMA backend vs PyTorch (prefill phase)
-- `OpenBLASPrefillVsPyTorch`: OpenBLAS backend vs PyTorch (prefill phase)
-- `MKLPrefillVsPyTorch`: Intel MKL BF16 backend vs PyTorch (prefill phase)
-- `TrueIncrementalDecodeVsPyTorch`: Incremental decode vs PyTorch (autoregressive)
-
-**Status**: ✅ All passing with <0.1% relative error
-
-**Run:**
-```bash
-# All PyTorch parity tests
-ctest --test-dir build -R "ParityFrameworkTest" --output-on-failure --verbose
-
-# Specific backend
-GTEST_FILTER="ParityFramework.OpenBLASPrefillVsPyTorch" \
-  ctest --test-dir build -R "ParityFrameworkTest" --verbose
-```
-
-#### 2. Batch vs Sequential Parity (`BatchCorrectnessTest`)
-
-**Purpose**: Validate batch and sequential pipelines produce identical results
-
-**Tests:**
-- `BatchedAttentionStagesParity`: ✅ **8/8 attention stages passing** (exact matches)
-- `PrefillBatchVsSequential`: 🔄 In progress (extending to FFN/LM head)
-
-**Status**: Attention mechanism fully validated, FFN stages under investigation
-
-**Run:**
-```bash
-export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
-export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
-export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
-export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
-export LLAMINAR_LOG_LEVEL=DEBUG
-mpirun -np 2 ./build/test_batch_correctness \
-  --gtest_filter="BatchCorrectnessTest.BatchedAttentionStagesParity"
-```
-
-#### 3. Prefill vs Decode Parity (`AbstractPipelineParity`)
-
-**Purpose**: Validate incremental decode produces same results as prefill
-
-**Status**: ✅ Passing - proves KV cache and incremental attention correctness
-
-#### 4. Weight Verification
-
-**Purpose**: Validate weights loaded from GGUF match PyTorch checkpoint
-
-**Coverage:**
-- Embedding table: Token embeddings
-- Layer weights: Q/K/V/O projections, FFN gate/up/down, RMSNorm gamma
-- LM head: Output projection weights
-
-**Verification:**
-```cpp
-WeightVerifier verifier("path/to/pytorch_weights.npz");
-auto result = verifier.verifyEmbedding(model_loader.getEmbeddingTable());
-EXPECT_TRUE(result.passed()) << result.summary();
-```
-
-### Debugging with Snapshots
-
-**When a parity test fails:**
-
-1. **Identify divergence point**: Framework reports first mismatching stage
-   ```
-   ✓ Q_PROJECTION layer 0 (max_diff=0)
-   ✗ ATTENTION_SCORES layer 0 FAILED (max_diff=0.523)
-   ```
-
-2. **Inspect tensors**: Snapshots contain shape, data, metadata
-   ```cpp
-   std::cout << "Shape: " << snapshot.seq_len << " × " << snapshot.feature_dim << std::endl;
-   std::cout << "First values: " << snapshot.data[0] << ", " << snapshot.data[1] << std::endl;
-   ```
-
-3. **Compare metrics**: Relative L2, max absolute difference, mismatch count
-   ```cpp
-   std::cout << "Relative L2: " << result.metrics.rel_l2 << std::endl;
-   std::cout << "Max abs diff: " << result.metrics.max_abs_diff << std::endl;
-   std::cout << "Mismatches: " << result.metrics.num_mismatches << "/" << total << std::endl;
-   ```
-
-4. **Isolate bug**: Stage-by-stage validation narrows down to specific operation
-
-### Best Practices
-
-1. **Always add snapshots** when implementing new pipeline stages
-2. **Run parity tests** before merging pipeline changes
-3. **Use strict tolerances** for early stages (embedding, projections): `1e-4`
-4. **Use relaxed tolerances** for late stages (accumulated error): `1e-3`
-5. **Capture on rank 0 only** to avoid MPI synchronization overhead
-6. **Clear registry** between test cases to avoid stale snapshots
-
-### Documentation
-
-For comprehensive guide including API reference, debugging workflows, and advanced usage:
-- **`.github/instructions/parity-test-framework.instructions.md`** (2600+ lines)
-
-For architectural overview and batch parity testing:
-- **`.github/instructions/llaminar-architecture.instructions.md`**
 
 ## Code Quality Guidelines
 

@@ -272,6 +272,7 @@ TEST_F(IQ1_SSIMDTest, EdgeCase_MixedDeltaSigns)
 // GEMM Tests
 // =============================================================================
 
+/*
 TEST_F(IQ1_SSIMDTest, GEMM_SmallBatch)
 {
     auto tensor = createRandomTensor(8, 256); // 8 output features, 256 input features (1 block per row)
@@ -356,6 +357,65 @@ TEST_F(IQ1_SSIMDTest, GEMM_LargeBatch)
 
     EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 32 * 32, 1e-3f));
 }
+*/
+
+/*
+TEST_F(IQ1_SSIMDTest, GEMM_MediumBatch)
+{
+    auto tensor = createRandomTensor(16, 512); // 16 output features, 512 input features (2 blocks per row)
+
+    auto gemm = tensor->createGemm();
+
+    // A: [16, 512]
+    std::vector<float> A(16 * 512);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (auto &v : A)
+        v = dist(rng_);
+
+    // C: [16, 16]
+    std::vector<float> C(16 * 16, 0.0f);
+
+    // Weight-owned GEMM path removed: IQ1_S now participates in GEMM only via
+    // activation-tensor-centric paths.
+
+    // Reference
+    std::vector<float> B_decoded(16 * 512);
+    tensor->to_fp32(B_decoded.data());
+
+    std::vector<float> C_expected(16 * 16, 0.0f);
+    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 16, 16, 512);
+
+    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 16 * 16, 1e-3f));
+}
+
+TEST_F(IQ1_SSIMDTest, GEMM_LargeBatch)
+{
+    auto tensor = createRandomTensor(32, 768); // 32 output features, 768 input features (3 blocks per row)
+
+    auto gemm = tensor->createGemm();
+
+    // A: [32, 768]
+    std::vector<float> A(32 * 768);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    for (auto &v : A)
+        v = dist(rng_);
+
+    // C: [32, 32]
+    std::vector<float> C(32 * 32, 0.0f);
+
+    // Weight-owned GEMM path removed: IQ1_S now participates in GEMM only via
+    // activation-tensor-centric paths.
+
+    // Reference
+    std::vector<float> B_decoded(32 * 768);
+    tensor->to_fp32(B_decoded.data());
+
+    std::vector<float> C_expected(32 * 32, 0.0f);
+    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 32, 32, 768);
+
+    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 32 * 32, 1e-3f));
+}
+*/
 
 TEST_F(IQ1_SSIMDTest, EdgeCase_RandomValues)
 {

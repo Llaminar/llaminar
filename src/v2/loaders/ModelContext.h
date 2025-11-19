@@ -70,7 +70,8 @@ namespace llaminar2
          */
         static std::shared_ptr<ModelContext> createForTesting(
             const std::string &model_path = "test.gguf",
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr)
+            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+            uint32_t block_count = 1)
         {
             // Create TensorFactory from MPI context (if provided) to prevent ModelLoader
             // from creating internal MPI_COMM_NULL context that conflicts with test's MPI_COMM_WORLD
@@ -84,7 +85,7 @@ namespace llaminar2
 
             auto ctx = std::shared_ptr<ModelContext>(
                 new ModelContext(model_path, mpi_ctx, nullptr, factory, WeightDistributionStrategy::REPLICATED));
-
+            
             // Store owned factory so it lives as long as the context
             if (owned_factory)
             {
@@ -92,11 +93,9 @@ namespace llaminar2
             }
 
             // Initialize minimal valid model structure to prevent accessing uninitialized memory
-            ctx->loader_.initializeTestModel();
+            ctx->loader_.initializeTestModel(block_count);
             return ctx;
-        }
-
-        /**
+        }        /**
          * @brief Get model file path
          */
         const std::string &path() const { return model_path_; }

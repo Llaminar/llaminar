@@ -219,7 +219,7 @@ namespace llaminar2
          * Creates a dummy GGUFModel with valid defaults to prevent accessing
          * uninitialized memory in unit tests. Does not load any actual file.
          */
-        void initializeTestModel();
+        void initializeTestModel(uint32_t block_count = 1);
 
         /**
          * @brief Check if model has been loaded

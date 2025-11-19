@@ -136,8 +136,10 @@ namespace llaminar2
         // full K heads (n_kv_heads_ == n_heads_). To keep the indexing correct and
         // avoid out-of-bounds, we derive d_model_k from the configured KV head count.
 
+        // K is always expanded to n_heads_ before calling this function
+        // (either naturally if n_kv_heads == n_heads, or via expand_kv_heads)
         int d_model_q = n_heads_ * d_head_;
-        int d_model_k = n_kv_heads_ * d_head_;
+        int d_model_k = n_heads_ * d_head_;
 
         for (int b = 0; b < batch; ++b)
         {

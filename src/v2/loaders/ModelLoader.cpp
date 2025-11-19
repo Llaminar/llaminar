@@ -323,7 +323,7 @@ namespace llaminar2
         return true;
     }
 
-    void ModelLoader::initializeTestModel()
+    void ModelLoader::initializeTestModel(uint32_t block_count)
     {
         // Initialize minimal valid GGUFModel structure for testing
         model_.version = 3;
@@ -333,7 +333,7 @@ namespace llaminar2
         model_.architecture = "test";
         model_.context_length = 2048;
         model_.embedding_length = 512;
-        model_.block_count = 1;
+        model_.block_count = block_count;
         model_.head_count = 8;
         model_.head_count_kv = 8;
         model_.vocab_size = 1000;
@@ -1424,6 +1424,7 @@ namespace llaminar2
                 temp_unique = factory_->createQuantized(TensorType::Q4_1, shape, raw);
                 break;
             case GGUFTensorType::Q5_0:
+                std::cerr << "ModelLoader calling createQuantized for Q5_0" << std::endl;
                 temp_unique = factory_->createQuantized(TensorType::Q5_0, shape, raw);
                 break;
             case GGUFTensorType::Q5_1:

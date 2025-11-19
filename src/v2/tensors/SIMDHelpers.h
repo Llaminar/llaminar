@@ -1326,12 +1326,23 @@ namespace llaminar2
          */
         inline void quantize_fp32_to_q8_0(const float *src, size_t count, int8_t *dst_qs, uint16_t *dst_scale_fp16)
         {
+            const float *src_ptr = src;
+            float temp_src[32];
+
+            // Handle partial blocks by copying to temporary buffer
+            if (count < 32)
+            {
+                std::memset(temp_src, 0, sizeof(temp_src));
+                std::memcpy(temp_src, src, count * sizeof(float));
+                src_ptr = temp_src;
+            }
+
 #if defined(__AVX512F__)
-            quantize_fp32_to_q8_0_avx512(src, count, dst_qs, dst_scale_fp16);
+            quantize_fp32_to_q8_0_avx512(src_ptr, 32, dst_qs, dst_scale_fp16);
 #elif defined(__AVX2__)
-            quantize_fp32_to_q8_0_avx2(src, count, dst_qs, dst_scale_fp16);
+            quantize_fp32_to_q8_0_avx2(src_ptr, 32, dst_qs, dst_scale_fp16);
 #else
-            quantize_fp32_to_q8_0_scalar(src, count, dst_qs, dst_scale_fp16);
+            quantize_fp32_to_q8_0_scalar(src_ptr, 32, dst_qs, dst_scale_fp16);
 #endif
         }
 

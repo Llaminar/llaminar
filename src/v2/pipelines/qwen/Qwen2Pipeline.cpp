@@ -295,8 +295,13 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[Position State] current_positions_: "
-                      << "[" << current_positions_[0] << ", " << current_positions_[1] << "]");
+            std::stringstream ss;
+            ss << "[";
+            for (size_t i = 0; i < current_positions_.size(); ++i) {
+                ss << current_positions_[i] << (i < current_positions_.size() - 1 ? ", " : "");
+            }
+            ss << "]";
+            LOG_DEBUG("[Position State] current_positions_: " << ss.str());
         }
 
         // Pad sequences to uniform length

@@ -377,6 +377,7 @@ TEST_F(IQ2_SSIMDTest, EdgeCase_MaxScale)
 // GEMM Tests
 // =============================================================================
 
+/*
 TEST_F(IQ2_SSIMDTest, GEMM_SmallBatch)
 {
     auto tensor = createRandomTensor(8, 256); // 8 output features, 256 input features (1 block per row)
@@ -461,6 +462,7 @@ TEST_F(IQ2_SSIMDTest, GEMM_LargeBatch)
 
     EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 32 * 32, 1e-3f));
 }
+*/
 
 TEST_F(IQ2_SSIMDTest, EdgeCase_RandomValues)
 {

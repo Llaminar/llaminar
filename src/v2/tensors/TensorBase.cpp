@@ -139,13 +139,27 @@ namespace llaminar2
             }
         }
 
-        // Step 4: Quantize to INT8 using per-column scales
+        // Step 4: Quantize to INT8 using per-column scales (or per-row if requested)
+        const bool use_row_scales = (dst_row_scales != nullptr);
+
         for (size_t i = 0; i < rows; ++i)
         {
+            const float row_inv_scale = use_row_scales ? (1.0f / dst_row_scales[i]) : 1.0f;
+
             for (size_t j = 0; j < cols; ++j)
             {
                 const size_t idx = i * cols + j;
-                const float inv_scale = 1.0f / dst_col_scales[j];
+                float inv_scale;
+
+                if (use_row_scales)
+                {
+                    inv_scale = row_inv_scale;
+                }
+                else
+                {
+                    inv_scale = 1.0f / dst_col_scales[j];
+                }
+
                 float scaled = fp32_data[idx] * inv_scale;
                 int32_t quantized = static_cast<int32_t>(std::round(scaled));
 

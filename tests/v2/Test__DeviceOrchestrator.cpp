@@ -100,7 +100,8 @@ TEST_F(Test__DeviceOrchestrator, LayerSplitStrategy)
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_, mpi_ctx_, config);
 
-    auto model_ctx = ModelContext::createForTesting("test.gguf");
+    // Create model with 12 layers to support testing offload_layers=4 and checking blk.10
+    auto model_ctx = ModelContext::createForTesting("test.gguf", nullptr, 12);
     auto placement_map = orchestrator->createPlacementMap(model_ctx);
 
     ASSERT_NE(nullptr, placement_map);
@@ -139,7 +140,7 @@ TEST_F(Test__DeviceOrchestrator, LayerSplitZeroOffload)
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_, mpi_ctx_, config);
 
-    auto model_ctx = ModelContext::createForTesting("test.gguf");
+    auto model_ctx = ModelContext::createForTesting("test.gguf", nullptr, 12);
     auto placement_map = orchestrator->createPlacementMap(model_ctx);
 
     // Embeddings still on GPU (for performance)

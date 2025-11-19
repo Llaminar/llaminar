@@ -234,7 +234,7 @@ TEST_F(Test__FP32AttentionParity, AttentionScoresVsPyTorch)
     ASSERT_TRUE(load_snapshot("Q_rope", pytorch_q));
     ASSERT_TRUE(load_snapshot("K_rope", pytorch_k));
     ASSERT_TRUE(load_snapshot("V_projection", pytorch_v));
-    ASSERT_TRUE(load_snapshot("attention_scores", pytorch_scores));
+    ASSERT_TRUE(load_snapshot("attention_weights", pytorch_scores));
 
     // Extract dimensions (same configuration as BasicForwardVsPyTorch)
     ASSERT_EQ(pytorch_q.shape.size(), 3) << "Expected Q to be 3D";

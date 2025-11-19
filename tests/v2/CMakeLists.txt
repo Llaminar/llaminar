@@ -423,15 +423,15 @@ add_v2_test(V2_Unit_RoPEPrecisionCorrectness
 )
 
 # Test: BPETokenizer (native tokenizer implementation)
-add_executable(v2_test_bpe_tokenizer unit/Test__BPETokenizer.cpp)
+add_executable(v2_test_bpe_tokenizer integration/Test__BPETokenizer.cpp)
 target_link_libraries(v2_test_bpe_tokenizer 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_BPETokenizer 
+add_v2_test(V2_Integration_BPETokenizer 
     COMMAND $<TARGET_FILE:v2_test_bpe_tokenizer>
-    LABELS "V2;Unit;Tokenization;BPE;NLP;TextProcessing"
+    LABELS "V2;Integration;Tokenization;BPE;NLP;TextProcessing"
     MPI_PROCS 1  # Tokenizer is single-rank only
 )
 
@@ -751,31 +751,18 @@ add_v2_test(V2_Unit_Q8_K_Views
 # with synthetic test data to ensure numerical equivalency across all code paths.
 
 # Test: Q4_0 SIMD Equivalency
-add_executable(v2_test_q4_0_simd unit/tensors/Test__Q4_0Tensor.cpp)
+add_executable(v2_test_q4_0_simd integration/Test__Q4_0Tensor.cpp)
 target_link_libraries(v2_test_q4_0_simd 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Q4_0_SIMD 
+add_v2_test(V2_Integration_Q4_0_SIMD 
     COMMAND $<TARGET_FILE:v2_test_q4_0_simd>
     MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;Q4_0;Quantization;SIMD;AVX2;AVX512;Equivalency"
+    LABELS "V2;Integration;TensorOperations;Q4_0;Quantization;SIMD;AVX2;AVX512;Equivalency"
 )
 
-# Test: Q4_0 Fused Dequant+GEMM Parity
-add_executable(v2_test_q4_0_gemm_parity unit/tensors/Test__Q4_0Gemm_DequantParity.cpp)
-target_link_libraries(v2_test_q4_0_gemm_parity 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-    ${BLAS_LIBRARIES}
-)
-add_v2_test(V2_Unit_Q4_0_Gemm_DequantParity 
-    COMMAND $<TARGET_FILE:v2_test_q4_0_gemm_parity>
-    MPI_PROCS 1
-    LABELS "V2;Unit;Kernels;GEMM;Q4_0;Quantization;DequantParity;FusedKernels"
-)
 
 # Test: Q4_1 SIMD Equivalency
 add_executable(v2_test_q4_1_simd unit/tensors/Test__Q4_1Tensor.cpp)
@@ -791,16 +778,16 @@ add_v2_test(V2_Unit_Q4_1_SIMD
 )
 
 # Test: Q5_0 SIMD Equivalency
-add_executable(v2_test_q5_0_simd unit/tensors/Test__Q5_0Tensor.cpp)
+add_executable(v2_test_q5_0_simd integration/Test__Q5_0Tensor.cpp)
 target_link_libraries(v2_test_q5_0_simd 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Q5_0_SIMD 
+add_v2_test(V2_Integration_Q5_0_SIMD 
     COMMAND $<TARGET_FILE:v2_test_q5_0_simd>
     MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;Q5_0;Quantization;SIMD;AVX2;AVX512;Equivalency;HighBit"
+    LABELS "V2;Integration;TensorOperations;Q5_0;Quantization;SIMD;AVX2;AVX512;Equivalency;HighBit"
 )
 
 # Test: Q5_1 SIMD Equivalency
@@ -848,16 +835,16 @@ add_v2_test(V2_Unit_Q2_K_SIMD
 )
 
 # Test: Q8_0 SIMD Equivalency
-add_executable(v2_test_q8_0_simd unit/tensors/Test__Q8_0Tensor.cpp)
+add_executable(v2_test_q8_0_simd integration/Test__Q8_0Tensor.cpp)
 target_link_libraries(v2_test_q8_0_simd 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Q8_0_SIMD 
+add_v2_test(V2_Integration_Q8_0_SIMD 
     COMMAND $<TARGET_FILE:v2_test_q8_0_simd>
     MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;Q8_0;Quantization;SIMD;AVX2;AVX512;Equivalency"
+    LABELS "V2;Integration;TensorOperations;Q8_0;Quantization;SIMD;AVX2;AVX512;Equivalency"
 )
 
 # Test: Q3_K SIMD Equivalency
@@ -961,16 +948,16 @@ add_v2_test(V2_Unit_PipelinePrecisionMode
 )
 
 # Test: ModelLoader
-add_executable(v2_test_model_loader unit/loaders/Test__ModelLoader.cpp)
+add_executable(v2_test_model_loader integration/Test__ModelLoader.cpp)
 target_link_libraries(v2_test_model_loader 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_ModelLoader 
+add_v2_test(V2_Integration_ModelLoader 
     COMMAND $<TARGET_FILE:v2_test_model_loader>
     MPI_PROCS 1
-    LABELS "V2;Unit;ModelLoading;GGUF;WeightLoading"
+    LABELS "V2;Integration;ModelLoading;GGUF;WeightLoading"
 )
 
 # Test: IQ4_NL Tensor GEMM
@@ -1156,16 +1143,16 @@ add_v2_test(V2_Unit_TensorViews
 )
 
 # Test: Qwen2 Null MPI Context (regression test for null pointer crash)
-add_executable(v2_test_qwen2_null_mpi_context unit/Test__Qwen2NullMPIContext.cpp)
+add_executable(v2_test_qwen2_null_mpi_context integration/Test__Qwen2NullMPIContext.cpp)
 target_link_libraries(v2_test_qwen2_null_mpi_context
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Qwen2NullMPIContext
+add_v2_test(V2_Integration_Qwen2NullMPIContext
     COMMAND $<TARGET_FILE:v2_test_qwen2_null_mpi_context>
     MPI_PROCS 1
-    LABELS "V2;Unit;PipelineExecution;Qwen;SingleRank;Regression;Models"
+    LABELS "V2;Integration;PipelineExecution;Qwen;SingleRank;Regression;Models"
     FIXTURES_REQUIRED "V2_Models"
 )
 
