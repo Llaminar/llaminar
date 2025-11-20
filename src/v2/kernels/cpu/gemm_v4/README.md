@@ -1,22 +1,26 @@
 # OneDNN GEMM Kernel (gemm_v4)
 
 **Location**: `src/v2/kernels/cpu/gemm_v4/`  
-**Status**: Production-ready INT8 GEMM with FP32 reference validation and fused softmax helpers  
+**Status**: Production-ready multi-precision GEMM with INT8, FP32, BF16, and FP16 support  
 **Performance**: ~480 GOPS on Qwen 0.5B FFN (8192×896×4864), 21% of theoretical peak
 
 ---
 
 ## Overview
 
-The OneDNN GEMM kernel (`gemm_v4`) provides high-performance INT8 matrix multiplication using Intel's [oneDNN library](https://github.com/oneapi-src/oneDNN). It leverages **per-channel quantization** with separate activation (row) and weight (column) scales to achieve near-FP32 accuracy while exploiting INT8 compute throughput.
+The OneDNN GEMM kernel (`gemm_v4`) provides high-performance matrix multiplication using Intel's [oneDNN library](https://github.com/oneapi-src/oneDNN). It supports **multiple precision formats** (INT8, FP32, BF16, FP16) with **per-channel quantization** for INT8 paths, achieving near-FP32 accuracy while exploiting specialized compute throughput.
 
 ### Key Features
 
-- ✅ **INT8 Compute**: Uses `dnnl::matmul` with `s8×s8→s32` accumulation
-- ✅ **Per-Channel Quantization**: Independent scales per activation row and weight column
+- ✅ **Multi-Precision Support**: INT8 (`s8×s8→s32`), FP32 (`f32×f32→f32`), BF16 (`bf16×bf16→f32`), FP16 (`f16×f16→f32`)
+- ✅ **Typed GEMM Interface**: Template-based `multiply_activations_typed()` with compile-time type safety
+- ✅ **Mixed Precision Operations**: FP32 activations × BF16/FP16 weights (attention context projection)
+- ✅ **Strided Memory Access**: Zero-copy multi-head attention via `multiply_activations_strided_typed()`
+- ✅ **Per-Channel Quantization**: Independent scales per activation row and weight column (INT8 path)
 - ✅ **Fused GEMM + Softmax**:
     - INT8 path: `run_onednn_int8_matmul_with_softmax()` (INT8 matmul + numerically stable softmax)
     - FP32 path: `run_onednn_fp32_matmul_softmax()` with softmax post-op, falling back to host softmax
+    - Typed path: `multiply_with_softmax_typed()` for native-precision attention scores
 - ✅ **Zero-Copy Integration**: Direct tensor API without intermediate buffers (via `ActivationView`)
 - ✅ **FP32 Reference Validation**: Automated correctness checks in performance tests
 - ✅ **Adapter Pattern**: Seamless integration with V2 pipeline infrastructure (`OneDNNGemmKernel` + `onednn_gemm_adapter`)
@@ -29,16 +33,34 @@ The OneDNN GEMM kernel (`gemm_v4`) provides high-performance INT8 matrix multipl
 
 ```
 OneDNNGemmKernel.h
-├── onednn_engine()               # Singleton oneDNN CPU engine
-├── onednn_stream()               # Singleton execution stream
-├── run_onednn_int8_matmul()      # Low-level s8×s8→s32 primitive
-├── run_onednn_fp32_matmul()      # FP32 matmul (activation-activation GEMM)
-├── run_onednn_fp32_matmul_softmax()
-│                                 # FP32 matmul + fused softmax post-op (row/col axis)
-├── run_onednn_int8_matmul_with_softmax()
-│                                 # INT8 matmul + host softmax (scores path)
-├── apply_softmax_inplace()       # Vectorized softmax for 2D [rows, cols]
-└── OneDNNGemmKernel              # ITensorGemm implementation (GEMM + GEMM+softmax)
+├── onednn_engine()                          # Singleton oneDNN CPU engine
+├── onednn_stream()                          # Singleton execution stream
+│
+├── Low-Level Primitives:
+│   ├── run_onednn_int8_matmul()             # INT8: s8×s8→s32
+│   ├── run_onednn_fp32_matmul()             # FP32: f32×f32→f32
+│   ├── run_onednn_bf16_matmul()             # BF16: bf16×bf16→f32 (AVX512_BF16)
+│   ├── run_onednn_fp16_matmul()             # FP16: f16×f16→f32 (AVX512_FP16)
+│   ├── run_onednn_mixed_bf16_matmul()       # Mixed: f32×bf16→f32 (scores@V)
+│   └── run_onednn_mixed_fp16_matmul()       # Mixed: f32×fp16→f32 (scores@V)
+│
+├── Fused Operations:
+│   ├── run_onednn_fp32_matmul_softmax()     # FP32 matmul + softmax post-op
+│   ├── run_onednn_int8_matmul_with_softmax()# INT8 matmul + host softmax
+│   └── apply_softmax_inplace()              # Vectorized softmax (libmvec)
+│
+├── Helper Classes:
+│   └── ActivationView                       # Lightweight IActivationTensor view
+│
+└── OneDNNGemmKernel (ITensorGemm):
+    ├── multiply()                            # Weight GEMM (INT8 path)
+    ├── multiply_activations()                # Activation GEMM (FP32)
+    ├── multiply_activations_strided()        # Strided GEMM (FP32)
+    ├── multiply_activations_typed_impl()     # Type-erased typed GEMM
+    ├── multiply_activations_strided_typed_impl()  # Type-erased strided typed
+    ├── multiply_with_softmax()               # Weight GEMM + softmax
+    ├── multiply_with_softmax_typed_impl()    # Type-erased softmax GEMM
+    └── multiply_with_softmax_strided_typed_impl() # Type-erased strided softmax
 
 OneDNNGemmAdapter.h
 ├── pack_weights_to_int8()        # Weight tensor → WeightPack (col-major INT8)
@@ -166,6 +188,48 @@ public:
                                       const MPIContext *mpi_ctx = nullptr,
                                       int device_idx = -1) override;
 
+    // Typed activation GEMM (template interface)
+    template <typename ActT, typename WeightT>
+    bool multiply_activations_typed(const ActT *A, const WeightT *B, float *C,
+                                   int m, int n, int k,
+                                   bool transpose_B = true,
+                                   float alpha = 1.0f, float beta = 0.0f,
+                                   const MPIContext *mpi_ctx = nullptr,
+                                   int device_idx = -1,
+                                   ActivationFormat format = ActivationFormat::FP32);
+
+    // Type-erased implementation for typed GEMM
+    bool multiply_activations_typed_impl(const void *A, const void *B, float *C,
+                                        int m, int n, int k,
+                                        bool transpose_B,
+                                        float alpha, float beta,
+                                        const MPIContext *mpi_ctx,
+                                        int device_idx,
+                                        ActivationFormat format_A,
+                                        ActivationFormat format_B) override;
+
+    // Typed strided activation GEMM (template interface)
+    template <typename ActT, typename WeightT>
+    bool multiply_activations_strided_typed(const ActT *A, const WeightT *B, float *C,
+                                           int m, int n, int k,
+                                           int lda, int ldb, int ldc,
+                                           bool transpose_B = true,
+                                           float alpha = 1.0f, float beta = 0.0f,
+                                           const MPIContext *mpi_ctx = nullptr,
+                                           int device_idx = -1,
+                                           ActivationFormat format = ActivationFormat::FP32);
+
+    // Type-erased implementation for strided typed GEMM
+    bool multiply_activations_strided_typed_impl(const void *A, const void *B, float *C,
+                                                int m, int n, int k,
+                                                int lda, int ldb, int ldc,
+                                                bool transpose_B,
+                                                float alpha, float beta,
+                                                const MPIContext *mpi_ctx,
+                                                int device_idx,
+                                                ActivationFormat format_A,
+                                                ActivationFormat format_B) override;
+
     // Fused GEMM + softmax on weights: C = softmax(A @ B^T)
     bool multiply_with_softmax(const float *A, float *C,
                                int m, int n, int k,
@@ -174,19 +238,71 @@ public:
                                const MPIContext *mpi_ctx = nullptr,
                                int device_idx = -1) override;
 
-    // Fused GEMM + softmax on activations: C = softmax(A @ B^T)
-    bool multiply_activations_with_softmax(const float *A, const float *B, float *C,
-                                           int m, int n, int k,
-                                           bool transpose_B = true,
-                                           int softmax_axis = 1,
-                                           const MPIContext *mpi_ctx = nullptr,
-                                           int device_idx = -1) override;
+    // Template-based typed fused matmul + softmax
+    template <typename ActT, typename WeightT>
+    bool multiply_with_softmax_typed(const ActT *A, const WeightT *B, float *C,
+                                    int m, int n, int k,
+                                    float scale = 1.0f,
+                                    bool transpose_B = true,
+                                    int softmax_axis = 1,
+                                    const float *mask = nullptr,
+                                    bool is_causal = false,
+                                    const MPIContext *mpi_ctx = nullptr,
+                                    int device_idx = -1,
+                                    ActivationFormat format = ActivationFormat::FP32);
+
+    // Type-erased implementation for typed softmax GEMM
+    bool multiply_with_softmax_typed_impl(const void *A, const void *B, float *C,
+                                         int m, int n, int k,
+                                         float scale,
+                                         bool transpose_B,
+                                         int softmax_axis,
+                                         const float *mask,
+                                         bool is_causal,
+                                         const MPIContext *mpi_ctx,
+                                         int device_idx,
+                                         ActivationFormat format_A,
+                                         ActivationFormat format_B) override;
+
+    // Template-based strided typed fused matmul + softmax
+    template <typename ActT, typename WeightT>
+    bool multiply_with_softmax_strided_typed(const ActT *A, const WeightT *B, float *C,
+                                            int m, int n, int k,
+                                            int lda, int ldb, int ldc,
+                                            float scale = 1.0f,
+                                            bool transpose_B = true,
+                                            int softmax_axis = 1,
+                                            const float *mask = nullptr,
+                                            bool is_causal = false,
+                                            const MPIContext *mpi_ctx = nullptr,
+                                            int device_idx = -1,
+                                            ActivationFormat format = ActivationFormat::FP32);
+
+    // Type-erased implementation for strided typed softmax GEMM
+    bool multiply_with_softmax_strided_typed_impl(const void *A, const void *B, float *C,
+                                                 int m, int n, int k,
+                                                 int lda, int ldb, int ldc,
+                                                 float scale,
+                                                 bool transpose_B,
+                                                 int softmax_axis,
+                                                 const float *mask,
+                                                 bool is_causal,
+                                                 const MPIContext *mpi_ctx,
+                                                 int device_idx,
+                                                 ActivationFormat format_A,
+                                                 ActivationFormat format_B) override;
 };
 ```
 
-`multiply_with_softmax()` uses the INT8 adapter + `apply_softmax_inplace()`, while
-`multiply_activations_with_softmax()` uses the FP32 matmul+softmax primitive, falling
-back to FP32 matmul + host softmax when oneDNN cannot fuse for the requested axis.
+**Precision Dispatch Logic**:
+- **FP32×FP32**: `run_onednn_fp32_matmul()` (universal fallback)
+- **BF16×BF16**: `run_onednn_bf16_matmul()` (AVX512_BF16 required, falls back to FP32)
+- **FP16×FP16**: `run_onednn_fp16_matmul()` (AVX512_FP16 required, falls back to FP32)
+- **FP32×BF16**: `run_onednn_mixed_bf16_matmul()` (attention context: scores@V)
+- **FP32×FP16**: `run_onednn_mixed_fp16_matmul()` (attention context: scores@V)
+- **INT8×INT8**: `run_onednn_int8_matmul()` (via adapter, quantization path)
+
+**Strided Operations**: `multiply_activations_strided_typed_impl()` detects row-major layouts and falls back to contiguous copy when strides don't match expected dimensions.
 
 ### Tensor Conversion Methods
 
@@ -469,6 +585,27 @@ Running the executable directly will produce **inconsistent and degraded perform
 
 ---
 
+## Precision Support Matrix
+
+| Operation | FP32 | BF16 | FP16 | Mixed (FP32×BF16/FP16) | INT8 |
+|-----------|------|------|------|------------------------|------|
+| `multiply_activations()` | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `multiply_activations_typed()` | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `multiply_activations_strided_typed()` | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `multiply_with_softmax_typed()` | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `multiply()` (weight GEMM) | ❌ | ❌ | ❌ | ❌ | ✅ |
+
+**Hardware Requirements**:
+- **BF16**: AVX512_BF16 (Sapphire Rapids, Zen 4+)
+- **FP16**: AVX512_FP16 (Sapphire Rapids) or emulation fallback
+- **INT8**: AVX512-VNNI (Cascade Lake+) or scalar fallback
+
+**Fallback Behavior**:
+- Missing BF16/FP16 support → Convert to FP32, run FP32 GEMM
+- Missing AVX512-VNNI → Scalar INT8 accumulation (significant slowdown)
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
@@ -477,14 +614,18 @@ Running the executable directly will produce **inconsistent and degraded perform
 2. **No Bias Fusion**: Bias addition happens in dequant step (not fused into OneDNN primitive)
 3. **Static Threading**: Thread count set at pipeline init (no dynamic adjustment)
 4. **INT8 Range**: Clamps to `[-127, 127]` vs full `[-128, 127]` to avoid asymmetry
+5. **Strided Overhead**: Non-row-major layouts require copy to contiguous buffer
+6. **Softmax Axis**: OneDNN softmax post-op only supports last dimension (falls back to host for other axes)
 
 ### Planned Enhancements
 
 - [ ] **OneDNN Bias Fusion**: Add bias as post-op to matmul descriptor (eliminate dequant-stage fusion)
-- [ ] **BF16 Path**: Leverage BF16 matmul for models with BF16 weights (bypass INT8 quantization)
+- [x] **BF16 Path**: Leverage BF16 matmul for models with BF16 weights (✅ implemented)
+- [x] **FP16 Path**: Leverage FP16 matmul for FP16 activations (✅ implemented)
 - [ ] **Kernel Caching**: Reuse compiled primitives across calls (JIT amortization)
 - [ ] **INT4 Support**: Add IQ4_NL direct path (bypass INT8 expansion)
 - [ ] **Async Execution**: Non-blocking GEMM for pipeline overlap
+- [ ] **In-Place Strided**: Avoid copy overhead by using oneDNN's strided memory descriptors
 
 ---
 
@@ -502,4 +643,4 @@ Running the executable directly will produce **inconsistent and degraded perform
 - **David Sanftenberg** - Initial implementation and validation framework
 - **OneDNN Team** - Underlying matrix multiplication primitives
 
-**Last Updated**: November 17, 2025
+**Last Updated**: November 20, 2025

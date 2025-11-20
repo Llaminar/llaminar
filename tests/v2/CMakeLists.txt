@@ -338,6 +338,19 @@ add_v2_test(V2_Unit_OneDNNGemmKernel
     MPI_PROCS 1  # OneDNN fused kernel executes on CPU only
 )
 
+# Test: OneDNN GEMM kernel strided/causal support
+add_executable(v2_test_onednn_gemm_kernel_strided unit/kernels/gemm/Test__OneDNNGemmKernel_Strided.cpp)
+target_link_libraries(v2_test_onednn_gemm_kernel_strided
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OneDNNGemmKernel_Strided
+    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_strided>
+    LABELS "V2;Unit;Kernels;GEMM;Softmax;OneDNN;CPU;Strided"
+    MPI_PROCS 1
+)
+
 # Test: OneDNN GEMM kernel typed interface (BF16/FP16/FP32)
 add_executable(v2_test_onednn_gemm_kernel_typed unit/kernels/gemm/Test__OneDNNGemmKernel_Typed.cpp)
 target_link_libraries(v2_test_onednn_gemm_kernel_typed
@@ -348,6 +361,19 @@ target_link_libraries(v2_test_onednn_gemm_kernel_typed
 add_v2_test(V2_Unit_OneDNNGemmKernel_Typed
     COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_typed>
     LABELS "V2;Unit;Kernels;GEMM;OneDNN;Typed;BF16;FP16;CPU"
+    MPI_PROCS 1
+)
+
+# Test: OneDNN GEMM kernel scratch buffer functionality
+add_executable(v2_test_onednn_gemm_kernel_scratch_buffers unit/kernels/gemm/Test__OneDNNGemmKernel_ScratchBuffers.cpp)
+target_link_libraries(v2_test_onednn_gemm_kernel_scratch_buffers
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OneDNNGemmKernel_ScratchBuffers
+    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_scratch_buffers>
+    LABELS "V2;Unit;Kernels;GEMM;OneDNN;ScratchBuffers;MemoryManagement;ThreadLocal;Performance;CPU"
     MPI_PROCS 1
 )
 
@@ -1450,8 +1476,7 @@ if(HAVE_CUDA)
     add_v2_test(V2_Unit_CudaGemmPhase4QuickWins 
         COMMAND $<TARGET_FILE:v2_test_cuda_gemm_phase4_quickwins>
         LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;TensorCores;CuTe;SwizzledMemory;AsyncCopy;Performance"
-        MPI_PROCS 1
-    )
+        MPI_PROCS 1    )
     
     # Phase 4: Profiling (manual timing breakdown)
     add_executable(v2_test_phase4_profiling unit/Test__Phase4Profiling.cpp)
@@ -1493,7 +1518,7 @@ if(HAVE_CUDA)
     # Phase 5: JIT Auto-Tuning Sweep
     # Configuration space exploration for Phase 5 streaming dequant
     # Tests hypothesis that single buffering may outperform double buffering
-    add_executable(v2_test_phase5_sweep cuda/Test__Phase5Sweep.cpp)
+    add_executable(v2_test_phase5_sweep cuda/Perf__Phase5Sweep.cpp)
     target_include_directories(v2_test_phase5_sweep PRIVATE
         ${CMAKE_SOURCE_DIR}/kernels/cuda
         /opt/cutlass/include
@@ -2213,8 +2238,8 @@ endif()
 # Requires: cnpy library for NumPy .npz file loading
 find_package(ZLIB)
 if(ZLIB_FOUND)
-    # Get the workspace root (parent of src/v2)
-    get_filename_component(WORKSPACE_ROOT "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+    # Get the workspace root (parent of tests/v2)
+    get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
     # E2E parity test requires ENABLE_PIPELINE_SNAPSHOTS (Debug or E2ERelease builds)
     # Skip in standard Release builds to avoid linking errors

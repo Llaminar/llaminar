@@ -28,6 +28,8 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/FP16Utils.h"
+#include "../../../utils/CPUFeatures.h"
 #include "OneDNNGemmAdapter.h"
 #include "../../../utils/Logger.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
@@ -350,8 +352,8 @@ namespace llaminar2
             }
             catch (const dnnl::error &e)
             {
-                LOG_ERROR("OneDNN FP16 matmul failed: status=" << e.status
-                                                               << " message=" << e.what());
+                LOG_WARN("OneDNN FP16 matmul failed (likely unsupported hardware): status=" << e.status
+                                                                                            << " message=" << e.what());
                 return false;
             }
 
@@ -456,6 +458,12 @@ namespace llaminar2
                         max_val = std::max(max_val, data[base + static_cast<size_t>(c)]);
                     }
 
+                    if (max_val == -std::numeric_limits<float>::infinity())
+                    {
+                        std::fill(data + base, data + base + cols, 0.0f);
+                        continue;
+                    }
+
                     float sum = detail::apply_libmvec_exp(data + base, cols, max_val);
 
                     const float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
@@ -478,6 +486,15 @@ namespace llaminar2
                         const float val = data[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)];
                         column[static_cast<size_t>(r)] = val;
                         max_val = std::max(max_val, val);
+                    }
+
+                    if (max_val == -std::numeric_limits<float>::infinity())
+                    {
+                        for (int r = 0; r < rows; ++r)
+                        {
+                            data[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(c)] = 0.0f;
+                        }
+                        continue;
                     }
 
                     float sum = detail::apply_libmvec_exp(column.data(), rows, max_val);
@@ -870,8 +887,8 @@ namespace llaminar2
             }
             catch (const dnnl::error &e)
             {
-                LOG_ERROR("OneDNN Mixed FP16 matmul failed: status=" << e.status
-                                                                     << " message=" << e.what());
+                LOG_WARN("OneDNN Mixed FP16 matmul failed (likely unsupported hardware): status=" << e.status
+                                                                                                  << " message=" << e.what());
                 return false;
             }
 
@@ -897,6 +914,55 @@ namespace llaminar2
                 return device_idx == -1; // CPU only
             }
 
+        private:
+            /**
+             * @brief Thread-local scratch buffers to avoid hot-path allocations
+             * 
+             * Buffers grow as needed but never shrink, providing zero-allocation 
+             * GEMM calls after initial warm-up. Thread-local to support OpenMP.
+             */
+            struct ScratchBuffers
+            {
+                std::vector<float> fp32_buffer_a;
+                std::vector<float> fp32_buffer_b;
+                std::vector<float> fp32_buffer_c;
+                std::vector<uint16_t> fp16_buffer;
+                std::vector<uint8_t> byte_buffer_a;
+                std::vector<uint8_t> byte_buffer_b;
+            };
+
+            static ScratchBuffers& get_scratch_buffers()
+            {
+                thread_local ScratchBuffers buffers;
+                return buffers;
+            }
+
+            static void ensure_fp32_capacity(std::vector<float>& buf, size_t required_size)
+            {
+                if (buf.size() < required_size)
+                {
+                    buf.resize(required_size);
+                }
+            }
+
+            static void ensure_fp16_capacity(std::vector<uint16_t>& buf, size_t required_size)
+            {
+                if (buf.size() < required_size)
+                {
+                    buf.resize(required_size);
+                }
+            }
+
+            static void ensure_byte_capacity(std::vector<uint8_t>& buf, size_t required_size)
+            {
+                if (buf.size() < required_size)
+                {
+                    buf.resize(required_size);
+                }
+            }
+
+        public:
+
             /**
              * @brief Execute GEMM: C = alpha * A @ B^T + beta * C
              */
@@ -905,6 +971,7 @@ namespace llaminar2
                 int m, int n, int k,
                 bool transpose_B = true,
                 int softmax_axis = 1,
+                const float *mask = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
@@ -937,6 +1004,19 @@ namespace llaminar2
                         LOG_ERROR("[OneDNNGemmKernel] Fallback activation matmul failed in "
                                   "multiply_with_softmax");
                         return false;
+                    }
+
+                    // Apply mask if provided
+                    if (mask)
+                    {
+#pragma omp parallel for collapse(2)
+                        for (int i = 0; i < m; ++i)
+                        {
+                            for (int j = 0; j < n; ++j)
+                            {
+                                C[i * n + j] += mask[i * n + j];
+                            }
+                        }
                     }
 
                     int axis = softmax_axis;
@@ -1084,6 +1164,7 @@ namespace llaminar2
                     return false;
                 }
 
+                // LOG_DEBUG("[OneDNNGemmKernel] multiply_activations_strided_typed_impl called. m=" << m << " n=" << n << " k=" << k << " lda=" << lda << " ldb=" << ldb << " ldc=" << ldc);
                 const bool a_row_major = (lda == k);
                 const bool b_row_major = (ldb == (transpose_B ? k : n));
                 const bool c_row_major = (ldc == n);
@@ -1093,13 +1174,16 @@ namespace llaminar2
                     return multiply_activations(A, B, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
                 }
 
-                std::vector<float> A_buf(static_cast<size_t>(m) * static_cast<size_t>(k));
-                std::vector<float> B_buf(static_cast<size_t>(k) * static_cast<size_t>(n));
+                auto& scratch = get_scratch_buffers();
+                ensure_fp32_capacity(scratch.fp32_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k));
+                ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
+                float* A_buf = scratch.fp32_buffer_a.data();
+                float* B_buf = scratch.fp32_buffer_b.data();
 
                 for (int row = 0; row < m; ++row)
                 {
                     const float *src = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
-                    float *dst = A_buf.data() + static_cast<size_t>(row) * static_cast<size_t>(k);
+                    float *dst = A_buf + static_cast<size_t>(row) * static_cast<size_t>(k);
                     std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(k));
                 }
 
@@ -1108,7 +1192,7 @@ namespace llaminar2
                     for (int ki = 0; ki < k; ++ki)
                     {
                         const float *src = B + static_cast<size_t>(ki) * static_cast<size_t>(ldb);
-                        float *dst = B_buf.data() + static_cast<size_t>(ki) * static_cast<size_t>(n);
+                        float *dst = B_buf + static_cast<size_t>(ki) * static_cast<size_t>(n);
                         std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
                     }
                 }
@@ -1125,7 +1209,6 @@ namespace llaminar2
                     }
                 }
 
-                std::vector<float> C_tmp;
                 float *C_target = nullptr;
                 if (c_row_major)
                 {
@@ -1133,11 +1216,11 @@ namespace llaminar2
                 }
                 else
                 {
-                    C_tmp.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
-                    C_target = C_tmp.data();
+                    ensure_fp32_capacity(scratch.fp32_buffer_c, static_cast<size_t>(m) * static_cast<size_t>(n));
+                    C_target = scratch.fp32_buffer_c.data();
                 }
 
-                if (!multiply_activations(A_buf.data(), B_buf.data(), C_target, m, n, k, false, alpha, beta, mpi_ctx, device_idx))
+                if (!multiply_activations(A_buf, B_buf, C_target, m, n, k, false, alpha, beta, mpi_ctx, device_idx))
                 {
                     return false;
                 }
@@ -1146,7 +1229,7 @@ namespace llaminar2
                 {
                     for (int row = 0; row < m; ++row)
                     {
-                        const float *src = C_target + static_cast<size_t>(row) * static_cast<size_t>(n);
+                        const float *src = scratch.fp32_buffer_c.data() + static_cast<size_t>(row) * static_cast<size_t>(n);
                         float *dst = C + static_cast<size_t>(row) * static_cast<size_t>(ldc);
                         std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
                     }
@@ -1184,25 +1267,54 @@ namespace llaminar2
                     const uint16_t *rhs_ptr = static_cast<const uint16_t *>(B);
                     const uint16_t *lhs_ptr = static_cast<const uint16_t *>(A);
 
-                    std::vector<uint16_t> B_transposed;
+                    auto& scratch = get_scratch_buffers();
                     if (transpose_B)
                     {
-                        B_transposed.resize(static_cast<size_t>(k) * static_cast<size_t>(n));
+                        ensure_fp16_capacity(scratch.fp16_buffer, static_cast<size_t>(k) * static_cast<size_t>(n));
                         for (int i = 0; i < n; ++i)
                         {
                             for (int j = 0; j < k; ++j)
                             {
-                                B_transposed[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
+                                scratch.fp16_buffer[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
                                     rhs_ptr[static_cast<size_t>(i) * static_cast<size_t>(k) + static_cast<size_t>(j)];
                             }
                         }
-                        rhs_ptr = B_transposed.data();
+                        rhs_ptr = scratch.fp16_buffer.data();
                     }
 
                     if (format_A == ActivationFormat::FP16)
                     {
-                        if (!run_onednn_fp16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
-                            return false;
+                        static const bool has_fp16 = cpu_supports_avx512_fp16();
+                        if (has_fp16)
+                        {
+                            if (!run_onednn_fp16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
+                                return false;
+                        }
+                        else
+                        {
+                            // Fallback to FP32 on hardware without AVX512_FP16
+                            ensure_fp32_capacity(scratch.fp32_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k));
+                            ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
+
+                            // Convert A (m x k)
+                            for (size_t i = 0; i < static_cast<size_t>(m) * static_cast<size_t>(k); ++i)
+                            {
+                                scratch.fp32_buffer_a[i] = fp16_to_fp32(lhs_ptr[i]);
+                            }
+
+                            // Convert B (k x n)
+                            // Note: rhs_ptr is already transposed if transpose_B was true
+                            for (size_t i = 0; i < static_cast<size_t>(k) * static_cast<size_t>(n); ++i)
+                            {
+                                scratch.fp32_buffer_b[i] = fp16_to_fp32(rhs_ptr[i]);
+                            }
+
+                            // Call FP32 matmul
+                            // We pass transpose_B=false because we already handled transposition of B
+                            return multiply_activations(
+                                scratch.fp32_buffer_a.data(), scratch.fp32_buffer_b.data(), C,
+                                m, n, k, false /* transpose_B */, alpha, beta, mpi_ctx, device_idx);
+                        }
                     }
                     else
                     {
@@ -1230,25 +1342,42 @@ namespace llaminar2
                     const float *lhs_ptr = static_cast<const float *>(A);
                     const uint16_t *rhs_ptr = static_cast<const uint16_t *>(B);
 
-                    std::vector<uint16_t> B_transposed;
+                    auto& scratch = get_scratch_buffers();
                     if (transpose_B)
                     {
-                        B_transposed.resize(static_cast<size_t>(k) * static_cast<size_t>(n));
+                        ensure_fp16_capacity(scratch.fp16_buffer, static_cast<size_t>(k) * static_cast<size_t>(n));
                         for (int i = 0; i < n; ++i)
                         {
                             for (int j = 0; j < k; ++j)
                             {
-                                B_transposed[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
+                                scratch.fp16_buffer[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
                                     rhs_ptr[static_cast<size_t>(i) * static_cast<size_t>(k) + static_cast<size_t>(j)];
                             }
                         }
-                        rhs_ptr = B_transposed.data();
+                        rhs_ptr = scratch.fp16_buffer.data();
                     }
 
                     if (format_B == ActivationFormat::FP16)
                     {
-                        if (!run_onednn_mixed_fp16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
-                            return false;
+                        static const bool has_fp16 = cpu_supports_avx512_fp16();
+                        if (has_fp16)
+                        {
+                            if (!run_onednn_mixed_fp16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
+                                return false;
+                        }
+                        else
+                        {
+                            // Fallback: Convert B (FP16) to FP32
+                            ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
+                            for (size_t i = 0; i < static_cast<size_t>(k) * static_cast<size_t>(n); ++i)
+                            {
+                                scratch.fp32_buffer_b[i] = fp16_to_fp32(rhs_ptr[i]);
+                            }
+
+                            return multiply_activations(
+                                lhs_ptr, scratch.fp32_buffer_b.data(), C,
+                                m, n, k, false /* transpose_B */, alpha, beta, mpi_ctx, device_idx);
+                        }
                     }
                     else
                     {
@@ -1273,6 +1402,89 @@ namespace llaminar2
                 return false;
             }
 
+            bool multiply_with_softmax_typed_impl(
+                const void *A, const void *B, float *C,
+                int m, int n, int k,
+                float scale,
+                bool transpose_B,
+                int softmax_axis,
+                const float *mask,
+                bool is_causal,
+                const MPIContext *mpi_ctx,
+                int device_idx,
+                ActivationFormat format_A, ActivationFormat format_B) override
+            {
+                (void)mpi_ctx;
+
+                if (device_idx != -1)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Only CPU execution supported (device_idx="
+                              << device_idx << ")");
+                    return false;
+                }
+
+                // 1. Perform typed matmul
+                if (!multiply_activations_typed_impl(
+                        A, B, C,
+                        m, n, k,
+                        transpose_B,
+                        scale, 0.0f,
+                        mpi_ctx, device_idx,
+                        format_A, format_B))
+                {
+                    return false;
+                }
+
+                // 2. Apply mask if provided
+                if (mask)
+                {
+#pragma omp parallel for collapse(2)
+                    for (int i = 0; i < m; ++i)
+                    {
+                        for (int j = 0; j < n; ++j)
+                        {
+                            C[i * n + j] += mask[i * n + j];
+                        }
+                    }
+                }
+
+                // 3. Apply causal mask if requested
+                if (is_causal)
+                {
+                    // Assuming C is [m, n] where m=seq_len, n=seq_len (or kv_seq_len)
+                    // Causal mask: mask out upper triangle (j > i + offset)
+                    // Usually for self-attention, m=n=seq_len.
+                    // If m != n (e.g. decoding step), causal mask might be different.
+                    // But usually causal mask is applied during prefill where m=n.
+                    // During decode (m=1), causal mask is usually not needed or handled by mask.
+
+                    // Simple implementation for m=n
+                    if (m == n)
+                    {
+#pragma omp parallel for collapse(2)
+                        for (int i = 0; i < m; ++i)
+                        {
+                            for (int j = 0; j < n; ++j)
+                            {
+                                if (j > i)
+                                {
+                                    C[i * n + j] = -std::numeric_limits<float>::infinity();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4. Apply softmax inplace
+                if (!apply_softmax_inplace(C, m, n, softmax_axis))
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Softmax application failed in multiply_with_softmax_typed_impl");
+                    return false;
+                }
+
+                return true;
+            }
+
             bool multiply_activations_strided_typed_impl(
                 const void *A, const void *B, float *C,
                 int m, int n, int k,
@@ -1293,93 +1505,161 @@ namespace llaminar2
                 }
 
                 // Handle striding by copying to contiguous buffers
-                // We need to know the element size to copy.
                 size_t elem_size_A = (format_A == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
                 size_t elem_size_B = (format_B == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
 
-                std::vector<uint8_t> A_buf(static_cast<size_t>(m) * static_cast<size_t>(k) * elem_size_A);
-                std::vector<uint8_t> B_buf(static_cast<size_t>(k) * static_cast<size_t>(n) * elem_size_B);
-
-                // Copy A
-                for (int row = 0; row < m; ++row)
+                auto& scratch = get_scratch_buffers();
+                const void *A_ptr = A;
+                if (!a_row_major)
                 {
-                    const uint8_t *src = static_cast<const uint8_t *>(A) + static_cast<size_t>(row) * static_cast<size_t>(lda) * elem_size_A;
-                    uint8_t *dst = A_buf.data() + static_cast<size_t>(row) * static_cast<size_t>(k) * elem_size_A;
-                    std::memcpy(dst, src, static_cast<size_t>(k) * elem_size_A);
-                }
-
-                // Copy B
-                if (!transpose_B)
-                {
-                    for (int ki = 0; ki < k; ++ki)
+                    ensure_byte_capacity(scratch.byte_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k) * elem_size_A);
+                    for (int row = 0; row < m; ++row)
                     {
-                        const uint8_t *src = static_cast<const uint8_t *>(B) + static_cast<size_t>(ki) * static_cast<size_t>(ldb) * elem_size_B;
-                        uint8_t *dst = B_buf.data() + static_cast<size_t>(ki) * static_cast<size_t>(n) * elem_size_B;
-                        std::memcpy(dst, src, static_cast<size_t>(n) * elem_size_B);
+                        const uint8_t *src = static_cast<const uint8_t *>(A) + static_cast<size_t>(row) * static_cast<size_t>(lda) * elem_size_A;
+                        uint8_t *dst = scratch.byte_buffer_a.data() + static_cast<size_t>(row) * static_cast<size_t>(k) * elem_size_A;
+                        std::memcpy(dst, src, static_cast<size_t>(k) * elem_size_A);
                     }
+                    A_ptr = scratch.byte_buffer_a.data();
                 }
-                else
+
+                const void *B_ptr = B;
+                if (!b_row_major)
                 {
-                    // Transpose copy B
-                    // This is tricky with void*. We need to cast to specific type to index correctly.
-                    if (format_B == ActivationFormat::FP32)
+                    size_t rows_B = transpose_B ? n : k;
+                    size_t cols_B = transpose_B ? k : n;
+                    ensure_byte_capacity(scratch.byte_buffer_b, rows_B * cols_B * elem_size_B);
+
+                    for (size_t row = 0; row < rows_B; ++row)
                     {
-                        const float *B_ptr = static_cast<const float *>(B);
-                        float *B_buf_ptr = reinterpret_cast<float *>(B_buf.data());
-                        for (int ki = 0; ki < k; ++ki)
-                        {
-                            for (int nj = 0; nj < n; ++nj)
-                            {
-                                const float *src_row = B_ptr + static_cast<size_t>(nj) * static_cast<size_t>(ldb);
-                                B_buf_ptr[static_cast<size_t>(ki) * static_cast<size_t>(n) + static_cast<size_t>(nj)] =
-                                    src_row[static_cast<size_t>(ki)];
-                            }
-                        }
+                        const uint8_t *src = static_cast<const uint8_t *>(B) + static_cast<size_t>(row) * static_cast<size_t>(ldb) * elem_size_B;
+                        uint8_t *dst = scratch.byte_buffer_b.data() + static_cast<size_t>(row) * static_cast<size_t>(cols_B) * elem_size_B;
+                        std::memcpy(dst, src, static_cast<size_t>(cols_B) * elem_size_B);
                     }
-                    else
-                    {
-                        const uint16_t *B_ptr = static_cast<const uint16_t *>(B);
-                        uint16_t *B_buf_ptr = reinterpret_cast<uint16_t *>(B_buf.data());
-                        for (int ki = 0; ki < k; ++ki)
-                        {
-                            for (int nj = 0; nj < n; ++nj)
-                            {
-                                const uint16_t *src_row = B_ptr + static_cast<size_t>(nj) * static_cast<size_t>(ldb);
-                                B_buf_ptr[static_cast<size_t>(ki) * static_cast<size_t>(n) + static_cast<size_t>(nj)] =
-                                    src_row[static_cast<size_t>(ki)];
-                            }
-                        }
-                    }
+                    B_ptr = scratch.byte_buffer_b.data();
                 }
 
-                std::vector<float> C_tmp;
-                float *C_target = nullptr;
-                if (c_row_major)
-                {
-                    C_target = C;
-                }
-                else
-                {
-                    C_tmp.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
-                    C_target = C_tmp.data();
-                }
-
-                if (!multiply_activations_typed_impl(A_buf.data(), B_buf.data(), C_target, m, n, k, false, alpha, beta, mpi_ctx, device_idx, format_A, format_B))
-                {
-                    return false;
-                }
-
+                float *C_target = C;
                 if (!c_row_major)
+                {
+                    ensure_fp32_capacity(scratch.fp32_buffer_c, static_cast<size_t>(m) * static_cast<size_t>(n));
+                    C_target = scratch.fp32_buffer_c.data();
+                    if (beta != 0.0f)
+                    {
+                        for (int row = 0; row < m; ++row)
+                        {
+                            const float *src = C + row * ldc;
+                            float *dst = scratch.fp32_buffer_c.data() + row * n;
+                            std::memcpy(dst, src, n * sizeof(float));
+                        }
+                    }
+                }
+
+                bool result = multiply_activations_typed_impl(
+                    A_ptr, B_ptr, C_target,
+                    m, n, k,
+                    transpose_B,
+                    alpha, beta,
+                    mpi_ctx, device_idx,
+                    format_A, format_B);
+
+                if (result && !c_row_major)
                 {
                     for (int row = 0; row < m; ++row)
                     {
-                        const float *src = C_target + static_cast<size_t>(row) * static_cast<size_t>(n);
-                        float *dst = C + static_cast<size_t>(row) * static_cast<size_t>(ldc);
-                        std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
+                        const float *src = scratch.fp32_buffer_c.data() + row * n;
+                        float *dst = C + row * ldc;
+                        std::memcpy(dst, src, n * sizeof(float));
                     }
                 }
 
-                return true;
+                return result;
+            }
+
+            bool multiply_with_softmax_strided_typed_impl(
+                const void *A, const void *B, float *C,
+                int m, int n, int k,
+                int lda, int ldb, int ldc,
+                float scale,
+                bool transpose_B,
+                int softmax_axis,
+                const float *mask,
+                bool is_causal,
+                const MPIContext *mpi_ctx,
+                int device_idx,
+                ActivationFormat format_A, ActivationFormat format_B) override
+            {
+                const bool a_row_major = (lda == k);
+                const bool b_row_major = (ldb == (transpose_B ? k : n));
+                const bool c_row_major = (ldc == n);
+
+                if (a_row_major && b_row_major && c_row_major)
+                {
+                    return multiply_with_softmax_typed_impl(A, B, C, m, n, k, scale, transpose_B, softmax_axis, mask, is_causal, mpi_ctx, device_idx, format_A, format_B);
+                }
+
+                // Handle striding by copying to contiguous buffers
+                size_t elem_size_A = (format_A == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
+                size_t elem_size_B = (format_B == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
+
+                auto& scratch = get_scratch_buffers();
+                const void *A_ptr = A;
+                if (!a_row_major)
+                {
+                    ensure_byte_capacity(scratch.byte_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k) * elem_size_A);
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const uint8_t *src = static_cast<const uint8_t *>(A) + static_cast<size_t>(row) * static_cast<size_t>(lda) * elem_size_A;
+                        uint8_t *dst = scratch.byte_buffer_a.data() + static_cast<size_t>(row) * static_cast<size_t>(k) * elem_size_A;
+                        std::memcpy(dst, src, static_cast<size_t>(k) * elem_size_A);
+                    }
+                    A_ptr = scratch.byte_buffer_a.data();
+                }
+
+                const void *B_ptr = B;
+                if (!b_row_major)
+                {
+                    size_t rows_B = transpose_B ? n : k;
+                    size_t cols_B = transpose_B ? k : n;
+                    ensure_byte_capacity(scratch.byte_buffer_b, rows_B * cols_B * elem_size_B);
+
+                    for (size_t row = 0; row < rows_B; ++row)
+                    {
+                        const uint8_t *src = static_cast<const uint8_t *>(B) + static_cast<size_t>(row) * static_cast<size_t>(ldb) * elem_size_B;
+                        uint8_t *dst = scratch.byte_buffer_b.data() + static_cast<size_t>(row) * static_cast<size_t>(cols_B) * elem_size_B;
+                        std::memcpy(dst, src, static_cast<size_t>(cols_B) * elem_size_B);
+                    }
+                    B_ptr = scratch.byte_buffer_b.data();
+                }
+
+                float *C_target = C;
+                if (!c_row_major)
+                {
+                    ensure_fp32_capacity(scratch.fp32_buffer_c, static_cast<size_t>(m) * static_cast<size_t>(n));
+                    C_target = scratch.fp32_buffer_c.data();
+                }
+
+                bool result = multiply_with_softmax_typed_impl(
+                    A_ptr, B_ptr, C_target,
+                    m, n, k,
+                    scale,
+                    transpose_B,
+                    softmax_axis,
+                    mask,
+                    is_causal,
+                    mpi_ctx, device_idx,
+                    format_A, format_B);
+
+                if (result && !c_row_major)
+                {
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const float *src = C_target + row * n;
+                        float *dst = C + row * ldc;
+                        std::memcpy(dst, src, n * sizeof(float));
+                    }
+                }
+
+                return result;
             }
 
         private:

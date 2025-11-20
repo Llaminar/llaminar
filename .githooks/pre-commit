@@ -62,8 +62,9 @@ echo ""
 
 # Run CTest with unit test filter
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
+# --parallel: Run unit tests in parallel for faster execution
 set +e
-ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Unit_" --output-on-failure
+ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Unit_" --output-on-failure --parallel
 UNIT_EXIT_CODE=$?
 set -e
 

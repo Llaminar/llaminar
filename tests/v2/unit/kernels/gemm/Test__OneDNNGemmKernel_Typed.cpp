@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include "tensors/FP16Utils.h"
 
 #ifdef HAVE_ONEDNN
 #include "kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
@@ -28,6 +29,31 @@ namespace
         float f;
         std::memcpy(&f, &x, sizeof(float));
         return f;
+    }
+
+    // Reference Softmax implementation
+    void reference_softmax(float *C, int m, int n)
+    {
+        for (int i = 0; i < m; ++i)
+        {
+            float max_val = -std::numeric_limits<float>::infinity();
+            for (int j = 0; j < n; ++j)
+            {
+                max_val = std::max(max_val, C[i * n + j]);
+            }
+
+            float sum = 0.0f;
+            for (int j = 0; j < n; ++j)
+            {
+                C[i * n + j] = std::exp(C[i * n + j] - max_val);
+                sum += C[i * n + j];
+            }
+
+            for (int j = 0; j < n; ++j)
+            {
+                C[i * n + j] /= sum;
+            }
+        }
     }
 
     // Reference GEMM implementation for validation
@@ -257,6 +283,143 @@ TEST_F(Test__OneDNNGemmKernel_Typed, Unsupported_Int8Int8_ReturnsFalse)
         m, n, k, true, 1.0f, 0.0f,
         nullptr, -1, llaminar2::ActivationFormat::INT8);
     EXPECT_FALSE(success);
+}
+
+TEST_F(Test__OneDNNGemmKernel_Typed, BF16BF16_FusedSoftmax_MatchesReference)
+{
+    int m = 16;
+    int n = 16;
+    int k = 32;
+
+    std::vector<uint16_t> A_bf16(m * k);
+    std::vector<uint16_t> B_bf16(n * k);
+    std::vector<float> C(m * n, 0.0f);
+    std::vector<float> C_ref(m * n, 0.0f);
+
+    std::vector<float> A_float(m * k);
+    std::vector<float> B_float(n * k);
+
+    // Initialize
+    for (int i = 0; i < m * k; ++i)
+    {
+        float val = static_cast<float>(rand()) / RAND_MAX;
+        A_bf16[i] = float_to_bf16(val);
+        A_float[i] = bf16_to_float(A_bf16[i]);
+    }
+    for (int i = 0; i < n * k; ++i)
+    {
+        float val = static_cast<float>(rand()) / RAND_MAX;
+        B_bf16[i] = float_to_bf16(val);
+        B_float[i] = bf16_to_float(B_bf16[i]);
+    }
+
+    // Run Kernel
+    bool success = kernel.multiply_with_softmax_typed<uint16_t, uint16_t>(
+        A_bf16.data(), B_bf16.data(), C.data(),
+        m, n, k, 1.0f /* scale */, true /* transpose_B */, 1 /* axis */,
+        nullptr /* mask */, false /* is_causal */, nullptr, -1, llaminar2::ActivationFormat::BF16);
+    ASSERT_TRUE(success);
+
+    // Run Reference
+    reference_gemm(A_float.data(), B_float.data(), C_ref.data(), m, n, k, true, 1.0f, 0.0f);
+    reference_softmax(C_ref.data(), m, n);
+
+    // Compare
+    for (size_t i = 0; i < C.size(); ++i)
+    {
+        EXPECT_NEAR(C[i], C_ref[i], 1e-2f);
+    }
+}
+
+TEST_F(Test__OneDNNGemmKernel_Typed, FP16FP16_FusedSoftmax_MatchesReference)
+{
+    int m = 16;
+    int n = 16;
+    int k = 32;
+
+    std::vector<uint16_t> A_fp16(m * k);
+    std::vector<uint16_t> B_fp16(n * k);
+    std::vector<float> C(m * n, 0.0f);
+    std::vector<float> C_ref(m * n, 0.0f);
+
+    std::vector<float> A_float(m * k);
+    std::vector<float> B_float(n * k);
+
+    // Initialize
+    for (int i = 0; i < m * k; ++i)
+    {
+        float val = static_cast<float>(rand()) / RAND_MAX;
+        A_fp16[i] = llaminar2::fp32_to_fp16(val);
+        A_float[i] = llaminar2::fp16_to_fp32(A_fp16[i]);
+    }
+    for (int i = 0; i < n * k; ++i)
+    {
+        float val = static_cast<float>(rand()) / RAND_MAX;
+        B_fp16[i] = llaminar2::fp32_to_fp16(val);
+        B_float[i] = llaminar2::fp16_to_fp32(B_fp16[i]);
+    }
+
+    // Run Kernel
+    bool success = kernel.multiply_with_softmax_typed<uint16_t, uint16_t>(
+        A_fp16.data(), B_fp16.data(), C.data(),
+        m, n, k, 1.0f /* scale */, true /* transpose_B */, 1 /* axis */,
+        nullptr /* mask */, false /* is_causal */, nullptr, -1, llaminar2::ActivationFormat::FP16);
+    ASSERT_TRUE(success);
+
+    // Run Reference
+    reference_gemm(A_float.data(), B_float.data(), C_ref.data(), m, n, k, true, 1.0f, 0.0f);
+    reference_softmax(C_ref.data(), m, n);
+
+    // Compare
+    for (size_t i = 0; i < C.size(); ++i)
+    {
+        EXPECT_NEAR(C[i], C_ref[i], 1e-2f);
+    }
+}
+
+TEST_F(Test__OneDNNGemmKernel_Typed, FloatFloat_FusedSoftmax_WithMask_MatchesReference)
+{
+    int m = 16;
+    int n = 16;
+    int k = 32;
+
+    std::vector<float> A(m * k);
+    std::vector<float> B(n * k);
+    std::vector<float> C(m * n, 0.0f);
+    std::vector<float> C_ref(m * n, 0.0f);
+    std::vector<float> mask(m * n);
+
+    // Initialize
+    for (auto &val : A)
+        val = static_cast<float>(rand()) / RAND_MAX;
+    for (auto &val : B)
+        val = static_cast<float>(rand()) / RAND_MAX;
+    for (auto &val : mask)
+        val = (static_cast<float>(rand()) / RAND_MAX) - 0.5f; // Some negative values
+
+    // Run Kernel
+    bool success = kernel.multiply_with_softmax_typed<float, float>(
+        A.data(), B.data(), C.data(),
+        m, n, k, 1.0f /* scale */, true /* transpose_B */, 1 /* axis */,
+        mask.data(), false /* is_causal */, nullptr, -1, llaminar2::ActivationFormat::FP32);
+    ASSERT_TRUE(success);
+
+    // Run Reference
+    reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, true, 1.0f, 0.0f);
+
+    // Apply mask
+    for (int i = 0; i < m * n; ++i)
+    {
+        C_ref[i] += mask[i];
+    }
+
+    reference_softmax(C_ref.data(), m, n);
+
+    // Compare
+    for (size_t i = 0; i < C.size(); ++i)
+    {
+        EXPECT_NEAR(C[i], C_ref[i], 1e-4f);
+    }
 }
 
 #endif // HAVE_ONEDNN

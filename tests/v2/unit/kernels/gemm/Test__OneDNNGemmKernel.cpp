@@ -405,6 +405,7 @@ TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxMatchesReference)
         true,
         1,
         nullptr,
+        nullptr,
         -1));
 
     ASSERT_TRUE(kernel.multiply_activations(
@@ -457,6 +458,7 @@ TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxHandlesNegativeAxis)
         k,
         true,
         1,
+        nullptr,
         nullptr,
         -1));
 
@@ -511,6 +513,7 @@ TEST(Test__OneDNNGemmKernel, ColumnSoftmaxFallbackMatchesReference)
         true,
         0,
         nullptr,
+        nullptr,
         -1));
 
     ASSERT_TRUE(kernel.multiply_activations(
@@ -554,6 +557,7 @@ TEST(Test__OneDNNGemmKernel, RejectsInvalidSoftmaxAxis)
         true,
         2,
         nullptr,
+        nullptr,
         -1));
 }
 
@@ -578,6 +582,7 @@ TEST(Test__OneDNNGemmKernel, WeightPathRejectsInvalidSoftmaxAxis)
         k,
         true,
         /*softmax_axis=*/2,
+        /*mask=*/nullptr,
         /*mpi_ctx=*/nullptr,
         /*device=*/-1));
 }
@@ -642,6 +647,70 @@ TEST(Test__OneDNNGemmKernel, StridedNonTransposedB)
     for (int i = 0; i < m * n; ++i)
     {
         EXPECT_NEAR(C[static_cast<size_t>(i)], expected[i], 1e-4f) << "Mismatch at idx " << i;
+    }
+}
+
+TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxWithMaskMatchesReference)
+{
+    constexpr int m = 2;
+    constexpr int n = 3;
+    constexpr int k = 4;
+
+    const float A[m * k] = {
+        0.5f, -1.0f, 0.25f, 1.0f,
+        1.5f, 0.0f, -0.5f, 0.75f};
+
+    const float B[n * k] = {
+        0.2f, -0.3f, 0.1f, 0.4f,
+        -0.6f, 0.5f, 0.0f, 0.25f,
+        0.3f, 0.2f, -0.4f, -0.1f};
+
+    const float mask[m * n] = {
+        -100.0f, 0.0f, -100.0f,
+        0.0f, -100.0f, 0.0f};
+
+    float fused_output[m * n] = {0};
+    float reference[m * n] = {0};
+
+    OneDNNGemmKernel kernel;
+
+    ASSERT_TRUE(kernel.multiply_with_softmax(
+        A,
+        B,
+        fused_output,
+        m,
+        n,
+        k,
+        true,
+        1,
+        mask,
+        nullptr,
+        -1));
+
+    ASSERT_TRUE(kernel.multiply_activations(
+        A,
+        B,
+        reference,
+        m,
+        n,
+        k,
+        true,
+        1.0f,
+        0.0f,
+        nullptr,
+        -1));
+
+    // Apply mask
+    for (int i = 0; i < m * n; ++i)
+    {
+        reference[i] += mask[i];
+    }
+
+    apply_rowwise_softmax(reference, m, n);
+
+    for (int i = 0; i < m * n; ++i)
+    {
+        EXPECT_NEAR(fused_output[i], reference[i], 1e-5f) << "Mismatch at idx " << i;
     }
 }
 

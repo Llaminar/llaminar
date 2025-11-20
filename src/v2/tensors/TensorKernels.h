@@ -437,6 +437,7 @@ namespace llaminar2
             int m, int n, int k,
             bool transpose_B = true,
             int softmax_axis = 1,
+            const float *mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
@@ -448,9 +449,185 @@ namespace llaminar2
             (void)k;
             (void)transpose_B;
             (void)softmax_axis;
+            (void)mask;
             (void)mpi_ctx;
             (void)device_idx;
             return false;
+        }
+
+        /**
+         * @brief Type-erased implementation for typed fused matmul+softmax
+         *
+         * @param A Left activation matrix (void* to support float/uint16_t/int8_t)
+         * @param B Right activation matrix (void* to support float/uint16_t/int8_t)
+         * @param C Output matrix (always float*)
+         * @param m Number of rows in A and C
+         * @param n Number of rows in B
+         * @param k Number of columns in A and B
+         * @param transpose_B Whether to transpose B
+         * @param softmax_axis Axis for softmax
+         * @param mask Optional mask to add to logits before softmax (broadcastable to [m, n])
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @param format_A Format of A (FP32, BF16, FP16, INT8)
+         * @param format_B Format of B (FP32, BF16, FP16, INT8)
+         *
+         * @return true on success, false on error
+         */
+        virtual bool multiply_with_softmax_typed_impl(
+            const void *A, const void *B, float *C,
+            int m, int n, int k,
+            float scale,
+            bool transpose_B,
+            int softmax_axis,
+            const float *mask,
+            bool is_causal,
+            const MPIContext *mpi_ctx,
+            int device_idx,
+            ActivationFormat format_A,
+            ActivationFormat format_B)
+        {
+            (void)A;
+            (void)B;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)scale;
+            (void)transpose_B;
+            (void)softmax_axis;
+            (void)mask;
+            (void)is_causal;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)format_A;
+            (void)format_B;
+            return false;
+        }
+
+        /**
+         * @brief Template-based typed fused matmul+softmax
+         *
+         * C = Softmax(A @ B^T / sqrt(k) + mask)
+         *
+         * @tparam ActT Activation element type (float, uint16_t, int8_t)
+         * @tparam WeightT Weight element type (same options as ActT)
+         *
+         * @param A Left activation matrix [m, k]
+         * @param B Right activation matrix [n, k] (transposed)
+         * @param C Output matrix [m, n]
+         * @param m Number of rows in A and C
+         * @param n Number of rows in B
+         * @param k Number of columns in A and B
+         * @param transpose_B Whether to transpose B
+         * @param softmax_axis Axis for softmax
+         * @param mask Optional mask to add to logits before softmax
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @param format Activation format hint (e.g. BF16 vs FP16 for uint16_t)
+         *
+         * @return true on success, false on error
+         */
+        template <typename ActT, typename WeightT>
+        bool multiply_with_softmax_typed(
+            const ActT *A, const WeightT *B, float *C,
+            int m, int n, int k,
+            float scale = 1.0f,
+            bool transpose_B = true,
+            int softmax_axis = 1,
+            const float *mask = nullptr,
+            bool is_causal = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            ActivationFormat format = ActivationFormat::FP32)
+        {
+            ActivationFormat fmt_A = (std::is_same_v<ActT, float>) ? ActivationFormat::FP32 : format;
+            ActivationFormat fmt_B = (std::is_same_v<WeightT, float>) ? ActivationFormat::FP32 : format;
+            return multiply_with_softmax_typed_impl(
+                static_cast<const void *>(A), static_cast<const void *>(B), C,
+                m, n, k, scale, transpose_B, softmax_axis, mask, is_causal, mpi_ctx, device_idx, fmt_A, fmt_B);
+        }
+
+        /**
+         * @brief Type-erased implementation for typed fused matmul+softmax with striding
+         */
+        virtual bool multiply_with_softmax_strided_typed_impl(
+            const void *A, const void *B, float *C,
+            int m, int n, int k,
+            int lda, int ldb, int ldc,
+            float scale,
+            bool transpose_B,
+            int softmax_axis,
+            const float *mask,
+            bool is_causal,
+            const MPIContext *mpi_ctx,
+            int device_idx,
+            ActivationFormat format_A,
+            ActivationFormat format_B)
+        {
+            (void)A;
+            (void)B;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)lda;
+            (void)ldb;
+            (void)ldc;
+            (void)scale;
+            (void)transpose_B;
+            (void)softmax_axis;
+            (void)mask;
+            (void)is_causal;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)format_A;
+            (void)format_B;
+            return false;
+        }
+
+        /**
+         * @brief Template-based typed fused matmul+softmax with striding
+         *
+         * C = Softmax(A @ B^T / sqrt(k) + mask)
+         *
+         * @tparam ActT Activation element type (float, uint16_t, int8_t)
+         * @tparam WeightT Weight element type (same options as ActT)
+         *
+         * @param A Left activation matrix [m, k]
+         * @param B Right activation matrix [n, k] (transposed)
+         * @param C Output matrix [m, n]
+         * @param m Number of rows in A and C
+         * @param n Number of rows in B
+         * @param k Number of columns in A and B
+         * @param transpose_B Whether to transpose B
+         * @param softmax_axis Axis for softmax
+         * @param mask Optional mask to add to logits before softmax
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @param format Activation format hint (e.g. BF16 vs FP16 for uint16_t)
+         *
+         * @return true on success, false on error
+         */
+        template <typename ActT, typename WeightT>
+        bool multiply_with_softmax_strided_typed(
+            const ActT *A, const WeightT *B, float *C,
+            int m, int n, int k,
+            int lda, int ldb, int ldc,
+            float scale = 1.0f,
+            bool transpose_B = true,
+            int softmax_axis = 1,
+            const float *mask = nullptr,
+            bool is_causal = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            ActivationFormat format = ActivationFormat::FP32)
+        {
+            ActivationFormat fmt_A = (std::is_same_v<ActT, float>) ? ActivationFormat::FP32 : format;
+            ActivationFormat fmt_B = (std::is_same_v<WeightT, float>) ? ActivationFormat::FP32 : format;
+            return multiply_with_softmax_strided_typed_impl(
+                static_cast<const void *>(A), static_cast<const void *>(B), C,
+                m, n, k, lda, ldb, ldc, scale, transpose_B, softmax_axis, mask, is_causal, mpi_ctx, device_idx, fmt_A, fmt_B);
         }
     };
 

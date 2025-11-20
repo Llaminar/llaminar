@@ -271,7 +271,7 @@ namespace llaminar2
                     V_use = V_buf.data();
                 }
 
-                // 2. Compute Q @ K^T -> Scores (FP32)
+                // 2. Compute Q @ K^T -> Scores (FP32) + Mask + Softmax
                 const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
 #pragma omp parallel for if (n_heads > 1)
@@ -285,29 +285,16 @@ namespace llaminar2
                     const int ldb = n_heads * head_dim;
                     const int ldc = seq_len;
 
-                    gemm->template multiply_activations_strided_typed<ElementType, ElementType>(
+                    gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
                         Q_h, K_h, scores_h,
                         seq_len, seq_len, head_dim,
                         lda, ldb, ldc,
-                        true, scale, 0.0f, nullptr, -1, format);
-                }
-
-                // 3. Masking & Softmax (FP32)
-                if (mask)
-                {
-#pragma omp parallel for if (n_heads > 1)
-                    for (int h = 0; h < n_heads; ++h)
-                    {
-                        float *scores_h = scores + h * seq_len * seq_len;
-                        attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
-                    }
-                }
-
-#pragma omp parallel for if (n_heads > 1)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    float *scores_h = scores + h * seq_len * seq_len;
-                    primitives::softmax_row_major_fp32(scores_h, seq_len, seq_len, causal, 1.0f, true);
+                        scale,
+                        true, // transpose_B
+                        1,    // softmax_axis
+                        mask,
+                        causal,
+                        nullptr, -1, format);
                 }
 
                 // 4. Scores @ V -> Output (FP32)

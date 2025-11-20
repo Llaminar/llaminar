@@ -257,7 +257,7 @@ Llaminar V2 has a comprehensive test suite organized into several categories:
 cd /workspaces/llaminar && ctest --test-dir build_v2 -R --output-on-failure
 
 # Just unit tests
-cd /workspaces/llaminar && ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
+cd /workspaces/llaminar && ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
 # Run a specific test in a single test file
 cd /workspaces/llaminar && GTEST_FILTER=The.Specific.GTest.Name ctest --test-dir build_v2 -R V2_My_Test_File -V
@@ -579,7 +579,7 @@ ctest -L "DeviceManagement" -L "Orchestration"
 ctest -LE Performance
 
 # Precommit hook command (unit tests only)
-ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
+ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 ```
 
 #### Adding New Tests
@@ -628,7 +628,7 @@ V2 includes a dedicated performance test framework for benchmarking component-le
 ```bash
 # From workspace root - first ensure Release build exists
 cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
-cmake --build build_v2_release --parallel
+cmake --build build_v2_release --parallel # IMPORTANT: always run with `--parallel` for faster builds!
 
 # Run all V2 performance tests
 cd build_v2
@@ -677,7 +677,7 @@ add_v2_perf_test(V2_Perf_MyFeature
 
 # 3. Build and run
 cmake --build build_v2_release --target v2_perf_my_feature --parallel
-cd build_v2 && ctest -L Performance -R "MyFeature" --verbose
+cd build_v2 && ctest -L Performance -R "MyFeature" --verbose --parallel
 ```
 
 **Best Practices:**
