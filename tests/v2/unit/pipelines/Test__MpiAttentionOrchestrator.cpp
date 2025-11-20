@@ -1013,3 +1013,158 @@ TEST_F(MpiAttentionOrchestratorTest, EdgeCase_LastHead)
         }
     }
 }
+
+// ============================================================================
+// Regression Tests
+// ============================================================================
+
+TEST_F(MpiAttentionOrchestratorTest, CausalFlagPropagation_NonCausalWithPadding)
+{
+    // Regression test for bug where needs_mask (due to padding) forced causal=true
+    // Scenario: Batch size 2, seq_len 2
+    // Seq 0: Length 2 (Full)
+    // Seq 1: Length 2 (Full)
+    // We want to verify that for Seq 0, Token 0 can attend to Token 1.
+
+    int batch_size = 2;
+    int seq_len = 2;
+    int n_heads = 1; // Keep it simple
+    int head_dim = 64;
+    int d_model = n_heads * head_dim;
+
+    // Setup Config
+    MpiAttentionConfig config;
+    config.n_heads = n_heads;
+    config.n_kv_heads = n_heads;
+    config.head_dim = head_dim;
+    config.causal = false; // CRITICAL: Non-causal attention
+    config.mpi_strategy = MPIStrategy::TensorParallel;
+    config.mpi_ctx = std::make_shared<MPIContext>(0, 1); // Single rank
+    config.precision = ActivationPrecision::FP32;
+
+    // Allocate workspaces
+    allocateWorkspaces(config, seq_len, n_heads, head_dim);
+    // Also need workspace_mask for padding
+    config.workspace_mask = std::make_shared<FP32Tensor>(std::vector<size_t>{(size_t)batch_size * seq_len, (size_t)seq_len});
+
+    // Create Tensors
+    // Q: [batch_size * seq_len, d_model]
+    auto Q = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+    auto K = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+    auto V = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+    auto output = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+
+    float *q_data = Q->mutable_data();
+    float *k_data = K->mutable_data();
+    float *v_data = V->mutable_data();
+
+    // Setup Sequence 0 (Tokens 0, 1)
+    // Token 0: Query vector [1, 0, ...]
+    q_data[0] = 10.0f; // High magnitude to force sharp attention
+
+    // Token 1: Key vector [1, 0, ...] -> Matches Token 0
+    k_data[1 * d_model] = 10.0f;
+
+    // Token 0: Key vector [0, 1, ...] -> Mismatch
+    k_data[0] = 0.0f;
+    k_data[0 + 1] = 10.0f;
+
+    // Token 1: Value vector [1, 1, 1, ...]
+    std::fill_n(v_data + 1 * d_model, d_model, 1.0f);
+
+    // Token 0: Value vector [0, 0, 0, ...]
+    std::fill_n(v_data, d_model, 0.0f);
+
+    // Sequence lengths (both full length)
+    std::vector<int> seq_lens = {2, 2};
+
+    // Execute
+    bool success = MpiAttentionOrchestrator::compute_mpi(
+        Q.get(), K.get(), V.get(), output.get(),
+        config, batch_size, &seq_lens);
+
+    EXPECT_TRUE(success);
+
+    // Verify Output for Token 0
+    // If non-causal: Token 0 attends to Token 1 (match) -> Output should be close to V[1] (1.0)
+    // If causal (bug): Token 0 CANNOT attend to Token 1 -> Output should be close to V[0] (0.0) or uniform if masked
+
+    float *out_data = output->mutable_data();
+    float val = out_data[0]; // First element of Token 0 output
+
+    // Expect high value (attending to Token 1)
+    EXPECT_GT(val, 0.9f) << "Token 0 should attend to future Token 1 in non-causal mode";
+}
+
+TEST_F(MpiAttentionOrchestratorTest, CausalFlagPropagation_CausalWithPadding)
+{
+    // Counter-test: Verify that causal=true DOES mask future tokens even with padding
+    // Scenario: Same as above, but config.causal = true.
+    // Token 0 should NOT attend to Token 1.
+
+    int batch_size = 2;
+    int seq_len = 2;
+    int n_heads = 1;
+    int head_dim = 64;
+    int d_model = n_heads * head_dim;
+
+    // Setup Config
+    MpiAttentionConfig config;
+    config.n_heads = n_heads;
+    config.n_kv_heads = n_heads;
+    config.head_dim = head_dim;
+    config.causal = true; // CRITICAL: Causal attention
+    config.mpi_strategy = MPIStrategy::TensorParallel;
+    config.mpi_ctx = std::make_shared<MPIContext>(0, 1);
+    config.precision = ActivationPrecision::FP32;
+
+    // Allocate workspaces
+    allocateWorkspaces(config, seq_len, n_heads, head_dim);
+    config.workspace_mask = std::make_shared<FP32Tensor>(std::vector<size_t>{(size_t)batch_size * seq_len, (size_t)seq_len});
+
+    // Create Tensors
+    auto Q = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+    auto K = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+    auto V = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+    auto output = createFilledTensor({(size_t)batch_size * seq_len, (size_t)d_model}, 0.0f);
+
+    float *q_data = Q->mutable_data();
+    float *k_data = K->mutable_data();
+    float *v_data = V->mutable_data();
+
+    // Setup Sequence 0 (Tokens 0, 1)
+    // Token 0: Query vector [1, 0, ...]
+    q_data[0] = 10.0f;
+
+    // Token 1: Key vector [1, 0, ...] -> Matches Token 0
+    k_data[1 * d_model] = 10.0f;
+
+    // Token 0: Key vector [0, 1, ...] -> Mismatch
+    k_data[0] = 0.0f;
+    k_data[0 + 1] = 10.0f;
+
+    // Token 1: Value vector [1, 1, 1, ...]
+    std::fill_n(v_data + 1 * d_model, d_model, 1.0f);
+
+    // Token 0: Value vector [0, 0, 0, ...]
+    std::fill_n(v_data, d_model, 0.0f);
+
+    // Sequence lengths (both full length)
+    std::vector<int> seq_lens = {2, 2};
+
+    // Execute
+    bool success = MpiAttentionOrchestrator::compute_mpi(
+        Q.get(), K.get(), V.get(), output.get(),
+        config, batch_size, &seq_lens);
+
+    EXPECT_TRUE(success);
+
+    // Verify Output for Token 0
+    // If causal: Token 0 CANNOT attend to Token 1 -> Output should be close to V[0] (0.0)
+
+    float *out_data = output->mutable_data();
+    float val = out_data[0];
+
+    // Expect low value (masked)
+    EXPECT_LT(val, 0.1f) << "Token 0 should NOT attend to future Token 1 in causal mode";
+}

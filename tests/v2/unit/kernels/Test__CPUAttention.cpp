@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/kernels/cpu/CPUAttention.h"
+#include "../../../../src/v2/kernels/cpu/CpuAttentionKernelT.h"
 #include "../../../../src/v2/tensors/Tensors.h"
 #include <memory>
 #include <vector>
@@ -46,7 +46,7 @@ TEST(CPUAttentionInterface, BasicComputation)
     std::vector<float> output_data(seq_len * n_heads * head_dim, 0.0f);
 
     // Create attention kernel
-    CPUAttention attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // Compute attention
     bool success = attention.compute(
@@ -98,7 +98,7 @@ TEST(CPUAttentionInterface, CausalMasking)
     std::vector<float> output_data(seq_len * n_heads * head_dim, 0.0f);
 
     // Create attention kernel
-    CPUAttention attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // Compute with causal masking
     bool success = attention.compute(
@@ -124,7 +124,7 @@ TEST(CPUAttentionInterface, CausalMasking)
  */
 TEST(CPUAttentionInterface, NullPointers)
 {
-    CPUAttention attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
     std::vector<float> dummy(16);
 
     // Null Q
@@ -153,7 +153,7 @@ TEST(CPUAttentionInterface, NullPointers)
  */
 TEST(CPUAttentionInterface, WrongDevice)
 {
-    CPUAttention attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
     std::vector<float> dummy(16);
 
     // CPU kernel shouldn't accept GPU device index
@@ -189,7 +189,7 @@ TEST(CPUAttentionInterface, BF16Mode)
     std::vector<float> output_bf16(seq_len * n_heads * head_dim, 0.0f);
 
     // Create attention kernel
-    CPUAttention attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // Compute with FP32
     bool success_fp32 = attention.compute(

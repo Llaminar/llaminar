@@ -201,6 +201,81 @@ namespace llaminar2
         }
 
         /**
+         * @brief Create batch padding mask (non-causal, padding-only)
+         *
+         * Creates a combined mask for batched attention that ONLY masks padding tokens.
+         * No causal masking applied - allows attending to all valid tokens in sequence.
+         *
+         * Layout: Combined mask [total_tokens, total_tokens] where total_tokens = batch_size * padded_seq_len
+         * - Block-diagonal structure: Each sequence can only attend within itself
+         * - Padding masking: Padding tokens (pos >= sequence_length) are masked with -inf
+         * - No causal constraint: Can attend to past AND future tokens (bi-directional)
+         *
+         * @param mask Output mask buffer [total_tokens, total_tokens]
+         * @param batch_size Number of sequences in batch
+         * @param padded_seq_len Padded sequence length (uniform for all sequences)
+         * @param sequence_lengths Actual lengths of each sequence (nullptr = all sequences are full length)
+         * @param window_size Sliding window size (-1 = disabled, >0 = limit context window)
+         */
+        inline void create_batch_padding_mask(
+            float *mask,
+            int batch_size,
+            int padded_seq_len,
+            const int *sequence_lengths = nullptr,
+            int window_size = -1)
+        {
+            const float neg_inf = -std::numeric_limits<float>::infinity();
+            const int total_len = batch_size * padded_seq_len;
+
+// Parallelize over rows - each row's mask is independent
+// Use flattened 1D iteration for better load balancing
+#pragma omp parallel for if (total_len * total_len > 4096) schedule(static)
+            for (int i = 0; i < total_len; ++i)
+            {
+                const int batch_i = i / padded_seq_len; // Which sequence does token i belong to?
+                const int pos_i = i % padded_seq_len;   // Position within that sequence
+
+                // Get actual sequence length for this sequence
+                const int actual_len_i = sequence_lengths ? sequence_lengths[batch_i] : padded_seq_len;
+
+                // If token i is a padding token, it cannot attend to anything
+                const bool i_is_padding = (pos_i >= actual_len_i);
+
+                for (int j = 0; j < total_len; ++j)
+                {
+                    const int batch_j = j / padded_seq_len;
+                    const int pos_j = j % padded_seq_len;
+
+                    bool can_attend = false;
+
+                    // Padding tokens cannot attend to anything
+                    if (!i_is_padding)
+                    {
+                        // 1. Must be in same sequence (block-diagonal structure)
+                        if (batch_i == batch_j)
+                        {
+                            // 2. Check if token j is within valid sequence (not padding)
+                            const int actual_len_j = sequence_lengths ? sequence_lengths[batch_j] : padded_seq_len;
+                            const bool j_is_padding = (pos_j >= actual_len_j);
+
+                            if (!j_is_padding)
+                            {
+                                // 3. NO CAUSAL CONSTRAINT - can attend to any valid token (past or future)
+                                // 4. Sliding window constraint (if enabled)
+                                if (window_size < 0 || (std::abs(pos_i - pos_j) < window_size))
+                                {
+                                    can_attend = true;
+                                }
+                            }
+                        }
+                    }
+
+                    mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                }
+            }
+        }
+
+        /**
          * @brief Apply attention mask to scores (adds mask to scores)
          *
          * scores[i][j] += mask[i][j]

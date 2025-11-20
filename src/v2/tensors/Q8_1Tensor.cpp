@@ -9,7 +9,7 @@
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
-#include "../kernels/cpu/CPUAttention.h"
+#include "../kernels/cpu/CpuAttentionKernelT.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
@@ -222,7 +222,7 @@ namespace llaminar2
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
     {
         // Attention operates on dequantized FP32 data
-        return std::make_unique<llaminar2::CPUAttention>();
+        return std::make_unique<CpuAttentionKernelT<FP32Tensor>>();
     }
 
     bool Q8_1Tensor::applyRMSNorm(

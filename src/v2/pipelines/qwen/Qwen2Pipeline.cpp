@@ -150,7 +150,8 @@ namespace llaminar2
         // Generic Initialization (PipelineBase handles device/MPI/KV cache setup)
         // =============================================================================
 
-        initializeInfrastructure();
+        // Initialize infrastructure with batched workspace buffers
+        initializeInfrastructureBatched();
 
         // Override KV cache with batched version
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
@@ -160,6 +161,24 @@ namespace llaminar2
                                                              << ", max_seq_len=" << config.max_seq_len);
 
         LOG_INFO("Pipeline initialized (weights loaded on-demand)");
+    }
+
+    void Qwen2Pipeline::initializeInfrastructureBatched()
+    {
+        // Use max_seq_len from runtime configuration
+        int max_seq_len = config_.max_seq_len;
+
+        // Phase 4.1: Device infrastructure with batch_size for workspace mask allocation
+        initializeDeviceInfrastructure(max_seq_len, batch_size_);
+
+        // Phase 2: MPI strategy configuration
+        configureMPIStrategy();
+
+        // Phase 3: KV cache initialization
+        initializeKVCache(max_seq_len);
+
+        LOG_INFO("Pipeline infrastructure initialized (max_seq_len=" << max_seq_len
+                                                                     << ", batch_size=" << batch_size_ << ")");
     }
 
     // =============================================================================

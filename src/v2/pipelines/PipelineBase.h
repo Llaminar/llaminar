@@ -444,9 +444,9 @@ namespace llaminar2
         // ===== Generic Initialization (extracted from Qwen2Pipeline) =====
 
         /**
-         * @brief Initialize device infrastructure (Phase 4.1)
+         * @brief Initialize device infrastructure (Phase 1)
          *
-         * Generic initialization logic extracted from derived class constructors:
+         * Generic device initialization extracted from derived class constructors:
          * 1. Discover active devices via placement map
          * 2. Allocate activation buffers for each device
          * 3. Handle single-device vs multi-device modes
@@ -455,8 +455,9 @@ namespace llaminar2
          * Derived class must implement createBuffersForDevice() for buffer allocation.
          *
          * @param max_seq_len Maximum sequence length to support (e.g., 2048)
+         * @param batch_size Maximum batch size to support (default: 1)
          */
-        void initializeDeviceInfrastructure(int max_seq_len);
+        void initializeDeviceInfrastructure(int max_seq_len, int batch_size = 1);
 
         /**
          * @brief Configure MPI strategy (Phase 2)

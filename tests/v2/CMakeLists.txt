@@ -513,6 +513,45 @@ add_v2_test(V2_Unit_BatchAttentionCorrectness
     MPI_PROCS 1  # Unit test for mask utilities, single rank
 )
 
+# Test: Attention mask application - verify masks are applied before softmax
+add_executable(v2_test_attention_mask_application unit/Test__AttentionMaskApplication.cpp)
+target_link_libraries(v2_test_attention_mask_application 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionMaskApplication 
+    COMMAND $<TARGET_FILE:v2_test_attention_mask_application>
+    LABELS "V2;Unit;Attention;MaskApplication;Softmax;PaddingMask;AttentionWeights"
+    MPI_PROCS 1  # Unit test for mask application in attention, single rank
+)
+
+# Test: Sequential vs Batched Attention Comparison
+add_executable(v2_test_attention_sequential_vs_batched unit/Test__AttentionSequentialVsBatched.cpp)
+target_link_libraries(v2_test_attention_sequential_vs_batched 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionSequentialVsBatched 
+    COMMAND $<TARGET_FILE:v2_test_attention_sequential_vs_batched>
+    LABELS "V2;Unit;Attention;Batched;Padding;SequentialComparison"
+    MPI_PROCS 1  # Unit test comparing sequential vs batched execution
+)
+
+# Test: GQAAttention batched path (comprehensive batched attention tests)
+add_executable(v2_test_gqa_attention_batched_path unit/Test__GQAAttention_BatchedPath.cpp)
+target_link_libraries(v2_test_gqa_attention_batched_path 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GQAAttention_BatchedPath
+    COMMAND $<TARGET_FILE:v2_test_gqa_attention_batched_path>
+    LABELS "V2;Unit;Attention;GQA;Batched;Causal;Padding;HeadBroadcasting"
+    MPI_PROCS 1  # Unit test for GQAAttention compute_batch()
+)
+
 # Test: INT8 SwiGLU kernel (SwiGLU activation with INT8 gate/up projections)
 add_executable(v2_test_int8_swiglu unit/Test__INT8SwiGLUKernel.cpp)
 target_link_libraries(v2_test_int8_swiglu 
@@ -971,6 +1010,16 @@ target_link_libraries(v2_test_pipeline_precision_mode llaminar2_core GTest::gtes
 add_v2_test(V2_Unit_PipelinePrecisionMode
     COMMAND $<TARGET_FILE:v2_test_pipeline_precision_mode>
     LABELS "V2;Unit;PipelineExecution;PrecisionConfiguration;WeightPrecision;ActivationPrecision"
+)
+
+# Test: GQAAttention Second Sequence Handling
+# Tests that sequence 1 in batched attention is handled correctly
+# Validates buffer offsets, mask application, and cross-sequence isolation
+add_executable(v2_test_gqa_attention_second_sequence unit/Test__GQAAttention_SecondSequence.cpp)
+target_link_libraries(v2_test_gqa_attention_second_sequence llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_GQAAttention_SecondSequence
+    COMMAND $<TARGET_FILE:v2_test_gqa_attention_second_sequence>
+    LABELS "V2;Unit;Attention;GQA;Batched;SecondSequence;BufferOffsets"
 )
 
 # Test: ModelLoader

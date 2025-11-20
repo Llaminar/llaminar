@@ -10,7 +10,13 @@
  * Requirements:
  * - Real Qwen 2.5 0.5B model (models/qwen2.5-0.5b-instruct-q4_0.gguf)
  * - MPI support (exactly 2 ranks for tensor-parallel validation)
+ * - ENABLE_PIPELINE_SNAPSHOTS must be defined (Debug or E2ERelease build)
  */
+
+// CRITICAL: This test requires snapshot capture to work properly
+#ifndef ENABLE_PIPELINE_SNAPSHOTS
+#error "Test__Qwen2E2ECorrectness requires ENABLE_PIPELINE_SNAPSHOTS to be defined. Build with CMAKE_BUILD_TYPE=Debug or CMAKE_BUILD_TYPE=E2ERelease"
+#endif
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -1039,13 +1045,17 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
 
     // ======== Sequential Execution (Baseline) ========
     std::vector<std::vector<float>> logits_sequential(batch_size);
+    std::vector<std::unique_ptr<Qwen2Pipeline>> pipelines_seq(batch_size);
 
     for (int i = 0; i < batch_size; ++i)
     {
-        auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
+        pipelines_seq[i] = std::make_unique<Qwen2Pipeline>(
             model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
-        bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
+        // Enable snapshot capture for detailed layer comparison
+        pipelines_seq[i]->enableSnapshotCapture("/tmp/llaminar_snapshots_seq_" + std::to_string(i));
+
+        bool success = pipelines_seq[i]->forward(batch[i].data(), batch[i].size());
         local_ok = success;
         int global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -1053,7 +1063,7 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
 
         const size_t seq_len = batch[i].size();
         logits_sequential[i].resize(seq_len * vocab_size);
-        const float *logits_ptr = pipeline_seq->getLogits(0);
+        const float *logits_ptr = pipelines_seq[i]->getLogits(0);
         std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
 
         if (rank_ == 0)
@@ -1067,6 +1077,9 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
     // ======== Batched Execution ========
     auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
+
+    // Enable snapshot capture for batched execution
+    pipeline_batch->enableSnapshotCapture("/tmp/llaminar_snapshots_batch");
 
     bool success = pipeline_batch->forward_batch(batch);
     local_ok = success;
@@ -1118,6 +1131,92 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
             printComparisonResult(result, test_name);
 
             test_results[i] = result.passed ? 1 : 0;
+
+            // If this sequence failed, do detailed layer-by-layer snapshot comparison
+            if (!result.passed)
+            {
+                LOG_INFO("\n[E2E] ===== Layer-by-Layer Snapshot Comparison for Sequence " << i << " =====");
+
+                // Get all snapshot keys from sequential execution
+                auto seq_keys = pipelines_seq[i]->getSnapshotKeys();
+                LOG_INFO("[E2E] Sequential has " << seq_keys.size() << " snapshots");
+
+                // Track if we found the first divergence
+                bool found_first_divergence = false;
+
+                // Compare each snapshot
+                for (const auto &key : seq_keys)
+                {
+                    size_t seq_size = 0;
+                    size_t batch_size_snap = 0;
+
+                    const float *seq_data = pipelines_seq[i]->getSnapshot(key, seq_size);
+                    const float *batch_data = pipeline_batch->getSnapshot(key, batch_size_snap);
+
+                    if (seq_data && batch_data)
+                    {
+                        // For batched snapshots, extract the specific sequence
+                        // Layout: [batch_size * padded_seq_len, feature_dim]
+                        const int padded_len = pipeline_batch->padded_seq_len();
+                        const size_t feature_dim = seq_size / seq_len;
+                        const size_t batch_feature_dim = batch_size_snap / (batch_size * padded_len);
+
+                        if (feature_dim == batch_feature_dim)
+                        {
+                            // Extract sequence i from batch
+                            std::vector<float> batch_seq_i(seq_len * feature_dim);
+                            for (size_t tok = 0; tok < seq_len; ++tok)
+                            {
+                                const size_t batch_offset = (i * padded_len + tok) * feature_dim;
+                                const size_t seq_offset = tok * feature_dim;
+                                std::memcpy(batch_seq_i.data() + seq_offset,
+                                            batch_data + batch_offset,
+                                            feature_dim * sizeof(float));
+                            }
+
+                            // Compare this snapshot
+                            auto snap_result = compareTensors(seq_data, batch_seq_i.data(),
+                                                              seq_len * feature_dim, tolerance);
+
+                            const char *status = snap_result.passed ? "✓ PASS" : "✗ FAIL";
+                            LOG_INFO("[E2E]   " << key << ": " << status
+                                                << " (max_diff=" << snap_result.max_abs_diff
+                                                << ", mean_diff=" << snap_result.mean_abs_diff << ")");
+
+                            // If this is the first failing snapshot, print detailed comparison
+                            if (!snap_result.passed && !found_first_divergence)
+                            {
+                                found_first_divergence = true;
+                                LOG_INFO("[E2E]     ═══════════════════════════════════════════════════");
+                                LOG_INFO("[E2E]     → FIRST DIVERGENCE DETECTED: " << key);
+                                LOG_INFO("[E2E]     → Shape: [" << seq_len << ", " << feature_dim << "]");
+                                LOG_INFO("[E2E]     → Max diff: " << snap_result.max_abs_diff);
+                                LOG_INFO("[E2E]     → Mean diff: " << snap_result.mean_abs_diff);
+                                LOG_INFO("[E2E]     → Rel L2 norm: " << snap_result.rel_l2_norm);
+
+                                // Print first few values for debugging
+                                LOG_INFO("[E2E]     → Sequential first 5 values: "
+                                         << seq_data[0] << ", " << seq_data[1] << ", "
+                                         << seq_data[2] << ", " << seq_data[3] << ", " << seq_data[4]);
+                                LOG_INFO("[E2E]     → Batched first 5 values: "
+                                         << batch_seq_i[0] << ", " << batch_seq_i[1] << ", "
+                                         << batch_seq_i[2] << ", " << batch_seq_i[3] << ", " << batch_seq_i[4]);
+                                LOG_INFO("[E2E]     ═══════════════════════════════════════════════════");
+                            }
+                        }
+                        else
+                        {
+                            LOG_WARN("[E2E]   " << key << ": dimension mismatch (seq="
+                                                << feature_dim << ", batch=" << batch_feature_dim << ")");
+                        }
+                    }
+                    else
+                    {
+                        LOG_WARN("[E2E]   " << key << ": snapshot not found (seq="
+                                            << (seq_data != nullptr) << ", batch=" << (batch_data != nullptr) << ")");
+                    }
+                }
+            }
         }
     }
 

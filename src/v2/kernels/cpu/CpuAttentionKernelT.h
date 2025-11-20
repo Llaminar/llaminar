@@ -506,9 +506,19 @@ namespace llaminar2
             }
 
             const float *mask_ptr = nullptr;
+            const int total_tokens = batch_size * seq_len;
             if (workspace_mask)
             {
                 mask_ptr = workspace_mask->data();
+            }
+
+            // Allocate mask tile buffer once for reuse across all batch items
+            // The combined mask is [total_tokens, total_tokens], but compute_typed expects [seq_len, seq_len]
+            // We extract the relevant [seq_len, seq_len] block per batch item
+            std::vector<float> mask_tile;
+            if (mask_ptr)
+            {
+                mask_tile.resize(seq_len * seq_len);
             }
 
             // Cast inputs to ElementType FIRST (before any pointer arithmetic)
@@ -543,10 +553,28 @@ namespace llaminar2
                     buffer_offset = b * 2 * seq_len * n_heads * head_dim;
                 }
 
+                // Extract per-sequence mask tile from combined batch mask
+                // Combined mask: [total_tokens, total_tokens] where total_tokens = batch_size * seq_len
+                // For batch item b, tokens span [b*seq_len : (b+1)*seq_len]
+                // Extract the [seq_len, seq_len] block at rows [b*seq_len : (b+1)*seq_len], cols [b*seq_len : (b+1)*seq_len]
                 const float *mask_slice = nullptr;
                 if (mask_ptr)
                 {
-                    mask_slice = mask_ptr + b * seq_len * seq_len;
+                    const int row_offset = b * seq_len;
+                    const int col_offset = b * seq_len;
+
+                    // Copy the relevant block from combined mask to tile buffer
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        for (int j = 0; j < seq_len; ++j)
+                        {
+                            const int global_row = row_offset + i;
+                            const int global_col = col_offset + j;
+                            mask_tile[i * seq_len + j] = mask_ptr[global_row * total_tokens + global_col];
+                        }
+                    }
+
+                    mask_slice = mask_tile.data();
                 }
 
                 // Pointer arithmetic in ElementType units (already cast above)

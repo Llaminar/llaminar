@@ -62,7 +62,9 @@ namespace llaminar2
 
             // For batched attention, choose appropriate mask builder:
             // - If sequence_lengths provided: Use combined mask (padding + optional causal)
-            // - Otherwise: Use batch causal mask (causal only)
+            // - Otherwise:
+            //   - If causal: Use batch causal mask
+            //   - If non-causal: Use padding-only mask
             if (sequence_lengths && !sequence_lengths->empty())
             {
                 attention_utils::create_combined_batch_mask(mask_data,
@@ -74,13 +76,26 @@ namespace llaminar2
             }
             else
             {
-                // No padding, use batch causal mask (respects config.causal implicitly via window)
+                // No sequence_lengths provided - choose mask type based on causal flag
                 const int *seq_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
-                attention_utils::create_batch_causal_mask(mask_data,
-                                                          batch_size,
-                                                          seq_len,
-                                                          seq_ptr,
-                                                          config.window_size);
+                if (config.causal)
+                {
+                    // Causal attention: mask future tokens
+                    attention_utils::create_batch_causal_mask(mask_data,
+                                                              batch_size,
+                                                              seq_len,
+                                                              seq_ptr,
+                                                              config.window_size);
+                }
+                else
+                {
+                    // Non-causal attention: bi-directional, only mask padding
+                    attention_utils::create_batch_padding_mask(mask_data,
+                                                               batch_size,
+                                                               seq_len,
+                                                               seq_ptr,
+                                                               config.window_size);
+                }
             }
             return true;
         }

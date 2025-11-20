@@ -225,18 +225,53 @@ namespace llaminar2
         std::vector<float> V_local(local_tensor_elements);
         std::vector<float> local_output(local_tensor_elements, 0.0f);
 
+        // For batch path, we need to preserve [batch_size, seq_len, n_heads, head_dim] layout
+        // For single-sequence path, total_tokens = seq_len, so batch structure doesn't matter
         auto copy_head_slice = [&](const float *src, float *dst)
         {
-            for (int t = 0; t < total_tokens; ++t)
+            if (effective_batch_size > 1)
             {
-                const float *src_row = src + static_cast<size_t>(t) * config.n_heads * config.head_dim;
-                float *dst_row = dst + static_cast<size_t>(t) * local_n_heads * config.head_dim;
-                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                // Batch path: src is [batch_size, seq_len, n_heads, head_dim]
+                // dst should be [batch_size, seq_len, local_n_heads, head_dim]
+                const size_t seq_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
+                const size_t batch_stride = static_cast<size_t>(seq_len) * seq_head_stride;
+                const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
+                const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
+
+                for (int b = 0; b < effective_batch_size; ++b)
                 {
-                    const size_t global_h = start_head + local_h;
-                    const float *src_head = src_row + global_h * config.head_dim;
-                    float *dst_head = dst_row + local_h * config.head_dim;
-                    std::memcpy(dst_head, src_head, static_cast<size_t>(config.head_dim) * sizeof(float));
+                    const float *batch_src = src + b * batch_stride;
+                    float *batch_dst = dst + b * local_batch_stride;
+
+                    for (int s = 0; s < seq_len; ++s)
+                    {
+                        const float *seq_src = batch_src + static_cast<size_t>(s) * seq_head_stride;
+                        float *seq_dst = batch_dst + static_cast<size_t>(s) * local_seq_head_stride;
+
+                        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                        {
+                            const size_t global_h = start_head + local_h;
+                            const float *src_head = seq_src + global_h * config.head_dim;
+                            float *dst_head = seq_dst + local_h * config.head_dim;
+                            std::memcpy(dst_head, src_head, static_cast<size_t>(config.head_dim) * sizeof(float));
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Single-sequence path: src is [seq_len, n_heads, head_dim]
+                for (int t = 0; t < total_tokens; ++t)
+                {
+                    const float *src_row = src + static_cast<size_t>(t) * config.n_heads * config.head_dim;
+                    float *dst_row = dst + static_cast<size_t>(t) * local_n_heads * config.head_dim;
+                    for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                    {
+                        const size_t global_h = start_head + local_h;
+                        const float *src_head = src_row + global_h * config.head_dim;
+                        float *dst_head = dst_row + local_h * config.head_dim;
+                        std::memcpy(dst_head, src_head, static_cast<size_t>(config.head_dim) * sizeof(float));
+                    }
                 }
             }
         };
@@ -272,13 +307,35 @@ namespace llaminar2
             float *mask_data = mask_tensor->mutable_data();
             if (effective_batch_size == 1)
             {
-                attention_utils::create_causal_mask(mask_data, total_tokens, config.window_size);
+                // Single sequence: respect causal flag (fixes E2E parity tests)
+                if (config.causal)
+                {
+                    attention_utils::create_causal_mask(mask_data, total_tokens, config.window_size);
+                }
+                else
+                {
+                    // Non-causal single sequence: no mask needed (all tokens can attend to all tokens)
+                    // Fill with zeros (no masking)
+                    std::fill_n(mask_data, total_tokens * total_tokens, 0.0f);
+                }
             }
             else
             {
                 const int *seq_lens_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
-                attention_utils::create_batch_causal_mask(
-                    mask_data, effective_batch_size, padded_seq_len, seq_lens_ptr, config.window_size);
+
+                // Use appropriate mask based on causal flag
+                if (config.causal)
+                {
+                    // Causal attention: mask future tokens + padding
+                    attention_utils::create_batch_causal_mask(
+                        mask_data, effective_batch_size, padded_seq_len, seq_lens_ptr, config.window_size);
+                }
+                else
+                {
+                    // Non-causal attention: mask only padding tokens (bi-directional)
+                    attention_utils::create_batch_padding_mask(
+                        mask_data, effective_batch_size, padded_seq_len, seq_lens_ptr, config.window_size);
+                }
             }
         }
 
@@ -298,7 +355,7 @@ namespace llaminar2
                 static_cast<int>(local_n_heads),
                 static_cast<int>(local_n_heads), // K/V already broadcast per head
                 config.head_dim,
-                needs_mask,
+                config.causal,
                 config.window_size,
                 config.workspace_scores.get(),
                 config.workspace_qkv_buffer.get(),
@@ -320,7 +377,7 @@ namespace llaminar2
                 static_cast<int>(local_n_heads),
                 static_cast<int>(local_n_heads), // K/V already broadcast per head
                 config.head_dim,
-                needs_mask,
+                config.causal,
                 config.window_size,
                 config.workspace_scores.get(),
                 config.workspace_qkv_buffer.get(),
@@ -353,17 +410,50 @@ namespace llaminar2
         std::vector<float> send_buffer(total_tokens * config.n_heads * config.head_dim, 0.0f);
 
         // Copy local heads to correct position in send buffer
-#pragma omp parallel for collapse(2) if (total_tokens * local_n_heads > 64)
-        for (int t = 0; t < total_tokens; ++t)
+        // Must preserve batch structure if effective_batch_size > 1
+        if (effective_batch_size > 1)
         {
-            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+            // Batch path: local_output is [batch_size, seq_len, local_n_heads, head_dim]
+            // send_buffer should be [batch_size, seq_len, n_heads, head_dim] with only start_head..start_head+local_n_heads filled
+            const size_t seq_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
+            const size_t batch_stride = static_cast<size_t>(seq_len) * seq_head_stride;
+            const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
+            const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
+
+#pragma omp parallel for collapse(3) if (effective_batch_size * seq_len * local_n_heads > 64)
+            for (int b = 0; b < effective_batch_size; ++b)
             {
-                size_t global_h = start_head + local_h;
-#pragma omp simd
-                for (int d = 0; d < config.head_dim; ++d)
+                for (int s = 0; s < seq_len; ++s)
                 {
-                    send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
-                        local_output[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                    for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                    {
+                        size_t global_h = start_head + local_h;
+                        const float *src = local_output.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
+                        float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
+#pragma omp simd
+                        for (int d = 0; d < config.head_dim; ++d)
+                        {
+                            dst[d] = src[d];
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Single-sequence path: local_output is [seq_len, local_n_heads, head_dim]
+#pragma omp parallel for collapse(2) if (total_tokens * local_n_heads > 64)
+            for (int t = 0; t < total_tokens; ++t)
+            {
+                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                {
+                    size_t global_h = start_head + local_h;
+#pragma omp simd
+                    for (int d = 0; d < config.head_dim; ++d)
+                    {
+                        send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
+                            local_output[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                    }
                 }
             }
         }
@@ -672,8 +762,19 @@ namespace llaminar2
         else
         {
             // Batched sequences: block-diagonal mask with padding
-            attention_utils::create_batch_causal_mask(
-                mask, batch_size, seq_len, seq_lengths, window_size);
+            // Use appropriate mask based on causal flag
+            if (causal)
+            {
+                // Causal attention: mask future tokens + padding
+                attention_utils::create_batch_causal_mask(
+                    mask, batch_size, seq_len, seq_lengths, window_size);
+            }
+            else
+            {
+                // Non-causal attention: mask only padding tokens (bi-directional)
+                attention_utils::create_batch_padding_mask(
+                    mask, batch_size, seq_len, seq_lengths, window_size);
+            }
 
             // Apply to all heads (mask is shared across heads within a batch)
             attention_utils::apply_attention_mask(scores, mask, batch_size * seq_len, seq_len);

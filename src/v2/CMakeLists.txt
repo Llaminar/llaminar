@@ -519,7 +519,6 @@ add_library(llaminar2_core STATIC
     kernels/cpu/CPURMSNormKernel.cpp
     kernels/cpu/CPUSoftmaxKernel.cpp
     kernels/cpu/CPUSwiGLUKernel.cpp
-    kernels/cpu/CPUAttention.cpp
     kernels/cpu/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp

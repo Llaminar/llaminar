@@ -148,6 +148,14 @@ namespace llaminar2
         std::vector<std::string> getAllWeightNames() const override;
         ActivationBuffers createBuffersForDevice(int device_idx, int max_seq_len) override;
 
+        /**
+         * @brief Initialize infrastructure with batched workspace buffers
+         *
+         * Calls PipelineBase::initializeDeviceInfrastructure with batch_size
+         * to ensure workspace mask has correct dimensions for batched attention.
+         */
+        void initializeInfrastructureBatched();
+
     private:
         // Qwen2-specific architecture parameters
         int d_ff_ = 0;

@@ -74,7 +74,8 @@ namespace llaminar2
         int max_seq_len = config_.max_seq_len;
 
         // Phase 4.1: Device infrastructure (device discovery, buffer allocation)
-        initializeDeviceInfrastructure(max_seq_len);
+        // Default batch_size=1 for backward compatibility
+        initializeDeviceInfrastructure(max_seq_len, 1);
 
         // Phase 2: MPI strategy configuration (auto-select or validate)
         configureMPIStrategy();
@@ -516,7 +517,7 @@ namespace llaminar2
     // Generic Initialization (extracted from Qwen2Pipeline)
     // =============================================================================
 
-    void PipelineBase::initializeDeviceInfrastructure(int max_seq_len)
+    void PipelineBase::initializeDeviceInfrastructure(int max_seq_len, int batch_size)
     {
         // Phase 4.1: Discover which devices are used by this rank
         active_devices_ = discoverActiveDevices();
@@ -558,35 +559,40 @@ namespace llaminar2
         // Phase 4.2: Allocate attention workspace buffers (zero-allocation hot path)
         // These buffers are reused across all attention calls, eliminating per-call allocations
         const int max_threads = omp_get_max_threads();
+        const int total_len = batch_size * max_seq_len; // Total sequence length across batch
         LOG_INFO("Allocating attention workspace buffers (max_seq_len=" << max_seq_len
+                                                                        << ", batch_size=" << batch_size
+                                                                        << ", total_len=" << total_len
                                                                         << ", max_threads=" << max_threads << ")");
 
-        // Scores buffer: [n_heads * max_seq_len, max_seq_len]
-        // Sized for worst case (all heads, full sequence)
+        // Scores buffer: [n_heads * total_len, total_len] where total_len = batch_size * max_seq_len
+        // For batched attention, scores computed between all tokens across all sequences
+        // Sized for worst case (all heads, full batch)
         attention_workspace_scores_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(n_heads_ * max_seq_len),
-                                static_cast<size_t>(max_seq_len)});
+            std::vector<size_t>{static_cast<size_t>(n_heads_ * total_len),
+                                static_cast<size_t>(total_len)});
 
-        // QKV extraction buffer: [max_threads * max_seq_len * head_dim * 3]
-        // 3x: Q, K, V extraction buffers per thread
+        // QKV extraction buffer: [max_threads * total_len * head_dim * 3]
+        // 3x: Q, K, V extraction buffers per thread, sized for full batch
         attention_workspace_qkv_buffer_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_threads * max_seq_len * head_dim_ * 3)});
+            std::vector<size_t>{static_cast<size_t>(max_threads * total_len * head_dim_ * 3)});
 
-        // Context buffer: [max_threads * max_seq_len * head_dim]
-        // Thread-local context accumulation
+        // Context buffer: [max_threads * total_len * head_dim]
+        // Thread-local context accumulation, sized for full batch
         attention_workspace_context_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_threads * max_seq_len * head_dim_)});
+            std::vector<size_t>{static_cast<size_t>(max_threads * total_len * head_dim_)});
 
-        // Mask buffer: [max_seq_len * max_seq_len]
+        // Mask buffer: [total_len * total_len]
         // Causal/padding mask (reused across heads)
+        // Must be square to support batched attention (attention between all tokens across all batches)
         attention_workspace_mask_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len * max_seq_len)});
+            std::vector<size_t>{static_cast<size_t>(total_len * total_len)});
 
-        LOG_INFO("Attention workspace buffers allocated: "
-                 << "scores=" << (n_heads_ * max_seq_len * max_seq_len * sizeof(float) / 1024 / 1024) << "MB, "
-                 << "qkv=" << (max_threads * max_seq_len * head_dim_ * 3 * sizeof(float) / 1024 / 1024) << "MB, "
-                 << "context=" << (max_threads * max_seq_len * head_dim_ * sizeof(float) / 1024 / 1024) << "MB, "
-                 << "mask=" << (max_seq_len * max_seq_len * sizeof(float) / 1024 / 1024) << "MB");
+        LOG_INFO("Attention workspace buffers allocated (batch_size=" << batch_size << "): "
+                                                                      << "scores=" << (n_heads_ * max_seq_len * max_seq_len * sizeof(float) / 1024 / 1024) << "MB, "
+                                                                      << "qkv=" << (max_threads * max_seq_len * head_dim_ * 3 * sizeof(float) / 1024 / 1024) << "MB, "
+                                                                      << "context=" << (max_threads * max_seq_len * head_dim_ * sizeof(float) / 1024 / 1024) << "MB, "
+                                                                      << "mask=" << (total_len * total_len * sizeof(float) / 1024 / 1024) << "MB");
     }
 
     void PipelineBase::configureMPIStrategy()

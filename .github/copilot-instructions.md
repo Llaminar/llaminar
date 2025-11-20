@@ -263,6 +263,219 @@ cd /workspaces/llaminar && ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-
 cd /workspaces/llaminar && GTEST_FILTER=The.Specific.GTest.Name ctest --test-dir build_v2 -R V2_My_Test_File -V
 ```
 
+### Snapshot Framework and E2E Testing
+
+**Overview**: Llaminar V2 includes a comprehensive snapshot framework for capturing and comparing intermediate pipeline activations during inference. This is essential for E2E (end-to-end) correctness validation and debugging divergences.
+
+**Key Concepts**:
+- **Snapshots**: Captured intermediate tensors at specific pipeline stages (embeddings, Q/K/V projections, attention outputs, FFN outputs, layer norms, etc.)
+- **Snapshot Keys**: Human-readable identifiers for each captured tensor (e.g., `"layer0_ATTENTION_CONTEXT"`, `"layer5_FFN_DOWN"`)
+- **Ground Truth Comparison**: Compare Llaminar outputs against PyTorch reference implementation to validate correctness
+
+#### Snapshot-Enabled Builds
+
+**CRITICAL**: E2E tests require `ENABLE_PIPELINE_SNAPSHOTS` compile flag. This is **only enabled in specific build configurations**:
+
+1. **E2ERelease Build** (recommended for E2E tests):
+   ```bash
+   # Create E2E-specific build with snapshots enabled
+   cmake -B build_v2_e2e -S src/v2 \
+     -DCMAKE_BUILD_TYPE=Release \
+     -DENABLE_PIPELINE_SNAPSHOTS=ON \
+     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+   
+   cmake --build build_v2_e2e --parallel
+   ```
+
+2. **Debug Build** (snapshots enabled by default):
+   ```bash
+   # Debug builds automatically enable snapshots
+   cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug
+   cmake --build build_v2 --parallel
+   ```
+
+3. **Release Build** (snapshots **DISABLED**):
+   ```bash
+   # Standard release builds have snapshots disabled for performance
+   cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+   cmake --build build_v2_release --parallel
+   # ⚠️ E2E tests will FAIL to compile against this build!
+   ```
+
+#### Running Qwen2 E2E Tests
+
+**Basic E2E Test Execution**:
+```bash
+# Set up optimal MPI/OpenMP environment
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close \
+       OMP_NESTED=false OMP_DYNAMIC=false \
+       KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 \
+       OPENBLAS_NUM_THREADS=28 GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false \
+       OMPI_MCA_mpi_leave_pinned=1 OMPI_MCA_btl_vader_single_copy_mechanism=none \
+       OMPI_MCA_btl_openib_allow_ib=1 LLAMINAR_LOG_LEVEL=ERROR
+
+# Run all E2E tests (requires 2 MPI ranks)
+timeout 180 mpirun -np 2 --bind-to socket --map-by socket \
+  ./build_v2_e2e/tests/v2/v2_test_qwen2_e2e_correctness
+
+# Run specific E2E test
+timeout 180 mpirun -np 2 --bind-to socket --map-by socket \
+  ./build_v2_e2e/tests/v2/v2_test_qwen2_e2e_correctness \
+  --gtest_filter="Qwen2E2ECorrectness.SingleTokenInference"
+```
+
+**Available E2E Tests** (`tests/v2/e2e/Test__Qwen2E2ECorrectness.cpp`):
+- `SingleTokenInference`: Single token forward pass validation
+- `MultiSequenceBatch`: Batched inference with multiple sequences
+- `BatchScaling`: Batch size scaling validation
+- `ComprehensiveBatchParity`: Sequential vs batched execution comparison
+
+#### Snapshot Capture API
+
+**Pipeline-Level Snapshot Control**:
+```cpp
+// Enable snapshot capture (must be done before forward pass)
+pipeline->enableSnapshotCapture("/tmp/llaminar_snapshots");
+
+// Run inference (snapshots automatically captured at instrumented points)
+pipeline->forward(input_ids, seq_len);
+
+// Retrieve captured snapshots
+auto snapshot_keys = pipeline->getSnapshotKeys();  // List of all captured stages
+auto tensor_data = pipeline->getSnapshot("layer0_ATTENTION_CONTEXT");  // Get specific snapshot
+```
+
+**Common Snapshot Keys** (Qwen2 Pipeline):
+- `EMBEDDING`: Token embeddings after embedding layer
+- `layer{N}_ATTENTION_NORM`: Pre-attention RMS normalization
+- `layer{N}_Q_PROJECTION`, `layer{N}_K_PROJECTION`, `layer{N}_V_PROJECTION`: QKV projections
+- `layer{N}_Q_ROPE`, `layer{N}_K_ROPE`: After RoPE application
+- `layer{N}_ATTENTION_CONTEXT`: Attention output before output projection
+- `layer{N}_ATTENTION_OUTPUT`: After attention output projection
+- `layer{N}_ATTENTION_RESIDUAL`: After attention residual connection
+- `layer{N}_FFN_NORM`: Pre-FFN RMS normalization
+- `layer{N}_FFN_GATE`, `layer{N}_FFN_UP`: FFN gate and up projections
+- `layer{N}_FFN_SWIGLU`: After SwiGLU activation
+- `layer{N}_FFN_DOWN`: FFN down projection
+- `layer{N}_FFN_RESIDUAL`: After FFN residual connection
+- `FINAL_NORM`: Final RMS normalization before LM head
+- `LM_HEAD`: Logits output
+
+#### Debugging with Snapshots
+
+**Layer-by-Layer Divergence Detection**:
+```cpp
+// Example from ComprehensiveBatchParity test
+auto seq_keys = pipeline_sequential->getSnapshotKeys();
+for (const auto& key : seq_keys) {
+    auto seq_snapshot = pipeline_sequential->getSnapshot(key);
+    auto batch_snapshot = pipeline_batched->getSnapshot(key);
+    
+    // Extract corresponding sequence from batch
+    // Compare tensors with tolerance
+    if (max_diff > tolerance) {
+        LOG_ERROR("First divergence at stage: " << key);
+        LOG_ERROR("Max diff: " << max_diff << ", Mean diff: " << mean_diff);
+        break;
+    }
+}
+```
+
+**Snapshot Output Directories**:
+- `/tmp/llaminar_snapshots/`: Default snapshot directory
+- Snapshots are **NOT automatically cleaned up** - useful for post-test analysis
+- Each snapshot is a binary file containing FP32 tensor data
+
+#### Compile-Time Safety
+
+E2E tests include compile-time checks to prevent building against non-snapshot builds:
+
+```cpp
+// In Test__Qwen2E2ECorrectness.cpp
+#ifndef ENABLE_PIPELINE_SNAPSHOTS
+#error "Test requires ENABLE_PIPELINE_SNAPSHOTS. Build with: \
+cmake -B build_v2_e2e -S src/v2 -DCMAKE_BUILD_TYPE=Release -DENABLE_PIPELINE_SNAPSHOTS=ON"
+#endif
+```
+
+This ensures clear error messages if you accidentally try to build E2E tests against `build_v2_release`.
+
+#### Performance Impact
+
+**Snapshot Overhead**:
+- **Disabled (Release builds)**: Zero overhead - snapshot capture code compiled out
+- **Enabled (E2E/Debug builds)**: ~10-20% slowdown due to tensor copying and disk I/O
+- Snapshots are **only captured when explicitly enabled** via `enableSnapshotCapture()`
+
+**Best Practices**:
+- Use E2ERelease build for correctness testing (snapshots enabled, optimizations on)
+- Use standard Release build for performance benchmarking (snapshots disabled)
+- Snapshots are not needed for unit or integration tests (use Debug build for those)
+
+#### Further Reading
+
+For in-depth documentation on the snapshot framework architecture, implementation details, and PyTorch reference comparison:
+- **`.github/instructions/llaminar-v2-architecture.instructions.md`** - Complete snapshot system design
+- **`docs/v2/SNAPSHOT_FRAMEWORK_DESIGN.md`** - Detailed technical documentation
+- **`python/reference/`** - PyTorch reference implementation for ground truth generation
+
+### Model Loading in Tests
+
+**Best Practice**: Use `ModelContext` to manage model loading and tensor creation in tests. This ensures consistent initialization of `ModelLoader`, `WeightManager`, and `TensorFactory`.
+
+#### 1. E2E / Integration Tests (Real Model)
+
+For tests that require a real GGUF model (e.g., E2E correctness tests), use `ModelContext::create()`:
+
+```cpp
+// In SetUp()
+const std::string model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+// Create MPI context first
+auto mpi_ctx = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+
+// Load model with MPI context
+auto model_ctx = ModelContext::create(model_path, mpi_ctx);
+if (!model_ctx) {
+    FAIL() << "Failed to load model: " << model_path;
+}
+
+// Create pipeline using the context
+auto pipeline = PipelineFactory::create(
+    model_ctx->architecture(), 
+    model_ctx, 
+    mpi_ctx
+);
+```
+
+#### 2. Unit Tests (Mock/Test Model)
+
+For unit tests that need a pipeline structure but don't require real weights (or want to avoid loading a large file), use `ModelContext::createForTesting()`:
+
+```cpp
+// Create a test-only context (initializes minimal valid metadata)
+auto model_ctx = ModelContext::createForTesting(
+    "dummy_path.gguf", 
+    nullptr, // No MPI context for simple unit tests
+    24       // block_count (optional)
+);
+
+// You can now create a pipeline or access the loader
+// The loader will have initialized metadata but no actual weights
+```
+
+#### 3. Tensor Creation
+
+Avoid manual `new FP32Tensor(...)`. Use `TensorFactory` to ensure correct NUMA placement and memory alignment:
+
+```cpp
+// Get factory from context or create one
+TensorFactory factory(mpi_ctx);
+
+// Create tensor with specific placement
+auto tensor = factory.create({32, 4096}, TensorType::FP32, device_idx);
+```
+
 ### CTest Label Best Practices
 
 **Philosophy**: Labels should describe **what** is tested, not **when** it was developed.
