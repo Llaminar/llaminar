@@ -274,7 +274,21 @@ namespace llaminar2
                 // 2. Compute Q @ K^T -> Scores (FP32) + Mask + Softmax
                 const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-#pragma omp parallel for if (n_heads > 1)
+                // Parallelism strategy:
+                // 1. Decoding (seq_len < 128): Always parallelize over heads to hide latency/overhead.
+                //    BLAS threading is inefficient for small matrices (M=1).
+                // 2. Prefill (seq_len >= 128):
+                //    - If we have enough heads to saturate ~50% of cores, parallelize over heads.
+                //      (Single-threaded GEMM is efficient, avoids sync overhead).
+                //    - If few heads (e.g. 1-4) on many cores, run sequentially to let BLAS use all cores.
+                const int max_threads = omp_get_max_threads();
+                bool parallelize_heads = true;
+                if (seq_len >= 128 && n_heads * 2 < max_threads)
+                {
+                    parallelize_heads = false;
+                }
+
+#pragma omp parallel for if (parallelize_heads)
                 for (int h = 0; h < n_heads; ++h)
                 {
                     float *scores_h = scores + h * seq_len * seq_len;
@@ -300,7 +314,8 @@ namespace llaminar2
                 // 4. Scores @ V -> Output (FP32)
                 std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 
-#pragma omp parallel for if (n_heads > 1)
+                // Reuse parallelism strategy from Q@K^T
+#pragma omp parallel for if (parallelize_heads)
                 for (int h = 0; h < n_heads; ++h)
                 {
                     const float *weights_h = scores + h * seq_len * seq_len;
@@ -470,7 +485,21 @@ namespace llaminar2
 
             // GEMM kernel already created above
 
-#pragma omp parallel for if (n_heads > 1)
+            // Parallelism strategy:
+            // 1. Decoding (seq_len < 128): Always parallelize over heads to hide latency/overhead.
+            //    BLAS threading is inefficient for small matrices (M=1).
+            // 2. Prefill (seq_len >= 128):
+            //    - If we have enough heads to saturate ~50% of cores, parallelize over heads.
+            //      (Single-threaded GEMM is efficient, avoids sync overhead).
+            //    - If few heads (e.g. 1-4) on many cores, run sequentially to let BLAS use all cores.
+            const int max_threads = omp_get_max_threads();
+            bool parallelize_heads = true;
+            if (seq_len >= 128 && n_heads * 2 < max_threads)
+            {
+                parallelize_heads = false;
+            }
+
+#pragma omp parallel for if (parallelize_heads)
             for (int h = 0; h < n_heads; ++h)
             {
                 float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
@@ -509,6 +538,7 @@ namespace llaminar2
 
             // 3. Apply softmax with optional causal masking
             // Softmax operates on FP32 workspaces (even for BF16/FP16 inputs)
+            // Softmax is lightweight, parallelize even with few heads
 
 #pragma omp parallel for if (n_heads > 1)
             for (int h = 0; h < n_heads; ++h)
@@ -524,8 +554,9 @@ namespace llaminar2
             std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 
             // Reuse GEMM kernel from Q@K^T computation
+            // Reuse parallelism strategy
 
-#pragma omp parallel for if (n_heads > 1)
+#pragma omp parallel for if (parallelize_heads)
             for (int h = 0; h < n_heads; ++h)
             {
                 // NOTE: weights_h points to FP32 workspace (scores)
