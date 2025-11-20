@@ -917,8 +917,8 @@ namespace llaminar2
         private:
             /**
              * @brief Thread-local scratch buffers to avoid hot-path allocations
-             * 
-             * Buffers grow as needed but never shrink, providing zero-allocation 
+             *
+             * Buffers grow as needed but never shrink, providing zero-allocation
              * GEMM calls after initial warm-up. Thread-local to support OpenMP.
              */
             struct ScratchBuffers
@@ -931,13 +931,13 @@ namespace llaminar2
                 std::vector<uint8_t> byte_buffer_b;
             };
 
-            static ScratchBuffers& get_scratch_buffers()
+            static ScratchBuffers &get_scratch_buffers()
             {
                 thread_local ScratchBuffers buffers;
                 return buffers;
             }
 
-            static void ensure_fp32_capacity(std::vector<float>& buf, size_t required_size)
+            static void ensure_fp32_capacity(std::vector<float> &buf, size_t required_size)
             {
                 if (buf.size() < required_size)
                 {
@@ -945,7 +945,7 @@ namespace llaminar2
                 }
             }
 
-            static void ensure_fp16_capacity(std::vector<uint16_t>& buf, size_t required_size)
+            static void ensure_fp16_capacity(std::vector<uint16_t> &buf, size_t required_size)
             {
                 if (buf.size() < required_size)
                 {
@@ -953,7 +953,7 @@ namespace llaminar2
                 }
             }
 
-            static void ensure_byte_capacity(std::vector<uint8_t>& buf, size_t required_size)
+            static void ensure_byte_capacity(std::vector<uint8_t> &buf, size_t required_size)
             {
                 if (buf.size() < required_size)
                 {
@@ -962,7 +962,6 @@ namespace llaminar2
             }
 
         public:
-
             /**
              * @brief Execute GEMM: C = alpha * A @ B^T + beta * C
              */
@@ -1174,11 +1173,11 @@ namespace llaminar2
                     return multiply_activations(A, B, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
                 }
 
-                auto& scratch = get_scratch_buffers();
+                auto &scratch = get_scratch_buffers();
                 ensure_fp32_capacity(scratch.fp32_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k));
                 ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
-                float* A_buf = scratch.fp32_buffer_a.data();
-                float* B_buf = scratch.fp32_buffer_b.data();
+                float *A_buf = scratch.fp32_buffer_a.data();
+                float *B_buf = scratch.fp32_buffer_b.data();
 
                 for (int row = 0; row < m; ++row)
                 {
@@ -1267,7 +1266,7 @@ namespace llaminar2
                     const uint16_t *rhs_ptr = static_cast<const uint16_t *>(B);
                     const uint16_t *lhs_ptr = static_cast<const uint16_t *>(A);
 
-                    auto& scratch = get_scratch_buffers();
+                    auto &scratch = get_scratch_buffers();
                     if (transpose_B)
                     {
                         ensure_fp16_capacity(scratch.fp16_buffer, static_cast<size_t>(k) * static_cast<size_t>(n));
@@ -1342,7 +1341,7 @@ namespace llaminar2
                     const float *lhs_ptr = static_cast<const float *>(A);
                     const uint16_t *rhs_ptr = static_cast<const uint16_t *>(B);
 
-                    auto& scratch = get_scratch_buffers();
+                    auto &scratch = get_scratch_buffers();
                     if (transpose_B)
                     {
                         ensure_fp16_capacity(scratch.fp16_buffer, static_cast<size_t>(k) * static_cast<size_t>(n));
@@ -1508,7 +1507,7 @@ namespace llaminar2
                 size_t elem_size_A = (format_A == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
                 size_t elem_size_B = (format_B == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
 
-                auto& scratch = get_scratch_buffers();
+                auto &scratch = get_scratch_buffers();
                 const void *A_ptr = A;
                 if (!a_row_major)
                 {
@@ -1601,7 +1600,7 @@ namespace llaminar2
                 size_t elem_size_A = (format_A == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
                 size_t elem_size_B = (format_B == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
 
-                auto& scratch = get_scratch_buffers();
+                auto &scratch = get_scratch_buffers();
                 const void *A_ptr = A;
                 if (!a_row_major)
                 {

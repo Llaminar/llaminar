@@ -17,8 +17,8 @@
 #include "tensors/SIMDHelpers.h"
 #include "utils/MPIContext.h"
 
-using llaminar2::gemm_v4::OneDNNGemmKernel;
 using llaminar2::ActivationFormat;
+using llaminar2::gemm_v4::OneDNNGemmKernel;
 
 namespace
 {
@@ -43,13 +43,13 @@ namespace
 
     /**
      * @brief Verify scratch buffers are reused across multiple calls
-     * 
+     *
      * Tests that scratch buffers grow to accommodate the largest request
      * and are reused without reallocation on subsequent smaller calls.
      */
     TEST_F(OneDNNGemmKernelScratchBuffers, BufferReuse)
     {
-        const int device_idx = -1;  // Default device (CPU)
+        const int device_idx = -1; // Default device (CPU)
         llaminar2::MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
 
         // First call with small matrices (should allocate buffers)
@@ -60,7 +60,7 @@ namespace
             std::vector<float> C(m * n, 0.0f);
 
             // Strided layout to force buffer usage
-            const int lda = k + 5;  // Padding
+            const int lda = k + 5; // Padding
             const int ldb = n + 3;
             const int ldc = n + 2;
 
@@ -151,7 +151,7 @@ namespace
             {
                 for (int j = 0; j < n; ++j)
                 {
-                    float expected = k * 3.0f * 3.0f;  // A[i,*] dot B[*,j]
+                    float expected = k * 3.0f * 3.0f; // A[i,*] dot B[*,j]
                     float actual = C_strided[i * ldc + j];
                     EXPECT_NEAR(expected, actual, 1e-3f)
                         << "Mismatch at C[" << i << "," << j << "]";
@@ -165,7 +165,7 @@ namespace
      */
     TEST_F(OneDNNGemmKernelScratchBuffers, TypedGemmBufferReuse)
     {
-        const int device_idx = -1;  // Default device (CPU)
+        const int device_idx = -1; // Default device (CPU)
         llaminar2::MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
 
         // Test FP16 path (requires buffer conversions)
@@ -242,21 +242,21 @@ namespace
 
     /**
      * @brief Test thread-local scratch buffer isolation
-     * 
+     *
      * Verifies that each thread gets its own scratch buffer instance
      * and there's no contention or corruption between threads.
      */
     TEST_F(OneDNNGemmKernelScratchBuffers, ThreadLocalIsolation)
     {
         const int num_threads = 4;
-        const int device_idx = -1;  // Default device (CPU)
+        const int device_idx = -1; // Default device (CPU)
         std::vector<std::thread> threads;
         std::vector<bool> results(num_threads, false);
 
         for (int t = 0; t < num_threads; ++t)
         {
             threads.emplace_back([this, t, &results, device_idx]()
-            {
+                                 {
                 llaminar2::MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
 
                 // Each thread uses different matrix sizes to ensure isolation
@@ -306,8 +306,7 @@ namespace
                         }
                     }
                     results[t] = correct;
-                }
-            });
+                } });
         }
 
         for (auto &thread : threads)
@@ -324,13 +323,13 @@ namespace
 
     /**
      * @brief Test strided typed GEMM buffer usage
-     * 
+     *
      * Verifies that strided typed GEMM operations correctly use
      * scratch buffers for byte-level copies.
      */
     TEST_F(OneDNNGemmKernelScratchBuffers, StridedTypedGemmBuffers)
     {
-        const int device_idx = -1;  // Default device (CPU)
+        const int device_idx = -1; // Default device (CPU)
         llaminar2::MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
 
         const int m = 16, n = 32, k = 24;
@@ -392,7 +391,7 @@ namespace
      */
     TEST_F(OneDNNGemmKernelScratchBuffers, SoftmaxStridedGemmBuffers)
     {
-        const int device_idx = -1;  // Default device (CPU)
+        const int device_idx = -1; // Default device (CPU)
         llaminar2::MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
 
         const int m = 8, n = 16, k = 12;
@@ -461,25 +460,25 @@ namespace
 
     /**
      * @brief Stress test with rapid buffer size changes
-     * 
+     *
      * Tests that buffers handle rapid size changes correctly
      * without memory corruption or performance degradation.
      */
     TEST_F(OneDNNGemmKernelScratchBuffers, RapidSizeChanges)
     {
-        const int device_idx = -1;  // Default device (CPU)
+        const int device_idx = -1; // Default device (CPU)
         llaminar2::MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
 
         // Sequence of matrix sizes that alternate between small and large
         std::vector<std::tuple<int, int, int>> sizes = {
-            {8, 16, 12},      // Small
-            {64, 128, 96},    // Large
-            {4, 8, 6},        // Very small
-            {128, 256, 192},  // Very large
-            {16, 32, 24},     // Medium
-            {32, 64, 48},     // Medium-large
-            {2, 4, 3},        // Tiny
-            {256, 512, 384}   // Huge
+            {8, 16, 12},     // Small
+            {64, 128, 96},   // Large
+            {4, 8, 6},       // Very small
+            {128, 256, 192}, // Very large
+            {16, 32, 24},    // Medium
+            {32, 64, 48},    // Medium-large
+            {2, 4, 3},       // Tiny
+            {256, 512, 384}  // Huge
         };
 
         for (const auto &[m, n, k] : sizes)
