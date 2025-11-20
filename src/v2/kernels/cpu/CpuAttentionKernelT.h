@@ -127,21 +127,7 @@ namespace llaminar2
                 scores_ptr = workspace_scores->mutable_data();
             }
 
-            if (!workspace_buffer)
-            {
-                // Buffer for KV broadcast if needed
-                if (n_heads != n_kv_heads)
-                {
-                    // Need buffer for broadcasted K and V
-                    // Size: 2 * seq_len * n_heads * head_dim
-                    buffer_alloc = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(2 * seq_len * n_heads * head_dim)});
-                    buffer_ptr = buffer_alloc->mutable_data();
-                }
-            }
-            else
-            {
-                buffer_ptr = workspace_buffer->mutable_data();
-            }
+            // buffer_ptr is no longer used (Virtual GQA)
 
             if (!workspace_context)
             {
@@ -162,7 +148,7 @@ namespace llaminar2
                 Q_typed, K_typed, V_typed, output,
                 seq_len, n_heads, n_kv_heads, head_dim,
                 causal, window_size,
-                scores_ptr, buffer_ptr, context_ptr,
+                scores_ptr, context_ptr,
                 mask_ptr,
                 device_idx);
         }
@@ -186,10 +172,9 @@ namespace llaminar2
             bool causal,
             int window_size,
             float *scores,
-            float *buffer,
             float *context,
             const float *mask,
-            int device_idx)
+            int device_idx) const
         {
             // Validate device
             if (device_idx != -1)
@@ -232,47 +217,10 @@ namespace llaminar2
                 else if constexpr (std::is_same_v<TensorType, FP16Tensor>)
                     format = ActivationFormat::FP16;
 
-                // 1. Handle GQA Broadcast (Typed)
-                const ElementType *K_use = K;
-                const ElementType *V_use = V;
-                std::vector<ElementType> K_buf, V_buf;
-
-                if (n_heads != n_kv_heads)
-                {
-                    K_buf.resize(seq_len * n_heads * head_dim);
-                    V_buf.resize(seq_len * n_heads * head_dim);
-
-                    // Manual broadcast loop for ElementType
-                    const int heads_per_kv = n_heads / n_kv_heads;
-
-#pragma omp parallel for collapse(2)
-                    for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
-                    {
-                        for (int s = 0; s < seq_len; ++s)
-                        {
-                            // Source pointer for this token and KV head
-                            const ElementType *src_k = K + (s * n_kv_heads + kv_h) * head_dim;
-                            const ElementType *src_v = V + (s * n_kv_heads + kv_h) * head_dim;
-
-                            for (int i = 0; i < heads_per_kv; ++i)
-                            {
-                                int h = kv_h * heads_per_kv + i;
-                                // Dest pointer for this token and Q head
-                                ElementType *dst_k = K_buf.data() + (s * n_heads + h) * head_dim;
-                                ElementType *dst_v = V_buf.data() + (s * n_heads + h) * head_dim;
-
-                                std::memcpy(dst_k, src_k, head_dim * sizeof(ElementType));
-                                std::memcpy(dst_v, src_v, head_dim * sizeof(ElementType));
-                            }
-                        }
-                    }
-
-                    K_use = K_buf.data();
-                    V_use = V_buf.data();
-                }
-
-                // 2. Compute Q @ K^T -> Scores (FP32) + Mask + Softmax
+                // 1. Compute Q @ K^T -> Scores (FP32) + Mask + Softmax
+                // No GQA broadcast needed! We handle strides virtually.
                 const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                const int heads_per_kv = n_heads / n_kv_heads;
 
                 // Parallelism strategy:
                 // 1. Decoding (seq_len < 128): Always parallelize over heads to hide latency/overhead.
@@ -293,10 +241,13 @@ namespace llaminar2
                 {
                     float *scores_h = scores + h * seq_len * seq_len;
                     const ElementType *Q_h = Q + h * head_dim;
-                    const ElementType *K_h = K_use + h * head_dim;
+                    
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
+                    const ElementType *K_h = K + kv_h * head_dim;
 
                     const int lda = n_heads * head_dim;
-                    const int ldb = n_heads * head_dim;
+                    const int ldb = n_kv_heads * head_dim; // Stride of K is based on n_kv_heads
                     const int ldc = seq_len;
 
                     gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
@@ -311,7 +262,7 @@ namespace llaminar2
                         nullptr, -1, format);
                 }
 
-                // 4. Scores @ V -> Output (FP32)
+                // 2. Scores @ V -> Output (FP32)
                 std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 
                 // Reuse parallelism strategy from Q@K^T
@@ -319,11 +270,15 @@ namespace llaminar2
                 for (int h = 0; h < n_heads; ++h)
                 {
                     const float *weights_h = scores + h * seq_len * seq_len;
-                    const ElementType *V_h = V_use + h * head_dim;
+                    
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
+                    const ElementType *V_h = V + kv_h * head_dim;
+                    
                     float *output_h = output + h * head_dim;
 
                     const int lda = seq_len;
-                    const int ldb = n_heads * head_dim;
+                    const int ldb = n_kv_heads * head_dim; // Stride of V is based on n_kv_heads
                     const int ldc = n_heads * head_dim;
 
                     gemm->template multiply_activations_strided_typed<float, ElementType>(
@@ -458,30 +413,10 @@ namespace llaminar2
                 throw std::runtime_error("Unsupported tensor type for CpuAttentionKernelT");
             }
 
-            // 2. Broadcast K/V heads if needed (GQA/MQA)
-            std::vector<float> K_broadcast, V_broadcast;
-            const float *K_expanded = K_fp32.data();
-            const float *V_expanded = V_fp32.data();
-
-            if (n_heads != n_kv_heads)
-            {
-                K_broadcast.resize(seq_len * n_heads * head_dim);
-                V_broadcast.resize(seq_len * n_heads * head_dim);
-
-                // broadcast_kv_heads: FP32 -> FP32 broadcast (no conversion)
-                attention_utils::broadcast_kv_heads(
-                    K_fp32.data(), K_broadcast.data(),
-                    seq_len, n_heads, n_kv_heads, head_dim);
-                attention_utils::broadcast_kv_heads(
-                    V_fp32.data(), V_broadcast.data(),
-                    seq_len, n_heads, n_kv_heads, head_dim);
-
-                K_expanded = K_broadcast.data();
-                V_expanded = V_broadcast.data();
-            }
-
-            // 3. Compute attention scores per head: Q @ K^T with fused scaling
+            // 2. Compute attention scores per head: Q @ K^T with fused scaling
+            // No GQA broadcast needed! We handle strides virtually.
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            const int heads_per_kv = n_heads / n_kv_heads;
 
             // GEMM kernel already created above
 
@@ -506,10 +441,13 @@ namespace llaminar2
 
                 // Strided Q@K^T with fused scaling
                 const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
-                const float *K_h = K_expanded + h * head_dim;    // K_expanded: already FP32
+                
+                // Virtual GQA: Map head h to kv_head
+                int kv_h = h / heads_per_kv;
+                const float *K_h = K_fp32.data() + kv_h * head_dim; // K_fp32: already FP32
 
                 const int lda = n_heads * head_dim; // Q: stride between rows (skip other heads)
-                const int ldb = n_heads * head_dim; // K: stride between rows (skip other heads)
+                const int ldb = n_kv_heads * head_dim; // K: stride between rows (skip other heads)
                 const int ldc = seq_len;            // scores: contiguous [seq_len, seq_len]
 
                 // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
@@ -561,14 +499,17 @@ namespace llaminar2
             {
                 // NOTE: weights_h points to FP32 workspace (scores)
                 const float *weights_h = scores + h * seq_len * seq_len;
-                const float *V_h = V_expanded + h * head_dim; // V_expanded is float* after broadcast
+                
+                // Virtual GQA: Map head h to kv_head
+                int kv_h = h / heads_per_kv;
+                const float *V_h = V_fp32.data() + kv_h * head_dim; // V_fp32 is float*
 
                 // CRITICAL: output is float* (not ElementType*), pointer arithmetic in floats
                 float *output_h = output + h * head_dim; // First element of head h
 
                 // Strided GEMM: context = weights @ V
                 const int lda = seq_len;            // weights: contiguous [seq_len, seq_len]
-                const int ldb = n_heads * head_dim; // V: stride between rows (skip other heads)
+                const int ldb = n_kv_heads * head_dim; // V: stride between rows (skip other heads)
                 const int ldc = n_heads * head_dim; // output: stride between rows
 
                 // Strided GEMM: context = weights @ V
@@ -624,19 +565,7 @@ namespace llaminar2
                 scores_ptr = workspace_scores->mutable_data();
             }
 
-            if (!workspace_buffer)
-            {
-                if (n_heads != n_kv_heads)
-                {
-                    // Buffer for KV broadcast: [batch_size, 2, seq_len, n_heads, head_dim]
-                    buffer_alloc = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(batch_size * 2 * seq_len * n_heads * head_dim)});
-                    buffer_ptr = buffer_alloc->mutable_data();
-                }
-            }
-            else
-            {
-                buffer_ptr = workspace_buffer->mutable_data();
-            }
+            // buffer_ptr is no longer used (Virtual GQA)
 
             const float *mask_ptr = nullptr;
             const int total_tokens = batch_size * seq_len;
@@ -679,13 +608,6 @@ namespace llaminar2
                 // Scores: [batch_size, n_heads, seq_len, seq_len] (always float)
                 size_t scores_offset = b * n_heads * seq_len * seq_len;
 
-                // Buffer: [batch_size, 2, seq_len, n_heads, head_dim] (always float)
-                size_t buffer_offset = 0;
-                if (buffer_ptr)
-                {
-                    buffer_offset = b * 2 * seq_len * n_heads * head_dim;
-                }
-
                 // Extract per-sequence mask tile from combined batch mask
                 // Combined mask: [total_tokens, total_tokens] where total_tokens = batch_size * seq_len
                 // For batch item b, tokens span [b*seq_len : (b+1)*seq_len]
@@ -723,7 +645,6 @@ namespace llaminar2
                     seq_len, n_heads, n_kv_heads, head_dim,
                     causal, window_size,
                     scores_ptr + scores_offset,
-                    buffer_ptr ? buffer_ptr + buffer_offset : nullptr,
                     nullptr, // context not used
                     mask_slice,
                     device_idx);
@@ -733,46 +654,6 @@ namespace llaminar2
             }
 
             return true;
-        }
-
-        /**
-         * @brief Broadcast K/V from n_kv_heads to n_heads (for GQA/MQA)
-         *
-         * Type-safe implementation for ElementType.
-         */
-    private:
-        void broadcast_kv_typed(
-            const ElementType *input, ElementType *output,
-            int seq_len, int n_heads, int n_kv_heads, int head_dim) const
-        {
-            const int heads_per_kv = n_heads / n_kv_heads;
-
-#pragma omp parallel for if (seq_len * n_kv_heads > 512)
-            for (int s = 0; s < seq_len; ++s)
-            {
-                for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
-                {
-                    const ElementType *src = input + s * n_kv_heads * head_dim + kv_h * head_dim;
-                    for (int i = 0; i < heads_per_kv; ++i)
-                    {
-                        const int q_h = kv_h * heads_per_kv + i;
-                        if (q_h >= n_heads)
-                            continue;
-                        ElementType *dst = output + s * n_heads * head_dim + q_h * head_dim;
-                        std::memcpy(dst, src, head_dim * sizeof(ElementType));
-                    }
-                }
-            }
-        }
-
-        /**
-         * @brief Legacy broadcast_kv (deprecated, kept for compatibility if needed)
-         */
-        void broadcast_kv(
-            const ElementType *input, ElementType *output,
-            int seq_len, int n_heads, int n_kv_heads, int head_dim) const
-        {
-            broadcast_kv_typed(input, output, seq_len, n_heads, n_kv_heads, head_dim);
         }
     };
 
