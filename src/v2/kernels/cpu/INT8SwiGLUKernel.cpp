@@ -30,7 +30,13 @@ namespace llaminar2
         int seq_len,
         int d_ff)
     {
-        (void)device_idx_; // Device index ignored - always operates on CPU buffers
+        // Validate device compatibility - CPU kernel only supports CPU devices
+        if (device_idx_ >= 0)
+        {
+            LOG_ERROR("INT8SwiGLUKernel: CPU kernel does not support GPU devices (device_idx="
+                      << device_idx_ << ")");
+            return false;
+        }
 
         // Validate pointers
         if (!gate_int8 || !gate_row_scales || !up_int8 || !up_row_scales ||
