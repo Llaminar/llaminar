@@ -76,6 +76,7 @@ namespace llaminar2
         // PipelineBase interface
         bool forward(const int *tokens, int seq_len) override; // Legacy single-sequence (wraps batch version)
         const char *architecture() const override { return "qwen2"; }
+        const float *logits() const override { return getLogits(0); }  // Return logits for first sequence
 
         /**
          * @brief Batch-first forward pass (primary interface)

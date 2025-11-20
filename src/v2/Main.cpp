@@ -507,8 +507,12 @@ int main(int argc, char *argv[])
     // Generate tokens autoregressively
     for (int i = 0; i < args.n_predict; ++i)
     {
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << i);
+        
         // Get logits from last forward pass
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Getting logits...");
         const float *logits = pipeline->logits();
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Logits retrieved");
 
         // Get vocabulary size from tokenizer
         size_t vocab_size = tokenizer->vocab_size();
@@ -517,12 +521,14 @@ int main(int argc, char *argv[])
         int next_token = -1;
         if (mpi_ctx->rank() == 0)
         {
+            LOG_DEBUG("[Rank 0] Sampling token...");
             std::vector<float> logits_vec(logits, logits + vocab_size);
 
             // Sample next token
             try
             {
                 next_token = sampler.sample(logits_vec, sampling_params);
+                LOG_DEBUG("[Rank 0] Sampled token: " << next_token);
             }
             catch (const std::exception &e)
             {
@@ -547,7 +553,9 @@ int main(int argc, char *argv[])
         }
 
         // Broadcast next_token to all ranks for synchronized decode
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Broadcasting token...");
         MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Token broadcast complete: " << next_token);
 
         // Check if rank 0 hit EOS
         if (next_token == eos_token_id)
@@ -556,8 +564,10 @@ int main(int argc, char *argv[])
         }
 
         // Forward next token through pipeline (single token decode)
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Entering decode forward...");
         if (!pipeline->forward(&next_token, 1))
         {
+            LOG_ERROR("[Rank " << mpi_ctx->rank() << "] Decode forward FAILED at token " << (i + 1));
             if (mpi_ctx->rank() == 0)
             {
                 LOG_ERROR("\nError: Decode forward pass failed at token " << (i + 1));
@@ -565,6 +575,7 @@ int main(int argc, char *argv[])
             MPI_Finalize();
             return 1;
         }
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Decode forward SUCCESS");
     }
 
     if (mpi_ctx->rank() == 0)
