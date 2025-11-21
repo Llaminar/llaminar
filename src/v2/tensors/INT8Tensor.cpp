@@ -458,7 +458,7 @@ namespace llaminar2
      * @param k_block_offset Block offset within row (currently unused - full row decoded)
      * @param output Output buffer for dequantized FP32 data [cols elements]
      */
-    __attribute__((always_inline)) void INT8Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
+    void INT8Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
     {
         const size_t cols = shape_[1];
         const int8_t *int8_row = host_int8_data_.data() + row_idx * cols;
@@ -499,7 +499,6 @@ namespace llaminar2
      * @param k_block_offset Block offset within row (currently unused)
      * @return Const pointer to raw INT8 data
      */
-    __attribute__((always_inline))
     const void *
     INT8Tensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
     {

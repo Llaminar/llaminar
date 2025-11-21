@@ -41,13 +41,21 @@ protected:
     {
         // Create temp directory for test files
         test_dir_ = "/tmp/llaminar_test_modelloader/";
-        system(("mkdir -p " + test_dir_).c_str());
+        int ret = system(("mkdir -p " + test_dir_).c_str());
+        if (ret != 0)
+        {
+            std::cerr << "Warning: Failed to create test directory: " << test_dir_ << std::endl;
+        }
     }
 
     void TearDown() override
     {
         // Clean up test files
-        system(("rm -rf " + test_dir_).c_str());
+        int ret = system(("rm -rf " + test_dir_).c_str());
+        if (ret != 0)
+        {
+            std::cerr << "Warning: Failed to remove test directory: " << test_dir_ << std::endl;
+        }
     }
 
     /**

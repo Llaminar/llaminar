@@ -117,7 +117,9 @@ namespace llaminar2
         // Matches llama.cpp's dequantize_row_iq1_s implementation
         const float d = fp16_to_fp32(block.d);
         const uint8_t *qs = block.qs;
-        const uint16_t *qh = block.qh;
+        // Copy qh to avoid taking address of packed member (alignment warning)
+        uint16_t qh[8];
+        std::memcpy(qh, block.qh, sizeof(qh));
 
         // Process in 8 iterations (QK_K/32 = 256/32 = 8)
         // Each iteration handles 32 elements (4 groups of 8)
@@ -202,7 +204,7 @@ namespace llaminar2
         throw std::runtime_error("IQ1_STensor::mutable_data: quantized tensors are immutable");
     }
 
-        bool IQ1_STensor::copyFrom(const TensorBase *src)
+    bool IQ1_STensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;

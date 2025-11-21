@@ -1127,11 +1127,9 @@ namespace llaminar2
         }
 
         // ITensorGemmTileDataProvider interface - for INT8 GEMM kernels
-        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
 
-        __attribute__((always_inline))
-        const void *
-        get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
