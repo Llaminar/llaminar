@@ -25,6 +25,7 @@
 #include <cstring>
 #include <limits>
 #include <iostream>
+#include <optional>
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
@@ -1059,11 +1060,28 @@ namespace llaminar2
                 ActivationView activation_view(A, static_cast<size_t>(m), static_cast<size_t>(k));
                 ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
 
-                if (!onednn_gemm_adapter(m, n, k,
-                                         activation_view,
-                                         *weight_tensor_,
-                                         output_view,
-                                         nullptr))
+                // Check cache or pack weights
+                if (!weight_tensor_->cache_.has_value())
+                {
+                    try
+                    {
+                        weight_tensor_->cache_ = pack_weights_to_int8(*weight_tensor_, k, n);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] Failed to pack weights: " << e.what());
+                        return false;
+                    }
+                }
+
+                // Quantize activations
+                auto activation_pack = activation_view.to_int8_activation_pack(m, k);
+
+                if (!onednn_gemm_from_packed(activation_pack,
+                                             std::any_cast<const WeightPack &>(weight_tensor_->cache_),
+                                             output_view,
+                                             m, n, k,
+                                             nullptr))
                 {
                     LOG_ERROR("[OneDNNGemmKernel] OneDNN adapter matmul failed for fused softmax path");
                     return false;
@@ -1091,7 +1109,55 @@ namespace llaminar2
             {
                 (void)device_idx; // Device index ignored - always operates on CPU buffers
 
-                if (!A || !B || !C)
+                const float *B_ptr = B;
+                if (!B_ptr && weight_tensor_)
+                {
+                    // Check if we should use INT8 adapter (for quantized weights)
+                    TensorType type = weight_tensor_->native_type();
+                    bool is_quantized = (type != TensorType::FP32 &&
+                                         type != TensorType::FP16 &&
+                                         type != TensorType::BF16 &&
+                                         type != TensorType::INT32);
+
+                    if (is_quantized)
+                    {
+                        if (!transpose_B)
+                        {
+                            LOG_ERROR("[OneDNNGemmKernel] INT8 adapter requires transpose_B=true (A @ B^T)");
+                            return false;
+                        }
+
+                        ActivationView activation_view(A, static_cast<size_t>(m), static_cast<size_t>(k));
+                        ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
+
+                        // Check cache or pack weights
+                        if (!weight_tensor_->cache_.has_value())
+                        {
+                            try
+                            {
+                                weight_tensor_->cache_ = pack_weights_to_int8(*weight_tensor_, k, n);
+                            }
+                            catch (const std::exception &e)
+                            {
+                                LOG_ERROR("[OneDNNGemmKernel] Failed to pack weights: " << e.what());
+                                return false;
+                            }
+                        }
+
+                        // Quantize activations
+                        auto activation_pack = activation_view.to_int8_activation_pack(m, k);
+
+                        return onednn_gemm_from_packed(activation_pack,
+                                                       std::any_cast<const WeightPack &>(weight_tensor_->cache_),
+                                                       output_view,
+                                                       m, n, k,
+                                                       nullptr);
+                    }
+
+                    B_ptr = weight_tensor_->data();
+                }
+
+                if (!A || !B_ptr || !C)
                 {
                     LOG_ERROR("[OneDNNGemmKernel] Null activation buffer in multiply_activations");
                     return false;
@@ -1135,16 +1201,15 @@ namespace llaminar2
                 (void)mpi_ctx;
                 (void)device_idx; // Device index ignored - always operates on CPU buffers
 
-                if (!A || !B || !C)
+                // Check for quantized weights
+                bool is_quantized_weight = false;
+                if (!B && weight_tensor_)
                 {
-                    LOG_ERROR("[OneDNNGemmKernel] Null buffer in multiply_activations_strided");
-                    return false;
-                }
-
-                if (m <= 0 || n <= 0 || k <= 0)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Invalid dimensions in multiply_activations_strided");
-                    return false;
+                    TensorType type = weight_tensor_->native_type();
+                    is_quantized_weight = (type != TensorType::FP32 &&
+                                           type != TensorType::FP16 &&
+                                           type != TensorType::BF16 &&
+                                           type != TensorType::INT32);
                 }
 
                 // LOG_DEBUG("[OneDNNGemmKernel] multiply_activations_strided_typed_impl called. m=" << m << " n=" << n << " k=" << k << " lda=" << lda << " ldb=" << ldb << " ldc=" << ldc);
@@ -1155,6 +1220,30 @@ namespace llaminar2
                 if (a_row_major && b_row_major && c_row_major)
                 {
                     return multiply_activations(A, B, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+                }
+
+                if (is_quantized_weight)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Strided access not supported for quantized weights");
+                    return false;
+                }
+
+                const float *B_ptr = B;
+                if (!B_ptr && weight_tensor_)
+                {
+                    B_ptr = weight_tensor_->data();
+                }
+
+                if (!A || !B_ptr || !C)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Null buffer in multiply_activations_strided");
+                    return false;
+                }
+
+                if (m <= 0 || n <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Invalid dimensions in multiply_activations_strided");
+                    return false;
                 }
 
                 auto &scratch = get_scratch_buffers();

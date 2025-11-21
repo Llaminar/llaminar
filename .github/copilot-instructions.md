@@ -808,10 +808,10 @@ timeout 60 mpirun -np 2 ./build_v2_release/src/v2/llaminar2
 
 ### Core V2 Principles
 
-1. **No Operator Layer**: Pipelines call kernels directly (no `MPILinearOperator`, etc.)
+1. **Tensor-centric Design**: All operations are focused on Tensors
 2. **Per-Tensor Device Affinity**: Tensors know their device placement
 3. **Strategy Pattern**: Generic kernels + format-specific decode strategies
-4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
+4. **ITensor Interfaces Expose Kernels**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
 
 ### ITensorGemmTileDataProvider Strategy Pattern
 
@@ -968,6 +968,15 @@ bool Qwen2Pipeline::attention_block(const LayerWeights& layer, int layer_idx, in
 ```
 
 **See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for complete V2 documentation.
+
+### SIMD Writing Guidelines for v2 Kernels
+
+When writing SIMD in v2, we follow these principles:
+
+1. **Exploit ILP**: Unroll loops, do interleaved loads and stores to exploit dual load ports
+2. **Vectorized Tail Handling in All Loops**: AVX512 16-way, AVX2 8-way, AVX 4-way, SSE 2-way, scalar tail
+3. **Prefetch**: Prefetch upcoming sequential reads
+
 
 ## MPI Development Best Practices
 

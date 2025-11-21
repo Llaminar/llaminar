@@ -19,6 +19,14 @@
 #include <stdexcept>
 #include <omp.h>
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 namespace llaminar2
 {
 
@@ -710,5 +718,171 @@ namespace llaminar2
     }
 
 #endif // ENABLE_PIPELINE_SNAPSHOTS
+
+    // =============================================================================
+    // Numerical Health Checks (Debug builds only)
+    // =============================================================================
+
+#ifndef NDEBUG
+    float check_numerical_health_impl(const char *stage_name,
+                                      const float *data,
+                                      size_t len)
+    {
+        if (!data || len == 0)
+        {
+            return 0.0f;
+        }
+
+        // Vectorized computation of max_abs and sum_abs
+        float max_val = 0.0f;
+        float sum_abs = 0.0f;
+
+#if defined(__AVX512F__)
+        // AVX512: Process 16 floats per iteration
+        __m512 vmax = _mm512_setzero_ps();
+        __m512 vsum = _mm512_setzero_ps();
+
+        size_t i = 0;
+        for (; i + 16 <= len; i += 16)
+        {
+            __m512 v = _mm512_loadu_ps(&data[i]);
+            __m512 vabs = _mm512_abs_ps(v); // Absolute value (flip sign bit)
+            vmax = _mm512_max_ps(vmax, vabs);
+            vsum = _mm512_add_ps(vsum, vabs);
+        }
+
+        // Horizontal reduction
+        float max_array[16], sum_array[16];
+        _mm512_storeu_ps(max_array, vmax);
+        _mm512_storeu_ps(sum_array, vsum);
+
+        for (int j = 0; j < 16; ++j)
+        {
+            max_val = std::max(max_val, max_array[j]);
+            sum_abs += sum_array[j];
+        }
+
+        // Scalar tail
+        for (; i < len; ++i)
+        {
+            float abs_val = std::fabs(data[i]);
+            max_val = std::max(max_val, abs_val);
+            sum_abs += abs_val;
+        }
+
+#elif defined(__AVX2__)
+        // AVX2: Process 8 floats per iteration
+        __m256 vmax = _mm256_setzero_ps();
+        __m256 vsum = _mm256_setzero_ps();
+        const __m256 sign_mask = _mm256_set1_ps(-0.0f); // Sign bit mask
+
+        size_t i = 0;
+        for (; i + 8 <= len; i += 8)
+        {
+            __m256 v = _mm256_loadu_ps(&data[i]);
+            __m256 vabs = _mm256_andnot_ps(sign_mask, v); // Clear sign bit
+            vmax = _mm256_max_ps(vmax, vabs);
+            vsum = _mm256_add_ps(vsum, vabs);
+        }
+
+        // Horizontal reduction
+        float max_array[8], sum_array[8];
+        _mm256_storeu_ps(max_array, vmax);
+        _mm256_storeu_ps(sum_array, vsum);
+
+        for (int j = 0; j < 8; ++j)
+        {
+            max_val = std::max(max_val, max_array[j]);
+            sum_abs += sum_array[j];
+        }
+
+        // Scalar tail
+        for (; i < len; ++i)
+        {
+            float abs_val = std::fabs(data[i]);
+            max_val = std::max(max_val, abs_val);
+            sum_abs += abs_val;
+        }
+
+#elif defined(__SSE2__)
+        // SSE2: Process 4 floats per iteration
+        __m128 vmax = _mm_setzero_ps();
+        __m128 vsum = _mm_setzero_ps();
+        const __m128 sign_mask = _mm_set1_ps(-0.0f);
+
+        size_t i = 0;
+        for (; i + 4 <= len; i += 4)
+        {
+            __m128 v = _mm_loadu_ps(&data[i]);
+            __m128 vabs = _mm_andnot_ps(sign_mask, v);
+            vmax = _mm_max_ps(vmax, vabs);
+            vsum = _mm_add_ps(vsum, vabs);
+        }
+
+        // Horizontal reduction
+        float max_array[4], sum_array[4];
+        _mm_storeu_ps(max_array, vmax);
+        _mm_storeu_ps(sum_array, vsum);
+
+        for (int j = 0; j < 4; ++j)
+        {
+            max_val = std::max(max_val, max_array[j]);
+            sum_abs += sum_array[j];
+        }
+
+        // Scalar tail
+        for (; i < len; ++i)
+        {
+            float abs_val = std::fabs(data[i]);
+            max_val = std::max(max_val, abs_val);
+            sum_abs += abs_val;
+        }
+
+#else
+        // Scalar fallback
+        for (size_t i = 0; i < len; ++i)
+        {
+            float abs_val = std::fabs(data[i]);
+            max_val = std::max(max_val, abs_val);
+            sum_abs += abs_val;
+        }
+#endif
+
+        // Compute statistics
+        float mean = sum_abs / static_cast<float>(len);
+        float dynamic_range = max_val / (mean + 1e-10f);
+
+        // Check for numerical issues
+        constexpr float EXPLODING_THRESHOLD = 1e3f;
+        constexpr float COLLAPSING_THRESHOLD = 1e-5f;
+
+        if (max_val > EXPLODING_THRESHOLD)
+        {
+            LOG_WARN("[NumHealth] Exploding activations at " << stage_name
+                                                             << ": max=" << max_val << ", mean=" << mean
+                                                             << ", dynamic_range=" << dynamic_range);
+            return 0.0f; // Signal unhealthy
+        }
+
+        if (mean < COLLAPSING_THRESHOLD)
+        {
+            LOG_WARN("[NumHealth] Collapsing distribution at " << stage_name
+                                                               << ": max=" << max_val << ", mean=" << mean
+                                                               << ", dynamic_range=" << dynamic_range);
+            return 0.0f; // Signal unhealthy
+        }
+
+        // Optional: Warn on poor dynamic range (may indicate quantization issues)
+        constexpr float POOR_DYNAMIC_RANGE_THRESHOLD = 1e4f;
+        if (dynamic_range > POOR_DYNAMIC_RANGE_THRESHOLD)
+        {
+            LOG_DEBUG("[NumHealth] High dynamic range at " << stage_name
+                                                           << ": max=" << max_val << ", mean=" << mean
+                                                           << ", dynamic_range=" << dynamic_range);
+        }
+
+        return dynamic_range;
+    }
+#endif // NDEBUG
 
 } // namespace llaminar2

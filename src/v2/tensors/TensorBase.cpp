@@ -90,6 +90,7 @@ namespace llaminar2
         // Step 1: Decode entire tensor to FP32 (temporary buffer)
         std::vector<float> fp32_data(rows * cols);
 
+#pragma omp parallel for schedule(static)
         for (size_t row = 0; row < rows; ++row)
         {
             float *row_dst = fp32_data.data() + row * cols;
@@ -111,6 +112,7 @@ namespace llaminar2
         }
 
         // Step 2: Compute per-column scales
+#pragma omp parallel for schedule(static)
         for (size_t j = 0; j < cols; ++j)
         {
             float max_abs = 0.0f;
@@ -126,6 +128,7 @@ namespace llaminar2
         // Step 3: Compute per-row scales (if requested)
         if (dst_row_scales != nullptr)
         {
+#pragma omp parallel for schedule(static)
             for (size_t i = 0; i < rows; ++i)
             {
                 float max_abs = 0.0f;
@@ -142,6 +145,7 @@ namespace llaminar2
         // Step 4: Quantize to INT8 using per-column scales (or per-row if requested)
         const bool use_row_scales = (dst_row_scales != nullptr);
 
+#pragma omp parallel for schedule(static)
         for (size_t i = 0; i < rows; ++i)
         {
             const float row_inv_scale = use_row_scales ? (1.0f / dst_row_scales[i]) : 1.0f;

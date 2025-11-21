@@ -153,15 +153,17 @@ namespace llaminar2
 
             // Step 2: Transpose from row-major [N, K] to column-major [K, N]
             // This changes memory layout for optimal OneDNN access patterns
-            for (int n = 0; n < N; ++n)
+            // Optimized: Parallelize over K (output rows) for sequential writes
+#pragma omp parallel for schedule(static)
+            for (int k = 0; k < K; ++k)
             {
-                // Source: row n in row-major layout
-                const int8_t *row_src = row_major.data() + static_cast<size_t>(n) * static_cast<size_t>(K);
+                // Destination: row k in column-major layout (which is K x N)
+                int8_t *dst_row = pack.data.data() + static_cast<size_t>(k) * static_cast<size_t>(N);
 
-                // Destination: column n in column-major layout
-                for (int k = 0; k < K; ++k)
+                for (int n = 0; n < N; ++n)
                 {
-                    pack.data[static_cast<size_t>(k) * static_cast<size_t>(N) + static_cast<size_t>(n)] = row_src[static_cast<size_t>(k)];
+                    // Source: row n, col k in row-major layout [N, K]
+                    dst_row[n] = row_major[static_cast<size_t>(n) * static_cast<size_t>(K) + static_cast<size_t>(k)];
                 }
             }
 

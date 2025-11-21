@@ -292,7 +292,6 @@
                 "--test-dir",
                 "${workspaceFolder}/build_v2_e2e_release",
                 "--output-on-failure",
-                "--verbose",
                 "-R",
                 "^V2_E2E_"
             ],

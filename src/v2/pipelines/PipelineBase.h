@@ -105,8 +105,56 @@
         }                                   \
     } while (0)
 
+/**
+ * @brief Check numerical health of activation tensor (Debug builds only)
+ *
+ * Detects numerical instability issues:
+ * - Exploding activations (max > 1e3)
+ * - Collapsing distributions (mean < 1e-5)
+ * - Poor dynamic range (max/mean ratio)
+ *
+ * Compiles to no-op in Release builds for zero overhead.
+ * Uses vectorized AVX512/AVX2 for minimal Debug overhead.
+ *
+ * Usage: CHECK_NUMERICAL_HEALTH("layer5_FFN_output", tensor_ptr->data(), 9 * 896)
+ *
+ * @param stage_name Human-readable stage identifier for logging
+ * @param data Pointer to FP32 activation buffer
+ * @param len Number of elements in buffer
+ */
+#ifndef NDEBUG
+#define CHECK_NUMERICAL_HEALTH(stage_name, data, len) \
+    check_numerical_health_impl((stage_name), (data), (len))
+#else
+#define CHECK_NUMERICAL_HEALTH(stage_name, data, len) \
+    do                                                \
+    {                                                 \
+        (void)(stage_name);                           \
+        (void)(data);                                 \
+        (void)(len);                                  \
+    } while (0)
+#endif
+
 namespace llaminar2
 {
+    // Forward declarations
+#ifndef NDEBUG
+    /**
+     * @brief Vectorized numerical health check implementation (Debug only)
+     *
+     * Detects numerical drift in activation tensors.
+     * See CHECK_NUMERICAL_HEALTH macro for usage.
+     *
+     * @param stage_name Human-readable identifier
+     * @param data FP32 activation buffer
+     * @param len Number of elements
+     * @return Dynamic range (max / mean), or 0 if unhealthy
+     */
+    float check_numerical_health_impl(const char *stage_name,
+                                      const float *data,
+                                      size_t len);
+#endif
+
     /**
      * @brief Pre-allocated activation buffers for inference
      *

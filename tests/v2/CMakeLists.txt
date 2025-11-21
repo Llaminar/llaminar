@@ -403,6 +403,19 @@ add_v2_test(V2_Unit_OneDNNGemmAdapter
     MPI_PROCS 1  # Adapter operates purely on CPU tensors, single rank
 )
 
+# Test: WeightPack cache functionality (lazy INT8 repacking, memory deallocation)
+add_executable(v2_test_weight_pack_cache unit/Test__WeightPackCache.cpp)
+target_link_libraries(v2_test_weight_pack_cache
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightPackCache
+    COMMAND $<TARGET_FILE:v2_test_weight_pack_cache>
+    LABELS "V2;Unit;TensorOperations;WeightCaching;INT8;MemoryOptimization;OneDNN;CPU"
+    MPI_PROCS 1  # Cache tests are single-rank CPU operations
+)
+
 # Test: ActivationTraits (trait dispatch to softmax primitives, GEMM, workspace allocation)
 add_executable(v2_test_activation_traits unit/Test__ActivationTraits.cpp)
 target_link_libraries(v2_test_activation_traits
@@ -1126,7 +1139,7 @@ target_link_libraries(v2_test_iq2xxs_tensor
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_IQ2_XXSTensor 
+add_v2_test(V2_Unit_IQ2_XXS_Tensor 
     COMMAND $<TARGET_FILE:v2_test_iq2xxs_tensor>
     MPI_PROCS 1
     LABELS "V2;Unit;TensorOperations;IQ2_XXS;Quantization;SIMD;AVX2;AVX512;Equivalency;IQQuant;GridLookup;SignMask"
@@ -1142,7 +1155,7 @@ target_link_libraries(v2_test_iq2xs_tensor
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_IQ2_XSTensor 
+add_v2_test(V2_Unit_IQ2_XS_Tensor 
     COMMAND $<TARGET_FILE:v2_test_iq2xs_tensor>
     MPI_PROCS 1
     LABELS "V2;Unit;TensorOperations;IQ2_XS;Quantization;SIMD;AVX2;AVX512;Equivalency;IQQuant;GridLookup;SubBlockScales;9BitIndex"
@@ -1728,9 +1741,9 @@ if(HAVE_CUDA)
         GTest::gtest_main
     )
     add_v2_test(V2_Unit_Phase6_Int8_Functional
-        COMMAND $<TARGET_FILE:v2_test_phase6_int8_functional>
-        LABELS "V2;Unit;CUDA;Phase6;Int8;DP4A;FunctionalTest;Correctness"
-        MPI_PROCS 1
+    COMMAND $<TARGET_FILE:v2_test_phase6_int8_functional>
+    LABELS "V2;Unit;CUDA;Phase6;Int8;DP4A;FunctionalTest;Correctness"
+    MPI_PROCS 1
     )
     
     # Phase 6: Int8 DP4A Kernel - Debug test with intermediate value printing
@@ -2463,6 +2476,23 @@ add_v2_perf_test(V2_Perf_OneDNNGemm_QwenProfile
     MPI_PROCS 1
 )
 
+# Performance Test: OneDNN GEMM Overhead (M=1)
+add_executable(v2_perf_onednn_gemm_overhead performance/kernels/cpu/gemm/gemm_v4/Perf__OneDNNGemm_Overhead.cpp)
+target_link_libraries(v2_perf_onednn_gemm_overhead 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_onednn_gemm_overhead PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_OneDNNGemm_Overhead
+    COMMAND $<TARGET_FILE:v2_perf_onednn_gemm_overhead>
+    LABELS "V2;Performance;GEMM;OneDNN;FP32;Qwen;Overhead;gemm_v4"
+    MPI_PROCS 1
+)
+
 # Performance Test: Fused OneDNN matmul + softmax diagnostic
 add_executable(v2_perf_onednn_gemm_fused_softmax performance/kernels/cpu/gemm/gemm_v4/Perf__OneDNNGemm_FusedSoftmax.cpp)
 target_link_libraries(v2_perf_onednn_gemm_fused_softmax
@@ -2511,6 +2541,24 @@ set_target_properties(v2_perf_onednn_conversion PROPERTIES
 add_v2_perf_test(V2_Perf_OneDNN_Conversion
     COMMAND $<TARGET_FILE:v2_perf_onednn_conversion>
     LABELS "V2;Performance;GEMM;OneDNN;Conversion;FP32"
+    MPI_PROCS 1
+)
+
+# Performance Test: Qwen2 Single Token Profile
+# Runs a tight decode loop for profiling with perf
+add_executable(v2_perf_qwen2_single_token performance/pipelines/qwen/Perf__Qwen2_SingleToken_Profile.cpp)
+target_link_libraries(v2_perf_qwen2_single_token
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_qwen2_single_token PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_Qwen2_SingleToken
+    COMMAND $<TARGET_FILE:v2_perf_qwen2_single_token>
+    LABELS "V2;Performance;Pipeline;Qwen2;Profiling"
     MPI_PROCS 1
 )
 

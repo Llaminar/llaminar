@@ -5,6 +5,7 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/QuantizedGemmKernel.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "Tensors.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
@@ -139,24 +140,18 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q4_0Tensor::createGemm()
     {
+        // Use OneDNNGemmKernel with INT8 adapter support
         return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     void Q4_0Tensor::decodeBlock(const Q4_0Block &block, float *output)
     {
-        const auto &env = debugEnv();
-
-        // Check for forced SIMD path (for testing)
-        if (env.dequant.simd_path == "scalar")
-        {
-            // Force scalar path
-            decodeBlockScalar(block, output);
-            return;
-        }
+        // OPTIMIZATION: Removed debugEnv() string comparisons from hot path
+        // This function is called millions of times during dequantization.
+        // We default to the best available SIMD instruction set.
 
 #if defined(__AVX512F__)
-        if (env.dequant.simd_path == "avx512" ||
-            (env.dequant.simd_path == "auto" && cpu_supports_avx512()))
+        if (cpu_supports_avx512())
         {
             decodeBlockAVX512(block, output);
             return;
@@ -164,8 +159,7 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-        if (env.dequant.simd_path == "avx2" ||
-            (env.dequant.simd_path == "auto" && cpu_supports_avx2()))
+        if (cpu_supports_avx2())
         {
             decodeBlockAVX2(block, output);
             return;

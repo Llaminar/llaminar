@@ -19,7 +19,6 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/CPURMSNormKernel.h"
-#include "../../utils/ThreadingUtils.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -342,11 +341,6 @@ namespace llaminar2
         sequence_lengths_ = padded.actual_lengths;
         int effective_seq_len = batch_size_ * padded_seq_len_;
 
-        // Optimization: For single-token decode (effective_seq_len == 1),
-        // force single-threaded execution to avoid OpenMP synchronization overhead.
-        // This improves TPS from ~2.8 to ~5.0 on small models.
-        utils::ScopedSingleThread guard(effective_seq_len == 1);
-
         LOG_DEBUG("Forward pass: batch_size=" << batch_size_
                                               << ", padded_seq_len=" << padded_seq_len_
                                               << ", effective_seq_len=" << effective_seq_len);
@@ -509,7 +503,7 @@ namespace llaminar2
 
         // Q = hidden @ wq^T
         VALIDATE_OP(q_gemm->multiply_activations(
-                        normalized_hidden->data(), layer.wq->data(), buffers.Q->mutable_data(),
+                        normalized_hidden->data(), nullptr, buffers.Q->mutable_data(),
                         effective_seq_len, n_heads_ * head_dim_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "Q projection");
@@ -520,7 +514,7 @@ namespace llaminar2
 
         // K = hidden @ wk^T
         VALIDATE_OP(k_gemm->multiply_activations(
-                        normalized_hidden->data(), layer.wk->data(), buffers.K->mutable_data(),
+                        normalized_hidden->data(), nullptr, buffers.K->mutable_data(),
                         effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "K projection");
@@ -531,7 +525,7 @@ namespace llaminar2
 
         // V = hidden @ wv^T
         VALIDATE_OP(v_gemm->multiply_activations(
-                        normalized_hidden->data(), layer.wv->data(), buffers.V->mutable_data(),
+                        normalized_hidden->data(), nullptr, buffers.V->mutable_data(),
                         effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "V projection");
@@ -656,7 +650,7 @@ namespace llaminar2
         // 5. Output projection (reuse attn_proj buffer)
         VALIDATE_KERNEL(o_gemm, layer.wo->createGemm(), "output GEMM kernel");
         VALIDATE_OP(o_gemm->multiply_activations(
-                        buffers.attn_output->data(), layer.wo->data(), buffers.attn_proj->mutable_data(),
+                        buffers.attn_output->data(), nullptr, buffers.attn_proj->mutable_data(),
                         effective_seq_len, d_model_, n_heads_ * head_dim_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "Output projection");
@@ -740,7 +734,7 @@ namespace llaminar2
 
         // gate = hidden @ gate_proj^T
         VALIDATE_OP(gate_gemm->multiply_activations(
-                        normalized_hidden->data(), layer.gate_proj->data(), buffers.gate->mutable_data(),
+                        normalized_hidden->data(), nullptr, buffers.gate->mutable_data(),
                         effective_seq_len, d_ff_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Gate projection");
@@ -749,9 +743,13 @@ namespace llaminar2
         // Capture gate projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE", buffers.gate, effective_seq_len, d_ff_);
 
+        // Health check: Gate projection output
+        CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_GATE").c_str(),
+                               buffers.gate->data(), effective_seq_len * d_ff_);
+
         // up = hidden @ up_proj^T
         VALIDATE_OP(up_gemm->multiply_activations(
-                        normalized_hidden->data(), layer.up_proj->data(), buffers.up->mutable_data(),
+                        normalized_hidden->data(), nullptr, buffers.up->mutable_data(),
                         effective_seq_len, d_ff_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Up projection");
@@ -776,12 +774,16 @@ namespace llaminar2
         // Capture SwiGLU output
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_SWIGLU", buffers.up, effective_seq_len, d_ff_);
 
+        // Health check: SwiGLU activation output (critical for numerical stability)
+        CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_SWIGLU").c_str(),
+                               buffers.up->data(), effective_seq_len * d_ff_);
+
         // 4. Down projection (reuse ffn_output buffer)
         VALIDATE_KERNEL(down_gemm, layer.down_proj->createGemm(), "down GEMM kernel");
 
         // ffn_output = up @ down_proj^T
         VALIDATE_OP(down_gemm->multiply_activations(
-                        buffers.up->data(), layer.down_proj->data(), buffers.ffn_output->mutable_data(),
+                        buffers.up->data(), nullptr, buffers.ffn_output->mutable_data(),
                         effective_seq_len, d_model_, d_ff_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Down projection");
@@ -789,6 +791,10 @@ namespace llaminar2
 
         // Capture down projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_DOWN", buffers.ffn_output, effective_seq_len, d_model_);
+
+        // Health check: FFN output before residual (final dequantized output from INT8 path)
+        CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_DOWN").c_str(),
+                               buffers.ffn_output->data(), effective_seq_len * d_model_);
 
         // 5. Residual connection - write back to current_hidden_
         for (size_t i = 0; i < effective_seq_len * d_model_; ++i)
@@ -988,7 +994,7 @@ namespace llaminar2
         // hidden: [effective_seq_len, d_model], lm_head: [vocab_size, d_model]
         // output: [effective_seq_len, vocab_size]
         VALIDATE_OP(lm_gemm->multiply_activations(
-                        hidden->data(), lm_head->data(), logits_buffer_->mutable_data(),
+                        hidden->data(), nullptr, logits_buffer_->mutable_data(),
                         effective_seq_len, vocab_size_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_),
                     "LM head projection");

@@ -146,18 +146,8 @@ namespace llaminar2
 
     void Q5_1Tensor::decodeBlock(const Q5_1Block &block, float *output)
     {
-        // Check debug environment for forced SIMD path
-        const auto &env = debugEnv();
-
-        if (env.dequant.simd_path == "scalar")
-        {
-            decodeBlockScalar(block, output);
-            return;
-        }
-
 #if defined(__AVX512F__)
-        if (env.dequant.simd_path == "avx512" ||
-            (env.dequant.simd_path == "auto" && cpu_supports_avx512()))
+        if (cpu_supports_avx512())
         {
             decodeBlockAVX512(block, output);
             return;
@@ -165,8 +155,7 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-        if (env.dequant.simd_path == "avx2" ||
-            (env.dequant.simd_path == "auto" && cpu_supports_avx2()))
+        if (cpu_supports_avx2())
         {
             decodeBlockAVX2(block, output);
             return;

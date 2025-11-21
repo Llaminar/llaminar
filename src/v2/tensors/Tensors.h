@@ -87,6 +87,7 @@
 #include <memory>
 #include <cstddef>
 #include <cstdint>
+#include <any>
 
 namespace llaminar2
 {
@@ -352,6 +353,9 @@ namespace llaminar2
     {
     public:
         virtual ~TensorBase() = default;
+
+        // Generic cache for kernel state (e.g. packed weights)
+        mutable std::any cache_;
 
         // Shape and type
         virtual const std::vector<size_t> &shape() const = 0;
