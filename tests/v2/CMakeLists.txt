@@ -248,6 +248,20 @@ add_v2_test(V2_Unit_Q8_1Tensor
     LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Activations"
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
+
+# Test: INT8Tensor class (runtime activation quantization with per-row scales)
+add_executable(v2_test_int8_tensor unit/Test__INT8Tensor.cpp)
+target_link_libraries(v2_test_int8_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8Tensor 
+    COMMAND $<TARGET_FILE:v2_test_int8_tensor>
+    LABELS "V2;Unit;TensorOperations;INT8;Quantization;PerRowScales;Dequantization;BatchedExecution"
+    MPI_PROCS 1  # INT8 activation tests are CPU-only, single rank
+)
+
 add_executable(v2_test_int32_tensor unit/tensors/Test__INT32Tensor.cpp)
 target_link_libraries(v2_test_int32_tensor 
     llaminar2_core 
@@ -271,6 +285,19 @@ add_v2_test(V2_Unit_INT32RMSNorm
     COMMAND $<TARGET_FILE:v2_test_int32_rmsnorm>
     LABELS "V2;Unit;Kernels;RMSNorm;INT32;INT8Pipeline;Quantization;AVX512;CPU"
     MPI_PROCS 1  # RMSNorm is CPU-only, single rank
+)
+
+# Test: FusedRMSNormQuantize kernel (operator fusion framework - Phase 1)
+add_executable(v2_test_fused_rmsnorm_quantize unit/Test__FusedRMSNormQuantize.cpp)
+target_link_libraries(v2_test_fused_rmsnorm_quantize
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedRMSNormQuantize
+    COMMAND $<TARGET_FILE:v2_test_fused_rmsnorm_quantize>
+    LABELS "V2;Unit;Kernels;FusedKernels;RMSNorm;Quantization;INT8;OperatorFusion;AVX512;AVX2;CPU"
+    MPI_PROCS 1  # CPU-only fused kernel, single rank
 )
 
 # Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
@@ -455,6 +482,19 @@ add_v2_test(V2_Unit_CpuAttentionKernelT_Batch
     MPI_PROCS 1  # Batch attention tests are CPU-only, single rank
 )
 
+# Test: CpuAttentionKernelT Padding Mask (critical batch padding bug tests)
+add_executable(v2_test_cpu_attention_kernel_t_padding_mask unit/Test__CpuAttentionKernelT_PaddingMask.cpp)
+target_link_libraries(v2_test_cpu_attention_kernel_t_padding_mask
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CpuAttentionKernelT_PaddingMask
+    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t_padding_mask>
+    LABELS "V2;Unit;Kernels;Attention;FP32;BatchAttention;PaddingMask;MaskApplication;OutputZeroing;SequentialVsBatch"
+    MPI_PROCS 1  # CPU-only padding mask tests, single rank
+)
+
 # Test: BF16 SIMD Accuracy (Stage 2 - SIMD-optimized BF16 conversion)
 add_executable(v2_test_bf16_simd_accuracy unit/Test__BF16_SIMD_Accuracy.cpp)
 target_link_libraries(v2_test_bf16_simd_accuracy
@@ -630,6 +670,58 @@ add_v2_test(V2_Unit_GQAAttention_BatchedPath
     MPI_PROCS 1  # Unit test for GQAAttention compute_batch()
 )
 
+# Test: GQAAttention padding mask correctness
+add_executable(v2_test_gqa_attention_padding_mask unit/Test__GQAAttention_PaddingMask.cpp)
+target_link_libraries(v2_test_gqa_attention_padding_mask 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GQAAttention_PaddingMask
+    COMMAND $<TARGET_FILE:v2_test_gqa_attention_padding_mask>
+    LABELS "V2;Unit;Attention;GQA;Padding;Masking;BatchProcessing;SequenceIsolation"
+    MPI_PROCS 1  # Unit test for padding mask construction and application
+)
+
+# Test: GQAAttention mask passing verification (critical bug investigation)
+add_executable(v2_test_gqa_attention_mask_passing unit/Test__GQAAttention_MaskPassing.cpp)
+target_link_libraries(v2_test_gqa_attention_mask_passing 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GQAAttention_MaskPassing
+    COMMAND $<TARGET_FILE:v2_test_gqa_attention_mask_passing>
+    LABELS "V2;Unit;Attention;GQA;MaskPassing;BufferLayout;PaddingZeroing;SequentialVsBatch"
+    MPI_PROCS 1  # Critical tests for batch padding divergence bug
+)
+
+# Test: MpiAttentionOrchestrator mask passing verification
+add_executable(v2_test_mpi_attention_orchestrator_mask_passing unit/Test__MpiAttentionOrchestrator_MaskPassing.cpp)
+target_link_libraries(v2_test_mpi_attention_orchestrator_mask_passing 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MpiAttentionOrchestrator_MaskPassing
+    COMMAND $<TARGET_FILE:v2_test_mpi_attention_orchestrator_mask_passing>
+    LABELS "V2;Unit;Attention;MpiOrchestrator;MaskPassing;BatchProcessing;MPIDispatch;SequentialVsBatch"
+    MPI_PROCS 1  # Tests orchestrator layer mask handling (next layer up from GQA)
+)
+
+# Test: Attention mask diagnostic (basic mask construction verification)
+add_executable(v2_test_attention_mask_diagnostic unit/Test__AttentionMaskDiagnostic.cpp)
+target_link_libraries(v2_test_attention_mask_diagnostic 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionMaskDiagnostic
+    COMMAND $<TARGET_FILE:v2_test_attention_mask_diagnostic>
+    LABELS "V2;Unit;Attention;Masking;Diagnostic;MaskConstruction"
+    MPI_PROCS 1  # Unit test for mask utility functions
+)
+
 # Test: INT8GemmKernel (OneDNN per-channel quantization)
 ## NOTE: INT8GemmKernel test removed - depends on obsolete GEMM v4 weight-owned APIs
 
@@ -645,6 +737,19 @@ add_v2_test(V2_Unit_GQAAttention_BatchedPath
 #     LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;Pipeline;INT32;Requantization;EndToEnd"
 #     MPI_PROCS 1  # CPU-only, single rank
 # )
+
+# Test: Qwen2Pipeline INT8 Buffer Bug (demonstrates total_rows vs effective_seq_len bug)
+add_executable(v2_test_qwen2_int8_buffer_bug unit/Test__Qwen2Pipeline_INT8BufferBug.cpp)
+target_link_libraries(v2_test_qwen2_int8_buffer_bug 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen2INT8BufferBug
+    COMMAND $<TARGET_FILE:v2_test_qwen2_int8_buffer_bug>
+    LABELS "V2;Unit;Pipelines;Qwen2;INT8;BufferManagement;BatchPadding;BugDemonstration"
+    MPI_PROCS 1  # Single rank unit test
+)
 
 # Test: TensorBase Conversion Interface
 add_executable(v2_test_tensor_conversion unit/tensors/Test__TensorConversion.cpp)
@@ -1571,7 +1676,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase5Sweep
+    add_v2_perf_test(V2_Perf_Phase5Sweep
         COMMAND $<TARGET_FILE:v2_test_phase5_sweep>
         LABELS "V2;Performance;AutoTuning;JIT;CUDA;ConfigSpaceSweep;OccupancyOptimization"
         MPI_PROCS 1
@@ -1592,7 +1697,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase5Parity
+    add_v2_perf_test(V2_Perf_Phase5Parity
         COMMAND $<TARGET_FILE:v2_test_phase5_parity>
         LABELS "V2;Performance;Parity;JIT;CUDA;Baseline;Phase5A"
         MPI_PROCS 1
@@ -1613,7 +1718,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase5_SUB_K_Sweep
+    add_v2_perf_test(V2_Perf_Phase5_SUB_K_Sweep
         COMMAND $<TARGET_FILE:v2_test_phase5_sub_k_sweep>
         LABELS "V2;Performance;CUDA;Phase5;TensorCore;TileSizeTuning;Optimization;GEMM"
         MPI_PROCS 1  # Single GPU, no MPI
@@ -1634,7 +1739,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase5_SUB_K_64_Profile
+    add_v2_perf_test(V2_Perf_Phase5_SUB_K_64_Profile
         COMMAND $<TARGET_FILE:v2_test_phase5_sub_k_64_profile>
         LABELS "V2;Performance;Profile;SUB_K;CUDA;Phase5;Coalescing"
         MPI_PROCS 1
@@ -1656,7 +1761,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase5_Transpose_Benchmark
+    add_v2_perf_test(V2_Perf_Phase5_Transpose_Benchmark
         COMMAND $<TARGET_FILE:v2_test_phase5_transpose_benchmark>
         LABELS "V2;Performance;CUDA;Phase5;Coalescing;Transpose;MemoryLayout"
         MPI_PROCS 1
@@ -1677,7 +1782,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase5_Transpose_Large
+    add_v2_perf_test(V2_Perf_Phase5_Transpose_Large
         COMMAND $<TARGET_FILE:v2_test_phase5_transpose_large>
         LABELS "V2;Performance;CUDA;Phase5;Coalescing;Transpose;LargeProblem"
         MPI_PROCS 1
@@ -1783,7 +1888,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase6_Int8_Performance
+    add_v2_perf_test(V2_Perf_Phase6_Int8_Performance
         COMMAND $<TARGET_FILE:v2_test_phase6_int8_performance>
         LABELS "V2;Performance;CUDA;Phase6;Int8;DP4A;Benchmark"
         MPI_PROCS 1
@@ -2170,6 +2275,20 @@ add_v2_test(V2_Integration_MPIStaging
 # Medium-complexity tests involving multiple components
 # May load models, test pipelines, verify end-to-end data flow
 
+# Test: Qwen2Pipeline INT8 Dequantization Regression (prevents recurrence of 97B% divergence bug)
+# Loads full model, runs complete forward passes - too slow for unit test suite
+add_executable(v2_test_qwen2_int8_dequant_regression integration/Test__Qwen2Pipeline_INT8DequantRegression.cpp)
+target_link_libraries(v2_test_qwen2_int8_dequant_regression 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Qwen2INT8DequantRegression
+    COMMAND $<TARGET_FILE:v2_test_qwen2_int8_dequant_regression>
+    LABELS "V2;Integration;Pipelines;Qwen2;INT8;Regression;BatchPadding;Dequantization"
+    MPI_PROCS 1  # Single rank integration test
+)
+
 # Test: Batched Attention (Phase 2)
 add_executable(v2_test_batched_attention integration/Test__BatchedAttention.cpp)
 target_link_libraries(v2_test_batched_attention 
@@ -2232,6 +2351,34 @@ add_v2_test(V2_Integration_DequantEquivalency
 #         LABELS "V2;Integration;AutoTuner;MachineLearning;GEMM;Performance;Correctness"
 #     )
 # endif()
+
+# Test: Qwen2Pipeline Integration - Comprehensive pipeline validation with numerical sanity checks
+add_executable(v2_test_qwen2_pipeline integration/Test__Qwen2Pipeline.cpp)
+target_link_libraries(v2_test_qwen2_pipeline 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_Qwen2Pipeline
+    COMMAND $<TARGET_FILE:v2_test_qwen2_pipeline>
+    MPI_PROCS 2
+    LABELS "V2;Integration;PipelineExecution;Qwen;Batching;Models;NumericalSanity"
+)
+
+# Test: Batch Padding Divergence - Minimal reproducer for batch padding bug
+add_executable(v2_test_batch_padding_divergence unit/Test__BatchPaddingDivergence.cpp)
+target_link_libraries(v2_test_batch_padding_divergence 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Unit_BatchPaddingDivergence
+    COMMAND $<TARGET_FILE:v2_test_batch_padding_divergence>
+    MPI_PROCS 2
+    LABELS "V2;Unit;PipelineExecution;Batching;BugReproducer;Correctness"
+)
 
 # Placeholder for integration test executables (to be added)
 # Example:
@@ -2724,5 +2871,24 @@ set_target_properties(v2_perf_cpu_rmsnorm_fp32 PROPERTIES
 add_v2_perf_test(V2_Perf_CpuRMSNorm_FP32
     COMMAND $<TARGET_FILE:v2_perf_cpu_rmsnorm_fp32>
     LABELS "V2;Performance;RMSNorm;FP32;Latency"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_mpi_attention_orchestrator_masking unit/pipelines/Test__MpiAttentionOrchestrator_Masking.cpp)
+target_link_libraries(v2_test_mpi_attention_orchestrator_masking llaminar2_core GTest::gtest_main)
+
+add_v2_test(V2_Unit_MpiAttentionOrchestrator_Masking
+    COMMAND v2_test_mpi_attention_orchestrator_masking
+    LABELS "V2;Unit;PipelineExecution;Orchestration;Attention"
+    MPI_PROCS 1
+)
+
+# Test: Qwen2Pipeline Batch Handling
+add_executable(v2_test_qwen2_pipeline_batch_handling unit/pipelines/Test__Qwen2Pipeline_BatchHandling.cpp)
+target_link_libraries(v2_test_qwen2_pipeline_batch_handling llaminar2_core GTest::gtest_main)
+
+add_v2_test(V2_Unit_Qwen2Pipeline_BatchHandling
+    COMMAND v2_test_qwen2_pipeline_batch_handling
+    LABELS "V2;Unit;PipelineExecution;Qwen2;BatchProcessing;ResidualConnections"
     MPI_PROCS 1
 )

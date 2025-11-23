@@ -88,6 +88,16 @@ namespace llaminar2
             int seq_len, int head_dim,
             int q_heads, int k_heads,
             int n_past, float freq_base);
+
+        // Kernel contract (operator fusion framework)
+        KernelContract get_contract() const override
+        {
+            return KernelContract{
+                .accepted_input_formats = {TensorFormat::FP32, TensorFormat::BF16, TensorFormat::FP16},
+                .output_format = TensorFormat::FP32,
+                .supports_inplace = true,
+                .is_fusable = true};
+        }
     };
 
     // Backward compatibility alias

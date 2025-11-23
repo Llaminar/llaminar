@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     gpg \
     gpg-agent \
     ca-certificates \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Install system dependencies
@@ -70,15 +71,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     lsb-release \
-    linux-tools-generic \
-    linux-tools-common \ 
-    linux-tools-$(uname -r) \
+    # Perf dependencies (for build-from-source in postCreateCommand)
+    flex \
+    bison \
+    libelf-dev \
+    libdw-dev \
+    libdwarf-dev \
+    libunwind-dev \
+    libcap-dev \
+    zlib1g-dev \
+    liblzma-dev \
+    libzstd-dev \
+    libaio-dev \
+    libtraceevent-dev \
+    libpfm4-dev \
+    libslang2-dev \
+    systemtap-sdt-dev \
+    binutils-dev \
+    libiberty-dev \
+    libbabeltrace-dev \
+    libbfd-dev \
+    clang \
+    llvm \
     # Python for scripting and tooling
     python3 \
     python3-pip \
     python3-dev \
     python3-venv \
     python3.12-venv \
+    python3-setuptools \
     # Additional libraries that might be useful
     libssl-dev \
     libcurl4-openssl-dev \
@@ -88,15 +109,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Node.js for MCP servers (will be installed via features)
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Fix perf symlink for Ubuntu 24.04 bug
-# Detect installed linux-tools version and create proper symlink
-RUN KERNEL_VERSION=$(uname -r) && \
-    INSTALLED_VERSION=$(ls -1 /usr/lib/linux-tools/ | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1) && \
-    if [ -n "$INSTALLED_VERSION" ] && [ -n "$KERNEL_VERSION" ]; then \
-        mkdir -p /usr/lib/linux-tools/$KERNEL_VERSION && \
-        ln -sf /usr/lib/linux-tools/$INSTALLED_VERSION/perf /usr/lib/linux-tools/$KERNEL_VERSION/perf; \
-        echo "Created perf symlink: $INSTALLED_VERSION -> $KERNEL_VERSION"; \
-    fi
+# NOTE: perf/bpftool are built from source during postCreateCommand
+# This ensures they match the running kernel version (6.14.x)
+# See .devcontainer/fix-perf.sh for the build script
 
 # Build and install GoogleTest libraries (CMake find_package friendly)
 RUN cmake -S /usr/src/googletest -B /tmp/googletest-build \

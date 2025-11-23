@@ -267,14 +267,14 @@ namespace llaminar2
             auto gemm = Traits::create_activation_gemm();
 
             // Optimized path for FP32, BF16, FP16 (Native & Mixed Precision)
-            if constexpr (std::is_same_v<TensorType, FP32Tensor> ||
-                          std::is_same_v<TensorType, BF16Tensor> ||
-                          std::is_same_v<TensorType, FP16Tensor>)
+            if constexpr (std::is_same_v<TensorT, FP32Tensor> ||
+                          std::is_same_v<TensorT, BF16Tensor> ||
+                          std::is_same_v<TensorT, FP16Tensor>)
             {
                 ActivationFormat format = ActivationFormat::FP32;
-                if constexpr (std::is_same_v<TensorType, BF16Tensor>)
+                if constexpr (std::is_same_v<TensorT, BF16Tensor>)
                     format = ActivationFormat::BF16;
-                else if constexpr (std::is_same_v<TensorType, FP16Tensor>)
+                else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
                     format = ActivationFormat::FP16;
 
                 // 1. Compute Q @ K^T -> Scores (FP32) + Mask + Softmax
@@ -315,9 +315,9 @@ namespace llaminar2
                     const int ldc_k = kv_len;
 
                     // Optimized path for decoding (seq_len == 1) on FP32
-                    if (seq_len == 1 && std::is_same_v<TensorType, FP32Tensor>)
+                    if (seq_len == 1 && std::is_same_v<TensorT, FP32Tensor>)
                     {
-                        if constexpr (std::is_same_v<TensorType, FP32Tensor>)
+                        if constexpr (std::is_same_v<TensorT, FP32Tensor>)
                         {
                             // 1. Q @ K^T
                             for (int t = 0; t < kv_len; ++t)
@@ -413,7 +413,7 @@ namespace llaminar2
                 std::memcpy(K_fp32.data(), K, K_fp32.size() * sizeof(float));
                 std::memcpy(V_fp32.data(), V, V_fp32.size() * sizeof(float));
             }
-            else if constexpr (std::is_same_v<TensorType, BF16Tensor>)
+            else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
             {
                 // BF16: convert using simd::bf16_to_fp32
                 for (size_t i = 0; i < Q_fp32.size(); ++i)
@@ -429,7 +429,7 @@ namespace llaminar2
                     V_fp32[i] = simd::bf16_to_fp32(V[i]);
                 }
             }
-            else if constexpr (std::is_same_v<TensorType, FP16Tensor>)
+            else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
             {
                 // FP16: convert using simd::fp16_to_fp32
                 for (size_t i = 0; i < Q_fp32.size(); ++i)
@@ -445,7 +445,7 @@ namespace llaminar2
                     V_fp32[i] = simd::fp16_to_fp32(V[i]);
                 }
             }
-            else if constexpr (std::is_same_v<TensorType, Q8_1Tensor>)
+            else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
             {
                 // Q8_1: decode blocks
                 // Q is Q8_1Block*
@@ -469,7 +469,7 @@ namespace llaminar2
                     Q8_1Tensor::decodeBlock(V[i], V_fp32.data() + i * 32);
                 }
             }
-            else if constexpr (std::is_same_v<TensorType, INT32Tensor>)
+            else if constexpr (std::is_same_v<TensorT, INT32Tensor>)
             {
                 // INT32: convert using static_cast
                 for (size_t i = 0; i < Q_fp32.size(); ++i)
@@ -485,7 +485,7 @@ namespace llaminar2
                     V_fp32[i] = static_cast<float>(V[i]);
                 }
             }
-            else if constexpr (std::is_same_v<TensorType, Q8_0Tensor>)
+            else if constexpr (std::is_same_v<TensorT, Q8_0Tensor>)
             {
                 // Q8_0: dequantize blocks to FP32
                 // Calculate raw data size (34 bytes per block of 32 elements)

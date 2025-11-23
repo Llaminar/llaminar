@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../utils/MPIContext.h"
+#include "../kernels/cpu/CPUKernelBase.h" // For TensorFormat enum
 #include <memory>
 
 namespace llaminar2
@@ -415,6 +416,66 @@ namespace llaminar2
         }
 
         /**
+         * @brief Matrix multiplication with typed activations (fusion framework API)
+         *
+         * Accepts pre-quantized or typed activations from fused kernels (e.g., FusedRMSNormQuantize).
+         * Enables operator fusion by eliminating redundant FP32 materialization.
+         *
+         * **Use Case**: After FusedRMSNormQuantize outputs INT8 activations, pass directly to GEMM:
+         * ```cpp
+         * FusedRMSNormQuantize fused_kernel;
+         * fused_kernel.execute(input_fp32, gamma, output_int8, scales, ...);
+         *
+         * gemm->multiply_typed_activations(
+         *     output_int8, TensorFormat::INT8, scales,
+         *     output_fp32, m, n, k, ...
+         * );
+         * ```
+         *
+         * @param A Left activation matrix [m, k] (typed format)
+         * @param format_A Format of activation matrix (INT8, FP32, BF16, FP16, etc.)
+         * @param A_scales Per-row or per-tensor scales for quantized formats (nullptr for FP32/BF16/FP16)
+         * @param C Output matrix [m, n] (FP32)
+         * @param m Number of rows in A and C
+         * @param n Number of columns in output C (rows in B if transpose_B=true)
+         * @param k Number of columns in A and rows in B
+         * @param transpose_B Whether weight matrix B is stored transposed (typical)
+         * @param alpha Scale factor for A@B
+         * @param beta Scale factor for existing C (for fused add)
+         * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
+         * @param device_idx Device index (-1 = CPU, ≥0 = GPU)
+         *
+         * @return true on success, false if format combination not supported
+         *
+         * @note Default implementation returns false (not implemented).
+         *       Kernels override to support specific format combinations.
+         *       Currently supported: INT8 activations with quantized weights (OneDNN path).
+         */
+        virtual bool multiply_typed_activations(
+            const void *A, TensorFormat format_A, const float *A_scales,
+            float *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)A;
+            (void)format_A;
+            (void)A_scales;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Not implemented by default
+        }
+
+        /**
          * @brief Matrix multiplication with fused Softmax (for attention scores)
          *
          * C = Softmax(A @ B^T / sqrt(k) + mask)
@@ -782,6 +843,63 @@ namespace llaminar2
         virtual bool apply_int32_to_int8(
             const int32_t *input, const float *weight, int8_t *output,
             float *scales, int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) { return false; }
+
+        /**
+         * @brief Execute fused RMSNorm + INT8 quantization (operator fusion API)
+         *
+         * Fuses RMS normalization with per-row INT8 quantization in a single pass.
+         * Eliminates intermediate FP32 buffer and redundant memory traffic.
+         *
+         * Algorithm:
+         * 1. Compute RMS per row: rms = sqrt(mean(x²) + eps)
+         * 2. Normalize: x_norm = x / rms
+         * 3. Apply gamma: x_scaled = x_norm * gamma
+         * 4. Quantize per-row: x_int8 = round(x_scaled / scale), scale = max(|x_scaled|) / 127
+         *
+         * Performance Benefits:
+         * - Saves 1 FP32 intermediate buffer allocation (rows × cols × 4 bytes)
+         * - Reduces memory bandwidth by ~33% (1 write instead of 2)
+         * - Improves cache efficiency (single-pass algorithm)
+         * - Expected speedup: 5-10% per RMSNorm operation
+         *
+         * @param input Input tensor [rows, cols] FP32
+         * @param weight RMSNorm scale parameters [cols] FP32 (gamma)
+         * @param output Output tensor [rows, cols] INT8
+         * @param scales Per-row quantization scales [rows] FP32 (output parameter)
+         * @param rows Number of rows (sequence length)
+         * @param cols Hidden dimension (d_model)
+         * @param epsilon RMSNorm epsilon for numerical stability (default: 1e-6)
+         * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
+         * @param device_idx Device index for execution (-1 = host/CPU, ≥0 = GPU)
+         *
+         * @return true on success, false if not supported by this kernel
+         *
+         * @note Default implementation returns false (not implemented).
+         *       FusedRMSNormQuantize kernel overrides this for optimized fused path.
+         *       Standard RMSNorm kernels do not implement this (use apply() instead).
+         */
+        virtual bool execute(
+            const float *input,
+            const float *weight,
+            int8_t *output,
+            float *scales,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)scales;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Not implemented by default (use apply() for standard RMSNorm)
+        }
     };
 
 } // namespace llaminar2

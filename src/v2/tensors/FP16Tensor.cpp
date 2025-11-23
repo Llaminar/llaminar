@@ -717,30 +717,6 @@ namespace llaminar2
         return pack;
     }
 
-    bool FP16Tensor::applyRMSNorm(
-        const float *gamma,
-        int seq_len,
-        int d_model,
-        float eps,
-        const MPIContext *mpi_ctx,
-        int device_idx)
-    {
-        auto kernel = createRMSNorm();
-        if (!kernel)
-        {
-            LOG_ERROR("[FP16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        // FP16 path: apply_fp16() with FP16 buffers (in-place)
-        return kernel->apply_fp16(
-            this->fp16_data(),
-            gamma,
-            this->mutable_fp16_data(),
-            seq_len, d_model, eps,
-            device_idx);
-    }
-
     bool FP16Tensor::applyRoPE(
         float *K,
         const int *position_ids,

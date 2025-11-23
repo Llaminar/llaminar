@@ -55,6 +55,16 @@ namespace llaminar2
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        // Kernel contract (operator fusion framework)
+        KernelContract get_contract() const override
+        {
+            return KernelContract{
+                .accepted_input_formats = {TensorFormat::FP32, TensorFormat::BF16, TensorFormat::FP16},
+                .output_format = TensorFormat::FP32,
+                .supports_inplace = true,
+                .is_fusable = true};
+        }
     };
 
 } // namespace llaminar2

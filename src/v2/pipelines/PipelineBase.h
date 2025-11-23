@@ -170,6 +170,10 @@ namespace llaminar2
         // Normalization buffer (reused by attention and FFN blocks)
         std::shared_ptr<TensorBase> normalized;
 
+        // INT8 quantization buffers (for FusedRMSNormQuantize output)
+        std::shared_ptr<TensorBase> normalized_int8; // INT8 post-fusion buffer
+        std::vector<float> normalized_scales;        // Per-row quantization scales
+
         // Attention buffers
         std::shared_ptr<TensorBase> Q;
         std::shared_ptr<TensorBase> K;
@@ -225,6 +229,14 @@ namespace llaminar2
          * @return Logits tensor [seq_len, vocab_size], or nullptr if not available
          */
         virtual const float *logits() const;
+
+        /**
+         * @brief Get output logits for a specific sequence in batch (FP32)
+         *
+         * @param seq_idx Sequence index in the batch (0-based)
+         * @return Logits tensor [seq_len_for_seq, vocab_size], or nullptr if not available
+         */
+        virtual const float *getLogits(int seq_idx = 0) const;
 
         // ===== Snapshot Capture API (for parity testing / debugging) =====
         // Only available when ENABLE_PIPELINE_SNAPSHOTS is defined (test builds)

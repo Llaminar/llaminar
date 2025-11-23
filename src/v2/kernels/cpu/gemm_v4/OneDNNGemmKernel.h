@@ -655,10 +655,6 @@ namespace llaminar2
             {
                 throw std::runtime_error("ActivationView::createAttention() not supported");
             }
-            bool applyRMSNorm(const float *, int, int, float, const MPIContext *, int) override
-            {
-                throw std::runtime_error("ActivationView::applyRMSNorm() not supported");
-            }
             bool applyRoPE(float *, const int *, int, int, int, int, float, bool, const MPIContext *, int) override
             {
                 throw std::runtime_error("ActivationView::applyRoPE() not supported");
@@ -1188,6 +1184,181 @@ namespace llaminar2
                 }
 
                 return true;
+            }
+
+            /**
+             * @brief Execute GEMM with typed activations: C = alpha * A @ B^T + beta * C
+             *
+             * Accepts pre-quantized activations (INT8 from FusedRMSNormQuantize) and
+             * multiplies with bound weight tensor using OneDNN's INT8×INT8 GEMM.
+             *
+             * @param A Type-erased activation matrix [m, k]
+             * @param format_A Format of activation matrix (INT8, FP32, BF16, FP16)
+             * @param A_scales Per-row quantization scales for A (required for INT8)
+             * @param C Output matrix [m, n] (FP32)
+             * @param m Number of rows in A and C
+             * @param n Number of columns in C (must match weight tensor rows)
+             * @param k Number of columns in A (must match weight tensor columns)
+             * @param transpose_B Whether B is stored as N×K (true) or K×N (false)
+             * @param alpha Scalar multiplier for A@B result
+             * @param beta Scalar multiplier for existing C values (0.0 = overwrite)
+             * @param mpi_ctx MPI context (unused - CPU only)
+             * @param device_idx Device index (unused - CPU only)
+             *
+             * @return true on success, false on error
+             *
+             * **Supported Paths:**
+             * - INT8 activations + quantized weights → OneDNN INT8 GEMM
+             * - FP32 activations → multiply_activations()
+             * - BF16/FP16 activations → multiply_activations_typed_impl()
+             *
+             * **Requirements:**
+             * - Weight tensor must be bound (constructor)
+             * - transpose_B=true required for INT8 path
+             * - A_scales required for INT8 activations (per-row scales)
+             * - Weight tensor cached INT8 pack used if available
+             */
+            bool multiply_typed_activations(
+                const void *A, TensorFormat format_A, const float *A_scales,
+                float *C, int m, int n, int k,
+                bool transpose_B = true,
+                float alpha = 1.0f, float beta = 0.0f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)device_idx; // CPU only
+
+                if (!A || !C || m <= 0 || n <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Invalid parameters in multiply_typed_activations");
+                    return false;
+                }
+
+                if (!weight_tensor_)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] No bound weight tensor for multiply_typed_activations");
+                    return false;
+                }
+
+                // Validate weight tensor dimensions
+                const auto &shape = weight_tensor_->shape();
+                if (shape.size() != 2 || static_cast<int>(shape[0]) != n || static_cast<int>(shape[1]) != k)
+                {
+                    LOG_ERROR("[OneDNNGemmKernel] Weight tensor shape mismatch: expected ["
+                              << n << ", " << k << "], got [" << shape[0] << ", " << shape[1] << "]");
+                    return false;
+                }
+
+                // INT8 path: Use OneDNN adapter with pre-quantized activations
+                if (format_A == TensorFormat::INT8)
+                {
+                    if (!A_scales)
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] INT8 activations require per-row scales (A_scales)");
+                        return false;
+                    }
+
+                    if (!transpose_B)
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] INT8 path requires transpose_B=true (A @ B^T)");
+                        return false;
+                    }
+
+                    // Check if weights are quantized
+                    TensorType weight_type = weight_tensor_->native_type();
+                    bool is_quantized_weight = (weight_type != TensorType::FP32 &&
+                                                weight_type != TensorType::FP16 &&
+                                                weight_type != TensorType::BF16 &&
+                                                weight_type != TensorType::INT32);
+
+                    if (!is_quantized_weight)
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] INT8 activations require quantized weight tensor");
+                        return false;
+                    }
+
+                    // Create views
+                    ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
+
+                    // Pack weights if not cached
+                    if (!weight_tensor_->cache_.has_value())
+                    {
+                        try
+                        {
+                            weight_tensor_->cache_ = pack_weights_to_int8(*weight_tensor_, k, n);
+                        }
+                        catch (const std::exception &e)
+                        {
+                            LOG_ERROR("[OneDNNGemmKernel] Failed to pack weights: " << e.what());
+                            return false;
+                        }
+                    }
+
+                    // Wrap pre-quantized INT8 activations into ActivationPack
+                    // FusedRMSNormQuantize guarantees: per-row quantization, INT8 range [-127, 127]
+                    ActivationPack activation_pack;
+                    const int8_t *int8_data = static_cast<const int8_t *>(A);
+                    const size_t total_elements = static_cast<size_t>(m) * static_cast<size_t>(k);
+                    activation_pack.data.assign(int8_data, int8_data + total_elements);
+                    activation_pack.row_scales.assign(A_scales, A_scales + m);
+                    activation_pack.rows = m;
+                    activation_pack.cols = k;
+
+                    // Execute INT8×INT8 GEMM via OneDNN adapter
+                    if (!onednn_gemm_from_packed(activation_pack,
+                                                 std::any_cast<const WeightPack &>(weight_tensor_->cache_),
+                                                 output_view,
+                                                 m, n, k,
+                                                 nullptr)) // No mask
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] INT8 GEMM via OneDNN adapter failed");
+                        return false;
+                    }
+
+                    // Apply alpha/beta scaling if needed
+                    if (alpha != 1.0f || beta != 0.0f)
+                    {
+                        const size_t total = static_cast<size_t>(m) * static_cast<size_t>(n);
+                        if (beta == 0.0f)
+                        {
+                            for (size_t i = 0; i < total; ++i)
+                                C[i] *= alpha;
+                        }
+                        else
+                        {
+                            LOG_ERROR("[OneDNNGemmKernel] beta != 0.0f not yet supported in INT8 path");
+                            return false;
+                        }
+                    }
+
+                    return true;
+                }
+
+                // FP32 path: Delegate to multiply_activations()
+                if (format_A == TensorFormat::FP32)
+                {
+                    return multiply_activations(
+                        static_cast<const float *>(A), nullptr, C,
+                        m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+                }
+
+                // BF16/FP16 path: Delegate to multiply_activations_typed_impl()
+                if (format_A == TensorFormat::BF16)
+                {
+                    return multiply_activations_typed_impl(
+                        A, nullptr, C, m, n, k, transpose_B, alpha, beta,
+                        mpi_ctx, device_idx, ActivationFormat::BF16, ActivationFormat::BF16);
+                }
+
+                if (format_A == TensorFormat::FP16)
+                {
+                    return multiply_activations_typed_impl(
+                        A, nullptr, C, m, n, k, transpose_B, alpha, beta,
+                        mpi_ctx, device_idx, ActivationFormat::FP16, ActivationFormat::FP16);
+                }
+
+                LOG_ERROR("[OneDNNGemmKernel] Unsupported activation format: " << static_cast<int>(format_A));
+                return false;
             }
 
             bool multiply_activations_strided(const float *A, const float *B, float *C,

@@ -99,6 +99,18 @@ namespace llaminar2
         return logits_->data();
     }
 
+    const float *PipelineBase::getLogits(int seq_idx) const
+    {
+        // Default implementation: delegate to subclass or return first sequence
+        // Subclasses with batched inference should override this
+        if (seq_idx == 0)
+        {
+            return logits();
+        }
+        LOG_ERROR("getLogits(" << seq_idx << ") called on pipeline without batch support");
+        return nullptr;
+    }
+
     bool PipelineBase::attention_gqa(
         TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
         int n_heads, int n_kv_heads, int head_dim,

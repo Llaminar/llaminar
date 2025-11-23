@@ -55,6 +55,16 @@ namespace llaminar2
         bool apply_int32_to_int8(
             const int32_t *input, const float *weight, int8_t *output,
             float *scales, int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override;
+
+        // Kernel contract (operator fusion framework)
+        KernelContract get_contract() const override
+        {
+            return KernelContract{
+                .accepted_input_formats = {TensorFormat::FP32, TensorFormat::BF16, TensorFormat::FP16, TensorFormat::INT32},
+                .output_format = TensorFormat::FP32,
+                .supports_inplace = false,
+                .is_fusable = true};
+        }
     };
 
 } // namespace llaminar2

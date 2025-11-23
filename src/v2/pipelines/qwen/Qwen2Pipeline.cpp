@@ -14,6 +14,7 @@
 #include "Qwen2Pipeline.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugAssert.h"
+#include "../../utils/DebugEnv.h"
 #include "../PipelineFactory.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
@@ -82,8 +83,8 @@ namespace llaminar2
         const PipelineConfig &config)
     {
         // Factory doesn't have placement_map yet (Phase 4.2 integration)
-        // Default batch_size=1 for backward compatibility
-        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config, 1);
+        // Use batch_size from config (defaults to 1 in PipelineConfig)
+        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config, config.batch_size);
     }
 
     /**
@@ -247,6 +248,9 @@ namespace llaminar2
             case ActivationPrecision::INT32:
                 return std::make_shared<INT32Tensor>(shape);
 
+            case ActivationPrecision::INT8:
+                return std::make_shared<INT8Tensor>(shape);
+
             default:
                 LOG_ERROR("Unknown activation precision, defaulting to FP32");
                 return std::make_shared<FP32Tensor>(shape, device_idx);
@@ -273,6 +277,21 @@ namespace llaminar2
         buffers.normalized = createActivationTensor(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
             device_idx, precision);
+
+        // INT8 quantization buffers (for FusedRMSNormQuantize output)
+        // Only allocate if using INT8 activation precision
+        if (precision == ActivationPrecision::INT8)
+        {
+            buffers.normalized_int8 = createActivationTensor(
+                {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
+                device_idx, ActivationPrecision::INT8);
+            buffers.normalized_scales.resize(effective_max); // Per-row scales
+        }
+        else
+        {
+            buffers.normalized_int8 = nullptr; // Explicitly null when not using INT8
+            buffers.normalized_scales.clear();
+        }
 
         // Attention buffers (Qwen-specific dimensions) - sized for batch
         buffers.Q = createActivationTensor(
@@ -341,6 +360,14 @@ namespace llaminar2
         sequence_lengths_ = padded.actual_lengths;
         int effective_seq_len = batch_size_ * padded_seq_len_;
 
+        // Debug: Print actual token batch lengths
+        LOG_ERROR("[BATCH DEBUG] batch_size_=" << batch_size_ << ", padded_seq_len_=" << padded_seq_len_
+                                               << ", effective_seq_len=" << effective_seq_len);
+        for (int i = 0; i < batch_size_; ++i)
+        {
+            LOG_ERROR("[BATCH DEBUG]   Sequence " << i << ": " << token_batches[i].size() << " tokens");
+        }
+
         LOG_DEBUG("Forward pass: batch_size=" << batch_size_
                                               << ", padded_seq_len=" << padded_seq_len_
                                               << ", effective_seq_len=" << effective_seq_len);
@@ -392,15 +419,37 @@ namespace llaminar2
         auto *activation_tensor = dynamic_cast<IActivationTensor *>(current_hidden_.get());
         VALIDATE_POINTER(activation_tensor, "activation tensor for RMSNorm");
 
-        VALIDATE_OP(activation_tensor->applyRMSNorm(
-                        final_norm->data(), effective_seq_len, d_model_,
-                        1e-6f, mpi_ctx_.get(), device_idx_),
+        // Use kernel pattern: tensor creates kernel, kernel executes
+        auto rmsnorm_kernel = activation_tensor->createRMSNorm();
+        VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
+
+        VALIDATE_OP(rmsnorm_kernel->apply(
+                        current_hidden_->data(),         // input
+                        final_norm->data(),              // weight (gamma)
+                        current_hidden_->mutable_data(), // output (in-place)
+                        effective_seq_len, d_model_,
+                        1e-6f, // epsilon
+                        false, // normalize_gamma
+                        mpi_ctx_.get(), device_idx_),
                     "Final RMSNorm");
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_final_norm");
 
         // Capture final norm output
         CAPTURE_SNAPSHOT("FINAL_NORM", current_hidden_.get());
+
+        // DEBUG: Track final norm output
+        static const bool debug_batch_env = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
+        if (debug_batch_env && batch_size_ == 2)
+        {
+            const float *norm_data = current_hidden_->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[FINAL_NORM] Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << norm_data[seq1_offset + i]);
+            }
+        }
 
         // LM head projection (batched)
         if (!lm_head_batch(current_hidden_.get(), effective_seq_len))
@@ -444,6 +493,8 @@ namespace llaminar2
 
     bool Qwen2Pipeline::attention_block(const LayerWeights &layer, int layer_idx, int effective_seq_len)
     {
+        static const bool debug_batch_env = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
+
         // Phase 4.3: Determine execution device based on weight placement
         // All attention weights should be on same device (enforced by placement strategies)
         int attn_device = placement_map_ ? getWeightDevice("attn_q", -1) : device_idx_;
@@ -482,53 +533,205 @@ namespace llaminar2
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     effective_seq_len * d_model_ * sizeof(float));
 
-        // 1. Pre-attention RMSNorm - clean tensor interface
-        auto *activation_tensor = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
-        VALIDATE_POINTER(activation_tensor, "activation tensor for RMSNorm");
+        // 1. Pre-attention RMSNorm + INT8 Quantization (fused for efficiency)
+        // Use FusedRMSNormQuantize to eliminate redundant FP32→INT8 quantization in GEMM
 
-        VALIDATE_OP(activation_tensor->applyRMSNorm(
-                        layer.attn_norm->data(), effective_seq_len, d_model_,
-                        1e-6f, mpi_ctx_.get(), attn_device),
-                    "Attention norm");
-        VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_attn_norm");
+        // Check if FusedRMSNormQuantize is available and INT8 buffers allocated
+        bool use_fused_quantize = (buffers.normalized_int8 != nullptr) &&
+                                  (!buffers.normalized_scales.empty());
+
+        if (use_fused_quantize)
+        {
+            // Fused path: RMSNorm + INT8 quantization in single kernel
+            // Use kernel from INT8 output tensor (which provides FusedRMSNormQuantize)
+            auto *int8_activation = dynamic_cast<IActivationTensor *>(buffers.normalized_int8.get());
+            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for fused RMSNorm");
+
+            auto rmsnorm_kernel = int8_activation->createRMSNorm();
+            VALIDATE_POINTER(rmsnorm_kernel, "Fused RMSNorm kernel");
+
+            // CRITICAL: Process ALL batch rows, not just effective_seq_len
+            const int total_rows = batch_size_ * padded_seq_len_;
+
+            // Get INT8 buffer directly (don't use dangerous mutable_data() cast)
+            auto *int8_tensor_ptr = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            VALIDATE_POINTER(int8_tensor_ptr, "INT8 tensor for quantized output");
+
+            VALIDATE_OP(rmsnorm_kernel->execute(
+                            buffers.residual->data(),             // input (FP32)
+                            layer.attn_norm->data(),              // weight
+                            int8_tensor_ptr->mutable_int8_data(), // output (INT8)
+                            buffers.normalized_scales.data(),     // scales
+                            total_rows, d_model_,
+                            1e-6f, mpi_ctx_.get(), attn_device),
+                        "Attention norm (fused INT8)");
+            VALIDATE_TENSOR_BUFFER(buffers.normalized_int8,
+                                   TensorSpec({static_cast<size_t>(effective_seq_len),
+                                               static_cast<size_t>(d_model_)},
+                                              "normalized_int8"),
+                                   "after_fused_attn_norm_quantize");
+
+            // Register per-row scales with INT8 tensor (critical for correct dequantization)
+            auto *int8_tensor = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            if (int8_tensor)
+            {
+                int8_tensor->set_row_scales(buffers.normalized_scales.data(), total_rows);
+
+                // Debug: Verify scale sanity
+                float min_scale = 1e9f, max_scale = -1e9f;
+                for (int r = 0; r < total_rows; ++r)
+                {
+                    min_scale = std::min(min_scale, buffers.normalized_scales[r]);
+                    max_scale = std::max(max_scale, buffers.normalized_scales[r]);
+                }
+                LOG_DEBUG("[FusedQuantize] Attn norm L" << layer_idx
+                                                        << " scales: min=" << min_scale << " max=" << max_scale
+                                                        << " total_rows=" << total_rows << " effective_seq_len=" << effective_seq_len);
+            }
+
+            // Capture INT8 normalized output (convert to FP32 for snapshot compatibility)
+            // CRITICAL FIX: Dequantize only effective_seq_len rows (not total_rows)
+            // BUG: Previously used total_rows, which accessed uninitialized scales beyond effective_seq_len,
+            //      causing garbage in normalized_hidden that propagated through QKV projections
+            auto *int8_tensor_data = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            if (int8_tensor_data)
+            {
+                const int8_t *int8_data = int8_tensor_data->int8_data();
+                for (int r = 0; r < effective_seq_len; ++r) // ← FIX: Use effective_seq_len
+                {
+                    const float row_scale = buffers.normalized_scales[r];
+                    for (int c = 0; c < d_model_; ++c)
+                    {
+                        const size_t idx = r * d_model_ + c;
+                        normalized_hidden->mutable_data()[idx] =
+                            static_cast<float>(int8_data[idx]) * row_scale;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Unfused path (fallback): Separate RMSNorm + implicit quantization in GEMM
+            auto *fp32_activation = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
+            VALIDATE_POINTER(fp32_activation, "FP32 activation tensor for RMSNorm");
+
+            auto rmsnorm_kernel = fp32_activation->createRMSNorm();
+            VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
+
+            VALIDATE_OP(rmsnorm_kernel->apply(
+                            buffers.residual->data(),          // input
+                            layer.attn_norm->data(),           // weight
+                            normalized_hidden->mutable_data(), // output
+                            effective_seq_len, d_model_,
+                            1e-6f, // epsilon
+                            false, // normalize_gamma
+                            mpi_ctx_.get(), attn_device),
+                        "Attention norm");
+            VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_attn_norm");
+        }
 
         // Capture attention norm output (use view to get only valid data, not entire buffer)
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_NORM",
                               normalized_hidden, effective_seq_len, d_model_);
+
+        // DEBUG: Track divergence after attention norm
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *norm_data = normalized_hidden->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After ATTN_NORM, Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << norm_data[seq1_offset + i]);
+            }
+        }
 
         // 2. Q/K/V projections (use device-appropriate buffers)
         VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
         VALIDATE_KERNEL(k_gemm, layer.wk->createGemm(), "K GEMM kernel");
         VALIDATE_KERNEL(v_gemm, layer.wv->createGemm(), "V GEMM kernel");
 
-        // Q = hidden @ wq^T
-        VALIDATE_OP(q_gemm->multiply_activations(
-                        normalized_hidden->data(), nullptr, buffers.Q->mutable_data(),
-                        effective_seq_len, n_heads_ * head_dim_, d_model_,
-                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                    "Q projection");
+        // Q = hidden @ wq^T (use typed activations if fused quantization was used)
+        if (use_fused_quantize)
+        {
+            // INT8 path: Direct consumption of pre-quantized activations
+            VALIDATE_OP(q_gemm->multiply_typed_activations(
+                            buffers.normalized_int8->data(), TensorFormat::INT8,
+                            buffers.normalized_scales.data(),
+                            buffers.Q->mutable_data(),
+                            effective_seq_len, n_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "Q projection (INT8)");
+        }
+        else
+        {
+            // FP32 path: Standard GEMM with implicit quantization
+            VALIDATE_OP(q_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.Q->mutable_data(),
+                            effective_seq_len, n_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "Q projection");
+        }
         VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
 
         // Capture Q projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_PROJECTION", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
 
-        // K = hidden @ wk^T
-        VALIDATE_OP(k_gemm->multiply_activations(
-                        normalized_hidden->data(), nullptr, buffers.K->mutable_data(),
-                        effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                    "K projection");
+        // DEBUG: Track Q projection output
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *q_data = buffers.Q->data();
+            size_t seq1_offset = 4 * n_heads_ * head_dim_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After Q_PROJ, Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << q_data[seq1_offset + i]);
+            }
+        }
+
+        // K = hidden @ wk^T (use typed activations if fused quantization was used)
+        if (use_fused_quantize)
+        {
+            VALIDATE_OP(k_gemm->multiply_typed_activations(
+                            buffers.normalized_int8->data(), TensorFormat::INT8,
+                            buffers.normalized_scales.data(),
+                            buffers.K->mutable_data(),
+                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "K projection (INT8)");
+        }
+        else
+        {
+            VALIDATE_OP(k_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.K->mutable_data(),
+                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "K projection");
+        }
         VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
 
         // Capture K projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_K_PROJECTION", buffers.K, effective_seq_len, n_kv_heads_ * head_dim_);
 
-        // V = hidden @ wv^T
-        VALIDATE_OP(v_gemm->multiply_activations(
-                        normalized_hidden->data(), nullptr, buffers.V->mutable_data(),
-                        effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                        true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                    "V projection");
+        // V = hidden @ wv^T (use typed activations if fused quantization was used)
+        if (use_fused_quantize)
+        {
+            VALIDATE_OP(v_gemm->multiply_typed_activations(
+                            buffers.normalized_int8->data(), TensorFormat::INT8,
+                            buffers.normalized_scales.data(),
+                            buffers.V->mutable_data(),
+                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "V projection (INT8)");
+        }
+        else
+        {
+            VALIDATE_OP(v_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.V->mutable_data(),
+                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "V projection");
+        }
         VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
 
         // Capture V projection
@@ -559,6 +762,26 @@ namespace llaminar2
         // DEBUG: Log position IDs for first layer
         if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
         {
+            if (debug_batch_env)
+            {
+                LOG_ERROR("[RoPE Layer " << layer_idx << "] Position IDs:");
+                for (int b = 0; b < batch_size_; ++b)
+                {
+                    std::stringstream ss;
+                    ss << "  Batch " << b << ": [";
+                    for (int i = 0; i < std::min(6, padded_seq_len_); ++i)
+                    {
+                        ss << position_ids[b * padded_seq_len_ + i];
+                        if (i < std::min(6, padded_seq_len_) - 1)
+                            ss << ", ";
+                    }
+                    if (padded_seq_len_ > 6)
+                        ss << ", ...";
+                    ss << "]";
+                    LOG_ERROR(ss.str());
+                }
+            }
+
             if (batch_size_ == 1)
             {
                 if (position_ids.size() >= 2)
@@ -647,6 +870,18 @@ namespace llaminar2
         // Capture attention context (before output projection)
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_CONTEXT", buffers.attn_output, effective_seq_len, n_heads_ * head_dim_);
 
+        // DEBUG: Track attention output (after attention mechanism, before output projection)
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *attn_data = buffers.attn_output->data();
+            size_t seq1_offset = 4 * n_heads_ * head_dim_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After ATTENTION (before output proj), Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << attn_data[seq1_offset + i]);
+            }
+        }
+
         // 5. Output projection (reuse attn_proj buffer)
         VALIDATE_KERNEL(o_gemm, layer.wo->createGemm(), "output GEMM kernel");
         VALIDATE_OP(o_gemm->multiply_activations(
@@ -661,7 +896,9 @@ namespace llaminar2
 
         // 6. Residual connection - write back to current_hidden_
         // Note: If multi-device, result stays on attn_device and is stored in current_hidden_
-        for (size_t i = 0; i < effective_seq_len * d_model_; ++i)
+        // CRITICAL: Process all batch sequences, not just effective_seq_len
+        const size_t residual_elements = batch_size_ * padded_seq_len_ * d_model_;
+        for (size_t i = 0; i < residual_elements; ++i)
         {
             current_hidden_->mutable_data()[i] = buffers.residual->data()[i] + buffers.attn_proj->data()[i];
         }
@@ -677,11 +914,25 @@ namespace llaminar2
         // Capture attention residual output
         CAPTURE_SNAPSHOT("layer" + std::to_string(layer_idx) + "_ATTENTION_RESIDUAL", current_hidden_.get());
 
+        // DEBUG: Track after attention residual connection
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *residual_data = current_hidden_->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After ATTN_RESIDUAL, Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << residual_data[seq1_offset + i]);
+            }
+        }
+
         return true;
     }
 
     bool Qwen2Pipeline::ffn_block(const LayerWeights &layer, int layer_idx, int effective_seq_len)
     {
+        static const bool debug_batch_env = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
+
         // Phase 4.3: Determine execution device based on weight placement
         int ffn_device = placement_map_ ? getWeightDevice("ffn_gate", -1) : device_idx_;
 
@@ -715,29 +966,140 @@ namespace llaminar2
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     effective_seq_len * d_model_ * sizeof(float));
 
-        // 1. Pre-FFN RMSNorm - clean tensor interface
-        auto *activation_tensor_norm = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
-        VALIDATE_POINTER(activation_tensor_norm, "activation tensor for FFN RMSNorm");
+        // 1. Pre-FFN RMSNorm + INT8 Quantization (fused for efficiency)
 
-        VALIDATE_OP(activation_tensor_norm->applyRMSNorm(
-                        layer.ffn_norm->data(), effective_seq_len, d_model_,
-                        1e-6f, mpi_ctx_.get(), ffn_device),
-                    "FFN norm");
-        VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_ffn_norm");
+        // Check if FusedRMSNormQuantize is available and INT8 buffers allocated
+        bool use_fused_quantize = (buffers.normalized_int8 != nullptr) &&
+                                  (!buffers.normalized_scales.empty());
+
+        if (use_fused_quantize)
+        {
+            // Fused path: RMSNorm + INT8 quantization in single kernel
+            // Use kernel from INT8 output tensor (which provides FusedRMSNormQuantize)
+            auto *int8_activation = dynamic_cast<IActivationTensor *>(buffers.normalized_int8.get());
+            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for fused FFN RMSNorm");
+
+            auto rmsnorm_kernel = int8_activation->createRMSNorm();
+            VALIDATE_POINTER(rmsnorm_kernel, "Fused RMSNorm kernel");
+
+            // CRITICAL: Process ALL batch rows, not just effective_seq_len
+            const int total_rows = batch_size_ * padded_seq_len_;
+
+            // Get INT8 buffer directly (don't use dangerous mutable_data() cast)
+            auto *int8_tensor_ptr = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            VALIDATE_POINTER(int8_tensor_ptr, "INT8 tensor for quantized output");
+
+            VALIDATE_OP(rmsnorm_kernel->execute(
+                            buffers.residual->data(),             // input (FP32)
+                            layer.ffn_norm->data(),               // weight
+                            int8_tensor_ptr->mutable_int8_data(), // output (INT8)
+                            buffers.normalized_scales.data(),     // scales
+                            total_rows, d_model_,
+                            1e-6f, mpi_ctx_.get(), ffn_device),
+                        "FFN norm (fused INT8)");
+            VALIDATE_TENSOR_BUFFER(buffers.normalized_int8,
+                                   TensorSpec({static_cast<size_t>(effective_seq_len),
+                                               static_cast<size_t>(d_model_)},
+                                              "normalized_int8"),
+                                   "after_fused_ffn_norm_quantize");
+
+            // Register per-row scales with INT8 tensor (critical for correct dequantization)
+            auto *int8_tensor = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            if (int8_tensor)
+            {
+                int8_tensor->set_row_scales(buffers.normalized_scales.data(), total_rows);
+
+                // Debug: Verify scale sanity
+                float min_scale = 1e9f, max_scale = -1e9f;
+                for (int r = 0; r < total_rows; ++r)
+                {
+                    min_scale = std::min(min_scale, buffers.normalized_scales[r]);
+                    max_scale = std::max(max_scale, buffers.normalized_scales[r]);
+                }
+                LOG_DEBUG("[FusedQuantize] FFN norm L" << layer_idx
+                                                       << " scales: min=" << min_scale << " max=" << max_scale
+                                                       << " total_rows=" << total_rows << " effective_seq_len=" << effective_seq_len);
+            }
+
+            // Capture INT8 normalized output (convert to FP32 for snapshot compatibility)
+            // CRITICAL FIX: Dequantize only effective_seq_len rows (not total_rows)
+            // BUG: Previously used total_rows, which accessed uninitialized scales beyond effective_seq_len,
+            //      causing garbage in normalized_hidden that propagated through FFN projections
+            auto *int8_tensor_data = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            if (int8_tensor_data)
+            {
+                const int8_t *int8_data = int8_tensor_data->int8_data();
+                for (int r = 0; r < effective_seq_len; ++r) // ← FIX: Use effective_seq_len
+                {
+                    const float row_scale = buffers.normalized_scales[r];
+                    for (int c = 0; c < d_model_; ++c)
+                    {
+                        const size_t idx = r * d_model_ + c;
+                        normalized_hidden->mutable_data()[idx] =
+                            static_cast<float>(int8_data[idx]) * row_scale;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Unfused path (fallback): Separate RMSNorm + implicit quantization in GEMM
+            auto *fp32_activation = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
+            VALIDATE_POINTER(fp32_activation, "FP32 activation tensor for FFN RMSNorm");
+
+            auto rmsnorm_kernel = fp32_activation->createRMSNorm();
+            VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
+
+            VALIDATE_OP(rmsnorm_kernel->apply(
+                            buffers.residual->data(),          // input
+                            layer.ffn_norm->data(),            // weight
+                            normalized_hidden->mutable_data(), // output
+                            effective_seq_len, d_model_,
+                            1e-6f, // epsilon
+                            false, // normalize_gamma
+                            mpi_ctx_.get(), ffn_device),
+                        "FFN norm");
+            VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_ffn_norm");
+        }
 
         // Capture FFN norm output
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_NORM", normalized_hidden, effective_seq_len, d_model_);
+
+        // DEBUG: Track FFN norm output
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *norm_data = normalized_hidden->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After FFN_NORM, Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << norm_data[seq1_offset + i]);
+            }
+        }
 
         // 2. Gate and up projections (use device-appropriate buffers)
         VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");
         VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
 
-        // gate = hidden @ gate_proj^T
-        VALIDATE_OP(gate_gemm->multiply_activations(
-                        normalized_hidden->data(), nullptr, buffers.gate->mutable_data(),
-                        effective_seq_len, d_ff_, d_model_,
-                        true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
-                    "Gate projection");
+        // gate = hidden @ gate_proj^T (use typed activations if fused quantization was used)
+        if (use_fused_quantize)
+        {
+            VALIDATE_OP(gate_gemm->multiply_typed_activations(
+                            buffers.normalized_int8->data(), TensorFormat::INT8,
+                            buffers.normalized_scales.data(),
+                            buffers.gate->mutable_data(),
+                            effective_seq_len, d_ff_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                        "Gate projection (INT8)");
+        }
+        else
+        {
+            VALIDATE_OP(gate_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.gate->mutable_data(),
+                            effective_seq_len, d_ff_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                        "Gate projection");
+        }
         VALIDATE_TENSOR_BUFFER(buffers.gate, spec_ffn_gate_up(effective_seq_len), "after_gate_proj");
 
         // Capture gate projection
@@ -747,12 +1109,25 @@ namespace llaminar2
         CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_GATE").c_str(),
                                buffers.gate->data(), effective_seq_len * d_ff_);
 
-        // up = hidden @ up_proj^T
-        VALIDATE_OP(up_gemm->multiply_activations(
-                        normalized_hidden->data(), nullptr, buffers.up->mutable_data(),
-                        effective_seq_len, d_ff_, d_model_,
-                        true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
-                    "Up projection");
+        // up = hidden @ up_proj^T (use typed activations if fused quantization was used)
+        if (use_fused_quantize)
+        {
+            VALIDATE_OP(up_gemm->multiply_typed_activations(
+                            buffers.normalized_int8->data(), TensorFormat::INT8,
+                            buffers.normalized_scales.data(),
+                            buffers.up->mutable_data(),
+                            effective_seq_len, d_ff_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                        "Up projection (INT8)");
+        }
+        else
+        {
+            VALIDATE_OP(up_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.up->mutable_data(),
+                            effective_seq_len, d_ff_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
+                        "Up projection");
+        }
         VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_gate_up(effective_seq_len), "after_up_proj");
 
         // Capture up projection
@@ -792,12 +1167,26 @@ namespace llaminar2
         // Capture down projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_DOWN", buffers.ffn_output, effective_seq_len, d_model_);
 
+        // DEBUG: Track FFN down projection output
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *down_data = buffers.ffn_output->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After FFN_DOWN, Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << down_data[seq1_offset + i]);
+            }
+        }
+
         // Health check: FFN output before residual (final dequantized output from INT8 path)
         CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_DOWN").c_str(),
                                buffers.ffn_output->data(), effective_seq_len * d_model_);
 
         // 5. Residual connection - write back to current_hidden_
-        for (size_t i = 0; i < effective_seq_len * d_model_; ++i)
+        // CRITICAL: Process all batch sequences, not just effective_seq_len
+        const size_t residual_elements = batch_size_ * padded_seq_len_ * d_model_;
+        for (size_t i = 0; i < residual_elements; ++i)
         {
             current_hidden_->mutable_data()[i] = buffers.residual->data()[i] + buffers.ffn_output->data()[i];
         }
@@ -812,6 +1201,32 @@ namespace llaminar2
 
         // Capture FFN residual output
         CAPTURE_SNAPSHOT("layer" + std::to_string(layer_idx) + "_FFN_RESIDUAL", current_hidden_.get());
+
+        // DEBUG: Track after FFN residual connection (end of layer)
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *residual_data = current_hidden_->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After FFN_RESIDUAL (END OF LAYER), Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << residual_data[seq1_offset + i]);
+            }
+            LOG_ERROR("[Layer " << layer_idx << "] ========================================");
+        }
+
+        // DEBUG: Track after FFN residual connection (end of layer)
+        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
+        {
+            const float *residual_data = current_hidden_->data();
+            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
+            LOG_ERROR("[Layer " << layer_idx << "] After FFN_RESIDUAL (END OF LAYER), Seq1 token0 [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << residual_data[seq1_offset + i]);
+            }
+            LOG_ERROR("[Layer " << layer_idx << "] ========================================");
+        }
 
         return true;
     }
@@ -942,12 +1357,20 @@ namespace llaminar2
         const float *embed_data = embed_table->data();
         float *output_data = output->mutable_data();
 
+        static const bool debug_batch = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
+
         // Process each sequence in the batch
         int global_idx = 0;
         for (int b = 0; b < batch_size_; ++b)
         {
             const auto &tokens = token_batches[b];
             int seq_len = tokens.size();
+
+            if (debug_batch && mpi_ctx_->rank() == 0)
+            {
+                LOG_ERROR("[embedding_batch] Batch " << b << ": seq_len=" << seq_len
+                                                     << ", padded_seq_len=" << padded_seq_len_);
+            }
 
             // Lookup embeddings for this sequence
             for (int i = 0; i < seq_len; ++i)
@@ -958,6 +1381,14 @@ namespace llaminar2
                 std::memcpy(output_data + global_idx * d_model_,
                             embed_data + token_id * d_model_,
                             d_model_ * sizeof(float));
+
+                if (debug_batch && mpi_ctx_->rank() == 0 && i < 2)
+                {
+                    LOG_ERROR("[embedding_batch] Batch " << b << ", token " << i
+                                                         << " (id=" << token_id << "): global_idx=" << global_idx
+                                                         << ", first_value=" << output_data[global_idx * d_model_]);
+                }
+
                 global_idx++;
             }
 
@@ -965,8 +1396,20 @@ namespace llaminar2
             for (int i = seq_len; i < padded_seq_len_; ++i)
             {
                 std::memset(output_data + global_idx * d_model_, 0, d_model_ * sizeof(float));
+
+                if (debug_batch && mpi_ctx_->rank() == 0 && i == seq_len)
+                {
+                    LOG_ERROR("[embedding_batch] Batch " << b << ", padding starts at global_idx=" << global_idx);
+                }
+
                 global_idx++;
             }
+        }
+
+        if (debug_batch && mpi_ctx_->rank() == 0)
+        {
+            LOG_ERROR("[embedding_batch] Total positions filled: " << global_idx
+                                                                   << " (expected: " << (batch_size_ * padded_seq_len_) << ")");
         }
 
         return true;
@@ -1003,6 +1446,29 @@ namespace llaminar2
 
         // Capture LM head logits
         CAPTURE_SNAPSHOT("LM_HEAD", logits_buffer_.get());
+
+        // DEBUG: Track LM head output (logits)
+        static const bool debug_batch_env = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
+        if (debug_batch_env && batch_size_ == 2)
+        {
+            const float *logits_data = logits_buffer_->data();
+
+            // Show position 4 (first token of Seq1)
+            size_t pos4_offset = 4 * vocab_size_;
+            LOG_ERROR("[LM_HEAD] Position 4 (Seq1 token0) logits [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << logits_data[pos4_offset + i]);
+            }
+
+            // Show position 5 (second token of Seq1)
+            size_t pos5_offset = 5 * vocab_size_;
+            LOG_ERROR("[LM_HEAD] Position 5 (Seq1 token1) logits [0:10]:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_ERROR("  [" << i << "] = " << logits_data[pos5_offset + i]);
+            }
+        }
 
         return true;
     }

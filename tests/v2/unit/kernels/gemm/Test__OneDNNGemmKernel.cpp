@@ -4,11 +4,14 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <random>
 
 #ifdef HAVE_ONEDNN
 
 #include "oneapi/dnnl/dnnl.hpp"
 #include "kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "tensors/IQQuantTables.h"
+#include "tensors/FP16Utils.h"
 
 using llaminar2::FP32Tensor;
 using llaminar2::gemm_v4::OneDNNGemmKernel;
@@ -711,6 +714,141 @@ TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxWithMaskMatchesReference)
     for (int i = 0; i < m * n; ++i)
     {
         EXPECT_NEAR(fused_output[i], reference[i], 1e-5f) << "Mismatch at idx " << i;
+    }
+}
+
+/**
+ * @brief Test multiply_typed_activations with INT8 activations
+ *
+ * Verifies that pre-quantized INT8 activations from FusedRMSNormQuantize
+ * can be consumed directly by OneDNNGemmKernel without re-quantization.
+ */
+TEST(Test__OneDNNGemmKernel, TypedActivationsINT8)
+{
+    using llaminar2::fp32_to_fp16;
+    using llaminar2::IQ4_NLBlock;
+    using llaminar2::IQ4_NLTensor;
+    using llaminar2::TensorFormat;
+
+    // Small test case: 4 tokens × 32 hidden_dim, weight [64, 32]
+    const int m = 4;  // batch size (tokens)
+    const int k = 32; // hidden dimension (1 IQ4_NL block)
+    const int n = 64; // output dimension (2 IQ4_NL blocks)
+
+    // Create mock IQ4_NL weight tensor [n, k] = [64, 32]
+    std::vector<size_t> shape = {static_cast<size_t>(n), static_cast<size_t>(k)};
+    size_t blocks_per_row = (k + 31) / 32;            // 1 block per row
+    size_t total_blocks = n * blocks_per_row;         // 64 blocks
+    std::vector<uint8_t> raw_data(total_blocks * 18); // 64 blocks × 18 bytes
+
+    // Initialize blocks with simple values
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+    std::uniform_int_distribution<uint8_t> index_dist(0, 15);
+
+    for (size_t b = 0; b < total_blocks; ++b)
+    {
+        IQ4_NLBlock *block = reinterpret_cast<IQ4_NLBlock *>(raw_data.data() + b * 18);
+        block->d = fp32_to_fp16(scale_dist(rng));
+        for (int i = 0; i < 16; ++i)
+        {
+            uint8_t low = index_dist(rng);
+            uint8_t high = index_dist(rng);
+            block->qs[i] = (high << 4) | low;
+        }
+    }
+
+    auto weight_tensor = std::make_unique<IQ4_NLTensor>(shape, raw_data);
+    ASSERT_EQ(weight_tensor->shape()[0], n);
+    ASSERT_EQ(weight_tensor->shape()[1], k);
+
+    // Create FP32 activations (simulate FusedRMSNormQuantize input)
+    std::vector<float> fp32_activations(m * k);
+    for (int i = 0; i < m * k; ++i)
+    {
+        fp32_activations[i] = static_cast<float>(i % 10) * 0.1f - 0.5f; // Range [-0.5, 0.4]
+    }
+
+    // Quantize to INT8 per-row (simulate FusedRMSNormQuantize output)
+    std::vector<int8_t> int8_activations(m * k);
+    std::vector<float> row_scales(m);
+
+    for (int row = 0; row < m; ++row)
+    {
+        const float *fp32_row = fp32_activations.data() + row * k;
+        int8_t *int8_row = int8_activations.data() + row * k;
+
+        // Find max absolute value for this row
+        float max_abs = 0.0f;
+        for (int col = 0; col < k; ++col)
+        {
+            max_abs = std::max(max_abs, std::abs(fp32_row[col]));
+        }
+
+        // Compute scale (symmetric quantization)
+        const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        row_scales[row] = scale;
+
+        // Quantize
+        for (int col = 0; col < k; ++col)
+        {
+            const float quantized = fp32_row[col] / scale;
+            int8_row[col] = static_cast<int8_t>(std::round(std::clamp(quantized, -127.0f, 127.0f)));
+        }
+    }
+
+    // Create OneDNN GEMM kernel bound to weight tensor
+    OneDNNGemmKernel kernel(weight_tensor.get());
+
+    // Execute GEMM with typed INT8 activations
+    std::vector<float> output(m * n);
+    ASSERT_TRUE(kernel.multiply_typed_activations(
+        int8_activations.data(),
+        TensorFormat::INT8,
+        row_scales.data(),
+        output.data(),
+        m, n, k,
+        true, // transpose_B
+        1.0f, // alpha
+        0.0f, // beta
+        nullptr,
+        -1))
+        << "multiply_typed_activations failed for INT8 path";
+
+    // Verify output is non-zero and reasonable
+    float sum = 0.0f;
+    for (int i = 0; i < m * n; ++i)
+    {
+        sum += std::abs(output[i]);
+    }
+    EXPECT_GT(sum, 0.0f) << "Output should be non-zero";
+
+    // Compare with FP32 reference path (via multiply_activations)
+    std::vector<float> reference_output(m * n);
+    ASSERT_TRUE(kernel.multiply_activations(
+        fp32_activations.data(),
+        nullptr, // Use bound weight tensor
+        reference_output.data(),
+        m, n, k,
+        true,
+        1.0f,
+        0.0f,
+        nullptr,
+        -1))
+        << "multiply_activations failed for FP32 reference";
+
+    // Allow higher tolerance due to INT8 quantization error
+    // FP32→INT8→FP32 round-trip introduces ~1-2% relative error
+    for (int i = 0; i < m * n; ++i)
+    {
+        const float abs_error = std::abs(output[i] - reference_output[i]);
+        const float rel_error = std::abs(reference_output[i]) > 1e-5f
+                                    ? abs_error / std::abs(reference_output[i])
+                                    : 0.0f;
+
+        // INT8 quantization: expect <5% relative error on most elements
+        EXPECT_LT(rel_error, 0.05f) << "Relative error too high at idx " << i
+                                    << " (INT8: " << output[i] << ", FP32: " << reference_output[i] << ")";
     }
 }
 

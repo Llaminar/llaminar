@@ -297,6 +297,52 @@ TEST_F(Test__PipelineFactory, Qwen2AutoRegistered)
 }
 
 // =============================================================================
+// Batch Size Regression Test
+// =============================================================================
+
+TEST_F(Test__PipelineFactory, BatchSizeParameterRespected)
+{
+    // Regression test: Verify factory respects batch_size from PipelineConfig
+    // Bug: Factory was hardcoding batch_size=1 regardless of config.batch_size
+
+    // Register a mock architecture that captures batch_size
+    int captured_batch_size = -1;
+    auto creator = [&captured_batch_size](
+                       std::shared_ptr<ModelContext> model_ctx,
+                       std::shared_ptr<MPIContext> mpi_ctx,
+                       int device_idx,
+                       const PipelineConfig &config) -> std::unique_ptr<PipelineBase>
+    {
+        captured_batch_size = config.batch_size;
+        return std::make_unique<MockPipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config);
+    };
+
+    PipelineFactory::instance().registerCreator("test_batch_size", creator);
+
+    // Create model context
+    auto model_ctx = ModelContext::createForTesting("test.gguf");
+
+    // Test various batch sizes
+    std::vector<int> test_batch_sizes = {1, 2, 4, 8, 16};
+
+    for (int expected_batch_size : test_batch_sizes)
+    {
+        PipelineConfig config;
+        config.batch_size = expected_batch_size;
+
+        captured_batch_size = -1; // Reset
+
+        auto pipeline = PipelineFactory::instance().create(
+            "test_batch_size", model_ctx, nullptr, -1, config);
+
+        ASSERT_NE(pipeline, nullptr) << "Failed to create pipeline with batch_size=" << expected_batch_size;
+        EXPECT_EQ(captured_batch_size, expected_batch_size)
+            << "Factory did not pass batch_size correctly (expected "
+            << expected_batch_size << ", got " << captured_batch_size << ")";
+    }
+}
+
+// =============================================================================
 // Integration Test
 // =============================================================================
 

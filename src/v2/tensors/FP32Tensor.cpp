@@ -570,32 +570,6 @@ namespace llaminar2
         return pack;
     }
 
-    bool FP32Tensor::applyRMSNorm(
-        const float *gamma,
-        int seq_len,
-        int d_model,
-        float eps,
-        const MPIContext *mpi_ctx,
-        int device_idx)
-    {
-        auto kernel = createRMSNorm();
-        if (!kernel)
-        {
-            LOG_ERROR("[FP32Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        // FP32 path: apply() with FP32 buffers (in-place)
-        return kernel->apply(
-            this->data(),
-            gamma,
-            this->mutable_data(),
-            seq_len, d_model, eps,
-            false, // normalize_gamma
-            mpi_ctx,
-            device_idx);
-    }
-
     bool FP32Tensor::from_int32_with_scales(
         const int32_t *accum,
         int rows,

@@ -79,20 +79,22 @@ namespace llaminar2
         const float *logits() const override { return getLogits(0); } // Return logits for first sequence
 
         /**
+         * @brief Get output logits for a specific sequence in batch (FP32)
+         *
+         * Overrides PipelineBase to support batched inference.
+         *
+         * @param seq_idx Sequence index in batch (default=0)
+         * @return Logits tensor [padded_seq_len, vocab_size], or nullptr if forward() not called
+         */
+        const float *getLogits(int seq_idx = 0) const override;
+
+        /**
          * @brief Batch-first forward pass (primary interface)
          *
          * @param token_batches Vector of token sequences (batch_size sequences)
          * @return true if forward pass succeeded
          */
         bool forward_batch(const std::vector<std::vector<int>> &token_batches);
-
-        /**
-         * @brief Get output logits for E2E testing/validation
-         *
-         * @param seq_idx Sequence index in batch (default=0)
-         * @return Logits tensor [padded_seq_len, vocab_size], or nullptr if forward() not called
-         */
-        const float *getLogits(int seq_idx = 0) const;
 
         /**
          * @brief Get batch size

@@ -223,22 +223,6 @@ namespace llaminar2
         return std::make_unique<CpuAttentionKernelT<FP32Tensor>>();
     }
 
-    bool Q8_1Tensor::applyRMSNorm(
-        const float *gamma,
-        int seq_len,
-        int d_model,
-        float eps,
-        const MPIContext *mpi_ctx,
-        int device_idx)
-    {
-        // Q8_1 is intermediate format - dequantize, apply, requantize
-        // For now, throw error as this is inefficient
-        // User should convert to FP32 first
-        LOG_ERROR("[Q8_1Tensor::applyRMSNorm] In-place RMSNorm not supported for Q8_1");
-        LOG_ERROR("  Convert to FP32 first, apply RMSNorm, then quantize back to Q8_1");
-        return false;
-    }
-
     bool Q8_1Tensor::applyRoPE(
         float *K,
         const int *position_ids,

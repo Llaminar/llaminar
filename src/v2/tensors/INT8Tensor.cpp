@@ -7,6 +7,7 @@
 
 #include "Tensors.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/fused/FusedRMSNormQuantize.h"
 #include "../utils/Logger.h"
 // #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>
@@ -142,10 +143,53 @@ namespace llaminar2
             dequant_cache_.resize(total);
         }
 
-        // Dequantize: fp32 = int8 * scale
-        for (size_t i = 0; i < total; ++i)
+        // Dequantize with per-row scales if available, otherwise use global scale
+        if (!row_scales_cache_.empty())
         {
-            dequant_cache_[i] = static_cast<float>(host_int8_data_[i]) * scale_;
+            // Per-row quantization (used by FusedRMSNormQuantize)
+            // CRITICAL: Only dequantize rows for which we have scales (effective_seq_len)
+            // Buffer may be larger (effective_max), but only first N rows contain valid data
+            const size_t rows_to_dequantize = row_scales_cache_.size();
+            const size_t cols = shape_.size() > 1 ? shape_[1] : 1;
+
+            // Log warning if shape doesn't match scales (expected for batched execution)
+            if (rows_to_dequantize != shape_[0])
+            {
+                LOG_DEBUG("[INT8Tensor::data] Dequantizing " << rows_to_dequantize
+                                                             << " rows (have scales) out of " << shape_[0] << " total rows (buffer size)");
+            }
+
+            for (size_t r = 0; r < rows_to_dequantize; ++r)
+            {
+                const float row_scale = row_scales_cache_[r];
+                for (size_t c = 0; c < cols; ++c)
+                {
+                    const size_t idx = r * cols + c;
+                    dequant_cache_[idx] = static_cast<float>(host_int8_data_[idx]) * row_scale;
+                }
+            }
+
+            // Zero out remaining rows (if buffer is larger than data)
+            const size_t total_rows = shape_[0];
+            if (rows_to_dequantize < total_rows)
+            {
+                for (size_t r = rows_to_dequantize; r < total_rows; ++r)
+                {
+                    for (size_t c = 0; c < cols; ++c)
+                    {
+                        const size_t idx = r * cols + c;
+                        dequant_cache_[idx] = 0.0f;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Global scale (default path for weight tensors)
+            for (size_t i = 0; i < total; ++i)
+            {
+                dequant_cache_[i] = static_cast<float>(host_int8_data_[i]) * scale_;
+            }
         }
 
         return dequant_cache_.data();
@@ -153,8 +197,12 @@ namespace llaminar2
 
     float *INT8Tensor::mutable_data()
     {
-        LOG_ERROR("[INT8Tensor] mutable_data() not supported (read-only tensor)");
-        return nullptr;
+        // Invalidate dequant cache since we're allowing mutation
+        dequant_cache_.clear();
+
+        // Return pointer to INT8 buffer (reinterpreted as float* for interface compatibility)
+        // Callers must reinterpret_cast back to int8_t* for actual INT8 writes
+        return reinterpret_cast<float *>(host_int8_data_.data());
     }
 
     bool INT8Tensor::copyFrom(const TensorBase *src)
@@ -170,6 +218,135 @@ namespace llaminar2
         // This tensor serves as the weight tensor (B parameter) in INT8×INT8→INT8 operations
         LOG_ERROR("[INT8Tensor] createGemm() not yet implemented for new IntegerGemm system");
         return nullptr; // TODO: Integrate with IntegerGemmAdapter
+    }
+
+    std::unique_ptr<ITensorRMSNorm> INT8Tensor::createRMSNorm()
+    {
+        // INT8 tensors can't be normalized in-place (would lose quantization)
+        // Return FusedRMSNormQuantize kernel for INT8 activation quantization
+        return std::make_unique<FusedRMSNormQuantize>();
+    }
+
+    std::unique_ptr<ITensorRoPE> INT8Tensor::createRoPE()
+    {
+        // RoPE not applicable to INT8 activations (needs FP32 for trigonometric ops)
+        LOG_ERROR("[INT8Tensor] RoPE not supported on INT8 activations");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorAttention> INT8Tensor::createAttention()
+    {
+        // Attention operates on dequantized FP32 data
+        LOG_ERROR("[INT8Tensor] Attention not supported on INT8 activations");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorSwiGLU> INT8Tensor::createSwiGLU()
+    {
+        // SwiGLU operates on dequantized FP32 data
+        LOG_ERROR("[INT8Tensor] SwiGLU not supported on INT8 activations");
+        return nullptr;
+    }
+
+    std::unique_ptr<ITensorSoftmax> INT8Tensor::createSoftmax()
+    {
+        // Softmax operates on dequantized FP32 data
+        LOG_ERROR("[INT8Tensor] Softmax not supported on INT8 activations");
+        return nullptr;
+    }
+
+    ActivationPack INT8Tensor::to_int8_activation_pack(int rows, int cols) const
+    {
+        // INT8Tensor is already quantized - copy existing data to pack
+        ActivationPack pack;
+        pack.data.assign(host_int8_data_.begin(), host_int8_data_.end()); // Copy INT8 data
+        pack.row_scales.assign(rows, scale_);                             // Use per-tensor scale for all rows
+        pack.rows = rows;
+        pack.cols = cols;
+        return pack;
+    }
+
+    bool INT8Tensor::applyRoPE(
+        float *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        bool use_bf16,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        // RoPE requires floating-point operations - not supported on INT8
+        LOG_ERROR("[INT8Tensor] applyRoPE not supported on INT8 activations");
+        return false;
+    }
+
+    bool INT8Tensor::from_int32_with_scales(
+        const int32_t *accum,
+        int rows,
+        int cols,
+        const float *row_scales,
+        const float *col_scales,
+        const float *bias)
+    {
+        if (!accum)
+        {
+            LOG_ERROR("[INT8Tensor::from_int32_with_scales] accum buffer is null");
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[INT8Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
+            return false;
+        }
+        if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
+        {
+            LOG_ERROR("[INT8Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
+                                                                                      << ", " << shape_[1] << "] input=[" << rows << ", " << cols << "]");
+            return false;
+        }
+
+        // For INT8 output, requantize from INT32 accumulator
+        // The INT32 accumulator contains values in the range:
+        //   accum[i,j] = sum_k(A_int8[i,k] * B_int8[k,j])
+        // We need to scale this back to INT8 range: accum * row_scales[i] * col_scales[j]
+        // Then requantize to INT8 with a new per-tensor scale
+
+        // First pass: find max absolute value for global quantization
+        float max_abs = 0.0f;
+        for (int i = 0; i < rows; ++i)
+        {
+            const float row_scale = row_scales ? row_scales[i] : 1.0f;
+            for (int j = 0; j < cols; ++j)
+            {
+                const float col_scale = col_scales ? col_scales[j] : 1.0f;
+                const float bias_val = bias ? bias[j] : 0.0f;
+                float val = static_cast<float>(accum[i * cols + j]) * row_scale * col_scale + bias_val;
+                max_abs = std::max(max_abs, std::abs(val));
+            }
+        }
+
+        // Compute quantization scale
+        scale_ = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+
+        // Second pass: quantize to INT8
+        for (int i = 0; i < rows; ++i)
+        {
+            const float row_scale = row_scales ? row_scales[i] : 1.0f;
+            for (int j = 0; j < cols; ++j)
+            {
+                const float col_scale = col_scales ? col_scales[j] : 1.0f;
+                const float bias_val = bias ? bias[j] : 0.0f;
+                float val = static_cast<float>(accum[i * cols + j]) * row_scale * col_scale + bias_val;
+                int8_t quantized = static_cast<int8_t>(std::round(val / scale_));
+                host_int8_data_[i * cols + j] = quantized;
+            }
+        }
+
+        return true;
     }
 
     void INT8Tensor::to_fp32(float *dst) const

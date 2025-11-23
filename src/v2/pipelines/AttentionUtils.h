@@ -106,7 +106,8 @@ namespace llaminar2
                     bool can_attend = (i >= j); // Causal: can't attend to future
 
                     // Sliding window: also check distance
-                    if (window_size >= 0 && can_attend)
+                    // NOTE: window_size=0 treated same as -1 (no windowing)
+                    if (window_size > 0 && can_attend)
                     {
                         can_attend = (i - j < window_size);
                     }
@@ -186,7 +187,8 @@ namespace llaminar2
                                 if (pos_i >= pos_j)
                                 {
                                     // 4. Sliding window constraint (if enabled)
-                                    if (window_size < 0 || (pos_i - pos_j < window_size))
+                                    // NOTE: window_size=0 treated same as -1 (no windowing)
+                                    if (window_size <= 0 || (pos_i - pos_j < window_size))
                                     {
                                         can_attend = true;
                                     }
@@ -262,7 +264,8 @@ namespace llaminar2
                             {
                                 // 3. NO CAUSAL CONSTRAINT - can attend to any valid token (past or future)
                                 // 4. Sliding window constraint (if enabled)
-                                if (window_size < 0 || (std::abs(pos_i - pos_j) < window_size))
+                                // NOTE: window_size=0 treated same as -1 (no windowing)
+                                if (window_size <= 0 || (std::abs(pos_i - pos_j) < window_size))
                                 {
                                     can_attend = true;
                                 }
@@ -417,7 +420,8 @@ namespace llaminar2
                                 if (!causal || pos_j <= pos_i)
                                 {
                                     // 4. Sliding window constraint (if enabled)
-                                    if (window_size < 0 || (pos_i - pos_j < window_size))
+                                    // NOTE: window_size=0 treated same as -1 (no windowing)
+                                    if (window_size <= 0 || (pos_i - pos_j < window_size))
                                     {
                                         can_attend = true;
                                     }

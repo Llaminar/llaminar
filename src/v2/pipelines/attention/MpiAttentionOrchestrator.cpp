@@ -360,7 +360,7 @@ namespace llaminar2
                 config.workspace_scores.get(),
                 config.workspace_qkv_buffer.get(),
                 config.workspace_context.get(),
-                mask_tensor,
+                needs_mask ? mask_tensor : nullptr,
                 (config.precision == ActivationPrecision::BF16),
                 config.mpi_ctx.get(),
                 -1);
@@ -382,7 +382,7 @@ namespace llaminar2
                 config.workspace_scores.get(),
                 config.workspace_qkv_buffer.get(),
                 config.workspace_context.get(),
-                mask_tensor,
+                needs_mask ? mask_tensor : nullptr,
                 (config.precision == ActivationPrecision::BF16),
                 config.mpi_ctx.get(),
                 -1);
@@ -420,6 +420,16 @@ namespace llaminar2
             const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
             const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
 
+            // Debug: log first element of local_output for each batch before gathering
+            if (rank == 0)
+            {
+                for (int b = 0; b < effective_batch_size; ++b)
+                {
+                    const float *batch_out = local_output.data() + b * local_batch_stride;
+                    LOG_DEBUG("[MpiAttentionOrchestrator] local_output batch " << b << " first element: " << batch_out[0]);
+                }
+            }
+
 #pragma omp parallel for collapse(3) if (effective_batch_size * seq_len * local_n_heads > 64)
             for (int b = 0; b < effective_batch_size; ++b)
             {
@@ -436,6 +446,16 @@ namespace llaminar2
                             dst[d] = src[d];
                         }
                     }
+                }
+            }
+
+            // Debug: log send_buffer first element for each batch after gathering
+            if (rank == 0)
+            {
+                for (int b = 0; b < effective_batch_size; ++b)
+                {
+                    const float *batch_send = send_buffer.data() + b * batch_stride;
+                    LOG_DEBUG("[MpiAttentionOrchestrator] send_buffer batch " << b << " first element: " << batch_send[0]);
                 }
             }
         }
@@ -519,6 +539,19 @@ namespace llaminar2
         {
             MPIStager::toDevice(host_output_staging, output);
             LOG_DEBUG("[MPI TP] Rank " << rank << ": Staged result back to GPU");
+        }
+
+        // Debug: log first element of output for each batch after Allreduce
+        if (rank == 0 && effective_batch_size > 1)
+        {
+            const float *result_buffer = requires_staging ? host_output_staging.data() : output_data;
+            const size_t seq_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
+            const size_t batch_stride = static_cast<size_t>(seq_len) * seq_head_stride;
+            for (int b = 0; b < effective_batch_size; ++b)
+            {
+                const float *batch_out = result_buffer + b * batch_stride;
+                LOG_DEBUG("[MpiAttentionOrchestrator] AFTER Allreduce batch " << b << " first element: " << batch_out[0]);
+            }
         }
 
         // Bounds-safe debug logging after allreduce (only construct string if logging enabled)

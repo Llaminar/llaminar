@@ -184,32 +184,6 @@ namespace llaminar2
         virtual ActivationPack to_int8_activation_pack(int rows, int cols) const = 0;
 
         /**
-         * @brief Apply RMSNorm in-place (native precision, no conversion overhead)
-         *
-         * Each tensor type implements this using its native precision method:
-         * - FP32Tensor: apply() with FP32 buffers
-         * - BF16Tensor: apply_bf16() with BF16 buffers
-         * - FP16Tensor: apply_fp16() with FP16 buffers
-         * - INT32Tensor: apply_int32_to_int8() with INT32→INT8 requantization
-         *
-         * @param gamma RMSNorm scale parameters [d_model] (always FP32)
-         * @param seq_len Sequence length
-         * @param d_model Model dimension
-         * @param eps Epsilon for numerical stability
-         * @param mpi_ctx MPI context (optional)
-         * @param device_idx Device index for kernel execution
-         *
-         * @return true on success, false on failure
-         */
-        virtual bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
-
-        /**
          * @brief Apply rotary position embeddings in-place (native precision)
          *
          * Each tensor type implements this using its native precision method:
@@ -572,14 +546,6 @@ namespace llaminar2
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
-        bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
-
         bool applyRoPE(
             float *K,
             const int *position_ids,
@@ -740,14 +706,6 @@ namespace llaminar2
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
-
-        bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
 
         bool applyRoPE(
             float *K,
@@ -917,14 +875,6 @@ namespace llaminar2
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
 
-        bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
-
         bool applyRoPE(
             float *K,
             const int *position_ids,
@@ -1056,7 +1006,7 @@ namespace llaminar2
      *
      * **NOT implemented**: IActivationTensor (INT8Tensor represents weights, not activations)
      */
-    class INT8Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class INT8Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
     {
     public:
         explicit INT8Tensor(const std::vector<size_t> &shape);
@@ -1080,7 +1030,19 @@ namespace llaminar2
 
         bool copyFrom(const TensorBase *src) override;
 
+        // IActivationTensor interface - kernel factory methods
         std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+
+        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
+        bool applyRoPE(float *K, const int *position_ids, int seq_len,
+                       int n_heads, int n_kv_heads, int head_dim,
+                       float rope_theta = 10000.0f, bool use_bf16 = false,
+                       const MPIContext *mpi_ctx = nullptr, int device_idx = 0) override;
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -1597,14 +1559,6 @@ namespace llaminar2
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
-
-        bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
 
         bool applyRoPE(
             float *K,

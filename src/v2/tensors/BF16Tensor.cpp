@@ -643,30 +643,6 @@ namespace llaminar2
         return pack;
     }
 
-    bool BF16Tensor::applyRMSNorm(
-        const float *gamma,
-        int seq_len,
-        int d_model,
-        float eps,
-        const MPIContext *mpi_ctx,
-        int device_idx)
-    {
-        auto kernel = createRMSNorm();
-        if (!kernel)
-        {
-            LOG_ERROR("[BF16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
-            return false;
-        }
-
-        // BF16 path: apply_bf16() with BF16 buffers (in-place)
-        return kernel->apply_bf16(
-            this->bf16_data(),
-            gamma,
-            this->mutable_bf16_data(),
-            seq_len, d_model, eps,
-            device_idx);
-    }
-
     bool BF16Tensor::applyRoPE(
         float *K,
         const int *position_ids,
