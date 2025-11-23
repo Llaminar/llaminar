@@ -139,6 +139,9 @@ export OMPI_MCA_mpi_leave_pinned=1                    # Keep memory pinned
 export OMPI_MCA_btl_vader_single_copy_mechanism=none  # Avoid cross-NUMA copies
 export OMPI_MCA_btl_openib_allow_ib=1                 # Enable InfiniBand if available
 
+# Disable hwloc components that require X11 (prevents hanging in containers)
+export HWLOC_COMPONENTS=-gl,-opencl
+
 # Additional system information
 NUMA_NODES=$(lscpu | grep 'NUMA node(s):' | awk '{print $3}')
 

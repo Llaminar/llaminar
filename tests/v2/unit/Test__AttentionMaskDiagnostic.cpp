@@ -86,10 +86,11 @@ TEST(Test__AttentionMaskDiagnostic, SimplePaddingMask)
 {
     const int batch_size = 1;
     const int seq_len = 4;
+    const int total_len = batch_size * seq_len;
     const int actual_length = 2; // Only 2 real tokens, 2 padding
     std::vector<int> lengths = {actual_length};
 
-    std::vector<float> mask(batch_size * seq_len * seq_len, 0.0f);
+    std::vector<float> mask(total_len * total_len, 0.0f);
 
     attention_utils::create_batch_padding_mask(
         mask.data(),
@@ -99,7 +100,7 @@ TEST(Test__AttentionMaskDiagnostic, SimplePaddingMask)
         0 /* no window */
     );
 
-    print_mask("Padding Only (batch=1, len=2/4)", mask.data(), seq_len, seq_len);
+    print_mask("Padding Only (batch=1, len=2/4)", mask.data(), total_len, total_len);
 
     // Expected structure (non-causal, so bidirectional attention):
     // Row 0 (real): [0, 0, -inf, -inf]  (can attend to 0,1 but not padding 2,3)
@@ -108,18 +109,18 @@ TEST(Test__AttentionMaskDiagnostic, SimplePaddingMask)
     // Row 3 (pad):  [-inf, -inf, -inf, -inf]  (padding doesn't attend)
 
     // Real tokens can attend to each other
-    EXPECT_FALSE(is_masked(mask[0 * seq_len + 0])) << "Real token 0 should see token 0";
-    EXPECT_FALSE(is_masked(mask[0 * seq_len + 1])) << "Real token 0 should see token 1";
-    EXPECT_TRUE(is_masked(mask[0 * seq_len + 2])) << "Real token 0 should NOT see padding 2";
-    EXPECT_TRUE(is_masked(mask[0 * seq_len + 3])) << "Real token 0 should NOT see padding 3";
+    EXPECT_FALSE(is_masked(mask[0 * total_len + 0])) << "Real token 0 should see token 0";
+    EXPECT_FALSE(is_masked(mask[0 * total_len + 1])) << "Real token 0 should see token 1";
+    EXPECT_TRUE(is_masked(mask[0 * total_len + 2])) << "Real token 0 should NOT see padding 2";
+    EXPECT_TRUE(is_masked(mask[0 * total_len + 3])) << "Real token 0 should NOT see padding 3";
 
-    EXPECT_FALSE(is_masked(mask[1 * seq_len + 0])) << "Real token 1 should see token 0";
-    EXPECT_FALSE(is_masked(mask[1 * seq_len + 1])) << "Real token 1 should see token 1";
-    EXPECT_TRUE(is_masked(mask[1 * seq_len + 2])) << "Real token 1 should NOT see padding 2";
+    EXPECT_FALSE(is_masked(mask[1 * total_len + 0])) << "Real token 1 should see token 0";
+    EXPECT_FALSE(is_masked(mask[1 * total_len + 1])) << "Real token 1 should see token 1";
+    EXPECT_TRUE(is_masked(mask[1 * total_len + 2])) << "Real token 1 should NOT see padding 2";
 
     // Padding tokens have all-masked rows
-    EXPECT_TRUE(is_masked(mask[2 * seq_len + 0])) << "Padding row should be fully masked";
-    EXPECT_TRUE(is_masked(mask[3 * seq_len + 0])) << "Padding row should be fully masked";
+    EXPECT_TRUE(is_masked(mask[2 * total_len + 0])) << "Padding row should be fully masked";
+    EXPECT_TRUE(is_masked(mask[3 * total_len + 0])) << "Padding row should be fully masked";
 }
 
 //==============================================================================
@@ -129,9 +130,10 @@ TEST(Test__AttentionMaskDiagnostic, BatchPaddingMask)
 {
     const int batch_size = 2;
     const int seq_len = 4;
+    const int total_len = batch_size * seq_len;
     std::vector<int> lengths = {4, 2}; // Seq0: 4 real, Seq1: 2 real + 2 padding
 
-    std::vector<float> mask(batch_size * seq_len * seq_len, 0.0f);
+    std::vector<float> mask(total_len * total_len, 0.0f);
 
     attention_utils::create_batch_padding_mask(
         mask.data(),
@@ -141,14 +143,14 @@ TEST(Test__AttentionMaskDiagnostic, BatchPaddingMask)
         0 /* no window */
     );
 
-    print_mask("Batch Padding (lengths=[4,2])", mask.data(), batch_size * seq_len, seq_len);
+    print_mask("Batch Padding (lengths=[4,2])", mask.data(), total_len, total_len);
 
-    // Seq0 (positions 0-3, no padding): All positions should be unmasked
+    // Seq0 (positions 0-3, no padding): All positions should be unmasked within seq0
     for (int i = 0; i < 4; ++i)
     {
         for (int j = 0; j < 4; ++j)
         {
-            EXPECT_FALSE(is_masked(mask[i * seq_len + j]))
+            EXPECT_FALSE(is_masked(mask[i * total_len + j]))
                 << "Seq0[" << i << "][" << j << "] should be unmasked (no padding)";
         }
     }
@@ -156,13 +158,13 @@ TEST(Test__AttentionMaskDiagnostic, BatchPaddingMask)
     // Seq1 (positions 4-7, actual_length=2):
     // Real tokens [4,5] should only attend to [4,5], not [6,7] (padding)
     const int seq1_offset = 4;
-    EXPECT_FALSE(is_masked(mask[seq1_offset * seq_len + 0]))
+    EXPECT_FALSE(is_masked(mask[seq1_offset * total_len + seq1_offset]))
         << "Seq1[0] should attend to position 0 (within local seq)";
-    EXPECT_FALSE(is_masked(mask[seq1_offset * seq_len + 1]))
+    EXPECT_FALSE(is_masked(mask[seq1_offset * total_len + seq1_offset + 1]))
         << "Seq1[0] should attend to position 1 (within local seq)";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 2]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 2]))
         << "Seq1[0] should NOT attend to position 2 (padding)";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 3]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 3]))
         << "Seq1[0] should NOT attend to position 3 (padding)";
 }
 
@@ -173,10 +175,11 @@ TEST(Test__AttentionMaskDiagnostic, CombinedCausalPaddingMask)
 {
     const int batch_size = 1;
     const int seq_len = 4;
+    const int total_len = batch_size * seq_len;
     const int actual_length = 2;
     std::vector<int> lengths = {actual_length};
 
-    std::vector<float> mask(batch_size * seq_len * seq_len, 0.0f);
+    std::vector<float> mask(total_len * total_len, 0.0f);
 
     attention_utils::create_combined_batch_mask(
         mask.data(),
@@ -187,7 +190,7 @@ TEST(Test__AttentionMaskDiagnostic, CombinedCausalPaddingMask)
         0     /* no window */
     );
 
-    print_mask("Combined Causal+Padding (len=2/4)", mask.data(), seq_len, seq_len);
+    print_mask("Combined Causal+Padding (len=2/4)", mask.data(), total_len, total_len);
 
     // Expected: Union of causal + padding masks
     // Row 0 (real): [0, -inf, -inf, -inf]  (causal: only self; padding: 2,3)
@@ -195,16 +198,16 @@ TEST(Test__AttentionMaskDiagnostic, CombinedCausalPaddingMask)
     // Row 2 (pad):  [-inf, -inf, -inf, -inf]
     // Row 3 (pad):  [-inf, -inf, -inf, -inf]
 
-    EXPECT_FALSE(is_masked(mask[0 * seq_len + 0])) << "Pos 0 should see itself";
-    EXPECT_TRUE(is_masked(mask[0 * seq_len + 1])) << "Pos 0 should NOT see future (causal)";
+    EXPECT_FALSE(is_masked(mask[0 * total_len + 0])) << "Pos 0 should see itself";
+    EXPECT_TRUE(is_masked(mask[0 * total_len + 1])) << "Pos 0 should NOT see future (causal)";
 
-    EXPECT_FALSE(is_masked(mask[1 * seq_len + 0])) << "Pos 1 should see past";
-    EXPECT_FALSE(is_masked(mask[1 * seq_len + 1])) << "Pos 1 should see itself";
-    EXPECT_TRUE(is_masked(mask[1 * seq_len + 2])) << "Pos 1 should NOT see padding";
+    EXPECT_FALSE(is_masked(mask[1 * total_len + 0])) << "Pos 1 should see past";
+    EXPECT_FALSE(is_masked(mask[1 * total_len + 1])) << "Pos 1 should see itself";
+    EXPECT_TRUE(is_masked(mask[1 * total_len + 2])) << "Pos 1 should NOT see padding";
 
     // Padding rows
-    EXPECT_TRUE(is_masked(mask[2 * seq_len + 0])) << "Padding row fully masked";
-    EXPECT_TRUE(is_masked(mask[3 * seq_len + 0])) << "Padding row fully masked";
+    EXPECT_TRUE(is_masked(mask[2 * total_len + 0])) << "Padding row fully masked";
+    EXPECT_TRUE(is_masked(mask[3 * total_len + 0])) << "Padding row fully masked";
 }
 
 //==============================================================================

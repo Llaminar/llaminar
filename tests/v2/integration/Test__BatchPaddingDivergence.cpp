@@ -134,23 +134,18 @@ protected:
 };
 
 /**
- * @brief Minimal reproducer for batch padding divergence bug
+ * @brief Validate batch execution with padding produces correct results
  *
  * Test Flow:
- * 1. Create pipeline with batch_size=1 (for sequential execution)
- * 2. Run sequence 0: [1, 2, 3, 4] (4 tokens)
- * 3. Run sequence 1: [5, 6] (2 tokens)
- * 4. Extract final token logits for each sequence
+ * 1. Run each sequence INDEPENDENTLY in batch_size=1 mode (isolated baseline)
+ * 2. Run both sequences together in batch_size=2 mode (with padding)
+ * 3. Compare: Each sequence's logits should match its isolated baseline
  *
- * 5. Create pipeline with batch_size=2 (for batched execution)
- * 6. Run batched: [[1, 2, 3, 4], [5, 6, PAD, PAD]]
- * 7. Extract logits for each sequence
+ * This validates that padding does not corrupt the computation for
+ * sequences in a batch. Each sequence should produce identical results
+ * whether run alone or in a batch with padding.
  *
- * 8. Compare: seq0_sequential vs seq0_batch (should match)
- * 9. Compare: seq1_sequential vs seq1_batch (FAILS - 96.8% divergence)
- *
- * Expected Result: Both sequences match within 10% tolerance
- * Actual Result: Sequence 1 (padded) diverges by ~97%
+ * Expected Result: Both sequences match their isolated baselines within 10%
  */
 TEST_F(BatchPaddingDivergenceTest, SequentialVsBatchedWithPadding)
 {
@@ -168,48 +163,53 @@ TEST_F(BatchPaddingDivergenceTest, SequentialVsBatchedWithPadding)
     std::vector<float> seq1_sequential_logits;
 
     // ========================================================================
-    // PART 1: Sequential Execution (baseline) - POSITION-MATCHED!
+    // PART 1: Sequential Execution (isolated baseline)
     // ========================================================================
     if (rank == 0)
     {
-        LOG_ERROR("[SEQUENTIAL] Running with POSITION-MATCHED K/V cache state");
-        LOG_ERROR("[SEQUENTIAL] Seq0 at positions [0-3], Seq1 at positions [4-5]");
-        LOG_ERROR("[SEQUENTIAL] This matches the batch layout for fair comparison");
+        LOG_ERROR("[SEQUENTIAL] Running sequences INDEPENDENTLY (isolated KV cache)");
+        LOG_ERROR("[SEQUENTIAL] Each sequence starts from empty KV cache");
     }
 
-    // Use SHARED pipeline to accumulate K/V cache state (mimics batch layout)
-    auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
-    ASSERT_NE(pipeline_seq, nullptr);
+    // Sequence 0: Run in isolation
+    {
+        auto pipeline_seq0 = std::make_unique<Qwen2Pipeline>(
+            model_ctx_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        ASSERT_NE(pipeline_seq0, nullptr);
 
-    // Run sequence 0 (positions 0-3 in K/V cache)
-    bool success_seq0 = pipeline_seq->forward(seq0.data(), seq0.size());
-    ASSERT_TRUE(success_seq0) << "Sequential sequence 0 forward pass failed";
+        bool success = pipeline_seq0->forward(seq0.data(), seq0.size());
+        ASSERT_TRUE(success) << "Sequential sequence 0 forward pass failed";
 
-    // Get logits for sequence 0 (last token at position 3)
-    seq0_sequential_logits.resize(vocab_size);
-    const float *seq0_logits_ptr = pipeline_seq->getLogits();
-    size_t seq0_logits_offset = (seq0.size() - 1) * vocab_size;
-    std::copy(seq0_logits_ptr + seq0_logits_offset,
-              seq0_logits_ptr + seq0_logits_offset + vocab_size,
-              seq0_sequential_logits.begin());
+        // Get logits for last token
+        seq0_sequential_logits.resize(vocab_size);
+        const float *logits_ptr = pipeline_seq0->getLogits();
+        size_t logits_offset = (seq0.size() - 1) * vocab_size;
+        std::copy(logits_ptr + logits_offset,
+                  logits_ptr + logits_offset + vocab_size,
+                  seq0_sequential_logits.begin());
+    }
 
-    // Run sequence 1 (positions 4-5 in K/V cache, AFTER seq0 context)
-    bool success_seq1 = pipeline_seq->forward(seq1.data(), seq1.size());
-    ASSERT_TRUE(success_seq1) << "Sequential sequence 1 forward pass failed";
+    // Sequence 1: Run in isolation (separate pipeline, fresh KV cache)
+    {
+        auto pipeline_seq1 = std::make_unique<Qwen2Pipeline>(
+            model_ctx_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        ASSERT_NE(pipeline_seq1, nullptr);
 
-    // Get logits for sequence 1 (last token at position 5)
-    seq1_sequential_logits.resize(vocab_size);
-    const float *seq1_logits_ptr = pipeline_seq->getLogits();
-    size_t seq1_logits_offset = (seq1.size() - 1) * vocab_size;
-    std::copy(seq1_logits_ptr + seq1_logits_offset,
-              seq1_logits_ptr + seq1_logits_offset + vocab_size,
-              seq1_sequential_logits.begin());
+        bool success = pipeline_seq1->forward(seq1.data(), seq1.size());
+        ASSERT_TRUE(success) << "Sequential sequence 1 forward pass failed";
+
+        // Get logits for last token
+        seq1_sequential_logits.resize(vocab_size);
+        const float *logits_ptr = pipeline_seq1->getLogits();
+        size_t logits_offset = (seq1.size() - 1) * vocab_size;
+        std::copy(logits_ptr + logits_offset,
+                  logits_ptr + logits_offset + vocab_size,
+                  seq1_sequential_logits.begin());
+    }
 
     if (rank == 0)
     {
-        LOG_ERROR("[SEQUENTIAL] Captured position-matched baseline logits");
-        LOG_ERROR("[SEQUENTIAL] Seq0 last token at position 3, Seq1 last token at position 5");
+        LOG_ERROR("[SEQUENTIAL] Captured isolated baseline logits");
         dumpTensorSample("Seq0_Sequential_Logits", seq0_sequential_logits.data(), vocab_size);
         dumpTensorSample("Seq1_Sequential_Logits", seq1_sequential_logits.data(), vocab_size);
     }
@@ -249,59 +249,27 @@ TEST_F(BatchPaddingDivergenceTest, SequentialVsBatchedWithPadding)
     // Extract logits for each sequence (last valid token only)
     const float *batch_logits_ptr = pipeline_batch->getLogits();
 
-    // Sequence 0: last valid token at position 3 (0-indexed)
+    // Sequence 0: last valid token at position 3 (0-indexed within seq0's slot)
     std::vector<float> seq0_batch_logits(vocab_size);
     size_t seq0_batch_offset = 3 * vocab_size; // Last token of seq0
     std::copy(batch_logits_ptr + seq0_batch_offset,
               batch_logits_ptr + seq0_batch_offset + vocab_size,
               seq0_batch_logits.begin());
 
-    // Sequence 1: last valid token at position 5 (batch1, token1)
+    // Sequence 1: last valid token at position 5 (4 + 1, accounting for padded layout)
     // Layout: [seq0_tok0, seq0_tok1, seq0_tok2, seq0_tok3, seq1_tok0, seq1_tok1, seq1_pad0, seq1_pad1]
-    // So seq1 last valid = position 5
-    // BUT: Based on debugging, position 4 has the correct logits! Investigating...
+    // Position 5 = seq1's last real token
     std::vector<float> seq1_batch_logits(vocab_size);
-
-    // Try both position 4 and 5 to see which matches
-    std::vector<float> seq1_batch_logits_pos4(vocab_size);
-    std::vector<float> seq1_batch_logits_pos5(vocab_size);
-
-    size_t seq1_batch_offset_pos4 = 4 * vocab_size;
-    size_t seq1_batch_offset_pos5 = 5 * vocab_size;
-
-    std::copy(batch_logits_ptr + seq1_batch_offset_pos4,
-              batch_logits_ptr + seq1_batch_offset_pos4 + vocab_size,
-              seq1_batch_logits_pos4.begin());
-
-    std::copy(batch_logits_ptr + seq1_batch_offset_pos5,
-              batch_logits_ptr + seq1_batch_offset_pos5 + vocab_size,
-              seq1_batch_logits_pos5.begin());
+    size_t seq1_batch_offset = 5 * vocab_size;
+    std::copy(batch_logits_ptr + seq1_batch_offset,
+              batch_logits_ptr + seq1_batch_offset + vocab_size,
+              seq1_batch_logits.begin());
 
     if (rank == 0)
     {
         LOG_ERROR("[BATCHED] Extracted logits from batch execution");
-        LOG_ERROR("[BATCHED] Logits layout: 8 total positions (4+4 padded)");
-        LOG_ERROR("[BATCHED] Seq0 positions: [0,1,2,3], Seq1 positions: [4,5,6(PAD),7(PAD)]");
-
-        // Check ALL positions for Seq1
-        const float *all_logits = pipeline_batch->getLogits();
-        for (int pos = 4; pos <= 7; ++pos)
-        {
-            const float *pos_logits = all_logits + pos * vocab_size;
-            float sum = 0.0f;
-            for (size_t i = 0; i < std::min(size_t(10), vocab_size); ++i)
-            {
-                sum += std::abs(pos_logits[i]);
-            }
-            LOG_ERROR("[BATCHED] Position " << pos << " (Seq1 "
-                                            << (pos < 6 ? "REAL" : "PAD") << "): "
-                                            << "first 10 sum=" << sum
-                                            << ", first_value=" << pos_logits[0]);
-        }
-
         dumpTensorSample("Seq0_Batch_Logits", seq0_batch_logits.data(), vocab_size);
-        dumpTensorSample("Seq1_Batch_Logits_Pos4", seq1_batch_logits_pos4.data(), vocab_size);
-        dumpTensorSample("Seq1_Batch_Logits_Pos5", seq1_batch_logits_pos5.data(), vocab_size);
+        dumpTensorSample("Seq1_Batch_Logits", seq1_batch_logits.data(), vocab_size);
     }
 
     // ========================================================================
@@ -309,7 +277,7 @@ TEST_F(BatchPaddingDivergenceTest, SequentialVsBatchedWithPadding)
     // ========================================================================
     if (rank == 0)
     {
-        LOG_ERROR("[COMPARISON] Comparing sequential vs batched logits...");
+        LOG_ERROR("[COMPARISON] Comparing isolated vs batched logits...");
     }
 
     // Compare sequence 0 (should match - no padding)
@@ -324,76 +292,40 @@ TEST_F(BatchPaddingDivergenceTest, SequentialVsBatchedWithPadding)
                   << (seq0_rel_diff * 100.0f) << "% max rel diff");
     }
 
-    // Compare sequence 1 POSITION 4 vs sequential (test if off-by-one error)
-    float seq1_pos4_rel_diff = compareLogits(
+    // Compare sequence 1 (padded - this is the critical test)
+    float seq1_rel_diff = compareLogits(
         seq1_sequential_logits.data(),
-        seq1_batch_logits_pos4.data(),
+        seq1_batch_logits.data(),
         vocab_size);
 
     if (rank == 0)
     {
-        LOG_ERROR("[COMPARISON] Sequence 1 Position 4 vs Sequential: "
-                  << (seq1_pos4_rel_diff * 100.0f) << "% max rel diff");
-    }
-
-    // Compare sequence 1 POSITION 5 vs sequential (original extraction)
-    float seq1_pos5_rel_diff = compareLogits(
-        seq1_sequential_logits.data(),
-        seq1_batch_logits_pos5.data(),
-        vocab_size);
-
-    if (rank == 0)
-    {
-        LOG_ERROR("[COMPARISON] Sequence 1 Position 5 vs Sequential: "
-                  << (seq1_pos5_rel_diff * 100.0f) << "% max rel diff");
-    }
-
-    // Assertions and root cause diagnosis
-    EXPECT_LT(seq0_rel_diff, 0.1f)
-        << "Sequence 0 (no padding) should match within 10% tolerance";
-
-    // Diagnostic logic
-    if (rank == 0)
-    {
-        if (seq1_pos5_rel_diff < 0.1f)
-        {
-            LOG_ERROR("[SUCCESS] Position-matched comparison PASSES!");
-            LOG_ERROR("  → Seq1 last token (position 5) matches between sequential and batch");
-            LOG_ERROR("  → Previous bug was due to comparing different K/V cache positions");
-            LOG_ERROR("  → Sequential isolated vs batched with context are NOT equivalent");
-        }
-        else if (seq1_pos4_rel_diff < 0.1f && seq1_pos5_rel_diff >= 0.1f)
-        {
-            LOG_ERROR("[OFFSET ERROR] Position 4 matches, Position 5 does NOT!");
-            LOG_ERROR("  → Last token logits are at wrong position in batch layout");
-        }
-        else if (seq1_pos4_rel_diff >= 0.1f && seq1_pos5_rel_diff >= 0.1f)
-        {
-            LOG_ERROR("[BUG CONFIRMED] Neither position matches!");
-            LOG_ERROR("  → Padding corruption affects logit computation");
-            LOG_ERROR("  → This is a real bug in batch processing with padding");
-        }
+        LOG_ERROR("[COMPARISON] Sequence 1 (padded): "
+                  << (seq1_rel_diff * 100.0f) << "% max rel diff");
     }
 
     // Final assertions
-    bool pos5_matches = seq1_pos5_rel_diff < 0.1f;
+    EXPECT_LT(seq0_rel_diff, 0.1f)
+        << "Sequence 0 (no padding) should match within 10% tolerance. "
+        << "Divergence: " << (seq0_rel_diff * 100.0f) << "%";
 
-    EXPECT_LT(seq1_pos5_rel_diff, 0.1f)
-        << "Position-matched Seq1 (position 5) should match within 10% tolerance. "
-        << "Divergence: " << (seq1_pos5_rel_diff * 100.0f) << "%";
+    EXPECT_LT(seq1_rel_diff, 0.1f)
+        << "Sequence 1 (with padding) should match within 10% tolerance. "
+        << "Divergence: " << (seq1_rel_diff * 100.0f) << "%";
 
     if (rank == 0)
     {
-        if (pos5_matches)
+        if (seq0_rel_diff < 0.1f && seq1_rel_diff < 0.1f)
         {
-            LOG_ERROR("[TEST PASSED] Position-matched comparison successful!");
-            LOG_ERROR("  Previous divergence was due to K/V cache position mismatch");
+            LOG_ERROR("[TEST PASSED] Both sequences match their isolated baselines!");
+            LOG_ERROR("  Padding does not corrupt batch execution");
         }
         else
         {
-            LOG_ERROR("[TEST FAILED] Even with position-matching, batch diverges by "
-                      << (seq1_pos5_rel_diff * 100.0f) << "%");
-            LOG_ERROR("  This indicates a real bug in batch padding handling");
+            LOG_ERROR("[TEST FAILED] Batch execution diverges from isolated baseline");
+            LOG_ERROR("  Seq0 divergence: " << (seq0_rel_diff * 100.0f) << "%");
+            LOG_ERROR("  Seq1 divergence: " << (seq1_rel_diff * 100.0f) << "%");
+            LOG_ERROR("  This indicates a bug in batch padding handling");
         }
     }
 }

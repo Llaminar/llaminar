@@ -155,7 +155,17 @@ function(add_v2_test TEST_NAME)
         set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
     else()
         # Use Debug build (default, CMAKE_CURRENT_BINARY_DIR)
-        set(FINAL_COMMAND ${ARG_COMMAND})
+        # Check if COMMAND uses $<TARGET_FILE:...> generator expression
+        list(GET ARG_COMMAND 0 FIRST_ARG)
+        if(FIRST_ARG MATCHES "\\$<TARGET_FILE:")
+            # Already has full path via generator expression, use as-is
+            set(FINAL_COMMAND ${ARG_COMMAND})
+        else()
+            # Bare executable name, need to prepend CMAKE_CURRENT_BINARY_DIR
+            set(EXECUTABLE_PATH "${CMAKE_CURRENT_BINARY_DIR}/${FIRST_ARG}")
+            list(REMOVE_AT ARG_COMMAND 0)
+            set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
+        endif()
     endif()
     
     # Create the test with mpirun wrapper
@@ -173,7 +183,7 @@ function(add_v2_test TEST_NAME)
     set_tests_properties(${TEST_NAME} PROPERTIES
         FIXTURES_REQUIRED V2_Models                    # Requires V2_Models fixture
         LABELS "${ARG_LABELS}"
-        ENVIRONMENT "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL};OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        ENVIRONMENT "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL};HWLOC_COMPONENTS=-gl,-opencl;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     )
 endfunction()
@@ -300,6 +310,19 @@ add_v2_test(V2_Unit_FusedRMSNormQuantize
     MPI_PROCS 1  # CPU-only fused kernel, single rank
 )
 
+# Test: FusedRMSNormQuantize Padding (Regression test)
+add_executable(v2_test_fused_rmsnorm_quantize_padding unit/Test__FusedRMSNormQuantize_Padding.cpp)
+target_link_libraries(v2_test_fused_rmsnorm_quantize_padding
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedRMSNormQuantize_Padding
+    COMMAND $<TARGET_FILE:v2_test_fused_rmsnorm_quantize_padding>
+    LABELS "V2;Unit;Kernels;FusedKernels;RMSNorm;Quantization;Padding"
+    MPI_PROCS 1
+)
+
 # Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
 add_executable(v2_test_device_index_cpu_kernels unit/Test__DeviceIndexCPUKernels.cpp)
 target_link_libraries(v2_test_device_index_cpu_kernels
@@ -363,6 +386,19 @@ add_v2_test(V2_Unit_SoftmaxPrimitives
     COMMAND $<TARGET_FILE:v2_test_softmax_primitives>
     LABELS "V2;Unit;Primitives;Softmax;FP32;BF16;FP16;SIMD;AVX2;AVX512;CPU;PrecisionTesting;NumericalStability"
     MPI_PROCS 1  # Softmax primitives are CPU-only, single rank
+)
+
+# Test: Softmax -Inf handling (AVX512 specific regression test)
+add_executable(v2_test_softmax_inf unit/Test__SoftmaxInf.cpp)
+target_link_libraries(v2_test_softmax_inf
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SoftmaxInf
+    COMMAND $<TARGET_FILE:v2_test_softmax_inf>
+    LABELS "V2;Unit;Primitives;Softmax;AVX512;Regression;InfHandling"
+    MPI_PROCS 1
 )
 
 # Test: OneDNN GEMM kernel fused matmul + softmax path
@@ -2302,6 +2338,20 @@ add_v2_test(V2_Integration_BatchedAttention
     LABELS "V2;Integration;Batching;Attention;CausalMasking;PaddingMasking;GQA"
 )
 
+# Test: Qwen2Pipeline Batch Handling (Integration - full model load)
+add_executable(v2_test_qwen2_pipeline_batch_handling integration/Test__Qwen2Pipeline_BatchHandling.cpp)
+target_link_libraries(v2_test_qwen2_pipeline_batch_handling 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Qwen2Pipeline_BatchHandling
+    COMMAND $<TARGET_FILE:v2_test_qwen2_pipeline_batch_handling>
+    LABELS "V2;Integration;PipelineExecution;Qwen2;BatchProcessing;ResidualConnections"
+    MPI_PROCS 1
+)
+
+
 # NOTE: MicroKernel AutoTuner Integration test removed - depends on obsolete gemm implementations
 
 # Test: Dequant Equivalency - Verify IBlockDecoder matches llama.cpp dequantization (October 2025)
@@ -2367,17 +2417,17 @@ add_v2_test(V2_Integration_Qwen2Pipeline
 )
 
 # Test: Batch Padding Divergence - Minimal reproducer for batch padding bug
-add_executable(v2_test_batch_padding_divergence unit/Test__BatchPaddingDivergence.cpp)
+add_executable(v2_test_batch_padding_divergence integration/Test__BatchPaddingDivergence.cpp)
 target_link_libraries(v2_test_batch_padding_divergence 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
     MPI::MPI_CXX
 )
-add_v2_test(V2_Unit_BatchPaddingDivergence
+add_v2_test(V2_Integration_BatchPaddingDivergence
     COMMAND $<TARGET_FILE:v2_test_batch_padding_divergence>
     MPI_PROCS 2
-    LABELS "V2;Unit;PipelineExecution;Batching;BugReproducer;Correctness"
+    LABELS "V2;Integration;PipelineExecution;Batching;BugReproducer;Correctness"
 )
 
 # Placeholder for integration test executables (to be added)
@@ -2588,7 +2638,7 @@ function(add_v2_perf_test TEST_NAME)
     # Performance tests default to INFO log level (less verbose than Unit/Integration)
     set_tests_properties(${TEST_NAME} PROPERTIES
         LABELS "${ARG_LABELS}"
-        ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;ONEDNN_VERBOSE=0;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO;HWLOC_COMPONENTS=-gl,-opencl;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;ONEDNN_VERBOSE=0;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
         WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
     )
     
@@ -2880,15 +2930,5 @@ target_link_libraries(v2_test_mpi_attention_orchestrator_masking llaminar2_core 
 add_v2_test(V2_Unit_MpiAttentionOrchestrator_Masking
     COMMAND v2_test_mpi_attention_orchestrator_masking
     LABELS "V2;Unit;PipelineExecution;Orchestration;Attention"
-    MPI_PROCS 1
-)
-
-# Test: Qwen2Pipeline Batch Handling
-add_executable(v2_test_qwen2_pipeline_batch_handling unit/pipelines/Test__Qwen2Pipeline_BatchHandling.cpp)
-target_link_libraries(v2_test_qwen2_pipeline_batch_handling llaminar2_core GTest::gtest_main)
-
-add_v2_test(V2_Unit_Qwen2Pipeline_BatchHandling
-    COMMAND v2_test_qwen2_pipeline_batch_handling
-    LABELS "V2;Unit;PipelineExecution;Qwen2;BatchProcessing;ResidualConnections"
     MPI_PROCS 1
 )

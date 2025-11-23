@@ -897,10 +897,24 @@ namespace llaminar2
         // 6. Residual connection - write back to current_hidden_
         // Note: If multi-device, result stays on attn_device and is stored in current_hidden_
         // CRITICAL: Process all batch sequences, not just effective_seq_len
+        // CRITICAL FIX: Zero out padding rows to prevent NaN propagation to next layer
         const size_t residual_elements = batch_size_ * padded_seq_len_ * d_model_;
+
+#pragma omp parallel for
         for (size_t i = 0; i < residual_elements; ++i)
         {
-            current_hidden_->mutable_data()[i] = buffers.residual->data()[i] + buffers.attn_proj->data()[i];
+            size_t token_idx = i / d_model_;
+            size_t batch_idx = token_idx / padded_seq_len_;
+            size_t seq_idx = token_idx % padded_seq_len_;
+
+            if (seq_idx >= sequence_lengths_[batch_idx])
+            {
+                current_hidden_->mutable_data()[i] = 0.0f;
+            }
+            else
+            {
+                current_hidden_->mutable_data()[i] = buffers.residual->data()[i] + buffers.attn_proj->data()[i];
+            }
         }
 
         // Update current_hidden_ device index to reflect where computation happened
@@ -1185,10 +1199,24 @@ namespace llaminar2
 
         // 5. Residual connection - write back to current_hidden_
         // CRITICAL: Process all batch sequences, not just effective_seq_len
+        // CRITICAL FIX: Zero out padding rows to prevent NaN propagation to next layer
         const size_t residual_elements = batch_size_ * padded_seq_len_ * d_model_;
+
+#pragma omp parallel for
         for (size_t i = 0; i < residual_elements; ++i)
         {
-            current_hidden_->mutable_data()[i] = buffers.residual->data()[i] + buffers.ffn_output->data()[i];
+            size_t token_idx = i / d_model_;
+            size_t batch_idx = token_idx / padded_seq_len_;
+            size_t seq_idx = token_idx % padded_seq_len_;
+
+            if (seq_idx >= sequence_lengths_[batch_idx])
+            {
+                current_hidden_->mutable_data()[i] = 0.0f;
+            }
+            else
+            {
+                current_hidden_->mutable_data()[i] = buffers.residual->data()[i] + buffers.ffn_output->data()[i];
+            }
         }
 
         // Update current_hidden_ device index to reflect where computation happened

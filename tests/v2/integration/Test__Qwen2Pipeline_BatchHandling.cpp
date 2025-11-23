@@ -11,7 +11,13 @@
 #include <vector>
 #include <cstring>
 
+// HACK: Expose private members for white-box testing
+// This allows us to inspect internal buffers like current_hidden_ and activation_buffers_
+#define private public
+#define protected public
 #include "v2/pipelines/qwen/Qwen2Pipeline.h"
+#undef private
+#undef protected
 #include "v2/pipelines/PipelineFactory.h"
 #include "v2/loaders/ModelContext.h"
 #include "v2/utils/MPIContext.h"
@@ -33,11 +39,15 @@ protected:
         ASSERT_NE(model_ctx_, nullptr) << "Failed to load model: " << model_path_;
 
         // Create pipeline with batch_size=2
+        PipelineConfig config;
+        config.batch_size = 2;
+
         auto pipeline_base = PipelineFactory::instance().create(
             model_ctx_->architecture(),
             model_ctx_,
             mpi_ctx_,
-            /*batch_size=*/2);
+            -1, // device_idx (CPU)
+            config);
 
         // Cast unique_ptr from PipelineBase to Qwen2Pipeline
         auto *raw_ptr = pipeline_base.release();
@@ -304,4 +314,56 @@ TEST_F(Test__Qwen2Pipeline_BatchHandling, GetLogits_SequenceIndexing)
     const float *expected_logits_1 = logits_0 + (padded_seq_len * vocab_size);
     EXPECT_EQ(logits_1, expected_logits_1)
         << "Logits pointer for sequence 1 has incorrect stride";
+}
+
+/**
+ * @test ResidualPaddingHygiene
+ * @brief Validates that padding regions in residual connections are zeroed out
+ *
+ * This is a regression test for a bug where garbage in padding regions
+ * propagated to the next layer, causing divergence in subsequent tokens.
+ */
+TEST_F(Test__Qwen2Pipeline_BatchHandling, ResidualPaddingHygiene)
+{
+    // Create a batch with padding:
+    // Seq 0: [1, 2] (len 2)
+    // Seq 1: [3]    (len 1) -> Padded to [3, PAD]
+    std::vector<std::vector<int>> batch = {
+        {1, 2},
+        {3}};
+
+    // Run forward pass
+    ASSERT_TRUE(pipeline_->forward_batch(batch));
+
+    // Inspect current_hidden_ (exposed via #define private public)
+    ASSERT_NE(pipeline_->current_hidden_, nullptr);
+    const float *hidden_data = pipeline_->current_hidden_->data();
+
+    int d_model = pipeline_->d_model_;
+    int padded_seq_len = pipeline_->padded_seq_len_;
+
+    // Verify padded_seq_len is 2
+    ASSERT_EQ(padded_seq_len, 2);
+
+    // Calculate index of the padding token
+    // Batch layout: [Seq0_Tok0, Seq0_Tok1, Seq1_Tok0, Seq1_Tok1(PAD)]
+    // Index 3 is the padding token
+    int padding_token_idx = 3;
+
+    // Check that the padding token's hidden state is all zeros
+    // The residual connection logic should have zeroed this out
+    bool all_zeros = true;
+    for (int i = 0; i < d_model; ++i)
+    {
+        float val = hidden_data[padding_token_idx * d_model + i];
+        if (val != 0.0f)
+        {
+            all_zeros = false;
+            // Log first failure
+            EXPECT_EQ(val, 0.0f) << "Padding token hidden state at dim " << i << " is not zero!";
+            break;
+        }
+    }
+
+    EXPECT_TRUE(all_zeros) << "Padding region in hidden state contains garbage!";
 }

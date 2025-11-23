@@ -148,8 +148,9 @@ TEST(Test__GQAAttention_PaddingMask, MaskConstruction_VariableLengths)
 
     std::vector<int> actual_lengths = {4, 2};
 
-    // Create mask workspace
-    auto mask_tensor = create_fp32_tensor(batch_size * seq_len, seq_len);
+    // Create mask workspace - must be [total_len, total_len] for batch attention
+    const int total_len = batch_size * seq_len;
+    auto mask_tensor = create_fp32_tensor(total_len, total_len);
     float *mask_data = mask_tensor->mutable_data();
 
     // Build padding mask (non-causal)
@@ -172,12 +173,13 @@ TEST(Test__GQAAttention_PaddingMask, MaskConstruction_VariableLengths)
     // Verify mask structure
     const float *mask = config.workspace_mask->data();
 
-    // Seq0 (length=4, positions [0-3]): All positions should be unmasked (0.0)
-    for (int i = 0; i < 4; ++i) // Query positions
+    // Seq0 (length=4, positions [0-3]): All positions should be unmasked (0.0) within seq0
+    // But masked from attending to seq1 (block diagonal)
+    for (int i = 0; i < 4; ++i) // Query positions in seq0
     {
-        for (int j = 0; j < 4; ++j) // Key positions
+        for (int j = 0; j < 4; ++j) // Key positions in seq0
         {
-            float mask_val = mask[i * seq_len + j];
+            float mask_val = mask[i * total_len + j];
             EXPECT_FALSE(is_masked(mask_val))
                 << "Seq0 position (" << i << "," << j << ") should be unmasked, got " << mask_val;
         }
@@ -186,34 +188,34 @@ TEST(Test__GQAAttention_PaddingMask, MaskConstruction_VariableLengths)
     // Seq1 (length=2, positions [4-7]):
     // - Positions [4-5] (real tokens) should attend to [4-5] only
     // - Positions [6-7] (padding) should be fully masked
-    const int seq1_offset = seq_len;
+    const int seq1_offset = seq_len; // First token of seq1 is at position 4
 
     // Real token at position 4 (first token of Seq1)
-    EXPECT_FALSE(is_masked(mask[seq1_offset * seq_len + 0]))
+    EXPECT_FALSE(is_masked(mask[seq1_offset * total_len + seq1_offset]))
         << "Seq1[0] should attend to position 0 (itself)";
-    EXPECT_FALSE(is_masked(mask[seq1_offset * seq_len + 1]))
+    EXPECT_FALSE(is_masked(mask[seq1_offset * total_len + seq1_offset + 1]))
         << "Seq1[0] should attend to position 1";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 2]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 2]))
         << "Seq1[0] should NOT attend to position 2 (padding)";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 3]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 3]))
         << "Seq1[0] should NOT attend to position 3 (padding)";
 
     // Real token at position 5 (second token of Seq1)
-    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * seq_len + 0]))
+    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset]))
         << "Seq1[1] should attend to position 0";
-    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * seq_len + 1]))
+    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset + 1]))
         << "Seq1[1] should attend to position 1 (itself)";
-    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * seq_len + 2]))
+    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset + 2]))
         << "Seq1[1] should NOT attend to position 2 (padding)";
-    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * seq_len + 3]))
+    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset + 3]))
         << "Seq1[1] should NOT attend to position 3 (padding)";
 
     // Padding tokens at positions 6-7 should have all-masked rows
     for (int i = 2; i < 4; ++i) // Padding positions in Seq1
     {
-        for (int j = 0; j < seq_len; ++j)
+        for (int j = 0; j < total_len; ++j) // All columns
         {
-            EXPECT_TRUE(is_masked(mask[(seq1_offset + i) * seq_len + j]))
+            EXPECT_TRUE(is_masked(mask[(seq1_offset + i) * total_len + j]))
                 << "Padding position " << (seq1_offset + i) << " row should be fully masked";
         }
     }
@@ -233,7 +235,8 @@ TEST(Test__GQAAttention_PaddingMask, CausalPaddingMaskInteraction)
 
     std::vector<int> actual_lengths = {4, 2};
 
-    auto mask_tensor = create_fp32_tensor(batch_size * seq_len, seq_len);
+    const int total_len = batch_size * seq_len;
+    auto mask_tensor = create_fp32_tensor(total_len, total_len);
 
     GQAAttentionConfig config;
     config.n_heads = n_heads;
@@ -254,24 +257,24 @@ TEST(Test__GQAAttention_PaddingMask, CausalPaddingMaskInteraction)
     const float *mask = config.workspace_mask->data();
     const int seq1_offset = seq_len;
 
-    // Seq1 position 4 (first real token): Should only attend to itself (causal)
-    EXPECT_FALSE(is_masked(mask[seq1_offset * seq_len + 0]))
+    // Seq1 position 4 (first real token): Should only attend to itself (causal) within seq1
+    EXPECT_FALSE(is_masked(mask[seq1_offset * total_len + seq1_offset]))
         << "Seq1[0] should attend to position 0 (itself)";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 1]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 1]))
         << "Seq1[0] should NOT attend to position 1 (future, causal mask)";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 2]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 2]))
         << "Seq1[0] should NOT attend to position 2 (padding)";
-    EXPECT_TRUE(is_masked(mask[seq1_offset * seq_len + 3]))
+    EXPECT_TRUE(is_masked(mask[seq1_offset * total_len + seq1_offset + 3]))
         << "Seq1[0] should NOT attend to position 3 (padding)";
 
     // Seq1 position 5 (second real token): Should attend to [0-1] (causal), not [2-3] (padding)
-    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * seq_len + 0]))
+    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset]))
         << "Seq1[1] should attend to position 0 (past)";
-    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * seq_len + 1]))
+    EXPECT_FALSE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset + 1]))
         << "Seq1[1] should attend to position 1 (itself)";
-    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * seq_len + 2]))
+    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset + 2]))
         << "Seq1[1] should NOT attend to position 2 (padding)";
-    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * seq_len + 3]))
+    EXPECT_TRUE(is_masked(mask[(seq1_offset + 1) * total_len + seq1_offset + 3]))
         << "Seq1[1] should NOT attend to position 3 (padding)";
 }
 
@@ -287,28 +290,29 @@ TEST(Test__GQAAttention_PaddingMask, PaddedPositionsProduceZeroOutput)
     const int n_kv_heads = 2;
     const int head_dim = 16;
     const int d_model = n_heads * head_dim;
+    const int total_len = batch_size * seq_len;
 
     std::vector<int> actual_lengths = {4, 2}; // Seq1 has 2 padding tokens
 
     // Create input tensors
-    auto Q = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto K = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto V = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto output = create_fp32_tensor(batch_size * seq_len, d_model);
+    auto Q = create_fp32_tensor(total_len, d_model);
+    auto K = create_fp32_tensor(total_len, d_model);
+    auto V = create_fp32_tensor(total_len, d_model);
+    auto output = create_fp32_tensor(total_len, d_model);
 
     // Initialize with small random values
-    init_random_like(Q->mutable_data(), batch_size * seq_len * d_model, 42);
-    init_random_like(K->mutable_data(), batch_size * seq_len * d_model, 43);
-    init_random_like(V->mutable_data(), batch_size * seq_len * d_model, 44);
+    init_random_like(Q->mutable_data(), total_len * d_model, 42);
+    init_random_like(K->mutable_data(), total_len * d_model, 43);
+    init_random_like(V->mutable_data(), total_len * d_model, 44);
 
     // Zero out the output
-    fill_constant(output->mutable_data(), batch_size * seq_len * d_model, 0.0f);
+    fill_constant(output->mutable_data(), total_len * d_model, 0.0f);
 
-    // Create workspace tensors
-    auto scores_ws = create_fp32_tensor(batch_size * seq_len, seq_len);
-    auto qkv_ws = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto context_ws = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto mask_ws = create_fp32_tensor(batch_size * seq_len, seq_len);
+    // Create workspace tensors - must be square [total_len, total_len] for batch attention
+    auto scores_ws = create_fp32_tensor(total_len, total_len);
+    auto qkv_ws = create_fp32_tensor(total_len, d_model);
+    auto context_ws = create_fp32_tensor(total_len, d_model);
+    auto mask_ws = create_fp32_tensor(total_len, total_len);
 
     // Configure attention
     GQAAttentionConfig config;
@@ -381,24 +385,25 @@ TEST(Test__GQAAttention_PaddingMask, IsolatedSequenceProcessing)
     const int n_kv_heads = 2;
     const int head_dim = 16;
     const int d_model = n_heads * head_dim;
+    const int total_len = batch_size * seq_len;
 
     std::vector<int> actual_lengths = {4, 2};
 
     // Run 1: Full batch with padding
-    auto Q_batch = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto K_batch = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto V_batch = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto output_batch = create_fp32_tensor(batch_size * seq_len, d_model);
+    auto Q_batch = create_fp32_tensor(total_len, d_model);
+    auto K_batch = create_fp32_tensor(total_len, d_model);
+    auto V_batch = create_fp32_tensor(total_len, d_model);
+    auto output_batch = create_fp32_tensor(total_len, d_model);
 
-    init_random_like(Q_batch->mutable_data(), batch_size * seq_len * d_model, 100);
-    init_random_like(K_batch->mutable_data(), batch_size * seq_len * d_model, 101);
-    init_random_like(V_batch->mutable_data(), batch_size * seq_len * d_model, 102);
-    fill_constant(output_batch->mutable_data(), batch_size * seq_len * d_model, 0.0f);
+    init_random_like(Q_batch->mutable_data(), total_len * d_model, 100);
+    init_random_like(K_batch->mutable_data(), total_len * d_model, 101);
+    init_random_like(V_batch->mutable_data(), total_len * d_model, 102);
+    fill_constant(output_batch->mutable_data(), total_len * d_model, 0.0f);
 
-    auto scores_ws1 = create_fp32_tensor(batch_size * seq_len, seq_len);
-    auto qkv_ws1 = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto context_ws1 = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto mask_ws1 = create_fp32_tensor(batch_size * seq_len, seq_len);
+    auto scores_ws1 = create_fp32_tensor(total_len, total_len);
+    auto qkv_ws1 = create_fp32_tensor(total_len, d_model);
+    auto context_ws1 = create_fp32_tensor(total_len, d_model);
+    auto mask_ws1 = create_fp32_tensor(total_len, total_len);
 
     GQAAttentionConfig config_batch;
     config_batch.n_heads = n_heads;
@@ -431,10 +436,11 @@ TEST(Test__GQAAttention_PaddingMask, IsolatedSequenceProcessing)
     std::memcpy(V_seq0->mutable_data(), V_batch->data(), 4 * d_model * sizeof(float));
     fill_constant(output_seq0->mutable_data(), 4 * d_model, 0.0f);
 
-    auto scores_ws2 = create_fp32_tensor(4, seq_len);
+    // Workspace for single-sequence attention: scores must be [n_heads * seq_len, seq_len]
+    auto scores_ws2 = create_fp32_tensor(n_heads * 4, 4);
     auto qkv_ws2 = create_fp32_tensor(4, d_model);
     auto context_ws2 = create_fp32_tensor(4, d_model);
-    auto mask_ws2 = create_fp32_tensor(4, seq_len);
+    auto mask_ws2 = create_fp32_tensor(4, 4);
 
     GQAAttentionConfig config_seq0;
     config_seq0.n_heads = n_heads;
@@ -488,28 +494,29 @@ TEST(Test__GQAAttention_PaddingMask, AttentionScoresMasking)
     const int n_kv_heads = 1;
     const int head_dim = 8;
     const int d_model = n_heads * head_dim;
+    const int total_len = batch_size * seq_len;
 
     std::vector<int> actual_lengths = {4, 2};
 
     // Create input tensors with known values
-    auto Q = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto K = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto V = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto output = create_fp32_tensor(batch_size * seq_len, d_model);
+    auto Q = create_fp32_tensor(total_len, d_model);
+    auto K = create_fp32_tensor(total_len, d_model);
+    auto V = create_fp32_tensor(total_len, d_model);
+    auto output = create_fp32_tensor(total_len, d_model);
 
     // Simple initialization: Q[i] = i, K[i] = i, V[i] = 1.0
-    for (int i = 0; i < batch_size * seq_len * d_model; ++i)
+    for (int i = 0; i < total_len * d_model; ++i)
     {
         Q->mutable_data()[i] = static_cast<float>(i % d_model) * 0.1f;
         K->mutable_data()[i] = static_cast<float>(i % d_model) * 0.1f;
         V->mutable_data()[i] = 1.0f;
     }
 
-    // Create workspace tensors (scores will be inspected)
-    auto scores_ws = create_fp32_tensor(batch_size * seq_len, seq_len);
-    auto qkv_ws = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto context_ws = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto mask_ws = create_fp32_tensor(batch_size * seq_len, seq_len);
+    // Create workspace tensors (scores will be inspected) - must be square [total_len, total_len]
+    auto scores_ws = create_fp32_tensor(total_len, total_len);
+    auto qkv_ws = create_fp32_tensor(total_len, d_model);
+    auto context_ws = create_fp32_tensor(total_len, d_model);
+    auto mask_ws = create_fp32_tensor(total_len, total_len);
 
     GQAAttentionConfig config;
     config.n_heads = n_heads;
@@ -578,23 +585,24 @@ TEST(Test__GQAAttention_PaddingMask, AllPaddingSequence)
     const int n_kv_heads = 2;
     const int head_dim = 16;
     const int d_model = n_heads * head_dim;
+    const int total_len = batch_size * seq_len;
 
     std::vector<int> actual_lengths = {4, 0}; // Seq1 is all padding!
 
-    auto Q = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto K = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto V = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto output = create_fp32_tensor(batch_size * seq_len, d_model);
+    auto Q = create_fp32_tensor(total_len, d_model);
+    auto K = create_fp32_tensor(total_len, d_model);
+    auto V = create_fp32_tensor(total_len, d_model);
+    auto output = create_fp32_tensor(total_len, d_model);
 
-    init_random_like(Q->mutable_data(), batch_size * seq_len * d_model, 200);
-    init_random_like(K->mutable_data(), batch_size * seq_len * d_model, 201);
-    init_random_like(V->mutable_data(), batch_size * seq_len * d_model, 202);
-    fill_constant(output->mutable_data(), batch_size * seq_len * d_model, 0.0f);
+    init_random_like(Q->mutable_data(), total_len * d_model, 200);
+    init_random_like(K->mutable_data(), total_len * d_model, 201);
+    init_random_like(V->mutable_data(), total_len * d_model, 202);
+    fill_constant(output->mutable_data(), total_len * d_model, 0.0f);
 
-    auto scores_ws = create_fp32_tensor(batch_size * seq_len, seq_len);
-    auto qkv_ws = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto context_ws = create_fp32_tensor(batch_size * seq_len, d_model);
-    auto mask_ws = create_fp32_tensor(batch_size * seq_len, seq_len);
+    auto scores_ws = create_fp32_tensor(total_len, total_len);
+    auto qkv_ws = create_fp32_tensor(total_len, d_model);
+    auto context_ws = create_fp32_tensor(total_len, d_model);
+    auto mask_ws = create_fp32_tensor(total_len, total_len);
 
     GQAAttentionConfig config;
     config.n_heads = n_heads;
@@ -642,13 +650,4 @@ TEST(Test__GQAAttention_PaddingMask, AllPaddingSequence)
 
     EXPECT_TRUE(seq0_has_nonzero)
         << "Seq0 (no padding) should produce non-zero output";
-}
-
-//==============================================================================
-// Main
-//==============================================================================
-int main(int argc, char **argv)
-{
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
 }
