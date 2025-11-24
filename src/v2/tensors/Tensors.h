@@ -31,6 +31,12 @@
  *    - Key method: decode_to_q8_1() - quantizes activation row to Q8_1 with pre-computed sum
  *    - Optimization: "Quantize once, use many times" for multi-head attention
  *
+ * 5. **IINT8Decodable** - Direct conversion to INT8 per-column symmetric quantization
+ *    - Implemented by: Quantized weight tensors (Q4_0, IQ4_NL, Q6_K, Q8_0, etc.)
+ *    - Usage: Fusion kernels (FusedDualGEMM, FusedTripleGEMM), model loader optimization
+ *    - Key method: decode_to_int8_percol() - direct Q4_0→INT8 without FP32 intermediate
+ *    - Optimization: Eliminates one quantization step, reduces error accumulation
+ *
  * ============================================================================
  * TENSOR CLASS SUMMARY
  * ============================================================================
@@ -318,6 +324,87 @@ namespace llaminar2
          * @return const Q8_1Block* Pointer to the Q8_1 block (valid until next call on same thread)
          */
         virtual const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const = 0;
+    };
+
+    /**
+     * @brief INT8 unpackable interface for native quantized format → plain INT8 unpacking
+     *
+     * Used by blockwise INT8 GEMM kernels (e.g., OneDNN BRGEMM) that need quantized weights
+     * unpacked to plain int8 values in their NATIVE quantization range (NO requantization).
+     *
+     * **Architecture Philosophy (Native Unpacking, NOT Requantization)**:
+     * - Q4_0: Unpack 4-bit nibbles to int8 range [-8, 7] via `(nibble - 8)`
+     * - Q6_K: Unpack 6-bit values to int8 range [-32, 31]
+     * - IQ4_NL: Unpack to native IQ4_NL int8 range (non-linear quantization)
+     * - Original block scales preserved and applied AFTER BRGEMM dot product
+     *
+     * **Why NOT requantize?**
+     * - BRGEMM computes: `C = A × B` (int8 dot product → int32 accumulator)
+     * - Scales applied after: `C_fp32 = C_int32 * scale_A * scale_B`
+     * - Requantizing B loses precision: Q4_0 → FP32 → Q8_0 (double quantization)
+     * - Native unpacking preserves original quantization: Q4_0 → int8 (single quantization)
+     *
+     * **BRGEMM Integration Pattern**:
+     * ```cpp
+     * // 1. Unpack weight block to plain int8 (native range)
+     * int8_t B_unpacked[32];
+     * weight->unpack_block_to_int8(row, kb, B_unpacked);
+     *
+     * // 2. BRGEMM matmul (u8 × s8 → s32)
+     * brgemm.execute(A_u8, B_unpacked, C_s32);
+     *
+     * // 3. Apply original scales after matmul
+     * float scale_A = activation->get_block_scale(...);
+     * float scale_B = weight->get_block_scale(row, kb);
+     * C_fp32[i] = C_s32[i] * scale_A * scale_B;
+     * ```
+     *
+     * @note This is **unpacking**, not requantization. Output is in NATIVE format range.
+     */
+    class IINT8Unpackable
+    {
+    public:
+        virtual ~IINT8Unpackable() = default;
+
+        /**
+         * @brief Unpack one quantized block to plain int8 values (native range, NO requantization)
+         *
+         * Unpacks native format (Q4_0, Q6_K, IQ4_NL) to plain int8 values in their
+         * native quantization range. Does NOT compute new scales or requantize.
+         *
+         * @param row_idx Row index in weight tensor
+         * @param k_block_offset Block offset along K dimension (units of block_size())
+         * @param output Output buffer for plain int8 values (must have space for block_size() elements)
+         *
+         * Examples:
+         * - Q4_0: Unpacks 4-bit nibbles to range [-8, 7] via `(nibble - 8)`
+         * - Q6_K: Unpacks 6-bit values to range [-32, 31]
+         * - IQ4_NL: Unpacks to native IQ4_NL int8 range
+         *
+         * @note Output values are in NATIVE range (e.g., [-8,7] for Q4_0), NOT [-127,127]
+         * @note Use get_block_scale() to retrieve original quantization scale
+         */
+        virtual void unpack_block_to_int8(
+            size_t row_idx,
+            size_t k_block_offset,
+            int8_t *output) const = 0;
+
+        /**
+         * @brief Get original quantization scale for block (from native format)
+         *
+         * Returns the original scale factor used when the block was quantized.
+         * This scale should be applied AFTER BRGEMM matmul, not before unpacking.
+         *
+         * @param row_idx Row index in weight tensor
+         * @param k_block_offset Block offset along K dimension
+         * @return FP32 scale factor from original quantization (e.g., Q4_0 block.d)
+         *
+         * @note For formats with per-block scales (Q4_0, Q8_0), returns block.d (FP16→FP32)
+         * @note For formats with super-block scales (Q6_K), returns appropriate scale for this block
+         */
+        virtual float get_block_scale(
+            size_t row_idx,
+            size_t k_block_offset) const = 0;
     };
 
     /**
@@ -1670,7 +1757,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + 4-bit packed values
      * Compression: 8× vs FP32
      */
-    class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1702,8 +1789,18 @@ namespace llaminar2
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
-        // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
+        // IQ8_0Decodable interface
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        // IINT8Unpackable interface - native Q4_0 → INT8 unpacking
+        void unpack_block_to_int8(
+            size_t row_idx,
+            size_t k_block_offset,
+            int8_t *output) const override;
+
+        float get_block_scale(
+            size_t row_idx,
+            size_t k_block_offset) const override;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(

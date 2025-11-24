@@ -105,22 +105,25 @@ namespace llaminar2
          *
          * Performs:
          * 1. Quantize input: FP32[m,k] → INT8[m,k] + row_scales[m]
-         * 2. Q GEMM: INT8[m,k] × q_weight[k,n] → q_output[m,n] (INT32)
-         * 3. K GEMM: INT8[m,k] × k_weight[k,n] → k_output[m,n] (INT32)
-         * 4. V GEMM: INT8[m,k] × v_weight[k,n] → v_output[m,n] (INT32)
+         * 2. Q GEMM: INT8[m,k] × q_weight[k,n_q] → q_output[m,n_q] (INT32)
+         * 3. K GEMM: INT8[m,k] × k_weight[k,n_kv] → k_output[m,n_kv] (INT32)
+         * 4. V GEMM: INT8[m,k] × v_weight[k,n_kv] → v_output[m,n_kv] (INT32)
          *
          * @param input Input activations [m, k] FP32
-         * @param q_output Output Q INT32 accumulators [m, n]
-         * @param k_output Output K INT32 accumulators [m, n]
-         * @param v_output Output V INT32 accumulators [m, n]
+         * @param q_output Output Q INT32 accumulators [m, n_q]
+         * @param k_output Output K INT32 accumulators [m, n_kv]
+         * @param v_output Output V INT32 accumulators [m, n_kv]
          * @param activation_scales Per-row quantization scales [m] FP32 (output)
          * @param m Batch size (sequence length)
-         * @param n Hidden dimension (output features per projection)
+         * @param n_q Q output dimension (n_heads * head_dim)
+         * @param n_kv K/V output dimension (n_kv_heads * head_dim, may differ for GQA)
          * @param k Input features
          * @return true on success, false on error
          *
          * Note: activation_scales are computed during quantization and needed
          *       for downstream dequantization in attention kernel.
+         *
+         * GQA Support: For Grouped Query Attention, n_q != n_kv (e.g., Qwen2.5: n_q=896, n_kv=128)
          */
         bool execute(
             const float *input,
@@ -128,7 +131,7 @@ namespace llaminar2
             int32_t *k_output,
             int32_t *v_output,
             float *activation_scales,
-            int m, int n, int k);
+            int m, int n_q, int n_kv, int k);
 
         /**
          * @brief Check if kernel supports given device

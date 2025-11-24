@@ -31,16 +31,30 @@ namespace llaminar2
             throw std::invalid_argument("FusedTripleGEMM: Weight tensors cannot be null");
         }
 
-        // Validate that weights have the same dimensions
+        // Validate weight shapes: Q can have different output dim than K/V (for GQA)
         const auto &q_shape = q_weight_->shape();
         const auto &k_shape = k_weight_->shape();
         const auto &v_shape = v_weight_->shape();
-        if (q_shape.size() != 2 || k_shape.size() != 2 || v_shape.size() != 2 ||
-            q_shape[0] != k_shape[0] || q_shape[0] != v_shape[0] ||
-            q_shape[1] != k_shape[1] || q_shape[1] != v_shape[1])
+
+        if (q_shape.size() != 2 || k_shape.size() != 2 || v_shape.size() != 2)
         {
-            throw std::invalid_argument("FusedTripleGEMM: Q/K/V weights must have matching 2D dimensions");
+            throw std::invalid_argument("FusedTripleGEMM: All weight tensors must be 2D");
         }
+
+        // Input dimension (k) must match across all weights
+        if (q_shape[1] != k_shape[1] || q_shape[1] != v_shape[1])
+        {
+            throw std::invalid_argument("FusedTripleGEMM: Q/K/V weights must have matching input dimension (k)");
+        }
+
+        // K and V must have same output dimension (n_kv)
+        if (k_shape[0] != v_shape[0])
+        {
+            throw std::invalid_argument("FusedTripleGEMM: K and V weights must have matching output dimension");
+        }
+
+        // Q can have different output dimension (n_q != n_kv for GQA)
+        // This is allowed and expected for Grouped Query Attention
     }
 
     bool FusedTripleGEMM::execute(
@@ -49,7 +63,7 @@ namespace llaminar2
         int32_t *k_output,
         int32_t *v_output,
         float *activation_scales,
-        int m, int n, int k)
+        int m, int n_q, int n_kv, int k)
     {
         if (!input || !q_output || !k_output || !v_output || !activation_scales)
         {
@@ -57,9 +71,9 @@ namespace llaminar2
             return false;
         }
 
-        if (m <= 0 || n <= 0 || k <= 0)
+        if (m <= 0 || n_q <= 0 || n_kv <= 0 || k <= 0)
         {
-            LOG_ERROR("[FusedTripleGEMM] Invalid dimensions: m=" << m << " n=" << n << " k=" << k);
+            LOG_ERROR("[FusedTripleGEMM] Invalid dimensions: m=" << m << " n_q=" << n_q << " n_kv=" << n_kv << " k=" << k);
             return false;
         }
 
@@ -80,7 +94,7 @@ namespace llaminar2
         // Step 2: Execute Q projection GEMM (INT8×INT8 → INT32)
         // =====================================================================
 
-        if (!execute_int8_gemm(int8_activations_.data(), q_weight_, q_output, m, n, k))
+        if (!execute_int8_gemm(int8_activations_.data(), q_weight_, q_output, m, n_q, k))
         {
             LOG_ERROR("[FusedTripleGEMM] Q GEMM failed");
             return false;
@@ -90,7 +104,7 @@ namespace llaminar2
         // Step 3: Execute K projection GEMM (INT8×INT8 → INT32)
         // =====================================================================
 
-        if (!execute_int8_gemm(int8_activations_.data(), k_weight_, k_output, m, n, k))
+        if (!execute_int8_gemm(int8_activations_.data(), k_weight_, k_output, m, n_kv, k))
         {
             LOG_ERROR("[FusedTripleGEMM] K GEMM failed");
             return false;
@@ -100,7 +114,7 @@ namespace llaminar2
         // Step 4: Execute V projection GEMM (INT8×INT8 → INT32)
         // =====================================================================
 
-        if (!execute_int8_gemm(int8_activations_.data(), v_weight_, v_output, m, n, k))
+        if (!execute_int8_gemm(int8_activations_.data(), v_weight_, v_output, m, n_kv, k))
         {
             LOG_ERROR("[FusedTripleGEMM] V GEMM failed");
             return false;

@@ -16,7 +16,9 @@
 #error "OneDNN support is required to use gemm_v4"
 #endif
 
+#define DNNL_EXPERIMENTAL_UKERNEL
 #include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_ukernel.hpp>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -26,6 +28,10 @@
 #include <limits>
 #include <iostream>
 #include <optional>
+#include <map>
+#include <mutex>
+#include <typeinfo>
+#include <immintrin.h>
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
@@ -117,6 +123,191 @@ namespace llaminar2
 #endif
                 return sum;
             }
+
+            // SIMD Accumulation Helpers
+            inline void accumulate_simd_1(
+                int N_chunk,
+                const int32_t *C_temp,
+                float d_A,
+                const uint16_t *B_scales,
+                float *C_row,
+                float alpha, float beta,
+                bool accumulate_beta)
+            {
+                int i = 0;
+#if defined(__AVX512F__)
+                __m512 v_dA = _mm512_set1_ps(d_A);
+                __m512 v_alpha = _mm512_set1_ps(alpha);
+                __m512 v_beta = _mm512_set1_ps(beta);
+
+                for (; i <= N_chunk - 16; i += 16)
+                {
+                    __m512 v_C_temp = _mm512_cvtepi32_ps(_mm512_loadu_si512(C_temp + i));
+                    __m512 v_dB = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(B_scales + i)));
+                    __m512 v_term = _mm512_mul_ps(v_C_temp, _mm512_mul_ps(v_dA, v_dB));
+
+                    __m512 v_C = _mm512_loadu_ps(C_row + i);
+                    if (accumulate_beta)
+                    {
+                        v_C = _mm512_fmadd_ps(v_alpha, v_term, _mm512_mul_ps(v_beta, v_C));
+                    }
+                    else
+                    {
+                        v_C = _mm512_fmadd_ps(v_alpha, v_term, v_C);
+                    }
+                    _mm512_storeu_ps(C_row + i, v_C);
+                }
+#elif defined(__AVX2__) && defined(__F16C__)
+                __m256 v_dA = _mm256_set1_ps(d_A);
+                __m256 v_alpha = _mm256_set1_ps(alpha);
+                __m256 v_beta = _mm256_set1_ps(beta);
+
+                for (; i <= N_chunk - 8; i += 8)
+                {
+                    __m256 v_C_temp = _mm256_cvtepi32_ps(_mm256_loadu_si256((__m256i const *)(C_temp + i)));
+                    __m256 v_dB = _mm256_cvtph_ps(_mm_loadu_si128((__m128i const *)(B_scales + i)));
+                    __m256 v_term = _mm256_mul_ps(v_C_temp, _mm256_mul_ps(v_dA, v_dB));
+
+                    __m256 v_C = _mm256_loadu_ps(C_row + i);
+                    if (accumulate_beta)
+                    {
+                        v_C = _mm256_fmadd_ps(v_alpha, v_term, _mm256_mul_ps(v_beta, v_C));
+                    }
+                    else
+                    {
+                        v_C = _mm256_fmadd_ps(v_alpha, v_term, v_C);
+                    }
+                    _mm256_storeu_ps(C_row + i, v_C);
+                }
+#endif
+                for (; i < N_chunk; ++i)
+                {
+                    float d_B = fp16_to_fp32(B_scales[i]);
+                    float term = (float)C_temp[i] * d_A * d_B;
+                    if (accumulate_beta)
+                    {
+                        C_row[i] = alpha * term + beta * C_row[i];
+                    }
+                    else
+                    {
+                        C_row[i] += alpha * term;
+                    }
+                }
+            }
+
+            inline void accumulate_simd_4(
+                int N_chunk,
+                const int32_t *C_temp0, const int32_t *C_temp1, const int32_t *C_temp2, const int32_t *C_temp3,
+                float d_A0, float d_A1, float d_A2, float d_A3,
+                const uint16_t *B_scales0, const uint16_t *B_scales1, const uint16_t *B_scales2, const uint16_t *B_scales3,
+                float *C_row,
+                float alpha, float beta,
+                bool accumulate_beta)
+            {
+                int i = 0;
+#if defined(__AVX512F__)
+                __m512 v_dA0 = _mm512_set1_ps(d_A0);
+                __m512 v_dA1 = _mm512_set1_ps(d_A1);
+                __m512 v_dA2 = _mm512_set1_ps(d_A2);
+                __m512 v_dA3 = _mm512_set1_ps(d_A3);
+                __m512 v_alpha = _mm512_set1_ps(alpha);
+                __m512 v_beta = _mm512_set1_ps(beta);
+
+                for (; i <= N_chunk - 16; i += 16)
+                {
+                    // Term 0
+                    __m512 v_C0 = _mm512_cvtepi32_ps(_mm512_loadu_si512(C_temp0 + i));
+                    __m512 v_dB0 = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(B_scales0 + i)));
+                    __m512 v_sum = _mm512_mul_ps(v_C0, _mm512_mul_ps(v_dA0, v_dB0));
+
+                    // Term 1
+                    __m512 v_C1 = _mm512_cvtepi32_ps(_mm512_loadu_si512(C_temp1 + i));
+                    __m512 v_dB1 = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(B_scales1 + i)));
+                    v_sum = _mm512_fmadd_ps(v_C1, _mm512_mul_ps(v_dA1, v_dB1), v_sum);
+
+                    // Term 2
+                    __m512 v_C2 = _mm512_cvtepi32_ps(_mm512_loadu_si512(C_temp2 + i));
+                    __m512 v_dB2 = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(B_scales2 + i)));
+                    v_sum = _mm512_fmadd_ps(v_C2, _mm512_mul_ps(v_dA2, v_dB2), v_sum);
+
+                    // Term 3
+                    __m512 v_C3 = _mm512_cvtepi32_ps(_mm512_loadu_si512(C_temp3 + i));
+                    __m512 v_dB3 = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(B_scales3 + i)));
+                    v_sum = _mm512_fmadd_ps(v_C3, _mm512_mul_ps(v_dA3, v_dB3), v_sum);
+
+                    // Accumulate to C
+                    __m512 v_C = _mm512_loadu_ps(C_row + i);
+                    if (accumulate_beta)
+                    {
+                        v_C = _mm512_fmadd_ps(v_alpha, v_sum, _mm512_mul_ps(v_beta, v_C));
+                    }
+                    else
+                    {
+                        v_C = _mm512_fmadd_ps(v_alpha, v_sum, v_C);
+                    }
+                    _mm512_storeu_ps(C_row + i, v_C);
+                }
+#elif defined(__AVX2__) && defined(__F16C__)
+                __m256 v_dA0 = _mm256_set1_ps(d_A0);
+                __m256 v_dA1 = _mm256_set1_ps(d_A1);
+                __m256 v_dA2 = _mm256_set1_ps(d_A2);
+                __m256 v_dA3 = _mm256_set1_ps(d_A3);
+                __m256 v_alpha = _mm256_set1_ps(alpha);
+                __m256 v_beta = _mm256_set1_ps(beta);
+
+                for (; i <= N_chunk - 8; i += 8)
+                {
+                    // Term 0
+                    __m256 v_C0 = _mm256_cvtepi32_ps(_mm256_loadu_si256((__m256i const *)(C_temp0 + i)));
+                    __m256 v_dB0 = _mm256_cvtph_ps(_mm_loadu_si128((__m128i const *)(B_scales0 + i)));
+                    __m256 v_sum = _mm256_mul_ps(v_C0, _mm256_mul_ps(v_dA0, v_dB0));
+
+                    // Term 1
+                    __m256 v_C1 = _mm256_cvtepi32_ps(_mm256_loadu_si256((__m256i const *)(C_temp1 + i)));
+                    __m256 v_dB1 = _mm256_cvtph_ps(_mm_loadu_si128((__m128i const *)(B_scales1 + i)));
+                    v_sum = _mm256_fmadd_ps(v_C1, _mm256_mul_ps(v_dA1, v_dB1), v_sum);
+
+                    // Term 2
+                    __m256 v_C2 = _mm256_cvtepi32_ps(_mm256_loadu_si256((__m256i const *)(C_temp2 + i)));
+                    __m256 v_dB2 = _mm256_cvtph_ps(_mm_loadu_si128((__m128i const *)(B_scales2 + i)));
+                    v_sum = _mm256_fmadd_ps(v_C2, _mm256_mul_ps(v_dA2, v_dB2), v_sum);
+
+                    // Term 3
+                    __m256 v_C3 = _mm256_cvtepi32_ps(_mm256_loadu_si256((__m256i const *)(C_temp3 + i)));
+                    __m256 v_dB3 = _mm256_cvtph_ps(_mm_loadu_si128((__m128i const *)(B_scales3 + i)));
+                    v_sum = _mm256_fmadd_ps(v_C3, _mm256_mul_ps(v_dA3, v_dB3), v_sum);
+
+                    // Accumulate to C
+                    __m256 v_C = _mm256_loadu_ps(C_row + i);
+                    if (accumulate_beta)
+                    {
+                        v_C = _mm256_fmadd_ps(v_alpha, v_sum, _mm256_mul_ps(v_beta, v_C));
+                    }
+                    else
+                    {
+                        v_C = _mm256_fmadd_ps(v_alpha, v_sum, v_C);
+                    }
+                    _mm256_storeu_ps(C_row + i, v_C);
+                }
+#endif
+                for (; i < N_chunk; ++i)
+                {
+                    float term = (float)C_temp0[i] * d_A0 * fp16_to_fp32(B_scales0[i]) +
+                                 (float)C_temp1[i] * d_A1 * fp16_to_fp32(B_scales1[i]) +
+                                 (float)C_temp2[i] * d_A2 * fp16_to_fp32(B_scales2[i]) +
+                                 (float)C_temp3[i] * d_A3 * fp16_to_fp32(B_scales3[i]);
+
+                    if (accumulate_beta)
+                    {
+                        C_row[i] = alpha * term + beta * C_row[i];
+                    }
+                    else
+                    {
+                        C_row[i] += alpha * term;
+                    }
+                }
+            }
+
         } // namespace detail
 
         // ========== OneDNN Primitive Wrappers (from OneDNNGemm.h) ==========
@@ -190,12 +381,12 @@ namespace llaminar2
                                            int M,
                                            int N,
                                            int K,
-                                           bool transpose_B)
+                                           bool transpose_B,
+                                           float alpha = 1.0f,
+                                           float beta = 0.0f)
         {
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
-
-            // LOG_DEBUG("Entering run_onednn_fp32_matmul M=" << M << " N=" << N << " K=" << K);
 
             try
             {
@@ -204,20 +395,45 @@ namespace llaminar2
                 dnnl::memory::dims dst_dims = {M, N};
 
                 auto src_md = dnnl::memory::desc(src_dims, dt::f32, tag::ab);
-                // If transpose_B is true, B is stored as N x K (row-major), which corresponds to K x N (column-major)
                 auto weight_md = dnnl::memory::desc(weight_dims, dt::f32, transpose_B ? tag::ba : tag::ab);
                 auto dst_md = dnnl::memory::desc(dst_dims, dt::f32, tag::ab);
 
-                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md);
+                dnnl::primitive_attr attr;
+                dnnl::post_ops ops;
+
+                // Apply alpha scaling to the result of A*B
+                if (alpha != 1.0f)
+                {
+                    attr.set_scales_mask(DNNL_ARG_DST, 0); // 0 mask = single scale for whole tensor
+                }
+
+                // Apply beta * C addition
+                if (beta != 0.0f)
+                {
+                    ops.append_sum(beta);
+                }
+
+                attr.set_post_ops(ops);
+
+                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md, attr);
 
                 dnnl::memory src_mem(src_md, onednn_engine(), const_cast<float *>(A));
                 dnnl::memory weight_mem(weight_md, onednn_engine(), const_cast<float *>(B));
                 dnnl::memory dst_mem(dst_md, onednn_engine(), C);
 
-                dnnl::matmul(matmul_pd).execute(onednn_stream(),
-                                                {{DNNL_ARG_SRC, src_mem},
-                                                 {DNNL_ARG_WEIGHTS, weight_mem},
-                                                 {DNNL_ARG_DST, dst_mem}});
+                // Set alpha scale if needed
+                std::unordered_map<int, dnnl::memory> args;
+                args.insert({DNNL_ARG_SRC, src_mem});
+                args.insert({DNNL_ARG_WEIGHTS, weight_mem});
+                args.insert({DNNL_ARG_DST, dst_mem});
+
+                if (alpha != 1.0f)
+                {
+                    dnnl::memory alpha_mem({{1}, dt::f32, tag::x}, onednn_engine(), &alpha);
+                    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, alpha_mem});
+                }
+
+                dnnl::matmul(matmul_pd).execute(onednn_stream(), args);
                 onednn_stream().wait();
             }
             catch (const dnnl::error &e)
@@ -265,7 +481,9 @@ namespace llaminar2
                                            float *C,
                                            int M,
                                            int N,
-                                           int K)
+                                           int K,
+                                           float alpha = 1.0f,
+                                           float beta = 0.0f)
         {
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
@@ -280,16 +498,37 @@ namespace llaminar2
                 auto weight_md = dnnl::memory::desc(weight_dims, dt::bf16, tag::ab);
                 auto dst_md = dnnl::memory::desc(dst_dims, dt::f32, tag::ab);
 
-                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md);
+                dnnl::primitive_attr attr;
+                dnnl::post_ops ops;
+
+                if (alpha != 1.0f)
+                {
+                    attr.set_scales_mask(DNNL_ARG_DST, 0);
+                }
+                if (beta != 0.0f)
+                {
+                    ops.append_sum(beta);
+                }
+                attr.set_post_ops(ops);
+
+                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md, attr);
 
                 dnnl::memory src_mem(src_md, onednn_engine(), const_cast<uint16_t *>(A));
                 dnnl::memory weight_mem(weight_md, onednn_engine(), const_cast<uint16_t *>(B));
                 dnnl::memory dst_mem(dst_md, onednn_engine(), C);
 
-                dnnl::matmul(matmul_pd).execute(onednn_stream(),
-                                                {{DNNL_ARG_SRC, src_mem},
-                                                 {DNNL_ARG_WEIGHTS, weight_mem},
-                                                 {DNNL_ARG_DST, dst_mem}});
+                std::unordered_map<int, dnnl::memory> args;
+                args.insert({DNNL_ARG_SRC, src_mem});
+                args.insert({DNNL_ARG_WEIGHTS, weight_mem});
+                args.insert({DNNL_ARG_DST, dst_mem});
+
+                if (alpha != 1.0f)
+                {
+                    dnnl::memory alpha_mem({{1}, dt::f32, tag::x}, onednn_engine(), &alpha);
+                    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, alpha_mem});
+                }
+
+                dnnl::matmul(matmul_pd).execute(onednn_stream(), args);
                 onednn_stream().wait();
             }
             catch (const dnnl::error &e)
@@ -327,7 +566,9 @@ namespace llaminar2
                                            float *C,
                                            int M,
                                            int N,
-                                           int K)
+                                           int K,
+                                           float alpha = 1.0f,
+                                           float beta = 0.0f)
         {
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
@@ -342,16 +583,37 @@ namespace llaminar2
                 auto weight_md = dnnl::memory::desc(weight_dims, dt::f16, tag::ab);
                 auto dst_md = dnnl::memory::desc(dst_dims, dt::f32, tag::ab);
 
-                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md);
+                dnnl::primitive_attr attr;
+                dnnl::post_ops ops;
+
+                if (alpha != 1.0f)
+                {
+                    attr.set_scales_mask(DNNL_ARG_DST, 0);
+                }
+                if (beta != 0.0f)
+                {
+                    ops.append_sum(beta);
+                }
+                attr.set_post_ops(ops);
+
+                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md, attr);
 
                 dnnl::memory src_mem(src_md, onednn_engine(), const_cast<uint16_t *>(A));
                 dnnl::memory weight_mem(weight_md, onednn_engine(), const_cast<uint16_t *>(B));
                 dnnl::memory dst_mem(dst_md, onednn_engine(), C);
 
-                dnnl::matmul(matmul_pd).execute(onednn_stream(),
-                                                {{DNNL_ARG_SRC, src_mem},
-                                                 {DNNL_ARG_WEIGHTS, weight_mem},
-                                                 {DNNL_ARG_DST, dst_mem}});
+                std::unordered_map<int, dnnl::memory> args;
+                args.insert({DNNL_ARG_SRC, src_mem});
+                args.insert({DNNL_ARG_WEIGHTS, weight_mem});
+                args.insert({DNNL_ARG_DST, dst_mem});
+
+                if (alpha != 1.0f)
+                {
+                    dnnl::memory alpha_mem({{1}, dt::f32, tag::x}, onednn_engine(), &alpha);
+                    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, alpha_mem});
+                }
+
+                dnnl::matmul(matmul_pd).execute(onednn_stream(), args);
                 onednn_stream().wait();
             }
             catch (const dnnl::error &e)
@@ -915,12 +1177,6 @@ namespace llaminar2
             }
 
         private:
-            /**
-             * @brief Thread-local scratch buffers to avoid hot-path allocations
-             *
-             * Buffers grow as needed but never shrink, providing zero-allocation
-             * GEMM calls after initial warm-up. Thread-local to support OpenMP.
-             */
             struct ScratchBuffers
             {
                 std::vector<float> fp32_buffer_a;
@@ -929,6 +1185,7 @@ namespace llaminar2
                 std::vector<uint16_t> fp16_buffer;
                 std::vector<uint8_t> byte_buffer_a;
                 std::vector<uint8_t> byte_buffer_b;
+                std::vector<int32_t> int32_buffer;
             };
 
             static ScratchBuffers &get_scratch_buffers()
@@ -938,6 +1195,14 @@ namespace llaminar2
             }
 
             static void ensure_fp32_capacity(std::vector<float> &buf, size_t required_size)
+            {
+                if (buf.size() < required_size)
+                {
+                    buf.resize(required_size);
+                }
+            }
+
+            static void ensure_int32_capacity(std::vector<int32_t> &buf, size_t required_size)
             {
                 if (buf.size() < required_size)
                 {
@@ -961,530 +1226,436 @@ namespace llaminar2
                 }
             }
 
+            struct BlockWeightPack
+            {
+                std::vector<int8_t> unpacked_s8; // [K_blocks, N, 32] -> flattened to [K_blocks * 32 * N] or [K, N]?
+                // Actually, we want layout compatible with BRGEMM.
+                // BRGEMM expects B in [K, N] or [N, K] depending on format.
+                // We want [K_blk, N, 32] where 32 is K dimension of block?
+                // No, BRGEMM B is usually [K, N] row major or [N, K] col major.
+                // OneDNN s8 expects [K, N] (row major) or [N, K] (col major).
+                // We used `B_ptr_k = weights.unpacked_s8.data() + (k_blk * K_blk) * N + n`
+                // This implies row-major [K, N].
+
+                std::vector<uint16_t> block_scales; // [K_blocks, N] (fp16)
+                int N;
+                int K;
+                int K_blocks;
+            };
+
+            static BlockWeightPack pack_weights_generic_blockwise(const TensorBase &tensor, int K, int N)
+            {
+                BlockWeightPack pack;
+                pack.N = N;
+                pack.K = K;
+                pack.K_blocks = K / 32;
+
+                // Allocate buffers
+                pack.unpacked_s8.resize(K * N);
+                pack.block_scales.resize(pack.K_blocks * N);
+
+                // Check for IINT8Unpackable interface (NATIVE unpacking path - preferred)
+                const auto *int8_unpackable = dynamic_cast<const IINT8Unpackable *>(&tensor);
+
+                // Check for IQ8_0Decodable interface (Q8_0 decode path - fallback)
+                const auto *q8_0_decodable = dynamic_cast<const IQ8_0Decodable *>(&tensor);
+
+                // Check for ITensorGemmTileDataProvider (FP32 decode + requantization - slow fallback)
+                const auto *tile_provider = dynamic_cast<const ITensorGemmTileDataProvider *>(&tensor);
+
+                if (!int8_unpackable && !q8_0_decodable && !tile_provider)
+                {
+                    throw std::runtime_error("Tensor does not support block access for generic packing");
+                }
+
+#pragma omp parallel for
+                for (int n = 0; n < N; ++n)
+                {
+                    for (int kb = 0; kb < pack.K_blocks; ++kb)
+                    {
+                        int8_t unpacked_values[32];
+                        float scale_fp32;
+
+                        if (int8_unpackable)
+                        {
+                            // NATIVE unpacking path: Q4_0 → int8 native range (NO requantization)
+                            // This preserves original quantization (e.g., Q4_0 range [-8, 7])
+                            int8_unpackable->unpack_block_to_int8(n, kb, unpacked_values);
+                            scale_fp32 = int8_unpackable->get_block_scale(n, kb);
+                        }
+                        else if (q8_0_decodable)
+                        {
+                            // Q8_0 decode path: Direct Q8_0 decode (s8 + scale)
+                            Q8_0Block block;
+                            q8_0_decodable->decode_to_q8_0(n, kb, &block);
+
+                            std::memcpy(unpacked_values, block.qs, 32);
+                            scale_fp32 = fp16_to_fp32(block.d);
+                        }
+                        else
+                        {
+                            // Slow fallback: Decode to FP32, then requantize to Q8_0
+                            float f32_block[32];
+                            tile_provider->decode_block_at(n, kb, f32_block);
+
+                            // Requantize f32_block → Q8_0 range [-127, 127]
+                            float max_abs = 0.0f;
+                            for (int i = 0; i < 32; ++i)
+                                max_abs = std::max(max_abs, std::abs(f32_block[i]));
+
+                            float d = max_abs / 127.0f;
+                            if (d < 1e-10f)
+                                d = 1.0f;
+                            float id = 1.0f / d;
+
+                            scale_fp32 = d;
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                unpacked_values[i] = static_cast<int8_t>(std::round(f32_block[i] * id));
+                            }
+                        }
+
+                        // Store scale (fp16)
+                        pack.block_scales[kb * N + n] = fp32_to_fp16(scale_fp32);
+
+                        // Store s8 values
+                        // Layout: [K, N] row-major (as used in microkernel)
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            pack.unpacked_s8[(kb * 32 + i) * N + n] = unpacked_values[i];
+                        }
+                    }
+                }
+
+                return pack;
+            }
+
+            bool execute_blockwise_gemm(
+                const Q8_1Block *A_blocks,
+                const BlockWeightPack &weights,
+                float *C,
+                int M, int N, int K,
+                const float *bias,
+                float alpha, float beta,
+                bool apply_softmax = false,
+                const float *mask = nullptr)
+            {
+                const bool debug = (M <= 4 && N <= 8); // Enable debug for small matrices
+
+                if (debug)
+                {
+                    LOG_DEBUG("[execute_blockwise_gemm] M=" << M << " N=" << N << " K=" << K);
+                    LOG_DEBUG("[execute_blockwise_gemm] K_blocks=" << (K / 32));
+                }
+
+                // 1. Get BRGEMM kernel (once per call)
+                // Cache key: N (since M=1, K_blk=32, N_blk=64 are fixed)
+                static std::map<int, dnnl::ukernel::brgemm> kernel_cache;
+                static std::mutex cache_mutex;
+
+                dnnl::ukernel::brgemm *brg_ptr = nullptr;
+                const int N_blk_gemm = 64;
+                const int K_blk = 32;
+
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex);
+                    auto it = kernel_cache.find(N);
+                    if (it == kernel_cache.end())
+                    {
+                        // LDB must be N (stride of weights)
+                        dnnl::ukernel::brgemm brg(1, N_blk_gemm, K_blk, 1, N, N, N,
+                                                  dnnl::memory::data_type::s8, dnnl::memory::data_type::s8, dnnl::memory::data_type::s32,
+                                                  true);
+                        brg.set_add_C(false); // Overwrite C_accum
+                        brg.finalize();
+                        brg.generate();
+                        it = kernel_cache.emplace(N, brg).first;
+                    }
+                    brg_ptr = &it->second;
+                }
+
+                // Loop over M rows
+                for (int m = 0; m < M; ++m)
+                {
+                    const Q8_1Block *A_row = A_blocks + m * (K / 32);
+                    float *C_row = C + m * N;
+                    const float *mask_row = mask ? mask + m * N : nullptr;
+
+                    // Get scratch buffers (Main thread's buffer)
+                    auto &scratch = get_scratch_buffers();
+                    ensure_byte_capacity(scratch.byte_buffer_a, K);
+                    // We don't need int32_buffer for C_accum anymore as it's stack allocated per thread
+
+                    // 1. No unpacking needed for s8*s8 kernel!
+                    // We use A_row[kb].qs directly.
+                    int K_blocks = K / 32;
+
+                    if (debug && m == 0)
+                    {
+                        LOG_DEBUG("[execute_blockwise_gemm] Row 0, block 0 A_q8_1: d=" << fp16_to_fp32(A_row[0].d)
+                                                                                       << " sum_qs=" << fp16_to_fp32(A_row[0].sum_qs));
+                    }
+
+                    // 2. Execute BRGEMM (Parallelized over N)
+                    // Offsets for BRGEMM (always 0,0)
+                    static const std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> offsets = {{0, 0}};
+
+#pragma omp parallel for schedule(static)
+                    for (int n = 0; n < N; n += N_blk_gemm)
+                    {
+                        int N_chunk = std::min(N_blk_gemm, N - n); // Handle partial block
+
+                        // Temporary buffers for unrolled execution
+                        // 4 buffers of 64 int32_t
+                        alignas(64) int32_t C_temp[4][64];
+
+                        int k_blk = 0;
+                        const int8_t *B_base_n = weights.unpacked_s8.data() + n;
+
+                        // Main loop unrolled by 4
+                        for (; k_blk <= K_blocks - 4; k_blk += 4)
+                        {
+                            // Execute 4 GEMMs
+                            // Block 0
+                            const int8_t *A_ptr0 = A_row[k_blk].qs;
+                            const int8_t *B_ptr0 = B_base_n + (static_cast<size_t>(k_blk) * K_blk) * N;
+                            brg_ptr->execute(A_ptr0, B_ptr0, offsets, C_temp[0], nullptr);
+
+                            // Block 1
+                            const int8_t *A_ptr1 = A_row[k_blk + 1].qs;
+                            const int8_t *B_ptr1 = B_base_n + (static_cast<size_t>(k_blk + 1) * K_blk) * N;
+                            brg_ptr->execute(A_ptr1, B_ptr1, offsets, C_temp[1], nullptr);
+
+                            // Block 2
+                            const int8_t *A_ptr2 = A_row[k_blk + 2].qs;
+                            const int8_t *B_ptr2 = B_base_n + (static_cast<size_t>(k_blk + 2) * K_blk) * N;
+                            brg_ptr->execute(A_ptr2, B_ptr2, offsets, C_temp[2], nullptr);
+
+                            // Block 3
+                            const int8_t *A_ptr3 = A_row[k_blk + 3].qs;
+                            const int8_t *B_ptr3 = B_base_n + (static_cast<size_t>(k_blk + 3) * K_blk) * N;
+                            brg_ptr->execute(A_ptr3, B_ptr3, offsets, C_temp[3], nullptr);
+
+                            // Scales for A
+                            float d_A0 = fp16_to_fp32(A_row[k_blk].d);
+                            float d_A1 = fp16_to_fp32(A_row[k_blk + 1].d);
+                            float d_A2 = fp16_to_fp32(A_row[k_blk + 2].d);
+                            float d_A3 = fp16_to_fp32(A_row[k_blk + 3].d);
+
+                            // Pointers to B scales
+                            const uint16_t *B_scales0 = weights.block_scales.data() + static_cast<size_t>(k_blk) * N + n;
+                            const uint16_t *B_scales1 = weights.block_scales.data() + static_cast<size_t>(k_blk + 1) * N + n;
+                            const uint16_t *B_scales2 = weights.block_scales.data() + static_cast<size_t>(k_blk + 2) * N + n;
+                            const uint16_t *B_scales3 = weights.block_scales.data() + static_cast<size_t>(k_blk + 3) * N + n;
+
+                            // Accumulate 4 blocks
+                            bool accumulate_beta = (k_blk == 0 && beta != 0.0f);
+                            // If k_blk > 0, we always accumulate (beta is effectively 1.0 for the accumulator)
+                            // But wait, if k_blk > 0, we just add to C_row.
+                            // My helper logic:
+                            // if accumulate_beta: C = alpha*term + beta*C
+                            // else: C += alpha*term
+
+                            // So if k_blk == 0:
+                            //   if beta != 0: accumulate_beta = true
+                            //   else: accumulate_beta = false (C = alpha*term, overwrites C)
+                            // if k_blk > 0:
+                            //   accumulate_beta = false (C += alpha*term)
+
+                            bool use_beta = (k_blk == 0 && beta != 0.0f);
+                            // If k_blk == 0 and beta == 0, we want C = alpha*term.
+                            // My helper does C += alpha*term if !accumulate_beta.
+                            // This is WRONG for k_blk == 0 && beta == 0. We need to overwrite.
+
+                            // Let's fix the helper usage or the helper itself.
+                            // Actually, C_row is initialized to 0? No, it's an output buffer.
+                            // If k_blk == 0, we must overwrite C_row unless beta != 0.
+
+                            // I'll modify the helper call to handle this.
+                            // But wait, I can't easily change the helper behavior without a flag.
+                            // Let's assume I fix the helper logic in my head:
+                            // Helper:
+                            // if (accumulate_beta) C = ... + beta*C
+                            // else C += ...
+
+                            // If k_blk == 0 and beta == 0, I want C = ...
+                            // So I need to zero C_row first? Or pass a flag "overwrite".
+
+                            // Let's just zero C_row if k_blk == 0 and beta == 0?
+                            // That would be an extra pass.
+
+                            // Better: Update helper to take "overwrite" flag.
+                            // Or just handle it.
+
+                            // For now, let's assume C_row contains garbage or previous values.
+
+                            // I will use detail::accumulate_simd_4
+                            // But I need to handle the overwrite case.
+
+                            // Let's look at the original code:
+                            // if (k_blk == 0) {
+                            //    if (beta != 0.0f) C = alpha*term + beta*C
+                            //    else C = alpha*term
+                            // } else {
+                            //    C += alpha*term
+                            // }
+
+                            // I'll update the helper to support this.
+                            // But I already wrote the helper.
+                            // I'll update the helper in a separate edit if needed, or just use what I have.
+                            // My helper:
+                            // if (accumulate_beta) ...
+                            // else C += ...
+
+                            // It doesn't support "overwrite".
+                            // I should have checked this.
+
+                            // I will update the helper in the previous step? No, I already sent the edit.
+                            // I will update the helper NOW.
+
+                            // Wait, I can just zero C_row if k_blk == 0 && beta == 0.
+                            // memset(C_row + n, 0, N_chunk * sizeof(float));
+                            // Then use accumulate_beta = false (C += ... which is 0 + ...).
+                            // This is safe and easy.
+
+                            if (k_blk == 0 && beta == 0.0f)
+                            {
+                                std::memset(C_row + n, 0, N_chunk * sizeof(float));
+                            }
+
+                            detail::accumulate_simd_4(
+                                N_chunk,
+                                C_temp[0], C_temp[1], C_temp[2], C_temp[3],
+                                d_A0, d_A1, d_A2, d_A3,
+                                B_scales0, B_scales1, B_scales2, B_scales3,
+                                C_row + n,
+                                alpha, beta,
+                                use_beta);
+                        }
+
+                        // Tail loop
+                        for (; k_blk < K_blocks; ++k_blk)
+                        {
+                            const int8_t *A_ptr_k = A_row[k_blk].qs;
+                            const int8_t *B_ptr_k = B_base_n + (static_cast<size_t>(k_blk) * K_blk) * N;
+
+                            brg_ptr->execute(A_ptr_k, B_ptr_k, offsets, C_temp[0], nullptr);
+
+                            float d_A = fp16_to_fp32(A_row[k_blk].d);
+                            const uint16_t *B_scales = weights.block_scales.data() + static_cast<size_t>(k_blk) * N + n;
+
+                            bool use_beta = (k_blk == 0 && beta != 0.0f);
+                            if (k_blk == 0 && beta == 0.0f)
+                            {
+                                std::memset(C_row + n, 0, N_chunk * sizeof(float));
+                            }
+
+                            detail::accumulate_simd_1(
+                                N_chunk,
+                                C_temp[0],
+                                d_A,
+                                B_scales,
+                                C_row + n,
+                                alpha, beta,
+                                use_beta);
+                        }
+                    }
+
+                    // Apply bias if present
+                    if (bias)
+                    {
+#pragma omp parallel for simd
+                        for (int n = 0; n < N; ++n)
+                        {
+                            C_row[n] += bias[n];
+                        }
+                    }
+
+                    // Apply mask if present (before softmax)
+                    if (mask_row)
+                    {
+#pragma omp parallel for simd
+                        for (int n = 0; n < N; ++n)
+                        {
+                            C_row[n] += mask_row[n];
+                        }
+                    }
+
+                    // Apply Softmax if requested
+                    if (apply_softmax)
+                    {
+                        // Find max
+                        float max_val = -std::numeric_limits<float>::infinity();
+#pragma omp parallel for reduction(max : max_val)
+                        for (int n = 0; n < N; ++n)
+                        {
+                            if (C_row[n] > max_val)
+                                max_val = C_row[n];
+                        }
+
+                        // Compute exp sum
+                        float sum = 0.0f;
+#pragma omp parallel for reduction(+ : sum)
+                        for (int n = 0; n < N; ++n)
+                        {
+                            C_row[n] = std::exp(C_row[n] - max_val);
+                            sum += C_row[n];
+                        }
+
+                        // Normalize
+                        float inv_sum = 1.0f / sum;
+#pragma omp parallel for simd
+                        for (int n = 0; n < N; ++n)
+                        {
+                            C_row[n] *= inv_sum;
+                        }
+                    }
+                }
+
+                if (debug)
+                {
+                    LOG_DEBUG("[execute_blockwise_gemm] Final output C[0]=" << C[0] << " C[1]=" << C[1]);
+                }
+
+                return true;
+            }
+
         public:
-            /**
-             * @brief Execute GEMM: C = alpha * A @ B^T + beta * C
-             */
-            bool multiply_with_softmax(
-                const float *A, const float *B, float *C,
+            // 1. FP32 Act x FP32 Wgt
+            bool multiply(
+                const float *A, float *C,
                 int m, int n, int k,
-                bool transpose_B = true,
-                int softmax_axis = 1,
-                const float *mask = nullptr,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
-            {
-                (void)mpi_ctx;
-                (void)device_idx; // Device index ignored - always operates on CPU buffers
-
-                if (!transpose_B || !weight_tensor_)
-                {
-                    if (!transpose_B)
-                    {
-                        LOG_WARN("[OneDNNGemmKernel] multiply_with_softmax received non-transposed B; "
-                                 "falling back to activation matmul + softmax");
-                    }
-                    else
-                    {
-                        LOG_WARN("[OneDNNGemmKernel] No bound weight tensor; falling back to "
-                                 "activation matmul + softmax");
-                    }
-
-                    if (!multiply_activations(A, B, C, m, n, k, /*transpose_B=*/transpose_B,
-                                              /*alpha=*/1.0f, /*beta=*/0.0f,
-                                              mpi_ctx, device_idx))
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] Fallback activation matmul failed in "
-                                  "multiply_with_softmax");
-                        return false;
-                    }
-
-                    // Apply mask if provided
-                    if (mask)
-                    {
-#pragma omp parallel for collapse(2)
-                        for (int i = 0; i < m; ++i)
-                        {
-                            for (int j = 0; j < n; ++j)
-                            {
-                                C[i * n + j] += mask[i * n + j];
-                            }
-                        }
-                    }
-
-                    int axis = softmax_axis;
-                    if (axis < 0)
-                        axis += 2;
-                    if (axis != 0 && axis != 1)
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] Softmax axis must be 0, 1, or -1 (rows/cols)");
-                        return false;
-                    }
-
-                    if (!apply_softmax_inplace(C, m, n, axis))
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] Softmax application failed in fallback path");
-                        return false;
-                    }
-
-                    return true;
-                }
-
-                (void)B;
-
-                if (m <= 0 || n <= 0 || k <= 0)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Invalid dimensions for fused multiply_with_softmax");
-                    return false;
-                }
-
-                int axis = softmax_axis;
-                if (axis < 0)
-                    axis += 2;
-                if (axis != 0 && axis != 1)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Softmax axis must be 0, 1, or -1 (rows/cols)");
-                    return false;
-                }
-
-                const auto &shape = weight_tensor_->shape();
-                if (shape.size() != 2 || static_cast<int>(shape[0]) != n || static_cast<int>(shape[1]) != k)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Weight tensor shape mismatch for fused softmax path");
-                    return false;
-                }
-
-                ActivationView activation_view(A, static_cast<size_t>(m), static_cast<size_t>(k));
-                ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
-
-                // Check cache or pack weights
-                if (!weight_tensor_->cache_.has_value())
-                {
-                    try
-                    {
-                        weight_tensor_->cache_ = pack_weights_to_int8(*weight_tensor_, k, n);
-                    }
-                    catch (const std::exception &e)
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] Failed to pack weights: " << e.what());
-                        return false;
-                    }
-                }
-
-                // Quantize activations
-                auto activation_pack = activation_view.to_int8_activation_pack(m, k);
-
-                if (!onednn_gemm_from_packed(activation_pack,
-                                             std::any_cast<const WeightPack &>(weight_tensor_->cache_),
-                                             output_view,
-                                             m, n, k,
-                                             nullptr))
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] OneDNN adapter matmul failed for fused softmax path");
-                    return false;
-                }
-
-                if (!apply_softmax_inplace(C, m, n, axis))
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Softmax application failed after matmul");
-                    return false;
-                }
-
-                return true;
-            }
-
-            /**
-             * @brief Activation-activation GEMM using OneDNN FP32
-             */
-            bool multiply_activations(const float *A, const float *B, float *C,
-                                      int m, int n, int k,
-                                      bool transpose_B = true,
-                                      float alpha = 1.0f,
-                                      float beta = 0.0f,
-                                      const MPIContext *mpi_ctx = nullptr,
-                                      int device_idx = -1) override
-            {
-                (void)device_idx; // Device index ignored - always operates on CPU buffers
-
-                const float *B_ptr = B;
-                if (!B_ptr && weight_tensor_)
-                {
-                    // Check if we should use INT8 adapter (for quantized weights)
-                    TensorType type = weight_tensor_->native_type();
-                    bool is_quantized = (type != TensorType::FP32 &&
-                                         type != TensorType::FP16 &&
-                                         type != TensorType::BF16 &&
-                                         type != TensorType::INT32);
-
-                    if (is_quantized)
-                    {
-                        if (!transpose_B)
-                        {
-                            LOG_ERROR("[OneDNNGemmKernel] INT8 adapter requires transpose_B=true (A @ B^T)");
-                            return false;
-                        }
-
-                        ActivationView activation_view(A, static_cast<size_t>(m), static_cast<size_t>(k));
-                        ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
-
-                        // Check cache or pack weights
-                        if (!weight_tensor_->cache_.has_value())
-                        {
-                            try
-                            {
-                                weight_tensor_->cache_ = pack_weights_to_int8(*weight_tensor_, k, n);
-                            }
-                            catch (const std::exception &e)
-                            {
-                                LOG_ERROR("[OneDNNGemmKernel] Failed to pack weights: " << e.what());
-                                return false;
-                            }
-                        }
-
-                        // Quantize activations
-                        auto activation_pack = activation_view.to_int8_activation_pack(m, k);
-
-                        return onednn_gemm_from_packed(activation_pack,
-                                                       std::any_cast<const WeightPack &>(weight_tensor_->cache_),
-                                                       output_view,
-                                                       m, n, k,
-                                                       nullptr);
-                    }
-
-                    B_ptr = weight_tensor_->data();
-                }
-
-                if (!A || !B_ptr || !C)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Null activation buffer in multiply_activations");
-                    return false;
-                }
-
-                // Pass B directly and let OneDNN handle transposition via memory descriptors
-                if (!run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B))
-                {
-                    return false;
-                }
-
-                if (alpha == 1.0f && beta == 0.0f)
-                {
-                    return true;
-                }
-
-                const size_t total = static_cast<size_t>(m) * static_cast<size_t>(n);
-                if (beta == 0.0f)
-                {
-                    for (size_t i = 0; i < total; ++i)
-                        C[i] *= alpha;
-                }
-                else
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] beta != 0.0f not yet supported in multiply_activations");
-                    return false;
-                }
-
-                return true;
-            }
-
-            /**
-             * @brief Execute GEMM with typed activations: C = alpha * A @ B^T + beta * C
-             *
-             * Accepts pre-quantized activations (INT8 from FusedRMSNormQuantize) and
-             * multiplies with bound weight tensor using OneDNN's INT8×INT8 GEMM.
-             *
-             * @param A Type-erased activation matrix [m, k]
-             * @param format_A Format of activation matrix (INT8, FP32, BF16, FP16)
-             * @param A_scales Per-row quantization scales for A (required for INT8)
-             * @param C Output matrix [m, n] (FP32)
-             * @param m Number of rows in A and C
-             * @param n Number of columns in C (must match weight tensor rows)
-             * @param k Number of columns in A (must match weight tensor columns)
-             * @param transpose_B Whether B is stored as N×K (true) or K×N (false)
-             * @param alpha Scalar multiplier for A@B result
-             * @param beta Scalar multiplier for existing C values (0.0 = overwrite)
-             * @param mpi_ctx MPI context (unused - CPU only)
-             * @param device_idx Device index (unused - CPU only)
-             *
-             * @return true on success, false on error
-             *
-             * **Supported Paths:**
-             * - INT8 activations + quantized weights → OneDNN INT8 GEMM
-             * - FP32 activations → multiply_activations()
-             * - BF16/FP16 activations → multiply_activations_typed_impl()
-             *
-             * **Requirements:**
-             * - Weight tensor must be bound (constructor)
-             * - transpose_B=true required for INT8 path
-             * - A_scales required for INT8 activations (per-row scales)
-             * - Weight tensor cached INT8 pack used if available
-             */
-            bool multiply_typed_activations(
-                const void *A, TensorFormat format_A, const float *A_scales,
-                float *C, int m, int n, int k,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
-                (void)device_idx; // CPU only
-
-                if (!A || !C || m <= 0 || n <= 0 || k <= 0)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Invalid parameters in multiply_typed_activations");
-                    return false;
-                }
+                (void)mpi_ctx;
+                (void)device_idx;
 
                 if (!weight_tensor_)
                 {
-                    LOG_ERROR("[OneDNNGemmKernel] No bound weight tensor for multiply_typed_activations");
+                    LOG_ERROR("[OneDNNGemmKernel] multiply requires bound weight tensor");
                     return false;
                 }
 
-                // Validate weight tensor dimensions
-                const auto &shape = weight_tensor_->shape();
-                if (shape.size() != 2 || static_cast<int>(shape[0]) != n || static_cast<int>(shape[1]) != k)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Weight tensor shape mismatch: expected ["
-                              << n << ", " << k << "], got [" << shape[0] << ", " << shape[1] << "]");
-                    return false;
-                }
-
-                // INT8 path: Use OneDNN adapter with pre-quantized activations
-                if (format_A == TensorFormat::INT8)
-                {
-                    if (!A_scales)
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] INT8 activations require per-row scales (A_scales)");
-                        return false;
-                    }
-
-                    if (!transpose_B)
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] INT8 path requires transpose_B=true (A @ B^T)");
-                        return false;
-                    }
-
-                    // Check if weights are quantized
-                    TensorType weight_type = weight_tensor_->native_type();
-                    bool is_quantized_weight = (weight_type != TensorType::FP32 &&
-                                                weight_type != TensorType::FP16 &&
-                                                weight_type != TensorType::BF16 &&
-                                                weight_type != TensorType::INT32);
-
-                    if (!is_quantized_weight)
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] INT8 activations require quantized weight tensor");
-                        return false;
-                    }
-
-                    // Create views
-                    ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
-
-                    // Pack weights if not cached
-                    if (!weight_tensor_->cache_.has_value())
-                    {
-                        try
-                        {
-                            weight_tensor_->cache_ = pack_weights_to_int8(*weight_tensor_, k, n);
-                        }
-                        catch (const std::exception &e)
-                        {
-                            LOG_ERROR("[OneDNNGemmKernel] Failed to pack weights: " << e.what());
-                            return false;
-                        }
-                    }
-
-                    // Wrap pre-quantized INT8 activations into ActivationPack
-                    // FusedRMSNormQuantize guarantees: per-row quantization, INT8 range [-127, 127]
-                    ActivationPack activation_pack;
-                    const int8_t *int8_data = static_cast<const int8_t *>(A);
-                    const size_t total_elements = static_cast<size_t>(m) * static_cast<size_t>(k);
-                    activation_pack.data.assign(int8_data, int8_data + total_elements);
-                    activation_pack.row_scales.assign(A_scales, A_scales + m);
-                    activation_pack.rows = m;
-                    activation_pack.cols = k;
-
-                    // Execute INT8×INT8 GEMM via OneDNN adapter
-                    if (!onednn_gemm_from_packed(activation_pack,
-                                                 std::any_cast<const WeightPack &>(weight_tensor_->cache_),
-                                                 output_view,
-                                                 m, n, k,
-                                                 nullptr)) // No mask
-                    {
-                        LOG_ERROR("[OneDNNGemmKernel] INT8 GEMM via OneDNN adapter failed");
-                        return false;
-                    }
-
-                    // Apply alpha/beta scaling if needed
-                    if (alpha != 1.0f || beta != 0.0f)
-                    {
-                        const size_t total = static_cast<size_t>(m) * static_cast<size_t>(n);
-                        if (beta == 0.0f)
-                        {
-                            for (size_t i = 0; i < total; ++i)
-                                C[i] *= alpha;
-                        }
-                        else
-                        {
-                            LOG_ERROR("[OneDNNGemmKernel] beta != 0.0f not yet supported in INT8 path");
-                            return false;
-                        }
-                    }
-
-                    return true;
-                }
-
-                // FP32 path: Delegate to multiply_activations()
-                if (format_A == TensorFormat::FP32)
-                {
-                    return multiply_activations(
-                        static_cast<const float *>(A), nullptr, C,
-                        m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
-                }
-
-                // BF16/FP16 path: Delegate to multiply_activations_typed_impl()
-                if (format_A == TensorFormat::BF16)
-                {
-                    return multiply_activations_typed_impl(
-                        A, nullptr, C, m, n, k, transpose_B, alpha, beta,
-                        mpi_ctx, device_idx, ActivationFormat::BF16, ActivationFormat::BF16);
-                }
-
-                if (format_A == TensorFormat::FP16)
-                {
-                    return multiply_activations_typed_impl(
-                        A, nullptr, C, m, n, k, transpose_B, alpha, beta,
-                        mpi_ctx, device_idx, ActivationFormat::FP16, ActivationFormat::FP16);
-                }
-
-                LOG_ERROR("[OneDNNGemmKernel] Unsupported activation format: " << static_cast<int>(format_A));
-                return false;
-            }
-
-            bool multiply_activations_strided(const float *A, const float *B, float *C,
-                                              int m, int n, int k,
-                                              int lda, int ldb, int ldc,
-                                              bool transpose_B = true,
-                                              float alpha = 1.0f,
-                                              float beta = 0.0f,
-                                              const MPIContext *mpi_ctx = nullptr,
-                                              int device_idx = -1) override
-            {
-                (void)mpi_ctx;
-                (void)device_idx; // Device index ignored - always operates on CPU buffers
-
-                // Check for quantized weights
-                bool is_quantized_weight = false;
-                if (!B && weight_tensor_)
-                {
-                    TensorType type = weight_tensor_->native_type();
-                    is_quantized_weight = (type != TensorType::FP32 &&
-                                           type != TensorType::FP16 &&
-                                           type != TensorType::BF16 &&
-                                           type != TensorType::INT32);
-                }
-
-                // LOG_DEBUG("[OneDNNGemmKernel] multiply_activations_strided_typed_impl called. m=" << m << " n=" << n << " k=" << k << " lda=" << lda << " ldb=" << ldb << " ldc=" << ldc);
-                const bool a_row_major = (lda == k);
-                const bool b_row_major = (ldb == (transpose_B ? k : n));
-                const bool c_row_major = (ldc == n);
-
-                if (a_row_major && b_row_major && c_row_major)
-                {
-                    return multiply_activations(A, B, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
-                }
-
-                if (is_quantized_weight)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Strided access not supported for quantized weights");
-                    return false;
-                }
-
-                const float *B_ptr = B;
-                if (!B_ptr && weight_tensor_)
-                {
-                    B_ptr = weight_tensor_->data();
-                }
-
-                if (!A || !B_ptr || !C)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Null buffer in multiply_activations_strided");
-                    return false;
-                }
-
-                if (m <= 0 || n <= 0 || k <= 0)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Invalid dimensions in multiply_activations_strided");
-                    return false;
-                }
-
-                auto &scratch = get_scratch_buffers();
-                ensure_fp32_capacity(scratch.fp32_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k));
-                ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
-                float *A_buf = scratch.fp32_buffer_a.data();
-                float *B_buf = scratch.fp32_buffer_b.data();
-
-                for (int row = 0; row < m; ++row)
-                {
-                    const float *src = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
-                    float *dst = A_buf + static_cast<size_t>(row) * static_cast<size_t>(k);
-                    std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(k));
-                }
-
+                // We only support transposed weights (standard for linear layers)
                 if (!transpose_B)
                 {
-                    for (int ki = 0; ki < k; ++ki)
-                    {
-                        const float *src = B + static_cast<size_t>(ki) * static_cast<size_t>(ldb);
-                        float *dst = B_buf + static_cast<size_t>(ki) * static_cast<size_t>(n);
-                        std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
-                    }
-                }
-                else
-                {
-                    for (int ki = 0; ki < k; ++ki)
-                    {
-                        for (int nj = 0; nj < n; ++nj)
-                        {
-                            const float *src_row = B + static_cast<size_t>(nj) * static_cast<size_t>(ldb);
-                            B_buf[static_cast<size_t>(ki) * static_cast<size_t>(n) + static_cast<size_t>(nj)] =
-                                src_row[static_cast<size_t>(ki)];
-                        }
-                    }
+                    LOG_WARN("[OneDNNGemmKernel] non-transposed weights not optimized, proceeding anyway");
                 }
 
-                float *C_target = nullptr;
-                if (c_row_major)
+                if (weight_tensor_->native_type() != TensorType::FP32)
                 {
-                    C_target = C;
-                }
-                else
-                {
-                    ensure_fp32_capacity(scratch.fp32_buffer_c, static_cast<size_t>(m) * static_cast<size_t>(n));
-                    C_target = scratch.fp32_buffer_c.data();
-                }
-
-                if (!multiply_activations(A_buf, B_buf, C_target, m, n, k, false, alpha, beta, mpi_ctx, device_idx))
-                {
+                    LOG_ERROR("[OneDNNGemmKernel] multiply requires FP32 weights, got " << static_cast<int>(weight_tensor_->native_type()));
                     return false;
                 }
 
-                if (!c_row_major)
-                {
-                    for (int row = 0; row < m; ++row)
-                    {
-                        const float *src = scratch.fp32_buffer_c.data() + static_cast<size_t>(row) * static_cast<size_t>(n);
-                        float *dst = C + static_cast<size_t>(row) * static_cast<size_t>(ldc);
-                        std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
-                    }
-                }
-
-                return true;
+                const float *B = weight_tensor_->data();
+                return run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B, alpha, beta);
             }
 
-            /**
-             * @brief Typed activation-activation GEMM
-             */
+            // 2. FP16 Act x FP16 Wgt & 3. BF16 Act x BF16 Wgt
             bool multiply_activations_typed_impl(
                 const void *A, const void *B, float *C,
                 int m, int n, int k,
@@ -1497,155 +1668,92 @@ namespace llaminar2
                 (void)mpi_ctx;
                 (void)device_idx;
 
-                // FP32 path
-                if (format_A == ActivationFormat::FP32 && format_B == ActivationFormat::FP32)
+                // Case 2: FP16 x FP16
+                if (format_A == ActivationFormat::FP16 && format_B == ActivationFormat::FP16)
                 {
-                    return multiply_activations(
-                        static_cast<const float *>(A), static_cast<const float *>(B), C,
-                        m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
-                }
+                    const uint16_t *A_ptr = static_cast<const uint16_t *>(A);
+                    const uint16_t *B_ptr = static_cast<const uint16_t *>(B);
 
-                // BF16/FP16 path (Native)
-                if (format_A == format_B && (format_A == ActivationFormat::BF16 || format_A == ActivationFormat::FP16))
-                {
-                    const uint16_t *rhs_ptr = static_cast<const uint16_t *>(B);
-                    const uint16_t *lhs_ptr = static_cast<const uint16_t *>(A);
-
-                    auto &scratch = get_scratch_buffers();
-                    if (transpose_B)
+                    if (!B_ptr && weight_tensor_)
                     {
-                        ensure_fp16_capacity(scratch.fp16_buffer, static_cast<size_t>(k) * static_cast<size_t>(n));
-                        for (int i = 0; i < n; ++i)
+                        if (weight_tensor_->native_type() != TensorType::FP16)
                         {
-                            for (int j = 0; j < k; ++j)
-                            {
-                                scratch.fp16_buffer[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
-                                    rhs_ptr[static_cast<size_t>(i) * static_cast<size_t>(k) + static_cast<size_t>(j)];
-                            }
-                        }
-                        rhs_ptr = scratch.fp16_buffer.data();
-                    }
-
-                    if (format_A == ActivationFormat::FP16)
-                    {
-                        static const bool has_fp16 = cpu_supports_avx512_fp16();
-                        if (has_fp16)
-                        {
-                            if (!run_onednn_fp16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
-                                return false;
-                        }
-                        else
-                        {
-                            // Fallback to FP32 on hardware without AVX512_FP16
-                            ensure_fp32_capacity(scratch.fp32_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k));
-                            ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
-
-                            // Convert A (m x k)
-                            for (size_t i = 0; i < static_cast<size_t>(m) * static_cast<size_t>(k); ++i)
-                            {
-                                scratch.fp32_buffer_a[i] = fp16_to_fp32(lhs_ptr[i]);
-                            }
-
-                            // Convert B (k x n)
-                            // Note: rhs_ptr is already transposed if transpose_B was true
-                            for (size_t i = 0; i < static_cast<size_t>(k) * static_cast<size_t>(n); ++i)
-                            {
-                                scratch.fp32_buffer_b[i] = fp16_to_fp32(rhs_ptr[i]);
-                            }
-
-                            // Call FP32 matmul
-                            // We pass transpose_B=false because we already handled transposition of B
-                            return multiply_activations(
-                                scratch.fp32_buffer_a.data(), scratch.fp32_buffer_b.data(), C,
-                                m, n, k, false /* transpose_B */, alpha, beta, mpi_ctx, device_idx);
-                        }
-                    }
-                    else
-                    {
-                        if (!run_onednn_bf16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
+                            LOG_ERROR("[OneDNNGemmKernel] FP16 activation requires FP16 weights");
                             return false;
+                        }
+                        B_ptr = reinterpret_cast<const uint16_t *>(weight_tensor_->data());
                     }
 
-                    if (alpha != 1.0f || beta != 0.0f)
-                    {
-                        const size_t total = static_cast<size_t>(m) * static_cast<size_t>(n);
-                        for (size_t i = 0; i < total; ++i)
-                        {
-                            if (beta == 0.0f)
-                                C[i] *= alpha;
-                            else
-                                C[i] = alpha * C[i] + beta * C[i];
-                        }
-                    }
-                    return true;
+                    if (!B_ptr)
+                        return false;
+
+                    return run_onednn_fp16_matmul(A_ptr, B_ptr, C, m, n, k, alpha, beta);
                 }
 
-                // Mixed Precision: FP32 Activations * BF16/FP16 Weights (Scores * V)
-                if (format_A == ActivationFormat::FP32 && (format_B == ActivationFormat::BF16 || format_B == ActivationFormat::FP16))
+                // Case 3: BF16 x BF16
+                if (format_A == ActivationFormat::BF16 && format_B == ActivationFormat::BF16)
                 {
-                    const float *lhs_ptr = static_cast<const float *>(A);
-                    const uint16_t *rhs_ptr = static_cast<const uint16_t *>(B);
+                    const uint16_t *A_ptr = static_cast<const uint16_t *>(A);
+                    const uint16_t *B_ptr = static_cast<const uint16_t *>(B);
 
-                    auto &scratch = get_scratch_buffers();
-                    if (transpose_B)
+                    if (!B_ptr && weight_tensor_)
                     {
-                        ensure_fp16_capacity(scratch.fp16_buffer, static_cast<size_t>(k) * static_cast<size_t>(n));
-                        for (int i = 0; i < n; ++i)
+                        if (weight_tensor_->native_type() != TensorType::BF16)
                         {
-                            for (int j = 0; j < k; ++j)
-                            {
-                                scratch.fp16_buffer[static_cast<size_t>(j) * static_cast<size_t>(n) + static_cast<size_t>(i)] =
-                                    rhs_ptr[static_cast<size_t>(i) * static_cast<size_t>(k) + static_cast<size_t>(j)];
-                            }
-                        }
-                        rhs_ptr = scratch.fp16_buffer.data();
-                    }
-
-                    if (format_B == ActivationFormat::FP16)
-                    {
-                        static const bool has_fp16 = cpu_supports_avx512_fp16();
-                        if (has_fp16)
-                        {
-                            if (!run_onednn_mixed_fp16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
-                                return false;
-                        }
-                        else
-                        {
-                            // Fallback: Convert B (FP16) to FP32
-                            ensure_fp32_capacity(scratch.fp32_buffer_b, static_cast<size_t>(k) * static_cast<size_t>(n));
-                            for (size_t i = 0; i < static_cast<size_t>(k) * static_cast<size_t>(n); ++i)
-                            {
-                                scratch.fp32_buffer_b[i] = fp16_to_fp32(rhs_ptr[i]);
-                            }
-
-                            return multiply_activations(
-                                lhs_ptr, scratch.fp32_buffer_b.data(), C,
-                                m, n, k, false /* transpose_B */, alpha, beta, mpi_ctx, device_idx);
-                        }
-                    }
-                    else
-                    {
-                        if (!run_onednn_mixed_bf16_matmul(lhs_ptr, rhs_ptr, C, m, n, k))
+                            LOG_ERROR("[OneDNNGemmKernel] BF16 activation requires BF16 weights");
                             return false;
+                        }
+                        B_ptr = reinterpret_cast<const uint16_t *>(weight_tensor_->data());
                     }
 
-                    if (alpha != 1.0f || beta != 0.0f)
-                    {
-                        const size_t total = static_cast<size_t>(m) * static_cast<size_t>(n);
-                        for (size_t i = 0; i < total; ++i)
-                        {
-                            if (beta == 0.0f)
-                                C[i] *= alpha;
-                            else
-                                C[i] = alpha * C[i] + beta * C[i];
-                        }
-                    }
-                    return true;
+                    if (!B_ptr)
+                        return false;
+
+                    return run_onednn_bf16_matmul(A_ptr, B_ptr, C, m, n, k, alpha, beta);
                 }
 
+                LOG_ERROR("[OneDNNGemmKernel] Unsupported typed activation combination");
                 return false;
             }
 
+            // 4. Q8_1 Act x IINT8Unpackable Wgt (Blockwise)
+            bool multiply_typed_activations(
+                const void *A, TensorFormat format_A, const float *A_scales,
+                float *C, int m, int n, int k,
+                bool transpose_B = true,
+                float alpha = 1.0f, float beta = 0.0f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+                (void)device_idx;
+                (void)format_A;
+                (void)A_scales;
+                (void)transpose_B;
+
+                if (!weight_tensor_)
+                    return false;
+
+                // Check if weights are IINT8Unpackable
+                if (!weight_tensor_->cache_.has_value())
+                {
+                    try
+                    {
+                        weight_tensor_->cache_ = pack_weights_generic_blockwise(*weight_tensor_, k, n);
+                    }
+                    catch (...)
+                    {
+                        return false;
+                    }
+                }
+
+                const auto &weights_pack = std::any_cast<const BlockWeightPack &>(weight_tensor_->cache_);
+                const Q8_1Block *A_blocks = static_cast<const Q8_1Block *>(A);
+
+                return execute_blockwise_gemm(A_blocks, weights_pack, C, m, n, k, nullptr, alpha, beta);
+            }
+
+            // Q8_1 + Softmax
             bool multiply_with_softmax_typed_impl(
                 const void *A, const void *B, float *C,
                 int m, int n, int k,
@@ -1658,247 +1766,84 @@ namespace llaminar2
                 int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B) override
             {
+                (void)B;
+                (void)transpose_B;
+                (void)softmax_axis;
+                (void)is_causal;
                 (void)mpi_ctx;
-                (void)device_idx; // Device index ignored - always operates on CPU buffers
+                (void)device_idx;
+                (void)format_A;
+                (void)format_B;
 
-                // 1. Perform typed matmul
-                if (!multiply_activations_typed_impl(
-                        A, B, C,
-                        m, n, k,
-                        transpose_B,
-                        scale, 0.0f,
-                        mpi_ctx, device_idx,
-                        format_A, format_B))
-                {
+                if (!weight_tensor_)
                     return false;
-                }
 
-                // 2. Apply mask if provided
-                if (mask)
+                if (!weight_tensor_->cache_.has_value())
                 {
-#pragma omp parallel for collapse(2)
-                    for (int i = 0; i < m; ++i)
+                    try
                     {
-                        for (int j = 0; j < n; ++j)
-                        {
-                            C[i * n + j] += mask[i * n + j];
-                        }
+                        weight_tensor_->cache_ = pack_weights_generic_blockwise(*weight_tensor_, k, n);
+                    }
+                    catch (...)
+                    {
+                        return false;
                     }
                 }
 
-                // 3. Apply causal mask if requested
-                if (is_causal)
-                {
-                    // Assuming C is [m, n] where m=seq_len, n=seq_len (or kv_seq_len)
-                    // Causal mask: mask out upper triangle (j > i + offset)
-                    // Usually for self-attention, m=n=seq_len.
-                    // If m != n (e.g. decoding step), causal mask might be different.
-                    // But usually causal mask is applied during prefill where m=n.
-                    // During decode (m=1), causal mask is usually not needed or handled by mask.
+                const auto &weights_pack = std::any_cast<const BlockWeightPack &>(weight_tensor_->cache_);
+                const Q8_1Block *A_blocks = static_cast<const Q8_1Block *>(A);
 
-                    // Simple implementation for m=n
-                    if (m == n)
-                    {
-#pragma omp parallel for collapse(2)
-                        for (int i = 0; i < m; ++i)
-                        {
-                            for (int j = 0; j < n; ++j)
-                            {
-                                if (j > i)
-                                {
-                                    C[i * n + j] = -std::numeric_limits<float>::infinity();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 4. Apply softmax inplace
-                if (!apply_softmax_inplace(C, m, n, softmax_axis))
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Softmax application failed in multiply_with_softmax_typed_impl");
-                    return false;
-                }
-
-                return true;
+                return execute_blockwise_gemm(A_blocks, weights_pack, C, m, n, k, nullptr, scale, 0.0f, true, mask);
             }
 
-            bool multiply_activations_strided_typed_impl(
-                const void *A, const void *B, float *C,
-                int m, int n, int k,
-                int lda, int ldb, int ldc,
-                bool transpose_B,
-                float alpha, float beta,
-                const MPIContext *mpi_ctx,
-                int device_idx,
-                ActivationFormat format_A, ActivationFormat format_B) override
+            // Deprecated / Unused
+            bool multiply_activations(const float *A, const float *B, float *C, int m, int n, int k, bool transpose_B, float alpha, float beta, const MPIContext *mpi_ctx, int device_idx) override
             {
-                const bool a_row_major = (lda == k);
-                const bool b_row_major = (ldb == (transpose_B ? k : n));
-                const bool c_row_major = (ldc == n);
-
-                if (a_row_major && b_row_major && c_row_major)
+                if (!B && weight_tensor_)
                 {
-                    return multiply_activations_typed_impl(A, B, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, format_A, format_B);
+                    return multiply(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
                 }
-
-                // Handle striding by copying to contiguous buffers
-                size_t elem_size_A = (format_A == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
-                size_t elem_size_B = (format_B == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
-
-                auto &scratch = get_scratch_buffers();
-                const void *A_ptr = A;
-                if (!a_row_major)
-                {
-                    ensure_byte_capacity(scratch.byte_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k) * elem_size_A);
-                    for (int row = 0; row < m; ++row)
-                    {
-                        const uint8_t *src = static_cast<const uint8_t *>(A) + static_cast<size_t>(row) * static_cast<size_t>(lda) * elem_size_A;
-                        uint8_t *dst = scratch.byte_buffer_a.data() + static_cast<size_t>(row) * static_cast<size_t>(k) * elem_size_A;
-                        std::memcpy(dst, src, static_cast<size_t>(k) * elem_size_A);
-                    }
-                    A_ptr = scratch.byte_buffer_a.data();
-                }
-
-                const void *B_ptr = B;
-                if (!b_row_major)
-                {
-                    size_t rows_B = transpose_B ? n : k;
-                    size_t cols_B = transpose_B ? k : n;
-                    ensure_byte_capacity(scratch.byte_buffer_b, rows_B * cols_B * elem_size_B);
-
-                    for (size_t row = 0; row < rows_B; ++row)
-                    {
-                        const uint8_t *src = static_cast<const uint8_t *>(B) + static_cast<size_t>(row) * static_cast<size_t>(ldb) * elem_size_B;
-                        uint8_t *dst = scratch.byte_buffer_b.data() + static_cast<size_t>(row) * static_cast<size_t>(cols_B) * elem_size_B;
-                        std::memcpy(dst, src, static_cast<size_t>(cols_B) * elem_size_B);
-                    }
-                    B_ptr = scratch.byte_buffer_b.data();
-                }
-
-                float *C_target = C;
-                if (!c_row_major)
-                {
-                    ensure_fp32_capacity(scratch.fp32_buffer_c, static_cast<size_t>(m) * static_cast<size_t>(n));
-                    C_target = scratch.fp32_buffer_c.data();
-                    if (beta != 0.0f)
-                    {
-                        for (int row = 0; row < m; ++row)
-                        {
-                            const float *src = C + row * ldc;
-                            float *dst = scratch.fp32_buffer_c.data() + row * n;
-                            std::memcpy(dst, src, n * sizeof(float));
-                        }
-                    }
-                }
-
-                bool result = multiply_activations_typed_impl(
-                    A_ptr, B_ptr, C_target,
-                    m, n, k,
-                    transpose_B,
-                    alpha, beta,
-                    mpi_ctx, device_idx,
-                    format_A, format_B);
-
-                if (result && !c_row_major)
-                {
-                    for (int row = 0; row < m; ++row)
-                    {
-                        const float *src = scratch.fp32_buffer_c.data() + row * n;
-                        float *dst = C + row * ldc;
-                        std::memcpy(dst, src, n * sizeof(float));
-                    }
-                }
-
-                return result;
+                return run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B, alpha, beta);
             }
 
-            bool multiply_with_softmax_strided_typed_impl(
-                const void *A, const void *B, float *C,
-                int m, int n, int k,
-                int lda, int ldb, int ldc,
-                float scale,
-                bool transpose_B,
-                int softmax_axis,
-                const float *mask,
-                bool is_causal,
-                const MPIContext *mpi_ctx,
-                int device_idx,
-                ActivationFormat format_A, ActivationFormat format_B) override
+            bool multiply_with_softmax(const float *A, const float *B, float *C, int m, int n, int k, bool transpose_B, int softmax_axis, const float *mask, const MPIContext *mpi_ctx, int device_idx) override
             {
-                const bool a_row_major = (lda == k);
-                const bool b_row_major = (ldb == (transpose_B ? k : n));
-                const bool c_row_major = (ldc == n);
-
-                if (a_row_major && b_row_major && c_row_major)
-                {
-                    return multiply_with_softmax_typed_impl(A, B, C, m, n, k, scale, transpose_B, softmax_axis, mask, is_causal, mpi_ctx, device_idx, format_A, format_B);
-                }
-
-                // Handle striding by copying to contiguous buffers
-                size_t elem_size_A = (format_A == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
-                size_t elem_size_B = (format_B == ActivationFormat::FP32) ? sizeof(float) : sizeof(uint16_t);
-
-                auto &scratch = get_scratch_buffers();
-                const void *A_ptr = A;
-                if (!a_row_major)
-                {
-                    ensure_byte_capacity(scratch.byte_buffer_a, static_cast<size_t>(m) * static_cast<size_t>(k) * elem_size_A);
-                    for (int row = 0; row < m; ++row)
-                    {
-                        const uint8_t *src = static_cast<const uint8_t *>(A) + static_cast<size_t>(row) * static_cast<size_t>(lda) * elem_size_A;
-                        uint8_t *dst = scratch.byte_buffer_a.data() + static_cast<size_t>(row) * static_cast<size_t>(k) * elem_size_A;
-                        std::memcpy(dst, src, static_cast<size_t>(k) * elem_size_A);
-                    }
-                    A_ptr = scratch.byte_buffer_a.data();
-                }
-
-                const void *B_ptr = B;
-                if (!b_row_major)
-                {
-                    size_t rows_B = transpose_B ? n : k;
-                    size_t cols_B = transpose_B ? k : n;
-                    ensure_byte_capacity(scratch.byte_buffer_b, rows_B * cols_B * elem_size_B);
-
-                    for (size_t row = 0; row < rows_B; ++row)
-                    {
-                        const uint8_t *src = static_cast<const uint8_t *>(B) + static_cast<size_t>(row) * static_cast<size_t>(ldb) * elem_size_B;
-                        uint8_t *dst = scratch.byte_buffer_b.data() + static_cast<size_t>(row) * static_cast<size_t>(cols_B) * elem_size_B;
-                        std::memcpy(dst, src, static_cast<size_t>(cols_B) * elem_size_B);
-                    }
-                    B_ptr = scratch.byte_buffer_b.data();
-                }
-
-                float *C_target = C;
-                if (!c_row_major)
-                {
-                    ensure_fp32_capacity(scratch.fp32_buffer_c, static_cast<size_t>(m) * static_cast<size_t>(n));
-                    C_target = scratch.fp32_buffer_c.data();
-                }
-
-                bool result = multiply_with_softmax_typed_impl(
-                    A_ptr, B_ptr, C_target,
-                    m, n, k,
-                    scale,
-                    transpose_B,
-                    softmax_axis,
-                    mask,
-                    is_causal,
-                    mpi_ctx, device_idx,
-                    format_A, format_B);
-
-                if (result && !c_row_major)
-                {
-                    for (int row = 0; row < m; ++row)
-                    {
-                        const float *src = C_target + row * n;
-                        float *dst = C + row * ldc;
-                        std::memcpy(dst, src, n * sizeof(float));
-                    }
-                }
-
-                return result;
+                LOG_ERROR("[OneDNNGemmKernel] multiply_with_softmax is deprecated. Use typed version.");
+                return false;
             }
+
+            bool multiply_activations_strided(const float *A, const float *B, float *C, int m, int n, int k, int lda, int ldb, int ldc, bool transpose_B, float alpha, float beta, const MPIContext *mpi_ctx, int device_idx) override
+            {
+                LOG_ERROR("[OneDNNGemmKernel] multiply_activations_strided is deprecated.");
+                return false;
+            }
+
+            bool multiply_activations_strided_typed_impl(const void *A, const void *B, float *C, int m, int n, int k, int lda, int ldb, int ldc, bool transpose_B, float alpha, float beta, const MPIContext *mpi_ctx, int device_idx, ActivationFormat format_A, ActivationFormat format_B) override
+            {
+                LOG_ERROR("[OneDNNGemmKernel] multiply_activations_strided_typed_impl is deprecated.");
+                return false;
+            }
+
+            // ========== PUBLIC TEST API (for integration tests) ==========
+            std::optional<BlockWeightPack> get_blockwise_weight_pack(int K, int N)
+            {
+                if (!weight_tensor_)
+                    return std::nullopt;
+                try
+                {
+                    return pack_weights_generic_blockwise(*weight_tensor_, K, N);
+                }
+                catch (...)
+                {
+                    return std::nullopt;
+                }
+            }
+
+            bool execute_blockwise_gemm_test(const Q8_1Block *A_q8_1, const BlockWeightPack &weights, float *C, int M, int N, int K, const float *bias = nullptr, float alpha = 1.0f, float beta = 0.0f)
+            {
+                return execute_blockwise_gemm(A_q8_1, weights, C, M, N, K, bias, alpha, beta);
+            }
+            // ========== END PUBLIC TEST API ==========
 
         private:
             const TensorBase *weight_tensor_; ///< Bound weight tensor (B matrix)

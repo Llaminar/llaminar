@@ -187,6 +187,13 @@ namespace llaminar2
          *       Weight tensor (B) is accessed via this->tensor which has its own device_idx.
          *       If weight is on different device than activation, kernel handles transfer.
          */
+        virtual bool multiply(
+            const float *A, float *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
         /**
          * @brief Activation-activation matrix multiplication: C = alpha * A @ B^T + beta * C
          *

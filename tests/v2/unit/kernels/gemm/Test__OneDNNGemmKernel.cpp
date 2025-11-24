@@ -852,6 +852,327 @@ TEST(Test__OneDNNGemmKernel, TypedActivationsINT8)
     }
 }
 
+TEST(Test__OneDNNGemmKernel, MicrokernelPath_M1)
+{
+    using llaminar2::fp32_to_fp16;
+    using llaminar2::IQ4_NLBlock;
+    using llaminar2::IQ4_NLTensor;
+    using llaminar2::TensorFormat;
+
+    // Microkernel test case: 1 token × 32 hidden_dim, weight [64, 32]
+    const int m = 1;  // batch size (tokens) - Triggers microkernel
+    const int k = 32; // hidden dimension (1 IQ4_NL block)
+    const int n = 64; // output dimension (2 IQ4_NL blocks)
+
+    // Create mock IQ4_NL weight tensor [n, k] = [64, 32]
+    std::vector<size_t> shape = {static_cast<size_t>(n), static_cast<size_t>(k)};
+    size_t blocks_per_row = (k + 31) / 32;            // 1 block per row
+    size_t total_blocks = n * blocks_per_row;         // 64 blocks
+    std::vector<uint8_t> raw_data(total_blocks * 18); // 64 blocks × 18 bytes
+
+    // Initialize blocks with simple values
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+    std::uniform_int_distribution<uint8_t> index_dist(0, 15);
+
+    for (size_t b = 0; b < total_blocks; ++b)
+    {
+        IQ4_NLBlock *block = reinterpret_cast<IQ4_NLBlock *>(raw_data.data() + b * 18);
+        block->d = fp32_to_fp16(scale_dist(rng));
+        for (int i = 0; i < 16; ++i)
+        {
+            uint8_t low = index_dist(rng);
+            uint8_t high = index_dist(rng);
+            block->qs[i] = (high << 4) | low;
+        }
+    }
+
+    auto weight_tensor = std::make_unique<IQ4_NLTensor>(shape, raw_data);
+    ASSERT_EQ(weight_tensor->shape()[0], n);
+    ASSERT_EQ(weight_tensor->shape()[1], k);
+
+    // Create FP32 activations (simulate FusedRMSNormQuantize input)
+    std::vector<float> fp32_activations(m * k);
+    for (int i = 0; i < m * k; ++i)
+    {
+        fp32_activations[i] = static_cast<float>(i % 10) * 0.1f - 0.5f; // Range [-0.5, 0.4]
+    }
+
+    // Quantize to INT8 per-row (simulate FusedRMSNormQuantize output)
+    std::vector<int8_t> int8_activations(m * k);
+    std::vector<float> row_scales(m);
+
+    for (int row = 0; row < m; ++row)
+    {
+        const float *fp32_row = fp32_activations.data() + row * k;
+        int8_t *int8_row = int8_activations.data() + row * k;
+
+        // Find max absolute value for this row
+        float max_abs = 0.0f;
+        for (int col = 0; col < k; ++col)
+        {
+            max_abs = std::max(max_abs, std::abs(fp32_row[col]));
+        }
+
+        // Compute scale (symmetric quantization)
+        const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        row_scales[row] = scale;
+
+        // Quantize
+        for (int col = 0; col < k; ++col)
+        {
+            const float quantized = fp32_row[col] / scale;
+            int8_row[col] = static_cast<int8_t>(std::round(std::clamp(quantized, -127.0f, 127.0f)));
+        }
+    }
+
+    // Create OneDNN GEMM kernel bound to weight tensor
+    OneDNNGemmKernel kernel(weight_tensor.get());
+
+    // Execute GEMM with typed INT8 activations
+    std::vector<float> output(m * n);
+    ASSERT_TRUE(kernel.multiply_typed_activations(
+        int8_activations.data(),
+        TensorFormat::INT8,
+        row_scales.data(),
+        output.data(),
+        m, n, k,
+        true, // transpose_B
+        1.0f, // alpha
+        0.0f, // beta
+        nullptr,
+        -1))
+        << "multiply_typed_activations failed for INT8 path";
+
+    // Verify output is non-zero and reasonable
+    float sum = 0.0f;
+    for (int i = 0; i < m * n; ++i)
+    {
+        sum += std::abs(output[i]);
+    }
+    EXPECT_GT(sum, 0.0f) << "Output should be non-zero";
+
+    // Compare with FP32 reference path (via multiply_activations)
+    std::vector<float> reference_output(m * n);
+    ASSERT_TRUE(kernel.multiply_activations(
+        fp32_activations.data(),
+        nullptr, // Use bound weight tensor
+        reference_output.data(),
+        m, n, k,
+        true,
+        1.0f,
+        0.0f,
+        nullptr,
+        -1))
+        << "multiply_activations failed for FP32 reference";
+
+    // Allow higher tolerance due to INT8 quantization error
+    // FP32→INT8→FP32 round-trip introduces ~1-2% relative error
+    for (int i = 0; i < m * n; ++i)
+    {
+        const float abs_error = std::abs(output[i] - reference_output[i]);
+        const float rel_error = std::abs(reference_output[i]) > 1e-5f
+                                    ? abs_error / std::abs(reference_output[i])
+                                    : 0.0f;
+
+        // INT8 quantization: expect <5% relative error on most elements
+        EXPECT_LT(rel_error, 0.05f) << "Relative error too high at idx " << i
+                                    << " (INT8: " << output[i] << ", FP32: " << reference_output[i] << ")";
+    }
+}
+
+TEST(Test__OneDNNGemmKernel, MicrokernelPath_M1_Scaling)
+{
+    using llaminar2::fp32_to_fp16;
+    using llaminar2::IQ4_NLBlock;
+    using llaminar2::IQ4_NLTensor;
+    using llaminar2::TensorFormat;
+
+    const int m = 1;
+    const int k = 32;
+    const int n = 64;
+
+    // Create mock IQ4_NL weight tensor
+    std::vector<size_t> shape = {static_cast<size_t>(n), static_cast<size_t>(k)};
+    size_t blocks_per_row = (k + 31) / 32;
+    size_t total_blocks = n * blocks_per_row;
+    std::vector<uint8_t> raw_data(total_blocks * 18);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+    std::uniform_int_distribution<uint8_t> index_dist(0, 15);
+
+    for (size_t b = 0; b < total_blocks; ++b)
+    {
+        IQ4_NLBlock *block = reinterpret_cast<IQ4_NLBlock *>(raw_data.data() + b * 18);
+        block->d = fp32_to_fp16(scale_dist(rng));
+        for (int i = 0; i < 16; ++i)
+        {
+            block->qs[i] = (index_dist(rng) << 4) | index_dist(rng);
+        }
+    }
+
+    auto weight_tensor = std::make_unique<IQ4_NLTensor>(shape, raw_data);
+    OneDNNGemmKernel kernel(weight_tensor.get());
+
+    // Create activations
+    std::vector<float> fp32_activations(m * k);
+    for (int i = 0; i < m * k; ++i)
+        fp32_activations[i] = (i % 10) * 0.1f - 0.5f;
+
+    std::vector<int8_t> int8_activations(m * k);
+    std::vector<float> row_scales(m);
+    for (int row = 0; row < m; ++row)
+    {
+        float max_abs = 0.0f;
+        for (int col = 0; col < k; ++col)
+            max_abs = std::max(max_abs, std::abs(fp32_activations[row * k + col]));
+        row_scales[row] = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        for (int col = 0; col < k; ++col)
+        {
+            int8_activations[row * k + col] = std::round(std::clamp(fp32_activations[row * k + col] / row_scales[row], -127.0f, 127.0f));
+        }
+    }
+
+    // Test with alpha=2.0, beta=0.5
+    std::vector<float> output(m * n, 1.0f); // Initialize with 1.0f for beta test
+    float alpha = 2.0f;
+    float beta = 0.5f;
+
+    ASSERT_TRUE(kernel.multiply_typed_activations(
+        int8_activations.data(),
+        TensorFormat::INT8,
+        row_scales.data(),
+        output.data(),
+        m, n, k,
+        true,
+        alpha,
+        beta,
+        nullptr,
+        -1));
+
+    // Reference calculation
+    std::vector<float> reference_output(m * n);
+    ASSERT_TRUE(kernel.multiply_activations(
+        fp32_activations.data(),
+        nullptr,
+        reference_output.data(),
+        m, n, k,
+        true,
+        1.0f,
+        0.0f,
+        nullptr,
+        -1));
+
+    for (int i = 0; i < m * n; ++i)
+    {
+        float expected = reference_output[i] * alpha + 1.0f * beta;
+        // Allow higher tolerance for INT8
+        float abs_diff = std::abs(output[i] - expected);
+        float rel_diff = std::abs(expected) > 1e-5f ? abs_diff / std::abs(expected) : 0.0f;
+        EXPECT_LT(rel_diff, 0.05f) << "Mismatch at " << i << " Expected: " << expected << " Got: " << output[i];
+    }
+}
+
+TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxMicrokernel)
+{
+    constexpr int m = 1;
+    constexpr int n = 4;
+    constexpr int k = 4;
+
+    const float A[m * k] = {0.5f, -1.0f, 0.25f, 1.0f};
+
+    const float B[n * k] = {
+        0.2f, -0.3f, 0.1f, 0.4f,
+        -0.6f, 0.5f, 0.0f, 0.25f,
+        0.3f, 0.2f, -0.4f, -0.1f,
+        0.1f, 0.1f, 0.1f, 0.1f};
+
+    float fused_output[m * n] = {0};
+    float reference[m * n] = {0};
+
+    // Create weight tensor
+    // Use IQ4_NLTensor like in MicrokernelPath_M1
+    using llaminar2::fp32_to_fp16;
+    using llaminar2::IQ4_NLBlock;
+    using llaminar2::IQ4_NLTensor;
+
+    const int k_real = 32;
+    const int n_real = 64;
+
+    std::vector<size_t> shape_real = {static_cast<size_t>(n_real), static_cast<size_t>(k_real)};
+    size_t blocks_per_row = (k_real + 31) / 32;
+    size_t total_blocks = n_real * blocks_per_row;
+    std::vector<uint8_t> raw_data(total_blocks * 18);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> scale_dist(0.5f, 1.5f);
+    std::uniform_int_distribution<uint8_t> index_dist(0, 15);
+    for (size_t b = 0; b < total_blocks; ++b)
+    {
+        IQ4_NLBlock *block = reinterpret_cast<IQ4_NLBlock *>(raw_data.data() + b * 18);
+        block->d = fp32_to_fp16(scale_dist(rng));
+        for (int i = 0; i < 16; ++i)
+            block->qs[i] = (index_dist(rng) << 4) | index_dist(rng);
+    }
+
+    auto weight_tensor = std::make_unique<IQ4_NLTensor>(shape_real, raw_data);
+    OneDNNGemmKernel kernel(weight_tensor.get());
+
+    std::vector<float> A_vec(m * k_real);
+    for (int i = 0; i < m * k_real; ++i)
+        A_vec[i] = (i % 10) * 0.1f - 0.5f;
+
+    std::vector<float> C_vec(m * n_real);
+
+    // Run fused softmax
+    ASSERT_TRUE(kernel.multiply_with_softmax(
+        A_vec.data(),
+        nullptr, // B is bound
+        C_vec.data(),
+        m,
+        n_real,
+        k_real,
+        true, // transpose_B
+        -1,   // axis (last dim)
+        nullptr,
+        nullptr,
+        -1));
+
+    // Verify output is softmaxed (sum to 1 along axis)
+    float sum = 0.0f;
+    for (int i = 0; i < n_real; ++i)
+        sum += C_vec[i];
+    EXPECT_NEAR(sum, 1.0f, 1e-5f);
+
+    // Also compare with reference (multiply_activations + softmax)
+    std::vector<float> C_ref(m * n_real);
+    ASSERT_TRUE(kernel.multiply_activations(
+        A_vec.data(),
+        nullptr,
+        C_ref.data(),
+        m, n_real, k_real,
+        true, 1.0f, 0.0f, nullptr, -1));
+
+    // Apply softmax to reference
+    float max_val = -1e9f;
+    for (int i = 0; i < n_real; ++i)
+        max_val = std::max(max_val, C_ref[i]);
+    float exp_sum = 0.0f;
+    for (int i = 0; i < n_real; ++i)
+    {
+        C_ref[i] = std::exp(C_ref[i] - max_val);
+        exp_sum += C_ref[i];
+    }
+    for (int i = 0; i < n_real; ++i)
+        C_ref[i] /= exp_sum;
+
+    // Compare
+    for (int i = 0; i < n_real; ++i)
+    {
+        EXPECT_NEAR(C_vec[i], C_ref[i], 1e-4f) << "Mismatch at " << i;
+    }
+}
 #else // HAVE_ONEDNN
 
 TEST(Test__OneDNNGemmKernel, SkippedWithoutOneDNN)

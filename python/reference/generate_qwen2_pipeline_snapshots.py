@@ -142,6 +142,17 @@ class Qwen2PipelineCapture:
                 self.model.load_state_dict(state_dict, strict=False)
                 self.model.eval()
                 
+                # CRITICAL: Set bias parameters to None (not just uninitialized)
+                # Even after removing from state_dict, PyTorch creates bias parameters
+                # that F.linear() will use if not explicitly set to None
+                if hasattr(config, 'model_type') and config.model_type == 'qwen2':
+                    for layer in self.model.model.layers:
+                        layer.self_attn.q_proj.bias = None
+                        layer.self_attn.k_proj.bias = None
+                        layer.self_attn.v_proj.bias = None
+                    if self.verbose:
+                        print(f"✓ Set Q/K/V bias parameters to None (Qwen2 use_qkv_bias=False)")
+                
                 # Load tokenizer from HuggingFace (infer from config)
                 if config.model_type == 'qwen2':
                     tokenizer_name = 'Qwen/Qwen2.5-0.5B-Instruct'  # Use official tokenizer
@@ -346,10 +357,10 @@ class Qwen2PipelineCapture:
         if capture:
             self._save_snapshot('ATTENTION_NORM', hidden_norm, layer_idx)
         
-        # 2. Q/K/V projections
-        q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, layer.self_attn.q_proj.bias)
-        k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, layer.self_attn.k_proj.bias)
-        v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, layer.self_attn.v_proj.bias)
+        # 2. Q/K/V projections (use None for bias - Qwen2 has use_qkv_bias=False)
+        q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, None)
+        k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, None)
+        v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, None)
         
         if capture:
             self._save_snapshot('Q_PROJECTION', q_proj, layer_idx)
@@ -392,9 +403,9 @@ class Qwen2PipelineCapture:
             attn_context_flat = attn_context.transpose(1, 2).reshape(bsz, seq_len, n_heads * d_head)
             self._save_snapshot('ATTENTION_CONTEXT', attn_context_flat, layer_idx)
         
-        # 9. Output projection
+        # 9. Output projection (Qwen2 doesn't use bias for attention projections)
         attn_context_flat = attn_context.transpose(1, 2).reshape(bsz, seq_len, n_heads * d_head)
-        attn_output = F.linear(attn_context_flat, layer.self_attn.o_proj.weight, layer.self_attn.o_proj.bias)
+        attn_output = F.linear(attn_context_flat, layer.self_attn.o_proj.weight, None)
         if capture:
             self._save_snapshot('ATTENTION_OUTPUT', attn_output, layer_idx)
         

@@ -31,9 +31,10 @@ namespace
         void SetUp() override
         {
             // Typical attention projection dimensions (Qwen2.5-0.5B: d_model=896, num_heads=14, head_dim=64)
-            m_ = 32;  // Batch size
-            k_ = 896; // d_model (input features)
-            n_ = 896; // d_model (output features, same as input for Q/K/V)
+            m_ = 32;     // Batch size
+            k_ = 896;    // d_model (input features)
+            n_q_ = 896;  // Q output dimension (n_heads * head_dim)
+            n_kv_ = 896; // K/V output dimension (n_kv_heads * head_dim, same as n_q for MHA)
 
             // Create random input activations
             input_fp32_.resize(m_ * k_);
@@ -41,14 +42,14 @@ namespace
 
             // Create mock INT8 weight tensors
             // NOTE: Weights must be [n, k] for pack_weights_to_int8 (expects [N, K] where C = A[m,k] @ B[k,n])
-            q_weight_ = create_mock_int8_weights(n_, k_, 111);
-            k_weight_ = create_mock_int8_weights(n_, k_, 222);
-            v_weight_ = create_mock_int8_weights(n_, k_, 333);
+            q_weight_ = create_mock_int8_weights(n_q_, k_, 111);
+            k_weight_ = create_mock_int8_weights(n_kv_, k_, 222);
+            v_weight_ = create_mock_int8_weights(n_kv_, k_, 333);
 
             // Allocate output buffers
-            q_output_int32_.resize(m_ * n_);
-            k_output_int32_.resize(m_ * n_);
-            v_output_int32_.resize(m_ * n_);
+            q_output_int32_.resize(m_ * n_q_);
+            k_output_int32_.resize(m_ * n_kv_);
+            v_output_int32_.resize(m_ * n_kv_);
             activation_scales_.resize(m_);
         }
 
@@ -94,7 +95,7 @@ namespace
             return static_cast<float>(std::sqrt(sum_sq_diff / sum_sq_ref));
         }
 
-        int m_, k_, n_;
+        int m_, k_, n_q_, n_kv_;
         std::vector<float> input_fp32_;
         std::unique_ptr<TensorBase> q_weight_;
         std::unique_ptr<TensorBase> k_weight_;
@@ -120,7 +121,7 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, k_);
+            m_, n_q_, n_kv_, k_);
 
         ASSERT_TRUE(success) << "FusedTripleGEMM execution failed";
 
@@ -163,7 +164,7 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, k_);
+            m_, n_q_, n_kv_, k_);
 
         ASSERT_TRUE(success) << "FusedTripleGEMM failed for single token";
         EXPECT_GT(activation_scales_[0], 0.0f) << "Invalid activation scale for single token";
@@ -185,7 +186,7 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, k_);
+            m_, n_q_, n_kv_, k_);
 
         ASSERT_TRUE(success) << "FusedTripleGEMM failed for large batch";
 
@@ -213,7 +214,7 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, k_));
+            m_, n_q_, n_kv_, k_));
 
         // Null Q output
         EXPECT_FALSE(fused_kernel.execute(
@@ -222,7 +223,7 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, k_));
+            m_, n_q_, n_kv_, k_));
 
         // Null K output
         EXPECT_FALSE(fused_kernel.execute(
@@ -231,7 +232,7 @@ namespace
             nullptr,
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, k_));
+            m_, n_q_, n_kv_, k_));
 
         // Null V output
         EXPECT_FALSE(fused_kernel.execute(
@@ -240,7 +241,7 @@ namespace
             k_output_int32_.data(),
             nullptr,
             activation_scales_.data(),
-            m_, n_, k_));
+            m_, n_q_, n_kv_, k_));
 
         // Null activation scales
         EXPECT_FALSE(fused_kernel.execute(
@@ -249,7 +250,7 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             nullptr,
-            m_, n_, k_));
+            m_, n_q_, n_kv_, k_));
 
         LOG_INFO("✓ FusedTripleGEMM NullPointerHandling: All null checks passed");
     }
@@ -265,16 +266,25 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            0, n_, k_));
+            0, n_q_, n_kv_, k_));
 
-        // Zero output features
+        // Zero Q output dimension
         EXPECT_FALSE(fused_kernel.execute(
             input_fp32_.data(),
             q_output_int32_.data(),
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, 0, k_));
+            m_, 0, n_kv_, k_));
+
+        // Zero K/V output dimension
+        EXPECT_FALSE(fused_kernel.execute(
+            input_fp32_.data(),
+            q_output_int32_.data(),
+            k_output_int32_.data(),
+            v_output_int32_.data(),
+            activation_scales_.data(),
+            m_, n_q_, 0, k_));
 
         // Zero input features
         EXPECT_FALSE(fused_kernel.execute(
@@ -283,22 +293,136 @@ namespace
             k_output_int32_.data(),
             v_output_int32_.data(),
             activation_scales_.data(),
-            m_, n_, 0));
+            m_, n_q_, n_kv_, 0));
 
         LOG_INFO("✓ FusedTripleGEMM InvalidDimensions: All dimension checks passed");
     }
 
     TEST_F(Test__FusedTripleGEMM, MismatchedWeights)
     {
-        // Create weights with mismatched dimensions
-        auto mismatched_weight = create_mock_int8_weights(n_ + 10, k_, 444);
+        // Create K weight with mismatched input dimension (k)
+        auto mismatched_k_weight = create_mock_int8_weights(n_kv_, k_ + 10, 444);
 
-        // Should throw during construction
+        // Should throw during construction (k dimension must match)
         EXPECT_THROW(
-            FusedTripleGEMM(q_weight_.get(), k_weight_.get(), mismatched_weight.get()),
+            FusedTripleGEMM(q_weight_.get(), mismatched_k_weight.get(), v_weight_.get()),
+            std::invalid_argument);
+
+        // Create V weight with mismatched output dimension (n_kv)
+        auto mismatched_v_weight = create_mock_int8_weights(n_kv_ + 10, k_, 555);
+
+        // Should throw during construction (K and V output dims must match)
+        EXPECT_THROW(
+            FusedTripleGEMM(q_weight_.get(), k_weight_.get(), mismatched_v_weight.get()),
             std::invalid_argument);
 
         LOG_INFO("✓ FusedTripleGEMM MismatchedWeights: Constructor validation passed");
+    }
+
+    // =============================================================================
+    // GQA (Grouped Query Attention) Tests
+    // =============================================================================
+
+    TEST_F(Test__FusedTripleGEMM, GQA_AsymmetricDimensions)
+    {
+        // Test GQA scenario: Q has more features than K/V
+        // Example: Qwen2.5-0.5B has n_heads=14, n_kv_heads=2, head_dim=64
+        // Q: 14 * 64 = 896, K/V: 2 * 64 = 128
+        m_ = 32;
+        k_ = 896;
+        n_q_ = 896;  // 14 query heads
+        n_kv_ = 128; // 2 key/value heads (GQA)
+
+        // Recreate weights with asymmetric dimensions
+        q_weight_ = create_mock_int8_weights(n_q_, k_, 111);
+        k_weight_ = create_mock_int8_weights(n_kv_, k_, 222);
+        v_weight_ = create_mock_int8_weights(n_kv_, k_, 333);
+
+        // Allocate output buffers with correct dimensions
+        input_fp32_.resize(m_ * k_);
+        fill_random(input_fp32_.data(), m_ * k_, 1.0f);
+        q_output_int32_.resize(m_ * n_q_);
+        k_output_int32_.resize(m_ * n_kv_);
+        v_output_int32_.resize(m_ * n_kv_);
+        activation_scales_.resize(m_);
+
+        // Execute fused kernel with asymmetric dimensions
+        FusedTripleGEMM fused_kernel(q_weight_.get(), k_weight_.get(), v_weight_.get());
+
+        bool success = fused_kernel.execute(
+            input_fp32_.data(),
+            q_output_int32_.data(),
+            k_output_int32_.data(),
+            v_output_int32_.data(),
+            activation_scales_.data(),
+            m_, n_q_, n_kv_, k_);
+
+        ASSERT_TRUE(success) << "FusedTripleGEMM failed for GQA (asymmetric dimensions)";
+
+        // Validate outputs
+        for (int i = 0; i < m_; ++i)
+        {
+            EXPECT_GT(activation_scales_[i], 0.0f) << "Invalid activation scale at row " << i;
+        }
+
+        // Check that Q output has correct size (m * n_q)
+        bool has_nonzero_q = false;
+        for (size_t i = 0; i < static_cast<size_t>(m_ * n_q_); ++i)
+        {
+            if (q_output_int32_[i] != 0)
+                has_nonzero_q = true;
+        }
+        EXPECT_TRUE(has_nonzero_q) << "Q output is all zeros (n_q=" << n_q_ << ")";
+
+        // Check that K/V outputs have correct size (m * n_kv)
+        bool has_nonzero_k = false, has_nonzero_v = false;
+        for (size_t i = 0; i < static_cast<size_t>(m_ * n_kv_); ++i)
+        {
+            if (k_output_int32_[i] != 0)
+                has_nonzero_k = true;
+            if (v_output_int32_[i] != 0)
+                has_nonzero_v = true;
+        }
+        EXPECT_TRUE(has_nonzero_k) << "K output is all zeros (n_kv=" << n_kv_ << ")";
+        EXPECT_TRUE(has_nonzero_v) << "V output is all zeros (n_kv=" << n_kv_ << ")";
+
+        LOG_INFO("✓ FusedTripleGEMM GQA_AsymmetricDimensions: n_q=" << n_q_ << ", n_kv=" << n_kv_ << " validated");
+    }
+
+    TEST_F(Test__FusedTripleGEMM, GQA_ExtremeRatio)
+    {
+        // Test extreme GQA ratio (e.g., 32 query heads, 1 KV head)
+        m_ = 16;
+        k_ = 512;
+        n_q_ = 2048; // 32 heads * 64 dim
+        n_kv_ = 64;  // 1 head * 64 dim (extreme ratio)
+
+        // Recreate weights
+        q_weight_ = create_mock_int8_weights(n_q_, k_, 111);
+        k_weight_ = create_mock_int8_weights(n_kv_, k_, 222);
+        v_weight_ = create_mock_int8_weights(n_kv_, k_, 333);
+
+        // Allocate buffers
+        input_fp32_.resize(m_ * k_);
+        fill_random(input_fp32_.data(), m_ * k_, 1.0f);
+        q_output_int32_.resize(m_ * n_q_);
+        k_output_int32_.resize(m_ * n_kv_);
+        v_output_int32_.resize(m_ * n_kv_);
+        activation_scales_.resize(m_);
+
+        // Execute
+        FusedTripleGEMM fused_kernel(q_weight_.get(), k_weight_.get(), v_weight_.get());
+        bool success = fused_kernel.execute(
+            input_fp32_.data(),
+            q_output_int32_.data(),
+            k_output_int32_.data(),
+            v_output_int32_.data(),
+            activation_scales_.data(),
+            m_, n_q_, n_kv_, k_);
+
+        ASSERT_TRUE(success) << "FusedTripleGEMM failed for extreme GQA ratio";
+
+        LOG_INFO("✓ FusedTripleGEMM GQA_ExtremeRatio: n_q=" << n_q_ << ", n_kv=" << n_kv_ << " (32:1 ratio) validated");
     }
 
     // =============================================================================

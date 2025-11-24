@@ -687,33 +687,140 @@ namespace llaminar2
             }
         }
 
-        // 2. Q/K/V projections (use device-appropriate buffers)
-        VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
-        VALIDATE_KERNEL(k_gemm, layer.wk->createGemm(), "K GEMM kernel");
-        VALIDATE_KERNEL(v_gemm, layer.wv->createGemm(), "V GEMM kernel");
-
-        // Q = hidden @ wq^T (use typed activations if fused quantization was used)
+        // 2. Q/K/V projections - PHASE 2 FUSED PATH
+        // Use FusedTripleGEMM to eliminate redundant quantization:
+        //   Old: Quant(norm) → q_gemm + Quant(norm) → k_gemm + Quant(norm) → v_gemm → Dequant(Q) + Dequant(K) + Dequant(V)
+        //   New: Quant(norm) → FusedTripleGEMM → [q_int32, k_int32, v_int32] → Dequant → [Q_fp32, K_fp32, V_fp32]
         if (use_fused_quantize)
         {
-            // INT8 path: Direct consumption of pre-quantized activations
-            VALIDATE_OP(q_gemm->multiply_typed_activations(
-                            buffers.normalized_int8->data(), TensorFormat::INT8,
-                            buffers.normalized_scales.data(),
-                            buffers.Q->mutable_data(),
-                            effective_seq_len, n_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "Q projection (INT8)");
+            // Phase 2: Fused path with FusedTripleGEMM + manual dequantization
+            // Create fused kernel from INT8 activation tensor
+            auto *int8_activation = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for FusedTripleGEMM");
+
+            auto fused_triple_gemm = int8_activation->createFusedTripleGemm(
+                layer.wq.get(), layer.wk.get(), layer.wv.get());
+            VALIDATE_POINTER(fused_triple_gemm, "FusedTripleGEMM kernel");
+
+            // Get INT32 buffers from activation buffers
+            auto *q_int32 = dynamic_cast<INT32Tensor *>(buffers.Q_int32.get());
+            auto *k_int32 = dynamic_cast<INT32Tensor *>(buffers.K_int32.get());
+            auto *v_int32 = dynamic_cast<INT32Tensor *>(buffers.V_int32.get());
+            VALIDATE_POINTER(q_int32, "INT32 Q buffer");
+            VALIDATE_POINTER(k_int32, "INT32 K buffer");
+            VALIDATE_POINTER(v_int32, "INT32 V buffer");
+
+            // Get column scales from weight tensors (for INT32 dequantization)
+            auto *q_weight_int8 = dynamic_cast<INT8Tensor *>(layer.wq.get());
+            auto *k_weight_int8 = dynamic_cast<INT8Tensor *>(layer.wk.get());
+            auto *v_weight_int8 = dynamic_cast<INT8Tensor *>(layer.wv.get());
+            VALIDATE_POINTER(q_weight_int8, "INT8 Q weight");
+            VALIDATE_POINTER(k_weight_int8, "INT8 K weight");
+            VALIDATE_POINTER(v_weight_int8, "INT8 V weight");
+
+            const float *q_col_scales = q_weight_int8->col_scales();
+            const float *k_col_scales = k_weight_int8->col_scales();
+            const float *v_col_scales = v_weight_int8->col_scales();
+            VALIDATE_POINTER(q_col_scales, "Q weight column scales");
+            VALIDATE_POINTER(k_col_scales, "K weight column scales");
+            VALIDATE_POINTER(v_col_scales, "V weight column scales");
+
+            // Execute FusedTripleGEMM: normalized_fp32 → [q_int32, k_int32, v_int32]
+            // Note: FusedTripleGEMM internally quantizes FP32 input to INT8, then performs GEMMs
+            // We pass normalized FP32 buffer (not INT8), as kernel handles quantization
+            const int n_q = n_heads_ * head_dim_;
+            const int n_kv = n_kv_heads_ * head_dim_;
+
+            // FusedTripleGEMM now supports GQA (different Q vs K/V dimensions)
+            VALIDATE_OP(fused_triple_gemm->execute(
+                            normalized_hidden->data(),        // Input FP32 [m, k]
+                            q_int32->mutable_int32_data(),    // Output Q INT32 [m, n_q]
+                            k_int32->mutable_int32_data(),    // Output K INT32 [m, n_kv]
+                            v_int32->mutable_int32_data(),    // Output V INT32 [m, n_kv]
+                            buffers.normalized_scales.data(), // Output row scales [m]
+                            effective_seq_len,                // m (batch size)
+                            n_q,                              // n_q (Q output features)
+                            n_kv,                             // n_kv (K/V output features, may differ for GQA)
+                            d_model_),                        // k (input features)
+                        "FusedTripleGEMM (Q+K+V projections)");
+
+            LOG_DEBUG("[Phase2] FusedTripleGEMM completed, dequantizing Q/K/V INT32 → FP32");
+
+// Dequantize Q: INT32 → FP32 (row_scales * col_scales)
+#pragma omp parallel for collapse(2)
+            for (int r = 0; r < effective_seq_len; ++r)
+            {
+                for (int c = 0; c < n_q; ++c)
+                {
+                    const size_t idx = r * n_q + c;
+                    buffers.Q->mutable_data()[idx] =
+                        static_cast<float>(q_int32->int32_data()[idx]) *
+                        buffers.normalized_scales[r] * q_col_scales[c];
+                }
+            }
+
+// Dequantize K: INT32 → FP32 (row_scales * col_scales)
+#pragma omp parallel for collapse(2)
+            for (int r = 0; r < effective_seq_len; ++r)
+            {
+                for (int c = 0; c < n_kv; ++c)
+                {
+                    const size_t idx = r * n_kv + c;
+                    buffers.K->mutable_data()[idx] =
+                        static_cast<float>(k_int32->int32_data()[idx]) *
+                        buffers.normalized_scales[r] * k_col_scales[c];
+                }
+            }
+
+// Dequantize V: INT32 → FP32 (row_scales * col_scales)
+#pragma omp parallel for collapse(2)
+            for (int r = 0; r < effective_seq_len; ++r)
+            {
+                for (int c = 0; c < n_kv; ++c)
+                {
+                    const size_t idx = r * n_kv + c;
+                    buffers.V->mutable_data()[idx] =
+                        static_cast<float>(v_int32->int32_data()[idx]) *
+                        buffers.normalized_scales[r] * v_col_scales[c];
+                }
+            }
+
+            LOG_DEBUG("[Phase2] Q/K/V dequantization completed");
+            VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
+            VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
+            VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
         }
         else
         {
-            // FP32 path: Standard GEMM with implicit quantization
+            // Phase 1: Unfused path (fallback for non-INT8 precision)
+            VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
+            VALIDATE_KERNEL(k_gemm, layer.wk->createGemm(), "K GEMM kernel");
+            VALIDATE_KERNEL(v_gemm, layer.wv->createGemm(), "V GEMM kernel");
+
+            // Q = hidden @ wq^T
             VALIDATE_OP(q_gemm->multiply_activations(
                             normalized_hidden->data(), nullptr, buffers.Q->mutable_data(),
                             effective_seq_len, n_heads_ * head_dim_, d_model_,
                             true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                         "Q projection");
+            VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
+
+            // K = hidden @ wk^T
+            VALIDATE_OP(k_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.K->mutable_data(),
+                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "K projection");
+            VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
+
+            // V = hidden @ wv^T
+            VALIDATE_OP(v_gemm->multiply_activations(
+                            normalized_hidden->data(), nullptr, buffers.V->mutable_data(),
+                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
+                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
+                        "V projection");
+            VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
         }
-        VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
 
         // Capture Q projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_PROJECTION", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
@@ -730,50 +837,8 @@ namespace llaminar2
             }
         }
 
-        // K = hidden @ wk^T (use typed activations if fused quantization was used)
-        if (use_fused_quantize)
-        {
-            VALIDATE_OP(k_gemm->multiply_typed_activations(
-                            buffers.normalized_int8->data(), TensorFormat::INT8,
-                            buffers.normalized_scales.data(),
-                            buffers.K->mutable_data(),
-                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "K projection (INT8)");
-        }
-        else
-        {
-            VALIDATE_OP(k_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.K->mutable_data(),
-                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "K projection");
-        }
-        VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
-
         // Capture K projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_K_PROJECTION", buffers.K, effective_seq_len, n_kv_heads_ * head_dim_);
-
-        // V = hidden @ wv^T (use typed activations if fused quantization was used)
-        if (use_fused_quantize)
-        {
-            VALIDATE_OP(v_gemm->multiply_typed_activations(
-                            buffers.normalized_int8->data(), TensorFormat::INT8,
-                            buffers.normalized_scales.data(),
-                            buffers.V->mutable_data(),
-                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "V projection (INT8)");
-        }
-        else
-        {
-            VALIDATE_OP(v_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.V->mutable_data(),
-                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "V projection");
-        }
-        VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
 
         // Capture V projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_V_PROJECTION", buffers.V, effective_seq_len, n_kv_heads_ * head_dim_);

@@ -351,6 +351,7 @@ if(USE_ONEDNN)
                     -DDNNL_CPU_RUNTIME=OMP
                     -DDNNL_BUILD_TESTS=OFF
                     -DDNNL_BUILD_EXAMPLES=OFF
+                    -DDNNL_EXPERIMENTAL_UKERNEL=ON
                     -DCMAKE_CXX_FLAGS=-march=native
                     -DCMAKE_C_FLAGS=-march=native
             RESULT_VARIABLE ONEDNN_CONFIG_RESULT

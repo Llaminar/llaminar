@@ -80,10 +80,11 @@ namespace llaminar2
          */
         struct WeightPack
         {
-            std::vector<int8_t> data;      ///< INT8 quantized weights [K, N] column-major
-            std::vector<float> col_scales; ///< Per-column FP32 dequantization scales [N]
-            int rows = 0;                  ///< Number of rows (K dimension)
-            int cols = 0;                  ///< Number of columns (N dimension)
+            std::vector<int8_t> data;          ///< INT8 quantized weights [K, N] column-major
+            std::vector<float> col_scales;     ///< Per-column FP32 dequantization scales [N]
+            std::vector<int32_t> compensation; ///< Per-column compensation for u8 shift [N]
+            int rows = 0;                      ///< Number of rows (K dimension)
+            int cols = 0;                      ///< Number of columns (N dimension)
 
             /**
              * @brief Get total number of quantized elements
@@ -140,6 +141,7 @@ namespace llaminar2
             pack.cols = N; // N columns in column-major format
             pack.data.resize(static_cast<size_t>(K) * static_cast<size_t>(N), 0);
             pack.col_scales.resize(static_cast<size_t>(N), 1.0f);
+            pack.compensation.resize(static_cast<size_t>(N), 0);
 
             // Step 1: Quantize tensor to INT8 row-major with per-column scales
             // row_major will be [N, K] (N rows, K columns)
@@ -165,6 +167,20 @@ namespace llaminar2
                     // Source: row n, col k in row-major layout [N, K]
                     dst_row[n] = row_major[static_cast<size_t>(n) * static_cast<size_t>(K) + static_cast<size_t>(k)];
                 }
+            }
+
+// Step 3: Compute compensation (sum of columns)
+// pack.data is [K, N] row-major.
+// We need sum over K for each N.
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < N; ++n)
+            {
+                int32_t sum = 0;
+                for (int k = 0; k < K; ++k)
+                {
+                    sum += pack.data[static_cast<size_t>(k) * static_cast<size_t>(N) + n];
+                }
+                pack.compensation[n] = sum;
             }
 
             return pack;

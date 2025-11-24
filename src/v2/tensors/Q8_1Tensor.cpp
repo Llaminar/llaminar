@@ -6,6 +6,7 @@
 
 #include "Tensors.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
 #include "../kernels/cpu/CPUSoftmaxKernelT.h"
 #include "../kernels/cpu/CPURMSNormKernelT.h"
 
@@ -192,8 +193,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
     {
-        // Use OneDNN GEMM kernel
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+        // Use custom JIT GEMM kernel for Q8_1
+        return std::make_unique<llaminar2::gemm_v4::Q8_1GemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()
