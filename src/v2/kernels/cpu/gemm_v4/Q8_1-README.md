@@ -83,6 +83,31 @@ For large matrices (e.g., Qwen 32B, K=27,392), a single weight row is ~27KB. A s
 For small batch sizes (M < Threads), the quantization of A (FP32 -> Int8) becomes a bottleneck if done serially.
 - **Logic**: Parallelizes quantization over the K-dimension.
 
+## Advanced Fused Operations (New in V4)
+
+To further reduce memory bandwidth and latency, the V4 kernel supports fusing common post-GEMM operations directly into the compute kernel.
+
+### 1. Bias Addition
+- **Feature**: Adds a bias vector to the result: $C_{ij} = \text{GEMM}_{ij} + \text{Bias}_j$.
+- **Implementation**: Loaded and added in AVX512 registers immediately after dequantization, before storing to memory.
+- **Benefit**: Eliminates a separate memory read/write pass for bias addition.
+
+### 2. Attention Masking (ALiBi / Causal)
+- **Feature**: Applies an additive mask to the result: $C_{ij} = C_{ij} + \text{Mask}_{ij}$.
+- **Implementation**: The mask pointer is passed to the kernel. If non-null, the mask value corresponding to the $(i, j)$ position is loaded and added.
+- **Benefit**: Essential for Attention layers, fusing the mask application (e.g., ALiBi slopes or causal mask) into the QKV projection or Attention Score computation.
+
+### 3. Online Softmax Fusion
+- **Feature**: Computes Softmax statistics (max and sum-exp) and optionally skips writing the raw output matrix $C$.
+- **Logic**:
+    1.  **Fused Max**: As each $C_{ij}$ is computed, update the row-wise maximum: $m_i = \max(m_i, C_{ij})$.
+    2.  **Fused Sum**: Compute exponentials relative to the current max and accumulate: $s_i = \sum \exp(C_{ij} - m_i)$.
+    3.  **Output Skip**: If `do_softmax=true`, the raw $C_{ij}$ values are **not** written to main memory. Only the statistics ($m_i, s_i$) are stored.
+- **Benefit**:
+    - **Latency**: 1.33x speedup for M=1 (Single Token).
+    - **Bandwidth**: Saves $M \times N$ writes and reads.
+    - **Context**: Critical for Attention layers where $C$ (Attention Scores) is transient and only the Softmax probability distribution is needed.
+
 ## Use Case
 
 This kernel is the default engine for **CPU Inference** in Llaminar V2 when using quantized models. It is specifically designed for:

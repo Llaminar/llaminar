@@ -54,6 +54,23 @@ ctest --test-dir build_v2_release -R V2_Perf_Q8_1_GEMM$ --verbose
 **Solution**: Added logic to split N evenly when clamped by cache limits (e.g., 2 blocks of 448).
 **Result**: Qwen 0.5B Attn Output (M=512) improved from ~1100 to **~1750 GFLOPS**.
 
+### Phase 5: Online Softmax Fusion
+**Challenge**: In Attention layers, the GEMM output (Attention Scores) is immediately followed by a Softmax operation. Writing the large GEMM output (M x N) to memory and then reading it back for Softmax incurs significant memory bandwidth overhead, especially for small batches (latency-critical) or large contexts.
+**Solution**: Implemented **Online Softmax Fusion**.
+- Fused the Softmax calculation directly into the GEMM kernel's accumulation loop.
+- Computes local max and sum-of-exponentials during the final reduction.
+- Avoids writing the raw GEMM output to memory entirely when `do_softmax=true`.
+- **Result**: Significant latency reduction for single-token and small-batch inference.
+
+**Performance Impact (M=1 to M=32):**
+| Batch Size (M) | Baseline (ms) | Fused (ms) | Speedup | Context |
+| :--- | :--- | :--- | :--- | :--- |
+| **M=1** | 0.109 | **0.082** | **1.33x** | Single Token Decode |
+| **M=2** | 0.110 | **0.088** | **1.25x** | Small Batch |
+| **M=32** | 0.566 | **0.516** | **1.10x** | Batch Prefill |
+
+*Note: Benchmarked with N=4096, K=4096 on 2-socket system.*
+
 ## Final Performance Results
 
 ### Qwen 32B (Large Model)
@@ -79,3 +96,20 @@ The `Q8_1` kernel is now highly robust. It dynamically adapts its blocking strat
 1.  **Massive K dimensions** (via K-tiling) to preserve L2 locality.
 2.  **Small N dimensions** (via adaptive splitting) to ensure thread saturation.
 3.  **Large Batch Sizes** (via conservative cache targets) to prevent thrashing.
+
+### Phase 5: Online Softmax Fusion
+**Challenge**: In Attention layers, the GEMM output (Attention Scores) is immediately followed by a Softmax operation. Writing the large GEMM output (M x N) to memory and then reading it back for Softmax incurs significant memory bandwidth overhead, especially for small batches (latency-critical) or large contexts.
+**Solution**: Implemented **Online Softmax Fusion**.
+- Fused the Softmax calculation directly into the GEMM kernel's accumulation loop.
+- Computes local max and sum-of-exponentials during the final reduction.
+- Avoids writing the raw GEMM output to memory entirely when `do_softmax=true`.
+- **Result**: Significant latency reduction for single-token and small-batch inference.
+
+**Performance Impact (M=1 to M=32):**
+| Batch Size (M) | Baseline (ms) | Fused (ms) | Speedup | Context |
+| :--- | :--- | :--- | :--- | :--- |
+| **M=1** | 0.109 | **0.082** | **1.33x** | Single Token Decode |
+| **M=2** | 0.110 | **0.088** | **1.25x** | Small Batch |
+| **M=32** | 0.566 | **0.516** | **1.10x** | Batch Prefill |
+
+*Note: Benchmarked with N=4096, K=4096 on 2-socket system.*

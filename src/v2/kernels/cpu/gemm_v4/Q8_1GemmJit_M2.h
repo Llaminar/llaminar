@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../../../../external/onednn/third_party/xbyak/xbyak.h"
+#include "Q8_1GemmJit_M1.h" // For Q8_1GemmParams
 #include <vector>
 #include <cstdint>
 
@@ -18,8 +19,7 @@ namespace llaminar2
             }
 
             // Signature:
-            // void kernel(const void* A, const void* B_packed, const void* comp, const void* scales, float* C, int K_blocks, int N, int ldc);
-            using kernel_func_t = void (*)(const void *A, const void *B_packed, const void *comp, const void *scales, float *C, int K_blocks, int N, int ldc);
+            using kernel_func_t = void (*)(const Q8_1GemmParams *params);
 
             kernel_func_t get_kernel()
             {
@@ -81,6 +81,8 @@ namespace llaminar2
                 const Zmm &zmm_scale_b1 = zmm27;
                 const Zmm &zmm_scale_b2 = zmm28;
                 const Zmm &zmm_scale_b3 = zmm29;
+                const Zmm &zmm_bias = zmm30;
+                const Zmm &zmm_mask = zmm31;
 
                 // Prologue
                 push(rbx);
@@ -90,8 +92,27 @@ namespace llaminar2
                 push(r14);
                 push(r15);
 
-                int stack_offset_N = 56;
-                int stack_offset_ldc = 64;
+                // Save params pointer
+                const Reg64 &reg_params = rdi;
+                push(reg_params);
+
+                // Load args
+                mov(reg_B, ptr[reg_params + 8]);
+                mov(reg_Comp, ptr[reg_params + 16]);
+                mov(reg_Scales, ptr[reg_params + 24]);
+                mov(reg_C, ptr[reg_params + 32]);
+                mov(reg_K_blocks.cvt32(), ptr[reg_params + 40]);
+
+                // Load N and push
+                mov(reg_loop_N.cvt32(), ptr[reg_params + 44]);
+                push(reg_loop_N);
+
+                // Load ldc and shift
+                mov(reg_stride.cvt32(), ptr[reg_params + 48]);
+                shl(reg_stride, 2);
+
+                // Load A
+                mov(reg_A, ptr[reg_params + 0]);
 
                 // Setup constants
                 mov(reg_tmp_32, 0x80808080);
@@ -103,15 +124,11 @@ namespace llaminar2
                 // Loop over N (step 64)
                 xor_(reg_loop_N, reg_loop_N);
 
-                // Precompute stride = ldc * 4
-                mov(reg_stride, ptr[rsp + stack_offset_ldc]);
-                shl(reg_stride, 2); // ldc * 4
-
                 Label loop_N_label;
                 L(loop_N_label);
                 {
                     // Check if we are done
-                    cmp(reg_loop_N, ptr[rsp + stack_offset_N]);
+                    cmp(reg_loop_N, ptr[rsp]);
                     jge("end_kernel", T_NEAR);
 
                     // Setup cursors
@@ -142,11 +159,23 @@ namespace llaminar2
                     mov(reg_B_cursor, reg_B);
                     add(reg_B_cursor, reg_tmp);
 
-                    // Initialize C Accumulators (zmm0..7) to 0
-                    for (int i = 0; i < 8; ++i)
-                    {
-                        vpxord(Zmm(i), Zmm(i), Zmm(i));
-                    }
+                    // Initialize C Accumulators (zmm0..7) from memory
+                    // Row 0
+                    vmovups(zmm0, ptr[reg_C_cursor + 0 * 64]);
+                    vmovups(zmm1, ptr[reg_C_cursor + 1 * 64]);
+                    vmovups(zmm2, ptr[reg_C_cursor + 2 * 64]);
+                    vmovups(zmm3, ptr[reg_C_cursor + 3 * 64]);
+
+                    // Row 1
+                    // Load ldc
+                    mov(rax, ptr[rsp + 8]);              // params
+                    mov(reg_tmp.cvt32(), ptr[rax + 48]); // ldc
+                    shl(reg_tmp, 2);                     // ldc * 4 bytes
+
+                    vmovups(zmm4, ptr[reg_C_cursor + reg_tmp + 0 * 64]);
+                    vmovups(zmm5, ptr[reg_C_cursor + reg_tmp + 1 * 64]);
+                    vmovups(zmm6, ptr[reg_C_cursor + reg_tmp + 2 * 64]);
+                    vmovups(zmm7, ptr[reg_C_cursor + reg_tmp + 3 * 64]);
 
                     // Loop over K blocks
                     mov(reg_loop_K, reg_K_blocks);
@@ -285,16 +314,239 @@ namespace llaminar2
                         jnz(loop_K_label, T_NEAR);
                     }
 
+                    // --- Bias & Mask ---
+                    mov(rax, ptr[rsp + 8]); // params
+
+                    // 1. Bias
+                    mov(rdx, ptr[rax + 56]); // bias ptr
+                    test(rdx, rdx);
+                    Label skip_bias;
+                    jz(skip_bias, T_NEAR);
+                    {
+                        lea(rdx, ptr[rdx + reg_loop_N * 4]);
+
+                        vmovups(zmm_bias, ptr[rdx + 0 * 64]);
+                        vaddps(zmm0, zmm0, zmm_bias);
+                        vaddps(zmm4, zmm4, zmm_bias); // Row 1
+
+                        vmovups(zmm_bias, ptr[rdx + 1 * 64]);
+                        vaddps(zmm1, zmm1, zmm_bias);
+                        vaddps(zmm5, zmm5, zmm_bias);
+
+                        vmovups(zmm_bias, ptr[rdx + 2 * 64]);
+                        vaddps(zmm2, zmm2, zmm_bias);
+                        vaddps(zmm6, zmm6, zmm_bias);
+
+                        vmovups(zmm_bias, ptr[rdx + 3 * 64]);
+                        vaddps(zmm3, zmm3, zmm_bias);
+                        vaddps(zmm7, zmm7, zmm_bias);
+                    }
+                    L(skip_bias);
+
+                    // 2. Mask
+                    mov(rdx, ptr[rax + 64]); // mask ptr
+                    test(rdx, rdx);
+                    Label skip_mask;
+                    jz(skip_mask, T_NEAR);
+                    {
+                        // Row 0 mask
+                        lea(rcx, ptr[rdx + reg_loop_N * 4]);
+
+                        vmovups(zmm_mask, ptr[rcx + 0 * 64]);
+                        vaddps(zmm0, zmm0, zmm_mask);
+
+                        vmovups(zmm_mask, ptr[rcx + 1 * 64]);
+                        vaddps(zmm1, zmm1, zmm_mask);
+
+                        vmovups(zmm_mask, ptr[rcx + 2 * 64]);
+                        vaddps(zmm2, zmm2, zmm_mask);
+
+                        vmovups(zmm_mask, ptr[rcx + 3 * 64]);
+                        vaddps(zmm3, zmm3, zmm_mask);
+
+                        // Row 1 mask
+                        // Offset = ldc * 4 (stride)
+                        mov(rsi, ptr[rax + 48]); // ldc
+                        shl(rsi, 2);
+                        add(rcx, rsi); // rcx points to Row 1 mask
+
+                        vmovups(zmm_mask, ptr[rcx + 0 * 64]);
+                        vaddps(zmm4, zmm4, zmm_mask);
+
+                        vmovups(zmm_mask, ptr[rcx + 1 * 64]);
+                        vaddps(zmm5, zmm5, zmm_mask);
+
+                        vmovups(zmm_mask, ptr[rcx + 2 * 64]);
+                        vaddps(zmm6, zmm6, zmm_mask);
+
+                        vmovups(zmm_mask, ptr[rcx + 3 * 64]);
+                        vaddps(zmm7, zmm7, zmm_mask);
+                    }
+                    L(skip_mask);
+
+                    // 3. Softmax
+                    mov(al, ptr[rax + 88]); // do_softmax
+                    test(al, al);
+                    Label skip_softmax;
+                    jz(skip_softmax, T_NEAR);
+                    {
+                        // Registers
+                        const Zmm &zmm_max = zmm22;
+                        const Zmm &zmm_sum = zmm23;
+                        const Zmm &zmm_tmp = zmm24;
+                        const Zmm &zmm_c1_const = zmm25;
+                        const Zmm &zmm_c2_const = zmm26;
+                        const Zmm &zmm_c3_coeff = zmm27;
+                        const Zmm &zmm_c4_const = zmm28;
+                        const Zmm &zmm_c5_const = zmm29;
+                        const Zmm &zmm_inv_ln2 = zmm30;
+                        const Zmm &zmm_max_clip = zmm31;
+                        const Zmm &zmm_min_clip = zmm8;
+                        const Zmm &zmm_127 = zmm9;
+                        const Zmm &zmm_tmp2 = zmm10;
+                        const Zmm &zmm_p = zmm11;
+                        const Zmm &zmm_fx = zmm12;
+
+                        // Load constants
+                        mov(reg_tmp_32, 0x3fb8aa3b); // 1.44269504 (inv_ln2)
+                        vpbroadcastd(zmm_inv_ln2, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3f7ffffe); // 0.99999994 (c1)
+                        vpbroadcastd(zmm_c1_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3f317218); // 0.69314718 (c2)
+                        vpbroadcastd(zmm_c2_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3e75fdf1); // 0.24022651 (c3)
+                        vpbroadcastd(zmm_c3_coeff, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3d6356eb); // 0.05550411 (c4)
+                        vpbroadcastd(zmm_c4_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3c1d9422); // 0.00961813 (c5)
+                        vpbroadcastd(zmm_c5_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x41200000); // 10.0f (max_clip)
+                        vpbroadcastd(zmm_max_clip, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0xc1a00000); // -20.0f (min_clip)
+                        vpbroadcastd(zmm_min_clip, reg_tmp_32);
+
+                        mov(reg_tmp_32, 127);
+                        vpbroadcastd(zmm_127, reg_tmp_32);
+
+                        // Reload params because reg_tmp_32 (eax) clobbered rax
+                        mov(rax, ptr[rsp + 8]);
+
+                        auto compute_exp_accumulate = [&](const Zmm &zmm_val)
+                        {
+                            vsubps(zmm_tmp, zmm_val, zmm_max);
+                            vminps(zmm_tmp, zmm_tmp, zmm_max_clip);
+                            vmaxps(zmm_tmp, zmm_tmp, zmm_min_clip);
+                            vmulps(zmm_tmp, zmm_tmp, zmm_inv_ln2);
+                            vrndscaleps(zmm_fx, zmm_tmp, 0x01);
+                            vsubps(zmm_tmp, zmm_tmp, zmm_fx);
+                            vmovaps(zmm_p, zmm_c5_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c4_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c3_coeff);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c2_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c1_const);
+                            vcvtps2dq(zmm_fx, zmm_fx);
+                            vpaddd(zmm_fx, zmm_fx, zmm_127);
+                            vpslld(zmm_fx, zmm_fx, 23);
+                            vmulps(zmm_p, zmm_p, zmm_fx);
+                            vaddps(zmm_sum, zmm_sum, zmm_p);
+                        };
+
+                        // --- Row 0 ---
+                        vmaxps(zmm_max, zmm0, zmm1);
+                        vmaxps(zmm_max, zmm_max, zmm2);
+                        vmaxps(zmm_max, zmm_max, zmm3);
+
+                        vextractf64x4(ymm10, zmm_max, 1);
+                        vmaxps(ymm10, ymm10, Ymm(zmm_max.getIdx()));
+                        vextractf128(xmm11, ymm10, 1);
+                        vmaxps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b01001110);
+                        vmaxps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b10110001);
+                        vmaxps(xmm10, xmm10, xmm11);
+
+                        vpbroadcastd(zmm_max, xmm10);
+
+                        mov(rdx, ptr[rax + 72]); // local_max ptr
+                        mov(r15, reg_loop_N);
+                        shr(r15, 4); // / 16
+                        vmovss(ptr[rdx + r15], xmm10);
+
+                        vpxord(zmm_sum, zmm_sum, zmm_sum);
+                        compute_exp_accumulate(zmm0);
+                        compute_exp_accumulate(zmm1);
+                        compute_exp_accumulate(zmm2);
+                        compute_exp_accumulate(zmm3);
+
+                        vextractf64x4(ymm10, zmm_sum, 1);
+                        vaddps(ymm10, ymm10, Ymm(zmm_sum.getIdx()));
+                        vextractf128(xmm11, ymm10, 1);
+                        vaddps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b01001110);
+                        vaddps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b10110001);
+                        vaddps(xmm10, xmm10, xmm11);
+
+                        mov(rdx, ptr[rax + 80]); // local_sum ptr
+                        vmovss(ptr[rdx + r15], xmm10);
+
+                        // --- Row 1 ---
+                        vmaxps(zmm_max, zmm4, zmm5);
+                        vmaxps(zmm_max, zmm_max, zmm6);
+                        vmaxps(zmm_max, zmm_max, zmm7);
+
+                        vextractf64x4(ymm10, zmm_max, 1);
+                        vmaxps(ymm10, ymm10, Ymm(zmm_max.getIdx()));
+                        vextractf128(xmm11, ymm10, 1);
+                        vmaxps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b01001110);
+                        vmaxps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b10110001);
+                        vmaxps(xmm10, xmm10, xmm11);
+
+                        vpbroadcastd(zmm_max, xmm10);
+
+                        mov(rdx.cvt32(), ptr[rax + 44]); // N (32-bit load)
+                        shr(rdx, 4);                     // N / 16
+                        add(rdx, r15);                   // offset_row1
+
+                        mov(rcx, ptr[rax + 72]); // local_max ptr
+                        vmovss(ptr[rcx + rdx], xmm10);
+
+                        vpxord(zmm_sum, zmm_sum, zmm_sum);
+                        compute_exp_accumulate(zmm4);
+                        compute_exp_accumulate(zmm5);
+                        compute_exp_accumulate(zmm6);
+                        compute_exp_accumulate(zmm7);
+
+                        vextractf64x4(ymm10, zmm_sum, 1);
+                        vaddps(ymm10, ymm10, Ymm(zmm_sum.getIdx()));
+                        vextractf128(xmm11, ymm10, 1);
+                        vaddps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b01001110);
+                        vaddps(xmm10, xmm10, xmm11);
+                        vpermilps(xmm11, xmm10, 0b10110001);
+                        vaddps(xmm10, xmm10, xmm11);
+
+                        mov(rcx, ptr[rax + 80]); // local_sum ptr
+                        vmovss(ptr[rcx + rdx], xmm10);
+                    }
+                    L(skip_softmax);
+
                     // Store C
                     // Load ldc
-                    mov(reg_tmp, ptr[rsp + stack_offset_ldc]);
-                    shl(reg_tmp, 2); // ldc * 4 bytes
+                    mov(rax, ptr[rsp + 8]);              // params
+                    mov(reg_tmp.cvt32(), ptr[rax + 48]); // ldc
+                    shl(reg_tmp, 2);                     // ldc * 4 bytes
 
                     // Row 0
-                    vaddps(zmm0, zmm0, ptr[reg_C_cursor + 0 * 64]);
-                    vaddps(zmm1, zmm1, ptr[reg_C_cursor + 1 * 64]);
-                    vaddps(zmm2, zmm2, ptr[reg_C_cursor + 2 * 64]);
-                    vaddps(zmm3, zmm3, ptr[reg_C_cursor + 3 * 64]);
                     vmovups(ptr[reg_C_cursor + 0 * 64], zmm0);
                     vmovups(ptr[reg_C_cursor + 1 * 64], zmm1);
                     vmovups(ptr[reg_C_cursor + 2 * 64], zmm2);
@@ -302,10 +554,6 @@ namespace llaminar2
 
                     // Row 1
                     add(reg_C_cursor, reg_tmp); // + ldc
-                    vaddps(zmm4, zmm4, ptr[reg_C_cursor + 0 * 64]);
-                    vaddps(zmm5, zmm5, ptr[reg_C_cursor + 1 * 64]);
-                    vaddps(zmm6, zmm6, ptr[reg_C_cursor + 2 * 64]);
-                    vaddps(zmm7, zmm7, ptr[reg_C_cursor + 3 * 64]);
                     vmovups(ptr[reg_C_cursor + 0 * 64], zmm4);
                     vmovups(ptr[reg_C_cursor + 1 * 64], zmm5);
                     vmovups(ptr[reg_C_cursor + 2 * 64], zmm6);
@@ -317,6 +565,7 @@ namespace llaminar2
                 }
 
                 L("end_kernel");
+                add(rsp, 16); // Pop N and params
                 pop(r15);
                 pop(r14);
                 pop(r13);

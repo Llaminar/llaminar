@@ -479,6 +479,19 @@ add_v2_test(V2_Unit_Q8_1GemmKernel
     MPI_PROCS 1
 )
 
+# Test: Q8_1 JIT GEMM Fused Operations (Bias, Mask, Softmax)
+add_executable(v2_test_q8_1_gemm_fused unit/kernels/gemm/Test__Q8_1GemmFused.cpp)
+target_link_libraries(v2_test_q8_1_gemm_fused
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1GemmFused
+    COMMAND $<TARGET_FILE:v2_test_q8_1_gemm_fused>
+    LABELS "V2;Unit;Kernels;GEMM;Q8_1;Fused;CPU"
+    MPI_PROCS 1
+)
+
 # Test: OneDNN GEMM kernel strided/causal support
 add_executable(v2_test_onednn_gemm_kernel_strided unit/kernels/gemm/Test__OneDNNGemmKernel_Strided.cpp)
 target_link_libraries(v2_test_onednn_gemm_kernel_strided
@@ -1400,4 +1413,15 @@ target_link_libraries(v2_perf_q8_1_gemm
 add_v2_test(V2_Perf_Q8_1_GEMM 
     COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm>
     LABELS "V2;Performance;GEMM;Q8_1"
+)
+
+# Performance Test: Q8_1 GEMM Fused (Online Softmax)
+add_executable(v2_perf_q8_1_gemm_fused performance/Perf__Q8_1_GEMM_Fused.cpp)
+target_link_libraries(v2_perf_q8_1_gemm_fused 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Perf_Q8_1_GEMM_Fused 
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_fused>
+    LABELS "V2;Performance;GEMM;Q8_1;Fused;Softmax"
 )

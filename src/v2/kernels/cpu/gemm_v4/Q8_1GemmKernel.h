@@ -78,6 +78,14 @@ namespace llaminar2
 
             bool multiply(const float *A, float *C, int m, int n, int k, bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx) override
             {
+                return multiply_fused(A, C, m, n, k, nullptr, nullptr, false, nullptr, nullptr, accumulate, alpha, beta, ctx, device_idx);
+            }
+
+            bool multiply_fused(const float *A, float *C, int m, int n, int k,
+                                const float *bias, const float *mask, bool do_softmax,
+                                float *local_max, float *local_sum,
+                                bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx)
+            {
                 // Check dimensions
                 if (n != packed_weights_.N || k != packed_weights_.K)
                 {
@@ -106,6 +114,7 @@ namespace llaminar2
                 }
 
                 int k_blocks = k / 32;
+                int blocks_per_row = (n + 63) / 64; // Added for Softmax offset calculation
 
                 // Shared buffer for quantized A
                 // We need to allocate this outside parallel region or use a shared vector
@@ -292,14 +301,57 @@ namespace llaminar2
                                         const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
                                         const float *scales_ptr = packed_weights_.scales.data() + n_blk;
 
-                                        if (rows_to_process == 2)
+                                        Q8_1GemmParams params;
+                                        params.A = blocks;
+                                        params.B_packed = b_ptr;
+                                        params.comp = comp_ptr;
+                                        params.scales = scales_ptr;
+                                        params.C = C + i * n + n_blk;
+                                        params.K_blocks = k_count;
+                                        params.N = 64;
+                                        params.ldc = n;
+                                        params.bias = bias ? bias + n_blk : nullptr;
+                                        params.mask = mask ? mask + i * n + n_blk : nullptr;
+
+                                        bool is_last_k_tile = (k_start + k_count == k_blocks);
+                                        bool current_do_softmax = do_softmax && is_last_k_tile;
+
+                                        float tmp_max[2], tmp_sum[2];
+                                        if (current_do_softmax)
                                         {
-                                            kernel_m2(blocks, b_ptr, comp_ptr, scales_ptr, C + i * n + n_blk, k_count, 64, n);
+                                            if (rows_to_process == 2)
+                                            {
+                                                params.local_max = tmp_max;
+                                                params.local_sum = tmp_sum;
+                                            }
+                                            else
+                                            {
+                                                int block_idx = n_blk / 64;
+                                                params.local_max = local_max + i * blocks_per_row + block_idx;
+                                                params.local_sum = local_sum + i * blocks_per_row + block_idx;
+                                            }
                                         }
                                         else
                                         {
-                                            kernel(blocks, b_ptr, comp_ptr, scales_ptr, C + i * n + n_blk, k_count, 64, n);
+                                            params.local_max = nullptr;
+                                            params.local_sum = nullptr;
                                         }
+                                        params.do_softmax = current_do_softmax;
+
+                                        if (rows_to_process == 2)
+                                        {
+                                            kernel_m2(&params);
+                                            if (current_do_softmax)
+                                            {
+                                                int block_idx = n_blk / 64;
+                                                local_max[i * blocks_per_row + block_idx] = tmp_max[0];
+                                                local_sum[i * blocks_per_row + block_idx] = tmp_sum[0];
+                                                local_max[(i + 1) * blocks_per_row + block_idx] = tmp_max[1];
+                                                local_sum[(i + 1) * blocks_per_row + block_idx] = tmp_sum[1];
+                                            }
+                                        }
+                                        else
+                                            kernel(&params);
                                     }
                                 }
                             }
@@ -328,14 +380,54 @@ namespace llaminar2
                                     const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
                                     const float *scales_ptr = packed_weights_.scales.data() + n_blk;
 
-                                    if (rows_to_process == 2)
+                                    Q8_1GemmParams params;
+                                    params.A = blocks;
+                                    params.B_packed = b_ptr;
+                                    params.comp = comp_ptr;
+                                    params.scales = scales_ptr;
+                                    params.C = C + i * n + n_blk;
+                                    params.K_blocks = k_blocks;
+                                    params.N = 64;
+                                    params.ldc = n;
+                                    params.bias = bias ? bias + n_blk : nullptr;
+                                    params.mask = mask ? mask + i * n + n_blk : nullptr;
+
+                                    float tmp_max[2], tmp_sum[2];
+                                    if (do_softmax)
                                     {
-                                        kernel_m2(blocks, b_ptr, comp_ptr, scales_ptr, C + i * n + n_blk, k_blocks, 64, n);
+                                        if (rows_to_process == 2)
+                                        {
+                                            params.local_max = tmp_max;
+                                            params.local_sum = tmp_sum;
+                                        }
+                                        else
+                                        {
+                                            int block_idx = n_blk / 64;
+                                            params.local_max = local_max + i * blocks_per_row + block_idx;
+                                            params.local_sum = local_sum + i * blocks_per_row + block_idx;
+                                        }
                                     }
                                     else
                                     {
-                                        kernel(blocks, b_ptr, comp_ptr, scales_ptr, C + i * n + n_blk, k_blocks, 64, n);
+                                        params.local_max = nullptr;
+                                        params.local_sum = nullptr;
                                     }
+                                    params.do_softmax = do_softmax;
+
+                                    if (rows_to_process == 2)
+                                    {
+                                        kernel_m2(&params);
+                                        if (do_softmax)
+                                        {
+                                            int block_idx = n_blk / 64;
+                                            local_max[i * blocks_per_row + block_idx] = tmp_max[0];
+                                            local_sum[i * blocks_per_row + block_idx] = tmp_sum[0];
+                                            local_max[(i + 1) * blocks_per_row + block_idx] = tmp_max[1];
+                                            local_sum[(i + 1) * blocks_per_row + block_idx] = tmp_sum[1];
+                                        }
+                                    }
+                                    else
+                                        kernel(&params);
                                 }
                             }
                         }
