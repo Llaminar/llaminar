@@ -1,9 +1,9 @@
 /**
- * @file Perf__Q8_1_GEMM.cpp
- * @brief Performance benchmark for Q8_1 quantized GEMM operations
+ * @file Perf__Q4_0_GEMM.cpp
+ * @brief Performance benchmark for Q4_0 quantized GEMM operations
  *
- * This test benchmarks Q8_1 quantized matrix multiplication performance
- * (Q8_1 weights x Q8_1 activations). It measures:
+ * This test benchmarks Q4_0 quantized matrix multiplication performance
+ * (Q4_0 weights x Q8_1 activations). It measures:
  *   - Throughput (GFLOPS)
  *   - Time per iteration (ms)
  *
@@ -62,7 +62,7 @@ struct BenchmarkStats
     double stddev_gflops; ///< Standard deviation of throughput
 };
 
-class Q8_1_GEMM_Perf : public ::testing::Test
+class Q4_0_GEMM_Perf : public ::testing::Test
 {
 protected:
     int rank_ = 0;
@@ -154,7 +154,7 @@ protected:
                   << ", Max Rel Diff=" << max_rel_diff
                   << ", L2 Error=" << l2_error * 100.0 << "%" << std::endl;
 
-        // Tolerance for Q8_1 Kernel vs Dequantized Reference
+        // Tolerance for Q4_0 Kernel vs Dequantized Reference
         // Since we are comparing against dequantized weights, error should be very low (arithmetic only).
         EXPECT_LT(l2_error, 0.01) << "Large divergence detected! L2 Error > 1%";
     }
@@ -172,13 +172,70 @@ protected:
         for (auto &x : weights_fp32)
             x = dist(gen);
 
-        // 2. Quantize weights to Q8_1Tensor
-        auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+        // 2. Quantize weights to Q4_0Tensor
+        // Manual quantization for Q4_0
+        size_t num_blocks = (N * K + 31) / 32;
+        std::vector<uint8_t> q4_0_data(num_blocks * sizeof(Q4_0Block));
+        Q4_0Block *blocks = reinterpret_cast<Q4_0Block *>(q4_0_data.data());
+
+        for (size_t i = 0; i < num_blocks; ++i)
+        {
+            float max_abs = 0.0f;
+            for (int j = 0; j < 32; ++j)
+            {
+                size_t idx = i * 32 + j;
+                if (idx < weights_fp32.size())
+                {
+                    max_abs = std::max(max_abs, std::abs(weights_fp32[idx]));
+                }
+            }
+
+            float d = max_abs / 7.0f;
+            if (d < 1e-10f)
+                d = 1e-10f;
+            blocks[i].d = fp32_to_fp16(d);
+
+            for (int j = 0; j < 16; ++j)
+            {
+                size_t idx0 = i * 32 + j;
+                size_t idx1 = i * 32 + j + 16;
+
+                int8_t q0 = 8;
+                if (idx0 < weights_fp32.size())
+                {
+                    q0 = std::round(weights_fp32[idx0] / d) + 8;
+                    q0 = std::max((int8_t)0, std::min((int8_t)15, q0));
+                }
+
+                int8_t q1 = 8;
+                if (idx1 < weights_fp32.size())
+                {
+                    q1 = std::round(weights_fp32[idx1] / d) + 8;
+                    q1 = std::max((int8_t)0, std::min((int8_t)15, q1));
+                }
+
+                blocks[i].qs[j] = (q0 & 0x0F) | (q1 << 4);
+            }
+        }
+        auto weights_tensor = std::make_shared<Q4_0Tensor>(std::vector<size_t>{(size_t)N, (size_t)K}, q4_0_data);
 
         // 2b. Dequantize weights for reference calculation (to exclude quantization error)
         // We want to verify the kernel's math, not the quantization loss.
         std::vector<float> weights_dequantized(N * K);
-        weights_tensor->to_fp32(weights_dequantized.data());
+        for (size_t i = 0; i < num_blocks; ++i)
+        {
+            float d = fp16_to_fp32(blocks[i].d);
+            for (int j = 0; j < 32; ++j)
+            {
+                size_t idx = i * 32 + j;
+                if (idx >= weights_dequantized.size())
+                    continue;
+
+                uint8_t q_packed = blocks[i].qs[j % 16];
+                int8_t q = (j < 16) ? (q_packed & 0x0F) : (q_packed >> 4);
+                weights_dequantized[idx] = (q - 8) * d;
+            }
+        }
 
         // 3. Create kernel
         auto kernel = weights_tensor->createGemm();
@@ -272,119 +329,32 @@ int main(int argc, char **argv)
     // Initialize GTest
     ::testing::InitGoogleTest(&argc, argv);
 
-    // Run tests
     int result = RUN_ALL_TESTS();
 
-    // Finalize MPI
     MPI_Finalize();
-
     return result;
 }
 
-// Qwen 7B Sizes
-// Hidden: 4096
-// Intermediate: 11008
-// Layers: 32
+// ============================================================================
+// Test Cases
+// ============================================================================
 
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_Attention_QKV)
+// Qwen 0.5B Dimensions
+// Attention Output: N=896, K=896
+// FFN Gate/Up: N=4864, K=896
+// FFN Down: N=896, K=4864
+
+TEST_F(Q4_0_GEMM_Perf, Qwen0_5B_Attention_Output)
 {
-    // QKV Projection: [M, 4096] -> [M, 12288]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
-
-    for (int m : batch_sizes)
-    {
-        BenchmarkConfig config;
-        config.seq_len = m;
-        config.in_features = 4096;
-        config.out_features = 12288; // 4096 * 3
-        config.warmup_iters = 5;
-        config.bench_iters = 20;
-        config.num_trials = 5;
-        config.description = "Qwen7B Attn QKV";
-
-        auto stats = run_benchmark(config);
-        print_results(config, stats);
-    }
-}
-
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_Attention_Output)
-{
-    // Output Projection: [M, 4096] -> [M, 4096]
-    std::vector<int> batch_sizes = {1, 32, 128, 512};
-
-    for (int m : batch_sizes)
-    {
-        BenchmarkConfig config;
-        config.seq_len = m;
-        config.in_features = 4096;
-        config.out_features = 4096;
-        config.warmup_iters = 5;
-        config.bench_iters = 20;
-        config.num_trials = 5;
-        config.description = "Qwen7B Attn Output";
-
-        auto stats = run_benchmark(config);
-        print_results(config, stats);
-    }
-}
-
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_FFN_GateUp)
-{
-    // FFN Gate/Up: [M, 4096] -> [M, 11008]
-    std::vector<int> batch_sizes = {1, 32, 128, 512};
-
-    for (int m : batch_sizes)
-    {
-        BenchmarkConfig config;
-        config.seq_len = m;
-        config.in_features = 4096;
-        config.out_features = 11008;
-        config.warmup_iters = 5;
-        config.bench_iters = 20;
-        config.num_trials = 5;
-        config.description = "Qwen7B FFN GateUp";
-
-        auto stats = run_benchmark(config);
-        print_results(config, stats);
-    }
-}
-
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_FFN_Down)
-{
-    // FFN Down: [M, 11008] -> [M, 4096]
-    std::vector<int> batch_sizes = {1, 32, 128, 512};
-
-    for (int m : batch_sizes)
-    {
-        BenchmarkConfig config;
-        config.seq_len = m;
-        config.in_features = 11008;
-        config.out_features = 4096;
-        config.warmup_iters = 5;
-        config.bench_iters = 20;
-        config.num_trials = 5;
-        config.description = "Qwen7B FFN Down";
-
-        auto stats = run_benchmark(config);
-        print_results(config, stats);
-    }
-}
-
-// --- Qwen 0.5B Tests ---
-
-TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_Attention_Output)
-{
-    // Output Projection: [M, 896] -> [M, 896]
-    std::vector<int> batch_sizes = {1, 32, 128, 512};
-
     for (int m : batch_sizes)
     {
         BenchmarkConfig config;
         config.seq_len = m;
         config.in_features = 896;
         config.out_features = 896;
-        config.warmup_iters = 5;
-        config.bench_iters = 20;
+        config.warmup_iters = 10;
+        config.bench_iters = 50;
         config.num_trials = 5;
         config.description = "Qwen0.5B Attn Output";
 
@@ -393,19 +363,17 @@ TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_Attention_Output)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_FFN_Down)
+TEST_F(Q4_0_GEMM_Perf, Qwen0_5B_FFN_Down)
 {
-    // FFN Down: [M, 4864] -> [M, 896]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
-
     for (int m : batch_sizes)
     {
         BenchmarkConfig config;
         config.seq_len = m;
         config.in_features = 4864;
         config.out_features = 896;
-        config.warmup_iters = 5;
-        config.bench_iters = 20;
+        config.warmup_iters = 10;
+        config.bench_iters = 50;
         config.num_trials = 5;
         config.description = "Qwen0.5B FFN Down";
 
@@ -414,13 +382,14 @@ TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_FFN_Down)
     }
 }
 
-// --- Qwen 32B Tests ---
+// Qwen 32B Dimensions
+// Attention Output: N=5120, K=5120
+// FFN Gate/Up: N=27392, K=5120
+// FFN Down: N=5120, K=27392
 
-TEST_F(Q8_1_GEMM_Perf, Qwen32B_Attention_Output)
+TEST_F(Q4_0_GEMM_Perf, Qwen32B_Attention_Output)
 {
-    // Output Projection: [M, 5120] -> [M, 5120]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
-
     for (int m : batch_sizes)
     {
         BenchmarkConfig config;
@@ -429,7 +398,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen32B_Attention_Output)
         config.out_features = 5120;
         config.warmup_iters = 5;
         config.bench_iters = 20;
-        config.num_trials = 5;
+        config.num_trials = 3;
         config.description = "Qwen32B Attn Output";
 
         auto stats = run_benchmark(config);
@@ -437,11 +406,9 @@ TEST_F(Q8_1_GEMM_Perf, Qwen32B_Attention_Output)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen32B_FFN_Down)
+TEST_F(Q4_0_GEMM_Perf, Qwen32B_FFN_Down)
 {
-    // FFN Down: [M, 27392] -> [M, 5120]
-    std::vector<int> batch_sizes = {1, 2, 32, 128, 512};
-
+    std::vector<int> batch_sizes = {1, 32, 128, 512};
     for (int m : batch_sizes)
     {
         BenchmarkConfig config;
@@ -450,7 +417,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen32B_FFN_Down)
         config.out_features = 5120;
         config.warmup_iters = 5;
         config.bench_iters = 20;
-        config.num_trials = 5;
+        config.num_trials = 3;
         config.description = "Qwen32B FFN Down";
 
         auto stats = run_benchmark(config);

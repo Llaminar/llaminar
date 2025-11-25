@@ -1,9 +1,9 @@
 /**
- * @file Perf__Q8_1_GEMM.cpp
- * @brief Performance benchmark for Q8_1 quantized GEMM operations
+ * @file Perf__Q8_0_GEMM.cpp
+ * @brief Performance benchmark for Q8_0 quantized GEMM operations
  *
- * This test benchmarks Q8_1 quantized matrix multiplication performance
- * (Q8_1 weights x Q8_1 activations). It measures:
+ * This test benchmarks Q8_0 quantized matrix multiplication performance
+ * (Q8_0 weights x Q8_1 activations). It measures:
  *   - Throughput (GFLOPS)
  *   - Time per iteration (ms)
  *
@@ -62,7 +62,7 @@ struct BenchmarkStats
     double stddev_gflops; ///< Standard deviation of throughput
 };
 
-class Q8_1_GEMM_Perf : public ::testing::Test
+class Q8_0_GEMM_Perf : public ::testing::Test
 {
 protected:
     int rank_ = 0;
@@ -154,7 +154,7 @@ protected:
                   << ", Max Rel Diff=" << max_rel_diff
                   << ", L2 Error=" << l2_error * 100.0 << "%" << std::endl;
 
-        // Tolerance for Q8_1 Kernel vs Dequantized Reference
+        // Tolerance for Q8_0 Kernel vs Dequantized Reference
         // Since we are comparing against dequantized weights, error should be very low (arithmetic only).
         EXPECT_LT(l2_error, 0.01) << "Large divergence detected! L2 Error > 1%";
     }
@@ -172,13 +172,59 @@ protected:
         for (auto &x : weights_fp32)
             x = dist(gen);
 
-        // 2. Quantize weights to Q8_1Tensor
-        auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+        // 2. Quantize weights to Q8_0Tensor
+        // Manual quantization for Q8_0
+        size_t num_blocks = (N * K + 31) / 32;
+        std::vector<uint8_t> q8_0_data(num_blocks * sizeof(Q8_0Block));
+        Q8_0Block *blocks = reinterpret_cast<Q8_0Block *>(q8_0_data.data());
+
+        for (size_t i = 0; i < num_blocks; ++i)
+        {
+            float max_abs = 0.0f;
+            for (int j = 0; j < 32; ++j)
+            {
+                size_t idx = i * 32 + j;
+                if (idx < weights_fp32.size())
+                {
+                    max_abs = std::max(max_abs, std::abs(weights_fp32[idx]));
+                }
+            }
+
+            float d = max_abs / 127.0f;
+            if (d < 1e-10f)
+                d = 1e-10f;
+            blocks[i].d = fp32_to_fp16(d);
+
+            for (int j = 0; j < 32; ++j)
+            {
+                size_t idx = i * 32 + j;
+                if (idx < weights_fp32.size())
+                {
+                    blocks[i].qs[j] = std::round(weights_fp32[idx] / d);
+                }
+                else
+                {
+                    blocks[i].qs[j] = 0;
+                }
+            }
+        }
+        auto weights_tensor = std::make_shared<Q8_0Tensor>(std::vector<size_t>{(size_t)N, (size_t)K}, q8_0_data);
 
         // 2b. Dequantize weights for reference calculation (to exclude quantization error)
         // We want to verify the kernel's math, not the quantization loss.
         std::vector<float> weights_dequantized(N * K);
-        weights_tensor->to_fp32(weights_dequantized.data());
+        for (size_t i = 0; i < num_blocks; ++i)
+        {
+            float d = fp16_to_fp32(blocks[i].d);
+            for (int j = 0; j < 32; ++j)
+            {
+                size_t idx = i * 32 + j;
+                if (idx < weights_dequantized.size())
+                {
+                    weights_dequantized[idx] = blocks[i].qs[j] * d;
+                }
+            }
+        }
 
         // 3. Create kernel
         auto kernel = weights_tensor->createGemm();
@@ -286,7 +332,7 @@ int main(int argc, char **argv)
 // Intermediate: 11008
 // Layers: 32
 
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_Attention_QKV)
+TEST_F(Q8_0_GEMM_Perf, Qwen7B_Attention_QKV)
 {
     // QKV Projection: [M, 4096] -> [M, 12288]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -307,7 +353,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen7B_Attention_QKV)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_Attention_Output)
+TEST_F(Q8_0_GEMM_Perf, Qwen7B_Attention_Output)
 {
     // Output Projection: [M, 4096] -> [M, 4096]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -328,7 +374,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen7B_Attention_Output)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_FFN_GateUp)
+TEST_F(Q8_0_GEMM_Perf, Qwen7B_FFN_GateUp)
 {
     // FFN Gate/Up: [M, 4096] -> [M, 11008]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -349,7 +395,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen7B_FFN_GateUp)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen7B_FFN_Down)
+TEST_F(Q8_0_GEMM_Perf, Qwen7B_FFN_Down)
 {
     // FFN Down: [M, 11008] -> [M, 4096]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -372,7 +418,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen7B_FFN_Down)
 
 // --- Qwen 0.5B Tests ---
 
-TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_Attention_Output)
+TEST_F(Q8_0_GEMM_Perf, Qwen0_5B_Attention_Output)
 {
     // Output Projection: [M, 896] -> [M, 896]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -393,7 +439,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_Attention_Output)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_FFN_Down)
+TEST_F(Q8_0_GEMM_Perf, Qwen0_5B_FFN_Down)
 {
     // FFN Down: [M, 4864] -> [M, 896]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -416,7 +462,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen0_5B_FFN_Down)
 
 // --- Qwen 32B Tests ---
 
-TEST_F(Q8_1_GEMM_Perf, Qwen32B_Attention_Output)
+TEST_F(Q8_0_GEMM_Perf, Qwen32B_Attention_Output)
 {
     // Output Projection: [M, 5120] -> [M, 5120]
     std::vector<int> batch_sizes = {1, 32, 128, 512};
@@ -437,7 +483,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen32B_Attention_Output)
     }
 }
 
-TEST_F(Q8_1_GEMM_Perf, Qwen32B_FFN_Down)
+TEST_F(Q8_0_GEMM_Perf, Qwen32B_FFN_Down)
 {
     // FFN Down: [M, 27392] -> [M, 5120]
     std::vector<int> batch_sizes = {1, 2, 32, 128, 512};

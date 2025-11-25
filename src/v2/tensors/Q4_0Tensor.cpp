@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
 #include "Tensors.h"
 #include "../kernels/cpu/CPURoPEKernelT.h"
 #include "../kernels/cpu/CPUSwiGLUKernelT.h"
@@ -139,8 +139,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q4_0Tensor::createGemm()
     {
-        // Use OneDNNGemmKernel with INT8 adapter support
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+        // Use Q8_1GemmKernel for AVX512 support
+        return std::make_unique<llaminar2::gemm_v4::Q8_1GemmKernel>(this);
     }
 
     void Q4_0Tensor::decodeBlock(const Q4_0Block &block, float *output)

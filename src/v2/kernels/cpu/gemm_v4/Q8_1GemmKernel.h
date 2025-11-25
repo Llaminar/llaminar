@@ -19,7 +19,79 @@ namespace llaminar2
         class Q8_1GemmKernel : public ITensorGemm
         {
         public:
-            Q8_1GemmKernel(const Q8_1Tensor *weights) : weights_(weights)
+            Q8_1GemmKernel(const Q8_1Tensor *weights)
+            {
+                pack_weights_impl<Q8_1Tensor, Q8_1Block>(weights);
+            }
+
+            Q8_1GemmKernel(const Q8_0Tensor *weights)
+            {
+                pack_weights_impl<Q8_0Tensor, Q8_0Block>(weights);
+            }
+
+            Q8_1GemmKernel(const Q4_0Tensor *weights)
+            {
+                pack_weights_q4_0(weights);
+            }
+
+        private:
+            void pack_weights_q4_0(const Q4_0Tensor *weights)
+            {
+                // Weights are typically [N, K] (out_features, in_features)
+                int N = weights->shape()[0];
+                int K = weights->shape()[1];
+
+                packed_weights_.K = K;
+                packed_weights_.N = N;
+
+                // Pad N to multiple of 64 for blocking
+                int N_padded = (N + 63) / 64 * 64;
+                packed_weights_.packed_data.resize(K * N_padded);
+                packed_weights_.compensation.resize((K / 32) * N);
+                packed_weights_.scales.resize((K / 32) * N);
+
+                // Iterate over N rows of weights
+                for (int n = 0; n < N; ++n)
+                {
+                    for (int k_blk = 0; k_blk < K / 32; ++k_blk)
+                    {
+                        // Get block from weights
+                        const void *raw_block = weights->get_raw_block_at(n, k_blk);
+                        const Q4_0Block *block = static_cast<const Q4_0Block *>(raw_block);
+
+                        // Unpack Q4_0 block
+                        // Layout: low nibbles in first half [0..15], high nibbles in second half [16..31]
+                        int8_t temp_vals[32];
+                        for (int i = 0; i < 16; ++i)
+                        {
+                            temp_vals[i] = (block->qs[i] & 0x0F) - 8;
+                            temp_vals[i + 16] = (block->qs[i] >> 4) - 8;
+                        }
+
+                        int32_t sum = 0;
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            int k = k_blk * 32 + i;
+                            int8_t val = temp_vals[i];
+                            sum += val;
+
+                            // Pack into [N/64][K/4][64][4]
+                            // Index: (n / 64) * (K * 64) + (k / 4) * 256 + (n % 64) * 4 + (k % 4)
+                            int n_blk = n / 64;
+                            int n_rem = n % 64;
+                            int k_blk_4 = k / 4;
+                            int k_rem = k % 4;
+                            size_t packed_idx = (size_t)n_blk * (K * 64) + (size_t)k_blk_4 * 256 + n_rem * 4 + k_rem;
+                            packed_weights_.packed_data[packed_idx] = val;
+                        }
+                        packed_weights_.compensation[k_blk * N + n] = sum;
+                        packed_weights_.scales[k_blk * N + n] = fp16_to_fp32(block->d);
+                    }
+                }
+            }
+
+            template <typename TensorT, typename BlockT>
+            void pack_weights_impl(const TensorT *weights)
             {
                 // Weights are typically [N, K] (out_features, in_features)
                 // We need to pack them as K x N for the kernel
@@ -47,7 +119,7 @@ namespace llaminar2
                     {
                         // Get block from weights
                         const void *raw_block = weights->get_raw_block_at(n, k_blk);
-                        const Q8_1Block *block = static_cast<const Q8_1Block *>(raw_block);
+                        const BlockT *block = static_cast<const BlockT *>(raw_block);
 
                         int32_t sum = 0;
                         for (int i = 0; i < 32; ++i)
@@ -71,6 +143,7 @@ namespace llaminar2
                 }
             }
 
+        public:
             bool supports_device(int device_idx) const override
             {
                 return device_idx == -1;
@@ -313,6 +386,7 @@ namespace llaminar2
                                         params.ldc = n;
                                         params.bias = bias ? bias + n_blk : nullptr;
                                         params.mask = mask ? mask + i * n + n_blk : nullptr;
+                                        params.A_stride = k_blocks * sizeof(Q8_1Block);
 
                                         bool is_last_k_tile = (k_start + k_count == k_blocks);
                                         bool current_do_softmax = do_softmax && is_last_k_tile;
@@ -392,6 +466,7 @@ namespace llaminar2
                                     params.ldc = n;
                                     params.bias = bias ? bias + n_blk : nullptr;
                                     params.mask = mask ? mask + i * n + n_blk : nullptr;
+                                    params.A_stride = k_blocks * sizeof(Q8_1Block);
 
                                     float tmp_max[2], tmp_sum[2];
                                     if (do_softmax)
@@ -449,7 +524,6 @@ namespace llaminar2
             }
 
         private:
-            const Q8_1Tensor *weights_;
             Q8_1PackedWeights packed_weights_;
         };
 

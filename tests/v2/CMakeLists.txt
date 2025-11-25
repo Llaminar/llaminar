@@ -1375,6 +1375,30 @@ add_v2_test(V2_Perf_Q8_1_GEMM
     LABELS "V2;Performance;GEMM;Q8_1"
 )
 
+# Performance Test: Q8_0 GEMM
+add_executable(v2_perf_q8_0_gemm performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_0_GEMM.cpp)
+target_link_libraries(v2_perf_q8_0_gemm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q8_0_GEMM 
+    COMMAND $<TARGET_FILE:v2_perf_q8_0_gemm>
+    LABELS "V2;Performance;GEMM;Q8_0"
+)
+
+# Performance Test: Q4_0 GEMM
+add_executable(v2_perf_q4_0_gemm performance/kernels/cpu/gemm/gemm_v4/Perf__Q4_0_GEMM.cpp)
+target_link_libraries(v2_perf_q4_0_gemm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q4_0_GEMM 
+    COMMAND $<TARGET_FILE:v2_perf_q4_0_gemm>
+    LABELS "V2;Performance;GEMM;Q4_0"
+)
+
 # Performance Test: Q8_1 GEMM Fused (Online Softmax)
 add_executable(v2_perf_q8_1_gemm_fused performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM_Fused.cpp)
 target_link_libraries(v2_perf_q8_1_gemm_fused 

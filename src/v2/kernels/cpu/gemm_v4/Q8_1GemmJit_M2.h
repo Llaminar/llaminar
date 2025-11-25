@@ -214,9 +214,9 @@ namespace llaminar2
                             vpxord(zmm_a0, zmm_a0, zmm_128); // Convert to uint8
 
                             // Load A Row 1
-                            // Offset: K_blocks * 36
-                            mov(reg_tmp, reg_K_blocks);
-                            imul(reg_tmp, reg_tmp, 36);
+                            // Offset: A_stride
+                            mov(reg_tmp, ptr[rsp + 8]);              // Load params ptr
+                            mov(reg_tmp.cvt32(), ptr[reg_tmp + 92]); // Load A_stride
                             vpbroadcastd(zmm_a1, ptr[reg_A_cursor + reg_tmp + 4 + i * 4]);
                             vpxord(zmm_a1, zmm_a1, zmm_128);
 
@@ -284,8 +284,8 @@ namespace llaminar2
                         vaddps(zmm3, zmm3, zmm11);
 
                         // 6. Load Scale A Row 1 and multiply
-                        mov(reg_tmp, reg_K_blocks);
-                        imul(reg_tmp, reg_tmp, 36);
+                        mov(reg_tmp, ptr[rsp + 8]);              // Load params ptr
+                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 92]); // Load A_stride
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp]);
                         vcvtph2ps(zmm_scale, ymm_tmp);
 

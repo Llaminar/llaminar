@@ -43,6 +43,7 @@ namespace llaminar2
             float *local_max; // Output: Local max for each 64-col block
             float *local_sum; // Output: Local sum for each 64-col block
             bool do_softmax;
+            int A_stride;
         };
 
         class Q8_1GemmJit_M1 : public Xbyak::CodeGenerator
