@@ -578,7 +578,12 @@ namespace llaminar2
         // Use FusedRMSNormQuantize to eliminate redundant FP32→INT8 quantization in GEMM
 
         // Check if FusedRMSNormQuantize is available and INT8 buffers allocated
-        bool use_fused_quantize = (buffers.normalized_int8 != nullptr) &&
+        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration
+        // The fused kernels now output FP32 (via Q8_1GemmKernel), but pipeline integration
+        // is pending. See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
+        constexpr bool ENABLE_FUSED_INT32_PATH = false; // TODO: Remove when FP32 fused path integrated
+        bool use_fused_quantize = ENABLE_FUSED_INT32_PATH &&
+                                  (buffers.normalized_int8 != nullptr) &&
                                   (!buffers.normalized_scales.empty());
 
         if (use_fused_quantize)
@@ -691,6 +696,11 @@ namespace llaminar2
         // Use FusedTripleGEMM to eliminate redundant quantization:
         //   Old: Quant(norm) → q_gemm + Quant(norm) → k_gemm + Quant(norm) → v_gemm → Dequant(Q) + Dequant(K) + Dequant(V)
         //   New: Quant(norm) → FusedTripleGEMM → [q_int32, k_int32, v_int32] → Dequant → [Q_fp32, K_fp32, V_fp32]
+
+        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration.
+        // The fused kernels now output FP32 (via Q8_1GemmKernel), but pipeline integration
+        // is pending. See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
+#if 0 // DISABLED: Old INT32 fused path - to be replaced with FP32 fused path
         if (use_fused_quantize)
         {
             // Phase 2: Fused path with FusedTripleGEMM + manual dequantization
@@ -791,6 +801,7 @@ namespace llaminar2
             VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
         }
         else
+#endif // DISABLED: Old INT32 fused path
         {
             // Phase 1: Unfused path (fallback for non-INT8 precision)
             VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
@@ -1089,7 +1100,11 @@ namespace llaminar2
         // 1. Pre-FFN RMSNorm + INT8 Quantization (fused for efficiency)
 
         // Check if FusedRMSNormQuantize is available and INT8 buffers allocated
-        bool use_fused_quantize = (buffers.normalized_int8 != nullptr) &&
+        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration
+        // See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
+        constexpr bool ENABLE_FUSED_INT32_PATH = false; // TODO: Remove when FP32 fused path integrated
+        bool use_fused_quantize = ENABLE_FUSED_INT32_PATH &&
+                                  (buffers.normalized_int8 != nullptr) &&
                                   (!buffers.normalized_scales.empty());
 
         if (use_fused_quantize)
@@ -1201,6 +1216,11 @@ namespace llaminar2
         // Use FusedDualGEMM to eliminate redundant quantization:
         //   Old: Quant(norm) → gate_gemm + Quant(norm) → up_gemm → Dequant(gate) + Dequant(up) → SwiGLU
         //   New: Quant(norm) → FusedDualGEMM → [gate_int32, up_int32] → FusedDequantSwiGLU → output_fp32
+
+        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration.
+        // The fused kernels now output FP32 (via Q8_1GemmKernel), but pipeline integration
+        // is pending. See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
+#if 0  // DISABLED: Old INT32 fused path - to be replaced with FP32 fused path
         if (use_fused_quantize)
         {
             // Phase 2: Fused path with FusedDualGEMM + FusedDequantSwiGLU
@@ -1273,6 +1293,7 @@ namespace llaminar2
             LOG_DEBUG("[Phase2] FusedDequantSwiGLU completed");
         }
         else
+#endif // DISABLED: Old INT32 fused path
         {
             // Phase 1: Unfused path (fallback for non-INT8 precision)
             VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");

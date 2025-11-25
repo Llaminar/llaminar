@@ -50,20 +50,10 @@ namespace llaminar2
      * @brief Q8_1 block: 8-bit quantization with pre-computed sum (36 bytes)
      *
      * Like Q8_0 but stores the pre-computed sum for asymmetric quantization compensation.
-     * This format is used as an intermediate format for activations (matching CUDA pattern):
+     * This format is used as an intermediate format for activations (matching llama-cpp/CUDA pattern):
      * - FP32/FP16/BF16 activations → Q8_1 (quantize once per panel)
      * - Q8_1 activations × quantized weights (many dot products)
      * - Pre-computed sum eliminates expensive horizontal reductions in K-loop
-     *
-     * Formula: output = d * sum(qs[i])
-     *
-     * GEMM OPTIMIZATION (Nov 2024):
-     * The 'sum_qs' field now stores the raw integer sum of qs[i] values (INT16),
-     * NOT d × sum(qs[i]). This eliminates FP16→FP32 conversion and division from
-     * the GEMM K-loop, allowing pure VNNI compute followed by scaling in post-processing.
-     *
-     * Compensation formula in GEMM:
-     *   C[i,j] = Σ_kb ((accum[kb] - 128*sum_qs[kb]) * d_a[kb] * d_b[kb])
      */
     struct Q8_1Block
     {

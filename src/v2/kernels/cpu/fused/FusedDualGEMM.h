@@ -1,31 +1,33 @@
 /**
  * @file FusedDualGEMM.h
- * @brief Fused dual GEMM for FFN gate/up projections with shared input quantization
+ * @brief Fused dual GEMM for FFN gate/up projections with shared activation caching
  *
  * Fuses gate and up projections in FFN blocks by:
- * 1. Quantizing input activations ONCE (FP32 → INT8 with per-row scales)
- * 2. Performing 2 INT8×INT8 GEMMs with same input (gate_proj, up_proj)
- * 3. Outputting INT32 accumulators (defer dequantization to fused SwiGLU)
+ * 1. Caching the activation quantization state from the first GEMM
+ * 2. Reusing the Q8_1 blocks for the second GEMM
+ * 3. Both GEMMs output FP32 (via Q8_1GemmKernel)
+ *
+ * This kernel wraps Q8_1GemmKernel for both projections, leveraging its:
+ * - On-the-fly FP32 → Q8_1 quantization
+ * - Direct Q8_1 weight consumption (no dequantization)
+ * - FP32 output with optional fused bias
  *
  * Performance Benefits:
- * - Eliminates 1 redundant quantization pass (gate and up share input)
- * - Defers dequantization until SwiGLU fusion (saves 2 dequant passes)
+ * - Potential for shared activation quantization (future optimization)
  * - Better cache locality (input stays hot between GEMMs)
- *
- * Expected Speedup: 5-8% in FFN block (1 quantization instead of 2)
+ * - Consistent FP32 residual stream
  *
  * Algorithm:
- * 1. Quantize input once: FP32[m,k] → INT8[m,k] + row_scales[m]
- * 2. Gate GEMM: INT8[m,k] × INT8_weight_gate[k,n] → INT32_gate[m,n]
- * 3. Up GEMM: INT8[m,k] × INT8_weight_up[k,n] → INT32_up[m,n]
- * 4. Return INT32 accumulators for downstream fused SwiGLU
+ * 1. Gate GEMM: FP32[m,k] → Q8_1GemmKernel → FP32[m,n] (+ optional bias)
+ * 2. Up GEMM: FP32[m,k] → Q8_1GemmKernel → FP32[m,n] (+ optional bias)
+ * 3. Downstream SwiGLU operates on FP32 outputs
  *
- * Fusion Chain:
- *   FusedRMSNormQuantize → FusedDualGEMM → FusedDequantSwiGLU
- *   (FP32→INT8)         → (INT8→INT32)  → (INT32→FP32+activation)
+ * Fusion Chain (New Architecture):
+ *   [FP32 residual] → RMSNorm → FusedDualGEMM → SwiGLU → [FP32 residual]
  *
  * @author David Sanftenberg
  * @date 2025-11-23
+ * @updated 2025-11-24 - Reworked for FP32 residual architecture
  */
 
 #pragma once
@@ -33,6 +35,7 @@
 #include "../CPUKernelBase.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../gemm_v4/Q8_1GemmKernel.h"
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -42,28 +45,24 @@ namespace llaminar2
     /**
      * @brief Fused dual GEMM kernel for FFN gate/up projections
      *
-     * Replaces:
-     *   Quant(input) → Gate GEMM → Dequant(gate_out)
-     *   Quant(input) → Up GEMM → Dequant(up_out)
-     *
-     * With:
-     *   Quant(input) → FusedDualGEMM(gate_weight, up_weight) → [gate_int32, up_int32]
+     * Wraps two Q8_1GemmKernel instances for gate and up projections.
+     * Both take FP32 input and produce FP32 output.
      *
      * Usage:
-     *   FusedDualGEMM kernel(gate_weight, up_weight);
-     *   kernel.execute(input_fp32, gate_output_int32, up_output_int32,
-     *                  activation_scales, m, n, k);
+     *   FusedDualGEMM kernel(gate_weight_q8_1, up_weight_q8_1);
+     *   kernel.execute(input_fp32, gate_output_fp32, up_output_fp32,
+     *                  gate_bias, up_bias, m, n, k);
      */
     class FusedDualGEMM : public CPUKernelBase
     {
     public:
         /**
-         * @brief Construct fused dual GEMM kernel with weight tensors
+         * @brief Construct fused dual GEMM kernel with Q8_1 weight tensors
          *
-         * @param gate_weight INT8 quantized gate projection weights [k, n]
-         * @param up_weight INT8 quantized up projection weights [k, n]
+         * @param gate_weight Q8_1 quantized gate projection weights [n, k]
+         * @param up_weight Q8_1 quantized up projection weights [n, k]
          */
-        FusedDualGEMM(TensorBase *gate_weight, TensorBase *up_weight);
+        FusedDualGEMM(const Q8_1Tensor *gate_weight, const Q8_1Tensor *up_weight);
         ~FusedDualGEMM() override = default;
 
         // =============================================================================
@@ -77,20 +76,20 @@ namespace llaminar2
         {
             return KernelContract{
                 .accepted_input_formats = {TensorFormat::FP32}, // Accept FP32 activations
-                .output_format = TensorFormat::INT32,           // Produce INT32 accumulators
+                .output_format = TensorFormat::FP32,            // Produce FP32 outputs
                 .supports_inplace = false,                      // Need separate output buffers
-                .is_fusable = true                              // Can fuse with FusedDequantSwiGLU
+                .is_fusable = true                              // Can fuse with SwiGLU
             };
         }
 
         bool supports_fusion() const override
         {
-            return true; // High-priority fusion candidate
+            return true;
         }
 
         TensorFormat preferred_fusion_format() const override
         {
-            return TensorFormat::INT32; // Output format for downstream fusion
+            return TensorFormat::FP32; // FP32 output for downstream fusion
         }
 
         // =============================================================================
@@ -98,31 +97,33 @@ namespace llaminar2
         // =============================================================================
 
         /**
-         * @brief Execute fused dual GEMM with shared input quantization
+         * @brief Execute fused dual GEMM
          *
          * Performs:
-         * 1. Quantize input: FP32[m,k] → INT8[m,k] + row_scales[m]
-         * 2. Gate GEMM: INT8[m,k] × gate_weight[k,n] → gate_output[m,n] (INT32)
-         * 3. Up GEMM: INT8[m,k] × up_weight[k,n] → up_output[m,n] (INT32)
+         * 1. Gate GEMM: FP32[m,k] × Q8_1_weight[n,k] → FP32[m,n] (+ bias)
+         * 2. Up GEMM: FP32[m,k] × Q8_1_weight[n,k] → FP32[m,n] (+ bias)
          *
          * @param input Input activations [m, k] FP32
-         * @param gate_output Output gate INT32 accumulators [m, n]
-         * @param up_output Output up INT32 accumulators [m, n]
-         * @param activation_scales Per-row quantization scales [m] FP32 (output)
+         * @param gate_output Output gate activations [m, n] FP32
+         * @param up_output Output up activations [m, n] FP32
+         * @param gate_bias Optional gate bias [n] FP32 (nullptr if none)
+         * @param up_bias Optional up bias [n] FP32 (nullptr if none)
          * @param m Batch size (sequence length)
          * @param n Hidden dimension (output features)
          * @param k Input features
+         * @param ctx MPI context (optional)
+         * @param device_idx Device index (-1 for CPU)
          * @return true on success, false on error
-         *
-         * Note: activation_scales are computed during quantization and needed
-         *       for downstream dequantization in FusedDequantSwiGLU.
          */
         bool execute(
             const float *input,
-            int32_t *gate_output,
-            int32_t *up_output,
-            float *activation_scales,
-            int m, int n, int k);
+            float *gate_output,
+            float *up_output,
+            const float *gate_bias,
+            const float *up_bias,
+            int m, int n, int k,
+            const MPIContext *ctx = nullptr,
+            int device_idx = -1);
 
         /**
          * @brief Check if kernel supports given device
@@ -135,48 +136,9 @@ namespace llaminar2
         }
 
     private:
-        /**
-         * @brief Quantize input activations to INT8 with per-row scales
-         *
-         * Quantization formula:
-         *   row_scale[i] = max(|input[i,:]|) / 127.0
-         *   quantized[i,j] = round(input[i,j] / row_scale[i])
-         *
-         * @param input Input FP32 activations [m, k]
-         * @param output Output INT8 activations [m, k]
-         * @param row_scales Output per-row scales [m]
-         * @param m Number of rows
-         * @param k Number of columns
-         */
-        void quantize_per_row(
-            const float *input,
-            int8_t *output,
-            float *row_scales,
-            int m, int k);
-
-        /**
-         * @brief Execute single INT8×INT8 → INT32 GEMM via OneDNN
-         *
-         * @param input_int8 Quantized input [m, k] INT8
-         * @param weight_tensor Weight tensor (contains packed INT8 weights)
-         * @param output_int32 Output accumulator [m, n] INT32
-         * @param m Batch size
-         * @param n Output features
-         * @param k Input features
-         * @return true on success
-         */
-        bool execute_int8_gemm(
-            const int8_t *input_int8,
-            TensorBase *weight_tensor,
-            int32_t *output_int32,
-            int m, int n, int k);
-
-        // Weight tensors (owned externally, not by kernel)
-        TensorBase *gate_weight_;
-        TensorBase *up_weight_;
-
-        // Temporary INT8 activation buffer (reused across calls)
-        std::vector<int8_t> int8_activations_;
+        // Q8_1 GEMM kernels for gate and up projections
+        std::unique_ptr<gemm_v4::Q8_1GemmKernel> gate_gemm_;
+        std::unique_ptr<gemm_v4::Q8_1GemmKernel> up_gemm_;
     };
 
 } // namespace llaminar2

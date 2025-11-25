@@ -1,30 +1,29 @@
 /**
  * @file FusedRMSNormQuantize.h
- * @brief Fused RMSNorm + INT8 quantization kernel (Phase 1: High-Impact Fusion)
+ * @brief RMSNorm kernel with optional output formats
  *
- * Fuses RMS normalization with per-row INT8 quantization in a single pass.
- * Eliminates intermediate FP32 buffer and redundant memory traffic.
+ * Provides RMSNorm with flexible output options:
+ * - Standard FP32 output (default, for residual stream)
+ * - Optional FP16/BF16 output (for memory-constrained scenarios)
+ *
+ * With the new FP32 residual architecture, the primary use case is
+ * FP32 → RMSNorm → FP32, keeping the residual stream in full precision.
+ * The Q8_1GemmKernel handles quantization internally.
+ *
+ * Note: The original "FusedRMSNormQuantize" design (FP32→INT8) is deprecated.
+ * INT8 quantization is now handled on-the-fly inside Q8_1GemmKernel.
  *
  * Performance Benefits:
- * - Saves 1 FP32 intermediate buffer allocation (seq_len × d_model × 4 bytes)
- * - Reduces memory bandwidth by ~33% (1 write instead of 2)
- * - Improves cache efficiency (single-pass algorithm)
+ * - Single-pass RMSNorm computation
+ * - SIMD-optimized (AVX512/AVX2)
+ * - Optional precision conversion on output
  *
- * Expected Speedup: 5-10% per RMSNorm operation (2× per layer: attention + FFN)
- *
- * Algorithm:
- * 1. Compute RMS per row: rms = sqrt(mean(x²) + eps)
- * 2. Normalize: x_norm = x / rms
- * 3. Apply gamma: x_scaled = x_norm * gamma
- * 4. Quantize per-row: x_int8 = round(x_scaled / scale), scale = max(|x_scaled|) / 127
- *
- * SIMD Optimizations:
- * - AVX512: 16-way FP32 operations
- * - AVX2: 8-way FP32 operations
- * - Scalar fallback for tail elements
+ * Fusion Chain (New Architecture):
+ *   [FP32 residual] → RMSNorm → [FP32] → Q8_1GemmKernel (quant inside)
  *
  * @author David Sanftenberg
  * @date 2025-11-22
+ * @updated 2025-11-24 - Reworked for FP32 residual architecture
  */
 
 #pragma once
@@ -38,15 +37,14 @@
 namespace llaminar2
 {
     /**
-     * @brief Fused RMSNorm + INT8 quantization kernel
+     * @brief RMSNorm kernel with FP32 output
      *
-     * Replaces: RMSNorm(FP32→FP32) → Quantize(FP32→INT8)
-     * With: FusedRMSNormQuantize(FP32→INT8)
+     * Standard RMSNorm: output = (input / rms) * gamma
+     * where rms = sqrt(mean(input²) + eps)
      *
      * Usage:
-     *   FusedRMSNormQuantize kernel;
-     *   kernel.execute(input_fp32, gamma, output_int8, output_scales,
-     *                  seq_len, d_model, eps);
+     *   FusedRMSNormQuantize kernel;  // Name kept for backward compat
+     *   kernel.apply(input_fp32, gamma, output_fp32, rows, cols, eps);
      */
     class FusedRMSNormQuantize : public CPUKernelBase, public ITensorRMSNorm
     {
@@ -65,20 +63,20 @@ namespace llaminar2
         {
             return KernelContract{
                 .accepted_input_formats = {TensorFormat::FP32}, // Accept FP32 input
-                .output_format = TensorFormat::INT8,            // Produce INT8 output
-                .supports_inplace = false,                      // Cannot write in-place (type change)
+                .output_format = TensorFormat::FP32,            // Produce FP32 output
+                .supports_inplace = true,                       // Can write in-place
                 .is_fusable = true                              // Can be fused with GEMM consumers
             };
         }
 
         bool supports_fusion() const override
         {
-            return true; // High-priority fusion candidate
+            return true;
         }
 
         TensorFormat preferred_fusion_format() const override
         {
-            return TensorFormat::INT8; // Output format for fusion chains
+            return TensorFormat::FP32; // FP32 output for fusion chains
         }
 
         // =============================================================================
@@ -86,10 +84,10 @@ namespace llaminar2
         // =============================================================================
 
         /**
-         * @brief Apply RMSNorm (ITensorRMSNorm interface - outputs FP32)
+         * @brief Apply RMSNorm (ITensorRMSNorm interface)
          *
-         * This is the standard ITensorRMSNorm interface that outputs FP32.
-         * For fused INT8 output, use execute() instead.
+         * Computes: output = (input / rms) * weight
+         * where rms = sqrt(mean(input²) + epsilon)
          */
         bool apply(
             const float *input, const float *weight, float *output,

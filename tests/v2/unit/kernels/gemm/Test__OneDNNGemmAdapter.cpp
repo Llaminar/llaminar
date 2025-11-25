@@ -3,6 +3,7 @@
 #include "tensors/TensorKernels.h" // IActivationTensor, ActivationPack
 #include "tensors/Tensors.h"       // FP32Tensor definition
 #include "kernels/cpu/gemm_v4/OneDNNGemmAdapter.h"
+#include "kernels/cpu/gemm_v4/OneDNNGemmKernel.h" // Inline definitions for run_onednn_*
 
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;

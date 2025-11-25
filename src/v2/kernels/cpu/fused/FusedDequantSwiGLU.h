@@ -1,31 +1,27 @@
 /**
  * @file FusedDequantSwiGLU.h
- * @brief Fused dequantization + SwiGLU activation for FFN blocks
+ * @brief SwiGLU activation kernel for FP32 inputs
  *
- * Fuses dequantization of INT32 accumulators with SwiGLU activation:
- * 1. Dequantize gate INT32 accumulators → FP32
- * 2. Dequantize up INT32 accumulators → FP32
- * 3. Apply SwiGLU: output = gate * silu(up)
- *    where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ * Applies SwiGLU activation to FP32 gate and up projections:
+ *   output = gate * silu(up)
+ *   where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ *
+ * With the new FP32 residual architecture, this kernel no longer needs
+ * to perform dequantization - it receives FP32 inputs directly from
+ * Q8_1GemmKernel outputs.
  *
  * Performance Benefits:
- * - Eliminates 2 separate dequantization passes (fused into activation)
- * - Better cache locality (gate/up dequantized and consumed immediately)
  * - SIMD-optimized SwiGLU (AVX512/AVX2 fused multiply-add)
+ * - Single-pass computation
+ * - Good cache locality
  *
- * Expected Speedup: 3-5% in FFN block (eliminates 2 dequant round trips)
- *
- * Algorithm:
- * 1. Dequantize gate: gate_fp32[i,j] = gate_int32[i,j] * act_scales[i] * gate_col_scales[j]
- * 2. Dequantize up: up_fp32[i,j] = up_int32[i,j] * act_scales[i] * up_col_scales[j]
- * 3. Apply SwiGLU: output[i,j] = gate_fp32[i,j] * silu(up_fp32[i,j])
- *
- * Fusion Chain:
- *   FusedDualGEMM → FusedDequantSwiGLU
- *   (FP32→INT32) → (INT32→FP32+activation)
+ * Fusion Chain (New Architecture):
+ *   FusedDualGEMM → FusedSwiGLU (this kernel)
+ *   (FP32→FP32)   → (FP32→FP32)
  *
  * @author David Sanftenberg
  * @date 2025-11-23
+ * @updated 2025-11-24 - Reworked for FP32 residual architecture (no dequant needed)
  */
 
 #pragma once
@@ -33,33 +29,26 @@
 #include "../CPUKernelBase.h"
 #include "../../../tensors/TensorKernels.h"
 #include <cstdint>
-#include <cmath> // For std::exp in silu()
+#include <cmath>
 #include <vector>
 
 namespace llaminar2
 {
     /**
-     * @brief Fused dequantization + SwiGLU activation kernel
+     * @brief SwiGLU activation kernel for FP32 inputs
      *
-     * Replaces:
-     *   Dequant(gate_int32) → gate_fp32
-     *   Dequant(up_int32) → up_fp32
-     *   SwiGLU(gate_fp32, up_fp32) → output
-     *
-     * With:
-     *   FusedDequantSwiGLU(gate_int32, up_int32, scales) → output
+     * Replaces the old FusedDequantSwiGLU that expected INT32 inputs.
+     * Now operates on FP32 inputs directly.
      *
      * Usage:
-     *   FusedDequantSwiGLU kernel;
-     *   kernel.execute(gate_int32, up_int32, output_fp32,
-     *                  activation_scales, gate_col_scales, up_col_scales,
-     *                  m, n);
+     *   FusedSwiGLU kernel;
+     *   kernel.execute(gate_fp32, up_fp32, output_fp32, m, n);
      */
-    class FusedDequantSwiGLU : public CPUKernelBase
+    class FusedSwiGLU : public CPUKernelBase
     {
     public:
-        FusedDequantSwiGLU() = default;
-        ~FusedDequantSwiGLU() override = default;
+        FusedSwiGLU() = default;
+        ~FusedSwiGLU() override = default;
 
         // =============================================================================
         // CPUKernelBase Interface (Fusion Framework)
@@ -71,21 +60,21 @@ namespace llaminar2
         KernelContract get_contract() const override
         {
             return KernelContract{
-                .accepted_input_formats = {TensorFormat::INT32}, // Accept INT32 accumulators
-                .output_format = TensorFormat::FP32,             // Produce FP32 output
-                .supports_inplace = false,                       // Need separate output buffer
-                .is_fusable = true                               // Can fuse with downstream ops
+                .accepted_input_formats = {TensorFormat::FP32}, // Accept FP32 inputs
+                .output_format = TensorFormat::FP32,            // Produce FP32 output
+                .supports_inplace = true,                       // Can write to gate buffer
+                .is_fusable = true                              // Can fuse with downstream ops
             };
         }
 
         bool supports_fusion() const override
         {
-            return true; // High-priority fusion candidate
+            return true;
         }
 
         TensorFormat preferred_fusion_format() const override
         {
-            return TensorFormat::FP32; // Output format for downstream fusion
+            return TensorFormat::FP32;
         }
 
         // =============================================================================
@@ -93,34 +82,21 @@ namespace llaminar2
         // =============================================================================
 
         /**
-         * @brief Execute fused dequantization + SwiGLU activation
+         * @brief Execute SwiGLU activation
          *
-         * Performs:
-         * 1. Dequantize gate: gate_fp32 = gate_int32 * act_scales * gate_col_scales
-         * 2. Dequantize up: up_fp32 = up_int32 * act_scales * up_col_scales
-         * 3. Apply SwiGLU: output = gate_fp32 * silu(up_fp32)
+         * Performs: output[i,j] = gate[i,j] * silu(up[i,j])
          *
-         * @param gate_int32 Gate INT32 accumulators [m, n]
-         * @param up_int32 Up INT32 accumulators [m, n]
-         * @param output Output FP32 activations [m, n]
-         * @param activation_scales Per-row activation quantization scales [m]
-         * @param gate_col_scales Per-column gate weight quantization scales [n]
-         * @param up_col_scales Per-column up weight quantization scales [n]
+         * @param gate Gate activations [m, n] FP32
+         * @param up Up activations [m, n] FP32
+         * @param output Output activations [m, n] FP32 (can alias gate for in-place)
          * @param m Batch size (sequence length)
          * @param n Hidden dimension (intermediate_size)
          * @return true on success, false on error
-         *
-         * Note: Scales come from:
-         *   - activation_scales: FusedDualGEMM quantization output
-         *   - gate_col_scales / up_col_scales: Weight tensor quantization metadata
          */
         bool execute(
-            const int32_t *gate_int32,
-            const int32_t *up_int32,
+            const float *gate,
+            const float *up,
             float *output,
-            const float *activation_scales,
-            const float *gate_col_scales,
-            const float *up_col_scales,
             int m, int n);
 
         /**
@@ -133,5 +109,8 @@ namespace llaminar2
             return device_idx == -1; // CPU only for now
         }
     };
+
+    // Keep old name as alias for backward compatibility during transition
+    using FusedDequantSwiGLU = FusedSwiGLU;
 
 } // namespace llaminar2

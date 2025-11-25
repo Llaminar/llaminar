@@ -697,28 +697,34 @@ namespace llaminar2
      * 3. Up GEMM (INT8×INT8 → INT32)
      *
      * @param gate_weight INT8 quantized gate projection weights [k, n]
-     * @param up_weight INT8 quantized up projection weights [k, n]
+     * @param up_weight Q8_1 quantized up projection weights [k, n]
      * @return Unique pointer to FusedDualGEMM kernel instance
      */
     std::unique_ptr<FusedDualGEMM> INT8Tensor::createFusedDualGemm(
         TensorBase *gate_weight,
         TensorBase *up_weight)
     {
-        return std::make_unique<FusedDualGEMM>(gate_weight, up_weight);
+        auto *gate_q8_1 = dynamic_cast<const Q8_1Tensor *>(gate_weight);
+        auto *up_q8_1 = dynamic_cast<const Q8_1Tensor *>(up_weight);
+        if (!gate_q8_1 || !up_q8_1)
+        {
+            LOG_ERROR("[INT8Tensor] FusedDualGEMM requires Q8_1Tensor weights");
+            return nullptr;
+        }
+        return std::make_unique<FusedDualGEMM>(gate_q8_1, up_q8_1);
     }
 
     /**
      * @brief Create fused triple GEMM kernel for attention Q/K/V projections
      *
      * Creates kernel that fuses:
-     * 1. Shared input quantization (FP32 → INT8)
-     * 2. Q GEMM (INT8×INT8 → INT32)
-     * 3. K GEMM (INT8×INT8 → INT32)
-     * 4. V GEMM (INT8×INT8 → INT32)
+     * 1. Q GEMM: FP32 input × Q8_1 weight → FP32 output
+     * 2. K GEMM: FP32 input × Q8_1 weight → FP32 output
+     * 3. V GEMM: FP32 input × Q8_1 weight → FP32 output
      *
-     * @param q_weight INT8 quantized Q projection weights [k, n]
-     * @param k_weight INT8 quantized K projection weights [k, n]
-     * @param v_weight INT8 quantized V projection weights [k, n]
+     * @param q_weight Q8_1 quantized Q projection weights [k, n]
+     * @param k_weight Q8_1 quantized K projection weights [k, n]
+     * @param v_weight Q8_1 quantized V projection weights [k, n]
      * @return Unique pointer to FusedTripleGEMM kernel instance
      */
     std::unique_ptr<FusedTripleGEMM> INT8Tensor::createFusedTripleGemm(
@@ -726,7 +732,15 @@ namespace llaminar2
         TensorBase *k_weight,
         TensorBase *v_weight)
     {
-        return std::make_unique<FusedTripleGEMM>(q_weight, k_weight, v_weight);
+        auto *q_q8_1 = dynamic_cast<const Q8_1Tensor *>(q_weight);
+        auto *k_q8_1 = dynamic_cast<const Q8_1Tensor *>(k_weight);
+        auto *v_q8_1 = dynamic_cast<const Q8_1Tensor *>(v_weight);
+        if (!q_q8_1 || !k_q8_1 || !v_q8_1)
+        {
+            LOG_ERROR("[INT8Tensor] FusedTripleGEMM requires Q8_1Tensor weights");
+            return nullptr;
+        }
+        return std::make_unique<FusedTripleGEMM>(q_q8_1, k_q8_1, v_q8_1);
     }
 
 } // namespace llaminar2
