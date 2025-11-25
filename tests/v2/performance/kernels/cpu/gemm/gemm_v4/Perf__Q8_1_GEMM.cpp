@@ -27,6 +27,7 @@
 #include <random>
 #include <numeric>
 #include <algorithm>
+#include <oneapi/dnnl/dnnl.hpp>
 
 // V2 includes
 #include "tensors/Tensors.h"
@@ -79,6 +80,91 @@ protected:
         }
     }
 
+    void compute_reference_gemm(int M, int N, int K, const float *A, const float *B, float *C)
+    {
+        using namespace dnnl;
+        engine eng(engine::kind::cpu, 0);
+        stream s(eng);
+
+        // A: M x K, row-major
+        memory::dims a_dims = {M, K};
+        memory::dims a_strides = {K, 1};
+        auto a_md = memory::desc(a_dims, memory::data_type::f32, a_strides);
+        auto a_mem = memory(a_md, eng, (void *)A);
+
+        // B: K x N, column-major (because B is passed as N x K row-major)
+        // We want to compute A * B^T.
+        // If B is N x K row-major, it is effectively K x N column-major.
+        // So we treat it as K x N matrix.
+        memory::dims b_dims = {K, N};
+        memory::dims b_strides = {1, K};
+        auto b_md = memory::desc(b_dims, memory::data_type::f32, b_strides);
+        auto b_mem = memory(b_md, eng, (void *)B);
+
+        // C: M x N, row-major
+        memory::dims c_dims = {M, N};
+        memory::dims c_strides = {N, 1};
+        auto c_md = memory::desc(c_dims, memory::data_type::f32, c_strides);
+        auto c_mem = memory(c_md, eng, (void *)C);
+
+        // Matmul primitive
+        auto matmul_pd = matmul::primitive_desc(eng, a_md, b_md, c_md);
+        auto matmul_prim = matmul(matmul_pd);
+
+        matmul_prim.execute(s, {{DNNL_ARG_SRC, a_mem},
+                                {DNNL_ARG_WEIGHTS, b_mem},
+                                {DNNL_ARG_DST, c_mem}});
+        s.wait();
+    }
+
+    void verify_correctness(int M, int N, int K, const float *A, const float *weights_fp32, const float *C_actual)
+    {
+        if (rank_ != 0)
+            return;
+
+        std::vector<float> C_ref(M * N);
+        compute_reference_gemm(M, N, K, A, weights_fp32, C_ref.data());
+
+        double max_diff = 0.0;
+        double mean_diff = 0.0;
+        double max_rel_diff = 0.0;
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+
+        for (size_t i = 0; i < C_ref.size(); ++i)
+        {
+            double diff = std::abs(C_actual[i] - C_ref[i]);
+            max_diff = std::max(max_diff, diff);
+            mean_diff += diff;
+
+            if (std::abs(C_ref[i]) > 1e-5)
+            {
+                max_rel_diff = std::max(max_rel_diff, diff / std::abs(C_ref[i]));
+            }
+
+            sum_sq_diff += diff * diff;
+            sum_sq_ref += C_ref[i] * C_ref[i];
+        }
+        mean_diff /= C_ref.size();
+
+        double l2_error = (sum_sq_ref > 0.0) ? std::sqrt(sum_sq_diff) / std::sqrt(sum_sq_ref) : 0.0;
+
+        std::cout << "Verification (M=" << M << ", N=" << N << ", K=" << K << "): "
+                  << "Max Diff=" << max_diff << ", Mean Diff=" << mean_diff
+                  << ", Max Rel Diff=" << max_rel_diff
+                  << ", L2 Error=" << l2_error * 100.0 << "%" << std::endl;
+
+        // Tolerance for Q8_1 vs FP32
+        // Q8_1 has quantization error.
+        // For large K, error accumulates.
+        // We expect reasonable agreement but not exact match.
+        // If max_diff is huge, something is wrong.
+        if (l2_error > 0.05)
+        {
+            std::cerr << "WARNING: Large divergence detected! L2 Error > 5%" << std::endl;
+        }
+    }
+
     BenchmarkStats run_benchmark(const BenchmarkConfig &config)
     {
         int M = config.seq_len;
@@ -109,6 +195,10 @@ protected:
 
         // 5. Output buffer C (M x N)
         std::vector<float> C(M * N);
+
+        // Verify correctness (once)
+        kernel->multiply(A.data(), C.data(), M, N, K);
+        verify_correctness(M, N, K, A.data(), weights_fp32.data(), C.data());
 
         // Warmup
         for (int i = 0; i < config.warmup_iters; ++i)
@@ -351,7 +441,7 @@ TEST_F(Q8_1_GEMM_Perf, Qwen32B_Attention_Output)
 TEST_F(Q8_1_GEMM_Perf, Qwen32B_FFN_Down)
 {
     // FFN Down: [M, 27392] -> [M, 5120]
-    std::vector<int> batch_sizes = {1, 32, 128, 512};
+    std::vector<int> batch_sizes = {1, 2, 32, 128, 512};
 
     for (int m : batch_sizes)
     {

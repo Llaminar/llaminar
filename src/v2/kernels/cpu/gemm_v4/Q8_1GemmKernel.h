@@ -298,8 +298,9 @@ namespace llaminar2
                                         size_t weights_offset = (size_t)(n_blk / 64) * (k * 64) + (size_t)k_start * 32 * 64;
                                         const int8_t *b_ptr = packed_weights_.packed_data.data() + weights_offset;
 
-                                        const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
-                                        const float *scales_ptr = packed_weights_.scales.data() + n_blk;
+                                        // Fix: Offset compensation and scales by k_start * N
+                                        const int32_t *comp_ptr = packed_weights_.compensation.data() + (size_t)k_start * n + n_blk;
+                                        const float *scales_ptr = packed_weights_.scales.data() + (size_t)k_start * n + n_blk;
 
                                         Q8_1GemmParams params;
                                         params.A = blocks;
