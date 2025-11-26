@@ -1,8 +1,11 @@
 # Q8_1 GEMM Performance Optimization Report
 
-**Date:** November 24, 2025
+**Date:** November 25, 2025
 **Kernel:** `src/v2/kernels/cpu/gemm_v4/Q8_1GemmKernel.h`
-**Test Suite:** `tests/v2/performance/Perf__Q8_1_GEMM.cpp`
+**Test Suites:** 
+- `tests/v2/performance/Perf__Q8_1_GEMM.cpp`
+- `tests/v2/performance/Perf__Q8_0_GEMM.cpp`
+- `tests/v2/performance/Perf__Q4_0_GEMM.cpp`
 
 ## Executive Summary
 
@@ -12,6 +15,7 @@ This document details the optimization journey for the `Q8_1` (8-bit quantized w
 - **Qwen 32B FFN Down**: Achieved **~2100 GFLOPS** (M=512), saturating compute capability.
 - **Qwen 0.5B Performance**: Improved small-model performance by **+60%** via adaptive blocking.
 - **Scalability**: Resolved L2 cache thrashing regressions, ensuring consistent scaling from M=128 to M=512.
+- **Generic Packing**: Successfully integrated `IINT8Unpackable` support, enabling Q4_0 and Q8_0 inference with minimal overhead.
 
 ## Methodology
 
@@ -22,8 +26,8 @@ This document details the optimization journey for the `Q8_1` (8-bit quantized w
 
 ### Benchmark Command
 ```bash
-cmake --build build_v2_release --target v2_perf_q8_1_gemm --parallel
-ctest --test-dir build_v2_release -R V2_Perf_Q8_1_GEMM$ --verbose
+cmake --build build_v2_release --target v2_perf_q8_1_gemm v2_perf_q8_0_gemm v2_perf_q4_0_gemm --parallel
+ctest --test-dir build_v2_release -R "V2_Perf_Q.*_GEMM$" --verbose
 ```
 
 ## Optimization Journey
@@ -73,29 +77,40 @@ ctest --test-dir build_v2_release -R V2_Perf_Q8_1_GEMM$ --verbose
 
 ## Final Performance Results
 
-### Qwen 32B (Large Model)
-| Layer | Dimensions (N, K) | M=1 | M=32 | M=128 | M=512 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Attn Output** | 5120, 5120 | 645 | 1732 | 1832 | **1814** |
-| **FFN Down** | 5120, 27392 | 221 | 1931 | 2087 | **2089** |
+### Q8_1 GEMM (Native Format)
+| Model | Layer | Dimensions (N, K) | M=1 | M=32 | M=128 | M=512 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen 32B** | Attn Output | 5120, 5120 | 603 | 990 | 1550 | **1796** |
+| **Qwen 32B** | FFN Down | 5120, 27392 | 161 | 1553 | 2002 | **2075** |
+| **Qwen 7B** | Attn Output | 4096, 4096 | 580 | 1577 | 1731 | **1810** |
+| **Qwen 7B** | FFN Down | 4096, 11008 | 257 | 1055 | 1693 | **1700** |
+| **Qwen 0.5B** | Attn Output | 896, 896 | 70 | 940 | 1425 | **1718** |
+| **Qwen 0.5B** | FFN Down | 896, 4864 | 249 | 1298 | 1652 | **1675** |
 
-### Qwen 7B (Medium Model)
-| Layer | Dimensions (N, K) | M=1 | M=32 | M=128 | M=512 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Attn Output** | 4096, 4096 | 326 | 877 | 975 | **1904** |
-| **FFN Down** | 4096, 11008 | 357 | 1473 | 1671 | **1685** |
+### Q8_0 GEMM (Generic Packing)
+| Model | Layer | Dimensions (N, K) | M=1 | M=32 | M=128 | M=512 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen 32B** | Attn Output | 5120, 5120 | 595 | 1665 | 1757 | **1793** |
+| **Qwen 32B** | FFN Down | 5120, 27392 | 167 | 1612 | 1895 | **2028** |
+| **Qwen 7B** | Attn Output | 4096, 4096 | 329 | 984 | 1348 | **1858** |
+| **Qwen 7B** | FFN Down | 4096, 11008 | 258 | 1116 | 1712 | **1694** |
+| **Qwen 0.5B** | Attn Output | 896, 896 | 55 | 889 | 1441 | **1690** |
+| **Qwen 0.5B** | FFN Down | 896, 4864 | 219 | 1304 | 1656 | **1662** |
 
-### Qwen 0.5B (Small Model)
-| Layer | Dimensions (N, K) | M=1 | M=32 | M=128 | M=512 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Attn Output** | 896, 896 | 73 | 973 | 1474 | **1751** |
-| **FFN Down** | 896, 4864 | 262 | 1316 | 1667 | **1701** |
+### Q4_0 GEMM (Generic Packing)
+| Model | Layer | Dimensions (N, K) | M=1 | M=32 | M=128 | M=512 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen 32B** | Attn Output | 5120, 5120 | 632 | 1595 | 1851 | **1884** |
+| **Qwen 32B** | FFN Down | 5120, 27392 | 168 | 1533 | 1755 | **1838** |
+| **Qwen 0.5B** | Attn Output | 896, 896 | 62 | 916 | 1450 | **1723** |
+| **Qwen 0.5B** | FFN Down | 896, 4864 | 250 | 1277 | 1594 | **1398** |
 
 ## Conclusion
 The `Q8_1` kernel is now highly robust. It dynamically adapts its blocking strategy to handle:
 1.  **Massive K dimensions** (via K-tiling) to preserve L2 locality.
 2.  **Small N dimensions** (via adaptive splitting) to ensure thread saturation.
 3.  **Large Batch Sizes** (via conservative cache targets) to prevent thrashing.
+4.  **Multiple Quantization Formats** (via `IINT8Unpackable`) with minimal overhead.
 
 ### Phase 5: Online Softmax Fusion
 **Challenge**: In Attention layers, the GEMM output (Attention Scores) is immediately followed by a Softmax operation. Writing the large GEMM output (M x N) to memory and then reading it back for Softmax incurs significant memory bandwidth overhead, especially for small batches (latency-critical) or large contexts.

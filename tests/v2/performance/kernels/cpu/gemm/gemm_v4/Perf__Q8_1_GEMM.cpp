@@ -60,6 +60,7 @@ struct BenchmarkStats
     double max_ms;        ///< Maximum time (ms)
     double mean_gflops;   ///< Mean throughput (GFLOPS)
     double stddev_gflops; ///< Standard deviation of throughput
+    double l2_error;      ///< L2 error from verification
 };
 
 class Q8_1_GEMM_Perf : public ::testing::Test
@@ -117,10 +118,10 @@ protected:
         s.wait();
     }
 
-    void verify_correctness(int M, int N, int K, const float *A, const float *weights_fp32, const float *C_actual)
+    double verify_correctness(int M, int N, int K, const float *A, const float *weights_fp32, const float *C_actual)
     {
         if (rank_ != 0)
-            return;
+            return 0.0;
 
         std::vector<float> C_ref(M * N);
         compute_reference_gemm(M, N, K, A, weights_fp32, C_ref.data());
@@ -149,14 +150,11 @@ protected:
 
         double l2_error = (sum_sq_ref > 0.0) ? std::sqrt(sum_sq_diff) / std::sqrt(sum_sq_ref) : 0.0;
 
-        std::cout << "Verification (M=" << M << ", N=" << N << ", K=" << K << "): "
-                  << "Max Diff=" << max_diff << ", Mean Diff=" << mean_diff
-                  << ", Max Rel Diff=" << max_rel_diff
-                  << ", L2 Error=" << l2_error * 100.0 << "%" << std::endl;
-
         // Tolerance for Q8_1 Kernel vs Dequantized Reference
         // Since we are comparing against dequantized weights, error should be very low (arithmetic only).
         EXPECT_LT(l2_error, 0.01) << "Large divergence detected! L2 Error > 1%";
+
+        return l2_error;
     }
 
     BenchmarkStats run_benchmark(const BenchmarkConfig &config)
@@ -197,7 +195,7 @@ protected:
 
         // Verify correctness (once)
         kernel->multiply(A.data(), C.data(), M, N, K);
-        verify_correctness(M, N, K, A.data(), weights_dequantized.data(), C.data());
+        double l2_error = verify_correctness(M, N, K, A.data(), weights_dequantized.data(), C.data());
 
         // Warmup
         for (int i = 0; i < config.warmup_iters; ++i)
@@ -243,7 +241,7 @@ protected:
         // Propagate error for GFLOPS stddev (approximate)
         double stddev_gflops = mean_gflops * (stddev_ms / mean_ms);
 
-        return {mean_ms, stddev_ms, min_ms, max_ms, mean_gflops, stddev_gflops};
+        return {mean_ms, stddev_ms, min_ms, max_ms, mean_gflops, stddev_gflops, l2_error};
     }
 
     void print_results(const BenchmarkConfig &config, const BenchmarkStats &stats)
@@ -258,6 +256,7 @@ protected:
                   << " | Time: " << std::fixed << std::setprecision(3) << stats.mean_ms << " ms"
                   << " (+/- " << stats.stddev_ms << ")"
                   << " | Perf: " << std::setprecision(2) << stats.mean_gflops << " GFLOPS"
+                  << " | L2 Err: " << std::scientific << std::setprecision(2) << stats.l2_error
                   << std::endl;
     }
 };

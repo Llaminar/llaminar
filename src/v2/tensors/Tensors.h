@@ -1490,7 +1490,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + int8[32] values
      * Compression: 4× vs FP32
      */
-    class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1523,6 +1523,19 @@ namespace llaminar2
 
         // IQ8_0Decodable interface - Q8_0 to Q8_0 is a direct copy (no conversion needed)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const Q8_0Block *block = static_cast<const Q8_0Block *>(get_raw_block_at(row_idx, k_block_offset));
+            std::memcpy(output, block->qs, 32);
+        }
+
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const Q8_0Block *block = static_cast<const Q8_0Block *>(get_raw_block_at(row_idx, k_block_offset));
+            return fp16_to_fp32(block->d);
+        }
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
@@ -1605,7 +1618,7 @@ namespace llaminar2
      *   FP32/FP16/BF16 activations → Q8_1 (quantize once per panel)
      *   → Q8_1 activations × quantized weights (many dot products, no sum computation!)
      */
-    class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable
+    class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable, public IINT8Unpackable
     {
     public:
         using value_type = Q8_1Block;
@@ -1642,6 +1655,19 @@ namespace llaminar2
 
         // IQ8_1Decodable interface - Q8_1 to Q8_1 returns direct pointer (zero-cost)
         const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const Q8_1Block *block = static_cast<const Q8_1Block *>(get_raw_block_at(row_idx, k_block_offset));
+            std::memcpy(output, block->qs, 32);
+        }
+
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const Q8_1Block *block = static_cast<const Q8_1Block *>(get_raw_block_at(row_idx, k_block_offset));
+            return fp16_to_fp32(block->d);
+        }
 
         // IActivationTensor interface (Q8_1 activations)
         std::unique_ptr<ITensorRoPE> createRoPE() override;

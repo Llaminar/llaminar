@@ -5065,12 +5065,12 @@ namespace llaminar2
             int8_t *output)
         {
             // Unpack 4-bit nibbles to native Q4_0 int8 range [-8, 7]
-            for (size_t i = 0; i < Q4_0Block::BLOCK_SIZE; ++i)
+            // Layout: low nibbles in first half [0..15], high nibbles in second half [16..31]
+            for (size_t i = 0; i < 16; ++i)
             {
-                const uint8_t packed = q4_block->qs[i / 2];
-                int8_t val = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
-                val -= 8; // Q4_0 native range: [-8, 7]
-                output[i] = val;
+                const uint8_t packed = q4_block->qs[i];
+                output[i] = (packed & 0x0F) - 8;
+                output[i + 16] = (packed >> 4) - 8;
             }
         }
 
@@ -5153,41 +5153,24 @@ namespace llaminar2
             // Prefetch next blocks
             _mm_prefetch(reinterpret_cast<const char *>(q4_block + 1), _MM_HINT_T0);
 
-            // Load 16 bytes and broadcast to 512 bits (4 copies)
+            // Load 16 bytes
             __m128i src128 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q4_block->qs));
-            __m512i src = _mm512_broadcast_i32x4(src128);
 
-            const __m512i mask_low = _mm512_set1_epi8(0x0F);
-            const __m512i offset = _mm512_set1_epi8(8);
+            const __m128i mask_low = _mm_set1_epi8(0x0F);
+            const __m128i offset = _mm_set1_epi8(8);
 
-            // Extract nibbles (parallel across 4 lanes)
-            __m512i low = _mm512_and_si512(src, mask_low);
-            __m512i high = _mm512_srli_epi16(src, 4);
-            high = _mm512_and_si512(high, mask_low);
+            // Low nibbles -> output[0..15]
+            __m128i low = _mm_and_si128(src128, mask_low);
+            low = _mm_sub_epi8(low, offset);
 
-            // Interleave
-            // u_lo lanes: [l0..h7] (repeated 4 times)
-            // u_hi lanes: [l8..h15] (repeated 4 times)
-            __m512i u_lo = _mm512_unpacklo_epi8(low, high);
-            __m512i u_hi = _mm512_unpackhi_epi8(low, high);
+            // High nibbles -> output[16..31]
+            __m128i high = _mm_srli_epi16(src128, 4);
+            high = _mm_and_si128(high, mask_low);
+            high = _mm_sub_epi8(high, offset);
 
-            // Combine using AVX512F permute
-            // We want low 128 bits from u_lo and low 128 bits from u_hi
-            // u_lo (512) = [L0, L0, L0, L0] (128-bit lanes)
-            // u_hi (512) = [H0, H0, H0, H0] (128-bit lanes)
-            // We want [L0, H0, ...] in the result.
-            // 128-bit lane = two 64-bit elements.
-            // L0 = elements 0, 1 of u_lo.
-            // H0 = elements 0, 1 of u_hi.
-            // Indices for permutex2var_epi64: 0, 1 (from u_lo), 8, 9 (from u_hi)
-            const __m512i idx = _mm512_setr_epi64(0, 1, 8, 9, 0, 0, 0, 0);
-            __m512i merged = _mm512_permutex2var_epi64(u_lo, idx, u_hi);
-
-            // Subtract offset (on ZMM)
-            merged = _mm512_sub_epi8(merged, offset);
-
-            // Extract low 256 bits and store
-            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), _mm512_castsi512_si256(merged));
+            // Combine into 256-bit register
+            __m256i result = _mm256_set_m128i(high, low); // high is upper 128, low is lower 128
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
 #endif
 
@@ -5204,46 +5187,22 @@ namespace llaminar2
             const Q4_0Block *q4_block,
             int8_t *output)
         {
-            // Process first 8 bytes (16 nibbles)
-            {
-                const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q4_block->qs));
+            // Load 16 bytes (32 nibbles)
+            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q4_block->qs));
 
-                // Unpack low nibbles
-                const __m128i mask_low = _mm_set1_epi8(0x0F);
-                __m128i low_nibbles = _mm_and_si128(packed, mask_low);
+            const __m128i mask_low = _mm_set1_epi8(0x0F);
+            const __m128i offset = _mm_set1_epi8(8);
 
-                // Unpack high nibbles
-                __m128i high_nibbles = _mm_srli_epi16(packed, 4);
-                high_nibbles = _mm_and_si128(high_nibbles, mask_low);
+            // Low nibbles -> output[0..15]
+            __m128i low_nibbles = _mm_and_si128(packed, mask_low);
+            low_nibbles = _mm_sub_epi8(low_nibbles, offset);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), low_nibbles);
 
-                // Interleave: [l0, h0, l1, h1, l2, h2, l3, h3, ...]
-                __m128i interleaved = _mm_unpacklo_epi8(low_nibbles, high_nibbles);
-
-                // Subtract 8
-                const __m128i offset = _mm_set1_epi8(8);
-                interleaved = _mm_sub_epi8(interleaved, offset);
-
-                // Store 16 bytes
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(output), interleaved);
-            }
-
-            // Process second 8 bytes (16 nibbles)
-            {
-                const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q4_block->qs + 8));
-
-                const __m128i mask_low = _mm_set1_epi8(0x0F);
-                __m128i low_nibbles = _mm_and_si128(packed, mask_low);
-
-                __m128i high_nibbles = _mm_srli_epi16(packed, 4);
-                high_nibbles = _mm_and_si128(high_nibbles, mask_low);
-
-                __m128i interleaved = _mm_unpacklo_epi8(low_nibbles, high_nibbles);
-
-                const __m128i offset = _mm_set1_epi8(8);
-                interleaved = _mm_sub_epi8(interleaved, offset);
-
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), interleaved);
-            }
+            // High nibbles -> output[16..31]
+            __m128i high_nibbles = _mm_srli_epi16(packed, 4);
+            high_nibbles = _mm_and_si128(high_nibbles, mask_low);
+            high_nibbles = _mm_sub_epi8(high_nibbles, offset);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), high_nibbles);
         }
 #endif
 

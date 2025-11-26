@@ -277,8 +277,6 @@ namespace llaminar2
             }
         }
 
-        // Fallback: couldn't detect, assume conservative 256KB
-        cached_size = 256 * 1024;
         detected = true;
         return cached_size;
     }
@@ -323,8 +321,6 @@ namespace llaminar2
             }
         }
 
-        // Fallback: couldn't detect, assume conservative 8MB
-        cached_size = 8 * 1024 * 1024;
         detected = true;
         return cached_size;
     }

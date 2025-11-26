@@ -6,10 +6,13 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/FP16Utils.h"
+#include "../../../utils/CPUFeatures.h"
 #include <vector>
 #include <memory>
 #include <mutex>
 #include <omp.h>
+#include <cstring>
+#include <iostream>
 
 namespace llaminar2
 {
@@ -21,21 +24,21 @@ namespace llaminar2
         public:
             Q8_1GemmKernel(const Q8_1Tensor *weights)
             {
-                pack_weights_impl<Q8_1Tensor, Q8_1Block>(weights);
+                pack_weights_generic(weights);
             }
 
             Q8_1GemmKernel(const Q8_0Tensor *weights)
             {
-                pack_weights_impl<Q8_0Tensor, Q8_0Block>(weights);
+                pack_weights_generic(weights);
             }
 
             Q8_1GemmKernel(const Q4_0Tensor *weights)
             {
-                pack_weights_q4_0(weights);
+                pack_weights_generic(weights);
             }
 
         private:
-            void pack_weights_q4_0(const Q4_0Tensor *weights)
+            void pack_weights_generic(const TensorBase *weights)
             {
                 // Weights are typically [N, K] (out_features, in_features)
                 int N = weights->shape()[0];
@@ -50,95 +53,55 @@ namespace llaminar2
                 packed_weights_.compensation.resize((K / 32) * N);
                 packed_weights_.scales.resize((K / 32) * N);
 
-                // Iterate over N rows of weights
-                for (int n = 0; n < N; ++n)
+                // Check for IINT8Unpackable interface
+                const IINT8Unpackable *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+                if (!unpackable)
                 {
-                    for (int k_blk = 0; k_blk < K / 32; ++k_blk)
-                    {
-                        // Get block from weights
-                        const void *raw_block = weights->get_raw_block_at(n, k_blk);
-                        const Q4_0Block *block = static_cast<const Q4_0Block *>(raw_block);
-
-                        // Unpack Q4_0 block
-                        // Layout: low nibbles in first half [0..15], high nibbles in second half [16..31]
-                        int8_t temp_vals[32];
-                        for (int i = 0; i < 16; ++i)
-                        {
-                            temp_vals[i] = (block->qs[i] & 0x0F) - 8;
-                            temp_vals[i + 16] = (block->qs[i] >> 4) - 8;
-                        }
-
-                        int32_t sum = 0;
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            int k = k_blk * 32 + i;
-                            int8_t val = temp_vals[i];
-                            sum += val;
-
-                            // Pack into [N/64][K/4][64][4]
-                            // Index: (n / 64) * (K * 64) + (k / 4) * 256 + (n % 64) * 4 + (k % 4)
-                            int n_blk = n / 64;
-                            int n_rem = n % 64;
-                            int k_blk_4 = k / 4;
-                            int k_rem = k % 4;
-                            size_t packed_idx = (size_t)n_blk * (K * 64) + (size_t)k_blk_4 * 256 + n_rem * 4 + k_rem;
-                            packed_weights_.packed_data[packed_idx] = val;
-                        }
-                        packed_weights_.compensation[k_blk * N + n] = sum;
-                        packed_weights_.scales[k_blk * N + n] = fp16_to_fp32(block->d);
-                    }
+                    std::cerr << "Tensor type " << (int)weights->native_type() << " does not implement IINT8Unpackable" << std::endl;
+                    return;
                 }
-            }
 
-            template <typename TensorT, typename BlockT>
-            void pack_weights_impl(const TensorT *weights)
-            {
-                // Weights are typically [N, K] (out_features, in_features)
-                // We need to pack them as K x N for the kernel
-                int N = weights->shape()[0];
-                int K = weights->shape()[1];
-
-                // Pack weights
-                // We need to read from weights tensor.
-                // It supports get_raw_block_at(row, k_offset).
-                // Here row is n (0..N), k_offset is k (0..K, step 32).
-
-                packed_weights_.K = K;
-                packed_weights_.N = N;
-
-                // Pad N to multiple of 64 for blocking
-                int N_padded = (N + 63) / 64 * 64;
-                packed_weights_.packed_data.resize(K * N_padded);
-                packed_weights_.compensation.resize((K / 32) * N);
-                packed_weights_.scales.resize((K / 32) * N);
-
-                // Iterate over N rows of weights
+// Iterate over N rows of weights (Parallelized)
+#pragma omp parallel for schedule(static)
                 for (int n = 0; n < N; ++n)
                 {
+                    int n_blk = n / 64;
+                    int n_rem = n % 64;
+                    // Base offset for this row n in the packed layout
+                    // Layout: [N/64][K/4][64][4]
+                    // Stride for K/4 is 256 bytes (64 * 4)
+                    size_t row_base_offset = (size_t)n_blk * (K * 64) + n_rem * 4;
+
                     for (int k_blk = 0; k_blk < K / 32; ++k_blk)
                     {
-                        // Get block from weights
-                        const void *raw_block = weights->get_raw_block_at(n, k_blk);
-                        const BlockT *block = static_cast<const BlockT *>(raw_block);
+                        // Unpack block using generic interface
+                        int8_t temp_vals[32];
+                        unpackable->unpack_block_to_int8(n, k_blk, temp_vals);
+                        float scale = unpackable->get_block_scale(n, k_blk);
 
+                        // Vectorized sum
                         int32_t sum = 0;
+#pragma omp simd reduction(+ : sum)
                         for (int i = 0; i < 32; ++i)
                         {
-                            int k = k_blk * 32 + i;
-                            int8_t val = block->qs[i];
-                            sum += val;
-
-                            // Pack into [N/64][K/4][64][4]
-                            // Index: (n / 64) * (K * 64) + (k / 4) * 256 + (n % 64) * 4 + (k % 4)
-                            int n_blk = n / 64;
-                            int n_rem = n % 64;
-                            int k_blk_4 = k / 4;
-                            int k_rem = k % 4;
-                            size_t packed_idx = (size_t)n_blk * (K * 64) + (size_t)k_blk_4 * 256 + n_rem * 4 + k_rem;
-                            packed_weights_.packed_data[packed_idx] = val;
+                            sum += temp_vals[i];
                         }
+
+                        // Pack 32 bytes into 8 groups of 4 bytes, strided by 256
+                        // k_blk corresponds to 32 columns.
+                        // k starts at k_blk * 32.
+                        // k/4 starts at k_blk * 8.
+                        size_t block_offset = row_base_offset + (size_t)(k_blk * 8) * 256;
+                        int8_t *dst_ptr = packed_weights_.packed_data.data() + block_offset;
+
+                        // Unroll the 8 writes
+                        for (int j = 0; j < 8; ++j)
+                        {
+                            std::memcpy(dst_ptr + j * 256, &temp_vals[j * 4], 4);
+                        }
+
                         packed_weights_.compensation[k_blk * N + n] = sum;
-                        packed_weights_.scales[k_blk * N + n] = fp16_to_fp32(block->d);
+                        packed_weights_.scales[k_blk * N + n] = scale;
                     }
                 }
             }
@@ -282,11 +245,34 @@ namespace llaminar2
                     // 2. GEMM (Parallel over N blocks and M)
                     // We want to parallelize over N blocks to keep B in L2 cache (B-stationary)
                     // when M is large.
-                    // L2 cache is typically 1MB.
-                    // B block size = n_block * K * 1 byte.
-                    // We want n_block * K <= 1MB.
-                    // Use 768KB (0.75MB) to leave room for A, C and overhead
-                    int max_n_block = 786432 / k;
+
+                    // Detect cache sizes
+                    int num_threads = omp_get_num_threads();
+                    long long l2_size = cpu_l2_cache_size();
+                    if (l2_size == 0)
+                        l2_size = 1024 * 1024; // Fallback 1MB
+
+                    long long l3_size = cpu_l3_cache_size();
+                    // If L3 is unknown, assume it's large enough to not be the bottleneck compared to L2
+                    if (l3_size == 0)
+                        l3_size = l2_size * num_threads;
+
+                    // Calculate block size limit
+                    // 1. L2 constraint: Block must fit in L2 (use 90% to leave room for A/C)
+                    long long l2_limit = (long long)(l2_size * 0.9);
+
+                    // 2. L3 constraint: All threads' blocks must fit in L3
+                    // Use 90% of L3 shared among threads
+                    long long l3_limit_per_thread = (long long)(l3_size * 0.9 / num_threads);
+
+                    // Take the tighter constraint
+                    long long block_size_limit = std::min(l2_limit, l3_limit_per_thread);
+
+                    // Ensure we have at least some reasonable block size (e.g. 64KB)
+                    if (block_size_limit < 65536)
+                        block_size_limit = 65536;
+
+                    int max_n_block = block_size_limit / k;
                     // Align to 64 (kernel block size)
                     max_n_block = (max_n_block / 64) * 64;
                     if (max_n_block < 64)
@@ -297,7 +283,7 @@ namespace llaminar2
                     // Total tasks = (m_tasks) * (n_tasks)
                     // m_tasks = (m + 1) / 2
                     // n_tasks = n / n_task_block
-                    int num_threads = omp_get_num_threads();
+                    // num_threads is already calculated above
                     int target_tasks = num_threads * 4; // Heuristic: 4x oversubscription for load balancing
                     int m_tasks = (m + 1) / 2;
                     if (m_tasks < 1)
@@ -330,8 +316,10 @@ namespace llaminar2
                     }
 
                     // Check if we need K-tiling (when B-block spills L2 cache)
-                    // L2 cache size estimate: 1MB. Use 90% to be safe.
-                    const long long L2_CACHE_SIZE = 900 * 1024;
+                    // l2_size is already detected above
+
+                    // Use 90% of L2 cache to be safe (leave room for A, C, overhead)
+                    const long long L2_CACHE_SIZE = (long long)(l2_size * 0.9);
                     bool needs_k_tiling = ((long long)n_task_block * k > L2_CACHE_SIZE);
 
                     // Check if we have enough parallelism to avoid collapsing M
@@ -341,8 +329,18 @@ namespace llaminar2
                     if (needs_k_tiling && enough_parallelism)
                     {
                         // K-tiling path: Parallelize N only, tile K inside to reuse B in L2
-                        // Reduce tile size to 128 (256KB) to leave room for A and C in L2
-                        const int k_tile_blocks = 128; // 128 * 32 = 4096 rows. 4096 * 64 = 256KB.
+                        // Calculate dynamic tile size based on L2 cache and n_task_block
+                        // We want n_task_block * (k_tile_blocks * 32) * sizeof(int8_t) <= L2_CACHE_SIZE * fraction
+                        // Let's use 60% of L2 for B to be safe and allow A/C streaming
+                        long long target_b_size = (long long)(L2_CACHE_SIZE * 0.6);
+                        int k_tile_elements = (int)(target_b_size / n_task_block);
+                        int k_tile_blocks = k_tile_elements / 32;
+
+                        // Clamp to reasonable limits
+                        if (k_tile_blocks < 32)
+                            k_tile_blocks = 32; // Min 1024 K elements
+                        if (k_tile_blocks > 256)
+                            k_tile_blocks = 256; // Max 8192 K elements
 
 #pragma omp for schedule(dynamic)
                         for (int n_task = 0; n_task < n; n_task += n_task_block)

@@ -9,6 +9,8 @@ The `Q8_1` GEMM system is a high-performance, JIT-compiled Int8 matrix multiplic
 
 Unlike static kernels, this system uses **Xbyak** to generate machine code at runtime, allowing for register-level optimizations specific to the batch size (M) and available instruction set.
 
+It now supports **Generic Weight Packing** via the `IINT8Unpackable` interface, allowing it to operate on any quantized tensor format (Q4_0, Q8_0, Q8_1, etc.) that implements this interface, without needing format-specific kernels.
+
 ## Component Architecture
 
 The system is composed of three layers:
@@ -28,6 +30,7 @@ This is the high-level C++ driver that manages execution strategy. It does **not
 - **Threading**: OpenMP parallelization over N and M dimensions.
 - **Cache Management**: K-Tiling and Block sizing.
 - **Dispatch**: Selecting the correct JIT kernel (M1, M2, or generic) based on runtime dimensions.
+- **Generic Weight Packing**: Uses the `IINT8Unpackable` interface to unpack weights from any source format (Q4_0, Q8_0, etc.) into the kernel's internal VNNI-optimized layout.
 - **Quantization**: Handling the on-the-fly quantization of activation matrices (A) into `Q8_1Block` format.
 
 ### 3. Data Structures (`src/v2/tensors/BlockStructures.h`)
@@ -38,6 +41,7 @@ This is the high-level C++ driver that manages execution strategy. It does **not
 - **Weights (`Q8_1PackedWeights`)**:
     - Re-packed into a layout optimal for VNNI loading (e.g., [K/4][N][4]).
     - Contains pre-computed scales and compensation terms.
+    - Populated via `IINT8Unpackable::unpack_block_to_int8()`.
 
 ## Algorithm & Math
 
@@ -76,12 +80,23 @@ For small matrices (e.g., Qwen 0.5B, N=896), standard blocking creates too few t
 ### 2. K-Tiling (Large Models)
 For large matrices (e.g., Qwen 32B, K=27,392), a single weight row is ~27KB. A standard block (64 rows) exceeds L2 cache (1MB).
 - **Logic**: Splits the K-loop into tiles (e.g., 256KB).
+- **Hardware Awareness**: Uses `CPUFeatures.h` to detect actual L2 and L3 cache sizes at runtime.
+    - **L2 Constraint**: Ensures the working block fits in the per-core L2 cache (typically 1MB-2MB).
+    - **L3 Constraint**: Ensures the total working set across all threads fits in the shared L3 cache.
 - **Benefit**: Keeps weight tiles resident in L2 cache ("B-stationary"), preventing thrashing.
 - **Result**: 4x performance boost on 32B models.
 
 ### 3. Parallel Quantization
 For small batch sizes (M < Threads), the quantization of A (FP32 -> Int8) becomes a bottleneck if done serially.
 - **Logic**: Parallelizes quantization over the K-dimension.
+
+### 4. Optimized Generic Packing
+The kernel uses a highly optimized generic packing routine (`pack_weights_generic`) that works with any tensor implementing `IINT8Unpackable`.
+- **Logic**:
+    - **Parallelization**: OpenMP parallelization over the N (row) dimension.
+    - **Vectorization**: SIMD-accelerated summation for zero-point compensation.
+    - **Memory**: Strided `memcpy` operations for efficient VNNI layout generation.
+- **Benefit**: Enables support for Q4_0, Q8_0, Q8_1, and future formats with **zero performance penalty** compared to hand-written specialized packers.
 
 ## Advanced Fused Operations (New in V4)
 
@@ -111,6 +126,6 @@ To further reduce memory bandwidth and latency, the V4 kernel supports fusing co
 ## Use Case
 
 This kernel is the default engine for **CPU Inference** in Llaminar V2 when using quantized models. It is specifically designed for:
-- **Input**: Quantized Weights (GGUF Q8_0/Q4_0 re-packed) + FP32 Activations (quantized on-the-fly).
+- **Input**: Any Quantized Weights implementing `IINT8Unpackable` (Q4_0, Q8_0, Q8_1, etc.) + FP32 Activations (quantized on-the-fly).
 - **Hardware**: Intel CPUs with AVX512-VNNI (Skylake-X, Cascade Lake, Ice Lake, Sapphire Rapids).
 - **Goal**: Maximize token generation speed (M=1) and prompt processing throughput (M=512).

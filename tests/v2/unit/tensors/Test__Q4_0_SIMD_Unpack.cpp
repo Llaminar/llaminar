@@ -95,10 +95,24 @@ TEST_F(Q4_0_SIMD_Unpack, ScalarReference_Pattern)
 
     unpack_q4_0_to_int8_scalar(&block, output);
 
-    // Verify pattern: nibbles [0,1,2,...,15,0,1,...] → [-8,-7,-6,...,7,-8,-7,...]
+    // Verify pattern with split layout (GGUF Q4_0 spec):
+    // Indices 0-15: Low nibbles of qs[0..15] -> even numbers 0, 2, 4...
+    // Indices 16-31: High nibbles of qs[0..15] -> odd numbers 1, 3, 5...
     for (size_t i = 0; i < 32; ++i)
     {
-        int8_t expected = static_cast<int8_t>((i % 16) - 8);
+        uint8_t nibble;
+        if (i < 16)
+        {
+            // Low nibbles: (i * 2) % 16
+            nibble = (i * 2) % 16;
+        }
+        else
+        {
+            // High nibbles: ((i - 16) * 2 + 1) % 16
+            nibble = ((i - 16) * 2 + 1) % 16;
+        }
+
+        int8_t expected = static_cast<int8_t>(nibble - 8);
         EXPECT_EQ(expected, output[i])
             << "Scalar pattern mismatch at index " << i;
     }
