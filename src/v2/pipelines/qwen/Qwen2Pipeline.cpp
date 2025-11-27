@@ -148,7 +148,7 @@ namespace llaminar2
         {
             // Fallback: typical ratio for Qwen models
             d_ff_ = d_model_ * 4;
-            LOG_INFO("Warning: feed_forward_length not in metadata, using " << d_ff_);
+            LOG_WARN("Warning: feed_forward_length not in metadata, using " << d_ff_);
         }
 
         LOG_INFO("Architecture: " << n_layers_ << " layers, "
@@ -345,14 +345,6 @@ namespace llaminar2
         sequence_lengths_ = padded.actual_lengths;
         int effective_seq_len = batch_size_ * padded_seq_len_;
 
-        // Debug: Print actual token batch lengths
-        LOG_ERROR("[BATCH DEBUG] batch_size_=" << batch_size_ << ", padded_seq_len_=" << padded_seq_len_
-                                               << ", effective_seq_len=" << effective_seq_len);
-        for (int i = 0; i < batch_size_; ++i)
-        {
-            LOG_ERROR("[BATCH DEBUG]   Sequence " << i << ": " << token_batches[i].size() << " tokens");
-        }
-
         LOG_DEBUG("Forward pass: batch_size=" << batch_size_
                                               << ", padded_seq_len=" << padded_seq_len_
                                               << ", effective_seq_len=" << effective_seq_len);
@@ -422,19 +414,6 @@ namespace llaminar2
 
         // Capture final norm output
         CAPTURE_SNAPSHOT("FINAL_NORM", current_hidden_.get());
-
-        // DEBUG: Track final norm output
-        static const bool debug_batch_env = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
-        if (debug_batch_env && batch_size_ == 2)
-        {
-            const float *norm_data = current_hidden_->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[FINAL_NORM] Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << norm_data[seq1_offset + i]);
-            }
-        }
 
         // LM head projection (batched)
         if (!lm_head_batch(current_hidden_.get(), effective_seq_len))
@@ -540,18 +519,6 @@ namespace llaminar2
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_NORM",
                               normalized_hidden, effective_seq_len, d_model_);
 
-        // DEBUG: Track divergence after attention norm
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *norm_data = normalized_hidden->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After ATTN_NORM, Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << norm_data[seq1_offset + i]);
-            }
-        }
-
         // 2. Q/K/V projections (FUSED: quantize activations once, reuse for all 3 projections)
         // Lazily initialize the fused QKV kernel if not already done
         if (!layer.qkv_fused)
@@ -583,18 +550,6 @@ namespace llaminar2
         // Capture Q projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_PROJECTION", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
 
-        // DEBUG: Track Q projection output
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *q_data = buffers.Q->data();
-            size_t seq1_offset = 4 * n_heads_ * head_dim_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After Q_PROJ, Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << q_data[seq1_offset + i]);
-            }
-        }
-
         // Capture K projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_K_PROJECTION", buffers.K, effective_seq_len, n_kv_heads_ * head_dim_);
 
@@ -620,50 +575,6 @@ namespace llaminar2
                     // Padding token: use -1 to signal "skip RoPE"
                     position_ids[b * padded_seq_len_ + i] = -1;
                 }
-            }
-        }
-
-        // DEBUG: Log position IDs for first layer
-        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
-        {
-            if (debug_batch_env)
-            {
-                LOG_ERROR("[RoPE Layer " << layer_idx << "] Position IDs:");
-                for (int b = 0; b < batch_size_; ++b)
-                {
-                    std::stringstream ss;
-                    ss << "  Batch " << b << ": [";
-                    for (int i = 0; i < std::min(6, padded_seq_len_); ++i)
-                    {
-                        ss << position_ids[b * padded_seq_len_ + i];
-                        if (i < std::min(6, padded_seq_len_) - 1)
-                            ss << ", ";
-                    }
-                    if (padded_seq_len_ > 6)
-                        ss << ", ...";
-                    ss << "]";
-                    LOG_ERROR(ss.str());
-                }
-            }
-
-            if (batch_size_ == 1)
-            {
-                if (position_ids.size() >= 2)
-                {
-                    LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=1) position_ids: "
-                                                    << "seq0=[" << position_ids[0] << "," << position_ids[1] << "]");
-                }
-                else if (position_ids.size() == 1)
-                {
-                    LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=1) position_ids: "
-                                                    << "seq0=[" << position_ids[0] << "]");
-                }
-            }
-            else if (batch_size_ == 2 && position_ids.size() >= 4)
-            {
-                LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=2) position_ids: "
-                                                << "seq0=[" << position_ids[0] << "," << position_ids[1] << "], "
-                                                << "seq1=[" << position_ids[2] << "," << position_ids[3] << "]");
             }
         }
 
@@ -792,18 +703,6 @@ namespace llaminar2
         // Capture attention residual output
         CAPTURE_SNAPSHOT("layer" + std::to_string(layer_idx) + "_ATTENTION_RESIDUAL", current_hidden_.get());
 
-        // DEBUG: Track after attention residual connection
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *residual_data = current_hidden_->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After ATTN_RESIDUAL, Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << residual_data[seq1_offset + i]);
-            }
-        }
-
         return true;
     }
 
@@ -864,18 +763,6 @@ namespace llaminar2
 
         // Capture FFN norm output
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_NORM", normalized_hidden, effective_seq_len, d_model_);
-
-        // DEBUG: Track FFN norm output
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *norm_data = normalized_hidden->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After FFN_NORM, Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << norm_data[seq1_offset + i]);
-            }
-        }
 
         // 2. Gate and up projections (FUSED: quantize activations once, reuse for both projections)
         // Lazily initialize the fused gate/up kernel if not already done
@@ -946,25 +833,11 @@ namespace llaminar2
         // Capture down projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_DOWN", buffers.ffn_output, effective_seq_len, d_model_);
 
-        // DEBUG: Track FFN down projection output
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *down_data = buffers.ffn_output->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After FFN_DOWN, Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << down_data[seq1_offset + i]);
-            }
-        }
-
         // Health check: FFN output before residual (final dequantized output from INT8 path)
         CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_DOWN").c_str(),
                                buffers.ffn_output->data(), effective_seq_len * d_model_);
 
         // 5. Residual connection - write back to current_hidden_
-        // CRITICAL: Process all batch sequences, not just effective_seq_len
-        // CRITICAL FIX: Zero out padding rows to prevent NaN propagation to next layer
         const size_t residual_elements = batch_size_ * padded_seq_len_ * d_model_;
 
 #pragma omp parallel for
@@ -994,32 +867,6 @@ namespace llaminar2
 
         // Capture FFN residual output
         CAPTURE_SNAPSHOT("layer" + std::to_string(layer_idx) + "_FFN_RESIDUAL", current_hidden_.get());
-
-        // DEBUG: Track after FFN residual connection (end of layer)
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *residual_data = current_hidden_->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After FFN_RESIDUAL (END OF LAYER), Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << residual_data[seq1_offset + i]);
-            }
-            LOG_ERROR("[Layer " << layer_idx << "] ========================================");
-        }
-
-        // DEBUG: Track after FFN residual connection (end of layer)
-        if (debug_batch_env && layer_idx < 3 && batch_size_ == 2)
-        {
-            const float *residual_data = current_hidden_->data();
-            size_t seq1_offset = 4 * d_model_; // Seq1 starts at position 4
-            LOG_ERROR("[Layer " << layer_idx << "] After FFN_RESIDUAL (END OF LAYER), Seq1 token0 [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << residual_data[seq1_offset + i]);
-            }
-            LOG_ERROR("[Layer " << layer_idx << "] ========================================");
-        }
 
         return true;
     }
@@ -1159,28 +1006,14 @@ namespace llaminar2
             const auto &tokens = token_batches[b];
             int seq_len = tokens.size();
 
-            if (debug_batch && mpi_ctx_->rank() == 0)
-            {
-                LOG_ERROR("[embedding_batch] Batch " << b << ": seq_len=" << seq_len
-                                                     << ", padded_seq_len=" << padded_seq_len_);
-            }
-
             // Lookup embeddings for this sequence
             for (int i = 0; i < seq_len; ++i)
             {
                 int token_id = tokens[i];
-                DEBUG_ASSERT_RANGE(token_id, 0, vocab_size_,
-                                   "Invalid token at batch=" << b << ", pos=" << i);
+
                 std::memcpy(output_data + global_idx * d_model_,
                             embed_data + token_id * d_model_,
                             d_model_ * sizeof(float));
-
-                if (debug_batch && mpi_ctx_->rank() == 0 && i < 2)
-                {
-                    LOG_ERROR("[embedding_batch] Batch " << b << ", token " << i
-                                                         << " (id=" << token_id << "): global_idx=" << global_idx
-                                                         << ", first_value=" << output_data[global_idx * d_model_]);
-                }
 
                 global_idx++;
             }
@@ -1189,20 +1022,8 @@ namespace llaminar2
             for (int i = seq_len; i < padded_seq_len_; ++i)
             {
                 std::memset(output_data + global_idx * d_model_, 0, d_model_ * sizeof(float));
-
-                if (debug_batch && mpi_ctx_->rank() == 0 && i == seq_len)
-                {
-                    LOG_ERROR("[embedding_batch] Batch " << b << ", padding starts at global_idx=" << global_idx);
-                }
-
                 global_idx++;
             }
-        }
-
-        if (debug_batch && mpi_ctx_->rank() == 0)
-        {
-            LOG_ERROR("[embedding_batch] Total positions filled: " << global_idx
-                                                                   << " (expected: " << (batch_size_ * padded_seq_len_) << ")");
         }
 
         return true;
@@ -1239,29 +1060,6 @@ namespace llaminar2
 
         // Capture LM head logits
         CAPTURE_SNAPSHOT("LM_HEAD", logits_buffer_.get());
-
-        // DEBUG: Track LM head output (logits)
-        static const bool debug_batch_env = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
-        if (debug_batch_env && batch_size_ == 2)
-        {
-            const float *logits_data = logits_buffer_->data();
-
-            // Show position 4 (first token of Seq1)
-            size_t pos4_offset = 4 * vocab_size_;
-            LOG_ERROR("[LM_HEAD] Position 4 (Seq1 token0) logits [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << logits_data[pos4_offset + i]);
-            }
-
-            // Show position 5 (second token of Seq1)
-            size_t pos5_offset = 5 * vocab_size_;
-            LOG_ERROR("[LM_HEAD] Position 5 (Seq1 token1) logits [0:10]:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_ERROR("  [" << i << "] = " << logits_data[pos5_offset + i]);
-            }
-        }
 
         return true;
     }

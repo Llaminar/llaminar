@@ -425,6 +425,28 @@ namespace llaminar2
             m_, k_));
     }
 
+    TEST_F(Test__FusedGEMM, DualGEMM_WithSwiGLU)
+    {
+        auto gate_weight = create_mock_weights(n_, k_, 111);
+        auto up_weight = create_mock_weights(n_, k_, 222);
+
+        FusedGEMM fused_kernel(gate_weight.get(), up_weight.get());
+
+        std::vector<float> gate_output(m_ * n_);
+        std::vector<float> up_output(m_ * n_);
+
+        // Execute using the generic execute() with GEMMProjection vector
+        // Projection 1: Gate (standard)
+        // Projection 2: Up (with SwiGLU using Gate output)
+        bool success = fused_kernel.execute(
+            input_fp32_.data(),
+            {{gate_output.data(), nullptr, n_, "gate"},
+             {up_output.data(), nullptr, n_, "up", gate_output.data(), true}},
+            m_, k_);
+
+        ASSERT_TRUE(success) << "FusedGEMM with SwiGLU failed";
+    }
+
 } // namespace llaminar2
 
 int main(int argc, char **argv)

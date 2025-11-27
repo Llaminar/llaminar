@@ -17,6 +17,151 @@ namespace llaminar2
 {
     // Forward declaration for tensor-based GEMM interface
     class TensorBase;
+
+    // =============================================================================
+    // Fused Operation Configuration
+    // =============================================================================
+
+    /**
+     * @brief Fused operation types that can be applied after GEMM
+     *
+     * These operations are fused into the GEMM kernel to avoid extra memory passes.
+     */
+    enum class GemmFusedOpType : uint8_t
+    {
+        None = 0, ///< No post-GEMM fusion
+        SwiGLU,   ///< SwiGLU activation: output *= swish(gate) = output * gate * sigmoid(gate)
+        Softmax,  ///< Row-wise softmax: output = softmax(output + mask)
+        ReLU,     ///< ReLU activation: output = max(0, output)
+        GeLU,     ///< GeLU activation: output = output * 0.5 * (1 + erf(output / sqrt(2)))
+        SiLU      ///< SiLU/Swish activation: output = output * sigmoid(output)
+    };
+
+    /**
+     * @brief Configuration for fused operations after GEMM
+     *
+     * This struct consolidates all fused operation parameters into a single
+     * extensible configuration object. Use the static factory methods for
+     * convenient construction.
+     *
+     * Design rationale:
+     * - Avoids interface bloat from separate methods for each fused op
+     * - Extensible: add new fused ops without breaking API
+     * - Zero-cost when unused (default-constructed = no fusion)
+     *
+     * Usage:
+     * @code
+     * // No fusion (default)
+     * kernel->multiply_with_precomputed_q8_1(..., GemmFusedOps::none());
+     *
+     * // SwiGLU fusion
+     * kernel->multiply_with_precomputed_q8_1(..., GemmFusedOps::swiglu(gate_output));
+     *
+     * // Softmax fusion (for attention)
+     * kernel->multiply_with_precomputed_q8_1(..., GemmFusedOps::softmax(1.0f / sqrt(d_k), mask));
+     * @endcode
+     */
+    struct GemmFusedOps
+    {
+        GemmFusedOpType op_type = GemmFusedOpType::None;
+
+        // --- SwiGLU parameters ---
+        const float *gate_input = nullptr; ///< Gate tensor for SwiGLU [m, n] (output *= swish(gate))
+
+        // --- Softmax parameters ---
+        float softmax_scale = 1.0f;          ///< Pre-softmax scale (typically 1/sqrt(d_k))
+        const float *softmax_mask = nullptr; ///< Additive mask before softmax [m, n] or nullptr
+        bool is_causal = false;              ///< Apply causal (lower-triangular) mask
+        int softmax_axis = 1;                ///< Axis for softmax reduction (typically 1 = row-wise)
+
+        // --- Online softmax outputs (for flash attention) ---
+        float *online_max = nullptr; ///< Output: per-row max values [m]
+        float *online_sum = nullptr; ///< Output: per-row sum of exp values [m]
+
+        // =========================================================================
+        // Factory methods for convenient construction
+        // =========================================================================
+
+        /**
+         * @brief No fused operation (default)
+         */
+        static GemmFusedOps none()
+        {
+            return GemmFusedOps{};
+        }
+
+        /**
+         * @brief SwiGLU fusion: output = output * swish(gate) = output * gate * sigmoid(gate)
+         *
+         * Used in FFN: up_output = up_proj * swish(gate_proj)
+         *
+         * @param gate Gate tensor [m, n] (must match output dimensions)
+         */
+        static GemmFusedOps swiglu(const float *gate)
+        {
+            GemmFusedOps ops;
+            ops.op_type = GemmFusedOpType::SwiGLU;
+            ops.gate_input = gate;
+            return ops;
+        }
+
+        /**
+         * @brief Softmax fusion: output = softmax(output * scale + mask)
+         *
+         * Used in attention: scores = softmax(Q @ K^T / sqrt(d_k) + mask)
+         *
+         * @param scale Pre-softmax scale (typically 1/sqrt(d_k))
+         * @param mask Optional additive mask [m, n] (nullptr = no mask)
+         * @param causal Apply causal (lower-triangular) mask
+         */
+        static GemmFusedOps softmax(float scale = 1.0f, const float *mask = nullptr, bool causal = false)
+        {
+            GemmFusedOps ops;
+            ops.op_type = GemmFusedOpType::Softmax;
+            ops.softmax_scale = scale;
+            ops.softmax_mask = mask;
+            ops.is_causal = causal;
+            return ops;
+        }
+
+        /**
+         * @brief Online softmax for flash attention (returns max/sum for rescaling)
+         *
+         * @param scale Pre-softmax scale
+         * @param out_max Output buffer for per-row max [m]
+         * @param out_sum Output buffer for per-row exp sum [m]
+         * @param mask Optional additive mask
+         * @param causal Apply causal mask
+         */
+        static GemmFusedOps online_softmax(float scale, float *out_max, float *out_sum,
+                                           const float *mask = nullptr, bool causal = false)
+        {
+            GemmFusedOps ops;
+            ops.op_type = GemmFusedOpType::Softmax;
+            ops.softmax_scale = scale;
+            ops.softmax_mask = mask;
+            ops.is_causal = causal;
+            ops.online_max = out_max;
+            ops.online_sum = out_sum;
+            return ops;
+        }
+
+        /**
+         * @brief Check if any fused operation is enabled
+         */
+        bool has_fusion() const { return op_type != GemmFusedOpType::None; }
+
+        /**
+         * @brief Check if specific operation type is enabled
+         */
+        bool is_swiglu() const { return op_type == GemmFusedOpType::SwiGLU; }
+        bool is_softmax() const { return op_type == GemmFusedOpType::Softmax; }
+    };
+
+    // =============================================================================
+    // Activation Format Enumeration
+    // =============================================================================
+
     /**
      * @brief Activation precision format enumeration
      *
@@ -787,6 +932,56 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
+            // Delegate to fused version with no fusion
+            return multiply_with_precomputed_q8_1(
+                q8_1_activations, C, m, n, k, bias, accumulate, alpha, beta,
+                mpi_ctx, device_idx, GemmFusedOps::none());
+        }
+
+        /**
+         * @brief GEMM with pre-quantized activations and fused post-ops
+         *
+         * Extended version that supports fused operations (SwiGLU, Softmax, etc.)
+         * after the GEMM computation. This enables single-pass execution of
+         * common patterns like FFN (GEMM + SwiGLU) and attention (GEMM + Softmax).
+         *
+         * @param q8_1_activations Pre-quantized Q8_1 blocks from quantize_activations()
+         * @param C Output matrix [m, n] (FP32)
+         * @param m Number of rows in activation matrix
+         * @param n Number of columns in output (rows in weight matrix)
+         * @param k Number of columns in activation matrix
+         * @param bias Optional bias vector [n] to add after GEMM (nullptr = no bias)
+         * @param accumulate If true, add to existing C; if false, overwrite
+         * @param alpha Scale factor for GEMM result
+         * @param beta Scale factor for existing C (only used if accumulate=true)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index (-1 = CPU)
+         * @param fused_ops Fused operation configuration (SwiGLU, Softmax, etc.)
+         *
+         * @return true on success, false if not supported
+         *
+         * Example - SwiGLU fusion for FFN:
+         * @code
+         * // Compute gate projection first
+         * gate_kernel->multiply_with_precomputed_q8_1(q8_acts, gate_out, m, n, k);
+         *
+         * // Compute up projection with fused SwiGLU
+         * up_kernel->multiply_with_precomputed_q8_1(q8_acts, up_out, m, n, k,
+         *     nullptr, false, 1.0f, 0.0f, nullptr, -1,
+         *     GemmFusedOps::swiglu(gate_out));
+         * @endcode
+         */
+        virtual bool multiply_with_precomputed_q8_1(
+            const void *q8_1_activations,
+            float *C,
+            int m, int n, int k,
+            const float *bias,
+            bool accumulate,
+            float alpha, float beta,
+            const MPIContext *mpi_ctx,
+            int device_idx,
+            const GemmFusedOps &fused_ops)
+        {
             (void)q8_1_activations;
             (void)C;
             (void)m;
@@ -798,6 +993,7 @@ namespace llaminar2
             (void)beta;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)fused_ops;
             return false; // Not implemented for non-quantized kernels
         }
 

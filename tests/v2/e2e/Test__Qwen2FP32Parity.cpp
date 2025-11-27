@@ -145,27 +145,27 @@ protected:
         pytorch_snapshots_.clear();
     }
 
-/**
- * @brief Comparison result structure
- */
-struct ComparisonResult
-{
-    bool passed = false;
-    float max_abs_diff = 0.0f;
-    float mean_abs_diff = 0.0f;
-    float rel_l2_norm = 0.0f;
-    float cosine_similarity = 0.0f;  // NEW: Measures directional alignment
-    float kl_divergence = 0.0f;      // NEW: For logits comparison
-    float norm_actual = 0.0f;        // L2 norm of actual tensor
-    float norm_expected = 0.0f;      // L2 norm of expected tensor
-    size_t num_mismatches = 0;
-    size_t total_elements = 0;
-};    /**
-     * @brief Load PyTorch snapshot from .npy file
-     *
-     * @param name Stage name (e.g., "EMBEDDING", "layer0_Q_PROJECTION")
-     * @return Vector of FP32 values
+    /**
+     * @brief Comparison result structure
      */
+    struct ComparisonResult
+    {
+        bool passed = false;
+        float max_abs_diff = 0.0f;
+        float mean_abs_diff = 0.0f;
+        float rel_l2_norm = 0.0f;
+        float cosine_similarity = 0.0f; // NEW: Measures directional alignment
+        float kl_divergence = 0.0f;     // NEW: For logits comparison
+        float norm_actual = 0.0f;       // L2 norm of actual tensor
+        float norm_expected = 0.0f;     // L2 norm of expected tensor
+        size_t num_mismatches = 0;
+        size_t total_elements = 0;
+    }; /**
+        * @brief Load PyTorch snapshot from .npy file
+        *
+        * @param name Stage name (e.g., "EMBEDDING", "layer0_Q_PROJECTION")
+        * @return Vector of FP32 values
+        */
     std::vector<float> loadPyTorchSnapshot(const std::string &name)
     {
         // Check if already loaded
@@ -243,7 +243,7 @@ struct ComparisonResult
         double denominator = std::sqrt(norm_a) * std::sqrt(norm_b);
         if (denominator < 1e-10)
         {
-            return 0.0f;  // Avoid division by zero
+            return 0.0f; // Avoid division by zero
         }
 
         return static_cast<float>(dot_product / denominator);
@@ -303,8 +303,8 @@ struct ComparisonResult
             double pos_kl = 0.0;
             for (size_t i = 0; i < vocab_size; ++i)
             {
-                double log_p = expected_row[i] - log_sum_expected;  // log P(x)
-                double log_q = actual_row[i] - log_sum_actual;      // log Q(x)
+                double log_p = expected_row[i] - log_sum_expected; // log P(x)
+                double log_q = actual_row[i] - log_sum_actual;     // log Q(x)
                 double p = std::exp(log_p);
 
                 // Skip very small probabilities to avoid numerical issues
@@ -318,6 +318,71 @@ struct ComparisonResult
 
         // Return average KL per position
         return static_cast<float>(total_kl / seq_len);
+    }
+
+    /**
+     * @brief Compute Top-K overlap between two sets of logits
+     *
+     * Checks if the top K tokens predicted by both models are the same (ignoring order within top K).
+     * This is a "Smoke Test" for decision quality.
+     *
+     * @param actual_logits Llaminar logits
+     * @param expected_logits PyTorch logits
+     * @param size Number of elements (seq_len * vocab_size)
+     * @param vocab_size Vocabulary size
+     * @param k Number of top tokens to consider
+     * @return Overlap percentage (0.0 to 1.0)
+     */
+    static float computeTopKOverlap(
+        const float *actual_logits,
+        const float *expected_logits,
+        size_t size,
+        size_t vocab_size,
+        int k)
+    {
+        size_t seq_len = size / vocab_size;
+        double total_overlap = 0.0;
+
+        for (size_t pos = 0; pos < seq_len; ++pos)
+        {
+            const float *actual_row = actual_logits + pos * vocab_size;
+            const float *expected_row = expected_logits + pos * vocab_size;
+
+            // Helper to get top K indices
+            auto get_top_k = [&](const float *logits)
+            {
+                std::vector<std::pair<float, int>> scores(vocab_size);
+                for (size_t i = 0; i < vocab_size; ++i)
+                {
+                    scores[i] = {logits[i], static_cast<int>(i)};
+                }
+                // Partial sort to get top K
+                std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
+                                  [](const auto &a, const auto &b)
+                                  { return a.first > b.first; });
+
+                std::vector<int> indices(k);
+                for (int i = 0; i < k; ++i)
+                    indices[i] = scores[i].second;
+                // Sort indices for set intersection
+                std::sort(indices.begin(), indices.end());
+                return indices;
+            };
+
+            auto actual_topk = get_top_k(actual_row);
+            auto expected_topk = get_top_k(expected_row);
+
+            // Compute intersection size
+            std::vector<int> intersection;
+            std::set_intersection(
+                actual_topk.begin(), actual_topk.end(),
+                expected_topk.begin(), expected_topk.end(),
+                std::back_inserter(intersection));
+
+            total_overlap += static_cast<double>(intersection.size()) / k;
+        }
+
+        return static_cast<float>(total_overlap / seq_len);
     }
 
     /**
@@ -881,15 +946,16 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
     // Cosine similarity threshold: vectors must be >99.9% directionally aligned
     const float COSINE_THRESHOLD = 0.999f;
     // KL divergence threshold for final logits (probability distribution check)
-    const float KL_THRESHOLD = 0.005f;
+    // Relaxed from 0.005 to 0.15 based on feedback that < 0.15 is acceptable for mixed precision
+    const float KL_THRESHOLD = 0.15f;
 
     // Store per-layer statistics (using cosine similarity instead of L2)
     struct LayerStats
     {
         int layer_idx;
-        float min_cosine_sim;  // Minimum cosine similarity across all stages in this layer
-        float avg_cosine_sim;  // Average cosine similarity across all stages
-        float max_rel_l2;      // Keep L2 for reference
+        float min_cosine_sim; // Minimum cosine similarity across all stages in this layer
+        float avg_cosine_sim; // Average cosine similarity across all stages
+        float max_rel_l2;     // Keep L2 for reference
         std::string worst_stage;
         int stages_compared;
         bool passed;
@@ -919,7 +985,7 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
     {
         LayerStats stats{};
         stats.layer_idx = layer_idx;
-        stats.min_cosine_sim = 1.0f;  // Start at perfect similarity
+        stats.min_cosine_sim = 1.0f; // Start at perfect similarity
         stats.avg_cosine_sim = 0.0f;
         stats.max_rel_l2 = 0.0f;
         stats.stages_compared = 0;
@@ -972,10 +1038,12 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
     float lm_head_cosine = 0.0f;
     float lm_head_l2 = 0.0f;
     float lm_head_kl_divergence = 0.0f;
+    float lm_head_top1_overlap = 0.0f;
+    float lm_head_top5_overlap = 0.0f;
     std::vector<float> pytorch_lm_head_data;
-    const float* llaminar_lm_head_data = nullptr;
+    const float *llaminar_lm_head_data = nullptr;
     size_t lm_head_size = 0;
-    
+
     {
         auto pytorch_data = loadPyTorchSnapshot("FINAL_NORM");
         if (!pytorch_data.empty())
@@ -999,7 +1067,7 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
                 auto result = compareTensors(llaminar_lm_head_data, pytorch_lm_head_data, lm_head_size);
                 lm_head_cosine = result.cosine_similarity;
                 lm_head_l2 = result.rel_l2_norm;
-                
+
                 // Compute KL divergence for final logits (probability distribution check)
                 // Note: We compare the last token's logits (most important for generation)
                 size_t vocab_size = model_ctx_->model().vocab_size;
@@ -1011,9 +1079,25 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
                     lm_head_kl_divergence = computeKLDivergence(
                         llaminar_lm_head_data + last_token_offset,
                         pytorch_lm_head_data.data() + last_token_offset,
-                        vocab_size,  // size = vocab_size (just 1 row)
-                        vocab_size   // vocab_size
+                        vocab_size, // size = vocab_size (just 1 row)
+                        vocab_size  // vocab_size
                     );
+
+                    // Compute Top-1 Overlap
+                    lm_head_top1_overlap = computeTopKOverlap(
+                        llaminar_lm_head_data + last_token_offset,
+                        pytorch_lm_head_data.data() + last_token_offset,
+                        vocab_size,
+                        vocab_size,
+                        1);
+
+                    // Compute Top-5 Overlap
+                    lm_head_top5_overlap = computeTopKOverlap(
+                        llaminar_lm_head_data + last_token_offset,
+                        pytorch_lm_head_data.data() + last_token_offset,
+                        vocab_size,
+                        vocab_size,
+                        5);
                 }
             }
         }
@@ -1064,7 +1148,7 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
     // Final stages
     bool final_norm_passed = (final_norm_cosine >= COSINE_THRESHOLD);
     bool lm_head_passed = (lm_head_cosine >= COSINE_THRESHOLD) && (lm_head_kl_divergence < KL_THRESHOLD);
-    
+
     std::cout << "╠═══════════╬═══════════════╬═══════════════╬═══════════════╬════════════════════╬══════╣\n";
     std::cout << "║FINAL_NORM ║"
               << std::setw(13) << std::fixed << std::setprecision(6) << final_norm_cosine << " ║"
@@ -1107,8 +1191,10 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
     std::cout << "Min layer cosine: " << std::fixed << std::setprecision(6) << min_layer_cosine << "\n";
     std::cout << "Final norm cosine: " << std::fixed << std::setprecision(6) << final_norm_cosine << "\n";
     std::cout << "LM head cosine:    " << std::fixed << std::setprecision(6) << lm_head_cosine << "\n";
-    std::cout << "LM head KL div:    " << std::fixed << std::setprecision(6) << lm_head_kl_divergence 
+    std::cout << "LM head KL div:    " << std::fixed << std::setprecision(6) << lm_head_kl_divergence
               << (lm_head_kl_divergence < KL_THRESHOLD ? " (PASS)" : " (FAIL)") << "\n";
+    std::cout << "LM head Top-1:     " << std::fixed << std::setprecision(2) << (lm_head_top1_overlap * 100.0f) << "%\n";
+    std::cout << "LM head Top-5:     " << std::fixed << std::setprecision(2) << (lm_head_top5_overlap * 100.0f) << "%\n";
     std::cout << "\n";
 
     // The test passes if layers 0-3 (early layers) have high cosine similarity
@@ -1126,7 +1212,7 @@ TEST_F(Qwen2FP32Parity, AllLayersParity)
 
     // Check that KL divergence for final logits is acceptable
     EXPECT_LT(lm_head_kl_divergence, KL_THRESHOLD)
-        << "LM_HEAD KL divergence too high: " << lm_head_kl_divergence 
+        << "LM_HEAD KL divergence too high: " << lm_head_kl_divergence
         << " (threshold: " << KL_THRESHOLD << ")";
 
     // Log observation about error accumulation

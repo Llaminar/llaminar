@@ -40,10 +40,12 @@ namespace llaminar2
      */
     struct GEMMProjection
     {
-        float *output;     ///< Output buffer [m, n]
-        const float *bias; ///< Optional bias [n] (nullptr if none)
-        int n;             ///< Output dimension
-        std::string name;  ///< Name for error messages (optional)
+        float *output;                     ///< Output buffer [m, n]
+        const float *bias;                 ///< Optional bias [n] (nullptr if none)
+        int n;                             ///< Output dimension
+        std::string name;                  ///< Name for error messages (optional)
+        const float *gate_input = nullptr; ///< Optional gate input for SwiGLU [m, n]
+        bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
     };
 
     /**

@@ -3,6 +3,9 @@
 #include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include <vector>
 #include <random>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
 
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;
@@ -272,4 +275,829 @@ TEST(Test__QuantisedGemmKernel, ActivationSharingNotSupportedByDefault)
     // Test buffer size calculation
     size_t buffer_size = kernel->get_quantized_activation_buffer_size(M, K);
     EXPECT_EQ(buffer_size, M * (K / 32) * sizeof(Q8_1Block));
+}
+
+// =============================================================================
+// SwiGLU Fused Operation Tests
+// =============================================================================
+
+namespace
+{
+    /**
+     * @brief Reference implementation of sigmoid function
+     */
+    inline float sigmoid_ref(float x)
+    {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+
+    /**
+     * @brief Reference implementation of swish/silu activation: x * sigmoid(x)
+     */
+    inline float swish_ref(float x)
+    {
+        return x * sigmoid_ref(x);
+    }
+
+    /**
+     * @brief Reference implementation of SwiGLU: up * swish(gate)
+     *
+     * SwiGLU(gate, up) = up * swish(gate) = up * gate * sigmoid(gate)
+     */
+    inline float swiglu_ref(float gate, float up)
+    {
+        return up * swish_ref(gate);
+    }
+}
+
+/**
+ * @brief Test SwiGLU fused operation mathematical correctness (M=1, single row)
+ *
+ * This tests the complete fused workflow:
+ * 1. Compute gate_output = input @ gate_weights.T
+ * 2. Compute up_output = input @ up_weights.T * swish(gate_output)
+ *
+ * The kernel should produce: up_output[i] = (input @ up_weights.T)[i] * swish((input @ gate_weights.T)[i])
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_SingleRow_Correctness)
+{
+    int M = 1;   // Single token (uses M1 kernel)
+    int N = 128; // Output dimension
+    int K = 64;  // Input dimension
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Create random weights for gate and up projections
+    std::vector<float> gate_weights_fp32(N * K);
+    std::vector<float> up_weights_fp32(N * K);
+    for (auto &x : gate_weights_fp32)
+        x = dist(gen);
+    for (auto &x : up_weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights
+    auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
+                                                       {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto up_weights = Q8_1Tensor::quantize_from_fp32(up_weights_fp32.data(),
+                                                     {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+    // Create kernels
+    auto gate_kernel = gate_weights->createGemm();
+    auto up_kernel = up_weights->createGemm();
+    ASSERT_NE(gate_kernel, nullptr);
+    ASSERT_NE(up_kernel, nullptr);
+
+    // Create random input
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // Step 1: Compute gate output (non-fused, for reference and as input to SwiGLU)
+    std::vector<float> gate_output(M * N, 0.0f);
+    ASSERT_TRUE(gate_kernel->multiply(input.data(), gate_output.data(), M, N, K));
+
+    // Step 2: Compute up output WITHOUT SwiGLU (for reference)
+    std::vector<float> up_output_no_swiglu(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply(input.data(), up_output_no_swiglu.data(), M, N, K));
+
+    // Step 3: Compute reference SwiGLU output manually
+    std::vector<float> swiglu_ref_output(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        swiglu_ref_output[i] = swiglu_ref(gate_output[i], up_output_no_swiglu[i]);
+    }
+
+    // Step 4: Compute fused SwiGLU output using the kernel
+    // First quantize activations
+    size_t buffer_size = up_kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(up_kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    // Execute with SwiGLU enabled
+    std::vector<float> swiglu_actual_output(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        swiglu_actual_output.data(),
+        M, N, K,
+        nullptr, // no bias
+        false,   // no accumulate
+        1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps::swiglu(gate_output.data())));
+
+    // Compare fused output vs reference
+    // Tolerance accounts for:
+    // - Quantization error in GEMM
+    // - Polynomial approximation of exp() in JIT kernel
+    float max_diff = 0.0f;
+    float mean_diff = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+    {
+        float diff = std::abs(swiglu_actual_output[i] - swiglu_ref_output[i]);
+        max_diff = std::max(max_diff, diff);
+        mean_diff += diff;
+        EXPECT_NEAR(swiglu_actual_output[i], swiglu_ref_output[i], 0.5f)
+            << "Mismatch at index " << i
+            << ", gate=" << gate_output[i]
+            << ", up=" << up_output_no_swiglu[i];
+    }
+    mean_diff /= (M * N);
+
+    // Also verify that the output is meaningfully different from un-swiglu'd output
+    // (i.e., the SwiGLU was actually applied)
+    float diff_from_unswiglu = 0.0f;
+    for (int i = 0; i < M * N; ++i)
+    {
+        diff_from_unswiglu += std::abs(swiglu_actual_output[i] - up_output_no_swiglu[i]);
+    }
+    diff_from_unswiglu /= (M * N);
+    EXPECT_GT(diff_from_unswiglu, 0.01f) << "SwiGLU should modify the output";
+}
+
+/**
+ * @brief Test SwiGLU fused operation with multiple rows (M=2, uses M2 kernel)
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_MultiRow_Correctness)
+{
+    int M = 2;   // Two rows (uses M2 kernel)
+    int N = 128; // Output dimension
+    int K = 64;  // Input dimension
+
+    std::mt19937 gen(123);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Create random weights
+    std::vector<float> gate_weights_fp32(N * K);
+    std::vector<float> up_weights_fp32(N * K);
+    for (auto &x : gate_weights_fp32)
+        x = dist(gen);
+    for (auto &x : up_weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights
+    auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
+                                                       {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto up_weights = Q8_1Tensor::quantize_from_fp32(up_weights_fp32.data(),
+                                                     {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+    auto gate_kernel = gate_weights->createGemm();
+    auto up_kernel = up_weights->createGemm();
+
+    // Create random input
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // Compute gate output
+    std::vector<float> gate_output(M * N, 0.0f);
+    ASSERT_TRUE(gate_kernel->multiply(input.data(), gate_output.data(), M, N, K));
+
+    // Compute up output without SwiGLU
+    std::vector<float> up_output_no_swiglu(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply(input.data(), up_output_no_swiglu.data(), M, N, K));
+
+    // Compute reference SwiGLU
+    std::vector<float> swiglu_ref_output(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        swiglu_ref_output[i] = swiglu_ref(gate_output[i], up_output_no_swiglu[i]);
+    }
+
+    // Compute fused SwiGLU
+    size_t buffer_size = up_kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(up_kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    std::vector<float> swiglu_actual_output(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        swiglu_actual_output.data(),
+        M, N, K,
+        nullptr, false, 1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps::swiglu(gate_output.data())));
+
+    // Compare per-row
+    for (int m = 0; m < M; ++m)
+    {
+        for (int n = 0; n < N; ++n)
+        {
+            int idx = m * N + n;
+            EXPECT_NEAR(swiglu_actual_output[idx], swiglu_ref_output[idx], 0.5f)
+                << "Row " << m << ", col " << n
+                << ", gate=" << gate_output[idx]
+                << ", up=" << up_output_no_swiglu[idx];
+        }
+    }
+}
+
+/**
+ * @brief Test SwiGLU with larger batch (M=8, tests OpenMP parallelization)
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_LargeBatch_Correctness)
+{
+    int M = 8;
+    int N = 256;
+    int K = 128;
+
+    std::mt19937 gen(456);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> gate_weights_fp32(N * K);
+    std::vector<float> up_weights_fp32(N * K);
+    for (auto &x : gate_weights_fp32)
+        x = dist(gen);
+    for (auto &x : up_weights_fp32)
+        x = dist(gen);
+
+    auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
+                                                       {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto up_weights = Q8_1Tensor::quantize_from_fp32(up_weights_fp32.data(),
+                                                     {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+    auto gate_kernel = gate_weights->createGemm();
+    auto up_kernel = up_weights->createGemm();
+
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // Compute gate and up outputs
+    std::vector<float> gate_output(M * N, 0.0f);
+    std::vector<float> up_output_no_swiglu(M * N, 0.0f);
+    ASSERT_TRUE(gate_kernel->multiply(input.data(), gate_output.data(), M, N, K));
+    ASSERT_TRUE(up_kernel->multiply(input.data(), up_output_no_swiglu.data(), M, N, K));
+
+    // Reference SwiGLU
+    std::vector<float> swiglu_ref_output(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        swiglu_ref_output[i] = swiglu_ref(gate_output[i], up_output_no_swiglu[i]);
+    }
+
+    // Fused SwiGLU
+    size_t buffer_size = up_kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(up_kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    std::vector<float> swiglu_actual_output(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        swiglu_actual_output.data(),
+        M, N, K,
+        nullptr, false, 1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps::swiglu(gate_output.data())));
+
+    // Verify correctness
+    float max_diff = 0.0f;
+    int mismatch_count = 0;
+    for (int i = 0; i < M * N; ++i)
+    {
+        float diff = std::abs(swiglu_actual_output[i] - swiglu_ref_output[i]);
+        max_diff = std::max(max_diff, diff);
+        if (diff > 0.5f)
+        {
+            mismatch_count++;
+        }
+    }
+    EXPECT_LT(max_diff, 1.0f) << "Max difference too large";
+    EXPECT_LT(mismatch_count, M * N * 0.01) << "Too many mismatches";
+}
+
+/**
+ * @brief Test SwiGLU with extreme gate values (tests exp() approximation stability)
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_ExtremeGateValues)
+{
+    int M = 1;
+    int N = 64;
+    int K = 32;
+
+    std::mt19937 gen(789);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Create simple identity-like weights so we can control the outputs
+    std::vector<float> weights_fp32(N * K, 0.0f);
+    // Make a diagonal-ish pattern
+    for (int n = 0; n < N && n < K; ++n)
+    {
+        weights_fp32[n * K + n] = 1.0f;
+    }
+    for (int n = K; n < N; ++n)
+    {
+        weights_fp32[n * K + (n % K)] = 0.5f;
+    }
+
+    auto weights = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(),
+                                                  {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights->createGemm();
+
+    // Create input that will produce extreme gate values
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // Compute a non-fused output for the "up" path
+    std::vector<float> up_output(M * N, 0.0f);
+    ASSERT_TRUE(kernel->multiply(input.data(), up_output.data(), M, N, K));
+
+    // Create extreme gate values: very negative, zero, very positive
+    std::vector<float> gate_values(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        if (i % 4 == 0)
+            gate_values[i] = -50.0f; // Very negative -> sigmoid ~ 0
+        else if (i % 4 == 1)
+            gate_values[i] = 0.0f; // Zero -> swish = 0
+        else if (i % 4 == 2)
+            gate_values[i] = 50.0f; // Very positive -> sigmoid ~ 1
+        else
+            gate_values[i] = dist(gen) * 2.0f; // Normal range
+    }
+
+    // Reference SwiGLU
+    std::vector<float> swiglu_ref_output(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        swiglu_ref_output[i] = swiglu_ref(gate_values[i], up_output[i]);
+    }
+
+    // Fused SwiGLU
+    size_t buffer_size = kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    std::vector<float> swiglu_actual_output(M * N, 0.0f);
+    ASSERT_TRUE(kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        swiglu_actual_output.data(),
+        M, N, K,
+        nullptr, false, 1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps::swiglu(gate_values.data())));
+
+    // Check specific cases
+    for (int i = 0; i < M * N; ++i)
+    {
+        if (i % 4 == 0)
+        {
+            // Very negative gate -> output should be ~0
+            EXPECT_NEAR(swiglu_actual_output[i], 0.0f, 0.1f)
+                << "Very negative gate should produce ~0 output at idx " << i;
+        }
+        else if (i % 4 == 1)
+        {
+            // Zero gate -> swish(0) = 0 -> output should be 0
+            EXPECT_NEAR(swiglu_actual_output[i], 0.0f, 0.1f)
+                << "Zero gate should produce 0 output at idx " << i;
+        }
+        else if (i % 4 == 2)
+        {
+            // Very positive gate -> swish(gate) ~ gate -> output ~ up * gate
+            EXPECT_NEAR(swiglu_actual_output[i], swiglu_ref_output[i], 1.0f)
+                << "Very positive gate mismatch at idx " << i;
+        }
+        else
+        {
+            // Normal range
+            EXPECT_NEAR(swiglu_actual_output[i], swiglu_ref_output[i], 0.5f)
+                << "Normal gate mismatch at idx " << i;
+        }
+    }
+}
+
+/**
+ * @brief Test that SwiGLU disabled (do_swiglu=false) produces same output as non-fused
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_Disabled_MatchesNonFused)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    std::mt19937 gen(999);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> weights_fp32(N * K);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    auto weights = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(),
+                                                  {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights->createGemm();
+
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // Reference: standard multiply path
+    std::vector<float> ref_output(M * N, 0.0f);
+    ASSERT_TRUE(kernel->multiply(input.data(), ref_output.data(), M, N, K));
+
+    // Test: multiply_with_precomputed_q8_1 with do_swiglu=false
+    size_t buffer_size = kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    std::vector<float> actual_output(M * N, 0.0f);
+    // Provide gate_input but with do_swiglu = false via empty GemmFusedOps
+    std::vector<float> dummy_gate(M * N, 1.0f);
+    ASSERT_TRUE(kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        actual_output.data(),
+        M, N, K,
+        nullptr, false, 1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps{} // No fused ops - do_swiglu defaults to false
+        ));
+
+    // Should match exactly (within floating-point tolerance)
+    for (int i = 0; i < M * N; ++i)
+    {
+        EXPECT_NEAR(actual_output[i], ref_output[i], 0.01f)
+            << "do_swiglu=false should match standard multiply at idx " << i;
+    }
+}
+
+/**
+ * @brief Test SwiGLU with bias (bias is applied before SwiGLU in the JIT kernel)
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_WithBias)
+{
+    int M = 2;
+    int N = 64;
+    int K = 32;
+
+    std::mt19937 gen(111);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> gate_weights_fp32(N * K);
+    std::vector<float> up_weights_fp32(N * K);
+    std::vector<float> up_bias(N);
+    for (auto &x : gate_weights_fp32)
+        x = dist(gen);
+    for (auto &x : up_weights_fp32)
+        x = dist(gen);
+    for (auto &x : up_bias)
+        x = dist(gen) * 0.1f;
+
+    auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
+                                                       {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto up_weights = Q8_1Tensor::quantize_from_fp32(up_weights_fp32.data(),
+                                                     {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+    auto gate_kernel = gate_weights->createGemm();
+    auto up_kernel = up_weights->createGemm();
+
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // Compute gate output
+    std::vector<float> gate_output(M * N, 0.0f);
+    ASSERT_TRUE(gate_kernel->multiply(input.data(), gate_output.data(), M, N, K));
+
+    // Compute up output without SwiGLU, with bias
+    std::vector<float> up_output_with_bias(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply(input.data(), up_output_with_bias.data(), M, N, K));
+    for (int m = 0; m < M; ++m)
+    {
+        for (int n = 0; n < N; ++n)
+        {
+            up_output_with_bias[m * N + n] += up_bias[n];
+        }
+    }
+
+    // Reference SwiGLU: bias is applied to up BEFORE SwiGLU
+    std::vector<float> swiglu_ref_output(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        swiglu_ref_output[i] = swiglu_ref(gate_output[i], up_output_with_bias[i]);
+    }
+
+    // Fused SwiGLU with bias
+    size_t buffer_size = up_kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(up_kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    std::vector<float> swiglu_actual_output(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        swiglu_actual_output.data(),
+        M, N, K,
+        up_bias.data(), // bias
+        false, 1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps::swiglu(gate_output.data())));
+
+    // Compare
+    for (int i = 0; i < M * N; ++i)
+    {
+        EXPECT_NEAR(swiglu_actual_output[i], swiglu_ref_output[i], 0.5f)
+            << "SwiGLU with bias mismatch at idx " << i;
+    }
+}
+
+/**
+ * @brief Compare L2 drift between fused SwiGLU (in-kernel) vs non-fused (separate kernel)
+ *
+ * This test verifies that the fused SwiGLU path produces equal or better numerical
+ * accuracy compared to the non-fused path (GEMM + separate SwiGLU application).
+ *
+ * The hypothesis is that fused SwiGLU should have less L2 drift because:
+ * 1. One fewer memory round-trip (GEMM result stays in registers)
+ * 2. Fewer floating-point rounding operations
+ *
+ * Both paths use the same polynomial exp() approximation, so the improvement
+ * should be minimal but measurable.
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_FusedVsNonFused_L2Drift)
+{
+    // Use realistic FFN dimensions for Qwen2-0.5B
+    // hidden_size=896, intermediate_size=4864
+    int M = 8;    // Batch of tokens
+    int N = 4864; // Intermediate size (d_ff)
+    int K = 896;  // Hidden size (d_model)
+
+    std::mt19937 gen(12345);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f); // Realistic activation range
+
+    // Create weights for gate and up projections
+    std::vector<float> gate_weights_fp32(N * K);
+    std::vector<float> up_weights_fp32(N * K);
+    for (auto &x : gate_weights_fp32)
+        x = dist(gen);
+    for (auto &x : up_weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights
+    auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
+                                                       {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto up_weights = Q8_1Tensor::quantize_from_fp32(up_weights_fp32.data(),
+                                                     {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+    auto gate_kernel = gate_weights->createGemm();
+    auto up_kernel = up_weights->createGemm();
+
+    // Create random input
+    std::vector<float> input(M * K);
+    for (auto &x : input)
+        x = dist(gen);
+
+    // =========================================================================
+    // PATH 1: Non-fused (GEMM + separate SwiGLU)
+    // =========================================================================
+
+    // Compute gate output
+    std::vector<float> gate_output(M * N, 0.0f);
+    ASSERT_TRUE(gate_kernel->multiply(input.data(), gate_output.data(), M, N, K));
+
+    // Compute up output (stored to memory)
+    std::vector<float> up_output_nonfused(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply(input.data(), up_output_nonfused.data(), M, N, K));
+
+    // Apply SwiGLU separately (simulates loading from memory and applying)
+    std::vector<float> swiglu_nonfused(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        swiglu_nonfused[i] = swiglu_ref(gate_output[i], up_output_nonfused[i]);
+    }
+
+    // =========================================================================
+    // PATH 2: Fused SwiGLU (GEMM with in-kernel SwiGLU)
+    // =========================================================================
+
+    // Quantize activations once for both paths
+    size_t buffer_size = up_kernel->get_quantized_activation_buffer_size(M, K);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+    ASSERT_TRUE(up_kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K));
+
+    // Execute fused GEMM + SwiGLU
+    std::vector<float> swiglu_fused(M * N, 0.0f);
+    ASSERT_TRUE(up_kernel->multiply_with_precomputed_q8_1(
+        q8_1_buffer.data(),
+        swiglu_fused.data(),
+        M, N, K,
+        nullptr, false, 1.0f, 0.0f,
+        nullptr, -1,
+        GemmFusedOps::swiglu(gate_output.data())));
+
+    // =========================================================================
+    // GROUND TRUTH: FP64 reference (highest precision)
+    // =========================================================================
+
+    // Compute FP64 ground truth for gate GEMM
+    std::vector<double> gate_output_fp64(M * N, 0.0);
+    for (int m = 0; m < M; ++m)
+    {
+        for (int n = 0; n < N; ++n)
+        {
+            double sum = 0.0;
+            for (int kk = 0; kk < K; ++kk)
+            {
+                sum += static_cast<double>(input[m * K + kk]) *
+                       static_cast<double>(gate_weights_fp32[n * K + kk]);
+            }
+            gate_output_fp64[m * N + n] = sum;
+        }
+    }
+
+    // Compute FP64 ground truth for up GEMM
+    std::vector<double> up_output_fp64(M * N, 0.0);
+    for (int m = 0; m < M; ++m)
+    {
+        for (int n = 0; n < N; ++n)
+        {
+            double sum = 0.0;
+            for (int kk = 0; kk < K; ++kk)
+            {
+                sum += static_cast<double>(input[m * K + kk]) *
+                       static_cast<double>(up_weights_fp32[n * K + kk]);
+            }
+            up_output_fp64[m * N + n] = sum;
+        }
+    }
+
+    // Compute FP64 ground truth for SwiGLU: up * silu(gate)
+    std::vector<double> swiglu_fp64(M * N);
+    for (int i = 0; i < M * N; ++i)
+    {
+        double gate = gate_output_fp64[i];
+        double up = up_output_fp64[i];
+        double sigmoid_gate = 1.0 / (1.0 + std::exp(-gate));
+        double silu_gate = gate * sigmoid_gate;
+        swiglu_fp64[i] = up * silu_gate;
+    }
+
+    // =========================================================================
+    // COMPUTE L2 DRIFT METRICS
+    // =========================================================================
+
+    double l2_nonfused = 0.0;
+    double l2_fused = 0.0;
+    double linf_nonfused = 0.0;
+    double linf_fused = 0.0;
+    double sum_sq_ref = 0.0;
+
+    for (int i = 0; i < M * N; ++i)
+    {
+        double ref = swiglu_fp64[i];
+        double err_nonfused = static_cast<double>(swiglu_nonfused[i]) - ref;
+        double err_fused = static_cast<double>(swiglu_fused[i]) - ref;
+
+        l2_nonfused += err_nonfused * err_nonfused;
+        l2_fused += err_fused * err_fused;
+
+        linf_nonfused = std::max(linf_nonfused, std::abs(err_nonfused));
+        linf_fused = std::max(linf_fused, std::abs(err_fused));
+
+        sum_sq_ref += ref * ref;
+    }
+
+    double rel_l2_nonfused = std::sqrt(l2_nonfused / sum_sq_ref);
+    double rel_l2_fused = std::sqrt(l2_fused / sum_sq_ref);
+    double rms_nonfused = std::sqrt(l2_nonfused / (M * N));
+    double rms_fused = std::sqrt(l2_fused / (M * N));
+
+    // Print comparison
+    std::cout << "\n========== SwiGLU Fused vs Non-Fused L2 Drift Comparison ==========\n";
+    std::cout << "Dimensions: M=" << M << " N=" << N << " K=" << K << "\n";
+    std::cout << "Total elements: " << (M * N) << "\n\n";
+
+    std::cout << "NON-FUSED (GEMM + separate SwiGLU):\n";
+    std::cout << "  Relative L2 error: " << std::scientific << rel_l2_nonfused << "\n";
+    std::cout << "  RMS error:         " << std::scientific << rms_nonfused << "\n";
+    std::cout << "  L-infinity error:  " << std::scientific << linf_nonfused << "\n\n";
+
+    std::cout << "FUSED (GEMM with in-kernel SwiGLU):\n";
+    std::cout << "  Relative L2 error: " << std::scientific << rel_l2_fused << "\n";
+    std::cout << "  RMS error:         " << std::scientific << rms_fused << "\n";
+    std::cout << "  L-infinity error:  " << std::scientific << linf_fused << "\n\n";
+
+    double improvement = (rel_l2_nonfused - rel_l2_fused) / rel_l2_nonfused * 100.0;
+    std::cout << "COMPARISON:\n";
+    std::cout << "  Fused L2 improvement: " << std::fixed << std::setprecision(2) << improvement << "%\n";
+    std::cout << "  Fused is " << (rel_l2_fused < rel_l2_nonfused ? "BETTER" : "WORSE") << " than non-fused\n";
+    std::cout << "===================================================================\n\n";
+
+    // The fused path should be at least as good as non-fused
+    // Allow 1% tolerance for measurement noise
+    EXPECT_LE(rel_l2_fused, rel_l2_nonfused * 1.01)
+        << "Fused SwiGLU should not be significantly worse than non-fused";
+
+    // Both should be within reasonable accuracy bounds
+    EXPECT_LT(rel_l2_fused, 1e-2) << "Fused L2 error too high";
+    EXPECT_LT(rel_l2_nonfused, 1e-2) << "Non-fused L2 error too high";
+}
+
+/**
+ * @brief Test L2 drift across multiple batch sizes to verify consistency
+ */
+TEST(Test__QuantisedGemmKernel, SwiGLU_FusedVsNonFused_BatchSizeScaling)
+{
+    const std::vector<int> batch_sizes = {1, 2, 4, 8, 16, 32};
+    int N = 1536; // Intermediate size
+    int K = 512;  // Hidden size
+
+    std::cout << "\n========== SwiGLU L2 Drift vs Batch Size ==========\n";
+    std::cout << std::setw(8) << "Batch"
+              << std::setw(16) << "NonFused L2"
+              << std::setw(16) << "Fused L2"
+              << std::setw(16) << "Improvement"
+              << "\n";
+    std::cout << std::string(56, '-') << "\n";
+
+    for (int M : batch_sizes)
+    {
+        std::mt19937 gen(42 + M); // Different seed per batch size
+        std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+        // Create weights
+        std::vector<float> gate_weights_fp32(N * K);
+        std::vector<float> up_weights_fp32(N * K);
+        for (auto &x : gate_weights_fp32)
+            x = dist(gen);
+        for (auto &x : up_weights_fp32)
+            x = dist(gen);
+
+        auto gate_weights = Q8_1Tensor::quantize_from_fp32(gate_weights_fp32.data(),
+                                                           {static_cast<size_t>(N), static_cast<size_t>(K)});
+        auto up_weights = Q8_1Tensor::quantize_from_fp32(up_weights_fp32.data(),
+                                                         {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+        auto gate_kernel = gate_weights->createGemm();
+        auto up_kernel = up_weights->createGemm();
+
+        std::vector<float> input(M * K);
+        for (auto &x : input)
+            x = dist(gen);
+
+        // Non-fused path
+        std::vector<float> gate_output(M * N, 0.0f);
+        std::vector<float> up_output(M * N, 0.0f);
+        gate_kernel->multiply(input.data(), gate_output.data(), M, N, K);
+        up_kernel->multiply(input.data(), up_output.data(), M, N, K);
+
+        std::vector<float> swiglu_nonfused(M * N);
+        for (int i = 0; i < M * N; ++i)
+        {
+            swiglu_nonfused[i] = swiglu_ref(gate_output[i], up_output[i]);
+        }
+
+        // Fused path
+        size_t buffer_size = up_kernel->get_quantized_activation_buffer_size(M, K);
+        std::vector<uint8_t> q8_1_buffer(buffer_size);
+        up_kernel->quantize_activations(input.data(), q8_1_buffer.data(), M, K);
+
+        std::vector<float> swiglu_fused(M * N, 0.0f);
+        up_kernel->multiply_with_precomputed_q8_1(
+            q8_1_buffer.data(), swiglu_fused.data(), M, N, K,
+            nullptr, false, 1.0f, 0.0f, nullptr, -1,
+            GemmFusedOps::swiglu(gate_output.data()));
+
+        // FP64 reference
+        std::vector<double> swiglu_fp64(M * N);
+        for (int m = 0; m < M; ++m)
+        {
+            for (int n = 0; n < N; ++n)
+            {
+                int idx = m * N + n;
+                double gate_sum = 0.0, up_sum = 0.0;
+                for (int kk = 0; kk < K; ++kk)
+                {
+                    gate_sum += static_cast<double>(input[m * K + kk]) * gate_weights_fp32[n * K + kk];
+                    up_sum += static_cast<double>(input[m * K + kk]) * up_weights_fp32[n * K + kk];
+                }
+                double silu_gate = gate_sum / (1.0 + std::exp(-gate_sum));
+                swiglu_fp64[idx] = up_sum * silu_gate;
+            }
+        }
+
+        // Compute relative L2
+        double l2_nonfused = 0.0, l2_fused = 0.0, sum_sq_ref = 0.0;
+        for (int i = 0; i < M * N; ++i)
+        {
+            double ref = swiglu_fp64[i];
+            double err_nonfused = swiglu_nonfused[i] - ref;
+            double err_fused = swiglu_fused[i] - ref;
+            l2_nonfused += err_nonfused * err_nonfused;
+            l2_fused += err_fused * err_fused;
+            sum_sq_ref += ref * ref;
+        }
+        double rel_l2_nonfused = std::sqrt(l2_nonfused / sum_sq_ref);
+        double rel_l2_fused = std::sqrt(l2_fused / sum_sq_ref);
+        double improvement = (rel_l2_nonfused - rel_l2_fused) / rel_l2_nonfused * 100.0;
+
+        std::cout << std::setw(8) << M
+                  << std::setw(16) << std::scientific << rel_l2_nonfused
+                  << std::setw(16) << std::scientific << rel_l2_fused
+                  << std::setw(15) << std::fixed << std::setprecision(2) << improvement << "%"
+                  << "\n";
+
+        // Fused should not be significantly worse
+        EXPECT_LE(rel_l2_fused, rel_l2_nonfused * 1.05);
+    }
+    std::cout << "====================================================\n\n";
 }

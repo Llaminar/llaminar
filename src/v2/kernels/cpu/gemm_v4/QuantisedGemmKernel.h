@@ -151,7 +151,8 @@ namespace llaminar2
             bool multiply_fused(const float *A, float *C, int m, int n, int k,
                                 const float *bias, const float *mask, bool do_softmax,
                                 float *local_max, float *local_sum,
-                                bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx)
+                                bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx,
+                                const float *gate_input = nullptr, bool do_swiglu = false)
             {
                 // Check dimensions
                 if (n != packed_weights_.N || k != packed_weights_.K)
@@ -238,6 +239,10 @@ namespace llaminar2
                         for (int i = 0; i < m; ++i)
                         {
                             const float *a_row = A + i * k;
+                            if (i == 0)
+                            {
+                                std::cerr << "[quantize_activations] Inside loop (else): A=" << A << " a_row=" << a_row << std::endl;
+                            }
                             Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
                             for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
@@ -419,6 +424,7 @@ namespace llaminar2
 
                                         bool is_last_k_tile = (k_start + k_count == k_blocks);
                                         bool current_do_softmax = do_softmax && is_last_k_tile;
+                                        bool current_do_swiglu = do_swiglu && is_last_k_tile;
 
                                         float tmp_max[2], tmp_sum[2];
                                         if (current_do_softmax)
@@ -441,6 +447,17 @@ namespace llaminar2
                                             params.local_sum = nullptr;
                                         }
                                         params.do_softmax = current_do_softmax;
+
+                                        if (current_do_swiglu)
+                                        {
+                                            params.gate_input = gate_input + i * n + n_blk;
+                                            params.do_swiglu = true;
+                                        }
+                                        else
+                                        {
+                                            params.gate_input = nullptr;
+                                            params.do_swiglu = false;
+                                        }
 
                                         if (rows_to_process == 2)
                                         {
@@ -518,6 +535,17 @@ namespace llaminar2
                                         params.local_sum = nullptr;
                                     }
                                     params.do_softmax = do_softmax;
+
+                                    if (do_swiglu)
+                                    {
+                                        params.gate_input = gate_input + i * n + n_blk;
+                                        params.do_swiglu = true;
+                                    }
+                                    else
+                                    {
+                                        params.gate_input = nullptr;
+                                        params.do_swiglu = false;
+                                    }
 
                                     if (rows_to_process == 2)
                                     {
@@ -628,7 +656,9 @@ namespace llaminar2
                 int m, int k) override
             {
                 if (!A || !q8_1_buffer)
+                {
                     return false;
+                }
 
                 int k_blocks = k / 32;
                 Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
@@ -718,21 +748,26 @@ namespace llaminar2
             }
 
             /**
-             * @brief GEMM with pre-quantized Q8_1 activations
+             * @brief GEMM with pre-quantized Q8_1 activations and fused post-ops
              *
              * This is the second step in the fused multi-GEMM workflow.
              * Uses pre-quantized activations from quantize_activations(),
              * eliminating redundant FP32→Q8_1 conversion.
+             *
+             * Supports fused operations via GemmFusedOps:
+             * - SwiGLU: output *= swish(gate)
+             * - Softmax: output = softmax(output * scale + mask)
              */
             bool multiply_with_precomputed_q8_1(
                 const void *q8_1_activations,
                 float *C,
                 int m, int n, int k,
-                const float *bias = nullptr,
-                bool accumulate = false,
-                float alpha = 1.0f, float beta = 0.0f,
-                const MPIContext *mpi_ctx = nullptr,
-                int device_idx = -1) override
+                const float *bias,
+                bool accumulate,
+                float alpha, float beta,
+                const MPIContext *mpi_ctx,
+                int device_idx,
+                const GemmFusedOps &fused_ops) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
@@ -749,6 +784,14 @@ namespace llaminar2
                               << " got n=" << n << ", k=" << k << std::endl;
                     return false;
                 }
+
+                // Extract fused op parameters
+                const float *gate_input = fused_ops.is_swiglu() ? fused_ops.gate_input : nullptr;
+                bool do_swiglu = fused_ops.is_swiglu();
+                bool do_softmax = fused_ops.is_softmax();
+                const float *softmax_mask = fused_ops.softmax_mask;
+                float *local_max = fused_ops.online_max;
+                float *local_sum = fused_ops.online_sum;
 
                 // Get JIT kernels
                 static QuantisedGemmJit_M1 jit;
@@ -853,11 +896,13 @@ namespace llaminar2
                                 params.N = 64;
                                 params.ldc = n;
                                 params.bias = bias ? bias + n_blk : nullptr;
-                                params.mask = nullptr;
+                                params.mask = softmax_mask ? (softmax_mask + i * n + n_blk) : nullptr;
                                 params.A_stride = k_blocks * sizeof(Q8_1Block);
-                                params.local_max = nullptr;
-                                params.local_sum = nullptr;
-                                params.do_softmax = false;
+                                params.local_max = local_max;
+                                params.local_sum = local_sum;
+                                params.do_softmax = do_softmax;
+                                params.gate_input = gate_input ? (gate_input + i * n + n_blk) : nullptr;
+                                params.do_swiglu = do_swiglu;
 
                                 if (rows_to_process == 2)
                                     kernel_m2(&params);

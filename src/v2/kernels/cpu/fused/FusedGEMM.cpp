@@ -141,6 +141,11 @@ namespace llaminar2
             const auto &proj = projections[i];
             const auto &name = projection_names_[i];
 
+            // Build fused ops configuration
+            GemmFusedOps fused_ops = proj.do_swiglu
+                                         ? GemmFusedOps::swiglu(proj.gate_input)
+                                         : GemmFusedOps::none();
+
             success = gemm_kernels_[i]->multiply_with_precomputed_q8_1(
                 q8_1_buffer.data(),
                 proj.output,
@@ -148,7 +153,8 @@ namespace llaminar2
                 proj.bias,  // Fused bias
                 false,      // No accumulation
                 1.0f, 0.0f, // alpha=1, beta=0
-                ctx, device_idx);
+                ctx, device_idx,
+                fused_ops);
 
             if (!success)
             {

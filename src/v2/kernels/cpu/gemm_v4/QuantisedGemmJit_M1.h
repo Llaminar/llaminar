@@ -179,6 +179,11 @@ namespace llaminar2
                     // Setup cursors
                     mov(reg_A_cursor, reg_A);
 
+                    // Reload params to rax to restore clobbered registers (rdx, rcx)
+                    mov(rax, ptr[rsp + 8]);
+                    mov(reg_Comp, ptr[rax + 16]);   // Restore comp
+                    mov(reg_Scales, ptr[rax + 24]); // Restore scales
+
                     // Offset calculation for Comp, Scales, C: loop_N * 4
                     mov(reg_tmp, reg_loop_N);
                     shl(reg_tmp, 2); // loop_N * 4
@@ -503,7 +508,7 @@ namespace llaminar2
 
                     // 4. SwiGLU
                     // Reload params (rax might be clobbered)
-                    mov(rax, ptr[rsp + 8]);
+                    mov(rax, ptr[rsp + 8]);  // params is at rsp + 8
                     cmp(byte[rax + 104], 1); // do_swiglu
                     Label skip_swiglu;
                     jne(skip_swiglu, T_NEAR);
@@ -553,12 +558,11 @@ namespace llaminar2
                         mov(reg_tmp_32, 127);
                         vpbroadcastd(zmm_127, reg_tmp_32);
 
+                        // Reload params because rax was clobbered by constants
+                        mov(rax, ptr[rsp + 8]);
+
                         // Load gate_input pointer
                         mov(rdx, ptr[rax + 96]);
-                        // Offset: reg_loop_N * 4
-                        mov(r15, reg_loop_N);
-                        shl(r15, 2);
-                        add(rdx, r15);
 
                         auto compute_swish = [&](const Zmm &zmm_val, int offset)
                         {

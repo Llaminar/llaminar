@@ -426,28 +426,10 @@ namespace llaminar2::primitives
         __attribute__((always_inline)) inline double compute_sumsq_dispatch(const float *row, std::size_t cols)
         {
 #if defined(__AVX512F__)
-            static bool printed = false;
-            if (!printed)
-            {
-                printf("DEBUG: Using AVX512 sumsq\n");
-                printed = true;
-            }
             return compute_sumsq_avx512(row, cols);
 #elif defined(__AVX2__)
-            static bool printed = false;
-            if (!printed)
-            {
-                printf("DEBUG: Using AVX2 sumsq\n");
-                printed = true;
-            }
             return compute_sumsq_avx2(row, cols);
 #else
-            static bool printed = false;
-            if (!printed)
-            {
-                printf("DEBUG: Using Scalar sumsq\n");
-                printed = true;
-            }
             return compute_sumsq_scalar(row, cols);
 #endif
         }
