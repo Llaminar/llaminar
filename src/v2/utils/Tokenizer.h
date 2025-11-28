@@ -109,6 +109,17 @@ namespace llaminar2
         virtual bool hasChatTemplate() const = 0;
 
         /**
+         * @brief Set/override the chat template
+         *
+         * Allows overriding the model's chat template with a custom one.
+         * Useful when the model doesn't have a template or when using
+         * a different template format.
+         *
+         * @param tmpl Chat template to use
+         */
+        virtual void setChatTemplate(std::unique_ptr<ChatTemplate> tmpl) = 0;
+
+        /**
          * @brief Apply chat template to messages and encode
          *
          * Formats messages using the model's chat template, then tokenizes.
@@ -180,6 +191,7 @@ namespace llaminar2
         std::string getChatTemplateString() const override { return chat_template_string_; }
         ChatTemplateType getChatTemplateType() const override;
         bool hasChatTemplate() const override { return chat_template_ != nullptr; }
+        void setChatTemplate(std::unique_ptr<ChatTemplate> tmpl) override;
         std::vector<int> encodeChat(
             const std::vector<ChatMessage> &messages,
             bool add_generation_prompt = true) const override;

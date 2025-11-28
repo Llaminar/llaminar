@@ -68,6 +68,12 @@ namespace llaminar2
 
         // Activation/accumulation precision
         std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "int32"
+
+        // Chat mode
+        bool chat_mode = false;              // Enable interactive chat (FTXUI UI)
+        bool single_shot_chat = false;       // Single prompt with chat template formatting
+        std::string system_prompt = "";      // System message for chat
+        std::string chat_template = "";      // Override template: "chatml", "llama3", "mistral", etc.
     };
 
     /**

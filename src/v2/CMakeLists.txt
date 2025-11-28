@@ -554,6 +554,7 @@ add_library(llaminar2_core STATIC
     utils/Tokenizer.cpp
     utils/Sampler.cpp
     utils/ChatTemplate.cpp
+    utils/ChatUI.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )

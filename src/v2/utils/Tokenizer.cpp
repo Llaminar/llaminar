@@ -527,6 +527,15 @@ namespace llaminar2
         return ChatTemplateType::UNKNOWN;
     }
 
+    void BPETokenizer::setChatTemplate(std::unique_ptr<ChatTemplate> tmpl)
+    {
+        chat_template_ = std::move(tmpl);
+        if (chat_template_)
+        {
+            LOG_DEBUG("[BPETokenizer] Chat template set to: " << chatTemplateTypeName(chat_template_->type()));
+        }
+    }
+
     std::vector<int> BPETokenizer::encodeChat(
         const std::vector<ChatMessage> &messages,
         bool add_generation_prompt) const

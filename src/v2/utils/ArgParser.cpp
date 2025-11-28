@@ -208,6 +208,27 @@ namespace llaminar2
                 ctx.use_mmap = false;
             }
 
+            // Chat mode
+            else if (arg == "--chat")
+            {
+                ctx.chat_mode = true;
+            }
+
+            else if (arg == "--chat-single")
+            {
+                ctx.single_shot_chat = true;
+            }
+
+            else if (arg == "--system")
+            {
+                ctx.system_prompt = getNextArg(argv, argc, i, "system");
+            }
+
+            else if (arg == "--chat-template")
+            {
+                ctx.chat_template = getNextArg(argv, argc, i, "chat-template");
+            }
+
             // Verbose logging levels
             else if (arg == "-vv" || arg == "--vverbose")
             {
@@ -301,6 +322,13 @@ namespace llaminar2
         std::cout << "                              fp16  - 16-bit float (ARM/GPU)\n";
         std::cout << "                              int32 - 32-bit integer (experimental)\n\n";
 
+        std::cout << "Chat Mode:\n";
+        std::cout << "  --chat                    Interactive chat mode (FTXUI terminal UI)\n";
+        std::cout << "  --chat-single             Single prompt with chat template formatting\n";
+        std::cout << "  --system TEXT             System prompt for chat context\n";
+        std::cout << "  --chat-template TEMPLATE  Override chat template:\n";
+        std::cout << "                              chatml, llama3, llama2, mistral, phi3, gemma, deepseek, etc.\n\n";
+
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";
         std::cout << "  -v, --verbose             Verbose logging (DEBUG level)\n";
@@ -322,6 +350,15 @@ namespace llaminar2
 
         std::cout << "  # Multi-GPU balanced\n";
         std::cout << "  " << prog_name << " -m model.gguf --multi-gpu --gpu-split even\n\n";
+
+        std::cout << "  # Interactive chat mode\n";
+        std::cout << "  " << prog_name << " -m model.gguf --chat\n\n";
+
+        std::cout << "  # Chat with system prompt\n";
+        std::cout << "  " << prog_name << " -m model.gguf --chat --system \"You are a helpful assistant.\"\n\n";
+
+        std::cout << "  # Single-shot with chat template\n";
+        std::cout << "  " << prog_name << " -m model.gguf --chat-single -p \"What is the capital of France?\"\n\n";
     }
 
     bool ArgParser::matchesFlag(const std::string &arg,
