@@ -21,8 +21,9 @@
 
 #include "../PipelineBase.h"
 #include "../TensorDimensions.h"
+#include "../ops/Ops.h"
 #include "../../tensors/BatchedKVCache.h"
-#include "../../kernels/cpu/fused/FusedGEMM.h"
+#include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
 
 namespace llaminar2
 {
@@ -185,6 +186,9 @@ namespace llaminar2
         // Batched KV cache
         std::shared_ptr<BatchedKVCache> kv_cache_batched_;
 
+        // NOTE: Ops are now in PipelineBase (rmsnorm_op_, gemm_op_, etc.)
+        // Child pipelines use the declarative methods: rms_norm(), project(), add_residual(), etc.
+
         // Helper methods for dimension specifications (batch-aware)
         // All tensors treat first dimension as batch_size * padded_seq_len
         TensorSpec spec_hidden(int effective_seq_len) const
@@ -234,6 +238,10 @@ namespace llaminar2
         bool ffn_block(const LayerWeights &layer, int layer_idx, int effective_seq_len);
         bool embedding_batch(const std::vector<std::vector<int>> &token_batches, TensorBase *output);
         bool lm_head_batch(TensorBase *hidden, int effective_seq_len);
+
+        // NOTE: Composite operations (rms_norm, project, add_residual, etc.)
+        // are now provided by PipelineBase. Child pipelines chain them to form
+        // a declarative compute graph.
 
     public:
         /**

@@ -20,7 +20,7 @@
 #include <gtest/gtest.h>
 #include "../../src/v2/tensors/Tensors.h"
 #include "../../src/v2/kernels/cpu/INT8GemmKernel.h"
-#include "../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
+#include "../../src/v2/kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../../src/v2/utils/Logger.h"
 #include <vector>
 #include <cmath>

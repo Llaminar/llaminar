@@ -14,9 +14,9 @@
 
 #pragma once
 
-#include "../../tensors/TensorKernels.h"
-#include "primitives/RoPEPrimitives.h"
-#include "CPUKernelBase.h"
+#include "../../../tensors/TensorKernels.h"
+#include "../primitives/RoPEPrimitives.h"
+#include "../CPUKernelBase.h"
 #include <vector>
 #include <cmath>
 

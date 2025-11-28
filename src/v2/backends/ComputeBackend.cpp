@@ -16,11 +16,11 @@
 #include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/NUMATopology.h"
-#include "../kernels/cpu/CPURoPEKernelT.h"
-#include "../kernels/cpu/CPUSoftmaxKernelT.h"
+#include "../kernels/cpu/ops/CPURoPEKernelT.h"
+#include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
 
-#include "../kernels/cpu/CPURMSNormKernelT.h"
-#include "../kernels/cpu/CPUSwiGLUKernelT.h"
+#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>

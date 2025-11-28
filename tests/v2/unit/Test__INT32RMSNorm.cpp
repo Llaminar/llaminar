@@ -20,7 +20,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
+#include "../../../src/v2/kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../../../src/v2/kernels/cpu/primitives/RMSNormPrimitives.h"
 #include <memory>
 #include <cmath>

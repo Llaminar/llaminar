@@ -16,7 +16,7 @@
 #include <cmath>
 #include <memory>
 
-#include "v2/kernels/cpu/CpuAttentionKernelT.h"
+#include "v2/kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 
 using namespace llaminar2;

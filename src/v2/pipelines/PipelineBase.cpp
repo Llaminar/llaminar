@@ -885,4 +885,181 @@ namespace llaminar2
     }
 #endif // NDEBUG
 
+    // =============================================================================
+    // Declarative Compute Graph Operations
+    // =============================================================================
+
+    bool PipelineBase::rms_norm(
+        TensorBase *input, const TensorBase *gamma, TensorBase *output,
+        int rows, int cols, float eps,
+        const std::string &snapshot_key, int device)
+    {
+        int target_device = (device >= 0) ? device : device_idx_;
+
+        if (!rmsnorm_op_(input, gamma, output, rows, cols, eps,
+                         snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        {
+            return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, rows, cols);
+        return true;
+    }
+
+    bool PipelineBase::project(
+        const TensorBase *input, TensorBase *weight, TensorBase *output,
+        int m, int n, int k,
+        const std::string &snapshot_key, int device)
+    {
+        int target_device = (device >= 0) ? device : device_idx_;
+
+        if (!gemm_op_(input, weight, output, m, n, k,
+                      snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        {
+            return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, m, n);
+        return true;
+    }
+
+    bool PipelineBase::add_residual(
+        const TensorBase *residual, const TensorBase *input, TensorBase *output,
+        int batch_size, int seq_len, int hidden_dim,
+        const std::vector<int> &sequence_lengths,
+        const std::string &snapshot_key)
+    {
+        if (!residual_op_.batched(residual, input, output,
+                                  batch_size, seq_len, hidden_dim,
+                                  sequence_lengths, snapshot_key.c_str()))
+        {
+            return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT(snapshot_key.c_str(), output);
+        return true;
+    }
+
+    bool PipelineBase::swiglu(
+        TensorBase *gate, TensorBase *up, TensorBase *output,
+        int rows, int cols,
+        const std::string &snapshot_key, int device)
+    {
+        int target_device = (device >= 0) ? device : device_idx_;
+
+        if (!swiglu_op_(gate, up, output, rows, cols,
+                        snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        {
+            return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, rows, cols);
+        return true;
+    }
+
+    bool PipelineBase::apply_rope(
+        TensorBase *Q, TensorBase *K,
+        const int *position_ids,
+        int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        float theta,
+        const std::string &snapshot_prefix, int device)
+    {
+        int target_device = (device >= 0) ? device : device_idx_;
+
+        if (!rope_op_(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
+                      snapshot_prefix.c_str(), mpi_ctx_.get(), target_device))
+        {
+            return false;
+        }
+
+        // Capture snapshots for Q and K after RoPE
+        CAPTURE_SNAPSHOT_VIEW((snapshot_prefix + "_Q_ROPE").c_str(), Q, seq_len, n_heads * head_dim);
+        CAPTURE_SNAPSHOT_VIEW((snapshot_prefix + "_K_ROPE").c_str(), K, seq_len, n_kv_heads * head_dim);
+        return true;
+    }
+
+    bool PipelineBase::copy_tensor(const TensorBase *src, TensorBase *dst, size_t num_elements)
+    {
+        if (!src || !dst)
+        {
+            LOG_ERROR("copy_tensor: null tensor");
+            return false;
+        }
+        if (!src->data() || !dst->mutable_data())
+        {
+            LOG_ERROR("copy_tensor: null data pointer");
+            return false;
+        }
+
+        std::memcpy(dst->mutable_data(), src->data(), num_elements * sizeof(float));
+        return true;
+    }
+
+    bool PipelineBase::save_residual(const TensorBase *input, TensorBase *residual_buffer, int seq_len, int hidden_dim)
+    {
+        return copy_tensor(input, residual_buffer, static_cast<size_t>(seq_len) * hidden_dim);
+    }
+
+    bool PipelineBase::compute_attention(
+        TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+        int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        int batch_size, const std::vector<int> &sequence_lengths, int padded_seq_len,
+        bool causal, const std::string &snapshot_key)
+    {
+        // Create views with actual effective_seq_len
+        auto Q_view = Q->create_view({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+        auto K_view = K->create_view({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+        auto V_view = V->create_view({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+        auto out_view = output->create_view({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+
+        if (!Q_view || !K_view || !V_view || !out_view)
+        {
+            LOG_ERROR("compute_attention: failed to create tensor views");
+            return false;
+        }
+
+        // Determine if we need padding mask
+        const std::vector<int> *seq_lens_ptr = nullptr;
+        if (batch_size > 1)
+        {
+            bool has_padding = false;
+            for (int b = 0; b < batch_size; ++b)
+            {
+                if (sequence_lengths[b] < padded_seq_len)
+                {
+                    has_padding = true;
+                    break;
+                }
+            }
+            if (has_padding)
+            {
+                seq_lens_ptr = &sequence_lengths;
+            }
+        }
+
+        // Execute attention
+        if (!attention_gqa_mpi(
+                Q_view.get(), K_view.get(), V_view.get(), out_view.get(),
+                n_heads, n_kv_heads, head_dim,
+                causal, /*window_size=*/-1,
+                batch_size, seq_lens_ptr))
+        {
+            LOG_ERROR("compute_attention: attention_gqa_mpi failed");
+            return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, seq_len, n_heads * head_dim);
+        return true;
+    }
+
+    void PipelineBase::capture_snapshot(const std::string &key, TensorBase *tensor, int rows, int cols)
+    {
+        CAPTURE_SNAPSHOT_VIEW(key.c_str(), tensor, rows, cols);
+    }
+
 } // namespace llaminar2

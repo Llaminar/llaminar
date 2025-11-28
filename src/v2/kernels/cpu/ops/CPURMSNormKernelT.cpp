@@ -6,8 +6,8 @@
  */
 
 #include "CPURMSNormKernelT.h"
-#include "primitives/RMSNormPrimitives.h"
-#include "../../tensors/Tensors.h"
+#include "../primitives/RMSNormPrimitives.h"
+#include "../../../tensors/Tensors.h"
 #include <cmath>
 #include <type_traits>
 

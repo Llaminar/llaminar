@@ -25,7 +25,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CPURMSNormKernelT.h"
+#include "kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

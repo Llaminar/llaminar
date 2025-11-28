@@ -332,6 +332,216 @@ bool ok = gemm->multiply_activations(
 
 The pipeline does **no backend-specific logic**. The tensor + kernel implementation decide how to map this onto oneDNN/OpenBLAS/quantized kernels.
 
+### 6.3 Pipeline Operations (Ops Layer)
+
+Location: `src/v2/pipelines/ops/`
+
+Pipeline operations encapsulate the **validate-execute-capture** pattern that repeats throughout pipelines:
+
+1. Validate inputs (null checks, dimension checks)
+2. Create kernel (from appropriate tensor interface)
+3. Execute kernel (with error handling)
+4. Capture snapshot (if enabled for E2E testing)
+
+**Available Operations:**
+
+| Op Class | Purpose | Key Method |
+|----------|---------|------------|
+| `RMSNormOp` | RMS normalization (pre-attention, pre-FFN, final) | `operator()(input, weight, output, rows, cols, eps, snapshot, mpi, device)` |
+| `GemmOp` | Weight projections (Q/K/V, output, FFN) | `operator()(A, W, C, m, n, k, snapshot, mpi, device)` |
+| `GemmOp::activations` | Activation matmul (attention scores) | `activations(A, B, C, m, n, k, transpose, alpha, beta, snapshot, mpi, device)` |
+| `SwiGLUOp` | SwiGLU activation (FFN) | `operator()(gate, up, output, rows, cols, snapshot, mpi, device)` |
+| `RoPEOp` | Rotary position embeddings | `operator()(Q, K, positions, seq_len, heads, kv_heads, dim, theta, prefix, mpi, device)` |
+| `ResidualOp` | Residual connections | `operator()(residual, input, output, rows, cols, snapshot)` |
+| `ResidualOp::batched` | Batched residual with padding mask | `batched(residual, input, output, batch, seq, cols, lengths, snapshot)` |
+
+### 6.4 PipelineBase Composite Operations
+
+Location: `src/v2/pipelines/PipelineBase.h` (lines 880-1045)
+
+**Design Philosophy**: Ops are private members of `PipelineBase`, exposed through high-level **composite operations** that encapsulate device placement, MPI context, snapshot capture, and validation. This makes child pipelines read like **declarative compute graphs**.
+
+**Composite Operations in PipelineBase:**
+
+| Method | Purpose | Internal Op |
+|--------|---------|-------------|
+| `rms_norm()` | RMSNorm with snapshot | `rmsnorm_op_` |
+| `project()` | Weight projection (GEMM) with snapshot | `gemm_op_` |
+| `add_residual()` | Batch-aware residual connection | `residual_op_` |
+| `swiglu()` | SwiGLU activation with snapshot | `swiglu_op_` |
+| `apply_rope()` | RoPE to Q/K with snapshots | `rope_op_` |
+| `compute_attention()` | GQA attention with snapshot | Direct kernel call |
+| `save_residual()` | Copy tensor for residual | memcpy wrapper |
+| `capture_snapshot()` | Manual snapshot capture | Direct macro call |
+
+**PipelineBase Private Members:**
+
+```cpp
+class PipelineBase {
+private:
+    // Reusable operations (stateless, self-validating)
+    RMSNormOp rmsnorm_op_;
+    GemmOp gemm_op_;
+    SwiGLUOp swiglu_op_;
+    RoPEOp rope_op_;
+    ResidualOp residual_op_;
+
+protected:
+    // High-level composite operations for child pipelines
+    bool rms_norm(TensorBase* input, const TensorBase* gamma, TensorBase* output,
+                  int rows, int cols, float eps,
+                  const std::string& snapshot_key, int device = -1);
+
+    bool project(const TensorBase* input, TensorBase* weight, TensorBase* output,
+                 int m, int n, int k,
+                 const std::string& snapshot_key, int device = -1);
+
+    bool add_residual(const TensorBase* residual, const TensorBase* input, TensorBase* output,
+                      int batch_size, int seq_len, int hidden_dim,
+                      const std::vector<int>& sequence_lengths,
+                      const std::string& snapshot_key);
+
+    bool swiglu(TensorBase* gate, TensorBase* up, TensorBase* output,
+                int rows, int cols,
+                const std::string& snapshot_key, int device = -1);
+
+    bool apply_rope(TensorBase* Q, TensorBase* K, const int* position_ids,
+                    int seq_len, int n_heads, int n_kv_heads, int head_dim,
+                    float theta, const std::string& snapshot_prefix, int device = -1);
+
+    bool compute_attention(TensorBase* Q, TensorBase* K, TensorBase* V, TensorBase* output,
+                           int seq_len, int n_heads, int n_kv_heads, int head_dim,
+                           int batch_size, const std::vector<int>& sequence_lengths,
+                           int padded_seq_len, bool causal, const std::string& snapshot_key);
+
+    bool save_residual(const TensorBase* input, TensorBase* residual_buffer,
+                       int seq_len, int hidden_dim);
+
+    void capture_snapshot(const std::string& key, TensorBase* tensor, int rows, int cols);
+};
+```
+
+### 6.5 Fused Kernels
+
+Location: `src/v2/kernels/cpu/fused/`
+
+Fused kernels optimize multi-projection patterns by quantizing activations once:
+
+**FusedGEMM** (`FusedGEMM.h`):
+- Fuses N GEMM projections with shared activation quantization
+- Use cases: FFN gate/up (2 GEMMs), Attention Q/K/V (3 GEMMs)
+- Performance: Saves N-1 activation quantization passes, better cache locality
+
+```cpp
+// FFN: Gate/Up fused (2 projections)
+layer.gate_up_fused = std::make_unique<FusedGEMM>(
+    layer.gate_proj.get(), layer.up_proj.get());
+
+layer.gate_up_fused->execute(
+    normalized->data(),
+    {{gate->mutable_data(), nullptr, d_ff, "gate"},
+     {up->mutable_data(), nullptr, d_ff, "up", nullptr, false}},
+    seq_len, d_model, mpi_ctx, device);
+
+// Attention: Q/K/V fused (3 projections)
+layer.qkv_fused = std::make_unique<FusedGEMM>(
+    layer.wq.get(), layer.wk.get(), layer.wv.get());
+
+layer.qkv_fused->execute(
+    normalized->data(),
+    Q->mutable_data(), K->mutable_data(), V->mutable_data(),
+    nullptr, nullptr, nullptr,  // biases
+    seq_len,
+    n_heads * head_dim, n_kv_heads * head_dim, n_kv_heads * head_dim,
+    d_model, mpi_ctx, device);
+```
+
+### 6.6 Declarative Pipeline Pattern
+
+With composite operations in PipelineBase, child pipelines now read like **declarative compute graphs**:
+
+```cpp
+bool Qwen2Pipeline::attention_block(const LayerWeights& layer, int layer_idx, int seq_len) {
+    auto& buffers = activation_buffers_;
+    std::string prefix = "layer" + std::to_string(layer_idx);
+
+    // Save residual for later
+    TRY_OP(save_residual(input_hidden, buffers.residual.get(), seq_len, d_model_));
+
+    // 1. Pre-attention RMSNorm
+    TRY_OP(rms_norm(buffers.residual.get(), layer.attn_norm.get(), buffers.normalized.get(),
+                    seq_len, d_model_, 1e-6f, prefix + "_ATTENTION_NORM", device));
+
+    // 2. Fused Q/K/V projections
+    VALIDATE_OP(layer.qkv_fused->execute(...), "Fused Q/K/V projection");
+
+    // Capture Q/K/V
+    capture_snapshot(prefix + "_Q_PROJECTION", buffers.Q.get(), seq_len, n_heads_ * head_dim_);
+    capture_snapshot(prefix + "_K_PROJECTION", buffers.K.get(), seq_len, n_kv_heads_ * head_dim_);
+    capture_snapshot(prefix + "_V_PROJECTION", buffers.V.get(), seq_len, n_kv_heads_ * head_dim_);
+
+    // 3. RoPE
+    TRY_OP(apply_rope(buffers.Q.get(), buffers.K.get(), position_ids.data(),
+                      seq_len, n_heads_, n_kv_heads_, head_dim_,
+                      rope_theta_, prefix, device));
+
+    // 4. GQA attention
+    TRY_OP(compute_attention(buffers.Q.get(), buffers.K.get(), buffers.V.get(),
+                             buffers.attn_output.get(), seq_len, n_heads_, n_kv_heads_,
+                             head_dim_, batch_size_, sequence_lengths_, padded_seq_len_,
+                             false, prefix + "_ATTENTION_CONTEXT"));
+
+    // 5. Output projection
+    TRY_OP(project(buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
+                   seq_len, d_model_, n_heads_ * head_dim_,
+                   prefix + "_ATTENTION_OUTPUT", device));
+
+    // 6. Residual
+    TRY_OP(add_residual(buffers.residual.get(), buffers.attn_proj.get(), current_hidden_.get(),
+                        batch_size_, padded_seq_len_, d_model_, sequence_lengths_,
+                        prefix + "_ATTENTION_RESIDUAL"));
+
+    return true;
+}
+
+bool Qwen2Pipeline::ffn_block(const LayerWeights& layer, int layer_idx, int seq_len) {
+    std::string prefix = "layer" + std::to_string(layer_idx);
+
+    TRY_OP(save_residual(input, buffers.residual.get(), seq_len, d_model_));
+
+    // 1. Pre-FFN RMSNorm
+    TRY_OP(rms_norm(buffers.residual.get(), layer.ffn_norm.get(), buffers.normalized.get(),
+                    seq_len, d_model_, 1e-6f, prefix + "_FFN_NORM", device));
+
+    // 2. Fused Gate/Up
+    VALIDATE_OP(layer.gate_up_fused->execute(...), "Fused Gate/Up projection");
+    capture_snapshot(prefix + "_FFN_GATE", buffers.gate.get(), seq_len, d_ff_);
+    capture_snapshot(prefix + "_FFN_UP", buffers.up.get(), seq_len, d_ff_);
+
+    // 3. SwiGLU
+    TRY_OP(swiglu(buffers.gate.get(), buffers.up.get(), buffers.up.get(),
+                  seq_len, d_ff_, prefix + "_FFN_SWIGLU", device));
+
+    // 4. Down projection
+    TRY_OP(project(buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
+                   seq_len, d_model_, d_ff_, prefix + "_FFN_DOWN", device));
+
+    // 5. Residual
+    TRY_OP(add_residual(buffers.residual.get(), buffers.ffn_output.get(), current_hidden_.get(),
+                        batch_size_, padded_seq_len_, d_model_, sequence_lengths_,
+                        prefix + "_FFN_RESIDUAL"));
+
+    return true;
+}
+```
+
+**Benefits:**
+- **~50 lines per block** vs ~150+ lines with manual validation/capture
+- **Self-documenting**: Each step is clearly named
+- **Reusable**: Same patterns work across Qwen2/Qwen3/MoE
+- **Testable**: Ops can be unit tested in isolation
+- **Snapshot capture built-in**: Every operation captures its output
+
 ---
 
 ## 7. Execution Modes and Testing
@@ -733,25 +943,41 @@ When you need to work on V2:
 1. **Find the right layer:**
    - Tensors / quantization → `src/v2/tensors/`
    - Kernels (GEMM, attention) → `src/v2/kernels/`
+   - Fused kernels (FusedGEMM) → `src/v2/kernels/cpu/fused/`
+   - Operations (Ops layer) → `src/v2/pipelines/ops/`
    - MPI + attention routing → `src/v2/pipelines/attention/`
-   - Pipelines → `src/v2/pipelines/`
+   - Pipeline base class → `src/v2/pipelines/PipelineBase.{h,cpp}`
+   - Model pipelines → `src/v2/pipelines/qwen/Qwen2Pipeline.cpp`
 
-2. **Use the interfaces:**
-   - Always go through `createGemm()`, `createAttention()`, etc. instead of instantiating kernels directly.
-   - When dealing with attention, prefer going through `GQAAttention` or a future attention front-end, unless you are explicitly refactoring that abstraction.
+2. **Understand the operation hierarchy:**
+   - **Ops** (`src/v2/pipelines/ops/`) – Low-level, stateless operations (RMSNormOp, GemmOp, etc.)
+   - **PipelineBase composite methods** – High-level wrappers (rms_norm, project, swiglu, etc.)
+   - **Fused kernels** – Multi-projection optimizations (FusedGEMM for Q/K/V, gate/up)
+   - **Child pipelines** – Model-specific orchestration using PipelineBase methods
 
-3. **Keep MPI out of kernels:**
+3. **Use the composite operations:**
+   - Child pipelines (Qwen2Pipeline) should use PipelineBase methods (`rms_norm()`, `project()`, etc.)
+   - These handle device placement, MPI context, snapshot capture, and validation
+   - Use `TRY_OP()` macro for clean chaining
+
+4. **Use fused kernels where applicable:**
+   - `FusedGEMM` for Q/K/V projections (3 GEMMs sharing activation quantization)
+   - `FusedGEMM` for gate/up projections (2 GEMMs sharing activation quantization)
+   - Fused kernels are created lazily on first use, stored in LayerWeights
+
+5. **Keep MPI out of kernels:**
    - MPI must live in orchestrators + `MPIContext`, not in `CpuAttentionKernelT` or GEMM kernels.
 
-4. **Add tests:**
+6. **Add tests:**
    - For any new feature or significant refactor, add or adjust unit tests in `tests/v2/unit/` and run the relevant suites.
 
-5. **Debug with snapshots:**
+7. **Debug with snapshots:**
    - When encountering numerical divergence or parity failures, use E2ERelease build with `enableSnapshotCapture()`
    - Compare layer-by-layer to identify first diverging operation
+   - Use `capture_snapshot()` in PipelineBase for manual captures
    - See Section 9 for complete snapshot system documentation
 
-6. **Document decisions:**
-   - If you change architectural boundaries (e.g. how attention is split between kernels vs front-ends vs orchestrators), update this file and any relevant `.md` plans under `.github/instructions/` and `docs/`.
+8. **Document decisions:**
+   - If you change architectural boundaries (e.g. how operations are layered, how fused kernels work), update this file and any relevant `.md` plans under `.github/instructions/` and `docs/`.
 
 This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. If you keep those boundaries sharp, V2 remains easy to extend and reason about—even with advanced attention types and heterogeneous backends.

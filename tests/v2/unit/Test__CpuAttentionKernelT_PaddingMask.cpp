@@ -18,7 +18,7 @@
 #include <iostream>
 #include <iomanip>
 
-#include "v2/kernels/cpu/CpuAttentionKernelT.h"
+#include "v2/kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/pipelines/AttentionUtils.h"
 

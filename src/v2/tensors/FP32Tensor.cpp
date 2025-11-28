@@ -12,12 +12,12 @@
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/CPUSoftmaxKernelT.h"
-#include "../kernels/cpu/CPURMSNormKernelT.h"
+#include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
+#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
-#include "../kernels/cpu/CPUSwiGLUKernelT.h"
-#include "../kernels/cpu/CpuAttentionKernelT.h"
-#include "../kernels/cpu/CPURoPEKernelT.h"
+#include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
+#include "../kernels/cpu/attention/CpuAttentionKernelT.h"
+#include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include <cstring>
 #include <stdexcept>
 #include <iostream>

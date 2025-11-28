@@ -1229,6 +1229,33 @@ add_v2_test(V2_Integration_ModelLoader
     LABELS "V2;Integration;ModelLoading;GGUF;WeightLoading"
 )
 
+# Test: QuantisedGemmKernel Fused Operations (Bias, Softmax, SwiGLU)
+# Validates mathematical correctness of fused ops against separate primitives
+add_executable(v2_integration_quantised_gemm_fused integration/Test__QuantisedGemmFused.cpp)
+target_link_libraries(v2_integration_quantised_gemm_fused 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_QuantisedGemmFused 
+    COMMAND $<TARGET_FILE:v2_integration_quantised_gemm_fused>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;GEMM;FusedOps;Softmax;SwiGLU;Bias;Correctness"
+)
+
+# Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
+# Large matrices, mixed precision, strided layouts, fused softmax, causal masking
+add_executable(v2_integration_fp_gemm integration/Test__FloatingPointGemmKernel.cpp)
+target_link_libraries(v2_integration_fp_gemm
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_FloatingPointGemmKernel
+    COMMAND $<TARGET_FILE:v2_integration_fp_gemm>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;GEMM;FP32;BF16;FP16;OneDNN;Softmax;Attention;MixedPrecision"
+)
+
 # Test: IQ4_NL Tensor GEMM
 add_executable(v2_test_iq4nl_tensor unit/tensors/Test__IQ4_NLTensor.cpp)
 target_link_libraries(v2_test_iq4nl_tensor 
@@ -1379,7 +1406,7 @@ add_v2_test(V2_Unit_IQ4_XSTensor
 # Only build for Debug or E2ERelease configurations (requires ENABLE_PIPELINE_SNAPSHOTS)
 if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
     add_executable(v2_test_qwen2_mpi_rank_parity 
-        e2e/Test__Qwen2MPIRankParity.cpp
+        e2e/qwen2/Test__Qwen2MPIRankParity.cpp
         e2e/gtest_mpi_main.cpp
     )
     target_link_libraries(v2_test_qwen2_mpi_rank_parity llaminar2_core GTest::gtest MPI::MPI_CXX)
@@ -1412,7 +1439,7 @@ if(ZLIB_FOUND)
     # Skip in standard Release builds to avoid linking errors
     if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
         add_executable(v2_test_qwen2_fp32_parity 
-            e2e/Test__Qwen2FP32Parity.cpp
+            e2e/qwen2/Test__Qwen2FP32Parity.cpp
             ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
         )
         target_link_libraries(v2_test_qwen2_fp32_parity 

@@ -3,7 +3,7 @@
  * @brief Unit tests for CPUSwiGLUKernelT class
  */
 
-#include "kernels/cpu/CPUSwiGLUKernelT.h"
+#include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/SIMDHelpers.h"

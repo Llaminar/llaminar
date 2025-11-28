@@ -7,7 +7,7 @@
 
 #include "Tensors.h"
 #include "../kernels/cpu/fused/FusedRMSNormQuantize.h"
-#include "../kernels/cpu/fused/FusedGEMM.h"
+#include "../kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "../utils/Logger.h"
 // #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>

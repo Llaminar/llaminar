@@ -10,8 +10,8 @@
 
 #pragma once
 
-#include "../../tensors/TensorKernels.h"
-#include "CPUKernelBase.h"
+#include "../../../tensors/TensorKernels.h"
+#include "../CPUKernelBase.h"
 
 namespace llaminar2
 {

@@ -37,9 +37,9 @@
 #include <unordered_map>
 #include <iomanip>
 
-#include "../../../src/v2/loaders/ModelContext.h"
-#include "../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
-#include "../../../src/v2/utils/Logger.h"
+#include "../../../../src/v2/loaders/ModelContext.h"
+#include "../../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
+#include "../../../../src/v2/utils/Logger.h"
 
 // NumPy .npz file loading (simple C++ implementation)
 #include <cnpy.h>

@@ -7,9 +7,9 @@
 
 #pragma once
 
-#include "../../tensors/TensorKernels.h"
-#include "primitives/SoftmaxPrimitives_New.h"
-#include "CPUKernelBase.h"
+#include "../../../tensors/TensorKernels.h"
+#include "../primitives/SoftmaxPrimitives_New.h"
+#include "../CPUKernelBase.h"
 
 namespace llaminar2
 {

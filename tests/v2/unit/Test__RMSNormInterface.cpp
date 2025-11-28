@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "v2/kernels/cpu/CPURMSNormKernelT.h"
+#include "v2/kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "v2/tensors/Tensors.h"
 #include <vector>
 #include <cmath>

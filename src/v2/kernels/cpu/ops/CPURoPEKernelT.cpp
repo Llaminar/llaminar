@@ -6,10 +6,10 @@
  */
 
 #include "CPURoPEKernelT.h"
-#include "primitives/RoPEPrimitives.h"
-#include "../../tensors/SIMDHelpers.h"
-#include "../../tensors/FP16Utils.h"
-#include "../../tensors/Tensors.h"
+#include "../primitives/RoPEPrimitives.h"
+#include "../../../tensors/SIMDHelpers.h"
+#include "../../../tensors/FP16Utils.h"
+#include "../../../tensors/Tensors.h"
 #include <cmath>
 #include <cstring>
 #include <unordered_map>

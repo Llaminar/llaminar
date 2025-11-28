@@ -25,7 +25,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/CPURoPEKernelT.h"
+#include "kernels/cpu/ops/CPURoPEKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

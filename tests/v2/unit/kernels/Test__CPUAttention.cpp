@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/kernels/cpu/CpuAttentionKernelT.h"
+#include "../../../../src/v2/kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "../../../../src/v2/tensors/Tensors.h"
 #include <memory>
 #include <vector>

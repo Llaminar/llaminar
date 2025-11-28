@@ -29,10 +29,10 @@
 #include <cmath>
 #include <cstring>
 
-#include "../../../src/v2/loaders/ModelContext.h"
-#include "../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
-#include "../../../src/v2/utils/MPIContext.h"
-#include "../../../src/v2/utils/Logger.h"
+#include "../../../../src/v2/loaders/ModelContext.h"
+#include "../../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
+#include "../../../../src/v2/utils/MPIContext.h"
+#include "../../../../src/v2/utils/Logger.h"
 
 using namespace llaminar2;
 

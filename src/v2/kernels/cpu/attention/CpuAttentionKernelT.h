@@ -16,14 +16,14 @@
 
 #pragma once
 
-#include "../../tensors/TensorKernels.h"
-#include "../../tensors/Tensors.h"
-#include "../../tensors/SIMDHelpers.h"
-#include "CPUKernelBase.h"
-#include "primitives/ActivationTraits.h"
-#include "primitives/SoftmaxPrimitivesImpl.h"
-#include "../../pipelines/AttentionUtils.h"
-#include "../../utils/Logger.h"
+#include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/Tensors.h"
+#include "../../../tensors/SIMDHelpers.h"
+#include "../CPUKernelBase.h"
+#include "../primitives/ActivationTraits.h"
+#include "../primitives/SoftmaxPrimitivesImpl.h"
+#include "../../../pipelines/AttentionUtils.h"
+#include "../../../utils/Logger.h"
 #include <memory>
 #include <vector>
 #include <cstring>

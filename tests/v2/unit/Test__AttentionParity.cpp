@@ -20,7 +20,7 @@
 #include <algorithm>
 #include "pipelines/attention/MpiAttentionOrchestrator.h"
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CPURoPEKernelT.h"
+#include "kernels/cpu/ops/CPURoPEKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

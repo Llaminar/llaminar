@@ -14,10 +14,10 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
-#include "../../src/v2/kernels/cpu/CPURoPEKernelT.h"
-#include "../../src/v2/kernels/cpu/CPUSwiGLUKernelT.h"
-#include "../../src/v2/kernels/cpu/CPUSoftmaxKernelT.h"
+#include "../../src/v2/kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../../src/v2/kernels/cpu/ops/CPURoPEKernelT.h"
+#include "../../src/v2/kernels/cpu/ops/CPUSwiGLUKernelT.h"
+#include "../../src/v2/kernels/cpu/ops/CPUSoftmaxKernelT.h"
 
 #include "../../src/v2/tensors/Tensors.h"
 #include "../../src/v2/utils/MPIContext.h"

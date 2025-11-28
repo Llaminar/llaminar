@@ -3,7 +3,7 @@
  * @brief Unit tests for CPURoPEKernelT class
  */
 
-#include "kernels/cpu/CPURoPEKernelT.h"
+#include "kernels/cpu/ops/CPURoPEKernelT.h"
 #include "tensors/Tensors.h"
 #include <gtest/gtest.h>
 #include <vector>

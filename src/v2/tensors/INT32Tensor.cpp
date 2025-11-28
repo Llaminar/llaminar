@@ -7,8 +7,8 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
-#include "../kernels/cpu/CPURMSNormKernelT.h"
-#include "../kernels/cpu/CpuAttentionKernelT.h"
+#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>

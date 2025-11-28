@@ -24,7 +24,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CpuAttentionKernelT.h"
+#include "kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

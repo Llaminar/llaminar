@@ -25,6 +25,7 @@
 #include "../tensors/KVCache.h" // KV cache for autoregressive decode
 #include "PipelineConfig.h"     // Runtime configuration
 #include "MPIStrategy.h"        // MPI parallelization strategies
+#include "ops/Ops.h"            // Self-validating operations
 #include <vector>
 #include <memory>
 #include <string>
@@ -860,6 +861,188 @@ namespace llaminar2
             // Compiler optimizes away the entire function call
         }
 
+        // =============================================================================
+        // Declarative Compute Graph Operations
+        // =============================================================================
+        //
+        // These high-level operations encapsulate the common patterns:
+        //   - Device placement (from placement_map_)
+        //   - MPI context (from mpi_ctx_)
+        //   - Snapshot capture (CAPTURE_SNAPSHOT macros)
+        //   - Validation (VALIDATE_TENSOR macros)
+        //
+        // Child pipelines chain these to form a declarative compute graph.
+        // All complexity is pushed up to PipelineBase.
+        //
+        // Example usage in Qwen2Pipeline::attention_block():
+        //   TRY_OP(rms_norm(input, gamma, output, seq_len, d_model, eps, "layer0_ATTENTION_NORM"));
+        //   TRY_OP(project(normalized, W_q, Q, seq_len, q_dim, d_model, "layer0_Q_PROJECTION"));
+        //   TRY_OP(add_residual(residual, attn_out, hidden, "layer0_ATTENTION_RESIDUAL"));
+
+        /**
+         * @brief RMSNorm with snapshot capture and validation
+         *
+         * @param input Input tensor
+         * @param gamma Normalization weights [hidden_dim]
+         * @param output Output tensor (can be same as input for in-place)
+         * @param rows Number of rows (sequence length)
+         * @param cols Number of columns (hidden dimension)
+         * @param eps Epsilon for numerical stability
+         * @param snapshot_key Snapshot identifier for parity testing
+         * @param device Target device (-1 to use current device)
+         * @return true on success
+         */
+        bool rms_norm(
+            TensorBase *input, const TensorBase *gamma, TensorBase *output,
+            int rows, int cols, float eps,
+            const std::string &snapshot_key, int device = -1);
+
+        /**
+         * @brief Weight projection (GEMM) with snapshot capture and validation
+         *
+         * Computes: output = input @ weight^T
+         *
+         * @param input Activation tensor [m, k]
+         * @param weight Weight tensor [n, k]
+         * @param output Output tensor [m, n]
+         * @param m Number of rows (sequence length)
+         * @param n Output dimension
+         * @param k Input dimension
+         * @param snapshot_key Snapshot identifier for parity testing
+         * @param device Target device (-1 to use current device)
+         * @return true on success
+         */
+        bool project(
+            const TensorBase *input, TensorBase *weight, TensorBase *output,
+            int m, int n, int k,
+            const std::string &snapshot_key, int device = -1);
+
+        /**
+         * @brief Residual connection with snapshot capture (batch-aware, padding-safe)
+         *
+         * Computes: output = residual + input (with padding zeroing)
+         *
+         * @param residual Saved residual tensor
+         * @param input Current activation to add
+         * @param output Output tensor
+         * @param batch_size Number of sequences in batch
+         * @param seq_len Padded sequence length
+         * @param hidden_dim Hidden dimension
+         * @param sequence_lengths Actual lengths per sequence (for padding)
+         * @param snapshot_key Snapshot identifier for parity testing
+         * @return true on success
+         */
+        bool add_residual(
+            const TensorBase *residual, const TensorBase *input, TensorBase *output,
+            int batch_size, int seq_len, int hidden_dim,
+            const std::vector<int> &sequence_lengths,
+            const std::string &snapshot_key);
+
+        /**
+         * @brief SwiGLU activation with snapshot capture
+         *
+         * Computes: output = gate * silu(up)
+         *
+         * @param gate Gate projection output
+         * @param up Up projection output (silu applied to this)
+         * @param output Output tensor (can reuse up buffer)
+         * @param rows Number of rows
+         * @param cols Number of columns (d_ff)
+         * @param snapshot_key Snapshot identifier for parity testing
+         * @param device Target device
+         * @return true on success
+         */
+        bool swiglu(
+            TensorBase *gate, TensorBase *up, TensorBase *output,
+            int rows, int cols,
+            const std::string &snapshot_key, int device = -1);
+
+        /**
+         * @brief RoPE (Rotary Position Embedding) with snapshot capture
+         *
+         * Applies RoPE to Q and K tensors in-place.
+         *
+         * @param Q Query tensor (modified in-place)
+         * @param K Key tensor (modified in-place)
+         * @param position_ids Position IDs for each token
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param theta RoPE theta parameter
+         * @param snapshot_prefix Prefix for snapshot keys (e.g., "layer0")
+         * @param device Target device
+         * @return true on success
+         */
+        bool apply_rope(
+            TensorBase *Q, TensorBase *K,
+            const int *position_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float theta,
+            const std::string &snapshot_prefix, int device = -1);
+
+        /**
+         * @brief Copy tensor data (for saving residual)
+         *
+         * @param src Source tensor
+         * @param dst Destination tensor
+         * @param num_elements Number of elements to copy
+         * @return true on success
+         */
+        bool copy_tensor(const TensorBase *src, TensorBase *dst, size_t num_elements);
+
+        /**
+         * @brief Save residual for later addition
+         *
+         * Convenience wrapper for copy_tensor with common pattern.
+         *
+         * @param input Input tensor to copy from
+         * @param residual_buffer Buffer to copy to
+         * @param seq_len Sequence length
+         * @param hidden_dim Hidden dimension
+         * @return true on success
+         */
+        bool save_residual(const TensorBase *input, TensorBase *residual_buffer, int seq_len, int hidden_dim);
+
+        /**
+         * @brief GQA attention with view creation and snapshot capture
+         *
+         * Handles view creation, attention computation, and snapshot capture.
+         * This is the high-level attention interface for pipelines.
+         *
+         * @param Q Query buffer [seq_len, n_heads * head_dim]
+         * @param K Key buffer [seq_len, n_kv_heads * head_dim]
+         * @param V Value buffer [seq_len, n_kv_heads * head_dim]
+         * @param output Output buffer [seq_len, n_heads * head_dim]
+         * @param seq_len Effective sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param batch_size Batch size
+         * @param sequence_lengths Actual sequence lengths (for padding mask)
+         * @param padded_seq_len Padded sequence length
+         * @param causal Whether to use causal masking
+         * @param snapshot_key Snapshot key for attention context output
+         * @return true on success
+         */
+        bool compute_attention(
+            TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            int batch_size, const std::vector<int> &sequence_lengths, int padded_seq_len,
+            bool causal, const std::string &snapshot_key);
+
+        /**
+         * @brief Capture a snapshot of a tensor view
+         *
+         * Helper for manual snapshot capture when needed.
+         *
+         * @param key Snapshot key
+         * @param tensor Tensor to capture
+         * @param rows Number of rows in view
+         * @param cols Number of columns in view
+         */
+        void capture_snapshot(const std::string &key, TensorBase *tensor, int rows, int cols);
+
     private:
         // ===== Snapshot Storage (for parity testing / debugging) =====
         // Only exists in test builds (ENABLE_PIPELINE_SNAPSHOTS defined)
@@ -869,6 +1052,14 @@ namespace llaminar2
         std::string snapshot_output_dir_;                     // Optional directory for saving
         std::map<std::string, std::vector<float>> snapshots_; // In-memory snapshot storage
 #endif
+
+        // ===== Reusable Operations (stateless, self-validating) =====
+        // These are used by the declarative compute graph methods above
+        RMSNormOp rmsnorm_op_;
+        GemmOp gemm_op_;
+        SwiGLUOp swiglu_op_;
+        RoPEOp rope_op_;
+        ResidualOp residual_op_;
     };
 
 } // namespace llaminar2

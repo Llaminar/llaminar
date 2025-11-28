@@ -515,15 +515,14 @@ add_library(llaminar2_core STATIC
     # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm_v4 (OneDNN) remains
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
     # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
-    kernels/cpu/CPURoPEKernelT.cpp
-    kernels/cpu/CPURMSNormKernelT.cpp
-    kernels/cpu/CPUSoftmaxKernelT.cpp
-
-    kernels/cpu/CPUSwiGLUKernelT.cpp
-    kernels/cpu/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
+    kernels/cpu/ops/CPURoPEKernelT.cpp
+    kernels/cpu/ops/CPURMSNormKernelT.cpp
+    kernels/cpu/ops/CPUSoftmaxKernelT.cpp
+    kernels/cpu/ops/CPUSwiGLUKernelT.cpp
+    kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     # Fused kernels (operator fusion framework)
     kernels/cpu/fused/FusedRMSNormQuantize.cpp  # Phase 1: RMSNorm + INT8 quantization
-    kernels/cpu/fused/FusedGEMM.cpp             # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
+    kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     kernels/cpu/fused/FusedDequantSwiGLU.cpp    # Phase 2: Dequant + SwiGLU activation
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "kernels/cpu/CpuAttentionKernelT.h"
+#include "kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "tensors/Tensors.h"
 #include <cmath>
 #include <vector>

@@ -6,8 +6,8 @@
  */
 
 #include "CPUSwiGLUKernelT.h"
-#include "primitives/SwiGLUPrimitives.h"
-#include "../../tensors/Tensors.h"
+#include "../primitives/SwiGLUPrimitives.h"
+#include "../../../tensors/Tensors.h"
 #include <cmath>
 #include <omp.h>
 #include <type_traits>

@@ -19,7 +19,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
-#include "kernels/cpu/CPUSwiGLUKernelT.h"
+#include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

@@ -18,7 +18,7 @@
 #include <random>
 #include <memory>
 
-#include "kernels/cpu/fused/FusedGEMM.h"
+#include "kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "tensors/Tensors.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/FP16Utils.h"

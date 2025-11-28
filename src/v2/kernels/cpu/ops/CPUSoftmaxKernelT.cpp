@@ -6,7 +6,7 @@
  */
 
 #include "CPUSoftmaxKernelT.h"
-#include "../../tensors/Tensors.h"
+#include "../../../tensors/Tensors.h"
 #include <omp.h>
 #include <cstring>
 
