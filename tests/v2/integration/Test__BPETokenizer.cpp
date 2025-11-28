@@ -354,7 +354,7 @@ namespace
     // Performance Tests (Optional - can be slow)
     // =============================================================================
 
-    TEST_F(BPETokenizerTest, DISABLED_PerformanceEncoding)
+    TEST_F(BPETokenizerTest, PerformanceEncoding)
     {
         // Disabled by default - enable with --gtest_also_run_disabled_tests
 
@@ -372,6 +372,30 @@ namespace
 
         // Should be reasonably fast (< 1 second for 1000 encodings)
         EXPECT_LT(duration.count(), 1000) << "Encoding should be fast";
+    }
+
+    TEST_F(BPETokenizerTest, PerformanceEncodingLarge)
+    {
+        // Disabled by default - enable with --gtest_also_run_disabled_tests
+
+        std::string base = "The quick brown fox jumps over the lazy dog. ";
+        std::string text;
+        // Create ~1KB of text (25 repetitions)
+        for (int i = 0; i < 25; ++i)
+            text += base;
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < 10000; ++i)
+        {
+            auto tokens = tokenizer_->encode(text, /*add_bos=*/true, /*add_eos=*/false);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        std::cout << "10000 encodings of 1KB text took " << duration.count() << " ms" << std::endl;
+
+        // Should be fast (target < 2000ms)
+        EXPECT_LT(duration.count(), 2000) << "Encoding should be fast";
     }
 
 } // anonymous namespace

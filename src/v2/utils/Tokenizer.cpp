@@ -5,7 +5,7 @@
  * @date 2025
  *
  * Implements Byte Pair Encoding (BPE) tokenization by reading vocabulary
- * directly from GGUF metadata, eliminating llama.cpp dependency.
+ * directly from GGUF metadata.
  */
 
 #include "Tokenizer.h"
@@ -75,16 +75,33 @@ namespace llaminar2
         {
             const auto &merge_strings = merges_it->second.asStringArray();
             merges_.reserve(merge_strings.size());
+            merge_result_ids_.resize(merge_strings.size(), -1);
 
             // Parse merge strings "token1 token2" into pairs
-            for (const auto &merge_str : merge_strings)
+            for (size_t i = 0; i < merge_strings.size(); ++i)
             {
+                const auto &merge_str = merge_strings[i];
                 size_t space_pos = merge_str.find(' ');
                 if (space_pos != std::string::npos)
                 {
-                    merges_.emplace_back(
-                        merge_str.substr(0, space_pos),
-                        merge_str.substr(space_pos + 1));
+                    std::string first = merge_str.substr(0, space_pos);
+                    std::string second = merge_str.substr(space_pos + 1);
+                    merges_.emplace_back(first, second);
+                    merge_ranks_[{first, second}] = static_cast<int>(i);
+
+                    // Integer optimization
+                    auto it1 = vocab_map_.find(first);
+                    auto it2 = vocab_map_.find(second);
+                    auto it3 = vocab_map_.find(first + second);
+
+                    if (it1 != vocab_map_.end() && it2 != vocab_map_.end())
+                    {
+                        merge_ranks_int_[{it1->second, it2->second}] = static_cast<int>(i);
+                    }
+                    if (it3 != vocab_map_.end())
+                    {
+                        merge_result_ids_[i] = it3->second;
+                    }
                 }
             }
         }
@@ -107,6 +124,18 @@ namespace llaminar2
         // Initialize byte-level encoder (GPT-2 style)
         initializeByteEncoder();
 
+        // Initialize byte to token ID map
+        byte_to_token_id_.resize(256, -1);
+        for (int i = 0; i < 256; ++i)
+        {
+            std::string s = byte_encoder_[i];
+            auto it = vocab_map_.find(s);
+            if (it != vocab_map_.end())
+            {
+                byte_to_token_id_[i] = it->second;
+            }
+        }
+
         LOG_DEBUG("[BPETokenizer] Initialized with " << vocab_.size() << " tokens, "
                                                      << merges_.size() << " merges");
         LOG_DEBUG("[BPETokenizer] Special tokens: BOS=" << bos_token_
@@ -118,15 +147,10 @@ namespace llaminar2
 
     void BPETokenizer::initializeByteEncoder()
     {
+        byte_encoder_.resize(256);
         // GPT-2 byte-level encoding
-        std::vector<int> byte_values;
-        for (int i = 0; i < 256; ++i)
-        {
-            byte_values.push_back(i);
-        }
-
         int n = 0;
-        for (int b : byte_values)
+        for (int b = 0; b < 256; ++b)
         {
             if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))
             {
@@ -165,21 +189,8 @@ namespace llaminar2
         // Apply BPE tokenization
         auto bpe_tokens = applyBPE(text);
 
-        // Convert BPE tokens to IDs
-        for (const auto &token_str : bpe_tokens)
-        {
-            auto it = vocab_map_.find(token_str);
-            if (it != vocab_map_.end())
-            {
-                tokens.push_back(it->second);
-            }
-            else
-            {
-                // Unknown token - try to handle gracefully
-                // For now, just skip it (could use <unk> token if available)
-                LOG_WARN("[BPETokenizer] Unknown token: " << token_str);
-            }
-        }
+        // Append BPE tokens
+        tokens.insert(tokens.end(), bpe_tokens.begin(), bpe_tokens.end());
 
         if (add_eos)
         {
@@ -224,7 +235,7 @@ namespace llaminar2
         return "";
     }
 
-    std::vector<std::string> BPETokenizer::applyBPE(const std::string &text) const
+    std::vector<int> BPETokenizer::applyBPE(const std::string &text) const
     {
         // Simplified BPE implementation
         // For production, this should match the original tokenizer's regex splitting
@@ -254,43 +265,42 @@ namespace llaminar2
         }
 
         // Convert each word to byte-level representation and tokenize
-        std::vector<std::string> result;
-        for (const auto &word : words)
-        {
-            std::string byte_word = bytesToUnicode(word);
+        std::vector<std::vector<int>> word_results(words.size());
 
-            // Start with each byte as a separate token
-            std::vector<std::string> word_tokens;
-            for (char c : byte_word)
+// Only parallelize for sufficient workload to overcome thread overhead
+#pragma omp parallel for schedule(static) if (words.size() > 32)
+        for (size_t i = 0; i < words.size(); ++i)
+        {
+            const auto &word = words[i];
+
+            std::vector<int> word_tokens;
+            word_tokens.reserve(word.size());
+            for (unsigned char c : word)
             {
-                word_tokens.push_back(std::string(1, c));
+                int id = byte_to_token_id_[c];
+                if (id != -1)
+                {
+                    word_tokens.push_back(id);
+                }
             }
 
             // Apply BPE merges
-            bool changed = true;
-            while (changed && word_tokens.size() > 1)
+            while (word_tokens.size() > 1)
             {
-                changed = false;
-
                 // Find the highest priority merge
                 int best_merge_idx = -1;
                 size_t best_merge_pos = 0;
 
-                for (size_t i = 0; i < word_tokens.size() - 1; ++i)
+                for (size_t j = 0; j < word_tokens.size() - 1; ++j)
                 {
-                    std::string bigram = word_tokens[i] + word_tokens[i + 1];
-
-                    // Check if this bigram is in our merge list
-                    for (size_t j = 0; j < merges_.size(); ++j)
+                    auto it = merge_ranks_int_.find({word_tokens[j], word_tokens[j + 1]});
+                    if (it != merge_ranks_int_.end())
                     {
-                        if (merges_[j].first == word_tokens[i] &&
-                            merges_[j].second == word_tokens[i + 1])
+                        int rank = it->second;
+                        if (best_merge_idx == -1 || rank < best_merge_idx)
                         {
-                            if (best_merge_idx == -1 || j < static_cast<size_t>(best_merge_idx))
-                            {
-                                best_merge_idx = j;
-                                best_merge_pos = i;
-                            }
+                            best_merge_idx = rank;
+                            best_merge_pos = j;
                         }
                     }
                 }
@@ -298,15 +308,30 @@ namespace llaminar2
                 // Apply the best merge if found
                 if (best_merge_idx != -1)
                 {
-                    std::string merged = word_tokens[best_merge_pos] + word_tokens[best_merge_pos + 1];
-                    word_tokens[best_merge_pos] = merged;
-                    word_tokens.erase(word_tokens.begin() + best_merge_pos + 1);
-                    changed = true;
+                    int new_token_id = merge_result_ids_[best_merge_idx];
+                    if (new_token_id != -1)
+                    {
+                        word_tokens[best_merge_pos] = new_token_id;
+                        word_tokens.erase(word_tokens.begin() + best_merge_pos + 1);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    break;
                 }
             }
 
-            // Add word tokens to result
-            result.insert(result.end(), word_tokens.begin(), word_tokens.end());
+            word_results[i] = std::move(word_tokens);
+        }
+
+        std::vector<int> result;
+        for (const auto &tokens : word_results)
+        {
+            result.insert(result.end(), tokens.begin(), tokens.end());
         }
 
         return result;
@@ -315,17 +340,10 @@ namespace llaminar2
     std::string BPETokenizer::bytesToUnicode(const std::string &text) const
     {
         std::string result;
+        result.reserve(text.size());
         for (unsigned char c : text)
         {
-            auto it = byte_encoder_.find(c);
-            if (it != byte_encoder_.end())
-            {
-                result += it->second;
-            }
-            else
-            {
-                result += static_cast<char>(c);
-            }
+            result += byte_encoder_[c];
         }
         return result;
     }

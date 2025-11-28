@@ -15,6 +15,7 @@
 #include <memory>
 #include <cstdint>
 #include <unordered_map>
+#include <map>
 
 namespace llaminar2
 {
@@ -137,7 +138,7 @@ namespace llaminar2
         /**
          * @brief Apply BPE merges to text
          */
-        std::vector<std::string> applyBPE(const std::string &text) const;
+        std::vector<int> applyBPE(const std::string &text) const;
 
         /**
          * @brief Byte-level encoding (for handling any UTF-8)
@@ -146,18 +147,20 @@ namespace llaminar2
         std::string unicodeToBytes(const std::string &text) const;
 
         // Vocabulary data
-        std::vector<std::string> vocab_;                          // token_id -> token_string
-        std::unordered_map<std::string, int> vocab_map_;          // token_string -> token_id
-        std::vector<std::pair<std::string, std::string>> merges_; // BPE merge rules
+        std::vector<std::string> vocab_;
+        std::unordered_map<std::string, int> vocab_map_;
+        std::vector<std::pair<std::string, std::string>> merges_;
+        std::map<std::pair<std::string, std::string>, int> merge_ranks_;
+        std::map<std::pair<int, int>, int> merge_ranks_int_;
+        std::vector<int> merge_result_ids_;
+        std::vector<int> byte_to_token_id_;
 
-        // Special tokens
+        std::vector<std::string> byte_encoder_;
+        std::unordered_map<std::string, int> byte_decoder_;
+
         int bos_token_ = 0;
         int eos_token_ = 0;
         int pad_token_ = 0;
-
-        // Byte-level mapping (GPT-2 style)
-        std::unordered_map<uint8_t, std::string> byte_encoder_;
-        std::unordered_map<std::string, uint8_t> byte_decoder_;
     };
 
     /**
