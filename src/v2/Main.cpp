@@ -439,22 +439,37 @@ int main(int argc, char *argv[])
         ChatTemplateType override_type = ChatTemplateType::UNKNOWN;
         std::string tmpl_lower = args.chat_template;
         std::transform(tmpl_lower.begin(), tmpl_lower.end(), tmpl_lower.begin(), ::tolower);
-        
-        if (tmpl_lower == "chatml") override_type = ChatTemplateType::CHATML;
-        else if (tmpl_lower == "llama3") override_type = ChatTemplateType::LLAMA3;
-        else if (tmpl_lower == "llama2") override_type = ChatTemplateType::LLAMA2;
-        else if (tmpl_lower == "mistral" || tmpl_lower == "mistral_v1") override_type = ChatTemplateType::MISTRAL_V1;
-        else if (tmpl_lower == "mistral_v3") override_type = ChatTemplateType::MISTRAL_V3;
-        else if (tmpl_lower == "mistral_v7") override_type = ChatTemplateType::MISTRAL_V7;
-        else if (tmpl_lower == "phi3") override_type = ChatTemplateType::PHI3;
-        else if (tmpl_lower == "phi4") override_type = ChatTemplateType::PHI4;
-        else if (tmpl_lower == "gemma") override_type = ChatTemplateType::GEMMA;
-        else if (tmpl_lower == "deepseek") override_type = ChatTemplateType::DEEPSEEK;
-        else if (tmpl_lower == "deepseek2") override_type = ChatTemplateType::DEEPSEEK2;
-        else if (tmpl_lower == "deepseek3") override_type = ChatTemplateType::DEEPSEEK3;
-        else if (tmpl_lower == "zephyr") override_type = ChatTemplateType::ZEPHYR;
-        else if (tmpl_lower == "vicuna") override_type = ChatTemplateType::VICUNA;
-        else if (tmpl_lower == "command_r" || tmpl_lower == "command-r") override_type = ChatTemplateType::COMMAND_R;
+
+        if (tmpl_lower == "chatml")
+            override_type = ChatTemplateType::CHATML;
+        else if (tmpl_lower == "llama3")
+            override_type = ChatTemplateType::LLAMA3;
+        else if (tmpl_lower == "llama2")
+            override_type = ChatTemplateType::LLAMA2;
+        else if (tmpl_lower == "mistral" || tmpl_lower == "mistral_v1")
+            override_type = ChatTemplateType::MISTRAL_V1;
+        else if (tmpl_lower == "mistral_v3")
+            override_type = ChatTemplateType::MISTRAL_V3;
+        else if (tmpl_lower == "mistral_v7")
+            override_type = ChatTemplateType::MISTRAL_V7;
+        else if (tmpl_lower == "phi3")
+            override_type = ChatTemplateType::PHI3;
+        else if (tmpl_lower == "phi4")
+            override_type = ChatTemplateType::PHI4;
+        else if (tmpl_lower == "gemma")
+            override_type = ChatTemplateType::GEMMA;
+        else if (tmpl_lower == "deepseek")
+            override_type = ChatTemplateType::DEEPSEEK;
+        else if (tmpl_lower == "deepseek2")
+            override_type = ChatTemplateType::DEEPSEEK2;
+        else if (tmpl_lower == "deepseek3")
+            override_type = ChatTemplateType::DEEPSEEK3;
+        else if (tmpl_lower == "zephyr")
+            override_type = ChatTemplateType::ZEPHYR;
+        else if (tmpl_lower == "vicuna")
+            override_type = ChatTemplateType::VICUNA;
+        else if (tmpl_lower == "command_r" || tmpl_lower == "command-r")
+            override_type = ChatTemplateType::COMMAND_R;
         else
         {
             if (mpi_ctx->rank() == 0)
@@ -462,7 +477,7 @@ int main(int argc, char *argv[])
                 LOG_WARN("Unknown chat template '" << args.chat_template << "', using model's template");
             }
         }
-        
+
         if (override_type != ChatTemplateType::UNKNOWN)
         {
             tokenizer->setChatTemplate(ChatTemplate::create(override_type));
@@ -476,7 +491,7 @@ int main(int argc, char *argv[])
     // ========================================================================
     // Chat Mode Handling
     // ========================================================================
-    
+
     // Interactive chat mode (--chat)
     if (args.chat_mode)
     {
@@ -491,20 +506,20 @@ int main(int argc, char *argv[])
             }
 
             LOG_INFO("Starting interactive chat mode...");
-            
+
             ChatUIConfig chat_config;
             chat_config.system_prompt = args.system_prompt;
             chat_config.max_tokens = args.n_predict;
             chat_config.temperature = args.temperature;
             chat_config.top_k = args.top_k;
             chat_config.top_p = args.top_p;
-            
+
             // Convert unique_ptr to shared_ptr for ChatUI
             std::shared_ptr<PipelineBase> shared_pipeline(std::move(pipeline));
-            
+
             ChatUI chat_ui(tokenizer, shared_pipeline, chat_config);
             int result = chat_ui.run();
-            
+
             MPI_Finalize();
             return result;
         }
@@ -517,7 +532,7 @@ int main(int argc, char *argv[])
             return 0;
         }
     }
-    
+
     // Single-shot chat mode (--chat-single)
     if (args.single_shot_chat)
     {
@@ -535,19 +550,19 @@ int main(int argc, char *argv[])
         if (mpi_ctx->rank() == 0)
         {
             LOG_INFO("Running single-shot chat...");
-            
+
             ChatUIConfig chat_config;
             chat_config.max_tokens = args.n_predict;
             chat_config.temperature = args.temperature;
             chat_config.top_k = args.top_k;
             chat_config.top_p = args.top_p;
-            
+
             // Convert unique_ptr to shared_ptr for runSingleShotChat
             std::shared_ptr<PipelineBase> shared_pipeline(std::move(pipeline));
-            
+
             runSingleShotChat(tokenizer, shared_pipeline, args.prompt, args.system_prompt, chat_config);
         }
-        
+
         MPI_Finalize();
         return 0;
     }

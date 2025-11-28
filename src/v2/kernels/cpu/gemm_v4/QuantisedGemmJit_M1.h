@@ -23,6 +23,9 @@ namespace llaminar2
             // Scales: [K/32][N] (float)
             std::vector<float> scales;
 
+            // Mins: [K/32][N] (float) - for asymmetric quantization
+            std::vector<float> mins;
+
             int K;
             int N;
         };
@@ -33,6 +36,7 @@ namespace llaminar2
             const void *B_packed;
             const void *comp;
             const void *scales;
+            const void *mins; // Added for asymmetric quantization
             float *C;
             int K_blocks;
             int N;
@@ -142,18 +146,19 @@ namespace llaminar2
 
                 // Load arguments from params struct
                 // rdi is params
-                mov(reg_B, ptr[reg_params + 8]);                 // B_packed
-                mov(reg_Comp, ptr[reg_params + 16]);             // comp
-                mov(reg_Scales, ptr[reg_params + 24]);           // scales
-                mov(reg_C, ptr[reg_params + 32]);                // C
-                mov(reg_K_blocks.cvt32(), ptr[reg_params + 40]); // K_blocks
+                mov(reg_B, ptr[reg_params + 8]);       // B_packed
+                mov(reg_Comp, ptr[reg_params + 16]);   // comp
+                mov(reg_Scales, ptr[reg_params + 24]); // scales
+                // mins is at +32
+                mov(reg_C, ptr[reg_params + 40]);                // C
+                mov(reg_K_blocks.cvt32(), ptr[reg_params + 48]); // K_blocks
 
                 // Load N into reg_loop_N temporarily to push it
-                mov(reg_loop_N.cvt32(), ptr[reg_params + 44]); // N
+                mov(reg_loop_N.cvt32(), ptr[reg_params + 52]); // N
                 push(reg_loop_N);                              // Push N to stack (now at rsp)
 
                 // Load ldc into reg_stride temporarily
-                mov(reg_stride.cvt32(), ptr[reg_params + 48]); // ldc
+                mov(reg_stride.cvt32(), ptr[reg_params + 56]); // ldc
                 shl(reg_stride, 2);                            // ldc * 4 (stride in bytes)
 
                 // Load A last (overwrites params pointer in rdi)
@@ -200,6 +205,20 @@ namespace llaminar2
                     mov(reg_C_cursor, reg_C);
                     add(reg_C_cursor, reg_tmp);
 
+                    // Initialize C accumulators
+                    vmovups(zmm_c0, ptr[reg_C_cursor + 0 * 64]);
+                    vmovups(zmm_c1, ptr[reg_C_cursor + 1 * 64]);
+                    vmovups(zmm_c2, ptr[reg_C_cursor + 2 * 64]);
+                    vmovups(zmm_c3, ptr[reg_C_cursor + 3 * 64]);
+
+                    // Overwrite reg_C_cursor (r14) with Mins cursor
+                    mov(rax, ptr[rsp + 8]);
+                    mov(r14, ptr[rax + 32]); // mins ptr
+                    mov(reg_tmp, reg_loop_N);
+                    shl(reg_tmp, 2);
+                    add(r14, reg_tmp);
+                    // Now r14 is reg_Mins_cursor
+
                     // B cursor calculation: (loop_N / 64) * (K_blocks * 2048)
                     mov(reg_tmp, reg_loop_N);
                     shr(reg_tmp, 6);             // loop_N / 64
@@ -208,12 +227,6 @@ namespace llaminar2
 
                     mov(reg_B_cursor, reg_B);
                     add(reg_B_cursor, reg_tmp);
-
-                    // Initialize C accumulators
-                    vmovups(zmm_c0, ptr[reg_C_cursor + 0 * 64]);
-                    vmovups(zmm_c1, ptr[reg_C_cursor + 1 * 64]);
-                    vmovups(zmm_c2, ptr[reg_C_cursor + 2 * 64]);
-                    vmovups(zmm_c3, ptr[reg_C_cursor + 3 * 64]);
 
                     // Loop over K blocks
                     mov(reg_loop_K, reg_K_blocks);
@@ -224,6 +237,36 @@ namespace llaminar2
                         // Load scale A (half) -> float broadcast
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor]);
                         vcvtph2ps(zmm_scale, ymm_tmp);
+
+                        // --- Asymmetric Weights Correction ---
+                        // Load sum_qs (offset 2)
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + 2]);
+                        vpmovsxwd(zmm20, ymm_tmp); // int16 -> int32 (zmm20 = sum_qs)
+                        vcvtdq2ps(zmm20, zmm20);   // int32 -> float
+
+                        // Multiply by scale A (zmm_scale)
+                        vmulps(zmm20, zmm20, zmm_scale);
+
+                        // Load mins (using r14)
+                        vmovups(zmm21, ptr[r14 + 0 * 64]);
+                        vmovups(zmm22, ptr[r14 + 1 * 64]);
+                        vmovups(zmm23, ptr[r14 + 2 * 64]);
+                        vmovups(zmm24, ptr[r14 + 3 * 64]);
+
+                        // Multiply by sum_qs * scale_A
+                        vmulps(zmm21, zmm21, zmm20);
+                        vmulps(zmm22, zmm22, zmm20);
+                        vmulps(zmm23, zmm23, zmm20);
+                        vmulps(zmm24, zmm24, zmm20);
+
+                        // Add to C
+                        vaddps(zmm_c0, zmm_c0, zmm21);
+                        vaddps(zmm_c1, zmm_c1, zmm22);
+                        vaddps(zmm_c2, zmm_c2, zmm23);
+                        vaddps(zmm_c3, zmm_c3, zmm24);
+
+                        // Advance Mins cursor
+                        add(r14, reg_stride);
 
                         vmovups(zmm_acc0, ptr[reg_Comp_cursor + 0 * 64]);
                         vmovups(zmm_acc1, ptr[reg_Comp_cursor + 1 * 64]);
@@ -304,13 +347,20 @@ namespace llaminar2
                         jnz(loop_K_label, T_NEAR);
                     }
 
+                    // Restore reg_C_cursor (r14)
+                    mov(rax, ptr[rsp + 8]);           // params
+                    mov(reg_C_cursor, ptr[rax + 40]); // C
+                    mov(reg_tmp, reg_loop_N);
+                    shl(reg_tmp, 2);
+                    add(reg_C_cursor, reg_tmp);
+
                     // --- Bias & Mask ---
                     // Retrieve params pointer from stack (rsp + 8)
                     // rsp points to N. rsp+8 points to params.
                     mov(rax, ptr[rsp + 8]);
 
                     // 1. Bias
-                    mov(rdx, ptr[rax + 56]); // bias ptr
+                    mov(rdx, ptr[rax + 64]); // bias ptr
                     test(rdx, rdx);
                     Label skip_bias;
                     jz(skip_bias, T_NEAR);
@@ -335,7 +385,7 @@ namespace llaminar2
                     L(skip_bias);
 
                     // 2. Mask
-                    mov(rdx, ptr[rax + 64]); // mask ptr
+                    mov(rdx, ptr[rax + 72]); // mask ptr
                     test(rdx, rdx);
                     Label skip_mask;
                     jz(skip_mask, T_NEAR);
@@ -359,7 +409,7 @@ namespace llaminar2
                     L(skip_mask);
 
                     // 3. Softmax
-                    mov(al, ptr[rax + 88]); // do_softmax
+                    mov(al, ptr[rax + 96]); // do_softmax
                     test(al, al);
                     Label skip_softmax;
                     jz(skip_softmax, T_NEAR);
@@ -432,8 +482,8 @@ namespace llaminar2
                         vpbroadcastd(zmm_max, xmm4);
 
                         // Store max to local_max
-                        // local_max ptr is at offset 72
-                        mov(rdx, ptr[rax + 72]);
+                        // local_max ptr is at offset 80
+                        mov(rdx, ptr[rax + 80]);
                         // Offset: (reg_loop_N / 64) * 4
                         mov(r15, reg_loop_N); // Use r15 as temp
                         shr(r15, 4);          // / 64 * 4 = / 16
@@ -499,8 +549,8 @@ namespace llaminar2
                         vaddps(xmm4, xmm4, xmm5);
 
                         // Store sum to local_sum
-                        // local_sum ptr is at offset 80
-                        mov(rdx, ptr[rax + 80]);
+                        // local_sum ptr is at offset 88
+                        mov(rdx, ptr[rax + 88]);
                         // Offset: r15 already has it
                         vmovss(ptr[rdx + r15], xmm4);
                     }
@@ -509,7 +559,7 @@ namespace llaminar2
                     // 4. SwiGLU
                     // Reload params (rax might be clobbered)
                     mov(rax, ptr[rsp + 8]);  // params is at rsp + 8
-                    cmp(byte[rax + 104], 1); // do_swiglu
+                    cmp(byte[rax + 112], 1); // do_swiglu
                     Label skip_swiglu;
                     jne(skip_swiglu, T_NEAR);
                     {
@@ -562,7 +612,7 @@ namespace llaminar2
                         mov(rax, ptr[rsp + 8]);
 
                         // Load gate_input pointer
-                        mov(rdx, ptr[rax + 96]);
+                        mov(rdx, ptr[rax + 104]);
 
                         auto compute_swish = [&](const Zmm &zmm_val, int offset)
                         {

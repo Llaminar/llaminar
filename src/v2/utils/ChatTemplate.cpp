@@ -520,7 +520,13 @@ namespace llaminar2
         // DeepSeek V2: User: content\n\nAssistant: content<｜end▁of▁sentence｜>
         std::stringstream ss;
         // UTF-8 encoding for special characters
-        const char *eos_marker = "\xEF\xBD\x9C" "end" "\xE2\x96\x81" "of" "\xE2\x96\x81" "sentence" "\xEF\xBD\x9C"; // ｜end▁of▁sentence｜
+        const char *eos_marker = "\xEF\xBD\x9C"
+                                 "end"
+                                 "\xE2\x96\x81"
+                                 "of"
+                                 "\xE2\x96\x81"
+                                 "sentence"
+                                 "\xEF\xBD\x9C"; // ｜end▁of▁sentence｜
 
         for (const auto &msg : messages)
         {
@@ -552,9 +558,19 @@ namespace llaminar2
         // DeepSeek V3: <｜User｜>content<｜Assistant｜>content<｜end▁of▁sentence｜>
         std::stringstream ss;
         // UTF-8 encoding for special characters
-        const char *user_marker = "\xEF\xBD\x9C" "User" "\xEF\xBD\x9C";         // ｜User｜
-        const char *assistant_marker = "\xEF\xBD\x9C" "Assistant" "\xEF\xBD\x9C"; // ｜Assistant｜
-        const char *eos_marker = "\xEF\xBD\x9C" "end" "\xE2\x96\x81" "of" "\xE2\x96\x81" "sentence" "\xEF\xBD\x9C"; // ｜end▁of▁sentence｜
+        const char *user_marker = "\xEF\xBD\x9C"
+                                  "User"
+                                  "\xEF\xBD\x9C"; // ｜User｜
+        const char *assistant_marker = "\xEF\xBD\x9C"
+                                       "Assistant"
+                                       "\xEF\xBD\x9C"; // ｜Assistant｜
+        const char *eos_marker = "\xEF\xBD\x9C"
+                                 "end"
+                                 "\xE2\x96\x81"
+                                 "of"
+                                 "\xE2\x96\x81"
+                                 "sentence"
+                                 "\xEF\xBD\x9C"; // ｜end▁of▁sentence｜
 
         for (const auto &msg : messages)
         {

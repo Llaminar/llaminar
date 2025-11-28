@@ -124,14 +124,14 @@ namespace
         ByteEncoderTest encoder;
 
         // Test specific important characters
-        EXPECT_EQ(encoder.encode('!'), "!");        // 33
-        EXPECT_EQ(encoder.encode('"'), "\"");       // 34
-        EXPECT_EQ(encoder.encode('+'), "+");        // 43
-        EXPECT_EQ(encoder.encode('.'), ".");        // 46
-        EXPECT_EQ(encoder.encode('0'), "0");        // 48
-        EXPECT_EQ(encoder.encode('A'), "A");        // 65
-        EXPECT_EQ(encoder.encode('a'), "a");        // 97
-        EXPECT_EQ(encoder.encode('~'), "~");        // 126
+        EXPECT_EQ(encoder.encode('!'), "!");  // 33
+        EXPECT_EQ(encoder.encode('"'), "\""); // 34
+        EXPECT_EQ(encoder.encode('+'), "+");  // 43
+        EXPECT_EQ(encoder.encode('.'), ".");  // 46
+        EXPECT_EQ(encoder.encode('0'), "0");  // 48
+        EXPECT_EQ(encoder.encode('A'), "A");  // 65
+        EXPECT_EQ(encoder.encode('a'), "a");  // 97
+        EXPECT_EQ(encoder.encode('~'), "~");  // 126
     }
 
     // =============================================================================

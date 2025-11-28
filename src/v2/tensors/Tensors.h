@@ -430,6 +430,21 @@ namespace llaminar2
         virtual float get_block_scale(
             size_t row_idx,
             size_t k_block_offset) const = 0;
+
+        /**
+         * @brief Get original quantization min (offset) for block
+         *
+         * Returns the minimum value (offset) used when the block was quantized.
+         * Used for asymmetric quantization (e.g., Q4_1, Q5_1, Q_K).
+         * Formula: value = scale * quant + min
+         *
+         * @param row_idx Row index in weight tensor
+         * @param k_block_offset Block offset along K dimension
+         * @return FP32 min value (default 0.0f for symmetric formats)
+         */
+        virtual float get_block_min(
+            size_t row_idx,
+            size_t k_block_offset) const { return 0.0f; }
     };
 
     /**

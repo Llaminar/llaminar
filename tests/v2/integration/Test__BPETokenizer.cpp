@@ -260,80 +260,95 @@ namespace
     TEST_F(BPETokenizerTest, RoundTripDiagnostic)
     {
         // Diagnostic test to isolate BPE encode/decode issues
-        
+
         // Check vocab content for specific tokens
         std::cout << "\n=== Vocab Token Content ===" << std::endl;
-        
+
         // Access model context to check vocab directly
-        const auto& metadata = model_ctx_->model().metadata;
+        const auto &metadata = model_ctx_->model().metadata;
         auto tokens_it = metadata.find("tokenizer.ggml.tokens");
         ASSERT_NE(tokens_it, metadata.end()) << "Should have tokenizer vocab";
-        
-        const auto& vocab = tokens_it->second.asStringArray();
+
+        const auto &vocab = tokens_it->second.asStringArray();
         std::cout << "Vocab size: " << vocab.size() << std::endl;
-        
+
         // Check specific tokens
         std::vector<int> check_ids = {10, 13, 17, 30};
-        for (int id : check_ids) {
-            if (id < (int)vocab.size()) {
+        for (int id : check_ids)
+        {
+            if (id < (int)vocab.size())
+            {
                 std::cout << "Token " << id << " (len=" << vocab[id].size() << "): [";
-                for (unsigned char c : vocab[id]) {
-                    if (c >= 32 && c < 127) {
+                for (unsigned char c : vocab[id])
+                {
+                    if (c >= 32 && c < 127)
+                    {
                         std::cout << c;
-                    } else {
+                    }
+                    else
+                    {
                         std::cout << "\\x" << std::hex << (int)c << std::dec;
                     }
                 }
                 std::cout << "] hex: ";
-                for (unsigned char c : vocab[id]) {
+                for (unsigned char c : vocab[id])
+                {
                     std::cout << std::hex << (int)c << " " << std::dec;
                 }
                 std::cout << std::endl;
             }
         }
-        
+
         // Now check tokenizer decode
         std::cout << "\n=== Tokenizer Decode ===" << std::endl;
-        for (int id : check_ids) {
+        for (int id : check_ids)
+        {
             std::string decoded = tokenizer_->decode_token(id);
             std::cout << "decode_token(" << id << "): [";
-            for (unsigned char c : decoded) {
-                if (c >= 32 && c < 127) {
+            for (unsigned char c : decoded)
+            {
+                if (c >= 32 && c < 127)
+                {
                     std::cout << c;
-                } else {
+                }
+                else
+                {
                     std::cout << "\\x" << std::hex << (int)c << std::dec;
                 }
             }
             std::cout << "]" << std::endl;
         }
-        
+
         // Check space decoding specifically
         std::cout << "\n=== Space Token Decode ===" << std::endl;
         // Token 220 should be single space
         std::string space_decoded = tokenizer_->decode_token(220);
         std::cout << "decode_token(220) = [";
-        for (unsigned char c : space_decoded) {
+        for (unsigned char c : space_decoded)
+        {
             std::cout << "\\x" << std::hex << (int)c << std::dec;
         }
         std::cout << "] (expected: space = \\x20)" << std::endl;
-        
+
         // Get the raw vocab for token 220
-        const auto& vocab2 = tokens_it->second.asStringArray();
+        const auto &vocab2 = tokens_it->second.asStringArray();
         std::string raw_220 = vocab2[220];
         std::cout << "vocab[220] raw bytes: ";
-        for (unsigned char c : raw_220) {
+        for (unsigned char c : raw_220)
+        {
             std::cout << std::hex << (int)c << " " << std::dec;
         }
         std::cout << std::endl;
-        
+
         // Token 525 should be " are"
         std::string are_decoded = tokenizer_->decode_token(525);
         std::cout << "decode_token(525) = [" << are_decoded << "] hex: ";
-        for (unsigned char c : are_decoded) {
+        for (unsigned char c : are_decoded)
+        {
             std::cout << std::hex << (int)c << " " << std::dec;
         }
         std::cout << std::endl;
-        
+
         // Test cases
         std::vector<std::string> test_cases = {
             "Hello",
@@ -698,7 +713,7 @@ namespace
     TEST_F(BPETokenizerTest, ChineseIndividualCharacters)
     {
         // Test individual Chinese characters
-        auto* bpe_tok = dynamic_cast<BPETokenizer*>(tokenizer_.get());
+        auto *bpe_tok = dynamic_cast<BPETokenizer *>(tokenizer_.get());
         ASSERT_NE(bpe_tok, nullptr);
 
         // Token 56568 = 你, Token 52801 = 好 according to HuggingFace

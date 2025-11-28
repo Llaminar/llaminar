@@ -175,7 +175,7 @@ namespace llaminar2
         byte_encoder_.resize(256);
         // GPT-2 byte-level encoding
         // Maps bytes to printable Unicode characters to avoid control chars
-        // 
+        //
         // The GPT-2 scheme treats bytes as Unicode codepoints:
         // - Printable ASCII (33-126): identity mapping (single byte UTF-8)
         // - Latin-1 Supplement (161-172, 174-255): identity mapping BUT stored as UTF-8
@@ -196,7 +196,7 @@ namespace llaminar2
             {
                 // Latin-1 Supplement: identity mapping (codepoint == byte value)
                 // but needs UTF-8 encoding for bytes >= 128
-                int codepoint = b;  // Identity: codepoint equals byte value
+                int codepoint = b; // Identity: codepoint equals byte value
                 // UTF-8 encoding for codepoints 0x80-0xFF: 110000xx 10xxxxxx
                 char utf8[3];
                 utf8[0] = static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F));
@@ -339,15 +339,17 @@ namespace llaminar2
 
         // Use a linked-list style structure for efficient merging
         // Each element stores: token_id, prev_idx, next_idx, is_valid
-        struct Node {
+        struct Node
+        {
             int token_id;
-            int prev;  // -1 if first
-            int next;  // -1 if last
+            int prev; // -1 if first
+            int next; // -1 if last
             bool valid;
         };
-        
+
         std::vector<Node> nodes(tokens.size());
-        for (size_t i = 0; i < tokens.size(); ++i) {
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
             nodes[i].token_id = tokens[i];
             nodes[i].prev = (i > 0) ? static_cast<int>(i - 1) : -1;
             nodes[i].next = (i < tokens.size() - 1) ? static_cast<int>(i + 1) : -1;
@@ -356,75 +358,92 @@ namespace llaminar2
 
         // Priority queue: (rank, position) - lower rank = higher priority
         // We use negative rank so std::priority_queue (max-heap) gives us min-rank first
-        using PQEntry = std::pair<int, int>;  // (rank, position)
+        using PQEntry = std::pair<int, int>; // (rank, position)
         std::priority_queue<PQEntry, std::vector<PQEntry>, std::greater<PQEntry>> pq;
 
         // Helper to add a merge candidate to the queue
-        auto add_merge_candidate = [&](int pos) {
-            if (pos < 0 || !nodes[pos].valid) return;
+        auto add_merge_candidate = [&](int pos)
+        {
+            if (pos < 0 || !nodes[pos].valid)
+                return;
             int next_pos = nodes[pos].next;
-            if (next_pos < 0 || !nodes[next_pos].valid) return;
-            
+            if (next_pos < 0 || !nodes[next_pos].valid)
+                return;
+
             auto it = merge_ranks_int_.find({nodes[pos].token_id, nodes[next_pos].token_id});
-            if (it != merge_ranks_int_.end()) {
+            if (it != merge_ranks_int_.end())
+            {
                 pq.push({it->second, pos});
             }
         };
 
         // Initialize queue with all valid merge pairs
-        for (size_t i = 0; i < nodes.size(); ++i) {
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
             add_merge_candidate(static_cast<int>(i));
         }
 
         // Process merges
-        while (!pq.empty()) {
+        while (!pq.empty())
+        {
             auto [rank, pos] = pq.top();
             pq.pop();
 
             // Skip if this node was already merged/invalidated
-            if (!nodes[pos].valid) continue;
+            if (!nodes[pos].valid)
+                continue;
             int next_pos = nodes[pos].next;
-            if (next_pos < 0 || !nodes[next_pos].valid) continue;
+            if (next_pos < 0 || !nodes[next_pos].valid)
+                continue;
 
             // Verify the merge is still valid (tokens haven't changed)
             auto it = merge_ranks_int_.find({nodes[pos].token_id, nodes[next_pos].token_id});
-            if (it == merge_ranks_int_.end() || it->second != rank) continue;
+            if (it == merge_ranks_int_.end() || it->second != rank)
+                continue;
 
             // Get the merged token
             int new_token_id = merge_result_ids_[rank];
-            if (new_token_id == -1) continue;
+            if (new_token_id == -1)
+                continue;
 
             // Apply the merge: update pos, invalidate next_pos
             nodes[pos].token_id = new_token_id;
             nodes[next_pos].valid = false;
-            
+
             // Update linked list
             int new_next = nodes[next_pos].next;
             nodes[pos].next = new_next;
-            if (new_next >= 0) {
+            if (new_next >= 0)
+            {
                 nodes[new_next].prev = pos;
             }
 
             // Add new merge candidates for affected pairs
-            add_merge_candidate(nodes[pos].prev);  // prev + pos (now merged)
-            add_merge_candidate(pos);               // pos (merged) + new_next
+            add_merge_candidate(nodes[pos].prev); // prev + pos (now merged)
+            add_merge_candidate(pos);             // pos (merged) + new_next
         }
 
         // Collect valid tokens
         std::vector<int> result;
-        result.reserve(tokens.size());  // Upper bound
-        for (int i = 0; i >= 0 && static_cast<size_t>(i) < nodes.size(); ) {
-            if (nodes[i].valid) {
+        result.reserve(tokens.size()); // Upper bound
+        for (int i = 0; i >= 0 && static_cast<size_t>(i) < nodes.size();)
+        {
+            if (nodes[i].valid)
+            {
                 result.push_back(nodes[i].token_id);
             }
             i = nodes[i].next;
-            if (i < 0) break;
+            if (i < 0)
+                break;
         }
-        
+
         // Handle edge case: if linked list traversal missed the first valid node
-        if (result.empty()) {
-            for (const auto& node : nodes) {
-                if (node.valid) {
+        if (result.empty())
+        {
+            for (const auto &node : nodes)
+            {
+                if (node.valid)
+                {
                     result.push_back(node.token_id);
                 }
             }
@@ -452,7 +471,7 @@ namespace llaminar2
         for (size_t i = 0; i < text.size();)
         {
             unsigned char b1 = static_cast<unsigned char>(text[i]);
-            
+
             // Check for 3-byte UTF-8 sequence FIRST (for higher codepoints)
             // UTF-8 pattern: 1110xxxx 10xxxxxx 10xxxxxx
             if (i + 2 < text.size() &&
@@ -473,7 +492,7 @@ namespace llaminar2
                 i += 3;
                 continue;
             }
-            
+
             // Check for 2-byte UTF-8 sequence (for GPT-2 encoded non-printable bytes)
             // UTF-8 pattern: 110xxxxx 10xxxxxx
             // This includes Ġ (U+0120) = \xc4\xa0 which maps to space

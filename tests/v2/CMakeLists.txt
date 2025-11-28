@@ -443,6 +443,19 @@ add_v2_test(V2_Unit_QuantisedGemmKernel
     MPI_PROCS 1
 )
 
+# Test: Quantised GEMM Kernel Reproduction (Asymmetric/Tail bugs)
+add_executable(v2_test_quantised_gemm_kernel_repro unit/kernels/Test__QuantisedGemmKernel_Repro.cpp)
+target_link_libraries(v2_test_quantised_gemm_kernel_repro
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_QuantisedGemmKernel_Repro
+    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_kernel_repro>
+    LABELS "V2;Unit;Kernels;GEMM;Quantised;Repro"
+    MPI_PROCS 1
+)
+
 # Test: Quantised JIT GEMM Fused Operations (Bias, Mask, Softmax)
 add_executable(v2_test_quantised_gemm_fused unit/kernels/gemm/Test__QuantisedGemmFused.cpp)
 target_link_libraries(v2_test_quantised_gemm_fused
@@ -1490,3 +1503,14 @@ if(ZLIB_FOUND)
 else()
     message(WARNING "ZLIB not found - Qwen2 FP32 parity test disabled (requires cnpy for .npz loading)")
 endif()
+
+# Performance Test: GEMM Tuning Sweep
+add_executable(v2_perf_gemm_tuning_sweep performance/Perf__GemmTuningSweep.cpp)
+target_link_libraries(v2_perf_gemm_tuning_sweep 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Perf_GemmTuningSweep 
+    COMMAND $<TARGET_FILE:v2_perf_gemm_tuning_sweep>
+    LABELS "V2;Performance;GEMM;Tuning"
+)

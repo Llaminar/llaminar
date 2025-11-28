@@ -29,11 +29,8 @@ namespace llaminar2
 
     ChatUI::ChatUI(std::shared_ptr<ITokenizer> tokenizer,
                    std::shared_ptr<PipelineBase> pipeline,
-                   const ChatUIConfig& config)
-        : tokenizer_(std::move(tokenizer))
-        , pipeline_(std::move(pipeline))
-        , config_(config)
-        , screen_(ScreenInteractive::Fullscreen())
+                   const ChatUIConfig &config)
+        : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), config_(config), screen_(ScreenInteractive::Fullscreen())
     {
         // Add system prompt to conversation if provided
         if (!config_.system_prompt.empty())
@@ -78,7 +75,8 @@ namespace llaminar2
     {
         auto input_option = InputOption::Default();
         input_option.multiline = false;
-        input_option.on_enter = [this] { onEnterPressed(); };
+        input_option.on_enter = [this]
+        { onEnterPressed(); };
 
         return Input(&current_input_, "Type your message...", input_option);
     }
@@ -86,9 +84,8 @@ namespace llaminar2
     Component ChatUI::createConversationView()
     {
         // Renderer that displays the conversation
-        return Renderer([this] {
-            return renderConversation();
-        });
+        return Renderer([this]
+                        { return renderConversation(); });
     }
 
     Component ChatUI::createLayout()
@@ -97,14 +94,18 @@ namespace llaminar2
 
         // Main layout with conversation and input
         auto layout = Container::Vertical({
-            Renderer([this] { return renderSystemPrompt(); }),
-            Renderer([this] { return renderConversation(); }),
+            Renderer([this]
+                     { return renderSystemPrompt(); }),
+            Renderer([this]
+                     { return renderConversation(); }),
             input_component,
-            Renderer([this] { return renderStatusBar(); }),
+            Renderer([this]
+                     { return renderStatusBar(); }),
         });
 
         // Wrap with event handler for special keys
-        return CatchEvent(layout, [this, input_component](Event event) {
+        return CatchEvent(layout, [this, input_component](Event event)
+                          {
             // Handle global events
             if (event == Event::Escape || 
                 (event.is_character() && event.character() == "q" && !is_generating_))
@@ -139,8 +140,7 @@ namespace llaminar2
                 return true;
             }
 
-            return false;
-        });
+            return false; });
     }
 
     // ========================================================================
@@ -166,9 +166,10 @@ namespace llaminar2
         Elements messages;
 
         // Render each message in conversation (skip system, shown separately)
-        for (const auto& msg : conversation_)
+        for (const auto &msg : conversation_)
         {
-            if (msg.role == "system") continue;
+            if (msg.role == "system")
+                continue;
 
             Element role_elem;
             Element content_elem;
@@ -192,7 +193,7 @@ namespace llaminar2
             messages.push_back(vbox({
                 role_elem,
                 content_elem,
-                text(""),  // Spacing
+                text(""), // Spacing
             }));
         }
 
@@ -206,8 +207,7 @@ namespace llaminar2
         if (messages.empty())
         {
             messages.push_back(
-                text("Start a conversation by typing a message below.") | dim | center
-            );
+                text("Start a conversation by typing a message below.") | dim | center);
         }
 
         return vbox(messages) | flex | border | vscroll_indicator | yframe;
@@ -224,7 +224,7 @@ namespace llaminar2
         Element status;
         if (is_generating_)
         {
-            status = text(" |") | blink;  // Cursor indicator
+            status = text(" |") | blink; // Cursor indicator
         }
         else
         {
@@ -256,9 +256,9 @@ namespace llaminar2
         }
         else if (last_token_count_ > 0 && config_.show_stats)
         {
-            double tokens_per_sec = (last_elapsed_ms_ > 0) 
-                ? (last_token_count_ * 1000.0 / last_elapsed_ms_) 
-                : 0.0;
+            double tokens_per_sec = (last_elapsed_ms_ > 0)
+                                        ? (last_token_count_ * 1000.0 / last_elapsed_ms_)
+                                        : 0.0;
             std::ostringstream oss;
             oss << last_token_count_ << " tokens, "
                 << std::fixed << std::setprecision(1) << tokens_per_sec << " tok/s";
@@ -270,10 +270,11 @@ namespace llaminar2
         }
 
         return hbox({
-            text(status_text) | dim,
-            filler(),
-            text("Llaminar Chat") | bold | color(Color::Blue),
-        }) | border;
+                   text(status_text) | dim,
+                   filler(),
+                   text("Llaminar Chat") | bold | color(Color::Blue),
+               }) |
+               border;
     }
 
     // ========================================================================
@@ -288,8 +289,10 @@ namespace llaminar2
 
     void ChatUI::onEnterPressed()
     {
-        if (is_generating_) return;
-        if (current_input_.empty()) return;
+        if (is_generating_)
+            return;
+        if (current_input_.empty())
+            return;
 
         // Handle special commands
         if (current_input_ == "/exit" || current_input_ == "/quit")
@@ -313,7 +316,7 @@ namespace llaminar2
 
         // Save to history
         input_history_.insert(input_history_.begin(), current_input_);
-        if (input_history_.size() > 100)  // Limit history
+        if (input_history_.size() > 100) // Limit history
         {
             input_history_.pop_back();
         }
@@ -329,7 +332,8 @@ namespace llaminar2
 
     void ChatUI::onUpArrow()
     {
-        if (input_history_.empty()) return;
+        if (input_history_.empty())
+            return;
 
         if (history_index_ < static_cast<int>(input_history_.size()) - 1)
         {
@@ -358,7 +362,8 @@ namespace llaminar2
 
     void ChatUI::startGeneration()
     {
-        if (is_generating_) return;
+        if (is_generating_)
+            return;
 
         // Clear current response
         {
@@ -375,7 +380,8 @@ namespace llaminar2
 
     void ChatUI::stopGeneration()
     {
-        if (!is_generating_) return;
+        if (!is_generating_)
+            return;
 
         stop_requested_ = true;
 
@@ -416,7 +422,7 @@ namespace llaminar2
             int eos_token_id = tokenizer_->eos_token();
 
             // Create sampler with configured parameters
-            Sampler sampler(0);  // Random seed
+            Sampler sampler(0); // Random seed
             SamplingParams sampling_params;
             sampling_params.temperature = config_.temperature;
             sampling_params.top_k = config_.top_k;
@@ -426,7 +432,7 @@ namespace llaminar2
             for (int i = 0; i < config_.max_tokens && !stop_requested_; ++i)
             {
                 // Get logits from last forward pass
-                const float* logits_ptr = pipeline_->logits();
+                const float *logits_ptr = pipeline_->logits();
                 if (!logits_ptr)
                 {
                     LOG_ERROR("ChatUI: Failed to get logits");
@@ -470,7 +476,7 @@ namespace llaminar2
                 screen_.PostEvent(Event::Custom);
             }
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
             LOG_ERROR("ChatUI: Generation error: " << e.what());
         }
@@ -481,7 +487,7 @@ namespace llaminar2
         onGenerationComplete(token_count, elapsed_ms);
     }
 
-    void ChatUI::onTokenGenerated(const std::string& token)
+    void ChatUI::onTokenGenerated(const std::string &token)
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         current_response_ += token;
@@ -514,7 +520,7 @@ namespace llaminar2
     // Helpers
     // ========================================================================
 
-    std::string ChatUI::formatMessage(const ChatMessage& msg) const
+    std::string ChatUI::formatMessage(const ChatMessage &msg) const
     {
         if (msg.role == "user")
         {
@@ -530,7 +536,7 @@ namespace llaminar2
         }
     }
 
-    void ChatUI::addToHistory(const std::string& role, const std::string& content)
+    void ChatUI::addToHistory(const std::string &role, const std::string &content)
     {
         conversation_.push_back(ChatMessage(role, content));
     }
@@ -547,9 +553,9 @@ namespace llaminar2
     std::string runSingleShotChat(
         std::shared_ptr<ITokenizer> tokenizer,
         std::shared_ptr<PipelineBase> pipeline,
-        const std::string& prompt,
-        const std::string& system_prompt,
-        const ChatUIConfig& config)
+        const std::string &prompt,
+        const std::string &system_prompt,
+        const ChatUIConfig &config)
     {
         if (!tokenizer || !tokenizer->hasChatTemplate())
         {
@@ -597,7 +603,7 @@ namespace llaminar2
 
         for (int i = 0; i < config.max_tokens; ++i)
         {
-            const float* logits_ptr = pipeline->logits();
+            const float *logits_ptr = pipeline->logits();
             if (!logits_ptr)
             {
                 break;

@@ -50,6 +50,7 @@ namespace llaminar2
                 const Reg64 &reg_C_cursor = r14;
                 const Reg64 &reg_A_cursor = r15;
                 const Reg64 &reg_Scales_cursor = rbp;
+                const Reg64 &reg_Mins_cursor = r8; // Use r8 for Mins cursor
 
                 const Reg32 &reg_tmp_32 = eax;
 
@@ -92,6 +93,14 @@ namespace llaminar2
                 push(r14);
                 push(r15);
 
+                // Allocate zero buffer (256 bytes) for null mins fallback
+                sub(rsp, 256);
+                vpxord(zmm0, zmm0, zmm0);
+                vmovups(ptr[rsp + 0 * 64], zmm0);
+                vmovups(ptr[rsp + 1 * 64], zmm0);
+                vmovups(ptr[rsp + 2 * 64], zmm0);
+                vmovups(ptr[rsp + 3 * 64], zmm0);
+
                 // Save params pointer
                 const Reg64 &reg_params = rdi;
                 push(reg_params);
@@ -100,18 +109,31 @@ namespace llaminar2
                 mov(reg_B, ptr[reg_params + 8]);
                 mov(reg_Comp, ptr[reg_params + 16]);
                 mov(reg_Scales, ptr[reg_params + 24]);
-                mov(reg_C, ptr[reg_params + 32]);
-                mov(reg_K_blocks.cvt32(), ptr[reg_params + 40]);
+                // mins is at +32
+                mov(reg_C, ptr[reg_params + 40]);
+                mov(reg_K_blocks.cvt32(), ptr[reg_params + 48]);
 
                 // Load N and push
-                mov(reg_loop_N.cvt32(), ptr[reg_params + 44]);
+                mov(reg_loop_N.cvt32(), ptr[reg_params + 52]);
                 push(reg_loop_N);
 
                 // Load ldc and shift
-                mov(reg_stride.cvt32(), ptr[reg_params + 48]);
+                mov(reg_stride.cvt32(), ptr[reg_params + 56]);
                 shl(reg_stride, 2);
 
+                // Check if mins is null
+                mov(rax, ptr[reg_params + 32]);
+                test(rax, rax);
+                mov(rax, reg_stride);
+                Label mins_ok;
+                jnz(mins_ok, T_NEAR);
+                xor_(rax, rax); // Set Mins stride to 0 if mins is null
+                L(mins_ok);
+                // Store Mins stride at end of zero buffer (rsp + 16 + 248 = rsp + 264)
+                mov(ptr[rsp + 264], rax);
+
                 // Load A
+                mov(reg_A_cursor, reg_A); // Use reg_A_cursor as temp for A base? No, reg_A is rdi.
                 mov(reg_A, ptr[reg_params + 0]);
 
                 // Setup constants
@@ -151,8 +173,34 @@ namespace llaminar2
                     mov(reg_Scales_cursor, reg_Scales);
                     add(reg_Scales_cursor, reg_tmp);
 
+                    // Mins cursor: params->mins + offset
+                    mov(rax, ptr[rsp + 8]);              // params
+                    mov(reg_Mins_cursor, ptr[rax + 32]); // mins
+
+                    test(reg_Mins_cursor, reg_Mins_cursor);
+                    Label mins_null_in_loop, mins_ready_in_loop;
+                    jz(mins_null_in_loop, T_NEAR);
+
+                    // Recalculate offset (rax was clobbered)
+                    mov(reg_tmp, reg_loop_N);
+                    shl(reg_tmp, 2);
+                    add(reg_Mins_cursor, reg_tmp); // + loop_N * 4
+                    jmp(mins_ready_in_loop, T_NEAR);
+
+                    L(mins_null_in_loop);
+                    lea(reg_Mins_cursor, ptr[rsp + 16]); // Point to zero buffer (rsp + 16 because of 2 pushes)
+
+                    L(mins_ready_in_loop);
+
                     // C cursor: reg_C + offset
-                    mov(reg_C_cursor, reg_C);
+                    // Reload C from params because reg_C (r8) is used for Mins cursor
+                    mov(rax, ptr[rsp + 8]);           // params
+                    mov(reg_C_cursor, ptr[rax + 40]); // C -> r14
+
+                    // Recalculate offset (rax was clobbered)
+                    mov(reg_tmp, reg_loop_N);
+                    shl(reg_tmp, 2); // loop_N * 4
+
                     add(reg_C_cursor, reg_tmp);
 
                     // B cursor calculation: (loop_N / 64) * (K_blocks * 2048)
@@ -174,7 +222,7 @@ namespace llaminar2
                     // Row 1
                     // Load ldc
                     mov(rax, ptr[rsp + 8]);              // params
-                    mov(reg_tmp.cvt32(), ptr[rax + 48]); // ldc
+                    mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
                     shl(reg_tmp, 2);                     // ldc * 4 bytes
 
                     vmovups(zmm4, ptr[reg_C_cursor + reg_tmp + 0 * 64]);
@@ -188,6 +236,66 @@ namespace llaminar2
                     Label loop_K_label;
                     L(loop_K_label);
                     {
+                        // --- Asymmetric Weights Correction ---
+                        // 1. Load sum_qs Row 0 -> zmm30
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + 2]);
+                        vpmovsxwd(zmm30, ymm_tmp); // int16 -> int32
+                        vcvtdq2ps(zmm30, zmm30);   // int32 -> float
+
+                        // 2. Load scale A Row 0 -> zmm22
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor]);
+                        vcvtph2ps(zmm22, ymm_tmp);
+
+                        // 3. sum_qs_0_scaled = sum_qs_0 * scale_A_0
+                        vmulps(zmm30, zmm30, zmm22);
+
+                        // 4. Load sum_qs Row 1 -> zmm31
+                        // Offset: A_stride
+                        mov(reg_tmp, ptr[rsp + 8]);
+                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // A_stride
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp + 2]);
+                        vpmovsxwd(zmm31, ymm_tmp);
+                        vcvtdq2ps(zmm31, zmm31);
+
+                        // 5. Load scale A Row 1 -> zmm25
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp]);
+                        vcvtph2ps(zmm25, ymm_tmp);
+
+                        // 6. sum_qs_1_scaled = sum_qs_1 * scale_A_1
+                        vmulps(zmm31, zmm31, zmm25);
+
+                        // 7. Apply correction
+                        // Load mins (using reg_Mins_cursor)
+                        vmovups(zmm26, ptr[reg_Mins_cursor + 0 * 64]);
+                        vmovups(zmm27, ptr[reg_Mins_cursor + 1 * 64]);
+                        vmovups(zmm28, ptr[reg_Mins_cursor + 2 * 64]);
+                        vmovups(zmm29, ptr[reg_Mins_cursor + 3 * 64]);
+
+                        // Correction Row 0 (using zmm16-19)
+                        vmulps(zmm16, zmm26, zmm30);
+                        vmulps(zmm17, zmm27, zmm30);
+                        vmulps(zmm18, zmm28, zmm30);
+                        vmulps(zmm19, zmm29, zmm30);
+
+                        vaddps(zmm0, zmm0, zmm16);
+                        vaddps(zmm1, zmm1, zmm17);
+                        vaddps(zmm2, zmm2, zmm18);
+                        vaddps(zmm3, zmm3, zmm19);
+
+                        // Correction Row 1 (using zmm16-19)
+                        vmulps(zmm16, zmm26, zmm31);
+                        vmulps(zmm17, zmm27, zmm31);
+                        vmulps(zmm18, zmm28, zmm31);
+                        vmulps(zmm19, zmm29, zmm31);
+
+                        vaddps(zmm4, zmm4, zmm16);
+                        vaddps(zmm5, zmm5, zmm17);
+                        vaddps(zmm6, zmm6, zmm18);
+                        vaddps(zmm7, zmm7, zmm19);
+
+                        // Advance Mins cursor
+                        add(reg_Mins_cursor, ptr[rsp + 264]); // Add Mins stride (0 or reg_stride)
+
                         // 1. Load Comp (4 regs) and init Temp Accumulators
                         vmovups(zmm_b0, ptr[reg_Comp_cursor + 0 * 64]);
                         vmovups(zmm_b1, ptr[reg_Comp_cursor + 1 * 64]);
@@ -220,8 +328,8 @@ namespace llaminar2
 
                             // Load A Row 1
                             // Offset: A_stride
-                            mov(reg_tmp, ptr[rsp + 8]);              // Load params ptr
-                            mov(reg_tmp.cvt32(), ptr[reg_tmp + 92]); // Load A_stride
+                            mov(reg_tmp, ptr[rsp + 8]);               // Load params ptr
+                            mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // Load A_stride
                             vpbroadcastd(zmm_a1, ptr[reg_A_cursor + reg_tmp + 4 + i * 4]);
                             vpxord(zmm_a1, zmm_a1, zmm_128);
 
@@ -289,8 +397,8 @@ namespace llaminar2
                         vaddps(zmm3, zmm3, zmm11);
 
                         // 6. Load Scale A Row 1 and multiply
-                        mov(reg_tmp, ptr[rsp + 8]);              // Load params ptr
-                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 92]); // Load A_stride
+                        mov(reg_tmp, ptr[rsp + 8]);               // Load params ptr
+                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // Load A_stride
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp]);
                         vcvtph2ps(zmm_scale, ymm_tmp);
 
@@ -323,7 +431,7 @@ namespace llaminar2
                     mov(rax, ptr[rsp + 8]); // params
 
                     // 1. Bias
-                    mov(rdx, ptr[rax + 56]); // bias ptr
+                    mov(rdx, ptr[rax + 64]); // bias ptr
                     test(rdx, rdx);
                     Label skip_bias;
                     jz(skip_bias, T_NEAR);
@@ -349,7 +457,7 @@ namespace llaminar2
                     L(skip_bias);
 
                     // 2. Mask
-                    mov(rdx, ptr[rax + 64]); // mask ptr
+                    mov(rdx, ptr[rax + 72]); // mask ptr
                     test(rdx, rdx);
                     Label skip_mask;
                     jz(skip_mask, T_NEAR);
@@ -371,7 +479,7 @@ namespace llaminar2
 
                         // Row 1 mask
                         // Offset = ldc * 4 (stride)
-                        mov(rsi, ptr[rax + 48]); // ldc
+                        mov(rsi, ptr[rax + 56]); // ldc
                         shl(rsi, 2);
                         add(rcx, rsi); // rcx points to Row 1 mask
 
@@ -390,7 +498,7 @@ namespace llaminar2
                     L(skip_mask);
 
                     // 3. Softmax
-                    mov(al, ptr[rax + 88]); // do_softmax
+                    mov(al, ptr[rax + 96]); // do_softmax
                     test(al, al);
                     Label skip_softmax;
                     jz(skip_softmax, T_NEAR);
@@ -479,7 +587,7 @@ namespace llaminar2
 
                         vpbroadcastd(zmm_max, xmm10);
 
-                        mov(rdx, ptr[rax + 72]); // local_max ptr
+                        mov(rdx, ptr[rax + 80]); // local_max ptr
                         mov(r15, reg_loop_N);
                         shr(r15, 4); // / 16
                         vmovss(ptr[rdx + r15], xmm10);
@@ -499,7 +607,7 @@ namespace llaminar2
                         vpermilps(xmm11, xmm10, 0b10110001);
                         vaddps(xmm10, xmm10, xmm11);
 
-                        mov(rdx, ptr[rax + 80]); // local_sum ptr
+                        mov(rdx, ptr[rax + 88]); // local_sum ptr
                         vmovss(ptr[rdx + r15], xmm10);
 
                         // --- Row 1 ---
@@ -518,11 +626,11 @@ namespace llaminar2
 
                         vpbroadcastd(zmm_max, xmm10);
 
-                        mov(rdx.cvt32(), ptr[rax + 44]); // N (32-bit load)
+                        mov(rdx.cvt32(), ptr[rax + 52]); // N (32-bit load)
                         shr(rdx, 4);                     // N / 16
                         add(rdx, r15);                   // offset_row1
 
-                        mov(rcx, ptr[rax + 72]); // local_max ptr
+                        mov(rcx, ptr[rax + 80]); // local_max ptr
                         vmovss(ptr[rcx + rdx], xmm10);
 
                         vpxord(zmm_sum, zmm_sum, zmm_sum);
@@ -540,14 +648,14 @@ namespace llaminar2
                         vpermilps(xmm11, xmm10, 0b10110001);
                         vaddps(xmm10, xmm10, xmm11);
 
-                        mov(rcx, ptr[rax + 80]); // local_sum ptr
+                        mov(rcx, ptr[rax + 88]); // local_sum ptr
                         vmovss(ptr[rcx + rdx], xmm10);
                     }
                     L(skip_softmax);
 
                     // 4. SwiGLU
                     mov(rax, ptr[rsp + 8]);  // params
-                    cmp(byte[rax + 104], 1); // do_swiglu
+                    cmp(byte[rax + 112], 1); // do_swiglu
                     Label skip_swiglu;
                     jne(skip_swiglu, T_NEAR);
                     {
@@ -593,10 +701,10 @@ namespace llaminar2
                         mov(rax, ptr[rsp + 8]);
 
                         // Load gate_input pointer
-                        mov(rdx, ptr[rax + 96]);
+                        mov(rdx, ptr[rax + 104]);
 
                         // Load ldc for Row 1
-                        mov(reg_tmp.cvt32(), ptr[rax + 48]); // ldc
+                        mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
                         shl(reg_tmp, 2);                     // ldc * 4
 
                         auto compute_swish = [&](const Zmm &zmm_val, const Reg64 &base, int offset)
@@ -644,7 +752,7 @@ namespace llaminar2
                     // Store C
                     // Load ldc
                     mov(rax, ptr[rsp + 8]);              // params
-                    mov(reg_tmp.cvt32(), ptr[rax + 48]); // ldc
+                    mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
                     shl(reg_tmp, 2);                     // ldc * 4 bytes
 
                     // Row 0
@@ -659,6 +767,10 @@ namespace llaminar2
                     vmovups(ptr[reg_C_cursor + 1 * 64], zmm5);
                     vmovups(ptr[reg_C_cursor + 2 * 64], zmm6);
                     vmovups(ptr[reg_C_cursor + 3 * 64], zmm7);
+                    sub(reg_C_cursor, reg_tmp); // Restore
+
+                    // Advance C cursor
+                    add(reg_C_cursor, 256);
 
                     // Advance N loop
                     add(reg_loop_N, 64);
@@ -666,7 +778,8 @@ namespace llaminar2
                 }
 
                 L("end_kernel");
-                add(rsp, 16); // Pop N and params
+                add(rsp, 16);  // Pop N and params
+                add(rsp, 256); // Free zero buffer
                 pop(r15);
                 pop(r14);
                 pop(r13);

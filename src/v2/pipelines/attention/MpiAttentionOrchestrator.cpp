@@ -179,18 +179,6 @@ namespace llaminar2
         // Distribute attention heads across ranks
         auto [start_head, local_n_heads] = config.mpi_ctx->get_local_slice(static_cast<size_t>(config.n_heads));
 
-        if (config.verbose_logging && rank == 0)
-        {
-            LOG_INFO("[MPI TensorParallel] Attention: n_heads=" << config.n_heads
-                                                                << ", world_size=" << world_size << ", local_n_heads=" << local_n_heads);
-        }
-
-        if (rank == 0 || config.verbose_logging)
-        {
-            LOG_INFO("[MPI TensorParallel] Rank " << rank << "/" << world_size
-                                                  << ": Computing heads [" << start_head << ", " << (start_head + local_n_heads - 1) << "]");
-        }
-
         // Get tensor data pointers
         const float *Q_data = Q->data();
         const float *K_data = K->data();

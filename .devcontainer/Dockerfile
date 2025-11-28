@@ -9,6 +9,9 @@ ENV INSTALL_ROCM=${INSTALL_ROCM}
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# CMake default parallelism
+ENV CMAKE_BUILD_PARALLEL_LEVEL=56
+
 # CRITICAL: Install sed, grep, and core utilities FIRST before anything else
 # These are required by VS Code's UID update process and Intel oneAPI repo setup
 RUN apt-get update && apt-get install -y \

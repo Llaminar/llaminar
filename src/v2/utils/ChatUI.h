@@ -35,13 +35,13 @@ namespace llaminar2
      */
     struct ChatUIConfig
     {
-        std::string system_prompt = "";    ///< Optional system message
-        int max_tokens = 512;              ///< Max tokens per response
-        float temperature = 0.7f;          ///< Sampling temperature
-        int top_k = 40;                    ///< Top-k sampling
-        float top_p = 0.9f;                ///< Top-p (nucleus) sampling
-        bool show_system = true;           ///< Show system prompt in UI
-        bool show_stats = true;            ///< Show generation statistics
+        std::string system_prompt = ""; ///< Optional system message
+        int max_tokens = 512;           ///< Max tokens per response
+        float temperature = 0.7f;       ///< Sampling temperature
+        int top_k = 40;                 ///< Top-k sampling
+        float top_p = 0.9f;             ///< Top-p (nucleus) sampling
+        bool show_system = true;        ///< Show system prompt in UI
+        bool show_stats = true;         ///< Show generation statistics
     };
 
     /**
@@ -63,10 +63,10 @@ namespace llaminar2
      * @code
      *   auto tokenizer = createTokenizer(model_ctx);
      *   auto pipeline = createPipeline(model_ctx);
-     *   
+     *
      *   ChatUIConfig config;
      *   config.system_prompt = "You are a helpful assistant.";
-     *   
+     *
      *   ChatUI chat(tokenizer, pipeline, config);
      *   chat.run();  // Blocks until user exits
      * @endcode
@@ -83,7 +83,7 @@ namespace llaminar2
          */
         ChatUI(std::shared_ptr<ITokenizer> tokenizer,
                std::shared_ptr<PipelineBase> pipeline,
-               const ChatUIConfig& config = {});
+               const ChatUIConfig &config = {});
 
         /**
          * @brief Destructor - ensures clean shutdown of generation thread
@@ -91,8 +91,8 @@ namespace llaminar2
         ~ChatUI();
 
         // Disable copy
-        ChatUI(const ChatUI&) = delete;
-        ChatUI& operator=(const ChatUI&) = delete;
+        ChatUI(const ChatUI &) = delete;
+        ChatUI &operator=(const ChatUI &) = delete;
 
         /**
          * @brief Run the interactive chat UI
@@ -133,12 +133,12 @@ namespace llaminar2
         void generationThread();
 
         // Token callback (called from generation thread)
-        void onTokenGenerated(const std::string& token);
+        void onTokenGenerated(const std::string &token);
         void onGenerationComplete(int tokens, double elapsed_ms);
 
         // Helpers
-        std::string formatMessage(const ChatMessage& msg) const;
-        void addToHistory(const std::string& role, const std::string& content);
+        std::string formatMessage(const ChatMessage &msg) const;
+        void addToHistory(const std::string &role, const std::string &content);
         void scrollToBottom();
 
         // Dependencies
@@ -153,9 +153,9 @@ namespace llaminar2
         // Conversation state
         std::vector<ChatMessage> conversation_;
         std::string current_input_;
-        std::string current_response_;         // Accumulator for streaming
+        std::string current_response_; // Accumulator for streaming
         std::vector<std::string> input_history_;
-        int history_index_ = -1;               // -1 = current input, 0+ = history
+        int history_index_ = -1; // -1 = current input, 0+ = history
 
         // Generation state
         std::atomic<bool> is_generating_{false};
@@ -187,8 +187,8 @@ namespace llaminar2
     std::string runSingleShotChat(
         std::shared_ptr<ITokenizer> tokenizer,
         std::shared_ptr<PipelineBase> pipeline,
-        const std::string& prompt,
-        const std::string& system_prompt = "",
-        const ChatUIConfig& config = {});
+        const std::string &prompt,
+        const std::string &system_prompt = "",
+        const ChatUIConfig &config = {});
 
 } // namespace llaminar2

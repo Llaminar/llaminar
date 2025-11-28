@@ -7,6 +7,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../utils/CPUFeatures.h"
+#include "../../../utils/DebugEnv.h"
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -62,9 +63,13 @@ namespace llaminar2
 
                 // Pad N to multiple of 64 for blocking
                 int N_padded = (N + 63) / 64 * 64;
+                // K_blocks covers all K, including tail
+                int K_blocks = (K + 31) / 32;
+
                 packed_weights_.packed_data.resize(K * N_padded);
-                packed_weights_.compensation.resize((K / 32) * N);
-                packed_weights_.scales.resize((K / 32) * N);
+                packed_weights_.compensation.resize(K_blocks * N_padded);
+                packed_weights_.scales.resize(K_blocks * N_padded);
+                packed_weights_.mins.resize(K_blocks * N_padded);
 
                 // Check for IINT8Unpackable interface
                 const IINT8Unpackable *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
@@ -85,12 +90,13 @@ namespace llaminar2
                     // Stride for K/4 is 256 bytes (64 * 4)
                     size_t row_base_offset = (size_t)n_blk * (K * 64) + n_rem * 4;
 
-                    for (int k_blk = 0; k_blk < K / 32; ++k_blk)
+                    for (int k_blk = 0; k_blk < K_blocks; ++k_blk)
                     {
                         // Unpack block using generic interface
                         int8_t temp_vals[32];
                         unpackable->unpack_block_to_int8(n, k_blk, temp_vals);
                         float scale = unpackable->get_block_scale(n, k_blk);
+                        float min_val = unpackable->get_block_min(n, k_blk);
 
                         // Vectorized sum
                         int32_t sum = 0;
@@ -105,6 +111,15 @@ namespace llaminar2
                         // k starts at k_blk * 32.
                         // k/4 starts at k_blk * 8.
                         size_t block_offset = row_base_offset + (size_t)(k_blk * 8) * 256;
+
+                        // Ensure we don't write out of bounds if K is weirdly small/unaligned
+                        // But packed_data is resized to K * N_padded.
+                        // If K=33, K_blocks=2.
+                        // k_blk=1. block_offset = ... + 2048.
+                        // We write 32 bytes.
+                        // If K=33, packed_data size is 33*64 = 2112.
+                        // 2048 + 32 = 2080 < 2112. Safe.
+
                         int8_t *dst_ptr = packed_weights_.packed_data.data() + block_offset;
 
                         // Unroll the 8 writes
@@ -113,8 +128,9 @@ namespace llaminar2
                             std::memcpy(dst_ptr + j * 256, &temp_vals[j * 4], 4);
                         }
 
-                        packed_weights_.compensation[k_blk * N + n] = sum;
-                        packed_weights_.scales[k_blk * N + n] = scale;
+                        packed_weights_.compensation[k_blk * N_padded + n] = sum;
+                        packed_weights_.scales[k_blk * N_padded + n] = scale;
+                        packed_weights_.mins[k_blk * N_padded + n] = min_val;
                     }
                 }
             }
@@ -181,8 +197,12 @@ namespace llaminar2
                         C[i] *= beta;
                 }
 
-                int k_blocks = k / 32;
+                int k_blocks = (k + 31) / 32;
                 int blocks_per_row = (n + 63) / 64; // Added for Softmax offset calculation
+
+                // Calculate N_padded (must match packing)
+                int N_padded = (n + 63) / 64 * 64;
+                bool is_padded = (n != N_padded);
 
                 // Shared buffer for quantized A
                 // We need to allocate this outside parallel region or use a shared vector
@@ -195,7 +215,11 @@ namespace llaminar2
                 {
                     // 1. Quantize A
                     // If M is small, parallelize over K to utilize threads
-                    if (m < omp_get_num_threads())
+                    int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
+                    if (quant_thresh == 0)
+                        quant_thresh = omp_get_num_threads();
+
+                    if (m < quant_thresh)
                     {
 #pragma omp for collapse(2) schedule(static)
                         for (int i = 0; i < m; ++i)
@@ -208,7 +232,8 @@ namespace llaminar2
                                 float max_abs = 0.0f;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = std::abs(a_row[k_blk * 32 + j]);
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
                                     if (val > max_abs)
                                         max_abs = val;
                                 }
@@ -223,7 +248,8 @@ namespace llaminar2
                                 int32_t sum_qs = 0;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = a_row[k_blk * 32 + j];
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
                                     int8_t q = static_cast<int8_t>(std::round(val * id));
                                     row_blocks[k_blk].qs[j] = q;
                                     sum_qs += q;
@@ -239,10 +265,6 @@ namespace llaminar2
                         for (int i = 0; i < m; ++i)
                         {
                             const float *a_row = A + i * k;
-                            if (i == 0)
-                            {
-                                std::cerr << "[quantize_activations] Inside loop (else): A=" << A << " a_row=" << a_row << std::endl;
-                            }
                             Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
                             for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
@@ -250,7 +272,8 @@ namespace llaminar2
                                 float max_abs = 0.0f;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = std::abs(a_row[k_blk * 32 + j]);
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
                                     if (val > max_abs)
                                         max_abs = val;
                                 }
@@ -265,7 +288,8 @@ namespace llaminar2
                                 int32_t sum_qs = 0;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = a_row[k_blk * 32 + j];
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
                                     int8_t q = static_cast<int8_t>(std::round(val * id));
                                     row_blocks[k_blk].qs[j] = q;
                                     sum_qs += q;
@@ -283,7 +307,7 @@ namespace llaminar2
                     // when M is large.
 
                     // Detect cache sizes
-                    int num_threads = omp_get_num_threads();
+                    int num_threads = omp_get_max_threads(); // Use max threads for planning
                     long long l2_size = cpu_l2_cache_size();
                     if (l2_size == 0)
                         l2_size = 1024 * 1024; // Fallback 1MB
@@ -294,34 +318,29 @@ namespace llaminar2
                         l3_size = l2_size * num_threads;
 
                     // Calculate block size limit
-                    // 1. L2 constraint: Block must fit in L2 (use 90% to leave room for A/C)
-                    long long l2_limit = (long long)(l2_size * 0.9);
+                    // 1. L2 constraint: Block must fit in L2 (use configured % to leave room for A/C)
+                    long long l2_limit = (long long)(l2_size * debugEnv().gemm.gemm_l2_limit_pct);
 
                     // 2. L3 constraint: All threads' blocks must fit in L3
-                    // Use 90% of L3 shared among threads
-                    long long l3_limit_per_thread = (long long)(l3_size * 0.9 / num_threads);
+                    // Use configured % of L3 shared among threads
+                    long long l3_limit_per_thread = (long long)(l3_size * debugEnv().gemm.gemm_l3_share_pct / num_threads);
 
                     // Take the tighter constraint
                     long long block_size_limit = std::min(l2_limit, l3_limit_per_thread);
 
                     // Ensure we have at least some reasonable block size (e.g. 64KB)
-                    if (block_size_limit < 65536)
-                        block_size_limit = 65536;
+                    int min_block_size = debugEnv().gemm.gemm_min_block_size;
+                    if (block_size_limit < min_block_size)
+                        block_size_limit = min_block_size;
 
                     int max_n_block = block_size_limit / k;
-                    // Align to 64 (kernel block size)
                     max_n_block = (max_n_block / 64) * 64;
                     if (max_n_block < 64)
                         max_n_block = 64;
 
-                    // Adaptive block sizing
-                    // We want enough tasks to saturate threads.
-                    // Total tasks = (m_tasks) * (n_tasks)
-                    // m_tasks = (m + 1) / 2
-                    // n_tasks = n / n_task_block
-                    // num_threads is already calculated above
-                    int target_tasks = num_threads * 4; // Heuristic: 4x oversubscription for load balancing
-                    int m_tasks = (m + 1) / 2;
+                    int target_tasks = num_threads * debugEnv().gemm.gemm_oversubscription_factor;
+                    int m_granularity = debugEnv().gemm.gemm_m_task_granularity;
+                    int m_tasks = (m + m_granularity - 1) / m_granularity;
                     if (m_tasks < 1)
                         m_tasks = 1;
 
@@ -354,8 +373,9 @@ namespace llaminar2
                     // Check if we need K-tiling (when B-block spills L2 cache)
                     // l2_size is already detected above
 
-                    // Use 90% of L2 cache to be safe (leave room for A, C, overhead)
-                    const long long L2_CACHE_SIZE = (long long)(l2_size * 0.9);
+                    // Use configured % of L2 cache as threshold for K-tiling
+                    // This ensures we tile even for moderate block sizes when M is large
+                    const long long L2_CACHE_SIZE = (long long)(l2_size * debugEnv().gemm.gemm_k_tile_threshold_pct);
                     bool needs_k_tiling = ((long long)n_task_block * k > L2_CACHE_SIZE);
 
                     // Check if we have enough parallelism to avoid collapsing M
@@ -367,16 +387,16 @@ namespace llaminar2
                         // K-tiling path: Parallelize N only, tile K inside to reuse B in L2
                         // Calculate dynamic tile size based on L2 cache and n_task_block
                         // We want n_task_block * (k_tile_blocks * 32) * sizeof(int8_t) <= L2_CACHE_SIZE * fraction
-                        // Let's use 60% of L2 for B to be safe and allow A/C streaming
-                        long long target_b_size = (long long)(L2_CACHE_SIZE * 0.6);
+                        // Let's use configured % of L2 for B tile
+                        long long target_b_size = (long long)(l2_size * debugEnv().gemm.gemm_target_b_size_pct);
                         int k_tile_elements = (int)(target_b_size / n_task_block);
                         int k_tile_blocks = k_tile_elements / 32;
 
                         // Clamp to reasonable limits
-                        if (k_tile_blocks < 32)
-                            k_tile_blocks = 32; // Min 1024 K elements
-                        if (k_tile_blocks > 256)
-                            k_tile_blocks = 256; // Max 8192 K elements
+                        if (k_tile_blocks < debugEnv().gemm.gemm_k_tile_min_blocks)
+                            k_tile_blocks = debugEnv().gemm.gemm_k_tile_min_blocks;
+                        if (k_tile_blocks > debugEnv().gemm.gemm_k_tile_max_blocks)
+                            k_tile_blocks = debugEnv().gemm.gemm_k_tile_max_blocks;
 
 #pragma omp for schedule(dynamic)
                         for (int n_task = 0; n_task < n; n_task += n_task_block)
@@ -389,10 +409,16 @@ namespace llaminar2
                                 int k_count = std::min(k_tile_blocks, k_blocks - k_start);
 
                                 // Iterate over M (reuse B-tile for all M)
-                                for (int i = 0; i < m; i += 2)
+                                int unroll = debugEnv().gemm.gemm_m_unroll_factor;
+                                if (unroll != 1 && unroll != 2)
+                                    unroll = 2;
+
+                                for (int i = 0; i < m; i += unroll)
                                 {
                                     int rows_left = m - i;
-                                    int rows_to_process = (rows_left >= 2) ? 2 : 1;
+                                    int rows_to_process = (rows_left >= unroll) ? unroll : rows_left;
+                                    if (is_padded && rows_to_process > 1)
+                                        rows_to_process = 1;
 
                                     Q8_1Block *blocks = all_blocks + i * k_blocks + k_start;
 
@@ -405,22 +431,37 @@ namespace llaminar2
                                         size_t weights_offset = (size_t)(n_blk / 64) * (k * 64) + (size_t)k_start * 32 * 64;
                                         const int8_t *b_ptr = packed_weights_.packed_data.data() + weights_offset;
 
-                                        // Fix: Offset compensation and scales by k_start * N
-                                        const int32_t *comp_ptr = packed_weights_.compensation.data() + (size_t)k_start * n + n_blk;
-                                        const float *scales_ptr = packed_weights_.scales.data() + (size_t)k_start * n + n_blk;
+                                        // Fix: Offset compensation and scales by k_start * N_padded
+                                        const int32_t *comp_ptr = packed_weights_.compensation.data() + (size_t)k_start * N_padded + n_blk;
+                                        const float *scales_ptr = packed_weights_.scales.data() + (size_t)k_start * N_padded + n_blk;
+                                        const float *mins_ptr = packed_weights_.mins.data() + (size_t)k_start * N_padded + n_blk;
 
                                         QuantisedGemmParams params;
                                         params.A = blocks;
                                         params.B_packed = b_ptr;
                                         params.comp = comp_ptr;
                                         params.scales = scales_ptr;
-                                        params.C = C + i * n + n_blk;
+                                        params.mins = mins_ptr;
                                         params.K_blocks = k_count;
                                         params.N = 64;
-                                        params.ldc = n;
+                                        params.ldc = N_padded;
                                         params.bias = bias ? bias + n_blk : nullptr;
                                         params.mask = mask ? mask + i * n + n_blk : nullptr;
                                         params.A_stride = k_blocks * sizeof(Q8_1Block);
+
+                                        bool is_tail = (n_blk + 64 > n);
+                                        float C_temp[64];
+                                        if (is_tail)
+                                        {
+                                            int valid_n = n - n_blk;
+                                            std::memcpy(C_temp, C + i * n + n_blk, valid_n * sizeof(float));
+                                            std::memset(C_temp + valid_n, 0, (64 - valid_n) * sizeof(float));
+                                            params.C = C_temp;
+                                        }
+                                        else
+                                        {
+                                            params.C = C + i * n + n_blk;
+                                        }
 
                                         bool is_last_k_tile = (k_start + k_count == k_blocks);
                                         bool current_do_softmax = do_softmax && is_last_k_tile;
@@ -473,6 +514,12 @@ namespace llaminar2
                                         }
                                         else
                                             kernel(&params);
+
+                                        if (is_tail)
+                                        {
+                                            int valid_n = n - n_blk;
+                                            std::memcpy(C + i * n + n_blk, C_temp, valid_n * sizeof(float));
+                                        }
                                     }
                                 }
                             }
@@ -480,14 +527,20 @@ namespace llaminar2
                     }
                     else
                     {
+                        int unroll = debugEnv().gemm.gemm_m_unroll_factor;
+                        if (unroll != 1 && unroll != 2)
+                            unroll = 2;
+
                         // Standard path: Collapse M and N for maximum parallelism
 #pragma omp for collapse(2) schedule(static)
                         for (int n_task = 0; n_task < n; n_task += n_task_block)
                         {
-                            for (int i = 0; i < m; i += 2)
+                            for (int i = 0; i < m; i += unroll)
                             {
                                 int rows_left = m - i;
-                                int rows_to_process = (rows_left >= 2) ? 2 : 1;
+                                int rows_to_process = (rows_left >= unroll) ? unroll : rows_left;
+                                if (is_padded && rows_to_process > 1)
+                                    rows_to_process = 1;
 
                                 Q8_1Block *blocks = all_blocks + i * k_blocks;
 
@@ -500,19 +553,34 @@ namespace llaminar2
 
                                     const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
                                     const float *scales_ptr = packed_weights_.scales.data() + n_blk;
+                                    const float *mins_ptr = packed_weights_.mins.data() + n_blk;
 
                                     QuantisedGemmParams params;
                                     params.A = blocks;
                                     params.B_packed = b_ptr;
                                     params.comp = comp_ptr;
                                     params.scales = scales_ptr;
-                                    params.C = C + i * n + n_blk;
+                                    params.mins = mins_ptr;
                                     params.K_blocks = k_blocks;
                                     params.N = 64;
-                                    params.ldc = n;
+                                    params.ldc = N_padded;
                                     params.bias = bias ? bias + n_blk : nullptr;
                                     params.mask = mask ? mask + i * n + n_blk : nullptr;
                                     params.A_stride = k_blocks * sizeof(Q8_1Block);
+
+                                    bool is_tail = (n_blk + 64 > n);
+                                    float C_temp[64];
+                                    if (is_tail)
+                                    {
+                                        int valid_n = n - n_blk;
+                                        std::memcpy(C_temp, C + i * n + n_blk, valid_n * sizeof(float));
+                                        std::memset(C_temp + valid_n, 0, (64 - valid_n) * sizeof(float));
+                                        params.C = C_temp;
+                                    }
+                                    else
+                                    {
+                                        params.C = C + i * n + n_blk;
+                                    }
 
                                     float tmp_max[2], tmp_sum[2];
                                     if (do_softmax)
@@ -561,6 +629,12 @@ namespace llaminar2
                                     }
                                     else
                                         kernel(&params);
+
+                                    if (is_tail)
+                                    {
+                                        int valid_n = n - n_blk;
+                                        std::memcpy(C + i * n + n_blk, C_temp, valid_n * sizeof(float));
+                                    }
                                 }
                             }
                         }
@@ -660,13 +734,17 @@ namespace llaminar2
                     return false;
                 }
 
-                int k_blocks = k / 32;
+                int k_blocks = (k + 31) / 32;
                 Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
 
 #pragma omp parallel
                 {
                     // Parallelize over rows for large M, or collapse for small M
-                    if (m < omp_get_num_threads())
+                    int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
+                    if (quant_thresh == 0)
+                        quant_thresh = omp_get_num_threads();
+
+                    if (m < quant_thresh)
                     {
 #pragma omp for collapse(2) schedule(static)
                         for (int i = 0; i < m; ++i)
@@ -679,7 +757,8 @@ namespace llaminar2
                                 float max_abs = 0.0f;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = std::abs(a_row[k_blk * 32 + j]);
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
                                     if (val > max_abs)
                                         max_abs = val;
                                 }
@@ -694,7 +773,8 @@ namespace llaminar2
                                 int32_t sum_qs = 0;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = a_row[k_blk * 32 + j];
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
                                     int8_t q = static_cast<int8_t>(std::round(val * id));
                                     row_blocks[k_blk].qs[j] = q;
                                     sum_qs += q;
@@ -717,7 +797,8 @@ namespace llaminar2
                                 float max_abs = 0.0f;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = std::abs(a_row[k_blk * 32 + j]);
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
                                     if (val > max_abs)
                                         max_abs = val;
                                 }
@@ -732,7 +813,8 @@ namespace llaminar2
                                 int32_t sum_qs = 0;
                                 for (int j = 0; j < 32; ++j)
                                 {
-                                    float val = a_row[k_blk * 32 + j];
+                                    int col_idx = k_blk * 32 + j;
+                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
                                     int8_t q = static_cast<int8_t>(std::round(val * id));
                                     row_blocks[k_blk].qs[j] = q;
                                     sum_qs += q;
@@ -866,13 +948,17 @@ namespace llaminar2
                         n_task_block = calc_block;
                     }
 
+                    int unroll = debugEnv().gemm.gemm_m_unroll_factor;
+                    if (unroll != 1 && unroll != 2)
+                        unroll = 2;
+
 #pragma omp for collapse(2) schedule(static)
                     for (int n_task = 0; n_task < n; n_task += n_task_block)
                     {
-                        for (int i = 0; i < m; i += 2)
+                        for (int i = 0; i < m; i += unroll)
                         {
                             int rows_left = m - i;
-                            int rows_to_process = (rows_left >= 2) ? 2 : 1;
+                            int rows_to_process = (rows_left >= unroll) ? unroll : rows_left;
 
                             // Pointer to Q8_1 blocks for this row
                             const Q8_1Block *blocks = all_blocks + i * k_blocks;
@@ -885,12 +971,14 @@ namespace llaminar2
 
                                 const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
                                 const float *scales_ptr = packed_weights_.scales.data() + n_blk;
+                                const float *mins_ptr = packed_weights_.mins.data() + n_blk;
 
                                 QuantisedGemmParams params;
                                 params.A = blocks;
                                 params.B_packed = b_ptr;
                                 params.comp = comp_ptr;
                                 params.scales = scales_ptr;
+                                params.mins = mins_ptr;
                                 params.C = C + i * n + n_blk;
                                 params.K_blocks = k_blocks;
                                 params.N = 64;
@@ -1064,13 +1152,17 @@ namespace llaminar2
 
                     // Standard path: Collapse M and N for maximum parallelism
                     // (K-tiling path would need similar adaptation)
+                    int unroll = debugEnv().gemm.gemm_m_unroll_factor;
+                    if (unroll != 1 && unroll != 2)
+                        unroll = 2;
+
 #pragma omp for collapse(2) schedule(static)
                     for (int n_task = 0; n_task < n; n_task += n_task_block)
                     {
-                        for (int i = 0; i < m; i += 2)
+                        for (int i = 0; i < m; i += unroll)
                         {
                             int rows_left = m - i;
-                            int rows_to_process = (rows_left >= 2) ? 2 : 1;
+                            int rows_to_process = (rows_left >= unroll) ? unroll : rows_left;
 
                             // Get pointer to first block for row i
                             // Use get_raw_block_at to get the Q8_1Block* directly
@@ -1085,12 +1177,14 @@ namespace llaminar2
 
                                 const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
                                 const float *scales_ptr = packed_weights_.scales.data() + n_blk;
+                                const float *mins_ptr = packed_weights_.mins.data() + n_blk;
 
                                 QuantisedGemmParams params;
                                 params.A = blocks;
                                 params.B_packed = b_ptr;
                                 params.comp = comp_ptr;
                                 params.scales = scales_ptr;
+                                params.mins = mins_ptr;
                                 params.C = C + i * n + n_blk;
                                 params.K_blocks = k_blocks;
                                 params.N = 64;
