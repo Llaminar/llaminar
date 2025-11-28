@@ -644,6 +644,18 @@ add_v2_test(V2_Unit_ChatTemplate
     MPI_PROCS 1  # ChatTemplate is single-rank only
 )
 
+# Test: BPETokenizer byte encoding (GPT-2 style byte-level encoding/decoding)
+add_executable(v2_test_bpe_byte_encoding unit/Test__BPETokenizerByteEncoding.cpp)
+target_link_libraries(v2_test_bpe_byte_encoding 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BPEByteEncoding 
+    COMMAND $<TARGET_FILE:v2_test_bpe_byte_encoding>
+    LABELS "V2;Unit;Tokenization;ByteEncoding;UTF8;Unicode;TextProcessing"
+    MPI_PROCS 1  # Pure unit test, no MPI needed
+)
+
 # Test: Attention parity regression tests (locks in RoPE theta, causal masking, GQA behavior)
 add_executable(v2_test_attention_parity unit/Test__AttentionParity.cpp)
 target_link_libraries(v2_test_attention_parity 

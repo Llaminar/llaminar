@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "ChatTemplate.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -77,6 +78,62 @@ namespace llaminar2
          * @brief Get vocabulary size
          */
         virtual int vocab_size() const = 0;
+
+        // =====================================================================
+        // Chat Template Support
+        // =====================================================================
+
+        /**
+         * @brief Get the chat template from model metadata
+         *
+         * Returns the raw chat template string from the GGUF metadata,
+         * typically from `tokenizer.chat_template`. Returns empty string
+         * if no template is available.
+         *
+         * @return Raw template string or empty if unavailable
+         */
+        virtual std::string getChatTemplateString() const = 0;
+
+        /**
+         * @brief Get the detected chat template type
+         *
+         * @return ChatTemplateType enum value (UNKNOWN if not detected)
+         */
+        virtual ChatTemplateType getChatTemplateType() const = 0;
+
+        /**
+         * @brief Check if the tokenizer has a chat template
+         *
+         * @return true if a chat template is available
+         */
+        virtual bool hasChatTemplate() const = 0;
+
+        /**
+         * @brief Apply chat template to messages and encode
+         *
+         * Formats messages using the model's chat template, then tokenizes.
+         * This is the main entry point for chat-based inference.
+         *
+         * @param messages Vector of chat messages (role + content)
+         * @param add_generation_prompt Whether to add assistant prompt suffix
+         * @return Encoded token IDs ready for inference
+         */
+        virtual std::vector<int> encodeChat(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt = true) const = 0;
+
+        /**
+         * @brief Format messages using chat template (without encoding)
+         *
+         * Useful for debugging or when you need the formatted text.
+         *
+         * @param messages Vector of chat messages
+         * @param add_generation_prompt Whether to add assistant prompt suffix
+         * @return Formatted text string
+         */
+        virtual std::string applyTemplate(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt = true) const = 0;
     };
 
     /**
@@ -118,6 +175,17 @@ namespace llaminar2
         int bos_token() const override { return bos_token_; }
         int eos_token() const override { return eos_token_; }
         int vocab_size() const override { return vocab_.size(); }
+
+        // Chat template implementation
+        std::string getChatTemplateString() const override { return chat_template_string_; }
+        ChatTemplateType getChatTemplateType() const override;
+        bool hasChatTemplate() const override { return chat_template_ != nullptr; }
+        std::vector<int> encodeChat(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt = true) const override;
+        std::string applyTemplate(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt = true) const override;
 
     private:
         /**
@@ -161,6 +229,10 @@ namespace llaminar2
         int bos_token_ = 0;
         int eos_token_ = 0;
         int pad_token_ = 0;
+
+        // Chat template data
+        std::string chat_template_string_;
+        std::unique_ptr<ChatTemplate> chat_template_;
     };
 
     /**
