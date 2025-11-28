@@ -54,7 +54,6 @@ if(LLAMINAR_ENABLE_PERF_TRACE)
 endif()
 
 # Compiler flags
-# Note: Removed -DDEBUG from global flags to prevent COSMA verbose output
 # Debug build with gcov coverage support:
 #   -g: debug symbols
 #   -O0: no optimizations (required for accurate coverage)
@@ -181,7 +180,7 @@ else()
     set(CMAKE_CXX_FLAGS_DEBUG "${SAVED_CMAKE_CXX_FLAGS_DEBUG}")
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${SAVED_CMAKE_EXE_LINKER_FLAGS_DEBUG}")
     
-    # Set variables for COSMA and llaminar_core
+    # Set variables for llaminar_core
     # OpenBLAS needs both source headers and generated headers from build directory
     set(CBLAS_INCLUDE_DIR 
         ${CMAKE_SOURCE_DIR}/external/OpenBLAS
@@ -230,39 +229,8 @@ else()
     message(STATUS "ROCm support not found - AMD GPU detection disabled")
 endif()
 
-# Configure COSMA submodule
-message(STATUS "Configuring COSMA submodule...")
-# Use CUSTOM BLAS backend to link against our built OpenBLAS
-# Note: We patched COSMA/cmake/FindBlas.cmake to add "CUSTOM" to the vendor list
-set(COSMA_BLAS "CUSTOM" CACHE STRING "Use custom BLAS backend for COSMA" FORCE)
-if(NOT USE_SYSTEM_BLAS)
-    # Point COSMA to our built OpenBLAS
-    set(COSMA_BLAS_LINK_LIBRARIES openblas CACHE STRING "OpenBLAS library target" FORCE)
-    # Include both source and build directories for OpenBLAS headers
-    set(COSMA_BLAS_INCLUDE_DIRS 
-        "${CMAKE_SOURCE_DIR}/external/OpenBLAS;${CMAKE_BINARY_DIR}/external/OpenBLAS" 
-        CACHE STRING "OpenBLAS include directories" FORCE)
-else()
-    set(COSMA_BLAS_LINK_LIBRARIES ${BLAS_LIBRARIES} CACHE STRING "System BLAS libraries" FORCE)
-endif()
-set(COSMA_SCALAPACK "OFF" CACHE BOOL "Disable ScaLAPACK for COSMA")
-set(COSMA_WITH_TESTS OFF CACHE BOOL "Build COSMA tests")
-set(COSMA_WITH_APPS OFF CACHE BOOL "Build COSMA applications")  
-set(COSMA_WITH_BENCHMARKS OFF CACHE BOOL "Build COSMA benchmarks")
-set(COSMA_WITH_INSTALL OFF CACHE BOOL "Install COSMA")
-set(COSMA_WITH_PROFILING OFF CACHE BOOL "Enable COSMA profiling")
-set(COSMA_WITH_NCCL OFF CACHE BOOL "Disable NCCL for COSMA")
-set(COSMA_WITH_GPU OFF CACHE BOOL "Disable GPU for COSMA")
-
-# Ensure COSMA is built with -march=native for optimal performance
-# These flags are inherited from parent project's CMAKE_C_FLAGS and CMAKE_CXX_FLAGS
-# which already include -march=native
-add_subdirectory(external/COSMA)
-
-# COSMA depends on OpenBLAS when using custom BLAS backend
-if(NOT USE_SYSTEM_BLAS)
-    add_dependencies(cosma openblas_static)
-endif()
+# COSMA submodule has been removed (V2 architecture doesn't use it)
+# V1 legacy code that referenced COSMA is now deprecated
 
 message(STATUS "Configuring llama.cpp submodule...")
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable llama.cpp tests" FORCE)
@@ -373,11 +341,11 @@ if(NOT BUILD_V2)
     target_sources(llaminar_core PRIVATE src/weights/WeightRoles.cpp)
 
     # Link libraries to core
+    # Note: COSMA has been removed - V1 is deprecated in favor of V2
     target_link_libraries(llaminar_core
     PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
-    cosma
     ggml
     ${OPENBLAS_LIBRARIES}
 )
@@ -411,15 +379,15 @@ find_library(MVEC_LIB mvec)
     # Set compile features
     target_compile_features(llaminar_core PUBLIC cxx_std_17)
 
-    # Add DEBUG flag only to our targets (not COSMA) when in Debug build
+    # Add DEBUG flag in Debug build
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_definitions(llaminar_core PRIVATE DEBUG)
     endif()
 
     # Include directories for core library
+    # Note: COSMA has been removed - V1 is deprecated
     target_include_directories(llaminar_core PUBLIC
         ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/external/COSMA/src
         ${CBLAS_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/src
         ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/include
@@ -716,21 +684,8 @@ add_executable(test_bias_contracts tests/TestBiasContracts.cpp)
 target_link_libraries(test_bias_contracts llaminar_core GTest::gtest)
 add_test_with_debug_logging(BiasContractTest COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} ./test_bias_contracts ${MPIEXEC_POSTFLAGS})
 
-add_executable(test_cosma tests/TestCosma.cpp)
-target_link_libraries(test_cosma llaminar_core)
-add_test(NAME CosmaTest COMMAND test_cosma)
-
-# COSMA precision comparison test (float vs double in multi-rank)
-add_executable(test_cosma_precision tests/TestCosmaPrecision.cpp)
-target_link_libraries(test_cosma_precision 
-    PRIVATE 
-    cosma 
-    GTest::gtest 
-    MPI::MPI_CXX
-    ${BLAS_LIBRARIES}
-)
-add_llaminar_mpi_test(CosmaPrecision 2 test_cosma_precision)
-set_tests_properties(CosmaPrecision PROPERTIES TIMEOUT 120)
+# COSMA tests removed - COSMA submodule has been removed from the project
+# V1 is deprecated in favor of V2 which doesn't use COSMA
 
 # Embedding standalone test (minimal isolation test for debugging)
 add_executable(test_embedding_standalone 
@@ -950,17 +905,7 @@ if(GTEST_FOUND)
     set_tests_properties(PrefillPerformanceBench_ThreadUtilization 
         PROPERTIES TIMEOUT 180 LABELS "performance;benchmark;threading" RUN_SERIAL TRUE)
     
-    add_test(NAME PrefillPerformanceBench_COSMA_StrongScaling
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
-             --gtest_filter=PrefillPerformanceBench.COSMA_StrongScaling_Prefill)
-    set_tests_properties(PrefillPerformanceBench_COSMA_StrongScaling 
-        PROPERTIES TIMEOUT 240 LABELS "performance;benchmark;cosma" RUN_SERIAL TRUE)
-    
-    add_test(NAME PrefillPerformanceBench_COSMA_ModelShapes
-             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
-             --gtest_filter=PrefillPerformanceBench.COSMA_ModelShapes)
-    set_tests_properties(PrefillPerformanceBench_COSMA_ModelShapes 
-        PROPERTIES TIMEOUT 300 LABELS "performance;benchmark;cosma" RUN_SERIAL TRUE)
+    # COSMA benchmark tests removed - COSMA submodule has been removed
     
     add_test(NAME PrefillPerformanceBench_Comparative
              COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_prefill_performance_bench> 
@@ -1371,65 +1316,8 @@ if(GTEST_FOUND)
     endif()
     add_llaminar_mpi_test(AdaptiveMatMulTest 2 test_adaptive_matmul)
     
-    # Minimal COSMA Custom Layout test
-    add_executable(test_cosma_minimal tests/TestCosmaMinimal.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_cosma_minimal llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_cosma_minimal GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_cosma_minimal PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_cosma_minimal ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_llaminar_mpi_test(CosmaMinimalTest 2 test_cosma_minimal)
-
-    # Cosma Prefill Manager correctness (single rank baseline)
-    add_executable(test_cosma_prefill_manager tests/TestCosmaPrefillManager.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_cosma_prefill_manager llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_cosma_prefill_manager GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_cosma_prefill_manager PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_cosma_prefill_manager ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME CosmaPrefillManagerTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager)
-    set_tests_properties(CosmaPrefillManagerTest PROPERTIES TIMEOUT 60)
-
-
-
-    add_executable(test_cosma_prefill_attention_integration tests/TestCosmaPrefillAttentionIntegration.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_cosma_prefill_attention_integration PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
-    add_llaminar_mpi_test(CosmaPrefillAttentionIntegrationTest 2 test_cosma_prefill_attention_integration)
-    set_tests_properties(CosmaPrefillAttentionIntegrationTest PROPERTIES TIMEOUT 120)
-
-    add_executable(test_cosma_prefill_manager_orientation_autofix tests/TestCosmaPrefillManagerOrientationAutofix.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_cosma_prefill_manager_orientation_autofix llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_cosma_prefill_manager_orientation_autofix GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_cosma_prefill_manager_orientation_autofix PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_cosma_prefill_manager_orientation_autofix ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME CosmaPrefillManagerOrientationAutoFixTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_orientation_autofix)
-    set_tests_properties(CosmaPrefillManagerOrientationAutoFixTest PROPERTIES TIMEOUT 60)
-
-    # Minimal scatter/gather coordinate mapping test
-    # add_executable(test_cosma_scatter_gather test_cosma_scatter_gather.cpp)
-    # target_link_libraries(test_cosma_scatter_gather PRIVATE llaminar_core MPI::MPI_CXX)
-    # add_llaminar_mpi_test(CosmaScatterGatherTest 2 test_cosma_scatter_gather)
-    # set_tests_properties(CosmaScatterGatherTest PROPERTIES TIMEOUT 60)
-
-
-
-    add_executable(test_cosma_prefill_manager_stats tests/TestCosmaPrefillManagerStats.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_cosma_prefill_manager_stats llaminar_core)
-    if(GTest_FOUND)
-        target_link_libraries(test_cosma_prefill_manager_stats GTest::gtest GTest::gtest_main)
-    else()
-        target_include_directories(test_cosma_prefill_manager_stats PRIVATE ${GTEST_INCLUDE_DIR})
-        target_link_libraries(test_cosma_prefill_manager_stats ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
-    endif()
-    add_test(NAME CosmaPrefillManagerStatsTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_stats)
-    set_tests_properties(CosmaPrefillManagerStatsTest PROPERTIES TIMEOUT 60)
+    # COSMA tests removed - COSMA submodule has been removed from the project
+    # V1 is deprecated in favor of V2 which doesn't use COSMA
 
     # TP output projection executor (simulation) test
     add_executable(test_tp_output_projection_executor tests/TestTpOutputProjectionExecutor.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -1472,13 +1360,6 @@ if(GTEST_FOUND)
     # ===== DEPRECATED 2025-10-06 =====
     # test_prefill_attention_golden has been DEPRECATED and moved to tests/deprecated/
     # Reason: 80% overlap with ParityFramework, timeout issues
-    # Replacement: ParityFramework.CosmaModeValidation in TestParityFramework.cpp
-    # Migration complete - see COSMA_MIGRATION_COMPLETE.md for details
-    # 
-    # Original lines (now removed):
-    # add_executable(test_prefill_attention_golden tests/TestPrefillAttentionGolden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    # target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
-    # add_llaminar_mpi_test(PrefillAttentionGoldenTest 2 test_prefill_attention_golden)
     # =================================
 
 # Parity test framework for comparing Llaminar with llama.cpp at intermediate stages
@@ -1705,7 +1586,7 @@ target_link_libraries(test_weight_passthrough PRIVATE llaminar_core llama GTest:
 add_llaminar_mpi_test(WeightPassthroughTest 2 test_weight_passthrough)
 set_tests_properties(WeightPassthroughTest PROPERTIES TIMEOUT 60 LABELS "unit;weights;dequant")
 
-# Isolated PrefillProvider unit tests (OpenBLAS & COSMA providers)
+# Isolated PrefillProvider unit tests (OpenBLAS provider)
 add_executable(test_prefill_providers 
     tests/TestPrefillProviders.cpp
     $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -1752,11 +1633,7 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     target_include_directories(test_embedding_orientation PRIVATE ${CMAKE_SOURCE_DIR}/external/llama.cpp/src)
     add_test(NAME EmbeddingOrientationTest COMMAND test_embedding_orientation)
 
-    # Dedicated fused RMSNorm+QKV correctness test (isolates CosmaPrefillManager::fused_rmsnorm_qkv)
-    add_executable(test_cosma_fused_rmsnorm_qkv tests/TestCosmaFusedRmsnormQkv.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
-    target_link_libraries(test_cosma_fused_rmsnorm_qkv PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
-    add_llaminar_mpi_test(CosmaFusedRmsnormQkvTest 2 test_cosma_fused_rmsnorm_qkv)
-    # REMOVED: set_tests_properties(PrefillAttentionGoldenTest PROPERTIES TIMEOUT 180) - test deprecated 2025-10-06
+    # Fused RMSNorm+QKV test removed - was COSMA-specific (V1 deprecated)
 
     # Dequantization tests (Q4_0 correctness + Q4_K placeholder sanity)
     add_executable(test_dequant tests/TestDequant.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
@@ -2109,10 +1986,6 @@ target_link_libraries(benchmark_iq4nl_gemm PRIVATE llaminar_core MPI::MPI_CXX)
         test_attention_primitives
         test_mpi_transformer_pipeline
         test_adaptive_matmul
-        test_cosma_minimal
-        test_cosma_prefill_manager
-        test_cosma_prefill_manager_orientation_autofix
-        test_cosma_prefill_manager_stats
         test_dequant
         test_dequant_extra
         test_dequant_golden
@@ -2128,7 +2001,7 @@ set_target_properties(llaminar adaptive_demo
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-set_target_properties(test_basic test_numa test_cosma ${KERNEL_TEST_TARGETS}
+set_target_properties(test_basic test_numa ${KERNEL_TEST_TARGETS}
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
@@ -2136,14 +2009,14 @@ set_target_properties(test_basic test_numa test_cosma ${KERNEL_TEST_TARGETS}
 # Custom test target to run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_basic test_numa test_cosma ${KERNEL_TEST_TARGETS}
+    DEPENDS test_basic test_numa ${KERNEL_TEST_TARGETS}
     COMMENT "Running all tests"
 )
 
 # Add DEBUG flag to all test targets when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     # List of all test targets
-    set(TEST_TARGETS test_basic test_numa test_cosma)
+    set(TEST_TARGETS test_basic test_numa)
     
     # Add any kernel test targets if they exist
     if(GTEST_FOUND)
@@ -2243,8 +2116,6 @@ message(STATUS "NUMA found: ${NUMA_FOUND}")
 message(STATUS "Google Test found: ${GTEST_FOUND}")
 message(STATUS "BLAS found: ${BLAS_FOUND}")
 message(STATUS "CBLAS include: ${CBLAS_INCLUDE_DIR}")
-message(STATUS "COSMA BLAS backend: ${COSMA_BLAS}")
-message(STATUS "COSMA ScaLAPACK backend: ${COSMA_SCALAPACK}")
 message(STATUS "===============================")
 
 # ==============================================================================
