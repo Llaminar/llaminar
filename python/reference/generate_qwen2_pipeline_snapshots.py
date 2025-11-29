@@ -119,20 +119,9 @@ class Qwen2PipelineCapture:
                 loader = GGUFLoader(self.model_path, verbose=self.verbose)
                 config, state_dict = loader.load()
                 
-                # BUGFIX: Remove bias tensors for Qwen2 models (use_qkv_bias=False)
-                # GGUF files contain bias tensors that shouldn't be used, leading to
-                # extreme output values (-79 to +48 range) that break parity testing.
-                # Llaminar correctly ignores these bias tensors.
-                if hasattr(config, 'model_type') and config.model_type == 'qwen2':
-                    bias_keys_to_remove = [k for k in state_dict.keys() if 
-                                          'self_attn.q_proj.bias' in k or 
-                                          'self_attn.k_proj.bias' in k or 
-                                          'self_attn.v_proj.bias' in k]
-                    if bias_keys_to_remove:
-                        if self.verbose:
-                            print(f"Removing {len(bias_keys_to_remove)} Q/K/V bias tensors (Qwen2 uses use_qkv_bias=False)")
-                        for key in bias_keys_to_remove:
-                            del state_dict[key]
+                # Note: Qwen2 GGUF files DO contain Q/K/V bias tensors.
+                # Llaminar loads and uses these biases, so we must keep them for parity.
+                # Previous versions incorrectly removed them assuming use_qkv_bias=False.
                 
                 # Create model from config
                 self.model = AutoModelForCausalLM.from_config(config)
@@ -409,7 +398,8 @@ class Qwen2PipelineCapture:
         self,
         hidden: torch.Tensor,
         layer_idx: int,
-        capture: bool = True
+        capture: bool = True,
+        snapshot_prefix: str = ""
     ) -> torch.Tensor:
         """
         Process single FFN block with optional snapshot capture.
@@ -418,41 +408,61 @@ class Qwen2PipelineCapture:
             hidden: Input hidden states [batch, seq_len, d_model]
             layer_idx: Layer index
             capture: Whether to capture snapshots (default: True)
+            snapshot_prefix: Prefix for snapshot keys (for decode steps)
             
         Returns:
             Output hidden states [batch, seq_len, d_model]
         """
         layer = self.model.model.layers[layer_idx]
         
+        # Build snapshot key prefix
+        key_prefix = f"{snapshot_prefix}layer{layer_idx}_" if snapshot_prefix else ""
+        
         # 1. Pre-FFN RMSNorm
         hidden_norm = self._apply_rmsnorm(hidden, layer.post_attention_layernorm.weight)
         if capture:
-            self._save_snapshot('FFN_NORM', hidden_norm, layer_idx)
+            if snapshot_prefix:
+                self._save_snapshot(f'{key_prefix}FFN_NORM', hidden_norm)
+            else:
+                self._save_snapshot('FFN_NORM', hidden_norm, layer_idx)
         
         # 2. Gate and up projections
         gate_proj = F.linear(hidden_norm, layer.mlp.gate_proj.weight, None)
         up_proj = F.linear(hidden_norm, layer.mlp.up_proj.weight, None)
         
         if capture:
-            self._save_snapshot('FFN_GATE', gate_proj, layer_idx)
-            self._save_snapshot('FFN_UP', up_proj, layer_idx)
+            if snapshot_prefix:
+                self._save_snapshot(f'{key_prefix}FFN_GATE', gate_proj)
+                self._save_snapshot(f'{key_prefix}FFN_UP', up_proj)
+            else:
+                self._save_snapshot('FFN_GATE', gate_proj, layer_idx)
+                self._save_snapshot('FFN_UP', up_proj, layer_idx)
         
         # 3. SwiGLU activation: gate * silu(up)
         # SiLU(x) = x * sigmoid(x)
         silu_up = F.silu(up_proj)
         swiglu_output = gate_proj * silu_up
         if capture:
-            self._save_snapshot('FFN_SWIGLU', swiglu_output, layer_idx)
+            if snapshot_prefix:
+                self._save_snapshot(f'{key_prefix}FFN_SWIGLU', swiglu_output)
+            else:
+                self._save_snapshot('FFN_SWIGLU', swiglu_output, layer_idx)
         
         # 4. Down projection
         ffn_output = F.linear(swiglu_output, layer.mlp.down_proj.weight, None)
         if capture:
-            self._save_snapshot('FFN_DOWN', ffn_output, layer_idx)
+            if snapshot_prefix:
+                self._save_snapshot(f'{key_prefix}FFN_DOWN', ffn_output)
+            else:
+                self._save_snapshot('FFN_DOWN', ffn_output, layer_idx)
         
         # 5. Residual connection
         hidden_residual = hidden + ffn_output
         if capture:
-            self._save_snapshot('FFN_RESIDUAL', hidden_residual, layer_idx)
+            if snapshot_prefix:
+                self._save_snapshot(f'{key_prefix}FFN_RESIDUAL', hidden_residual)
+            else:
+                self._save_snapshot('FFN_RESIDUAL', hidden_residual, layer_idx)
         
         return hidden_residual
     
@@ -530,6 +540,325 @@ class Qwen2PipelineCapture:
                 print(f"  Logits: {self.captures['LM_HEAD']['shape']}")
         
         return self.captures
+
+    def capture_decode_step(
+        self,
+        token_id: int,
+        position: int,
+        past_key_values: Optional[tuple] = None,
+        snapshot_prefix: str = "decode"
+    ) -> tuple:
+        """
+        Run a single decode step and capture intermediate states with KV caching.
+        
+        This simulates autoregressive decoding where we process one token at a time,
+        using cached K/V from previous steps.
+        
+        Args:
+            token_id: The single token ID to process
+            position: Current position in the sequence (after prefill tokens)
+            past_key_values: Tuple of (K, V) per layer from previous steps
+            snapshot_prefix: Prefix for snapshot keys (e.g., "decode_step0")
+            
+        Returns:
+            (logits, new_past_key_values) where:
+            - logits: Output logits for this single token [1, 1, vocab_size]
+            - new_past_key_values: Updated KV cache for next step
+        """
+        self.load_model()
+        
+        with torch.no_grad():
+            # Single token embedding
+            input_ids = torch.tensor([[token_id]], dtype=torch.long)
+            hidden = self.model.model.embed_tokens(input_ids)
+            self._save_snapshot(f'{snapshot_prefix}_EMBEDDING', hidden)
+            
+            bsz, seq_len = input_ids.shape  # seq_len = 1 for decode
+            
+            # Position ID for this decode step
+            position_ids = torch.tensor([[position]], dtype=torch.long)
+            
+            if self.verbose:
+                print(f"\n{snapshot_prefix}: token={token_id}, position={position}")
+            
+            # Process each layer with KV caching
+            n_layers = self.model.config.num_hidden_layers
+            n_heads = self.model.config.num_attention_heads
+            n_kv_heads = self.model.config.num_key_value_heads
+            d_head = self.model.config.hidden_size // n_heads
+            
+            new_past_key_values = []
+            
+            for layer_idx in range(n_layers):
+                layer = self.model.model.layers[layer_idx]
+                should_capture = self._should_capture_layer(layer_idx)
+                
+                # Pre-attention RMSNorm
+                hidden_norm = self._apply_rmsnorm(hidden, layer.input_layernorm.weight)
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_NORM', hidden_norm)
+                
+                # Q/K/V projections (for single token)
+                q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, layer.self_attn.q_proj.bias)
+                k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, layer.self_attn.k_proj.bias)
+                v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, layer.self_attn.v_proj.bias)
+                
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_Q_PROJECTION', q_proj)
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_K_PROJECTION', k_proj)
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_V_PROJECTION', v_proj)
+                
+                # Reshape for attention
+                q = q_proj.view(bsz, seq_len, n_heads, d_head).transpose(1, 2)
+                k = k_proj.view(bsz, seq_len, n_kv_heads, d_head).transpose(1, 2)
+                v = v_proj.view(bsz, seq_len, n_kv_heads, d_head).transpose(1, 2)
+                
+                # Apply RoPE
+                q_rope, k_rope = self._apply_rope(q, k, position_ids, layer_idx)
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_Q_ROPE', 
+                                       q_rope.transpose(1, 2).reshape(bsz, seq_len, -1))
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_K_ROPE',
+                                       k_rope.transpose(1, 2).reshape(bsz, seq_len, -1))
+                
+                # Concatenate with cached K/V from previous steps
+                if past_key_values is not None and len(past_key_values) > layer_idx:
+                    past_k, past_v = past_key_values[layer_idx]
+                    k_full = torch.cat([past_k, k_rope], dim=2)  # [bsz, n_kv_heads, total_seq_len, d_head]
+                    v_full = torch.cat([past_v, v], dim=2)
+                else:
+                    k_full = k_rope
+                    v_full = v
+                
+                # Save new KV cache
+                new_past_key_values.append((k_full, v_full))
+                
+                # Expand K/V for GQA
+                k_expanded, v_expanded = self._expand_kv_heads_for_gqa(k_full, v_full, n_heads, n_kv_heads)
+                
+                # Attention scores: Q @ K^T / sqrt(d_head)
+                # Q: [bsz, n_heads, 1, d_head], K: [bsz, n_heads, total_seq_len, d_head]
+                scale = 1.0 / np.sqrt(d_head)
+                attn_scores = torch.matmul(q_rope, k_expanded.transpose(-2, -1)) * scale
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_SCORES', attn_scores)
+                
+                # Softmax (causal mask not needed for decode - Q has single position attending to all K)
+                attn_probs = F.softmax(attn_scores, dim=-1)
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_SOFTMAX', attn_probs)
+                
+                # Context: attention_probs @ V
+                attn_context = torch.matmul(attn_probs, v_expanded)
+                attn_context_reshaped = attn_context.transpose(1, 2).reshape(bsz, seq_len, -1)
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_CONTEXT', attn_context_reshaped)
+                
+                # Output projection
+                attn_output = F.linear(attn_context_reshaped, layer.self_attn.o_proj.weight, None)
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_OUTPUT', attn_output)
+                
+                # Residual connection
+                hidden = hidden + attn_output
+                if should_capture:
+                    self._save_snapshot(f'{snapshot_prefix}_layer{layer_idx}_ATTENTION_RESIDUAL', hidden)
+                
+                # FFN block
+                hidden = self._ffn_block_impl(hidden, layer_idx, should_capture, 
+                                              snapshot_prefix=f'{snapshot_prefix}_')
+            
+            # Final RMSNorm
+            hidden = self._apply_rmsnorm(hidden, self.model.model.norm.weight)
+            self._save_snapshot(f'{snapshot_prefix}_FINAL_NORM', hidden)
+            
+            # LM head
+            logits = F.linear(hidden, self.model.lm_head.weight, None)
+            self._save_snapshot(f'{snapshot_prefix}_LM_HEAD', logits)
+            
+            if self.verbose:
+                print(f"  ✓ Captured decode step snapshots")
+                print(f"    Logits shape: {logits.shape}")
+                argmax_token = logits[0, -1].argmax().item()
+                print(f"    Argmax token: {argmax_token}")
+            
+            return logits, tuple(new_past_key_values)
+
+    def capture_prefill_and_decode(
+        self,
+        prompt: str,
+        num_decode_steps: int = 3
+    ) -> Dict[str, Dict]:
+        """
+        Run prefill followed by incremental decode steps, capturing all states.
+        
+        This is the primary method for generating E2E parity test data that
+        validates both prefill and autoregressive decode.
+        
+        Args:
+            prompt: Input text prompt for prefill
+            num_decode_steps: Number of decode steps to run after prefill
+            
+        Returns:
+            Dictionary with all captured snapshots including:
+            - Prefill snapshots (same as capture_pipeline_forward)
+            - decode_step{N}_* snapshots for each decode step
+        """
+        self.load_model()
+        self.captures = {}
+        
+        # Tokenize input for prefill
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        prefill_input_ids = inputs['input_ids']
+        prefill_seq_len = prefill_input_ids.shape[1]
+        
+        if self.verbose:
+            print(f"\n=== PREFILL ===")
+            print(f"Prompt: '{prompt}'")
+            print(f"Token IDs: {prefill_input_ids.tolist()[0]}")
+            print(f"Num tokens: {prefill_seq_len}")
+        
+        # Run prefill (captures to default snapshot names)
+        with torch.no_grad():
+            bsz = prefill_input_ids.shape[0]
+            
+            # Embedding
+            hidden = self.model.model.embed_tokens(prefill_input_ids)
+            self._save_snapshot('EMBEDDING', hidden)
+            
+            position_ids = torch.arange(prefill_seq_len, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+            
+            # Initialize KV cache from prefill
+            n_layers = self.model.config.num_hidden_layers
+            n_heads = self.model.config.num_attention_heads
+            n_kv_heads = self.model.config.num_key_value_heads
+            d_head = self.model.config.hidden_size // n_heads
+            
+            past_key_values = []
+            
+            # Process layers for prefill
+            for layer_idx in range(n_layers):
+                layer = self.model.model.layers[layer_idx]
+                should_capture = self._should_capture_layer(layer_idx)
+                
+                # Pre-attention RMSNorm
+                hidden_norm = self._apply_rmsnorm(hidden, layer.input_layernorm.weight)
+                if should_capture:
+                    self._save_snapshot('ATTENTION_NORM', hidden_norm, layer_idx)
+                
+                # Q/K/V projections
+                q_proj = F.linear(hidden_norm, layer.self_attn.q_proj.weight, layer.self_attn.q_proj.bias)
+                k_proj = F.linear(hidden_norm, layer.self_attn.k_proj.weight, layer.self_attn.k_proj.bias)
+                v_proj = F.linear(hidden_norm, layer.self_attn.v_proj.weight, layer.self_attn.v_proj.bias)
+                
+                if should_capture:
+                    self._save_snapshot('Q_PROJECTION', q_proj, layer_idx)
+                    self._save_snapshot('K_PROJECTION', k_proj, layer_idx)
+                    self._save_snapshot('V_PROJECTION', v_proj, layer_idx)
+                
+                # Reshape for attention
+                q = q_proj.view(bsz, prefill_seq_len, n_heads, d_head).transpose(1, 2)
+                k = k_proj.view(bsz, prefill_seq_len, n_kv_heads, d_head).transpose(1, 2)
+                v = v_proj.view(bsz, prefill_seq_len, n_kv_heads, d_head).transpose(1, 2)
+                
+                # Apply RoPE
+                q_rope, k_rope = self._apply_rope(q, k, position_ids, layer_idx)
+                if should_capture:
+                    self._save_snapshot('Q_ROPE', q_rope.transpose(1, 2).reshape(bsz, prefill_seq_len, -1), layer_idx)
+                    self._save_snapshot('K_ROPE', k_rope.transpose(1, 2).reshape(bsz, prefill_seq_len, -1), layer_idx)
+                
+                # Store K/V for decode cache
+                past_key_values.append((k_rope, v))
+                
+                # Expand K/V for GQA
+                k_expanded, v_expanded = self._expand_kv_heads_for_gqa(k_rope, v, n_heads, n_kv_heads)
+                
+                # Attention
+                scale = 1.0 / np.sqrt(d_head)
+                attn_scores = torch.matmul(q_rope, k_expanded.transpose(-2, -1)) * scale
+                if should_capture:
+                    self._save_snapshot('ATTENTION_SCORES', attn_scores, layer_idx)
+                
+                # Causal mask for prefill
+                causal_mask = torch.triu(
+                    torch.ones(prefill_seq_len, prefill_seq_len, dtype=torch.bool),
+                    diagonal=1
+                ).unsqueeze(0).unsqueeze(0)
+                attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+                
+                attn_probs = F.softmax(attn_scores, dim=-1)
+                if should_capture:
+                    self._save_snapshot('ATTENTION_SOFTMAX', attn_probs, layer_idx)
+                
+                attn_context = torch.matmul(attn_probs, v_expanded)
+                attn_context_reshaped = attn_context.transpose(1, 2).reshape(bsz, prefill_seq_len, -1)
+                if should_capture:
+                    self._save_snapshot('ATTENTION_CONTEXT', attn_context_reshaped, layer_idx)
+                
+                attn_output = F.linear(attn_context_reshaped, layer.self_attn.o_proj.weight, None)
+                if should_capture:
+                    self._save_snapshot('ATTENTION_OUTPUT', attn_output, layer_idx)
+                
+                hidden = hidden + attn_output
+                if should_capture:
+                    self._save_snapshot('ATTENTION_RESIDUAL', hidden, layer_idx)
+                
+                # FFN block
+                hidden = self._ffn_block_impl(hidden, layer_idx, should_capture)
+            
+            # Final norm and LM head for prefill
+            hidden = self._apply_rmsnorm(hidden, self.model.model.norm.weight)
+            self._save_snapshot('FINAL_NORM', hidden)
+            
+            logits = F.linear(hidden, self.model.lm_head.weight, None)
+            self._save_snapshot('LM_HEAD', logits)
+            
+            # Get first decode token from prefill logits
+            prefill_argmax = logits[0, -1].argmax().item()
+            
+            if self.verbose:
+                print(f"\nPrefill complete. First decode token: {prefill_argmax}")
+                print(f"KV cache initialized with {len(past_key_values)} layers")
+        
+        # Convert to tuple for decode
+        past_key_values = tuple(past_key_values)
+        
+        # Run decode steps
+        if self.verbose:
+            print(f"\n=== DECODE ({num_decode_steps} steps) ===")
+        
+        current_token = prefill_argmax
+        current_position = prefill_seq_len
+        
+        # Track decode tokens for saving to metadata
+        self.decode_tokens = [prefill_argmax]  # First token is prefill argmax
+        
+        for step in range(num_decode_steps):
+            snapshot_prefix = f"decode_step{step}"
+            
+            if self.verbose:
+                print(f"\nDecode step {step}: token={current_token}, position={current_position}")
+            
+            logits, past_key_values = self.capture_decode_step(
+                token_id=current_token,
+                position=current_position,
+                past_key_values=past_key_values,
+                snapshot_prefix=snapshot_prefix
+            )
+            
+            # Get next token
+            current_token = logits[0, -1].argmax().item()
+            current_position += 1
+            self.decode_tokens.append(current_token)
+            
+            if self.verbose:
+                decoded_text = self.tokenizer.decode([current_token])
+                print(f"  Next token: {current_token} = '{decoded_text}'")
+        
+        if self.verbose:
+            print(f"\n✓ Total snapshots captured: {len(self.captures)}")
+        
+        return self.captures
     
     def save_to_directory(self, output_dir: Path):
         """
@@ -566,6 +895,10 @@ class Qwen2PipelineCapture:
             f.write(f"d_ff: {config.intermediate_size}\n")
             f.write(f"vocab_size: {config.vocab_size}\n")
             f.write(f"num_snapshots: {len(self.captures)}\n")
+            
+            # Save decode tokens if available
+            if hasattr(self, 'decode_tokens') and self.decode_tokens:
+                f.write(f"decode_tokens: {','.join(map(str, self.decode_tokens))}\n")
         
         # Save each capture as separate .npy file (cnpy compatible)
         for key, capture in self.captures.items():
@@ -585,13 +918,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Default 8-token prompt
-    python3 generate_qwen2_pipeline_snapshots.py --output pytorch_qwen2_snapshots
+    # Generate snapshots from GGUF model (prefill only)
+    python3 generate_qwen2_pipeline_snapshots.py \\
+        --model models/qwen2.5-0.5b-instruct-q4_0.gguf \\
+        --output pytorch_qwen2_snapshots
     
     # Custom prompt
     python3 generate_qwen2_pipeline_snapshots.py \\
+        --model models/qwen2.5-0.5b-instruct-q4_0.gguf \\
         --prompt "The quick brown fox" \\
         --output snapshots_fox
+    
+    # Capture prefill + 3 decode steps
+    python3 generate_qwen2_pipeline_snapshots.py \\
+        --decode-steps 3 \\
+        --output snapshots_with_decode
     
     # Capture only first 3 layers (faster)
     python3 generate_qwen2_pipeline_snapshots.py \\
@@ -606,8 +947,8 @@ Examples:
     parser.add_argument(
         '--model',
         type=str,
-        default='Qwen/Qwen2.5-0.5B-Instruct',
-        help='HuggingFace model path or name (default: Qwen/Qwen2.5-0.5B-Instruct)'
+        required=True,
+        help='Path to GGUF model file (required). Example: models/qwen2.5-0.5b-instruct-q4_0.gguf'
     )
     
     parser.add_argument(
@@ -622,6 +963,13 @@ Examples:
         type=str,
         default=None,
         help='Comma-separated layer indices to capture (default: all layers). Example: 0,1,2'
+    )
+    
+    parser.add_argument(
+        '--decode-steps',
+        type=int,
+        default=0,
+        help='Number of decode steps to capture after prefill (default: 0, prefill only)'
     )
     
     parser.add_argument(
@@ -658,13 +1006,19 @@ Examples:
     print(f"Model: {args.model}")
     print(f"Prompt: '{args.prompt}'")
     
-    captures = capturer.capture_pipeline_forward(args.prompt)
+    if args.decode_steps > 0:
+        print(f"Decode steps: {args.decode_steps}")
+        captures = capturer.capture_prefill_and_decode(args.prompt, args.decode_steps)
+    else:
+        captures = capturer.capture_pipeline_forward(args.prompt)
     
     # Save to disk
     capturer.save_to_directory(args.output)
     
     print(f"\n✓ Done! Snapshots saved to: {args.output}")
     print(f"  Total snapshots: {len(captures)}")
+    if args.decode_steps > 0:
+        print(f"  Includes {args.decode_steps} decode steps")
     print(f"  Use these in C++ tests: tests/v2/e2e/Test__Qwen2FP32Parity.cpp")
 
 

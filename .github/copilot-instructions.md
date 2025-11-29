@@ -20,6 +20,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [Performance Optimization](#performance-optimization)
 - [Code Quality Guidelines](#code-quality-guidelines)
 - [Documentation Standards](#documentation-standards)
+- [Pytorch Parity Testing](#pytorch-parity-testing)
 
 ## Architecture Overview
 
@@ -1324,3 +1325,316 @@ When we write documentation and changelogs at the end of our work runs:
 5. **Build errors**: Clean build directory, verify dependencies (OpenBLAS, MPI, ScaLAPACK)
 
 **Debug environment variables**: See "Debug / Instrumentation Environment Variables" section for full list of `LLAMINAR_*` flags.
+
+## PyTorch Comparison Testing and Snapshotting Framework
+
+We have a PyTorch comparison/snapshotting framework in the `python/reference/` folder. This framework allows us to inference the same GGUFs that Llaminar uses, capturing stage-by-stage, layer-by-layer snapshots in PyTorch for comparison against Llaminar's outputs.
+
+### Key Concepts
+
+**CRITICAL**: Agents often get confused and think the PyTorch framework uses FP32 weights from HuggingFace. **This is NOT true!** PyTorch and Llaminar **use the exact same GGUF weights** (e.g., Q4_0) loaded from the `models/` folder. The key differences are:
+
+1. **PyTorch**: Dequantizes Q4_0 → FP32 upfront, then runs FP32 matmuls
+2. **Llaminar**: Does GEMM in the integer domain with AVX512-VNNI, converting activations to Q8_1 block format
+
+This means Llaminar's matmuls are "noisy" compared to PyTorch's FP32 ground truth, but this is acceptable for inference. We only worry if cosine similarity plummets in the first few layers.
+
+### E2E Test Configuration
+
+The E2E parity tests use these standardized constants (defined in `tests/v2/e2e/qwen2/Test__Qwen2FP32Parity.cpp`):
+
+```cpp
+// Model path - MUST match what Python uses
+static constexpr const char* TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+// Test prompt - MUST match Python snapshot generation
+static constexpr const char* TEST_PROMPT = "The quick brown fox jumps over the lazy dog";
+
+// Token IDs (from Qwen2.5 tokenizer) - MUST match between C++ and Python
+static const std::vector<int> TEST_TOKEN_IDS = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
+
+// Snapshot directory
+static constexpr const char* TEST_SNAPSHOT_DIR = "pytorch_qwen2_snapshots";
+```
+
+**CRITICAL**: E2E tests use **greedy sampling (temperature = 0.0)** for deterministic, reproducible token prediction. When debugging inference issues, always test with `-t 0` to match E2E behavior:
+
+```bash
+# Greedy sampling (matches E2E tests)
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "The quick brown fox jumps over the lazy dog" -n 10 -t 0
+
+# Default sampling (temperature=0.8) produces probabilistic/non-deterministic output
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "The quick brown fox jumps over the lazy dog" -n 10
+```
+
+### Parity Criteria
+
+Our comparison criteria between Llaminar and PyTorch:
+
+| Metric | Threshold | Notes |
+|--------|-----------|-------|
+| Cosine similarity (layers 0-5) | ≥ 0.999 | Expected to diverge in deeper layers |
+| Top-1 token match | 100% | Final token prediction must match |
+| Top-5 overlap | ≥ 60% | Order may differ slightly |
+| KL divergence | Low | Logits distribution alignment |
+
+Cosine similarity is expected to diverge in layers ≥ 6 due to accumulated quantization noise. What matters is **final token choice alignment**.
+
+### Running PyTorch Reference Inference
+
+#### Generate Snapshots from GGUF
+
+```bash
+cd /workspaces/llaminar
+
+# Generate full pipeline snapshots (prefill + decode)
+python python/reference/generate_qwen2_pipeline_snapshots.py \
+    --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
+    --output pytorch_qwen2_snapshots \
+    --decode-steps 5 \
+    --verbose
+
+# Generate snapshots for specific layers only
+python python/reference/generate_qwen2_pipeline_snapshots.py \
+    --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
+    --layers 0,1,2 \
+    --output pytorch_layer012_snapshots
+
+# Custom prompt (must match C++ test if comparing)
+python python/reference/generate_qwen2_pipeline_snapshots.py \
+    --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
+    --prompt "Hello, world!" \
+    --output custom_snapshots
+```
+
+#### Run Simple Inference (Text Generation)
+
+```bash
+# Generate text with PyTorch reference
+python python/reference/run_reference.py \
+    --model qwen \
+    --checkpoint models/qwen2.5-0.5b-instruct-q4_0.gguf \
+    --prompt "The quick brown fox" \
+    --max-tokens 20 \
+    --verbose
+```
+
+### Snapshot System Architecture
+
+#### Directory Structure
+
+Snapshots are saved as NumPy `.npy` files:
+
+```
+pytorch_qwen2_snapshots/
+├── metadata.txt              # Model config, token IDs, decode tokens
+├── EMBEDDING.npy             # Prefill: [1, seq_len, d_model]
+├── FINAL_NORM.npy            # Prefill: [1, seq_len, d_model]
+├── LM_HEAD.npy               # Prefill: [1, seq_len, vocab_size]
+├── layer0_ATTENTION_NORM.npy
+├── layer0_Q_PROJECTION.npy
+├── layer0_K_PROJECTION.npy
+├── layer0_V_PROJECTION.npy
+├── layer0_ATTENTION_CONTEXT.npy
+├── layer0_ATTENTION_OUTPUT.npy
+├── layer0_ATTENTION_RESIDUAL.npy
+├── layer0_FFN_NORM.npy
+├── layer0_FFN_GATE.npy
+├── layer0_FFN_UP.npy
+├── layer0_FFN_SWIGLU.npy
+├── layer0_FFN_DOWN.npy
+├── layer0_FFN_RESIDUAL.npy
+├── ... (layers 1-23)
+├── decode_step0_EMBEDDING.npy    # Decode step 0
+├── decode_step0_layer0_*.npy
+├── decode_step0_LM_HEAD.npy
+├── decode_step1_*.npy            # Decode step 1
+└── ...
+```
+
+#### Metadata File Format
+
+```
+Model: models/qwen2.5-0.5b-instruct-q4_0.gguf
+Architecture: Qwen2Config
+n_layers: 24
+n_heads: 14
+n_kv_heads: 2
+d_model: 896
+d_head: 64
+d_ff: 4864
+vocab_size: 151936
+num_snapshots: 2466
+decode_tokens: 256,40400,50735,29285,29285,60119
+```
+
+The `decode_tokens` field shows the tokens PyTorch generated during decode (with greedy sampling). These should match Llaminar's output with `-t 0`.
+
+### Investigating Logits and Token Predictions
+
+#### Load and Analyze PyTorch Logits
+
+```python
+import numpy as np
+
+# Load prefill logits (after processing full prompt)
+logits = np.load('pytorch_qwen2_snapshots/LM_HEAD.npy')
+print(f'Shape: {logits.shape}')  # (1, seq_len, vocab_size)
+
+# Get last position logits (prediction for next token)
+last_logits = logits[0, -1, :]
+
+# Find top-5 predictions
+top_indices = np.argsort(last_logits)[::-1][:5]
+print('PyTorch Top-5 predictions:')
+for i, idx in enumerate(top_indices):
+    print(f'  {i+1}. Token {idx} score={last_logits[idx]:.4f}')
+```
+
+#### Compare Llaminar vs PyTorch Logits
+
+```bash
+# Run Llaminar with TRACE logging to see top-5 predictions
+LLAMINAR_LOG_LEVEL=TRACE ./run_llaminar.sh \
+    -m models/qwen2.5-0.5b-instruct-q4_0.gguf \
+    -p "The quick brown fox jumps over the lazy dog" \
+    -n 5 -t 0 2>&1 | grep -E "Top-5|Token [0-9]|Sampled"
+```
+
+Expected output when working correctly:
+```
+[TRACE] [Rank 0] Top-5 logits at decode iteration 0:
+[TRACE]   1. Token 256 score=14.5406
+[TRACE]   2. Token 8159 score=14.0087
+[TRACE]   3. Token 100160 score=13.1267
+[DEBUG] [Rank 0] Sampled token: 256
+```
+
+The top-1 token should match PyTorch's prediction (`decode_tokens` in metadata).
+
+### Llaminar Snapshot Capture
+
+Llaminar can also capture snapshots during inference for comparison:
+
+#### Enable Snapshot Capture (E2E Build Required)
+
+```bash
+# Build with snapshot support
+cmake -B build_v2_e2e -S src/v2 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_PIPELINE_SNAPSHOTS=ON
+
+cmake --build build_v2_e2e --parallel
+```
+
+#### Capture Snapshots in Code
+
+```cpp
+// Enable snapshot capture before forward pass
+pipeline->enableSnapshotCapture("/tmp/llaminar_snapshots");
+
+// Run inference
+pipeline->forward(token_ids.data(), seq_len);
+
+// Retrieve snapshots
+auto keys = pipeline->getSnapshotKeys();
+for (const auto& key : keys) {
+    auto data = pipeline->getSnapshot(key);
+    // Compare with PyTorch reference...
+}
+```
+
+### Debugging Workflow for Inference Issues
+
+When Llaminar produces unexpected output, follow this systematic approach:
+
+#### Step 1: Verify with Greedy Sampling
+
+```bash
+# First, eliminate sampling randomness
+./run_llaminar.sh -m model.gguf -p "Your prompt" -n 10 -t 0 2>&1 | tail -20
+```
+
+If output is garbage with `-t 0`, there's a real inference bug. If output is reasonable with `-t 0` but random without, that's expected probabilistic sampling behavior.
+
+#### Step 2: Compare Top-5 Predictions
+
+```bash
+# Get Llaminar's top-5
+LLAMINAR_LOG_LEVEL=TRACE ./run_llaminar.sh -m model.gguf -p "prompt" -n 1 -t 0 2>&1 | grep "Top-5"
+
+# Compare to PyTorch's top-5 (from snapshots)
+python -c "
+import numpy as np
+logits = np.load('pytorch_qwen2_snapshots/LM_HEAD.npy')[0, -1, :]
+top5 = np.argsort(logits)[::-1][:5]
+print('PyTorch Top-5:', list(top5))
+print('Scores:', [logits[i] for i in top5])
+"
+```
+
+#### Step 3: Identify Divergence Point
+
+If top predictions don't match, run layer-by-layer comparison:
+
+```bash
+# Run E2E parity tests with verbose output
+cd build_v2_e2e && ctest -R Qwen2FP32 -V
+```
+
+The test output shows cosine similarity per layer, helping identify where divergence begins.
+
+#### Step 4: Check Token IDs Match
+
+Ensure the tokenizer produces the same token IDs:
+
+```bash
+# Python tokenization
+python -c "
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')
+print(tok.encode('The quick brown fox jumps over the lazy dog', add_special_tokens=False))
+"
+# Expected: [785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562]
+```
+
+### Common Investigation Pitfalls
+
+1. **Forgetting `-t 0`**: Default temperature (0.8) produces random output. Always use greedy sampling when comparing to PyTorch ground truth.
+
+2. **Prompt mismatch**: PyTorch snapshots are generated with a specific prompt. Using a different prompt in Llaminar will produce different (but possibly correct) output.
+
+3. **Token ID mismatch**: If C++ uses different token IDs than Python (e.g., including BOS token), results won't match even if the pipeline is correct.
+
+4. **MPI rank issues**: When running with MPI, only rank 0 does sampling. Other ranks must still participate in forward passes. Check for MPI deadlocks if inference hangs.
+
+5. **Chat template confusion**: Instruct models expect chat-formatted input. Raw prompts may produce nonsensical output even when the pipeline is correct. The E2E tests use raw prompts (no chat template) for simplicity.
+
+6. **Looking at wrong position**: For multi-token prompts, the "next token" prediction comes from the **last position's logits**, not the first.
+
+### Running E2E Parity Tests
+
+```bash
+# Build with snapshot support
+cmake -B build_v2_e2e_release -S src/v2 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_PIPELINE_SNAPSHOTS=ON
+cmake --build build_v2_e2e_release --parallel
+
+# Run all E2E tests
+ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
+
+# Run specific parity test
+ctest --test-dir build_v2_e2e_release -R Qwen2FP32Parity -V
+```
+
+### Key Files Reference
+
+| File | Purpose |
+|------|---------|
+| `python/reference/generate_qwen2_pipeline_snapshots.py` | Generate PyTorch snapshots |
+| `python/reference/loaders/gguf_loader.py` | Load GGUF files into PyTorch |
+| `python/reference/run_reference.py` | CLI for PyTorch inference |
+| `tests/v2/e2e/qwen2/Test__Qwen2FP32Parity.cpp` | C++ E2E parity tests |
+| `pytorch_qwen2_snapshots/` | Default snapshot output directory |
+| `src/v2/pipelines/qwen/Qwen2Pipeline.cpp` | Llaminar pipeline implementation |

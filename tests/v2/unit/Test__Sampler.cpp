@@ -555,4 +555,354 @@ namespace
         }
     }
 
+    // =============================================================================
+    // Error Handling Tests
+    // =============================================================================
+
+    TEST_F(SamplerTest, ErrorHandling_EmptyLogits_Greedy)
+    {
+        std::vector<float> empty;
+
+        EXPECT_THROW(sampler_->sample_greedy(empty), std::invalid_argument);
+    }
+
+    TEST_F(SamplerTest, ErrorHandling_EmptyLogits_Sample)
+    {
+        std::vector<float> empty;
+        SamplingParams params;
+
+        EXPECT_THROW(sampler_->sample(empty, params), std::invalid_argument);
+    }
+
+    TEST_F(SamplerTest, ErrorHandling_InvalidTopP)
+    {
+        // Top-p must be in (0, 1]
+        EXPECT_THROW(sampler_->sample_top_p(standard_logits_, 0.0f, 1.0f), std::invalid_argument);
+        EXPECT_THROW(sampler_->sample_top_p(standard_logits_, -0.5f, 1.0f), std::invalid_argument);
+        EXPECT_THROW(sampler_->sample_top_p(standard_logits_, 1.5f, 1.0f), std::invalid_argument);
+    }
+
+    TEST_F(SamplerTest, ErrorHandling_InvalidTopK)
+    {
+        // Top-k must be positive
+        EXPECT_THROW(sampler_->sample_top_k(standard_logits_, 0, 1.0f), std::invalid_argument);
+        EXPECT_THROW(sampler_->sample_top_k(standard_logits_, -1, 1.0f), std::invalid_argument);
+    }
+
+    // =============================================================================
+    // Temperature Boundary Tests (Critical for E2E parity)
+    // =============================================================================
+
+    TEST_F(SamplerTest, Temperature_VeryLow_AlmostGreedy)
+    {
+        // Temperature very close to 0 should behave like greedy
+        // This is critical: temperature=0.01 should almost always pick the max
+        Sampler sampler(42);
+
+        for (int i = 0; i < 100; ++i)
+        {
+            int token = sampler.sample_temperature(peaked_logits_, 0.01f);
+            EXPECT_EQ(token, 2) << "Very low temperature should always pick argmax";
+        }
+    }
+
+    TEST_F(SamplerTest, Temperature_ExactlyZero_EqualsGreedy)
+    {
+        // Temperature = 0.0 should be exactly equivalent to greedy
+        int greedy_token = sampler_->sample_greedy(standard_logits_);
+        int temp_zero_token = sampler_->sample_temperature(standard_logits_, 0.0f);
+
+        EXPECT_EQ(greedy_token, temp_zero_token)
+            << "Temperature=0 must equal greedy sampling";
+    }
+
+    TEST_F(SamplerTest, Temperature_NearZero_StillDeterministic)
+    {
+        // Any temperature < ~0.01 should be effectively deterministic
+        Sampler sampler1(123);
+        Sampler sampler2(456); // Different seeds
+
+        // Even with different seeds, near-zero temp should pick same token
+        int token1 = sampler1.sample_temperature(peaked_logits_, 0.001f);
+        int token2 = sampler2.sample_temperature(peaked_logits_, 0.001f);
+
+        EXPECT_EQ(token1, token2)
+            << "Near-zero temperature should be deterministic regardless of seed";
+    }
+
+    // =============================================================================
+    // Token Ranking Tests (Critical for debugging inference)
+    // =============================================================================
+
+    TEST_F(SamplerTest, Ranking_TopKReturnsCorrectIndices)
+    {
+        // Verify that top-k returns tokens from the correct indices
+        // Logits: [1.0, 2.0, 3.0, 0.5, 1.5]
+        // Sorted by logit: idx 2 (3.0), idx 1 (2.0), idx 4 (1.5), idx 0 (1.0), idx 3 (0.5)
+
+        Sampler sampler(42);
+        std::map<int, int> token_counts;
+
+        for (int i = 0; i < 1000; ++i)
+        {
+            int token = sampler.sample_top_k(standard_logits_, 3, 1.0f);
+            token_counts[token]++;
+        }
+
+        // Top-3 are tokens 2, 1, 4
+        EXPECT_GT(token_counts[2], 0) << "Token 2 (highest logit) should be sampled";
+        EXPECT_GT(token_counts[1], 0) << "Token 1 (2nd highest) should be sampled";
+        EXPECT_GT(token_counts[4], 0) << "Token 4 (3rd highest) should be sampled";
+        EXPECT_EQ(token_counts[0], 0) << "Token 0 (4th) should NOT be sampled with k=3";
+        EXPECT_EQ(token_counts[3], 0) << "Token 3 (5th) should NOT be sampled with k=3";
+    }
+
+    TEST_F(SamplerTest, Ranking_HigherLogitsHaveHigherProbability)
+    {
+        // With standard temperature, higher logits should be sampled more often
+        Sampler sampler(42);
+        std::map<int, int> token_counts;
+
+        for (int i = 0; i < 10000; ++i)
+        {
+            int token = sampler.sample_temperature(standard_logits_, 1.0f);
+            token_counts[token]++;
+        }
+
+        // Token 2 (logit 3.0) should be most frequent
+        // Token 1 (logit 2.0) should be second most frequent
+        // Token 3 (logit 0.5) should be least frequent
+        EXPECT_GT(token_counts[2], token_counts[1])
+            << "Higher logit should have higher sample count";
+        EXPECT_GT(token_counts[1], token_counts[4])
+            << "Logit 2.0 > 1.5, should be sampled more";
+        EXPECT_GT(token_counts[4], token_counts[0])
+            << "Logit 1.5 > 1.0, should be sampled more";
+        EXPECT_GT(token_counts[0], token_counts[3])
+            << "Logit 1.0 > 0.5, should be sampled more";
+    }
+
+    // =============================================================================
+    // Softmax Numerical Stability Tests
+    // =============================================================================
+
+    TEST_F(SamplerTest, Softmax_VeryLargeLogits)
+    {
+        // Test numerical stability with very large logit values
+        std::vector<float> large_logits = {500.0f, 501.0f, 502.0f, 500.5f};
+
+        // Should not overflow or produce NaN
+        int token = sampler_->sample_greedy(large_logits);
+        EXPECT_EQ(token, 2) << "Greedy should work with large logits";
+
+        token = sampler_->sample_temperature(large_logits, 1.0f);
+        EXPECT_GE(token, 0);
+        EXPECT_LT(token, 4);
+        EXPECT_FALSE(std::isnan(static_cast<float>(token)));
+    }
+
+    TEST_F(SamplerTest, Softmax_VerySmallLogits)
+    {
+        // Test numerical stability with very small (negative) logit values
+        std::vector<float> small_logits = {-500.0f, -501.0f, -499.0f, -500.5f};
+
+        // Should not underflow or produce NaN
+        int token = sampler_->sample_greedy(small_logits);
+        EXPECT_EQ(token, 2) << "Greedy should pick -499.0f (highest)";
+
+        token = sampler_->sample_temperature(small_logits, 1.0f);
+        EXPECT_GE(token, 0);
+        EXPECT_LT(token, 4);
+    }
+
+    TEST_F(SamplerTest, Softmax_MixedExtremeLogits)
+    {
+        // Mix of very large and very small logits
+        std::vector<float> mixed = {-1000.0f, 1000.0f, -1000.0f, -1000.0f};
+
+        // Token 1 should dominate completely
+        for (int i = 0; i < 100; ++i)
+        {
+            int token = sampler_->sample_temperature(mixed, 1.0f);
+            EXPECT_EQ(token, 1) << "Extreme positive logit should always win";
+        }
+    }
+
+    // =============================================================================
+    // Probability Distribution Verification
+    // =============================================================================
+
+    TEST_F(SamplerTest, Distribution_UniformLogitsGiveUniformSampling)
+    {
+        // Uniform logits should give approximately uniform sampling
+        Sampler sampler(42);
+        std::map<int, int> token_counts;
+
+        for (int i = 0; i < 10000; ++i)
+        {
+            int token = sampler.sample_temperature(uniform_logits_, 1.0f);
+            token_counts[token]++;
+        }
+
+        // Each token should be sampled ~2000 times (10000/5 = 2000)
+        // Allow 20% tolerance
+        for (int i = 0; i < 5; ++i)
+        {
+            EXPECT_GT(token_counts[i], 1600)
+                << "Token " << i << " undersampled in uniform distribution";
+            EXPECT_LT(token_counts[i], 2400)
+                << "Token " << i << " oversampled in uniform distribution";
+        }
+    }
+
+    TEST_F(SamplerTest, Distribution_HighTempFlattens)
+    {
+        // High temperature should flatten the distribution
+        // Use a less extreme distribution so we can see the flattening effect
+        std::vector<float> moderate_peak = {1.0f, 2.0f, 5.0f, 1.5f, 2.5f};
+
+        Sampler sampler(42);
+        std::map<int, int> counts_low_temp;
+        std::map<int, int> counts_high_temp;
+
+        for (int i = 0; i < 10000; ++i)
+        {
+            counts_low_temp[sampler.sample_temperature(moderate_peak, 0.3f)]++;
+        }
+
+        sampler.set_seed(42); // Reset for fair comparison
+        for (int i = 0; i < 10000; ++i)
+        {
+            counts_high_temp[sampler.sample_temperature(moderate_peak, 5.0f)]++;
+        }
+
+        // Low temp should heavily favor the peak (token 2)
+        EXPECT_GT(counts_low_temp[2], 8000) << "Low temp should strongly favor peak";
+
+        // High temp should distribute more evenly - all tokens should get some samples
+        for (int i = 0; i < 5; ++i)
+        {
+            EXPECT_GT(counts_high_temp[i], 500)
+                << "High temp should give token " << i << " meaningful probability";
+        }
+
+        // The peak should still be favored, but less so
+        EXPECT_LT(counts_high_temp[2], 4000)
+            << "High temp should reduce peak dominance";
+    }
+
+    // =============================================================================
+    // is_greedy() Method Comprehensive Tests
+    // =============================================================================
+
+    TEST_F(SamplerTest, IsGreedy_VariousConfigurations)
+    {
+        SamplingParams params;
+
+        // Temperature 0 is always greedy
+        params.temperature = 0.0f;
+        params.top_k = 0;
+        params.top_p = 1.0f;
+        EXPECT_TRUE(params.is_greedy()) << "temp=0 should be greedy";
+
+        // Top-k=1 with top_p>=1 is greedy
+        params.temperature = 1.0f;
+        params.top_k = 1;
+        params.top_p = 1.0f;
+        EXPECT_TRUE(params.is_greedy()) << "top_k=1 with top_p=1 should be greedy";
+
+        // Top-k=1 with top_p<1 - still considers only 1 token
+        params.temperature = 1.0f;
+        params.top_k = 1;
+        params.top_p = 0.5f;
+        EXPECT_FALSE(params.is_greedy()) << "top_k=1 with top_p<1 is NOT considered greedy by is_greedy()";
+
+        // Standard sampling is NOT greedy
+        params.temperature = 0.8f;
+        params.top_k = 40;
+        params.top_p = 0.95f;
+        EXPECT_FALSE(params.is_greedy()) << "Standard params should not be greedy";
+
+        // Temperature 1 with no filtering is NOT greedy (will sample)
+        params.temperature = 1.0f;
+        params.top_k = 0;
+        params.top_p = 1.0f;
+        EXPECT_FALSE(params.is_greedy()) << "temp=1 without filtering is not greedy";
+    }
+
+    // =============================================================================
+    // Real-World Scenario Tests (Qwen2 vocabulary size)
+    // =============================================================================
+
+    TEST_F(SamplerTest, RealWorld_Qwen2VocabSize)
+    {
+        // Qwen2.5 has vocab_size = 151936
+        const size_t vocab_size = 151936;
+        std::vector<float> logits(vocab_size, 0.0f);
+
+        // Set up realistic distribution: one clear winner with some noise
+        logits[256] = 15.0f;    // Top prediction (space token)
+        logits[8159] = 14.0f;   // Second
+        logits[100160] = 13.5f; // Third
+        logits[72363] = 13.0f;  // Fourth
+        logits[105797] = 12.8f; // Fifth
+
+        // Greedy should pick token 256
+        int token = sampler_->sample_greedy(logits);
+        EXPECT_EQ(token, 256) << "Greedy should pick highest logit token";
+
+        // With low temperature, should almost always pick 256
+        Sampler sampler(42);
+        int count_256 = 0;
+        for (int i = 0; i < 100; ++i)
+        {
+            if (sampler.sample_temperature(logits, 0.1f) == 256)
+            {
+                count_256++;
+            }
+        }
+        EXPECT_GT(count_256, 95) << "Low temp should strongly favor top token";
+
+        // Top-k=5 should only pick from the top 5 tokens
+        sampler.set_seed(42);
+        std::set<int> sampled_tokens;
+        for (int i = 0; i < 100; ++i)
+        {
+            sampled_tokens.insert(sampler.sample_top_k(logits, 5, 1.0f));
+        }
+
+        // All sampled tokens should be in top-5
+        std::set<int> top5 = {256, 8159, 100160, 72363, 105797};
+        for (int t : sampled_tokens)
+        {
+            EXPECT_TRUE(top5.count(t) > 0)
+                << "Token " << t << " not in top-5 but was sampled with k=5";
+        }
+    }
+
+    TEST_F(SamplerTest, RealWorld_DecodeLoopSimulation)
+    {
+        // Simulate a decode loop like Main.cpp does
+        const size_t vocab_size = 151936;
+        std::vector<float> logits(vocab_size, 0.0f);
+
+        // First decode step prediction
+        logits[256] = 14.54f;
+        logits[8159] = 14.01f;
+        logits[100160] = 13.13f;
+
+        SamplingParams params;
+        params.temperature = 0.0f; // Greedy for determinism
+        params.top_k = 0;
+        params.top_p = 1.0f;
+
+        // With greedy, should always get 256
+        for (int step = 0; step < 10; ++step)
+        {
+            int token = sampler_->sample(logits, params);
+            EXPECT_EQ(token, 256)
+                << "Greedy decode should produce consistent tokens";
+        }
+    }
+
 } // anonymous namespace

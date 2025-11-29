@@ -1281,6 +1281,31 @@ add_v2_test(V2_Integration_QuantisedGemmFused
     LABELS "V2;Integration;Kernels;GEMM;FusedOps;Softmax;SwiGLU;Bias;Correctness"
 )
 
+# Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
+# Validates end-to-end pipeline functionality including Q/K/V/O bias application
+add_executable(v2_integration_qwen2_pipeline integration/Test__Qwen2Pipeline.cpp)
+target_link_libraries(v2_integration_qwen2_pipeline
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Qwen2Pipeline
+    COMMAND $<TARGET_FILE:v2_integration_qwen2_pipeline>
+    LABELS "V2;Integration;Pipeline;Qwen2;AutoregressiveDecode;Bias;Attention;E2E"
+)
+
+# Test: KVCache Integration Tests (KV cache behavior during autoregressive decode)
+# Validates cache accumulation, data integrity, position tracking, and attention correctness
+add_executable(v2_integration_kv_cache integration/Test__KVCacheIntegration.cpp)
+target_link_libraries(v2_integration_kv_cache
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_KVCache
+    COMMAND $<TARGET_FILE:v2_integration_kv_cache>
+    LABELS "V2;Integration;KVCache;AutoregressiveDecode;Attention;Pipeline"
+)
+
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
 # Large matrices, mixed precision, strided layouts, fused softmax, causal masking
 add_executable(v2_integration_fp_gemm integration/Test__FloatingPointGemmKernel.cpp)

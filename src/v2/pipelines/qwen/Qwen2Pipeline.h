@@ -55,6 +55,11 @@ namespace llaminar2
             std::shared_ptr<TensorBase> up_proj;   // FFN up projection [d_model, d_ff]
             std::shared_ptr<TensorBase> down_proj; // FFN down projection [d_ff, d_model]
             std::shared_ptr<TensorBase> ffn_norm;  // Pre-FFN norm gamma [d_model]
+            
+            // Attention biases (Qwen2 uses Q/K/V biases)
+            std::shared_ptr<TensorBase> q_bias;    // Query bias [d_model]
+            std::shared_ptr<TensorBase> k_bias;    // Key bias [n_kv_heads * head_dim]
+            std::shared_ptr<TensorBase> v_bias;    // Value bias [n_kv_heads * head_dim]
 
             // Fused GEMM kernels (lazily initialized)
             // These quantize activations once and reuse for multiple projections
@@ -83,7 +88,7 @@ namespace llaminar2
         // PipelineBase interface
         bool forward(const int *tokens, int seq_len) override; // Legacy single-sequence (wraps batch version)
         const char *architecture() const override { return "qwen2"; }
-        const float *logits() const override { return getLogits(0); } // Return logits for first sequence
+        const float *logits() const override; // Return logits for LAST token of first sequence (for sampling)
 
         /**
          * @brief Batch-first forward pass (primary interface)
@@ -94,12 +99,27 @@ namespace llaminar2
         bool forward_batch(const std::vector<std::vector<int>> &token_batches);
 
         /**
-         * @brief Get output logits for E2E testing/validation
+         * @brief Get output logits for E2E testing/validation (full sequence)
+         *
+         * Returns pointer to logits for the START of the requested sequence's logits.
+         * Layout: [padded_seq_len, vocab_size] for seq_idx.
+         * Use this for E2E parity tests that compare all positions.
          *
          * @param seq_idx Sequence index in batch (default=0)
-         * @return Logits tensor [padded_seq_len, vocab_size], or nullptr if forward() not called
+         * @return Logits tensor pointer, or nullptr if forward() not called
          */
         const float *getLogits(int seq_idx = 0) const;
+
+        /**
+         * @brief Get logits for the last token of a sequence (for sampling)
+         *
+         * This is what you need for autoregressive generation - the logits
+         * predicting the next token given all previous tokens.
+         *
+         * @param seq_idx Sequence index in batch (default=0)
+         * @return Pointer to [vocab_size] logits for last token, or nullptr if forward() not called
+         */
+        const float *getLastTokenLogits(int seq_idx = 0) const;
 
         /**
          * @brief Get batch size

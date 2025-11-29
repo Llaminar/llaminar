@@ -10,6 +10,7 @@
 #include "attention/MpiAttentionOrchestrator.h"
 #include "../tensors/TensorFactory.h"
 #include "../tensors/Tensors.h"
+#include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -17,6 +18,7 @@
 #include <set>
 #include <algorithm>
 #include <stdexcept>
+#include <limits>
 #include <omp.h>
 
 #if defined(__AVX512F__)
@@ -694,6 +696,12 @@ namespace llaminar2
         LOG_INFO("[PipelineBase] Snapshot capture DISABLED");
     }
 
+    void PipelineBase::clearSnapshots()
+    {
+        snapshots_.clear();
+        LOG_DEBUG("[PipelineBase] Snapshots cleared (capture still " << (snapshot_capture_enabled_ ? "ENABLED" : "DISABLED") << ")");
+    }
+
     const float *PipelineBase::getSnapshot(const std::string &key, size_t &out_size) const
     {
         auto it = snapshots_.find(key);
@@ -1054,6 +1062,120 @@ namespace llaminar2
 
         // Capture snapshot
         CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, seq_len, n_heads * head_dim);
+        return true;
+    }
+
+    bool PipelineBase::compute_attention_with_kv_cache(
+        TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+        int q_seq_len, int kv_seq_len, int n_heads, int n_kv_heads, int head_dim,
+        int batch_size, const std::vector<int> &sequence_lengths,
+        bool causal, const std::string &snapshot_key)
+    {
+        // For now, when q_seq_len == kv_seq_len (prefill), use existing path
+        if (q_seq_len == kv_seq_len)
+        {
+            return compute_attention(Q, K, V, output, q_seq_len, n_heads, n_kv_heads, head_dim,
+                                     batch_size, sequence_lengths, q_seq_len, causal, snapshot_key);
+        }
+
+        // Decode path: Q has fewer tokens than K/V (incremental decode with KV cache)
+        // Create views with correct shapes
+        auto Q_view = Q->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(n_heads * head_dim)});
+        auto K_view = K->create_view({static_cast<size_t>(kv_seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+        auto V_view = V->create_view({static_cast<size_t>(kv_seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
+        auto out_view = output->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(n_heads * head_dim)});
+
+        if (!Q_view || !K_view || !V_view || !out_view)
+        {
+            LOG_ERROR("compute_attention_with_kv_cache: failed to create tensor views");
+            return false;
+        }
+
+        // Get attention kernel from output tensor
+        auto *activation_output = dynamic_cast<IActivationTensor *>(out_view.get());
+        if (!activation_output)
+        {
+            LOG_ERROR("compute_attention_with_kv_cache: output tensor does not implement IActivationTensor");
+            return false;
+        }
+
+        auto attention_kernel = activation_output->createAttention();
+        if (!attention_kernel)
+        {
+            LOG_ERROR("compute_attention_with_kv_cache: failed to create attention kernel");
+            return false;
+        }
+
+        // Use the attention kernel's compute_decode method (supports asymmetric lengths)
+        // For now, we need to access the underlying kernel directly since ITensorAttention
+        // doesn't expose compute_decode. We'll use the raw compute with proper workspace setup.
+
+        // Allocate workspace for attention scores [n_heads, q_seq_len, kv_seq_len]
+        auto scores_workspace = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(n_heads * q_seq_len * kv_seq_len)});
+
+        // Build causal mask for decode: [q_seq_len, kv_seq_len]
+        // For decode, we mask future positions. Since Q is at the end of the sequence,
+        // all K/V positions up to and including current position should be unmasked.
+        std::shared_ptr<FP32Tensor> mask_tensor = nullptr;
+        if (causal)
+        {
+            mask_tensor = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(q_seq_len * kv_seq_len)});
+            float *mask_data = mask_tensor->mutable_data();
+
+            // For decode with KV cache:
+            // Q position is at kv_seq_len - 1 (the last position)
+            // All K/V positions [0, kv_seq_len-1] should be visible (mask = 0)
+            // No future positions to mask since Q is at the end
+            for (int q = 0; q < q_seq_len; ++q)
+            {
+                int q_pos = (kv_seq_len - q_seq_len) + q; // Q position in the full sequence
+                for (int k = 0; k < kv_seq_len; ++k)
+                {
+                    // Causal: Q at position q_pos can attend to K at positions [0, q_pos]
+                    float mask_val = (k <= q_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
+                    mask_data[q * kv_seq_len + k] = mask_val;
+                }
+            }
+        }
+
+        // Use CpuAttentionKernelT's compute_decode which handles asymmetric lengths
+        // Since ITensorAttention doesn't expose compute_decode, we need to cast to the concrete type
+        auto *cpu_kernel = dynamic_cast<CpuAttentionKernelT<FP32Tensor> *>(attention_kernel.get());
+        if (cpu_kernel)
+        {
+            // Pass -1 for device_idx since CpuAttentionKernelT expects -1 for CPU execution
+            // (DeviceManager uses index 0 for CPU, but kernels use -1 convention)
+            bool success = cpu_kernel->compute_decode(
+                Q_view->data(),
+                K_view->data(),
+                V_view->data(),
+                out_view->mutable_data(),
+                q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                causal, /*window_size=*/-1,
+                scores_workspace.get(),
+                nullptr, // workspace_buffer
+                nullptr, // workspace_context
+                mask_tensor.get(),
+                false, // use_bf16
+                mpi_ctx_.get(),
+                -1); // CPU device index for kernel
+
+            if (!success)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed");
+                return false;
+            }
+        }
+        else
+        {
+            LOG_ERROR("compute_attention_with_kv_cache: could not get CpuAttentionKernelT");
+            return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, q_seq_len, n_heads * head_dim);
         return true;
     }
 

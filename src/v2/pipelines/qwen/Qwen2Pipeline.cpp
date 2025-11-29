@@ -337,6 +337,19 @@ namespace llaminar2
         // Validate after embedding
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_embedding");
 
+        // DEBUG: Print embedding values for last position
+        static const bool debug_layers = std::getenv("LLAMINAR_DEBUG_LAYERS") != nullptr;
+        if (debug_layers && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
+        {
+            const float *hidden = current_hidden_->data();
+            int last_pos = effective_seq_len - 1;
+            LOG_INFO("[DEBUG] Embedding output (position " << last_pos << "), first 10 values:");
+            for (int i = 0; i < 10; ++i)
+            {
+                LOG_INFO("  hidden[" << i << "] = " << hidden[last_pos * d_model_ + i]);
+            }
+        }
+
         // Process all transformer layers
         for (int i = 0; i < n_layers_; ++i)
         {
@@ -344,6 +357,18 @@ namespace llaminar2
             {
                 LOG_ERROR("Layer " << i << " failed");
                 return false;
+            }
+
+            // DEBUG: Print hidden state after each layer
+            if (debug_layers && (!mpi_ctx_ || mpi_ctx_->rank() == 0) && i == 0)
+            {
+                const float *hidden = current_hidden_->data();
+                int last_pos = effective_seq_len - 1;
+                LOG_INFO("[DEBUG] After layer " << i << " (position " << last_pos << "), first 10 values:");
+                for (int j = 0; j < 10; ++j)
+                {
+                    LOG_INFO("  hidden[" << j << "] = " << hidden[last_pos * d_model_ + j]);
+                }
             }
 
             // Validate hidden state dimensions unchanged between layers
@@ -435,6 +460,25 @@ namespace llaminar2
             effective_seq_len, d_model_, 1e-6f,
             layer_prefix + "_ATTENTION_NORM", attn_device));
 
+        // DEBUG: Print normalized output for layer 0
+        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
+        {
+            auto *norm_fp32 = dynamic_cast<FP32Tensor *>(buffers.normalized.get());
+            if (norm_fp32)
+            {
+                const float *norm_data = norm_fp32->data();
+                int last_pos = effective_seq_len - 1;
+                std::ostringstream oss;
+                oss << "Layer 0 after RMSNorm (seq_len=" << effective_seq_len
+                    << ", last_pos=" << last_pos << ", first 10 values): ";
+                for (int i = 0; i < std::min(10, d_model_); ++i)
+                {
+                    oss << norm_data[last_pos * d_model_ + i] << ", ";
+                }
+                LOG_TRACE(oss.str());
+            }
+        }
+
         // 2. Fused Q/K/V projections
         if (!layer.qkv_fused)
         {
@@ -442,12 +486,36 @@ namespace llaminar2
                 layer.wq.get(), layer.wk.get(), layer.wv.get());
         }
 
+        // Extract bias pointers (nullptr if model doesn't have biases)
+        const float *q_bias_ptr = nullptr;
+        const float *k_bias_ptr = nullptr;
+        const float *v_bias_ptr = nullptr;
+
+        if (layer.q_bias)
+        {
+            auto *q_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.q_bias.get());
+            if (q_bias_fp32)
+                q_bias_ptr = q_bias_fp32->data();
+        }
+        if (layer.k_bias)
+        {
+            auto *k_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.k_bias.get());
+            if (k_bias_fp32)
+                k_bias_ptr = k_bias_fp32->data();
+        }
+        if (layer.v_bias)
+        {
+            auto *v_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.v_bias.get());
+            if (v_bias_fp32)
+                v_bias_ptr = v_bias_fp32->data();
+        }
+
         VALIDATE_OP(layer.qkv_fused->execute(
                         buffers.normalized->data(),
                         buffers.Q->mutable_data(),
                         buffers.K->mutable_data(),
                         buffers.V->mutable_data(),
-                        nullptr, nullptr, nullptr,
+                        q_bias_ptr, k_bias_ptr, v_bias_ptr,
                         effective_seq_len,
                         n_heads_ * head_dim_, n_kv_heads_ * head_dim_, n_kv_heads_ * head_dim_,
                         d_model_,
@@ -458,6 +526,26 @@ namespace llaminar2
         capture_snapshot(layer_prefix + "_Q_PROJECTION", buffers.Q.get(), effective_seq_len, n_heads_ * head_dim_);
         capture_snapshot(layer_prefix + "_K_PROJECTION", buffers.K.get(), effective_seq_len, n_kv_heads_ * head_dim_);
         capture_snapshot(layer_prefix + "_V_PROJECTION", buffers.V.get(), effective_seq_len, n_kv_heads_ * head_dim_);
+
+        // DEBUG: Print Q projection output for layer 0
+        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
+        {
+            auto *Q_fp32 = dynamic_cast<FP32Tensor *>(buffers.Q.get());
+            if (Q_fp32)
+            {
+                const float *q_data = Q_fp32->data();
+                int last_pos = effective_seq_len - 1;
+                int q_dim = n_heads_ * head_dim_;
+                std::ostringstream oss;
+                oss << "Layer 0 Q projection (seq_len=" << effective_seq_len
+                    << ", last_pos=" << last_pos << ", first 10 values): ";
+                for (int i = 0; i < std::min(10, q_dim); ++i)
+                {
+                    oss << q_data[last_pos * q_dim + i] << ", ";
+                }
+                LOG_TRACE(oss.str());
+            }
+        }
 
         // 3. Apply RoPE to Q and K
         std::vector<int> position_ids(effective_seq_len);
@@ -476,18 +564,161 @@ namespace llaminar2
             model_ctx_->model().rope_theta,
             layer_prefix, attn_device));
 
-        // 4. GQA attention
-        TRY_OP(compute_attention(
-            buffers.Q.get(), buffers.K.get(), buffers.V.get(), buffers.attn_output.get(),
-            effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
-            batch_size_, sequence_lengths_, padded_seq_len_,
-            /*causal=*/false, layer_prefix + "_ATTENTION_CONTEXT"));
+        // DEBUG: Print Q after RoPE for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            auto *Q_fp32 = dynamic_cast<FP32Tensor *>(buffers.Q.get());
+            if (Q_fp32)
+            {
+                const float *q_data = Q_fp32->data();
+                int last_pos = effective_seq_len - 1;
+                int q_dim = n_heads_ * head_dim_;
+                std::ostringstream oss;
+                oss << "Layer 0 Q after RoPE (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, q_dim); ++i)
+                {
+                    oss << q_data[last_pos * q_dim + i] << ", ";
+                }
+                LOG_TRACE(oss.str());
+            }
+        }
+
+        // 4. Update KV cache and compute attention
+        // For single sequence: append new K/V to cache, then use full cache for attention
+        // For batched: append per-sequence K/V, then use per-sequence cached K/V
+        TensorBase *K_for_attention = buffers.K.get();
+        TensorBase *V_for_attention = buffers.V.get();
+        int kv_seq_len = effective_seq_len; // Default: K/V has same seq_len as Q
+        bool use_kv_cache = false;
+
+        // Debug: Log KV cache state for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            LOG_TRACE("KV Cache state: kv_cache_=" << (kv_cache_ ? "yes" : "no")
+                                                   << ", batch_size_=" << batch_size_
+                                                   << ", effective_seq_len=" << effective_seq_len);
+        }
+
+        if (kv_cache_ && batch_size_ == 1)
+        {
+            // Single-sequence KV cache path
+            // Cast buffers.K and buffers.V to FP32Tensor for cache append
+            auto *K_fp32 = dynamic_cast<FP32Tensor *>(buffers.K.get());
+            auto *V_fp32 = dynamic_cast<FP32Tensor *>(buffers.V.get());
+
+            if (K_fp32 && V_fp32)
+            {
+                // Create view of current K/V with correct shape for cache append
+                // Use effective_seq_len (which equals padded_seq_len_ for batch_size_==1)
+                auto K_view = K_fp32->create_view({static_cast<size_t>(effective_seq_len),
+                                                   static_cast<size_t>(n_kv_heads_ * head_dim_)});
+                auto V_view = V_fp32->create_view({static_cast<size_t>(effective_seq_len),
+                                                   static_cast<size_t>(n_kv_heads_ * head_dim_)});
+
+                if (K_view && V_view)
+                {
+                    auto *K_view_fp32 = dynamic_cast<FP32Tensor *>(K_view.get());
+                    auto *V_view_fp32 = dynamic_cast<FP32Tensor *>(V_view.get());
+
+                    if (K_view_fp32 && V_view_fp32)
+                    {
+                        // Append to cache
+                        if (!kv_cache_->append_kv(layer_idx, K_view_fp32, V_view_fp32))
+                        {
+                            LOG_ERROR("Failed to append K/V to cache for layer " << layer_idx);
+                            return false;
+                        }
+
+                        // Get full cached K/V for attention
+                        auto cached_K = kv_cache_->get_k(layer_idx);
+                        auto cached_V = kv_cache_->get_v(layer_idx);
+                        int cached_tokens = kv_cache_->get_cached_tokens(layer_idx);
+
+                        if (cached_K && cached_V && cached_tokens > 0)
+                        {
+                            K_for_attention = cached_K.get();
+                            V_for_attention = cached_V.get();
+                            kv_seq_len = cached_tokens;
+                            use_kv_cache = true;
+
+                            // Debug: Log KV cache usage for layer 0
+                            if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+                            {
+                                LOG_TRACE("KV Cache using cached K/V: cached_tokens=" << cached_tokens
+                                                                                      << ", Q tokens=" << effective_seq_len);
+                            }
+
+                            LOG_TRACE("[KVCache] Layer " << layer_idx << ": using cached K/V with "
+                                                         << cached_tokens << " tokens for attention (Q has " << effective_seq_len << " tokens)");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute attention
+        if (use_kv_cache && kv_seq_len != effective_seq_len)
+        {
+            // Decode path: Q has fewer tokens than cached K/V
+            // Use compute_attention_with_kv_cache which handles asymmetric lengths
+            TRY_OP(compute_attention_with_kv_cache(
+                buffers.Q.get(), K_for_attention, V_for_attention, buffers.attn_output.get(),
+                effective_seq_len, kv_seq_len, n_heads_, n_kv_heads_, head_dim_,
+                batch_size_, sequence_lengths_,
+                /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
+        }
+        else
+        {
+            // Prefill path or no KV cache: Q/K/V have same length
+            TRY_OP(compute_attention(
+                buffers.Q.get(), K_for_attention, V_for_attention, buffers.attn_output.get(),
+                effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
+                batch_size_, sequence_lengths_, padded_seq_len_,
+                /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
+        }
+
+        // DEBUG: Print attention output for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            auto *attn_out_fp32 = dynamic_cast<FP32Tensor *>(buffers.attn_output.get());
+            if (attn_out_fp32)
+            {
+                const float *attn_data = attn_out_fp32->data();
+                int last_pos = effective_seq_len - 1;
+                int attn_dim = n_heads_ * head_dim_;
+                std::ostringstream oss;
+                oss << "Layer 0 attention output (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, attn_dim); ++i)
+                {
+                    oss << attn_data[last_pos * attn_dim + i] << ", ";
+                }
+                LOG_TRACE(oss.str());
+            }
+        }
 
         // 5. Output projection
         TRY_OP(project(
             buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
             effective_seq_len, d_model_, n_heads_ * head_dim_,
             layer_prefix + "_ATTENTION_OUTPUT", attn_device));
+
+        // DEBUG: Print output projection for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            auto *attn_proj_fp32 = dynamic_cast<FP32Tensor *>(buffers.attn_proj.get());
+            if (attn_proj_fp32)
+            {
+                const float *proj_data = attn_proj_fp32->data();
+                int last_pos = effective_seq_len - 1;
+                std::ostringstream oss;
+                oss << "Layer 0 output projection (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, d_model_); ++i)
+                {
+                    oss << proj_data[last_pos * d_model_ + i] << ", ";
+                }
+                LOG_TRACE(oss.str());
+            }
+        }
 
         // 6. Residual connection
         TRY_OP(add_residual(
@@ -535,6 +766,35 @@ namespace llaminar2
             effective_seq_len, d_model_, 1e-6f,
             layer_prefix + "_FFN_NORM", ffn_device));
 
+        // DEBUG: Print FFN input (residual) and normalized for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            auto *res_fp32 = dynamic_cast<FP32Tensor *>(buffers.residual.get());
+            auto *norm_fp32 = dynamic_cast<FP32Tensor *>(buffers.normalized.get());
+            if (res_fp32 && norm_fp32)
+            {
+                const float *res_data = res_fp32->data();
+                const float *norm_data = norm_fp32->data();
+                int last_pos = effective_seq_len - 1;
+
+                std::ostringstream oss1;
+                oss1 << "Layer 0 FFN residual input (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, d_model_); ++i)
+                {
+                    oss1 << res_data[last_pos * d_model_ + i] << ", ";
+                }
+                LOG_TRACE(oss1.str());
+
+                std::ostringstream oss2;
+                oss2 << "Layer 0 FFN after RMSNorm (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, d_model_); ++i)
+                {
+                    oss2 << norm_data[last_pos * d_model_ + i] << ", ";
+                }
+                LOG_TRACE(oss2.str());
+            }
+        }
+
         // 2. Fused Gate/Up projections
         if (!layer.gate_up_fused)
         {
@@ -554,6 +814,35 @@ namespace llaminar2
         capture_snapshot(layer_prefix + "_FFN_GATE", buffers.gate.get(), effective_seq_len, d_ff_);
         capture_snapshot(layer_prefix + "_FFN_UP", buffers.up.get(), effective_seq_len, d_ff_);
 
+        // DEBUG: Print FFN gate/up output for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            auto *gate_fp32 = dynamic_cast<FP32Tensor *>(buffers.gate.get());
+            auto *up_fp32 = dynamic_cast<FP32Tensor *>(buffers.up.get());
+            if (gate_fp32 && up_fp32)
+            {
+                const float *gate_data = gate_fp32->data();
+                const float *up_data = up_fp32->data();
+                int last_pos = effective_seq_len - 1;
+
+                std::ostringstream oss1;
+                oss1 << "[DEBUG] Layer 0 FFN gate_proj (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, d_ff_); ++i)
+                {
+                    oss1 << gate_data[last_pos * d_ff_ + i] << ", ";
+                }
+                LOG_INFO(oss1.str());
+
+                std::ostringstream oss2;
+                oss2 << "[DEBUG] Layer 0 FFN up_proj (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, d_ff_); ++i)
+                {
+                    oss2 << up_data[last_pos * d_ff_ + i] << ", ";
+                }
+                LOG_INFO(oss2.str());
+            }
+        }
+
         // 3. Apply SwiGLU
         TRY_OP(swiglu(
             buffers.gate.get(), buffers.up.get(), buffers.up.get(),
@@ -565,6 +854,24 @@ namespace llaminar2
             buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
             effective_seq_len, d_model_, d_ff_,
             layer_prefix + "_FFN_DOWN", ffn_device));
+
+        // DEBUG: Print FFN down output for layer 0
+        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            auto *ffn_out_fp32 = dynamic_cast<FP32Tensor *>(buffers.ffn_output.get());
+            if (ffn_out_fp32)
+            {
+                const float *ffn_data = ffn_out_fp32->data();
+                int last_pos = effective_seq_len - 1;
+                std::ostringstream oss;
+                oss << "Layer 0 FFN down output (last position, first 10 values): ";
+                for (int i = 0; i < std::min(10, d_model_); ++i)
+                {
+                    oss << ffn_data[last_pos * d_model_ + i] << ", ";
+                }
+                LOG_TRACE(oss.str());
+            }
+        }
 
         // 5. Residual connection
         TRY_OP(add_residual(
@@ -592,7 +899,58 @@ namespace llaminar2
     {
         if (!embedding_table_)
         {
-            embedding_table_ = model_ctx_->getWeight("token_embd.weight", device_idx_);
+            auto raw_embed = model_ctx_->getWeight("token_embd.weight", device_idx_);
+            if (!raw_embed)
+            {
+                LOG_ERROR("[Qwen2Pipeline] Failed to load embedding table");
+                return nullptr;
+            }
+
+            // GGUF stores embedding as [d_model, vocab_size] but we need [vocab_size, d_model]
+            // for efficient row-wise lookup. Transpose the dequantized data.
+            const auto &shape = raw_embed->shape();
+
+            // Debug: Log actual shape
+            std::stringstream shape_str;
+            shape_str << "[";
+            for (size_t i = 0; i < shape.size(); ++i)
+            {
+                if (i > 0)
+                    shape_str << ", ";
+                shape_str << shape[i];
+            }
+            shape_str << "]";
+            LOG_INFO("[Qwen2Pipeline] Raw embedding shape: " << shape_str.str()
+                                                             << ", d_model_=" << d_model_ << ", vocab_size_=" << vocab_size_);
+
+            if (shape.size() == 2 && shape[0] == static_cast<size_t>(d_model_) && shape[1] == static_cast<size_t>(vocab_size_))
+            {
+                LOG_INFO("[Qwen2Pipeline] Transposing embedding table from [" << shape[0] << ", " << shape[1]
+                                                                              << "] to [" << shape[1] << ", " << shape[0] << "]");
+
+                // Create FP32 tensor with transposed shape [vocab_size, d_model]
+                embedding_table_ = std::make_shared<FP32Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(vocab_size_), static_cast<size_t>(d_model_)},
+                    device_idx_);
+
+                // Transpose: dst[v, d] = src[d, v]
+                const float *src = raw_embed->data();
+                float *dst = embedding_table_->mutable_data();
+
+#pragma omp parallel for
+                for (int v = 0; v < vocab_size_; ++v)
+                {
+                    for (int d = 0; d < d_model_; ++d)
+                    {
+                        dst[v * d_model_ + d] = src[d * vocab_size_ + v];
+                    }
+                }
+            }
+            else
+            {
+                // Already in correct shape or unexpected shape - use as-is
+                embedding_table_ = raw_embed;
+            }
         }
         return embedding_table_;
     }
@@ -663,6 +1021,16 @@ namespace llaminar2
             layer.up_proj = model_ctx_->getWeight(prefix + "ffn_up.weight", device_idx_);
             layer.down_proj = model_ctx_->getWeight(prefix + "ffn_down.weight", device_idx_);
             layer.ffn_norm = model_ctx_->getWeight(prefix + "ffn_norm.weight", device_idx_);
+
+            // Load Q/K/V biases (optional - not all models have them)
+            layer.q_bias = model_ctx_->getWeight(prefix + "attn_q.bias", device_idx_);
+            layer.k_bias = model_ctx_->getWeight(prefix + "attn_k.bias", device_idx_);
+            layer.v_bias = model_ctx_->getWeight(prefix + "attn_v.bias", device_idx_);
+
+            if (layer.q_bias)
+            {
+                LOG_DEBUG("[DEBUG] Layer " << layer_idx << " has Q/K/V biases");
+            }
         }
 
         return layer;
@@ -710,7 +1078,23 @@ namespace llaminar2
         const float *embed_data = embed_table->data();
         float *output_data = output->mutable_data();
 
+        static const bool debug_embedding = std::getenv("LLAMINAR_DEBUG_EMBEDDING") != nullptr;
         static const bool debug_batch = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
+
+        // DEBUG: Print first 10 values of embedding table for token 785 and 9906
+        if (debug_embedding && mpi_ctx_ && mpi_ctx_->rank() == 0)
+        {
+            int test_tokens[] = {785, 9906};
+            for (int token_id : test_tokens)
+            {
+                const float *emb = embed_data + token_id * d_model_;
+                LOG_INFO("[DEBUG] Embedding table for token " << token_id << ":");
+                for (int i = 0; i < 20; ++i)
+                {
+                    LOG_INFO("  emb[" << i << "] = " << emb[i]);
+                }
+            }
+        }
 
         // Process each sequence in the batch
         int global_idx = 0;
@@ -773,6 +1157,12 @@ namespace llaminar2
         return true;
     }
 
+    const float *Qwen2Pipeline::logits() const
+    {
+        // Return logits for LAST token of first sequence (what sampling needs)
+        return getLastTokenLogits(0);
+    }
+
     const float *Qwen2Pipeline::getLogits(int seq_idx) const
     {
         if (!logits_buffer_)
@@ -786,6 +1176,46 @@ namespace llaminar2
         // Layout: [batch_size * padded_seq_len, vocab_size]
         // For sequence seq_idx, logits start at row (seq_idx * padded_seq_len)
         return logits_buffer_->data() + (seq_idx * padded_seq_len_ * vocab_size_);
+    }
+
+    const float *Qwen2Pipeline::getLastTokenLogits(int seq_idx) const
+    {
+        if (!logits_buffer_)
+        {
+            return nullptr;
+        }
+
+        DEBUG_ASSERT_RANGE(seq_idx, 0, batch_size_, "Invalid sequence index");
+
+        // Return pointer to logits for the LAST token of the requested sequence
+        // Layout: [batch_size * padded_seq_len, vocab_size]
+        // For sequence seq_idx, the last token's logits are at row:
+        //   (seq_idx * padded_seq_len) + (sequence_length - 1)
+        // For single-sequence decode steps, padded_seq_len_ = 1, so last row = row 0
+        int seq_length = (seq_idx < static_cast<int>(sequence_lengths_.size()))
+                             ? sequence_lengths_[seq_idx]
+                             : padded_seq_len_;
+        int last_pos = seq_idx * padded_seq_len_ + (seq_length - 1);
+
+        // Compute the actual buffer size from the logits buffer shape
+        int logits_rows = static_cast<int>(logits_buffer_->shape()[0]);
+
+        LOG_DEBUG("[getLastTokenLogits] seq_idx=" << seq_idx
+                                                  << ", padded_seq_len=" << padded_seq_len_
+                                                  << ", seq_length=" << seq_length
+                                                  << ", last_pos=" << last_pos
+                                                  << ", logits_buffer_rows=" << logits_rows);
+
+        // Sanity check: ensure last_pos is within buffer bounds
+        if (last_pos >= logits_rows)
+        {
+            LOG_WARN("[getLastTokenLogits] last_pos=" << last_pos
+                                                      << " exceeds logits_buffer_rows=" << logits_rows
+                                                      << ", clamping to " << (logits_rows - 1));
+            last_pos = logits_rows - 1;
+        }
+
+        return logits_buffer_->data() + (last_pos * vocab_size_);
     }
 
 } // namespace llaminar2

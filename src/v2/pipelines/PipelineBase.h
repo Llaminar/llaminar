@@ -315,6 +315,16 @@ namespace llaminar2
         void disableSnapshotCapture();
 
         /**
+         * @brief Clear stored snapshots but keep capture enabled
+         *
+         * Useful for incremental decode testing where you want to capture
+         * each decode step separately without re-enabling capture.
+         *
+         * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
+         */
+        void clearSnapshots();
+
+        /**
          * @brief Retrieve a captured snapshot by key
          *
          * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
@@ -1029,6 +1039,33 @@ namespace llaminar2
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int seq_len, int n_heads, int n_kv_heads, int head_dim,
             int batch_size, const std::vector<int> &sequence_lengths, int padded_seq_len,
+            bool causal, const std::string &snapshot_key);
+
+        /**
+         * @brief Compute attention with KV cache support (asymmetric Q/K/V lengths)
+         *
+         * Used for incremental decode where Q has length 1 (current token)
+         * but K/V have full cached context length.
+         *
+         * @param Q Query tensor [q_seq_len, n_heads * head_dim]
+         * @param K Key tensor [kv_seq_len, n_kv_heads * head_dim] (from KV cache)
+         * @param V Value tensor [kv_seq_len, n_kv_heads * head_dim] (from KV cache)
+         * @param output Output tensor [q_seq_len, n_heads * head_dim]
+         * @param q_seq_len Query sequence length (1 for decode, prompt_len for prefill)
+         * @param kv_seq_len Key/Value sequence length (total cached tokens)
+         * @param n_heads Number of attention heads
+         * @param n_kv_heads Number of KV heads (for GQA)
+         * @param head_dim Head dimension
+         * @param batch_size Batch size
+         * @param sequence_lengths Actual sequence lengths (for padding mask)
+         * @param causal Whether to use causal masking
+         * @param snapshot_key Snapshot key for attention context output
+         * @return true on success
+         */
+        bool compute_attention_with_kv_cache(
+            TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            int q_seq_len, int kv_seq_len, int n_heads, int n_kv_heads, int head_dim,
+            int batch_size, const std::vector<int> &sequence_lengths,
             bool causal, const std::string &snapshot_key);
 
         /**

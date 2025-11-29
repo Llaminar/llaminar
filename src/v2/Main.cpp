@@ -534,6 +534,8 @@ int main(int argc, char *argv[])
     }
 
     // Single-shot chat mode (--chat-single)
+    // This mode applies the chat template to the prompt and generates a response.
+    // All MPI ranks must participate in forward passes to avoid deadlocks.
     if (args.single_shot_chat)
     {
         if (!tokenizer->hasChatTemplate())
@@ -543,6 +545,7 @@ int main(int argc, char *argv[])
                 LOG_ERROR("Chat mode requires a model with a chat template.");
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
             }
+            MPI_Barrier(MPI_COMM_WORLD);
             MPI_Finalize();
             return 1;
         }
@@ -550,17 +553,140 @@ int main(int argc, char *argv[])
         if (mpi_ctx->rank() == 0)
         {
             LOG_INFO("Running single-shot chat...");
+        }
 
-            ChatUIConfig chat_config;
-            chat_config.max_tokens = args.n_predict;
-            chat_config.temperature = args.temperature;
-            chat_config.top_k = args.top_k;
-            chat_config.top_p = args.top_p;
+        // Build conversation and encode with chat template (rank 0 only, then broadcast)
+        std::vector<int> token_ids;
+        int token_count = 0;
 
-            // Convert unique_ptr to shared_ptr for runSingleShotChat
-            std::shared_ptr<PipelineBase> shared_pipeline(std::move(pipeline));
+        if (mpi_ctx->rank() == 0)
+        {
+            std::vector<ChatMessage> conversation;
+            if (!args.system_prompt.empty())
+            {
+                conversation.push_back(ChatMessage("system", args.system_prompt));
+            }
+            conversation.push_back(ChatMessage("user", args.prompt));
 
-            runSingleShotChat(tokenizer, shared_pipeline, args.prompt, args.system_prompt, chat_config);
+            token_ids = tokenizer->encodeChat(conversation, /*add_generation_prompt=*/true);
+            token_count = static_cast<int>(token_ids.size());
+
+            if (token_ids.empty())
+            {
+                LOG_ERROR("Failed to encode conversation with chat template");
+                token_count = -1; // Signal error to other ranks
+            }
+            else
+            {
+                LOG_INFO("Encoded " << token_count << " tokens with chat template");
+            }
+        }
+
+        // Broadcast token count first (to handle errors and allocate on other ranks)
+        MPI_Bcast(&token_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        if (token_count <= 0)
+        {
+            MPI_Finalize();
+            return 1;
+        }
+
+        // Resize token_ids on non-rank-0 processes and broadcast the tokens
+        if (mpi_ctx->rank() != 0)
+        {
+            token_ids.resize(token_count);
+        }
+        MPI_Bcast(token_ids.data(), token_count, MPI_INT, 0, MPI_COMM_WORLD);
+
+        // All ranks participate in prefill
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("Running prefill (" << token_count << " tokens)...");
+        }
+
+        if (!pipeline->forward(token_ids.data(), token_count))
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Chat prefill failed");
+            }
+            MPI_Finalize();
+            return 1;
+        }
+
+        // Set up sampling
+        int eos_token_id = tokenizer->eos_token();
+        Sampler sampler(args.seed);
+        SamplingParams sampling_params;
+        sampling_params.temperature = args.temperature;
+        sampling_params.top_k = args.top_k;
+        sampling_params.top_p = args.top_p;
+        sampling_params.seed = args.seed;
+
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("Generating response (max " << args.n_predict << " tokens)...\n");
+        }
+
+        // Decode loop - all ranks participate in forward, rank 0 samples and outputs
+        for (int i = 0; i < args.n_predict; ++i)
+        {
+            int next_token = -1;
+
+            // Rank 0: sample next token
+            if (mpi_ctx->rank() == 0)
+            {
+                const float *logits = pipeline->logits();
+                size_t vocab_size = tokenizer->vocab_size();
+                std::vector<float> logits_vec(logits, logits + vocab_size);
+
+                // Sample
+                if (sampling_params.temperature < 0.01f)
+                {
+                    next_token = sampler.sample_greedy(logits_vec);
+                }
+                else
+                {
+                    next_token = sampler.sample(logits_vec, sampling_params);
+                }
+
+                // Output token text (streaming)
+                if (next_token != eos_token_id)
+                {
+                    std::string token_text = tokenizer->decode_token(next_token);
+                    std::cout << token_text << std::flush;
+                }
+            }
+
+            // Broadcast next token to all ranks
+            MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+            // Check for EOS
+            if (next_token == eos_token_id)
+            {
+                if (mpi_ctx->rank() == 0)
+                {
+                    LOG_DEBUG("EOS token encountered, stopping generation");
+                }
+                break;
+            }
+
+            // All ranks forward the next token
+            if (!pipeline->forward(&next_token, 1))
+            {
+                if (mpi_ctx->rank() == 0)
+                {
+                    LOG_ERROR("Decode forward failed at token " << i);
+                }
+                MPI_Finalize();
+                return 1;
+            }
+        }
+
+        if (mpi_ctx->rank() == 0)
+        {
+            std::cout << std::endl;
+            LOG_INFO("Chat generation complete.");
         }
 
         MPI_Finalize();
@@ -575,8 +701,8 @@ int main(int argc, char *argv[])
     std::vector<int> tokens;
     try
     {
-        // Encode with BOS token for instruction-tuned models
-        tokens = tokenizer->encode(args.prompt, /*add_bos=*/true, /*add_eos=*/false);
+        // Encode WITHOUT BOS token (E2E tests don't use BOS)
+        tokens = tokenizer->encode(args.prompt, /*add_bos=*/false, /*add_eos=*/false);
 
         if (tokens.empty())
         {
@@ -591,6 +717,16 @@ int main(int argc, char *argv[])
         if (mpi_ctx->rank() == 0)
         {
             LOG_INFO("Tokenized prompt: " << tokens.size() << " tokens");
+            std::ostringstream token_ids_str;
+            token_ids_str << "Token IDs: [";
+            for (size_t i = 0; i < tokens.size(); ++i)
+            {
+                token_ids_str << tokens[i];
+                if (i < tokens.size() - 1)
+                    token_ids_str << ", ";
+            }
+            token_ids_str << "]";
+            LOG_INFO(token_ids_str.str());
         }
     }
     catch (const std::exception &e)
@@ -666,6 +802,39 @@ int main(int argc, char *argv[])
         {
             LOG_DEBUG("[Rank 0] Sampling token...");
             std::vector<float> logits_vec(logits, logits + vocab_size);
+
+            // DEBUG: Print first 10 logit values and some specific positions
+            {
+                LOG_TRACE("[Rank 0] First 10 logit values:");
+                for (int k = 0; k < 10; ++k)
+                {
+                    LOG_TRACE("  logits[" << k << "] = " << logits_vec[k]);
+                }
+                LOG_TRACE("[Rank 0] Logits at key positions (PyTorch expected):");
+                LOG_TRACE("  logits[341] = " << logits_vec[341] << " (expected ~13.0 for ' {\\n')");
+                LOG_TRACE("  logits[11] = " << logits_vec[11] << " (expected ~12.9 for ',')");
+                LOG_TRACE("  logits[31792] = " << logits_vec[31792] << " (expected ~12.9 for '_world')");
+                LOG_TRACE("  logits[89012] = " << logits_vec[89012] << " (position 0 top: '给')");
+            }
+
+            // DEBUG: Print top-5 logits to help diagnose sampling issues
+            {
+                std::vector<std::pair<int, float>> indexed_logits;
+                indexed_logits.reserve(vocab_size);
+                for (size_t j = 0; j < vocab_size; ++j)
+                {
+                    indexed_logits.emplace_back(static_cast<int>(j), logits_vec[j]);
+                }
+                std::partial_sort(indexed_logits.begin(), indexed_logits.begin() + 5, indexed_logits.end(),
+                                  [](const auto &a, const auto &b)
+                                  { return a.second > b.second; });
+                LOG_TRACE("[Rank 0] Top-5 logits at decode iteration " << i << ":");
+                for (int k = 0; k < 5; ++k)
+                {
+                    LOG_TRACE("  " << (k + 1) << ". Token " << indexed_logits[k].first
+                                   << " score=" << indexed_logits[k].second);
+                }
+            }
 
             // Sample next token
             try

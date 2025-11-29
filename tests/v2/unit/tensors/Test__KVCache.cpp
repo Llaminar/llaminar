@@ -360,3 +360,294 @@ TEST(KVCacheHeterogeneousTest, ThreeDevicePlacement)
         EXPECT_EQ(cache->get_cached_tokens(i), seq_len);
     }
 }
+
+// =============================================================================
+// Edge Case and Boundary Condition Tests
+// =============================================================================
+
+/**
+ * @brief Test appending data to cache in interleaved order across layers
+ *
+ * Validates that appending to different layers in non-sequential order
+ * doesn't corrupt data.
+ */
+TEST_F(KVCacheTest, InterleavedLayerAppends)
+{
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+
+    // Append to layers in random order: 2, 0, 3, 1
+    std::vector<int> layer_order = {2, 0, 3, 1};
+
+    for (int layer : layer_order)
+    {
+        auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+        auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+
+        // Fill with layer-specific pattern
+        for (size_t i = 0; i < 4 * kv_dim; ++i)
+        {
+            K->mutable_data()[i] = static_cast<float>(layer * 100 + i);
+            V->mutable_data()[i] = static_cast<float>(layer * 100 + i + 0.5f);
+        }
+
+        EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+    }
+
+    // Verify each layer has correct data
+    for (int layer = 0; layer < n_layers_; ++layer)
+    {
+        EXPECT_EQ(cache_->get_cached_tokens(layer), 4);
+
+        auto K = cache_->get_k(layer);
+        ASSERT_NE(K, nullptr);
+
+        // Verify first element matches layer pattern
+        EXPECT_FLOAT_EQ(K->data()[0], static_cast<float>(layer * 100));
+    }
+}
+
+/**
+ * @brief Test multiple small appends followed by verification
+ *
+ * Simulates realistic decode: many single-token appends
+ */
+TEST_F(KVCacheTest, ManySmallAppends)
+{
+    int layer = 0;
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+
+    // Append 50 single tokens
+    int num_tokens = 50;
+    for (int t = 0; t < num_tokens; ++t)
+    {
+        auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{1, kv_dim}, -1);
+        auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{1, kv_dim}, -1);
+
+        for (size_t i = 0; i < kv_dim; ++i)
+        {
+            K->mutable_data()[i] = static_cast<float>(t);
+            V->mutable_data()[i] = static_cast<float>(t + 1000);
+        }
+
+        EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+        EXPECT_EQ(cache_->get_cached_tokens(layer), t + 1);
+    }
+
+    // Verify all data
+    auto cached_K = cache_->get_k(layer);
+    ASSERT_NE(cached_K, nullptr);
+
+    for (int t = 0; t < num_tokens; ++t)
+    {
+        // Check first element of each token's kv_dim block
+        EXPECT_FLOAT_EQ(cached_K->data()[t * kv_dim], static_cast<float>(t))
+            << "Token " << t << " has wrong value";
+    }
+}
+
+/**
+ * @brief Test boundary: append exactly max_seq_len tokens
+ */
+TEST_F(KVCacheTest, ExactCapacityFill)
+{
+    int layer = 0;
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+
+    // Fill to exactly max_seq_len
+    auto K = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(max_seq_len_), kv_dim}, -1);
+    auto V = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(max_seq_len_), kv_dim}, -1);
+
+    for (size_t i = 0; i < max_seq_len_ * kv_dim; ++i)
+    {
+        K->mutable_data()[i] = static_cast<float>(i);
+        V->mutable_data()[i] = static_cast<float>(i);
+    }
+
+    EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+    EXPECT_EQ(cache_->get_cached_tokens(layer), max_seq_len_);
+
+    // Verify first and last elements
+    auto cached_K = cache_->get_k(layer);
+    EXPECT_FLOAT_EQ(cached_K->data()[0], 0.0f);
+    EXPECT_FLOAT_EQ(cached_K->data()[max_seq_len_ * kv_dim - 1],
+                    static_cast<float>(max_seq_len_ * kv_dim - 1));
+}
+
+/**
+ * @brief Test data integrity after clear and refill
+ */
+TEST_F(KVCacheTest, ClearAndRefill)
+{
+    int layer = 0;
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+
+    // First fill with pattern A
+    {
+        auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{8, kv_dim}, -1);
+        auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{8, kv_dim}, -1);
+
+        for (size_t i = 0; i < 8 * kv_dim; ++i)
+        {
+            K->mutable_data()[i] = 111.0f;
+            V->mutable_data()[i] = 222.0f;
+        }
+
+        EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+        EXPECT_EQ(cache_->get_cached_tokens(layer), 8);
+    }
+
+    // Clear
+    cache_->clear_layer(layer);
+    EXPECT_EQ(cache_->get_cached_tokens(layer), 0);
+
+    // Refill with pattern B
+    {
+        auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+        auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+
+        for (size_t i = 0; i < 4 * kv_dim; ++i)
+        {
+            K->mutable_data()[i] = 333.0f;
+            V->mutable_data()[i] = 444.0f;
+        }
+
+        EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+        EXPECT_EQ(cache_->get_cached_tokens(layer), 4);
+    }
+
+    // Verify pattern B (not A)
+    auto cached_K = cache_->get_k(layer);
+    auto cached_V = cache_->get_v(layer);
+
+    for (size_t i = 0; i < 4 * kv_dim; ++i)
+    {
+        EXPECT_FLOAT_EQ(cached_K->data()[i], 333.0f);
+        EXPECT_FLOAT_EQ(cached_V->data()[i], 444.0f);
+    }
+}
+
+/**
+ * @brief Test invalid layer indices are handled gracefully
+ */
+TEST_F(KVCacheTest, InvalidLayerHandling)
+{
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+
+    auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+    auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+
+    // Negative layer
+    EXPECT_FALSE(cache_->append_kv(-1, K.get(), V.get()));
+
+    // Layer >= n_layers
+    EXPECT_FALSE(cache_->append_kv(n_layers_, K.get(), V.get()));
+    EXPECT_FALSE(cache_->append_kv(n_layers_ + 10, K.get(), V.get()));
+
+    // get_cached_tokens for invalid layers returns 0
+    EXPECT_EQ(cache_->get_cached_tokens(-1), 0);
+    EXPECT_EQ(cache_->get_cached_tokens(n_layers_), 0);
+
+    // get_k/get_v for invalid layers returns nullptr
+    EXPECT_EQ(cache_->get_k(-1), nullptr);
+    EXPECT_EQ(cache_->get_v(n_layers_), nullptr);
+}
+
+/**
+ * @brief Test null tensor handling
+ */
+TEST_F(KVCacheTest, NullTensorHandling)
+{
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+    auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+    auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{4, kv_dim}, -1);
+
+    // Null K
+    EXPECT_FALSE(cache_->append_kv(0, nullptr, V.get()));
+
+    // Null V
+    EXPECT_FALSE(cache_->append_kv(0, K.get(), nullptr));
+
+    // Both null
+    EXPECT_FALSE(cache_->append_kv(0, nullptr, nullptr));
+
+    // Cache should still be empty
+    EXPECT_EQ(cache_->get_cached_tokens(0), 0);
+}
+
+/**
+ * @brief Test prefill + multiple decode pattern matching real pipeline usage
+ *
+ * Simulates: prefill with N tokens, then 3 decode steps with 1 token each
+ */
+TEST_F(KVCacheTest, RealisticPrefillDecodePattern)
+{
+    size_t kv_dim = n_kv_heads_ * head_dim_;
+    int prefill_len = 32;  // Typical prompt length
+    int decode_steps = 10; // Typical decode steps
+
+    // Test across all layers to simulate real transformer
+    for (int layer = 0; layer < n_layers_; ++layer)
+    {
+        // Prefill: batch of tokens
+        {
+            auto K = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(prefill_len), kv_dim}, -1);
+            auto V = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(prefill_len), kv_dim}, -1);
+
+            // Fill with identifiable pattern
+            for (int t = 0; t < prefill_len; ++t)
+            {
+                for (size_t d = 0; d < kv_dim; ++d)
+                {
+                    K->mutable_data()[t * kv_dim + d] = static_cast<float>(layer * 10000 + t);
+                    V->mutable_data()[t * kv_dim + d] = static_cast<float>(layer * 10000 + t + 0.5f);
+                }
+            }
+
+            EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+            EXPECT_EQ(cache_->get_cached_tokens(layer), prefill_len);
+        }
+
+        // Decode: single tokens
+        for (int step = 0; step < decode_steps; ++step)
+        {
+            auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{1, kv_dim}, -1);
+            auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{1, kv_dim}, -1);
+
+            int token_id = prefill_len + step;
+            for (size_t d = 0; d < kv_dim; ++d)
+            {
+                K->mutable_data()[d] = static_cast<float>(layer * 10000 + token_id);
+                V->mutable_data()[d] = static_cast<float>(layer * 10000 + token_id + 0.5f);
+            }
+
+            EXPECT_TRUE(cache_->append_kv(layer, K.get(), V.get()));
+            EXPECT_EQ(cache_->get_cached_tokens(layer), prefill_len + step + 1);
+        }
+    }
+
+    // Final verification: all layers should have same token count
+    int expected_tokens = prefill_len + decode_steps;
+    for (int layer = 0; layer < n_layers_; ++layer)
+    {
+        EXPECT_EQ(cache_->get_cached_tokens(layer), expected_tokens);
+
+        // Verify data integrity
+        auto K = cache_->get_k(layer);
+
+        // First token from prefill
+        EXPECT_FLOAT_EQ(K->data()[0], static_cast<float>(layer * 10000));
+
+        // First token from decode
+        EXPECT_FLOAT_EQ(K->data()[prefill_len * kv_dim],
+                        static_cast<float>(layer * 10000 + prefill_len));
+
+        // Last token from decode
+        int last_token_id = expected_tokens - 1;
+        EXPECT_FLOAT_EQ(K->data()[last_token_id * kv_dim],
+                        static_cast<float>(layer * 10000 + last_token_id));
+    }
+}
