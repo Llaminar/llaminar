@@ -4,11 +4,15 @@
  * @author David Sanftenberg
  * @date 2025-11-23
  * @updated 2025-11-26 - Updated for FP32-only API (removed INT32 dequantization)
+ * @updated 2025-12-01 - Fixed SwiGLU formula: silu(gate) * up (matches HuggingFace)
  *
  * Tests the FusedSwiGLU kernel against a reference implementation
  * to validate correctness. The kernel applies SwiGLU activation:
- *   output = gate * silu(up)
+ *   output = silu(gate) * up
  *   where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ *
+ * NOTE: This is the correct formula matching HuggingFace:
+ *   down_proj(act_fn(gate_proj(x)) * up_proj(x))
  */
 
 #include <gtest/gtest.h>
@@ -41,6 +45,7 @@ namespace llaminar2
         }
 
         // Reference implementation: SwiGLU on FP32 inputs
+        // Correct formula: silu(gate) * up (matches HuggingFace)
         void reference_swiglu(
             const float *gate,
             const float *up,
@@ -52,7 +57,7 @@ namespace llaminar2
                 for (int j = 0; j < n; ++j)
                 {
                     int idx = i * n + j;
-                    output[idx] = gate[idx] * silu_ref(up[idx]);
+                    output[idx] = silu_ref(gate[idx]) * up[idx];
                 }
             }
         }

@@ -97,20 +97,20 @@ namespace llaminar2::primitives
             __m256 g = _mm256_loadu_ps(gate + i);
             __m256 u = _mm256_loadu_ps(up + i);
 
-            // silu(u) = u / (1 + exp(-u))
-            __m256 neg_u = _mm256_sub_ps(zero, u);
-            __m256 exp_neg_u = fast_exp256(neg_u);
-            __m256 denom = _mm256_add_ps(one, exp_neg_u);
+            // silu(g) = g / (1 + exp(-g))  [applies activation to GATE, per HuggingFace]
+            __m256 neg_g = _mm256_sub_ps(zero, g);
+            __m256 exp_neg_g = fast_exp256(neg_g);
+            __m256 denom = _mm256_add_ps(one, exp_neg_g);
 
             // Fast reciprocal with Newton-Raphson
             __m256 rcp = _mm256_rcp_ps(denom);
             __m256 term = _mm256_fnmadd_ps(denom, rcp, two); // 2 - d*rcp
-            __m256 sigmoid_u = _mm256_mul_ps(rcp, term);
+            __m256 sigmoid_g = _mm256_mul_ps(rcp, term);
 
-            __m256 silu_u = _mm256_mul_ps(u, sigmoid_u);
+            __m256 silu_g = _mm256_mul_ps(g, sigmoid_g);
 
-            // output = g * silu(u)
-            __m256 out = _mm256_mul_ps(g, silu_u);
+            // output = silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+            __m256 out = _mm256_mul_ps(silu_g, u);
             _mm256_storeu_ps(output + i, out);
         }
 
@@ -119,7 +119,7 @@ namespace llaminar2::primitives
         {
             float g = gate[i];
             float u = up[i];
-            output[i] = g * silu_scalar(u);
+            output[i] = silu_scalar(g) * u;
         }
     }
 #endif
@@ -172,19 +172,21 @@ namespace llaminar2::primitives
             __m512 g = _mm512_loadu_ps(gate + i);
             __m512 u = _mm512_loadu_ps(up + i);
 
-            __m512 neg_u = _mm512_sub_ps(zero, u);
-            __m512 exp_neg_u = fast_exp512(neg_u);
-            __m512 denom = _mm512_add_ps(one, exp_neg_u);
+            // silu(g) = g / (1 + exp(-g))  [applies activation to GATE, per HuggingFace]
+            __m512 neg_g = _mm512_sub_ps(zero, g);
+            __m512 exp_neg_g = fast_exp512(neg_g);
+            __m512 denom = _mm512_add_ps(one, exp_neg_g);
 
             __m512 rcp = _mm512_rcp14_ps(denom); // rcp14 is more accurate than rcp
             // Newton-Raphson for better precision (optional, rcp14 might be enough)
             // x1 = x0 * (2 - d * x0)
             __m512 term = _mm512_fnmadd_ps(denom, rcp, two);
-            __m512 sigmoid_u = _mm512_mul_ps(rcp, term);
+            __m512 sigmoid_g = _mm512_mul_ps(rcp, term);
 
-            __m512 silu_u = _mm512_mul_ps(u, sigmoid_u);
+            __m512 silu_g = _mm512_mul_ps(g, sigmoid_g);
 
-            __m512 out = _mm512_mul_ps(g, silu_u);
+            // output = silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+            __m512 out = _mm512_mul_ps(silu_g, u);
             _mm512_storeu_ps(output + i, out);
         }
 
@@ -192,7 +194,7 @@ namespace llaminar2::primitives
         {
             float g = gate[i];
             float u = up[i];
-            output[i] = g * silu_scalar(u);
+            output[i] = silu_scalar(g) * u; // silu on gate, per HuggingFace
         }
     }
 #endif
@@ -218,7 +220,7 @@ namespace llaminar2::primitives
 #else
             for (int j = 0; j < current_chunk; ++j)
             {
-                o_ptr[j] = g_ptr[j] * silu_scalar(u_ptr[j]);
+                o_ptr[j] = silu_scalar(g_ptr[j]) * u_ptr[j];
             }
 #endif
         }
@@ -231,7 +233,7 @@ namespace llaminar2::primitives
         {
             float g = simd::bf16_to_fp32(gate[i]);
             float u = simd::bf16_to_fp32(up[i]);
-            float res = g * silu_scalar(u);
+            float res = silu_scalar(g) * u; // silu on gate, per HuggingFace
             output[i] = simd::fp32_to_bf16(res);
         }
     }
@@ -243,7 +245,7 @@ namespace llaminar2::primitives
         {
             float g = simd::fp16_to_fp32(gate[i]);
             float u = simd::fp16_to_fp32(up[i]);
-            float res = g * silu_scalar(u);
+            float res = silu_scalar(g) * u; // silu on gate, per HuggingFace
             output[i] = simd::fp32_to_fp16(res);
         }
     }
@@ -306,22 +308,22 @@ namespace llaminar2::primitives
             u2 = _mm256_mul_ps(u2, u_scale);
             u3 = _mm256_mul_ps(u3, u_scale);
 
-            // Compute SwiGLU: g * silu(u)
-            auto compute_silu_op = [&](__m256 u_val)
+            // Compute SwiGLU: silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+            auto compute_silu_op = [&](__m256 val)
             {
-                __m256 neg_u = _mm256_sub_ps(zero, u_val);
-                __m256 exp_neg_u = fast_exp256(neg_u);
-                __m256 denom = _mm256_add_ps(one, exp_neg_u);
+                __m256 neg_val = _mm256_sub_ps(zero, val);
+                __m256 exp_neg_val = fast_exp256(neg_val);
+                __m256 denom = _mm256_add_ps(one, exp_neg_val);
                 __m256 rcp = _mm256_rcp_ps(denom);
                 __m256 term = _mm256_fnmadd_ps(denom, rcp, two);
-                __m256 sigmoid_u = _mm256_mul_ps(rcp, term);
-                return _mm256_mul_ps(u_val, sigmoid_u);
+                __m256 sigmoid = _mm256_mul_ps(rcp, term);
+                return _mm256_mul_ps(val, sigmoid);
             };
 
-            __m256 res0 = _mm256_mul_ps(g0, compute_silu_op(u0));
-            __m256 res1 = _mm256_mul_ps(g1, compute_silu_op(u1));
-            __m256 res2 = _mm256_mul_ps(g2, compute_silu_op(u2));
-            __m256 res3 = _mm256_mul_ps(g3, compute_silu_op(u3));
+            __m256 res0 = _mm256_mul_ps(compute_silu_op(g0), u0);
+            __m256 res1 = _mm256_mul_ps(compute_silu_op(g1), u1);
+            __m256 res2 = _mm256_mul_ps(compute_silu_op(g2), u2);
+            __m256 res3 = _mm256_mul_ps(compute_silu_op(g3), u3);
 
             // Max abs
             __m256 max_v = _mm256_and_ps(res0, abs_mask);
@@ -446,16 +448,17 @@ namespace llaminar2::primitives
             u1_hi = _mm512_mul_ps(u1_hi, u_scale1);
 
             // Compute SwiGLU (lambda for reuse)
+            // HuggingFace FFN formula: act_fn(gate_proj) * up_proj = silu(g) * u
             auto swiglu_op = [&](__m512 g, __m512 u)
             {
-                __m512 neg_u = _mm512_sub_ps(zero, u);
-                __m512 exp_neg_u = fast_exp512(neg_u);
-                __m512 denom = _mm512_add_ps(one, exp_neg_u);
+                __m512 neg_g = _mm512_sub_ps(zero, g);
+                __m512 exp_neg_g = fast_exp512(neg_g);
+                __m512 denom = _mm512_add_ps(one, exp_neg_g);
                 __m512 rcp = _mm512_rcp14_ps(denom);
                 __m512 term = _mm512_fnmadd_ps(denom, rcp, two);
-                __m512 sigmoid_u = _mm512_mul_ps(rcp, term);
-                __m512 silu_u = _mm512_mul_ps(u, sigmoid_u);
-                return _mm512_mul_ps(g, silu_u);
+                __m512 sigmoid_g = _mm512_mul_ps(rcp, term);
+                __m512 silu_g = _mm512_mul_ps(g, sigmoid_g);
+                return _mm512_mul_ps(silu_g, u);
             };
 
             __m512 res0_lo = swiglu_op(g0_lo, u0_lo);
@@ -547,14 +550,15 @@ namespace llaminar2::primitives
                 g0 = _mm512_mul_ps(g0, g_scale);
                 u0 = _mm512_mul_ps(u0, u_scale);
 
-                __m512 neg_u0 = _mm512_sub_ps(zero, u0);
-                __m512 exp_neg_u0 = fast_exp512(neg_u0);
-                __m512 denom0 = _mm512_add_ps(one, exp_neg_u0);
+                // silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+                __m512 neg_g0 = _mm512_sub_ps(zero, g0);
+                __m512 exp_neg_g0 = fast_exp512(neg_g0);
+                __m512 denom0 = _mm512_add_ps(one, exp_neg_g0);
                 __m512 rcp0 = _mm512_rcp14_ps(denom0);
                 __m512 term0 = _mm512_fnmadd_ps(denom0, rcp0, two);
-                __m512 sigmoid_u0 = _mm512_mul_ps(rcp0, term0);
-                __m512 silu_u0 = _mm512_mul_ps(u0, sigmoid_u0);
-                res[0] = _mm512_mul_ps(g0, silu_u0);
+                __m512 sigmoid_g0 = _mm512_mul_ps(rcp0, term0);
+                __m512 silu_g0 = _mm512_mul_ps(g0, sigmoid_g0);
+                res[0] = _mm512_mul_ps(silu_g0, u0);
 
                 // Chunk 1
                 __m128i bytes1 = _mm_loadu_si128((const __m128i *)(gb.qs + 16));
@@ -565,14 +569,15 @@ namespace llaminar2::primitives
                 g1 = _mm512_mul_ps(g1, g_scale);
                 u1 = _mm512_mul_ps(u1, u_scale);
 
-                __m512 neg_u1 = _mm512_sub_ps(zero, u1);
-                __m512 exp_neg_u1 = fast_exp512(neg_u1);
-                __m512 denom1 = _mm512_add_ps(one, exp_neg_u1);
+                // silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+                __m512 neg_g1 = _mm512_sub_ps(zero, g1);
+                __m512 exp_neg_g1 = fast_exp512(neg_g1);
+                __m512 denom1 = _mm512_add_ps(one, exp_neg_g1);
                 __m512 rcp1 = _mm512_rcp14_ps(denom1);
                 __m512 term1 = _mm512_fnmadd_ps(denom1, rcp1, two);
-                __m512 sigmoid_u1 = _mm512_mul_ps(rcp1, term1);
-                __m512 silu_u1 = _mm512_mul_ps(u1, sigmoid_u1);
-                res[1] = _mm512_mul_ps(g1, silu_u1);
+                __m512 sigmoid_g1 = _mm512_mul_ps(rcp1, term1);
+                __m512 silu_g1 = _mm512_mul_ps(g1, sigmoid_g1);
+                res[1] = _mm512_mul_ps(silu_g1, u1);
             }
 
             // Max abs
@@ -638,7 +643,7 @@ namespace llaminar2::primitives
             {
                 float g = g_scale * gb.qs[i];
                 float u = u_scale * ub.qs[i];
-                float res = g * silu_scalar(u);
+                float res = silu_scalar(g) * u; // silu on gate, per HuggingFace
                 temp[i] = res;
                 max_abs = std::max(max_abs, std::abs(res));
             }

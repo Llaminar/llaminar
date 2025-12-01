@@ -438,10 +438,11 @@ class Qwen2PipelineCapture:
                 self._save_snapshot('FFN_GATE', gate_proj, layer_idx)
                 self._save_snapshot('FFN_UP', up_proj, layer_idx)
         
-        # 3. SwiGLU activation: gate * silu(up)
+        # 3. SwiGLU activation: silu(gate) * up
+        # HuggingFace Qwen2 MLP: act_fn(gate_proj(x)) * up_proj(x)
         # SiLU(x) = x * sigmoid(x)
-        silu_up = F.silu(up_proj)
-        swiglu_output = gate_proj * silu_up
+        silu_gate = F.silu(gate_proj)
+        swiglu_output = silu_gate * up_proj
         if capture:
             if snapshot_prefix:
                 self._save_snapshot(f'{key_prefix}FFN_SWIGLU', swiglu_output)

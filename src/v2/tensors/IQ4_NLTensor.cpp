@@ -210,6 +210,32 @@ namespace llaminar2
         throw std::runtime_error("IQ4_NLTensor::mutable_data: quantized tensors are immutable");
     }
 
+    // ========== IINT8Unpackable Implementation ==========
+
+    void IQ4_NLTensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
+        const IQ4_NLBlock &block = blocks[row_idx * blocks_per_row + k_block_offset];
+
+        simd::unpack_iq4_nl_to_int8(block, output);
+    }
+
+    float IQ4_NLTensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
+        return simd::fp16_to_fp32(blocks[row_idx * blocks_per_row + k_block_offset].d);
+    }
+
+    float IQ4_NLTensor::get_block_min(size_t row_idx, size_t k_block_offset) const
+    {
+        // IQ4_NL is symmetric around 0 (mostly), no min offset
+        return 0.0f;
+    }
+
     // ========== Kernel Creation ==========
 
     std::unique_ptr<ITensorGemm> IQ4_NLTensor::createGemm()
@@ -250,8 +276,48 @@ namespace llaminar2
         else
         {
             // Tensor is on CPU - use QuantisedGemmKernel (requires IINT8Unpackable)
-            LOG_DEBUG("[IQ4_NLTensor] Creating CPU GEMM kernel");
+            // LOG_DEBUG("[IQ4_NLTensor] Creating CPU GEMM kernel");
             return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
+        }
+    }
+
+    ITensorGemm *IQ4_NLTensor::createGemmRaw()
+    {
+        if (device_idx_ >= 0)
+        {
+            // Tensor is on a GPU device - get device type from DeviceManager
+            auto &dm = DeviceManager::instance();
+            const auto &devices = dm.devices();
+
+            if (static_cast<size_t>(device_idx_) >= devices.size())
+            {
+                LOG_ERROR("[IQ4_NLTensor] Invalid device_idx: " << device_idx_);
+                throw std::runtime_error("IQ4_NLTensor::createGemm: invalid device index");
+            }
+
+            const auto &device = devices[device_idx_];
+
+            // Route based on backend type
+            switch (device.type)
+            {
+#ifdef HAVE_CUDA
+            case ComputeBackendType::GPU_CUDA:
+                LOG_DEBUG("[IQ4_NLTensor] Creating CUDA GEMM kernel for device " << device_idx_);
+                return llaminar::v2::kernels::cuda::createCudaGemmRaw(this);
+#endif
+#ifdef HAVE_ROCM
+            case ComputeBackendType::GPU_ROCM:
+                LOG_ERROR("[IQ4_NLTensor] ROCm GEMM not yet implemented");
+                throw std::runtime_error("ROCm GEMM not implemented");
+#endif
+            default:
+                LOG_ERROR("[IQ4_NLTensor] Unsupported GPU backend type: " << static_cast<int>(device.type));
+                throw std::runtime_error("Unsupported GPU backend type");
+            }
+        }
+        else
+        {
+            return new llaminar2::gemm_v4::QuantisedGemmKernel(this);
         }
     }
 

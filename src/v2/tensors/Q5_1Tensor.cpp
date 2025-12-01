@@ -480,4 +480,30 @@ namespace llaminar2
         output->d = q8_scale_fp16;
     }
 
+    void Q5_1Tensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
+        const Q5_1Block *q5_block = &blocks[row_idx * blocks_per_row + k_block_offset];
+
+        simd::unpack_q5_1_to_int8(*q5_block, output);
+    }
+
+    float Q5_1Tensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
+        return fp16_to_fp32(blocks[row_idx * blocks_per_row + k_block_offset].d);
+    }
+
+    float Q5_1Tensor::get_block_min(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
+        return fp16_to_fp32(blocks[row_idx * blocks_per_row + k_block_offset].m);
+    }
+
 } // namespace llaminar2

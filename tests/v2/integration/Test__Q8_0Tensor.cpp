@@ -22,6 +22,9 @@
 #include "../../../../src/v2/tensors/Tensors.h"
 #include "loaders/ModelLoader.h"
 #include <fstream>
+#include "v2/utils/MPIContext.h"
+#include "v2/tensors/TensorFactory.h"
+#include "v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -682,4 +685,100 @@ TEST_F(Test__Q8_0Tensor, RoundTrip_Q8_0_FP32_BF16_FP32)
 
     double rel_l2_error = std::sqrt(sum_sq_diff / sum_sq_orig);
     EXPECT_LT(rel_l2_error, 0.03) << "Round-trip relative L2 error: " << rel_l2_error;
+}
+
+/**
+ * @brief Quantized GEMM vs FP32 GEMM Parity Test for Q8_0
+ *
+ * Compares QuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
+ * using randomly initialized Q8_0 weights. Validates that quantization introduces
+ * acceptable error (< 1% relative L2).
+ */
+TEST_F(Test__Q8_0Tensor, QuantizedVsFP32Parity)
+{
+    using namespace llaminar2;
+
+    // Create MPI context for tensor factory
+    auto mpi_ctx = std::make_unique<MPIContext>(0, 1, MPI_COMM_WORLD);
+
+    // Realistic dimensions: 64 tokens, 512 hidden dim
+    const int m = 64;
+    const int n = 512;
+    const int k = 512;
+
+    // Q8_0: 32 elements per block (scale + 32 int8 values)
+    const size_t num_blocks = (static_cast<size_t>(n) * k) / 32;
+    std::vector<uint8_t> raw_data(num_blocks * sizeof(Q8_0Block));
+    Q8_0Block *blocks = reinterpret_cast<Q8_0Block *>(raw_data.data());
+
+    // Initialize with random but valid data
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int8_t> int8_dist(-127, 127);
+    std::uniform_real_distribution<float> scale_dist(0.001f, 0.1f);
+
+    for (size_t b = 0; b < num_blocks; ++b)
+    {
+        // Valid FP16 scale factor
+        blocks[b].d = fp32_to_fp16(scale_dist(rng));
+        // Random int8 values
+        for (int i = 0; i < 32; ++i)
+        {
+            blocks[b].qs[i] = int8_dist(rng);
+        }
+    }
+
+    // Create quantized tensor
+    auto q8_0_tensor = std::make_unique<Q8_0Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)},
+        raw_data);
+
+    // Dequantize to FP32 for reference
+    TensorFactory factory(*mpi_ctx);
+    auto fp32_weights = factory.createFP32({static_cast<size_t>(n), static_cast<size_t>(k)});
+    q8_0_tensor->to_fp32(fp32_weights->mutable_data());
+
+    // Create random input activations
+    auto input = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(k)});
+    float *input_data = input->mutable_data();
+    std::uniform_real_distribution<float> input_dist(-1.0f, 1.0f);
+    for (int i = 0; i < m * k; ++i)
+    {
+        input_data[i] = input_dist(rng);
+    }
+
+    // Allocate outputs
+    auto output_quantized = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
+    auto output_fp32 = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
+    std::memset(output_quantized->mutable_data(), 0, m * n * sizeof(float));
+    std::memset(output_fp32->mutable_data(), 0, m * n * sizeof(float));
+
+    // Run quantized GEMM (INT8 path)
+    auto quantized_gemm = q8_0_tensor->createGemm();
+    ASSERT_TRUE(quantized_gemm->multiply(
+        input_data,
+        output_quantized->mutable_data(),
+        m, n, k));
+
+    // Run FP32 GEMM (OneDNN reference)
+    gemm_v4::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
+    ASSERT_TRUE(fp32_gemm.multiply(
+        input_data,
+        output_fp32->mutable_data(),
+        m, n, k));
+
+    // Compare results - compute relative L2 error
+    double sum_sq_diff = 0.0, sum_sq_ref = 0.0;
+    for (int i = 0; i < m * n; ++i)
+    {
+        double diff = static_cast<double>(output_quantized->data()[i]) - static_cast<double>(output_fp32->data()[i]);
+        sum_sq_diff += diff * diff;
+        sum_sq_ref += static_cast<double>(output_fp32->data()[i]) * static_cast<double>(output_fp32->data()[i]);
+    }
+    float rel_l2_error_parity = (sum_sq_ref > 0) ? static_cast<float>(std::sqrt(sum_sq_diff / sum_sq_ref)) : 0.0f;
+
+    std::cout << "[Q8_0 Parity] Relative L2 error: " << (rel_l2_error_parity * 100.0f) << "%" << std::endl;
+
+    // 1% tolerance for quantization error
+    EXPECT_LT(rel_l2_error_parity, 0.01f)
+        << "Q8_0 quantized GEMM error exceeds 1% threshold";
 }

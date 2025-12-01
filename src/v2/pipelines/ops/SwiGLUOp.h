@@ -2,8 +2,10 @@
  * @file SwiGLUOp.h
  * @brief Self-validating SwiGLU activation operation
  *
- * SwiGLU is used in FFN blocks: output = gate * silu(up)
+ * SwiGLU is used in FFN blocks: output = silu(gate) * up
  * Where silu(x) = x * sigmoid(x)
+ *
+ * Per HuggingFace: down_proj(act_fn(gate_proj(x)) * up_proj(x))
  *
  * Encapsulates the full SwiGLU workflow:
  * 1. Validate gate/up/output tensors
@@ -33,9 +35,10 @@ namespace llaminar2
     /**
      * @brief Self-validating SwiGLU activation operation
      *
-     * Qwen2 SwiGLU formulation: output = gate * silu(up)
-     * - gate: Linear projection output (no activation applied)
-     * - up: Input to silu activation
+     * Qwen2 SwiGLU formulation: output = silu(gate) * up
+     * Per HuggingFace: down_proj(act_fn(gate_proj(x)) * up_proj(x))
+     * - gate: Linear projection output, gets silu activation
+     * - up: Linear projection output (no activation)
      * - output: Element-wise product
      *
      * Replaces:
@@ -57,10 +60,10 @@ namespace llaminar2
         const char *name() const override { return "SwiGLUOp"; }
 
         /**
-         * @brief Execute SwiGLU activation: output = gate * silu(up)
+         * @brief Execute SwiGLU activation: output = silu(gate) * up
          *
-         * @param gate Gate tensor [rows, cols] - linear term
-         * @param up Up tensor [rows, cols] - gets silu activation
+         * @param gate Gate tensor [rows, cols] - gets silu activation
+         * @param up Up tensor [rows, cols] - linear term
          * @param output Output tensor [rows, cols] - can be same as up for in-place
          * @param rows Number of rows (sequence length)
          * @param cols Number of columns (FFN intermediate size)

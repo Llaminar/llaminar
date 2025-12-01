@@ -502,12 +502,9 @@ namespace llaminar2
             reference_gemm(input_.data(), weights_dequant.data(), gemm_output.data(), m_, n_, k_);
 
             // Apply SwiGLU: The kernel computes output = gemm_output * silu(gate)
-            // which equals gate * silu(gemm_output) in compute_swiglu's convention
-            // So we swap the order: compute_swiglu(gemm_output, gate, output) -> gemm_output * silu(gate)
-            // Actually: compute_swiglu(a, b) = a * silu(b) = a * b * sigmoid(b)
-            // Kernel computes: gemm_output * silu(gate) = gemm_output * gate * sigmoid(gate)
-            // So we need: compute_swiglu(gemm_output, gate) = gemm_output * silu(gate)
-            primitives::compute_swiglu(gemm_output.data(), gate_output.data(), output_separate.data(), m_ * n_);
+            // compute_swiglu(gate, up, output) computes silu(gate) * up
+            // So to get gemm_output * silu(gate), we call compute_swiglu(gate, gemm_output, output)
+            primitives::compute_swiglu(gate_output.data(), gemm_output.data(), output_separate.data(), m_ * n_);
 
             // Compare
             auto result = compare_outputs(output_fused.data(), output_separate.data(), m_ * n_, 0.05);
@@ -552,11 +549,12 @@ namespace llaminar2
                 nullptr, false, 1.0f, 0.0f, nullptr, -1,
                 GemmFusedOps::swiglu(gate_output.data())));
 
-            // Reference: kernel computes gemm_output * silu(gate), so swap args
+            // Reference: kernel computes gemm_output * silu(gate)
+            // compute_swiglu(gate, up) = silu(gate) * up, so we pass (gate, gemm_output)
             std::vector<float> gemm_output(m_ * n_);
             std::vector<float> output_separate(m_ * n_);
             reference_gemm(input_.data(), weights_dequant.data(), gemm_output.data(), m_, n_, k_);
-            primitives::compute_swiglu(gemm_output.data(), gate_output.data(), output_separate.data(), m_ * n_);
+            primitives::compute_swiglu(gate_output.data(), gemm_output.data(), output_separate.data(), m_ * n_);
 
             auto result = compare_outputs(output_fused.data(), output_separate.data(), m_ * n_, 0.05);
             EXPECT_TRUE(result.passed)
@@ -591,11 +589,12 @@ namespace llaminar2
                 nullptr, false, 1.0f, 0.0f, nullptr, -1,
                 GemmFusedOps::swiglu(gate_output.data())));
 
-            // Reference: kernel computes gemm_output * silu(gate), so swap args
+            // Reference: kernel computes gemm_output * silu(gate)
+            // compute_swiglu(gate, up) = silu(gate) * up, so we pass (gate, gemm_output)
             std::vector<float> gemm_output(m_ * n_);
             std::vector<float> output_separate(m_ * n_);
             reference_gemm(input_.data(), weights_dequant.data(), gemm_output.data(), m_, n_, k_);
-            primitives::compute_swiglu(gemm_output.data(), gate_output.data(), output_separate.data(), m_ * n_);
+            primitives::compute_swiglu(gate_output.data(), gemm_output.data(), output_separate.data(), m_ * n_);
 
             auto result = compare_outputs(output_fused.data(), output_separate.data(), m_ * n_, 0.05);
             EXPECT_TRUE(result.passed)

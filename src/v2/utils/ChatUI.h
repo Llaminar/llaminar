@@ -36,7 +36,7 @@ namespace llaminar2
     struct ChatUIConfig
     {
         std::string system_prompt = ""; ///< Optional system message
-        int max_tokens = 512;           ///< Max tokens per response
+        int max_tokens = -1;            ///< Max tokens per response (-1 = unlimited until EOS or context full)
         float temperature = 0.7f;       ///< Sampling temperature
         int top_k = 40;                 ///< Top-k sampling
         float top_p = 0.9f;             ///< Top-p (nucleus) sampling

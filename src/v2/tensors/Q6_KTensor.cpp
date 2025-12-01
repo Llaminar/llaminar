@@ -456,4 +456,55 @@ namespace llaminar2
         simd::decode_q6_k_to_q8_0(q6k_block, sub_idx, output->qs, &output->d);
     }
 
+    void Q6_KTensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
+
+        // k_block_offset is in terms of 32-element sub-blocks
+        // Q6_KBlock contains 8 sub-blocks (256 elements)
+
+        const size_t super_block_idx = k_block_offset / 8;
+        const size_t sub_idx = k_block_offset % 8;
+
+        const Q6_KBlock &block = blocks[row_idx * blocks_per_row + super_block_idx];
+
+        float scale, min;
+        simd::transcode_q6_k_to_int8(block, sub_idx, output, &scale, &min);
+    }
+
+    float Q6_KTensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
+
+        const size_t super_block_idx = k_block_offset / 8;
+        const size_t sub_idx = k_block_offset % 8;
+
+        const Q6_KBlock &block = blocks[row_idx * blocks_per_row + super_block_idx];
+
+        int8_t dummy_int8[32];
+        float scale, min;
+        simd::transcode_q6_k_to_int8(block, sub_idx, dummy_int8, &scale, &min);
+        return scale;
+    }
+
+    float Q6_KTensor::get_block_min(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
+
+        const size_t super_block_idx = k_block_offset / 8;
+        const size_t sub_idx = k_block_offset % 8;
+
+        const Q6_KBlock &block = blocks[row_idx * blocks_per_row + super_block_idx];
+
+        int8_t dummy_int8[32];
+        float scale, min;
+        simd::transcode_q6_k_to_int8(block, sub_idx, dummy_int8, &scale, &min);
+        return min;
+    }
 } // namespace llaminar2

@@ -227,6 +227,13 @@ namespace llaminar2
         bool isLoaded() const { return loaded_; }
 
         /**
+         * @brief Check if a tensor exists in the model
+         * @param tensor_name Name of tensor to check
+         * @return true if tensor exists, false otherwise
+         */
+        bool hasTensor(const std::string &tensor_name) const;
+
+        /**
          * @brief Get parsed model metadata
          */
         const GGUFModel &getModel() const { return model_; }

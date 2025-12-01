@@ -137,6 +137,110 @@ namespace llaminar2
         return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
+    void Q4_KTensor::unpack_block_to_int8(
+        size_t row_idx,
+        size_t k_block_offset,
+        int8_t *output) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q4_KTensor::unpack_block_to_int8: output must not be null");
+        }
+
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q4_KTensor::unpack_block_to_int8: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q4_KTensor::unpack_block_to_int8: row index out of bounds");
+        }
+
+        // Map 32-element block index to 256-element super-block index
+        size_t super_block_idx = k_block_offset / 8;
+        size_t sub_block_idx = k_block_offset % 8;
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
+
+        if (super_block_idx >= super_blocks_per_row)
+        {
+            throw std::out_of_range("Q4_KTensor::unpack_block_to_int8: block offset out of bounds");
+        }
+
+        // Get Q4_K super-block
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q4_KBlock *blocks = reinterpret_cast<const Q4_KBlock *>(data_ptr);
+        const Q4_KBlock &block = blocks[row_idx * super_blocks_per_row + super_block_idx];
+
+        // Transcode directly to int8 (fused dequant/requant)
+        float scale, min_val;
+        simd::transcode_q4_k_to_int8(block, sub_block_idx, output, &scale, &min_val);
+    }
+
+    float Q4_KTensor::get_block_scale(
+        size_t row_idx,
+        size_t k_block_offset) const
+    {
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q4_KTensor::get_block_scale: tensor must be 2D");
+        }
+
+        size_t super_block_idx = k_block_offset / 8;
+        size_t sub_block_idx = k_block_offset % 8;
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
+
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q4_KBlock *blocks = reinterpret_cast<const Q4_KBlock *>(data_ptr);
+        const Q4_KBlock &block = blocks[row_idx * super_blocks_per_row + super_block_idx];
+
+        const float d = fp16_to_fp32(block.d);
+
+        const size_t group_idx = sub_block_idx / 2;
+        const size_t is_second_half = sub_block_idx % 2;
+        const size_t is = group_idx * 2 + is_second_half;
+
+        uint8_t sc, m;
+        simd::get_scale_min_k4(is, block.scales, &sc, &m);
+
+        return d * sc;
+    }
+
+    float Q4_KTensor::get_block_min(
+        size_t row_idx,
+        size_t k_block_offset) const
+    {
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q4_KTensor::get_block_min: tensor must be 2D");
+        }
+
+        size_t super_block_idx = k_block_offset / 8;
+        size_t sub_block_idx = k_block_offset % 8;
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
+
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q4_KBlock *blocks = reinterpret_cast<const Q4_KBlock *>(data_ptr);
+        const Q4_KBlock &block = blocks[row_idx * super_blocks_per_row + super_block_idx];
+
+        const float dmin = fp16_to_fp32(block.dmin);
+
+        const size_t group_idx = sub_block_idx / 2;
+        const size_t is_second_half = sub_block_idx % 2;
+        const size_t is = group_idx * 2 + is_second_half;
+
+        uint8_t sc, m;
+        simd::get_scale_min_k4(is, block.scales, &sc, &m);
+
+        return -dmin * m;
+    }
+
     void Q4_KTensor::decodeBlock(const Q4_KBlock &block, float *output)
     {
 #if defined(__AVX512F__)

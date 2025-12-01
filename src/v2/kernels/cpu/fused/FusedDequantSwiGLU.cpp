@@ -31,7 +31,7 @@ namespace llaminar2
         }
 
         // Apply SwiGLU using well-tested primitives
-        // SwiGLU: output = gate * silu(up)
+        // SwiGLU: output = silu(gate) * up  [per HuggingFace FFN formula]
         primitives::compute_swiglu(gate, up, output, static_cast<size_t>(m) * static_cast<size_t>(n));
 
         return true;

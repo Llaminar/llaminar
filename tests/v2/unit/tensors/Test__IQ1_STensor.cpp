@@ -576,3 +576,50 @@ TEST_F(IQ1_SSIMDTest, RoundTrip)
     }
     EXPECT_LT(mismatches, 13) << "Too many mismatches in round-trip conversion";
 }
+
+TEST_F(IQ1_SSIMDTest, UnpackBlockToInt8)
+{
+    // Create a block with random values
+    IQ1_SBlock block;
+    std::memset(&block, 0, sizeof(block));
+    block.d = fp32_to_fp16(1.0f);
+
+    std::uniform_int_distribution<uint8_t> byte_dist(0, 255);
+    uint8_t *raw = reinterpret_cast<uint8_t *>(&block);
+    for (size_t i = 0; i < sizeof(block); ++i)
+        raw[i] = byte_dist(rng_);
+
+    // Create tensor wrapper
+    std::vector<uint8_t> raw_data(sizeof(IQ1_SBlock));
+    std::memcpy(raw_data.data(), &block, sizeof(IQ1_SBlock));
+    IQ1_STensor tensor({1, 256}, raw_data);
+
+    // Check sub-block 0 (first 32 elements)
+    int8_t unpacked[32];
+    tensor.unpack_block_to_int8(0, 0, unpacked);
+    float scale = tensor.get_block_scale(0, 0);
+
+    // Decode using standard float decoder
+    float decoded[256];
+    tensor.decode_block_at(0, 0, decoded); // Decodes full 256 elements
+
+    // Compare unpacked[i] * scale vs decoded[i]
+    for (int i = 0; i < 32; ++i)
+    {
+        float val = unpacked[i] * scale;
+        float ref = decoded[i];
+
+        float diff = std::abs(val - ref);
+
+        if (scale > 1e-6f)
+        {
+            // Q8_0 quantization noise should be within 1 quantization step
+            // Step size is scale.
+            EXPECT_LE(diff, scale * 1.5f) << "Index " << i << " val=" << val << " ref=" << ref << " scale=" << scale;
+        }
+        else
+        {
+            EXPECT_NEAR(val, ref, 1e-5f);
+        }
+    }
+}

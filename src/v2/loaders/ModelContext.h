@@ -131,6 +131,16 @@ namespace llaminar2
         }
 
         /**
+         * @brief Check if a tensor exists in the model
+         * @param name GGUF tensor name to check
+         * @return true if tensor exists, false otherwise
+         */
+        bool hasTensor(const std::string &name) const
+        {
+            return loader_.hasTensor(name);
+        }
+
+        /**
          * @brief Get weight manager
          */
         std::shared_ptr<WeightManager> weightManager() { return weight_manager_; }

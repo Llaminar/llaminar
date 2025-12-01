@@ -349,6 +349,15 @@ namespace llaminar2
         LOG_DEBUG("[ModelLoader] Initialized test model (no file loaded)");
     }
 
+    bool ModelLoader::hasTensor(const std::string &tensor_name) const
+    {
+        if (!loaded_)
+        {
+            return false;
+        }
+        return model_.findTensor(tensor_name) != nullptr;
+    }
+
     std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
                                                         int device_idx,
                                                         WeightPrecision weight_precision)

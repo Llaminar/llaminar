@@ -143,6 +143,9 @@ namespace llaminar2
                                                         << ", EOS=" << eos_token_
                                                         << ", PAD=" << pad_token_);
 
+        // Initialize special tokens for proper encoding
+        initializeSpecialTokens();
+
         // Load chat template from metadata if available
         auto chat_template_it = metadata.find("tokenizer.chat_template");
         if (chat_template_it != metadata.end() && chat_template_it->second.type == GGUFValueType::STRING)
@@ -224,6 +227,101 @@ namespace llaminar2
         }
     }
 
+    void BPETokenizer::initializeSpecialTokens()
+    {
+        // Scan vocabulary for special tokens matching <|...|> pattern
+        // These need to be matched literally during encoding, not broken up by BPE
+        //
+        // Common patterns:
+        // - ChatML: <|im_start|>, <|im_end|>, <|endoftext|>
+        // - Phi: <|im_sep|>
+        // - Vision: <|vision_start|>, <|image_pad|>, etc.
+
+        for (size_t i = 0; i < vocab_.size(); ++i)
+        {
+            const std::string &token = vocab_[i];
+
+            // Match <|...|> pattern (at least 5 chars: <|x|>)
+            if (token.size() >= 5 &&
+                token[0] == '<' && token[1] == '|' &&
+                token[token.size() - 1] == '>' && token[token.size() - 2] == '|')
+            {
+                special_tokens_.emplace_back(token, static_cast<int>(i));
+            }
+        }
+
+        // Sort by length descending (longest first) for greedy matching
+        // This ensures <|im_start|> is matched before <|im|> if both existed
+        std::sort(special_tokens_.begin(), special_tokens_.end(),
+                  [](const auto &a, const auto &b)
+                  {
+                      return a.first.length() > b.first.length();
+                  });
+
+        if (!special_tokens_.empty())
+        {
+            LOG_DEBUG("[BPETokenizer] Found " << special_tokens_.size()
+                                              << " special tokens (e.g., "
+                                              << special_tokens_[0].first << " -> "
+                                              << special_tokens_[0].second << ")");
+        }
+    }
+
+    std::vector<int> BPETokenizer::encodeWithSpecialTokens(const std::string &text) const
+    {
+        // If no special tokens, just use regular BPE
+        if (special_tokens_.empty())
+        {
+            return applyBPE(text);
+        }
+
+        std::vector<int> result;
+        size_t pos = 0;
+
+        while (pos < text.size())
+        {
+            // Try to match a special token at current position
+            bool matched = false;
+            for (const auto &[token_str, token_id] : special_tokens_)
+            {
+                if (pos + token_str.size() <= text.size() &&
+                    text.compare(pos, token_str.size(), token_str) == 0)
+                {
+                    // Found special token
+                    result.push_back(token_id);
+                    pos += token_str.size();
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+            {
+                // Find next special token or end of string
+                size_t next_special = text.size();
+                for (const auto &[token_str, token_id] : special_tokens_)
+                {
+                    size_t found = text.find(token_str, pos);
+                    if (found != std::string::npos && found < next_special)
+                    {
+                        next_special = found;
+                    }
+                }
+
+                // Apply BPE to the non-special segment
+                std::string segment = text.substr(pos, next_special - pos);
+                if (!segment.empty())
+                {
+                    auto bpe_tokens = applyBPE(segment);
+                    result.insert(result.end(), bpe_tokens.begin(), bpe_tokens.end());
+                }
+                pos = next_special;
+            }
+        }
+
+        return result;
+    }
+
     std::vector<int> BPETokenizer::encode(const std::string &text,
                                           bool add_bos,
                                           bool add_eos) const
@@ -244,8 +342,10 @@ namespace llaminar2
             return tokens;
         }
 
-        // Apply BPE tokenization
-        auto bpe_tokens = applyBPE(text);
+        // Apply BPE tokenization with special token handling
+        // This splits on special tokens (like <|im_start|>) and applies BPE
+        // only to non-special segments, preserving special token IDs
+        auto bpe_tokens = encodeWithSpecialTokens(text);
 
         // Append BPE tokens
         tokens.insert(tokens.end(), bpe_tokens.begin(), bpe_tokens.end());

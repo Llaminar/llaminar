@@ -356,18 +356,19 @@ namespace llaminar2
             throw std::out_of_range("decode_to_q8_0: k_block_offset out of range");
         }
 
+        // Calculate super-block index (256 elements)
+        const size_t super_blocks_per_row = (cols + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
         // Get IQ4_XS super-block
         const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
-        const IQ4_XSBlock &iq4xs_block = blocks[row_idx * blocks_per_row + k_block_offset];
+        const IQ4_XSBlock &iq4xs_block = blocks[super_block_idx];
 
-        // IQ4_XS: 256-element super-blocks → 8 sub-blocks of 32 elements
-        // Decode all 8 sub-blocks (256 elements → 8 Q8_0 blocks)
-        for (size_t sub_idx = 0; sub_idx < 8; ++sub_idx)
-        {
-            simd::decode_iq4xs_to_q8_0(iq4xs_block, sub_idx,
-                                       output[sub_idx].qs, &output[sub_idx].d);
-        }
+        // Decode ONLY the requested sub-block
+        simd::decode_iq4xs_to_q8_0(iq4xs_block, sub_block_idx,
+                                   output->qs, &output->d);
     }
 
 } // namespace llaminar2

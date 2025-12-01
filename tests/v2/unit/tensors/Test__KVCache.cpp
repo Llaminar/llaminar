@@ -141,28 +141,55 @@ TEST_F(KVCacheTest, IncrementalAppend)
 }
 
 /**
- * @brief Test cache capacity overflow
+ * @brief Test cache capacity overflow with automatic eviction (sliding window)
  */
 TEST_F(KVCacheTest, CapacityOverflow)
 {
     int layer = 0;
     size_t kv_dim = n_kv_heads_ * head_dim_;
 
-    // Fill cache to capacity
+    // Fill cache to capacity with known values
     auto K_fill = std::make_shared<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(max_seq_len_), kv_dim}, -1);
     auto V_fill = std::make_shared<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(max_seq_len_), kv_dim}, -1);
 
+    // Initialize with position-based values so we can verify eviction
+    for (int i = 0; i < max_seq_len_; ++i)
+    {
+        for (size_t j = 0; j < kv_dim; ++j)
+        {
+            K_fill->mutable_data()[i * kv_dim + j] = static_cast<float>(i);
+            V_fill->mutable_data()[i * kv_dim + j] = static_cast<float>(i + 1000);
+        }
+    }
+
     EXPECT_TRUE(cache_->append_kv(layer, K_fill.get(), V_fill.get()));
     EXPECT_EQ(cache_->get_cached_tokens(layer), max_seq_len_);
 
-    // Try to append one more token (should fail)
+    // Append one more token - should auto-evict oldest and succeed
     auto K_extra = std::make_shared<FP32Tensor>(std::vector<size_t>{1, kv_dim}, -1);
     auto V_extra = std::make_shared<FP32Tensor>(std::vector<size_t>{1, kv_dim}, -1);
 
-    EXPECT_FALSE(cache_->append_kv(layer, K_extra.get(), V_extra.get()));
-    EXPECT_EQ(cache_->get_cached_tokens(layer), max_seq_len_); // Unchanged
+    // Fill with distinctive value
+    for (size_t j = 0; j < kv_dim; ++j)
+    {
+        K_extra->mutable_data()[j] = 999.0f;
+        V_extra->mutable_data()[j] = 1999.0f;
+    }
+
+    // With sliding window eviction, this should succeed
+    EXPECT_TRUE(cache_->append_kv(layer, K_extra.get(), V_extra.get()));
+    EXPECT_EQ(cache_->get_cached_tokens(layer), max_seq_len_); // Still at max (evicted 1, added 1)
+
+    // Verify the oldest token was evicted (position 0 data should be gone)
+    // The new first position should have the old position 1 data
+    auto cached_K = cache_->get_k(layer);
+    EXPECT_FLOAT_EQ(cached_K->data()[0], 1.0f); // Was position 1, now position 0
+
+    // Verify the newest token is at the end
+    size_t last_offset = (max_seq_len_ - 1) * kv_dim;
+    EXPECT_FLOAT_EQ(cached_K->data()[last_offset], 999.0f);
 }
 
 /**

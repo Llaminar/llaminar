@@ -516,3 +516,51 @@ TEST_F(IQ1_MSIMDTest, RoundTrip)
     }
     EXPECT_LT(mismatches, 13) << "Too many mismatches in round-trip conversion";
 }
+
+TEST_F(IQ1_MSIMDTest, UnpackBlockToInt8)
+{
+    // Create a random block
+    std::vector<uint8_t> qs(16), qh(16), scales(8);
+    std::uniform_int_distribution<uint8_t> dist(0, 255);
+    for (auto &x : qs)
+        x = dist(rng_);
+    for (auto &x : qh)
+        x = dist(rng_);
+    for (auto &x : scales)
+        x = dist(rng_);
+
+    IQ1_MBlock block = createBlock(qs, qh, scales);
+
+    // Create tensor with this block
+    std::vector<size_t> shape = {1, 256};
+    std::vector<uint8_t> raw_data(sizeof(IQ1_MBlock));
+    std::memcpy(raw_data.data(), &block, sizeof(IQ1_MBlock));
+    IQ1_MTensor tensor(shape, raw_data);
+
+    // Unpack to INT8
+    int8_t unpacked[256];
+    for (int i = 0; i < 8; ++i)
+    {
+        tensor.unpack_block_to_int8(0, i, unpacked + i * 32);
+    }
+
+    // Verify against manual decode
+    // We can use decode_iq1m_to_q8_0_scalar to verify
+    float global_scale = simd::extract_iq1m_global_scale(block);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        int8_t expected_qs[32];
+        uint16_t expected_scale_u16;
+        simd::decode_iq1m_to_q8_0_scalar(block, i, global_scale, expected_qs, &expected_scale_u16);
+
+        for (int j = 0; j < 32; ++j)
+        {
+            EXPECT_EQ(unpacked[i * 32 + j], expected_qs[j]) << "Mismatch at subblock " << i << " index " << j;
+        }
+
+        // Verify scale
+        float scale = tensor.get_block_scale(0, i);
+        EXPECT_NEAR(scale, simd::fp16_to_fp32(expected_scale_u16), 1e-5f);
+    }
+}

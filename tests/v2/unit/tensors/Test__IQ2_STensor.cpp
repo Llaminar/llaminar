@@ -640,3 +640,35 @@ TEST_F(IQ2_SSIMDTest, RoundTrip)
     }
     EXPECT_LT(mismatches, 13) << "Too many mismatches in round-trip conversion";
 }
+
+TEST_F(IQ2_SSIMDTest, UnpackBlockToInt8)
+{
+    // Create a dummy IQ2_S block
+    // IQ2_S block size is 256.
+    // We will test unpacking one sub-block (32 elements).
+
+    std::vector<uint8_t> raw_data(sizeof(IQ2_SBlock));
+    IQ2_SBlock *block = reinterpret_cast<IQ2_SBlock *>(raw_data.data());
+    std::memset(block, 0, sizeof(IQ2_SBlock));
+
+    // Set d = 1.0
+    block->d = fp32_to_fp16(1.0f);
+
+    std::vector<size_t> shape = {1, 256};
+    IQ2_STensor tensor(shape, raw_data);
+
+    int8_t output[32];
+    tensor.unpack_block_to_int8(0, 0, output);
+
+    float scale = tensor.get_block_scale(0, 0);
+
+    // Verify scale is positive
+    EXPECT_GT(scale, 0.0f);
+
+    // Verify output values are within range
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_GE(output[i], -128);
+        EXPECT_LE(output[i], 127);
+    }
+}

@@ -483,4 +483,71 @@ namespace llaminar2
         output->d = q8_scale_fp16;
     }
 
+    void Q5_0Tensor::unpack_block_to_int8(
+        size_t row_idx,
+        size_t k_block_offset,
+        int8_t *output) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q5_0Tensor::unpack_block_to_int8: output must not be null");
+        }
+
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q5_0Tensor::unpack_block_to_int8: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q5_0Tensor::unpack_block_to_int8: row index out of bounds");
+        }
+
+        const size_t cols = shape_[1];
+        const size_t blocks_per_row = (cols + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
+
+        if (k_block_offset >= blocks_per_row)
+        {
+            throw std::out_of_range("Q5_0Tensor::unpack_block_to_int8: block offset out of bounds");
+        }
+
+        // Get Q5_0 block
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
+        const Q5_0Block *q5_block = &blocks[row_idx * blocks_per_row + k_block_offset];
+
+        // Unpack Q5_0 block to INT8 using SIMD dispatcher
+        simd::unpack_q5_0_to_int8(*q5_block, output);
+    }
+
+    float Q5_0Tensor::get_block_scale(
+        size_t row_idx,
+        size_t k_block_offset) const
+    {
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q5_0Tensor::get_block_scale: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q5_0Tensor::get_block_scale: row index out of bounds");
+        }
+
+        const size_t cols = shape_[1];
+        const size_t blocks_per_row = (cols + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
+
+        if (k_block_offset >= blocks_per_row)
+        {
+            throw std::out_of_range("Q5_0Tensor::get_block_scale: block offset out of bounds");
+        }
+
+        // Get Q5_0 block and return original FP16 scale converted to FP32
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
+        const Q5_0Block &q5_block = blocks[row_idx * blocks_per_row + k_block_offset];
+
+        return fp16_to_fp32(q5_block.d);
+    }
+
 } // namespace llaminar2

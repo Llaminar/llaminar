@@ -562,6 +562,67 @@ TEST_F(IQ4_XSSIMDTest, RoundTrip)
 }
 
 // =============================================================================
+// IINT8Unpackable Interface Tests
+// =============================================================================
+
+TEST_F(IQ4_XSSIMDTest, IINT8Unpackable_Interface)
+{
+    // Create a tensor with 1 row, 256 columns (1 super-block)
+    std::vector<size_t> shape = {1, 256};
+    std::vector<uint8_t> raw_data(sizeof(IQ4_XSBlock));
+    IQ4_XSBlock *block = reinterpret_cast<IQ4_XSBlock *>(raw_data.data());
+
+    // Initialize block
+    block->d = simd::fp32_to_fp16(1.0f);
+
+    // Set scales for sub-blocks
+    // sub-block 0: ls=32 (scale factor 0) -> value = 0
+    // sub-block 1: ls=33 (scale factor 1) -> value = kvalues
+
+    // scales_l[0] = (low_0) | (low_1 << 4) = 0 | (1 << 4) = 0x10
+    block->scales_l[0] = 0x10;
+    // scales_h = (2 << 0) | (2 << 2) = 2 | 8 = 10
+    block->scales_h = 10;
+
+    // Fill qs for sub-block 1 with known indices
+    // index 0 -> kvalues[0] = -127
+    // index 1 -> kvalues[1] = -104
+    block->qs[16] = 0x10; // (1 << 4) | 0
+
+    auto tensor = std::make_unique<IQ4_XSTensor>(shape, raw_data);
+
+    // 1. Check block size
+    EXPECT_EQ(tensor->block_size(), 32);
+
+    // 2. Check unpack_block_to_int8
+    int8_t output[32];
+    tensor->unpack_block_to_int8(0, 1, output); // sub-block 1
+
+    // IQ4_XS layout: qs[j] contains element j (low) and j+16 (high)
+    // qs[0] (which is block->qs[16]) contains element 0 and 16
+    // We set qs[0] = 0x10 (low=0, high=1)
+    // So output[0] should be index 0
+    // output[16] should be index 1
+
+    EXPECT_EQ(output[0], kvalues_iq4nl_i8[0]);
+    EXPECT_EQ(output[16], kvalues_iq4nl_i8[1]);
+
+    // 3. Check get_block_scale
+    float scale = tensor->get_block_scale(0, 1);
+    EXPECT_FLOAT_EQ(scale, 1.0f);
+
+    scale = tensor->get_block_scale(0, 0);
+    EXPECT_FLOAT_EQ(scale, 0.0f);
+
+    // 4. Check decode_block_at (consistency check)
+    float float_output[32];
+    tensor->decode_block_at(0, 1, float_output);
+
+    EXPECT_FLOAT_EQ(float_output[0], kvalues_iq4nl_i8[0] * 1.0f);
+    EXPECT_FLOAT_EQ(float_output[16], kvalues_iq4nl_i8[1] * 1.0f);
+}
+
+// =============================================================================
 // MAIN
 // =============================================================================
 

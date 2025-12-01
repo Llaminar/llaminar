@@ -125,6 +125,16 @@ namespace llaminar2
         void clear_layer(int layer);
 
         /**
+         * @brief Evict oldest tokens from cache to make room for new tokens
+         *
+         * Shifts all cached K/V data to remove the oldest tokens, preserving
+         * the most recent context. This implements a sliding window approach.
+         *
+         * @param tokens_to_evict Number of oldest tokens to remove
+         */
+        void evict_oldest(int tokens_to_evict);
+
+        /**
          * @brief Get total number of layers
          */
         int num_layers() const { return n_layers_; }

@@ -242,6 +242,25 @@ namespace llaminar2
         int eos_token_ = 0;
         int pad_token_ = 0;
 
+        // Special tokens (sorted by length descending for greedy matching)
+        // e.g., <|im_start|>, <|im_end|>, <|endoftext|>
+        std::vector<std::pair<std::string, int>> special_tokens_;
+
+        /**
+         * @brief Initialize special tokens from vocabulary
+         *
+         * Scans vocab for tokens matching <|...|> pattern and stores them
+         * sorted by length (longest first) for greedy matching.
+         */
+        void initializeSpecialTokens();
+
+        /**
+         * @brief Encode text with special token handling
+         *
+         * Splits text on special tokens, applies BPE to non-special segments.
+         */
+        std::vector<int> encodeWithSpecialTokens(const std::string &text) const;
+
         // Chat template data
         std::string chat_template_string_;
         std::unique_ptr<ChatTemplate> chat_template_;

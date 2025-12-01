@@ -137,6 +137,66 @@ namespace llaminar2
         return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
+    void Q5_KTensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q5_KTensor::unpack_block_to_int8: output must not be null");
+        }
+
+        // Map 32-element block index to 256-element super-block index
+        size_t super_block_idx = k_block_offset / 8;
+        size_t sub_block_idx = k_block_offset % 8;
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
+
+        if (super_block_idx >= super_blocks_per_row)
+        {
+            throw std::out_of_range("Q5_KTensor::unpack_block_to_int8: block offset out of bounds");
+        }
+
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
+        const Q5_KBlock &block = blocks[row_idx * super_blocks_per_row + super_block_idx];
+
+        simd::unpack_q5_k_to_int8(block, sub_block_idx, output);
+    }
+
+    float Q5_KTensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        size_t super_block_idx = k_block_offset / 8;
+        size_t sub_block_idx = k_block_offset % 8;
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
+
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
+        const Q5_KBlock &block = blocks[row_idx * super_blocks_per_row + super_block_idx];
+
+        float scale, min_val;
+        simd::get_q5_k_scale_min(block, sub_block_idx, &scale, &min_val);
+        return scale;
+    }
+
+    float Q5_KTensor::get_block_min(size_t row_idx, size_t k_block_offset) const
+    {
+        size_t super_block_idx = k_block_offset / 8;
+        size_t sub_block_idx = k_block_offset % 8;
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
+
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
+        const Q5_KBlock &block = blocks[row_idx * super_blocks_per_row + super_block_idx];
+
+        float scale, min_val;
+        simd::get_q5_k_scale_min(block, sub_block_idx, &scale, &min_val);
+        return -min_val;
+    }
+
     void Q5_KTensor::decodeBlock(const Q5_KBlock &block, float *output)
     {
 #if defined(__AVX512F__)

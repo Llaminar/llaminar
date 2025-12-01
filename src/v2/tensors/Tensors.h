@@ -1414,7 +1414,7 @@ namespace llaminar2
      * **Usage**: Default quantization format for model weights (balance of size and quality).
      */
 
-    class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1434,6 +1434,12 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override; // Fused dequant+GEMM
+        ITensorGemm *createGemmRaw();
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         // Format conversion (TensorBase interface - delegates to decode methods)
         void to_fp32(float *dst) const override { decode_to_fp32(dst); }
@@ -1977,7 +1983,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + FP16 min + 4-bit packed values
      * Compression: ~7.1× vs FP32
      */
-    class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2011,6 +2017,20 @@ namespace llaminar2
 
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
+
+        // IINT8Unpackable interface - native Q4_1 → INT8 unpacking
+        void unpack_block_to_int8(
+            size_t row_idx,
+            size_t k_block_offset,
+            int8_t *output) const override;
+
+        float get_block_scale(
+            size_t row_idx,
+            size_t k_block_offset) const override;
+
+        float get_block_min(
+            size_t row_idx,
+            size_t k_block_offset) const override;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -2082,7 +2102,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~6.4× vs FP32
      */
-    class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2113,6 +2133,11 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override { return 0.0f; } // Q5_0 is symmetric
 
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -2187,7 +2212,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~5.7× vs FP32
      */
-    class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2218,6 +2243,11 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -2288,7 +2318,7 @@ namespace llaminar2
     /**
      * @brief Q6_K tensor (6-bit K-quant super-block)
      */
-    class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2307,6 +2337,11 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2387,7 +2422,7 @@ namespace llaminar2
     /**
      * @brief Q2_K tensor (2-bit K-quant super-block)
      */
-    class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2406,6 +2441,11 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2487,7 +2527,7 @@ namespace llaminar2
     /**
      * @brief Q5_K tensor (5-bit K-quant super-block)
      */
-    class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2495,6 +2535,11 @@ namespace llaminar2
 
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q5_K; }
+
+        // IINT8Unpackable implementation
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
@@ -2590,7 +2635,7 @@ namespace llaminar2
     /**
      * @brief Q3_K tensor (3-bit K-quant super-block)
      */
-    class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2609,6 +2654,11 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2689,7 +2739,7 @@ namespace llaminar2
     /**
      * @brief Q4_K tensor (4-bit K-quant super-block)
      */
-    class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2720,6 +2770,11 @@ namespace llaminar2
         }
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
         // Q8_0 quantization (for quantized GEMM)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -2895,7 +2950,7 @@ namespace llaminar2
     /**
      * @brief IQ4_XS tensor (4-bit extra-small IQ)
      */
-    class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2938,27 +2993,64 @@ namespace llaminar2
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
-            const size_t blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
-            const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
-            decodeBlock(blocks[block_idx], output);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            int8_t temp_int8[32];
+            simd::unpack_iq4_xs_to_int8(blocks[super_block_idx], sub_block_idx, temp_int8);
+            float scale = simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
+
+            for (int i = 0; i < 32; ++i)
+            {
+                output[i] = temp_int8[i] * scale;
+            }
         }
 
         __attribute__((always_inline))
         const void *
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
-            const size_t blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
-            const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
-            return &blocks[block_idx];
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+
+            return &blocks[super_block_idx];
         }
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
-        size_t block_size() const override { return IQ4_XSBlock::BLOCK_SIZE; }
+        size_t block_size() const override { return 32; } // Logical block size (sub-block)
+
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq4_xs_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
+        }
 
         // SIMD decode methods (public for testing)
         static void decodeBlock(const IQ4_XSBlock &block, float *output);
@@ -2992,7 +3084,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
      */
-    class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3053,6 +3145,31 @@ namespace llaminar2
             return &blocks[block_idx];
         }
 
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq2_xxs_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq2_xxs_scale(blocks[super_block_idx], sub_block_idx);
+        }
+
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return IQ2_XXSBlock::BLOCK_SIZE; }
@@ -3089,7 +3206,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XS tensor (2-bit extra-small IQ)
      */
-    class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3150,6 +3267,31 @@ namespace llaminar2
             return &blocks[block_idx];
         }
 
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq2_xs_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq2_xs_scale(blocks[super_block_idx], sub_block_idx);
+        }
+
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return IQ2_XSBlock::BLOCK_SIZE; }
@@ -3186,7 +3328,7 @@ namespace llaminar2
     /**
      * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
      */
-    class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3229,27 +3371,56 @@ namespace llaminar2
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
-            const size_t blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
-            const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
-            decodeBlock(blocks[block_idx], output);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::decode_iq3xxs_subblock_to_fp32(blocks[super_block_idx], sub_block_idx, output);
         }
 
         __attribute__((always_inline))
         const void *
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
-            const size_t blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
-            const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
-            return &blocks[block_idx];
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            return &blocks[super_block_idx];
         }
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
-        size_t block_size() const override { return IQ3_XXSBlock::BLOCK_SIZE; }
+        size_t block_size() const override { return 32; } // Logical block size (sub-block)
+
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq3_xxs_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq3_xxs_scale(blocks[super_block_idx], sub_block_idx);
+        }
 
         // SIMD decode methods (public for testing)
         static void decodeBlock(const IQ3_XXSBlock &block, float *output);
@@ -3283,7 +3454,7 @@ namespace llaminar2
     /**
      * @brief IQ2_S tensor (2-bit small IQ)
      */
-    class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3344,6 +3515,31 @@ namespace llaminar2
             return &blocks[block_idx];
         }
 
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq2_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq2_s_scale(blocks[super_block_idx], sub_block_idx);
+        }
+
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return IQ2_SBlock::BLOCK_SIZE; }
@@ -3380,7 +3576,7 @@ namespace llaminar2
     /**
      * @brief IQ3_S tensor (3-bit small IQ)
      */
-    class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3423,27 +3619,56 @@ namespace llaminar2
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
-            const size_t blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
-            const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
-            decodeBlock(blocks[block_idx], output);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::decode_iq3s_subblock_to_fp32(blocks[super_block_idx], sub_block_idx, output);
         }
 
         __attribute__((always_inline))
         const void *
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
-            const size_t blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
-            const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
-            return &blocks[block_idx];
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            return &blocks[super_block_idx];
+        }
+
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq3_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq3_s_scale(blocks[super_block_idx], sub_block_idx);
         }
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
-        size_t block_size() const override { return IQ3_SBlock::BLOCK_SIZE; }
+        size_t block_size() const override { return 32; }
 
         // SIMD decode methods (public for testing)
         static void decodeBlock(const IQ3_SBlock &block, float *output);
@@ -3477,7 +3702,7 @@ namespace llaminar2
     /**
      * @brief IQ1_S tensor (1-bit small IQ)
      */
-    class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3538,6 +3763,31 @@ namespace llaminar2
             return &blocks[block_idx];
         }
 
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq1_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq1_s_scale(blocks[super_block_idx], sub_block_idx);
+        }
+
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return IQ1_SBlock::BLOCK_SIZE; }
@@ -3574,7 +3824,7 @@ namespace llaminar2
     /**
      * @brief IQ1_M tensor (1-bit medium IQ)
      */
-    class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3633,6 +3883,31 @@ namespace llaminar2
             const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
+        }
+
+        // IINT8Unpackable interface
+        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            simd::unpack_iq1_m_to_int8(blocks[super_block_idx], sub_block_idx, output);
+        }
+
+        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
+        {
+            const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
+
+            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+            const size_t sub_block_idx = k_block_offset % 8;
+
+            return simd::get_iq1_m_scale(blocks[super_block_idx], sub_block_idx);
         }
 
         size_t decoder_rows() const override { return shape_[0]; }

@@ -157,10 +157,18 @@ namespace llaminar2
         }
 
         int current_cached = cache_[layer].cached_tokens;
+
+        // Auto-evict oldest tokens if cache would overflow
         if (current_cached + new_tokens > max_seq_len_)
         {
-            LOG_ERROR("[KVCache] Cache capacity exceeded: " << current_cached << " + " << new_tokens << " > " << max_seq_len_);
-            return false;
+            int tokens_to_evict = (current_cached + new_tokens) - max_seq_len_;
+            // Only evict on layer 0 (evict_oldest handles all layers atomically)
+            if (layer == 0)
+            {
+                LOG_INFO("[KVCache] Cache full, evicting " << tokens_to_evict << " oldest tokens (sliding window)");
+                evict_oldest(tokens_to_evict);
+            }
+            current_cached = cache_[layer].cached_tokens; // Re-read after eviction
         }
 
         // Copy new K/V into cache buffers at offset
@@ -180,6 +188,43 @@ namespace llaminar2
         LOG_DEBUG("[KVCache] Layer " << layer << " appended " << new_tokens << " tokens (total: " << cache_[layer].cached_tokens << ")");
 
         return true;
+    }
+
+    void KVCache::evict_oldest(int tokens_to_evict)
+    {
+        if (tokens_to_evict <= 0)
+        {
+            return;
+        }
+
+        size_t kv_dim = n_kv_heads_ * head_dim_;
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            int current_cached = cache_[layer].cached_tokens;
+            if (tokens_to_evict >= current_cached)
+            {
+                // Evict all tokens
+                cache_[layer].cached_tokens = 0;
+                continue;
+            }
+
+            // Shift remaining tokens to the beginning
+            int tokens_to_keep = current_cached - tokens_to_evict;
+            float *k_cache = cache_[layer].K->mutable_data();
+            float *v_cache = cache_[layer].V->mutable_data();
+
+            size_t shift_offset = tokens_to_evict * kv_dim;
+            size_t keep_size = tokens_to_keep * kv_dim * sizeof(float);
+
+            // Use memmove for overlapping regions
+            std::memmove(k_cache, k_cache + shift_offset, keep_size);
+            std::memmove(v_cache, v_cache + shift_offset, keep_size);
+
+            cache_[layer].cached_tokens = tokens_to_keep;
+        }
+
+        LOG_DEBUG("[KVCache] Evicted " << tokens_to_evict << " oldest tokens from all layers");
     }
 
     void KVCache::clear()

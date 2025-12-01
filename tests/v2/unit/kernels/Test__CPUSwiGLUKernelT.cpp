@@ -21,10 +21,12 @@ protected:
     }
 
     // Helper to compute expected SwiGLU
+    // Correct formula: silu(gate) * up
+    // This matches HuggingFace: act_fn(gate_proj(x)) * up_proj(x)
     float swiglu_ref(float g, float u)
     {
-        float silu = u / (1.0f + std::exp(-u));
-        return g * silu;
+        float silu_g = g / (1.0f + std::exp(-g));
+        return silu_g * u;
     }
 };
 

@@ -113,11 +113,11 @@ namespace llaminar2
             LOG_WARN("Warning: feed_forward_length not in metadata, using " << d_ff_);
         }
 
-        LOG_INFO("Architecture: " << n_layers_ << " layers, "
-                                  << d_model_ << " d_model, " << vocab_size_ << " vocab");
-        LOG_INFO("Attention: " << n_heads_ << " heads, "
-                               << n_kv_heads_ << " KV heads (GQA), " << head_dim_ << " head_dim");
-        LOG_INFO("FFN: " << d_ff_ << " intermediate_size (SwiGLU)");
+        LOG_DEBUG("Architecture: " << n_layers_ << " layers, "
+                                   << d_model_ << " d_model, " << vocab_size_ << " vocab");
+        LOG_DEBUG("Attention: " << n_heads_ << " heads, "
+                                << n_kv_heads_ << " KV heads (GQA), " << head_dim_ << " head_dim");
+        LOG_DEBUG("FFN: " << d_ff_ << " intermediate_size (SwiGLU)");
 
         // Weights are loaded lazily via getLayerWeight() and model_ctx_->getWeight()
         // Resize layer weights vector for lazy loading
@@ -134,10 +134,10 @@ namespace llaminar2
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
         kv_cache_batched_ = std::make_shared<BatchedKVCache>(
             n_layers_, batch_size_, config.max_seq_len, n_kv_heads_, head_dim_, attention_devices);
-        LOG_INFO("Initialized batched KV cache: batch_size=" << batch_size_
-                                                             << ", max_seq_len=" << config.max_seq_len);
+        LOG_DEBUG("Initialized batched KV cache: batch_size=" << batch_size_
+                                                              << ", max_seq_len=" << config.max_seq_len);
 
-        LOG_INFO("Pipeline initialized (weights loaded on-demand)");
+        LOG_DEBUG("Pipeline initialized (weights loaded on-demand)");
     }
 
     void Qwen2Pipeline::initializeInfrastructureBatched()
@@ -154,8 +154,8 @@ namespace llaminar2
         // KV cache initialization
         initializeKVCache(max_seq_len);
 
-        LOG_INFO("Pipeline infrastructure initialized (max_seq_len=" << max_seq_len
-                                                                     << ", batch_size=" << batch_size_ << ")");
+        LOG_DEBUG("Pipeline infrastructure initialized (max_seq_len=" << max_seq_len
+                                                                      << ", batch_size=" << batch_size_ << ")");
     }
 
     // =============================================================================
@@ -343,10 +343,10 @@ namespace llaminar2
         {
             const float *hidden = current_hidden_->data();
             int last_pos = effective_seq_len - 1;
-            LOG_INFO("[DEBUG] Embedding output (position " << last_pos << "), first 10 values:");
+            LOG_DEBUG("[DEBUG] Embedding output (position " << last_pos << "), first 10 values:");
             for (int i = 0; i < 10; ++i)
             {
-                LOG_INFO("  hidden[" << i << "] = " << hidden[last_pos * d_model_ + i]);
+                LOG_TRACE("  hidden[" << i << "] = " << hidden[last_pos * d_model_ + i]);
             }
         }
 
@@ -364,10 +364,10 @@ namespace llaminar2
             {
                 const float *hidden = current_hidden_->data();
                 int last_pos = effective_seq_len - 1;
-                LOG_INFO("[DEBUG] After layer " << i << " (position " << last_pos << "), first 10 values:");
+                LOG_TRACE("[DEBUG] After layer " << i << " (position " << last_pos << "), first 10 values:");
                 for (int j = 0; j < 10; ++j)
                 {
-                    LOG_INFO("  hidden[" << j << "] = " << hidden[last_pos * d_model_ + j]);
+                    LOG_TRACE("  hidden[" << j << "] = " << hidden[last_pos * d_model_ + j]);
                 }
             }
 
@@ -766,35 +766,6 @@ namespace llaminar2
             effective_seq_len, d_model_, 1e-6f,
             layer_prefix + "_FFN_NORM", ffn_device));
 
-        // DEBUG: Print FFN input (residual) and normalized for layer 0
-        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-        {
-            auto *res_fp32 = dynamic_cast<FP32Tensor *>(buffers.residual.get());
-            auto *norm_fp32 = dynamic_cast<FP32Tensor *>(buffers.normalized.get());
-            if (res_fp32 && norm_fp32)
-            {
-                const float *res_data = res_fp32->data();
-                const float *norm_data = norm_fp32->data();
-                int last_pos = effective_seq_len - 1;
-
-                std::ostringstream oss1;
-                oss1 << "Layer 0 FFN residual input (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, d_model_); ++i)
-                {
-                    oss1 << res_data[last_pos * d_model_ + i] << ", ";
-                }
-                LOG_TRACE(oss1.str());
-
-                std::ostringstream oss2;
-                oss2 << "Layer 0 FFN after RMSNorm (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, d_model_); ++i)
-                {
-                    oss2 << norm_data[last_pos * d_model_ + i] << ", ";
-                }
-                LOG_TRACE(oss2.str());
-            }
-        }
-
         // 2. Fused Gate/Up projections
         if (!layer.gate_up_fused)
         {
@@ -814,35 +785,6 @@ namespace llaminar2
         capture_snapshot(layer_prefix + "_FFN_GATE", buffers.gate.get(), effective_seq_len, d_ff_);
         capture_snapshot(layer_prefix + "_FFN_UP", buffers.up.get(), effective_seq_len, d_ff_);
 
-        // DEBUG: Print FFN gate/up output for layer 0
-        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-        {
-            auto *gate_fp32 = dynamic_cast<FP32Tensor *>(buffers.gate.get());
-            auto *up_fp32 = dynamic_cast<FP32Tensor *>(buffers.up.get());
-            if (gate_fp32 && up_fp32)
-            {
-                const float *gate_data = gate_fp32->data();
-                const float *up_data = up_fp32->data();
-                int last_pos = effective_seq_len - 1;
-
-                std::ostringstream oss1;
-                oss1 << "[DEBUG] Layer 0 FFN gate_proj (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, d_ff_); ++i)
-                {
-                    oss1 << gate_data[last_pos * d_ff_ + i] << ", ";
-                }
-                LOG_INFO(oss1.str());
-
-                std::ostringstream oss2;
-                oss2 << "[DEBUG] Layer 0 FFN up_proj (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, d_ff_); ++i)
-                {
-                    oss2 << up_data[last_pos * d_ff_ + i] << ", ";
-                }
-                LOG_INFO(oss2.str());
-            }
-        }
-
         // 3. Apply SwiGLU
         TRY_OP(swiglu(
             buffers.gate.get(), buffers.up.get(), buffers.up.get(),
@@ -854,24 +796,6 @@ namespace llaminar2
             buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
             effective_seq_len, d_model_, d_ff_,
             layer_prefix + "_FFN_DOWN", ffn_device));
-
-        // DEBUG: Print FFN down output for layer 0
-        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-        {
-            auto *ffn_out_fp32 = dynamic_cast<FP32Tensor *>(buffers.ffn_output.get());
-            if (ffn_out_fp32)
-            {
-                const float *ffn_data = ffn_out_fp32->data();
-                int last_pos = effective_seq_len - 1;
-                std::ostringstream oss;
-                oss << "Layer 0 FFN down output (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, d_model_); ++i)
-                {
-                    oss << ffn_data[last_pos * d_model_ + i] << ", ";
-                }
-                LOG_TRACE(oss.str());
-            }
-        }
 
         // 5. Residual connection
         TRY_OP(add_residual(
@@ -920,13 +844,13 @@ namespace llaminar2
                 shape_str << shape[i];
             }
             shape_str << "]";
-            LOG_INFO("[Qwen2Pipeline] Raw embedding shape: " << shape_str.str()
-                                                             << ", d_model_=" << d_model_ << ", vocab_size_=" << vocab_size_);
+            LOG_DEBUG("[Qwen2Pipeline] Raw embedding shape: " << shape_str.str()
+                                                              << ", d_model_=" << d_model_ << ", vocab_size_=" << vocab_size_);
 
             if (shape.size() == 2 && shape[0] == static_cast<size_t>(d_model_) && shape[1] == static_cast<size_t>(vocab_size_))
             {
-                LOG_INFO("[Qwen2Pipeline] Transposing embedding table from [" << shape[0] << ", " << shape[1]
-                                                                              << "] to [" << shape[1] << ", " << shape[0] << "]");
+                LOG_DEBUG("[Qwen2Pipeline] Transposing embedding table from [" << shape[0] << ", " << shape[1]
+                                                                               << "] to [" << shape[1] << ", " << shape[0] << "]");
 
                 // Create FP32 tensor with transposed shape [vocab_size, d_model]
                 embedding_table_ = std::make_shared<FP32Tensor>(
@@ -968,7 +892,25 @@ namespace llaminar2
     {
         if (!lm_head_)
         {
-            lm_head_ = model_ctx_->getWeight("output.weight", device_idx_);
+            // Check if model has explicit output.weight (not tied embeddings)
+            if (model_ctx_->hasTensor("output.weight"))
+            {
+                lm_head_ = model_ctx_->getWeight("output.weight", device_idx_);
+            }
+            else
+            {
+                // Model uses tied embeddings - LM head shares weights with token embeddings
+                // Use the transposed embedding table (already [vocab_size, d_model])
+                LOG_INFO("[Qwen2Pipeline] Using tied embeddings for LM head (no output.weight tensor)");
+                lm_head_ = getEmbeddingTable();
+
+                if (lm_head_)
+                {
+                    const auto &shape = lm_head_->shape();
+                    LOG_DEBUG("[Qwen2Pipeline] Using embedding table as LM head: ["
+                              << shape[0] << ", " << shape[1] << "]");
+                }
+            }
         }
         return lm_head_;
     }
@@ -1088,10 +1030,10 @@ namespace llaminar2
             for (int token_id : test_tokens)
             {
                 const float *emb = embed_data + token_id * d_model_;
-                LOG_INFO("[DEBUG] Embedding table for token " << token_id << ":");
+                LOG_DEBUG("[DEBUG] Embedding table for token " << token_id << ":");
                 for (int i = 0; i < 20; ++i)
                 {
-                    LOG_INFO("  emb[" << i << "] = " << emb[i]);
+                    LOG_DEBUG("  emb[" << i << "] = " << emb[i]);
                 }
             }
         }
@@ -1134,8 +1076,8 @@ namespace llaminar2
             logits_buffer_ = createActivationTensor(
                 {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
                 device_idx_, config_.activation_precision);
-            LOG_INFO("Allocated logits buffer: "
-                     << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
+            LOG_DEBUG("Allocated logits buffer: "
+                      << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
         }
 
         VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "logits_allocation");

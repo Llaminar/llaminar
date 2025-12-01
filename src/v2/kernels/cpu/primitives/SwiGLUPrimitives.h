@@ -11,10 +11,13 @@
 namespace llaminar2::primitives
 {
     /**
-     * @brief Compute SwiGLU: output = gate * silu(up)
+     * @brief Compute SwiGLU: output = silu(gate) * up
      *
-     * @param gate Pointer to gate tensor data
-     * @param up Pointer to up tensor data
+     * This implements the HuggingFace FFN formula: act_fn(gate_proj) * up_proj
+     * where act_fn is SiLU (Sigmoid Linear Unit): silu(x) = x * sigmoid(x)
+     *
+     * @param gate Pointer to gate tensor data (activation applied here)
+     * @param up Pointer to up tensor data (linear multiplier)
      * @param output Pointer to output tensor data
      * @param size Number of elements
      */

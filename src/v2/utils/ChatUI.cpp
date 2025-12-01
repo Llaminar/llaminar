@@ -17,6 +17,7 @@
 #include <sstream>
 #include <algorithm>
 #include <iomanip>
+#include <climits>
 
 namespace llaminar2
 {
@@ -429,7 +430,9 @@ namespace llaminar2
             sampling_params.top_p = config_.top_p;
 
             // Decode loop
-            for (int i = 0; i < config_.max_tokens && !stop_requested_; ++i)
+            // max_tokens = -1 means unlimited (generate until EOS)
+            int max_decode = (config_.max_tokens == -1) ? INT_MAX : config_.max_tokens;
+            for (int i = 0; i < max_decode && !stop_requested_; ++i)
             {
                 // Get logits from last forward pass
                 const float *logits_ptr = pipeline_->logits();
@@ -601,7 +604,9 @@ namespace llaminar2
         // Decode
         std::string response;
 
-        for (int i = 0; i < config.max_tokens; ++i)
+        // max_tokens = -1 means unlimited (generate until EOS)
+        int max_decode = (config.max_tokens == -1) ? INT_MAX : config.max_tokens;
+        for (int i = 0; i < max_decode; ++i)
         {
             const float *logits_ptr = pipeline->logits();
             if (!logits_ptr)

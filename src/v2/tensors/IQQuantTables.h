@@ -59,6 +59,17 @@ namespace llaminar2
         53.0f, 69.0f, 89.0f, 113.0f};
 
     /**
+     * @brief IQ4_NL non-linear quantization values (int8 version)
+     *
+     * Integer version of kvalues_iq4nl for SIMD shuffling and integer-only operations.
+     */
+    static constexpr int8_t kvalues_iq4nl_i8[16] = {
+        -127, -104, -83, -65,
+        -49, -35, -22, -10,
+        1, 13, 25, 38,
+        53, 69, 89, 113};
+
+    /**
      * @brief Sign patterns for IQ2_XS/IQ2_XXS formats (128 entries)
      *
      * These sign patterns are used to apply signs to decoded grid values.

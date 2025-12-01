@@ -28,6 +28,7 @@
 #include "loaders/DeviceOrchestrator.h"
 #include <mpi.h>
 #include <iostream>
+#include <climits>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -43,31 +44,31 @@ void list_devices()
 
     const auto &devices = dm.devices();
 
-    LOG_INFO("\n=== Available Devices ===\n\n");
+    LOG_DEBUG("\n=== Available Devices ===\n\n");
     for (size_t i = 0; i < devices.size(); ++i)
     {
         const auto &dev = devices[i];
-        LOG_INFO("Device " << i << ": ");
+        LOG_DEBUG("Device " << i << ": ");
 
         switch (dev.type)
         {
         case ComputeBackendType::CPU_OPENBLAS:
-            LOG_INFO("CPU (OpenBLAS)");
+            LOG_DEBUG("CPU (OpenBLAS)");
             break;
         case ComputeBackendType::CPU_MKL:
-            LOG_INFO("CPU (Intel MKL)");
+            LOG_DEBUG("CPU (Intel MKL)");
             break;
         case ComputeBackendType::GPU_CUDA:
-            LOG_INFO("GPU (CUDA) - " << dev.name);
+            LOG_DEBUG("GPU (CUDA) - " << dev.name);
             break;
         case ComputeBackendType::GPU_ROCM:
-            LOG_INFO("GPU (ROCm) - " << dev.name);
+            LOG_DEBUG("GPU (ROCm) - " << dev.name);
             break;
         case ComputeBackendType::GPU_VULKAN:
-            LOG_INFO("GPU (Vulkan) - " << dev.name);
+            LOG_DEBUG("GPU (Vulkan) - " << dev.name);
             break;
         case ComputeBackendType::GPU_METAL:
-            LOG_INFO("GPU (Metal) - " << dev.name);
+            LOG_DEBUG("GPU (Metal) - " << dev.name);
             break;
         }
 
@@ -75,13 +76,13 @@ void list_devices()
         {
             double total_gb = dev.total_memory_bytes / (1024.0 * 1024.0 * 1024.0);
             double free_gb = dev.free_memory_bytes / (1024.0 * 1024.0 * 1024.0);
-            LOG_INFO(" (" << total_gb << " GB total, " << free_gb << " GB free)");
+            LOG_DEBUG(" (" << total_gb << " GB total, " << free_gb << " GB free)");
         }
 
-        LOG_INFO("\n");
+        LOG_DEBUG("\n");
     }
 
-    LOG_INFO("\n");
+    LOG_DEBUG("\n");
 }
 
 int parse_device(const std::string &device_str, DeviceManager &dm)
@@ -144,11 +145,11 @@ int main(int argc, char *argv[])
 
     if (mpi_ctx->rank() == 0)
     {
-        LOG_INFO("=== NUMA Topology Detection ===");
+        LOG_DEBUG("=== NUMA Topology Detection ===");
     }
 
-    LOG_INFO("[Rank " << mpi_ctx->rank() << "] NUMA node: " << numa_info.local_numa_node
-                      << " (detection: " << numa_info.detection_method << ")");
+    LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] NUMA node: " << numa_info.local_numa_node
+                       << " (detection: " << numa_info.detection_method << ")");
 
     if (!numa_info.detection_succeeded && mpi_ctx->rank() == 0)
     {
@@ -382,8 +383,8 @@ int main(int argc, char *argv[])
             break;
         }
 
-        LOG_INFO("Weight precision: " << weight_prec_name);
-        LOG_INFO("Activation precision: " << activation_prec_name);
+        LOG_DEBUG("Weight precision: " << weight_prec_name);
+        LOG_DEBUG("Activation precision: " << activation_prec_name);
     }
 
     // Create pipeline using factory
@@ -483,7 +484,7 @@ int main(int argc, char *argv[])
             tokenizer->setChatTemplate(ChatTemplate::create(override_type));
             if (mpi_ctx->rank() == 0)
             {
-                LOG_INFO("Using chat template override: " << args.chat_template);
+                LOG_DEBUG("Using chat template override: " << args.chat_template);
             }
         }
     }
@@ -578,7 +579,7 @@ int main(int argc, char *argv[])
             }
             else
             {
-                LOG_INFO("Encoded " << token_count << " tokens with chat template");
+                LOG_DEBUG("Encoded " << token_count << " tokens with chat template");
             }
         }
 
@@ -601,7 +602,7 @@ int main(int argc, char *argv[])
         // All ranks participate in prefill
         if (mpi_ctx->rank() == 0)
         {
-            LOG_INFO("Running prefill (" << token_count << " tokens)...");
+            LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
         }
 
         if (!pipeline->forward(token_ids.data(), token_count))
@@ -749,17 +750,17 @@ int main(int argc, char *argv[])
 
     if (mpi_ctx->rank() == 0)
     {
-        LOG_INFO("Sampling parameters:");
-        LOG_INFO("  temperature: " << sampling_params.temperature);
-        LOG_INFO("  top_k: " << sampling_params.top_k);
-        LOG_INFO("  top_p: " << sampling_params.top_p);
-        LOG_INFO("  seed: " << sampling_params.seed);
+        LOG_DEBUG("Sampling parameters:");
+        LOG_DEBUG("  temperature: " << sampling_params.temperature);
+        LOG_DEBUG("  top_k: " << sampling_params.top_k);
+        LOG_DEBUG("  top_p: " << sampling_params.top_p);
+        LOG_DEBUG("  seed: " << sampling_params.seed);
     }
 
     // Run prefill inference
     if (mpi_ctx->rank() == 0)
     {
-        LOG_INFO("Running prefill (" << tokens.size() << " tokens)...");
+        LOG_DEBUG("Running prefill (" << tokens.size() << " tokens)...");
     }
 
     if (!pipeline->forward(tokens.data(), tokens.size()))
@@ -774,17 +775,23 @@ int main(int argc, char *argv[])
 
     if (mpi_ctx->rank() == 0)
     {
-        LOG_INFO("Prefill complete. Generating " << args.n_predict << " tokens...\n");
-        // Print the prompt (decoded from tokens)
-        std::string decoded_prompt = tokenizer->decode(tokens, /*remove_special=*/true);
-        std::cout << decoded_prompt << std::flush;
+        if (args.n_predict == -1)
+        {
+            LOG_DEBUG("Prefill complete. Generating tokens until EOS...\n");
+        }
+        else
+        {
+            LOG_DEBUG("Prefill complete. Generating " << args.n_predict << " tokens...\n");
+        }
     }
 
     // Get EOS token ID for early stopping
     int eos_token_id = tokenizer->eos_token();
 
     // Generate tokens autoregressively
-    for (int i = 0; i < args.n_predict; ++i)
+    // n_predict = -1 means unlimited (generate until EOS)
+    int max_tokens = (args.n_predict == -1) ? INT_MAX : args.n_predict;
+    for (int i = 0; i < max_tokens; ++i)
     {
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << i);
 
@@ -858,7 +865,7 @@ int main(int argc, char *argv[])
             {
                 if (args.verbose)
                 {
-                    LOG_INFO("\nGeneration stopped: EOS token encountered");
+                    LOG_DEBUG("\nGeneration stopped: EOS token encountered");
                 }
                 break;
             }
@@ -894,7 +901,7 @@ int main(int argc, char *argv[])
     {
         std::cout << "\n"
                   << std::endl; // Final newline
-        LOG_INFO("Generation complete.");
+        LOG_DEBUG("Generation complete.");
     }
 
     MPI_Finalize();

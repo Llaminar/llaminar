@@ -222,6 +222,19 @@ add_v2_test(V2_Unit_TensorBasics
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
+# Test: SwiGLU formula correctness (regression test for gate/up swap bug)
+# This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
+add_executable(v2_test_swiglu_formula unit/Test__SwiGLUFormula.cpp)
+target_link_libraries(v2_test_swiglu_formula 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SwiGLUFormula 
+    COMMAND $<TARGET_FILE:v2_test_swiglu_formula>
+    LABELS "V2;Unit;Kernels;SwiGLU;FFN;Activation;RegressionTest"
+)
+
 # Test: FP16Tensor class
 add_executable(v2_test_fp16_tensor unit/tensors/Test__FP16Tensor.cpp)
 target_link_libraries(v2_test_fp16_tensor 
@@ -295,6 +308,195 @@ add_v2_test(V2_Unit_INT32RMSNorm
     COMMAND $<TARGET_FILE:v2_test_int32_rmsnorm>
     LABELS "V2;Unit;Kernels;RMSNorm;INT32;INT8Pipeline;Quantization;AVX512;CPU"
     MPI_PROCS 1  # RMSNorm is CPU-only, single rank
+)
+
+# Test: Q4_1 SIMD Unpack
+add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q4_1_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_1_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q4_1_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q4_1;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: Q4_1 Transcode (Fused Dequant/Requant)
+add_executable(v2_test_q4_1_transcode unit/tensors/Test__Q4_1_Transcode.cpp)
+target_link_libraries(v2_test_q4_1_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_1_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q4_1_transcode>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q4_1;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: IQ4_NL Transcode (Unpack to INT8)
+add_executable(v2_test_iq4_nl_transcode unit/tensors/Test__IQ4_NL_Transcode.cpp)
+target_link_libraries(v2_test_iq4_nl_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ4_NL_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_iq4_nl_transcode>
+    LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: Q2_K SIMD Unpack
+add_executable(v2_test_q2_k_simd_unpack unit/tensors/Test__Q2_K_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q2_k_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q2_K_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q2_k_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q2_K;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: Q3_K SIMD Unpack
+add_executable(v2_test_q3_k_simd_unpack unit/tensors/Test__Q3_K_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q3_k_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q3_K_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q3_k_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q3_K;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: Q2_K Transcode (Fused Dequant/Requant)
+add_executable(v2_test_q2_k_transcode unit/tensors/Test__Q2_K_Transcode.cpp)
+target_link_libraries(v2_test_q2_k_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q2_K_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q2_k_transcode>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q2_K;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: Q3_K Transcode (Fused Dequant/Requant)
+add_executable(v2_test_q3_k_transcode unit/tensors/Test__Q3_K_Transcode.cpp)
+target_link_libraries(v2_test_q3_k_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q3_K_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q3_k_transcode>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q3_K;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: Q4_K Transcode (Fused Dequant/Requant)
+add_executable(v2_test_q4_k_transcode unit/tensors/Test__Q4_K_Transcode.cpp)
+target_link_libraries(v2_test_q4_k_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_K_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q4_k_transcode>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q4_K;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: Q6_K Transcode (Fused Dequant/Requant)
+add_executable(v2_test_q6_k_transcode unit/tensors/Test__Q6_K_Transcode.cpp)
+target_link_libraries(v2_test_q6_k_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q6_K_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q6_k_transcode>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q6_K;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: Q4_1 Integration (GEMM)
+add_executable(v2_test_q4_1_integration integration/Test__Q4_1Tensor.cpp)
+target_link_libraries(v2_test_q4_1_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Q4_1Tensor 
+    COMMAND $<TARGET_FILE:v2_test_q4_1_integration>
+    LABELS "V2;Integration;TensorOperations;Quantization;Q4_1;GEMM"
+)
+
+# Test: Q2_K Integration (GEMM)
+add_executable(v2_test_q2_k_integration integration/Test__Q2_KTensor.cpp)
+target_link_libraries(v2_test_q2_k_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Q2_KTensor 
+    COMMAND $<TARGET_FILE:v2_test_q2_k_integration>
+    LABELS "V2;Integration;TensorOperations;Quantization;Q2_K;GEMM"
+)
+
+# Test: Q3_K Integration (GEMM)
+add_executable(v2_test_q3_k_integration integration/Test__Q3_KTensor.cpp)
+target_link_libraries(v2_test_q3_k_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Q3_KTensor 
+    COMMAND $<TARGET_FILE:v2_test_q3_k_integration>
+    LABELS "V2;Integration;TensorOperations;Quantization;Q3_K;GEMM"
+)
+
+# Test: Q4_K Integration (GEMM)
+add_executable(v2_test_q4_k_integration integration/Test__Q4_KTensor.cpp)
+target_link_libraries(v2_test_q4_k_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Q4_KTensor 
+    COMMAND $<TARGET_FILE:v2_test_q4_k_integration>
+    LABELS "V2;Integration;TensorOperations;Quantization;Q4_K;GEMM"
+)
+
+# Test: Q6_K Integration (GEMM)
+add_executable(v2_test_q6_k_integration integration/Test__Q6_KTensor.cpp)
+target_link_libraries(v2_test_q6_k_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Q6_KTensor 
+    COMMAND $<TARGET_FILE:v2_test_q6_k_integration>
+    LABELS "V2;Integration;TensorOperations;Quantization;Q6_K;GEMM"
+)
+
+# Test: IQ4_NL Integration (GEMM)
+add_executable(v2_test_iq4_nl_integration integration/Test__IQ4_NLTensor.cpp)
+target_link_libraries(v2_test_iq4_nl_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_IQ4_NLTensor 
+    COMMAND $<TARGET_FILE:v2_test_iq4_nl_integration>
+    LABELS "V2;Integration;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
 # Test: FusedRMSNormQuantize kernel (operator fusion framework - Phase 1)
@@ -864,6 +1066,45 @@ add_v2_test(V2_Unit_Q4_0_SIMD_Unpack
     MPI_PROCS 1
 )
 
+# Test: Q5_0 Transcoding and SIMD Unpacking
+add_executable(v2_test_q5_0_transcode unit/tensors/Test__Q5_0_Transcode.cpp)
+target_link_libraries(v2_test_q5_0_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_0_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q5_0_transcode>
+    LABELS "V2;Unit;TensorOperations;Q5_0;Quantization;SIMD;Unpack;IINT8Unpackable"
+    MPI_PROCS 1
+)
+
+# Test: Q5_1 Transcoding and SIMD Unpacking
+add_executable(v2_test_q5_1_transcode unit/tensors/Test__Q5_1_Transcode.cpp)
+target_link_libraries(v2_test_q5_1_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_1_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q5_1_transcode>
+    LABELS "V2;Unit;TensorOperations;Q5_1;Quantization;SIMD;Unpack;IINT8Unpackable"
+    MPI_PROCS 1
+)
+
+# Test: Q5_K Transcoding and SIMD Unpacking
+add_executable(v2_test_q5_k_transcode unit/tensors/Test__Q5_K_Transcode.cpp)
+target_link_libraries(v2_test_q5_k_transcode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_K_Transcode 
+    COMMAND $<TARGET_FILE:v2_test_q5_k_transcode>
+    LABELS "V2;Unit;TensorOperations;Q5_K;Quantization;SIMD;Unpack;IINT8Unpackable"
+    MPI_PROCS 1
+)
+
 # Test: IQ2_XS Tensor Views
 add_executable(v2_test_iq2xs_views unit/tensors/Test__IQ2_XSTensor_Views.cpp)
 target_link_libraries(v2_test_iq2xs_views 
@@ -886,6 +1127,127 @@ target_link_libraries(v2_test_iq3xxs_views
 add_v2_test(V2_Unit_IQ3_XXS_Views 
     COMMAND $<TARGET_FILE:v2_test_iq3xxs_views>
     LABELS "V2;Unit;TensorOperations;IQ3_XXS;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ3_XXS Tensor Interface (IINT8Unpackable)
+add_executable(v2_test_iq3xxs_tensor unit/Test__IQ3_XXSTensor.cpp)
+target_link_libraries(v2_test_iq3xxs_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ3_XXS_Tensor 
+    COMMAND $<TARGET_FILE:v2_test_iq3xxs_tensor>
+    LABELS "V2;Unit;TensorOperations;IQ3_XXS;Quantization;IINT8Unpackable"
+)
+
+# Test: IQ3_S Tensor Interface (IINT8Unpackable)
+add_executable(v2_test_iq3s_tensor unit/Test__IQ3_STensor.cpp)
+target_link_libraries(v2_test_iq3s_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ3_S_Tensor 
+    COMMAND $<TARGET_FILE:v2_test_iq3s_tensor>
+    LABELS "V2;Unit;TensorOperations;IQ3_S;Quantization;IINT8Unpackable"
+)
+
+# Test: IQ3_XXS GEMM Integration
+add_executable(v2_test_iq3xxs_gemm integration/Test__IQ3_XXS_GEMM.cpp)
+target_link_libraries(v2_test_iq3xxs_gemm 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ3_XXS_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq3xxs_gemm>
+    LABELS "V2;Integration;GEMM;IQ3_XXS;Quantization"
+)
+
+# Test: IQ3_S GEMM Integration
+add_executable(v2_test_iq3s_gemm integration/Test__IQ3_S_GEMM.cpp)
+target_link_libraries(v2_test_iq3s_gemm 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ3_S_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq3s_gemm>
+    LABELS "V2;Integration;GEMM;IQ3_S;Quantization"
+)
+
+# Test: IQ2_XXS Tensor (IINT8Unpackable)
+add_executable(v2_test_iq2xxs_tensor unit/Test__IQ2_XXSTensor.cpp)
+target_link_libraries(v2_test_iq2xxs_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_XXSTensor 
+    COMMAND $<TARGET_FILE:v2_test_iq2xxs_tensor>
+    LABELS "V2;Unit;TensorOperations;IQ2_XXS;Quantization;IINT8Unpackable"
+)
+
+# Test: IQ2_XXS GEMM Integration
+add_executable(v2_test_iq2xxs_gemm_integration integration/Test__IQ2_XXS_GEMM_Integration.cpp)
+target_link_libraries(v2_test_iq2xxs_gemm_integration 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ2_XXS_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq2xxs_gemm_integration>
+    LABELS "V2;Integration;GEMM;IQ2_XXS;Quantization"
+)
+
+
+# Test: IQ2_XS GEMM Integration
+add_executable(v2_test_iq2xs_gemm_integration integration/Test__IQ2_XS_GEMM_Integration.cpp)
+target_link_libraries(v2_test_iq2xs_gemm_integration 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ2_XS_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq2xs_gemm_integration>
+    LABELS "V2;Integration;GEMM;IQ2_XS;Quantization"
+)
+
+# Test: IQ4_XS GEMM Integration
+add_executable(v2_test_iq4xs_gemm_integration integration/Test__IQ4_XS_GEMM_Integration.cpp)
+target_link_libraries(v2_test_iq4xs_gemm_integration 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ4_XS_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq4xs_gemm_integration>
+    LABELS "V2;Integration;GEMM;IQ4_XS;Quantization"
+)
+
+# Test: IQ2_S Tensor Unit
+add_executable(v2_test_iq2s_tensor unit/tensors/Test__IQ2_STensor.cpp)
+target_link_libraries(v2_test_iq2s_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_STensor
+    COMMAND $<TARGET_FILE:v2_test_iq2s_tensor>
+    LABELS "V2;Unit;TensorOperations;IQ2_S;Quantization"
+)
+
+# Test: IQ2_S GEMM Integration
+add_executable(v2_test_iq2s_gemm_integration integration/Test__IQ2_S_GEMM_Integration.cpp)
+target_link_libraries(v2_test_iq2s_gemm_integration 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ2_S_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq2s_gemm_integration>
+    LABELS "V2;Integration;GEMM;IQ2_S;Quantization"
 )
 
 # Test: IQ2_S Tensor Views
@@ -1090,6 +1452,42 @@ add_v2_test(V2_Integration_Q5_0_SIMD
     COMMAND $<TARGET_FILE:v2_test_q5_0_simd>
     MPI_PROCS 1
     LABELS "V2;Integration;TensorOperations;Q5_0;Quantization;SIMD;AVX2;AVX512;Equivalency;HighBit"
+)
+
+# Test: Q5_0 GEMM Integration
+add_executable(v2_test_q5_0_gemm integration/Test__Q5_0_GEMM.cpp)
+target_link_libraries(v2_test_q5_0_gemm 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q5_0_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_q5_0_gemm>
+    MPI_PROCS 1
+    LABELS "V2;Integration;TensorOperations;Q5_0;Quantization;GEMM;IINT8Unpackable"
+)
+
+# Test: Q5_1 GEMM Integration
+add_executable(v2_test_q5_1_gemm integration/Test__Q5_1_GEMM.cpp)
+target_link_libraries(v2_test_q5_1_gemm 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q5_1_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_q5_1_gemm>
+    MPI_PROCS 1
+    LABELS "V2;Integration;TensorOperations;Q5_1;Quantization;GEMM;IINT8Unpackable"
+)
+
+# Test: Q5_K GEMM Integration
+add_executable(v2_test_q5_k_gemm integration/Test__Q5_K_GEMM.cpp)
+target_link_libraries(v2_test_q5_k_gemm 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q5_K_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_q5_k_gemm>
+    MPI_PROCS 1
+    LABELS "V2;Integration;TensorOperations;Q5_K;Quantization;GEMM;IINT8Unpackable"
 )
 
 # Test: Q5_1 SIMD Equivalency
@@ -1426,6 +1824,30 @@ add_v2_test(V2_Unit_IQ1_STensor
     LABELS "V2;Unit;TensorOperations;Quantization;IQ1_S"
 )
 
+# Test: IQ1_S GEMM Integration
+add_executable(v2_test_iq1s_gemm_integration integration/Test__IQ1_S_GEMM_Integration.cpp)
+target_link_libraries(v2_test_iq1s_gemm_integration 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ1_S_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq1s_gemm_integration>
+    LABELS "V2;Integration;GEMM;IQ1_S;Quantization"
+)
+
+# Test: IQ1_M GEMM Integration
+add_executable(v2_test_iq1m_gemm_integration integration/Test__IQ1_M_GEMM_Integration.cpp)
+target_link_libraries(v2_test_iq1m_gemm_integration 
+    llaminar2_core 
+    GTest::gtest
+    # No gtest_main, uses custom main
+)
+add_v2_test(V2_Integration_IQ1_M_GEMM 
+    COMMAND $<TARGET_FILE:v2_test_iq1m_gemm_integration>
+    LABELS "V2;Integration;GEMM;IQ1_M;Quantization"
+)
+
 # Test: IQ1_M Tensor Tests
 add_executable(v2_test_iq1_m_simd unit/tensors/Test__IQ1_MTensor.cpp)
 target_link_libraries(v2_test_iq1_m_simd llaminar2_core GTest::gtest_main)
@@ -1443,12 +1865,12 @@ add_v2_test(V2_Unit_IQ3_STensor
 )
 
 # IQ2_XXS Tensor Tests
-add_executable(v2_test_iq2_xxs_simd unit/tensors/Test__IQ2_XXSTensor.cpp)
-target_link_libraries(v2_test_iq2_xxs_simd llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_IQ2_XXSTensor
-    COMMAND v2_test_iq2_xxs_simd
-    LABELS "V2;Unit;TensorOperations;Quantization;IQ2_XXS"
-)
+# add_executable(v2_test_iq2_xxs_simd unit/tensors/Test__IQ2_XXSTensor.cpp)
+# target_link_libraries(v2_test_iq2_xxs_simd llaminar2_core GTest::gtest_main)
+# add_v2_test(V2_Unit_IQ2_XXSTensor
+#     COMMAND v2_test_iq2_xxs_simd
+#     LABELS "V2;Unit;TensorOperations;Quantization;IQ2_XXS"
+# )
 
 # IQ4_XS Tensor Tests
 add_executable(v2_test_iq4_xs_simd unit/tensors/Test__IQ4_XSTensor.cpp)

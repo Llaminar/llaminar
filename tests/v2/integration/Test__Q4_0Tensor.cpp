@@ -14,8 +14,15 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+#include <random>
+#include <cstring>
 #include "loaders/ModelLoader.h"
 #include <fstream>
+#include "v2/utils/MPIContext.h"
+#include "v2/tensors/TensorFactory.h"
+#include "v2/tensors/FP16Utils.h"
+#include "v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 
 namespace llaminar2
 {
@@ -29,6 +36,9 @@ namespace llaminar2
                 // Save original environment variable
                 const char *original = std::getenv("LLAMINAR_DEQUANT_SIMD_PATH");
                 original_simd_path_ = original ? std::string(original) : "";
+
+                // Initialize MPI context for GEMM tests
+                mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
             }
 
             void TearDown() override
@@ -112,6 +122,25 @@ namespace llaminar2
             }
 
             std::string original_simd_path_;
+            std::shared_ptr<MPIContext> mpi_ctx_;
+
+            /**
+             * @brief Compute relative L2 error between two output vectors.
+             */
+            float compute_relative_l2_error(const float *a, const float *b, size_t n)
+            {
+                float sum_sq_diff = 0.0f;
+                float sum_sq_ref = 0.0f;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    float diff = a[i] - b[i];
+                    sum_sq_diff += diff * diff;
+                    sum_sq_ref += b[i] * b[i];
+                }
+                if (sum_sq_ref < 1e-10f)
+                    return 0.0f;
+                return std::sqrt(sum_sq_diff / sum_sq_ref);
+            }
         };
 
         /**
@@ -234,6 +263,93 @@ namespace llaminar2
             EXPECT_TRUE(compareOutputs(scalar_output.data(), avx2_output.data(),
                                        Q4_0Block::BLOCK_SIZE, 1e-6f));
 #endif
+        }
+
+        /**
+         * @brief Compare QuantisedGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q4_0.
+         *
+         * This test verifies that the quantized GEMM kernel produces results close to
+         * the FP32 reference implementation using OneDNN.
+         */
+        TEST_F(Test__Q4_0Tensor, QuantizedVsFP32Parity)
+        {
+            // Realistic dimensions: 64 tokens, 512 hidden dim
+            const int m = 64;
+            const int n = 512;
+            const int k = 512;
+
+            // Q4_0: 32 elements per block
+            const size_t num_blocks = (static_cast<size_t>(n) * k) / 32;
+            std::vector<uint8_t> raw_data(num_blocks * sizeof(Q4_0Block));
+            Q4_0Block *blocks = reinterpret_cast<Q4_0Block *>(raw_data.data());
+
+            // Initialize with random but valid data
+            std::mt19937 rng(42);
+            std::uniform_int_distribution<uint8_t> byte_dist(0, 255);
+            std::uniform_real_distribution<float> scale_dist(0.001f, 0.1f);
+
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                // Valid FP16 scale factor
+                blocks[b].d = fp32_to_fp16(scale_dist(rng));
+                // Random qs (4-bit values packed into 16 bytes)
+                for (int i = 0; i < 16; ++i)
+                {
+                    blocks[b].qs[i] = byte_dist(rng);
+                }
+            }
+
+            // Create quantized tensor
+            auto q4_0_tensor = std::make_unique<Q4_0Tensor>(
+                std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)},
+                raw_data);
+
+            // Dequantize to FP32 for reference
+            TensorFactory factory(*mpi_ctx_);
+            auto fp32_weights = factory.createFP32({static_cast<size_t>(n), static_cast<size_t>(k)});
+            q4_0_tensor->to_fp32(fp32_weights->mutable_data());
+
+            // Create random input activations
+            auto input = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(k)});
+            float *input_data = input->mutable_data();
+            std::uniform_real_distribution<float> input_dist(-1.0f, 1.0f);
+            for (int i = 0; i < m * k; ++i)
+            {
+                input_data[i] = input_dist(rng);
+            }
+
+            // Allocate outputs
+            auto output_quantized = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
+            auto output_fp32 = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
+            std::memset(output_quantized->mutable_data(), 0, m * n * sizeof(float));
+            std::memset(output_fp32->mutable_data(), 0, m * n * sizeof(float));
+
+            // Run quantized GEMM (INT8 path)
+            auto quantized_gemm = q4_0_tensor->createGemm();
+            ASSERT_TRUE(quantized_gemm->multiply(
+                input_data,
+                output_quantized->mutable_data(),
+                m, n, k));
+
+            // Run FP32 GEMM (OneDNN reference)
+            gemm_v4::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
+            ASSERT_TRUE(fp32_gemm.multiply(
+                input_data,
+                output_fp32->mutable_data(),
+                m, n, k));
+
+            // Compare results
+            float rel_l2_error = compute_relative_l2_error(
+                output_quantized->data(),
+                output_fp32->data(),
+                m * n);
+
+            std::cout << "[Q4_0 Parity] Relative L2 error: " << (rel_l2_error * 100.0f) << "%" << std::endl;
+
+            // 1% tolerance for quantization error
+            EXPECT_LT(rel_l2_error, 0.01f)
+                << "Q4_0 quantized GEMM diverged from FP32 reference by "
+                << (rel_l2_error * 100.0f) << "%";
         }
 
     } // namespace test

@@ -11,8 +11,12 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+#include <random>
 #include "loaders/ModelLoader.h"
 #include <fstream>
+#include "v2/utils/MPIContext.h"
+#include "v2/tensors/TensorFactory.h"
+#include "v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 
 namespace llaminar2
 {
@@ -73,6 +77,25 @@ namespace llaminar2
                 }
 
                 return mismatch_count == 0;
+            }
+
+            std::unique_ptr<MPIContext> mpi_ctx_;
+
+            void SetUp() override
+            {
+                mpi_ctx_ = std::make_unique<MPIContext>(0, 1, MPI_COMM_WORLD);
+            }
+
+            static float compute_relative_l2_error(const float *a, const float *b, size_t n)
+            {
+                double sum_sq_diff = 0.0, sum_sq_ref = 0.0;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+                    sum_sq_diff += diff * diff;
+                    sum_sq_ref += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+                }
+                return (sum_sq_ref > 0) ? static_cast<float>(std::sqrt(sum_sq_diff / sum_sq_ref)) : 0.0f;
             }
         };
 
@@ -285,6 +308,101 @@ namespace llaminar2
             EXPECT_TRUE(compareOutputs(scalar_output.data(), avx2_output.data(),
                                        Q5_1Block::BLOCK_SIZE, 1e-5f));
 #endif
+        }
+
+        /**
+         * @brief Quantized GEMM vs FP32 GEMM Parity Test for Q5_1
+         *
+         * Compares QuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
+         * using randomly initialized Q5_1 weights. Validates that quantization introduces
+         * acceptable error (< 1% relative L2).
+         */
+        TEST_F(Test__Q5_1Tensor, QuantizedVsFP32Parity)
+        {
+            // Realistic dimensions: 64 tokens, 512 hidden dim
+            const int m = 64;
+            const int n = 512;
+            const int k = 512;
+
+            // Q5_1: 32 elements per block, has both scale (d) and min (m)
+            const size_t num_blocks = (static_cast<size_t>(n) * k) / 32;
+            std::vector<uint8_t> raw_data(num_blocks * sizeof(Q5_1Block));
+            Q5_1Block *blocks = reinterpret_cast<Q5_1Block *>(raw_data.data());
+
+            // Initialize with random but valid data
+            std::mt19937 rng(42);
+            std::uniform_int_distribution<uint8_t> byte_dist(0, 255);
+            std::uniform_real_distribution<float> scale_dist(0.001f, 0.1f);
+            std::uniform_real_distribution<float> min_dist(-0.05f, 0.05f);
+
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                // Valid FP16 scale factor
+                blocks[b].d = fp32_to_fp16(scale_dist(rng));
+                // Valid FP16 min value
+                blocks[b].m = fp32_to_fp16(min_dist(rng));
+                // Random qh (high bits, 4 bytes = 32 bits)
+                for (int i = 0; i < 4; ++i)
+                {
+                    blocks[b].qh[i] = byte_dist(rng);
+                }
+                // Random qs (low 4 bits packed into 16 bytes)
+                for (int i = 0; i < 16; ++i)
+                {
+                    blocks[b].qs[i] = byte_dist(rng);
+                }
+            }
+
+            // Create quantized tensor
+            auto q5_1_tensor = std::make_unique<Q5_1Tensor>(
+                std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)},
+                raw_data);
+
+            // Dequantize to FP32 for reference
+            TensorFactory factory(*mpi_ctx_);
+            auto fp32_weights = factory.createFP32({static_cast<size_t>(n), static_cast<size_t>(k)});
+            q5_1_tensor->to_fp32(fp32_weights->mutable_data());
+
+            // Create random input activations
+            auto input = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(k)});
+            float *input_data = input->mutable_data();
+            std::uniform_real_distribution<float> input_dist(-1.0f, 1.0f);
+            for (int i = 0; i < m * k; ++i)
+            {
+                input_data[i] = input_dist(rng);
+            }
+
+            // Allocate outputs
+            auto output_quantized = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
+            auto output_fp32 = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
+            std::memset(output_quantized->mutable_data(), 0, m * n * sizeof(float));
+            std::memset(output_fp32->mutable_data(), 0, m * n * sizeof(float));
+
+            // Run quantized GEMM (INT8 path)
+            auto quantized_gemm = q5_1_tensor->createGemm();
+            ASSERT_TRUE(quantized_gemm->multiply(
+                input_data,
+                output_quantized->mutable_data(),
+                m, n, k));
+
+            // Run FP32 GEMM (OneDNN reference)
+            gemm_v4::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
+            ASSERT_TRUE(fp32_gemm.multiply(
+                input_data,
+                output_fp32->mutable_data(),
+                m, n, k));
+
+            // Compare results
+            float rel_l2_error = compute_relative_l2_error(
+                output_quantized->data(),
+                output_fp32->data(),
+                m * n);
+
+            std::cout << "[Q5_1 Parity] Relative L2 error: " << (rel_l2_error * 100.0f) << "%" << std::endl;
+
+            // 1% tolerance for quantization error
+            EXPECT_LT(rel_l2_error, 0.01f)
+                << "Q5_1 quantized GEMM error exceeds 1% threshold";
         }
 
     } // namespace test
