@@ -661,8 +661,8 @@ TEST_F(KVCacheIntegrationTest, KVCacheDataIntegrity)
     int head_dim = getHeadDim();
     int max_seq_len = 256;
 
-    // Create KV cache directly
-    auto cache = std::make_shared<KVCache>(n_layers, max_seq_len, n_kv_heads, head_dim);
+    // Create KV cache directly with MPI context for NUMA-aware allocation
+    auto cache = std::make_shared<KVCache>(*mpi_ctx_, n_layers, max_seq_len, n_kv_heads, head_dim);
 
     if (rank_ == 0)
     {

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <numa.h>
 
 // ============================================================================
 // GPU Backend Includes (DEPRECATED - Phase 3)
@@ -67,9 +68,8 @@ namespace llaminar2
         switch (type)
         {
         case ComputeBackendType::CPU_OPENBLAS:
-            return "CPU (OpenBLAS)";
         case ComputeBackendType::CPU_MKL:
-            return "CPU (Intel MKL)";
+            return "CPU";
         case ComputeBackendType::GPU_CUDA:
             return "NVIDIA CUDA";
         case ComputeBackendType::GPU_ROCM:
@@ -85,7 +85,7 @@ namespace llaminar2
     // CPU Device Enumeration
     // ============================================================================
 
-    static ComputeDevice enumerate_cpu_device()
+    static ComputeDevice enumerate_cpu_device(int numa_node = -1)
     {
         ComputeDevice dev;
 
@@ -93,37 +93,79 @@ namespace llaminar2
         // (see CMakeLists.txt BLAS_BACKEND selection)
 #ifdef HAVE_MKL
         dev.type = ComputeBackendType::CPU_MKL;
-        dev.name = "Intel MKL (CPU)";
+        dev.name = "CPU";
 #elif defined(HAVE_OPENBLAS)
         dev.type = ComputeBackendType::CPU_OPENBLAS;
-        dev.name = "OpenBLAS (CPU)";
+        dev.name = "CPU";
 #else
 #error "No BLAS backend configured - set BLAS_BACKEND in CMake"
 #endif
 
         dev.device_id = 0;
         dev.compute_capability = 0;
+        dev.numa_node = numa_node;
 
-        // Get system memory info
+        // Get memory info - prefer NUMA-local memory if node specified
 #ifdef __linux__
-        FILE *meminfo = fopen("/proc/meminfo", "r");
-        if (meminfo)
+        if (numa_node >= 0 && numa_available() >= 0)
         {
-            char line[256];
-            while (fgets(line, sizeof(line), meminfo))
+            // Get NUMA-local memory for this node
+            long long numa_size = numa_node_size64(numa_node, nullptr);
+            if (numa_size > 0)
             {
-                if (strncmp(line, "MemAvailable:", 13) == 0)
+                dev.total_memory_bytes = static_cast<size_t>(numa_size);
+                // Free memory approximation: assume ~90% available
+                long long numa_free = 0;
+                numa_node_size64(numa_node, &numa_free);
+                dev.free_memory_bytes = (numa_free > 0) ? static_cast<size_t>(numa_free) : dev.total_memory_bytes;
+            }
+            else
+            {
+                // Fallback to system memory divided by NUMA nodes
+                int num_nodes = numa_num_configured_nodes();
+                FILE *meminfo = fopen("/proc/meminfo", "r");
+                if (meminfo)
                 {
-                    unsigned long kb = 0;
-                    if (sscanf(line + 13, "%lu", &kb) == 1)
+                    char line[256];
+                    while (fgets(line, sizeof(line), meminfo))
                     {
-                        dev.total_memory_bytes = static_cast<size_t>(kb) * 1024;
-                        dev.free_memory_bytes = dev.total_memory_bytes; // Approximate
+                        if (strncmp(line, "MemAvailable:", 13) == 0)
+                        {
+                            unsigned long kb = 0;
+                            if (sscanf(line + 13, "%lu", &kb) == 1)
+                            {
+                                dev.total_memory_bytes = static_cast<size_t>(kb) * 1024 / (num_nodes > 0 ? num_nodes : 1);
+                                dev.free_memory_bytes = dev.total_memory_bytes;
+                            }
+                            break;
+                        }
                     }
-                    break;
+                    fclose(meminfo);
                 }
             }
-            fclose(meminfo);
+        }
+        else
+        {
+            // No NUMA node specified, get total system memory
+            FILE *meminfo = fopen("/proc/meminfo", "r");
+            if (meminfo)
+            {
+                char line[256];
+                while (fgets(line, sizeof(line), meminfo))
+                {
+                    if (strncmp(line, "MemAvailable:", 13) == 0)
+                    {
+                        unsigned long kb = 0;
+                        if (sscanf(line + 13, "%lu", &kb) == 1)
+                        {
+                            dev.total_memory_bytes = static_cast<size_t>(kb) * 1024;
+                            dev.free_memory_bytes = dev.total_memory_bytes;
+                        }
+                        break;
+                    }
+                }
+                fclose(meminfo);
+            }
         }
 #else
         // Fallback: assume 16 GB
@@ -398,8 +440,8 @@ namespace llaminar2
         }
 
         // Always enumerate CPU first (device index 0)
-        auto cpu_dev = enumerate_cpu_device();
-        cpu_dev.numa_node = (local_numa_node >= 0) ? local_numa_node : 0;
+        // Pass NUMA node so memory reporting is NUMA-local
+        auto cpu_dev = enumerate_cpu_device(local_numa_node >= 0 ? local_numa_node : 0);
         devices_.push_back(cpu_dev);
 
         // Enumerate GPUs with optional NUMA filtering
@@ -493,7 +535,7 @@ namespace llaminar2
         for (size_t i = 0; i < devices_.size(); ++i)
         {
             const auto &dev = devices_[i];
-            std::string device_info = "  [" + std::to_string(i) + "] " + backend_type_name(dev.type) + " - " + dev.name + " (" + std::to_string(dev.total_memory_bytes / (1024 * 1024 * 1024)) + " GB";
+            std::string device_info = "  [" + std::to_string(i) + "] " + dev.name + " (" + std::to_string(dev.total_memory_bytes / (1024 * 1024 * 1024)) + " GB";
             if (dev.type != ComputeBackendType::CPU_OPENBLAS &&
                 dev.type != ComputeBackendType::CPU_MKL)
             {
@@ -724,8 +766,7 @@ namespace llaminar2
 
         size_t selected = candidates[0].index;
         LOG_INFO("[DeviceManager] Auto-selected device " << selected
-                                                         << " (" << backend_type_name(devices_[selected].type)
-                                                         << "): " << devices_[selected].name << "");
+                                                         << ": " << devices_[selected].name);
 
         return selected;
     }

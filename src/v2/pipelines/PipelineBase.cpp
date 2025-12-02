@@ -664,10 +664,11 @@ namespace llaminar2
         DEBUG_ASSERT(n_layers_ > 0, "n_layers_ must be set before calling initializeKVCache");
         DEBUG_ASSERT(n_kv_heads_ > 0, "n_kv_heads_ must be set before calling initializeKVCache");
         DEBUG_ASSERT(head_dim_ > 0, "head_dim_ must be set before calling initializeKVCache");
+        DEBUG_ASSERT(mpi_ctx_ != nullptr, "mpi_ctx_ must be set before calling initializeKVCache");
 
         // Phase 3: Use placement map to detect attention devices per layer
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
-        kv_cache_ = std::make_shared<KVCache>(n_layers_, max_seq_len, n_kv_heads_, head_dim_, attention_devices);
+        kv_cache_ = std::make_shared<KVCache>(*mpi_ctx_, n_layers_, max_seq_len, n_kv_heads_, head_dim_, attention_devices);
         current_positions_.clear(); // Will be resized to batch_size in forward_batch()
 
         LOG_INFO("Initialized KV cache: " << n_layers_ << " layers, "

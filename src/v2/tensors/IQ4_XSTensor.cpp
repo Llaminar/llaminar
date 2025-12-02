@@ -200,6 +200,7 @@ namespace llaminar2
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
 
             size_t blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+#pragma omp parallel for schedule(static) if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
                 for (size_t b = 0; b < blocks_per_row; ++b)

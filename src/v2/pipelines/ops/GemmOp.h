@@ -101,11 +101,11 @@ namespace llaminar2
             if (!validateDimensions(m, n, "output C"))
                 return false;
 
-            // 2. Create kernel from weight tensor
-            auto gemm_kernel = W->createGemm();
+            // 2. Get cached kernel from weight tensor (avoids expensive repacking every call)
+            auto *gemm_kernel = W->getOrCreateGemm();
             if (!gemm_kernel)
             {
-                logError("failed to create GEMM kernel from weight tensor");
+                logError("failed to get GEMM kernel from weight tensor");
                 return false;
             }
 
@@ -229,11 +229,11 @@ namespace llaminar2
             if (!validatePointer(C_data, "output data (C)"))
                 return false;
 
-            // 2. Create kernel from weight tensor
-            auto gemm_kernel = W->createGemm();
+            // 2. Get cached kernel from weight tensor
+            auto *gemm_kernel = W->getOrCreateGemm();
             if (!gemm_kernel)
             {
-                logError("failed to create GEMM kernel from weight tensor");
+                logError("failed to get GEMM kernel from weight tensor");
                 return false;
             }
 

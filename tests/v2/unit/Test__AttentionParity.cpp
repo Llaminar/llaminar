@@ -124,8 +124,11 @@ namespace
         }
 
         // Apply RoPE with LLaMA theta (10000.0)
-        auto Q_llama = std::make_shared<FP32Tensor>(*Q);
-        auto K_llama = std::make_shared<FP32Tensor>(*K);
+        // Create independent tensors and copy data (TensorBase is non-copyable)
+        auto Q_llama = std::make_shared<FP32Tensor>(Q->shape());
+        auto K_llama = std::make_shared<FP32Tensor>(K->shape());
+        Q_llama->copyFrom(Q.get());
+        K_llama->copyFrom(K.get());
 
         CPURoPEKernel rope_kernel_llama;
         ASSERT_TRUE(rope_kernel_llama.apply(
@@ -135,8 +138,10 @@ namespace
             << "RoPE with LLaMA theta failed";
 
         // Apply RoPE with Qwen2.5 theta (1000000.0)
-        auto Q_qwen = std::make_shared<FP32Tensor>(*Q);
-        auto K_qwen = std::make_shared<FP32Tensor>(*K);
+        auto Q_qwen = std::make_shared<FP32Tensor>(Q->shape());
+        auto K_qwen = std::make_shared<FP32Tensor>(K->shape());
+        Q_qwen->copyFrom(Q.get());
+        K_qwen->copyFrom(K.get());
 
         CPURoPEKernel rope_kernel_qwen;
         ASSERT_TRUE(rope_kernel_qwen.apply(

@@ -220,20 +220,6 @@ namespace llaminar2
                 auto kernel = jit.get_kernel();
                 auto kernel_m2 = jit_m2.get_kernel();
 
-                // Handle beta scaling / zeroing
-                if (!accumulate || beta == 0.0f)
-                {
-#pragma omp parallel for
-                    for (size_t i = 0; i < (size_t)m * n; ++i)
-                        C[i] = 0.0f;
-                }
-                else if (beta != 1.0f)
-                {
-#pragma omp parallel for
-                    for (size_t i = 0; i < (size_t)m * n; ++i)
-                        C[i] *= beta;
-                }
-
                 int k_blocks = (k + 31) / 32;
                 int blocks_per_row = (n + 63) / 64; // Added for Softmax offset calculation
 
@@ -241,15 +227,37 @@ namespace llaminar2
                 int N_padded = (n + 63) / 64 * 64;
                 bool is_padded = (n != N_padded);
 
+                // Determine beta handling mode
+                bool needs_zero = (!accumulate || beta == 0.0f);
+                bool needs_scale = (!needs_zero && beta != 1.0f);
+
                 // Shared buffer for quantized A
-                // We need to allocate this outside parallel region or use a shared vector
-                // Since m can be large, we should be careful.
-                // But for typical batch sizes (up to 512), it's fine.
                 std::vector<uint8_t> shared_quantized_a(m * k_blocks * sizeof(Q8_1Block) + 64);
                 Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(shared_quantized_a.data());
 
 #pragma omp parallel
                 {
+                    // FUSED: Zero/scale C inside the same parallel region as quantize+GEMM
+                    // This eliminates one parallel region entry per GEMM call
+                    if (needs_zero)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int i = 0; i < m; ++i)
+                        {
+                            std::memset(C + i * n, 0, n * sizeof(float));
+                        }
+                    }
+                    else if (needs_scale)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int i = 0; i < m; ++i)
+                        {
+                            float *row = C + i * n;
+                            for (int j = 0; j < n; ++j)
+                                row[j] *= beta;
+                        }
+                    }
+
                     // 1. Quantize A
                     // If M is small, parallelize over K to utilize threads
                     int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
@@ -918,25 +926,39 @@ namespace llaminar2
                 auto kernel = jit.get_kernel();
                 auto kernel_m2 = jit_m2.get_kernel();
 
-                // Handle beta scaling / zeroing
-                if (!accumulate || beta == 0.0f)
-                {
-#pragma omp parallel for
-                    for (size_t i = 0; i < (size_t)m * n; ++i)
-                        C[i] = 0.0f;
-                }
-                else if (beta != 1.0f)
-                {
-#pragma omp parallel for
-                    for (size_t i = 0; i < (size_t)m * n; ++i)
-                        C[i] *= beta;
-                }
+                // Determine beta handling mode
+                bool needs_zero = (!accumulate || beta == 0.0f);
+                bool needs_scale = (!needs_zero && beta != 1.0f);
 
                 int k_blocks = k / 32;
                 const Q8_1Block *all_blocks = static_cast<const Q8_1Block *>(q8_1_activations);
 
 #pragma omp parallel
                 {
+                    // FUSED: Zero/scale C inside the same parallel region as GEMM
+                    // This eliminates one parallel region entry per GEMM call
+                    if (needs_zero)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int i = 0; i < m; ++i)
+                        {
+                            std::memset(C + i * n, 0, n * sizeof(float));
+                        }
+                    }
+                    else if (needs_scale)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int i = 0; i < m; ++i)
+                        {
+                            float *row = C + i * n;
+                            for (int j = 0; j < n; ++j)
+                                row[j] *= beta;
+                        }
+                    }
+
+                    // Barrier to ensure zeroing complete before GEMM writes
+#pragma omp barrier
+
                     // Cache-aware blocking (same logic as other paths)
                     int num_threads = omp_get_num_threads();
                     long long l2_size = cpu_l2_cache_size();

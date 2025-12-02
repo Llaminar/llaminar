@@ -846,6 +846,19 @@ add_v2_test(V2_Integration_BPETokenizer
     MPI_PROCS 1  # Tokenizer is single-rank only
 )
 
+# Test: Stop token detection (template-specific stop tokens for generation)
+add_executable(v2_test_stop_tokens integration/Test__StopTokens.cpp)
+target_link_libraries(v2_test_stop_tokens 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_StopTokens 
+    COMMAND $<TARGET_FILE:v2_test_stop_tokens>
+    LABELS "V2;Integration;Tokenization;StopTokens;Generation;ChatML"
+    MPI_PROCS 1  # Tokenizer is single-rank only
+)
+
 # Test: Sampler (token sampling strategies for generation)
 add_executable(v2_test_sampler unit/Test__Sampler.cpp)
 target_link_libraries(v2_test_sampler 

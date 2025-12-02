@@ -508,6 +508,7 @@ namespace llaminar2
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const Q4_KBlock *blocks = reinterpret_cast<const Q4_KBlock *>(data_ptr);
             size_t blocks_per_row = (shape_[1] + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
+#pragma omp parallel for schedule(static) if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
                 for (size_t b = 0; b < blocks_per_row; ++b)

@@ -42,9 +42,10 @@ namespace llaminar2
         /**
          * @brief Create FP32 tensor with NUMA-aware allocation
          * @param shape Tensor dimensions
+         * @param device_idx Optional device index for tracking (-1 = CPU, >=0 = GPU)
          * @return FP32 tensor allocated on local NUMA node
          */
-        std::unique_ptr<FP32Tensor> createFP32(const std::vector<size_t> &shape);
+        std::unique_ptr<FP32Tensor> createFP32(const std::vector<size_t> &shape, int device_idx = -1);
 
         /**
          * @brief Create FP16 tensor with NUMA-aware allocation

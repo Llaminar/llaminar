@@ -92,6 +92,9 @@ namespace llaminar2
 
         /**
          * @brief Validate tensor pointer and basic properties
+         *
+         * @note Does NOT call data() to avoid triggering expensive dequantization
+         *       on quantized weight tensors. Only checks pointer and shape validity.
          */
         bool validateTensor(const TensorBase *tensor, const char *desc) const
         {
@@ -100,9 +103,12 @@ namespace llaminar2
                 LOG_ERROR(name() << ": null " << desc << " tensor");
                 return false;
             }
-            if (!tensor->data())
+            // Check shape validity instead of data() to avoid triggering
+            // dequantization on quantized tensors (which can take 10+ seconds
+            // for large tensors like embedding tables)
+            if (tensor->shape().empty())
             {
-                LOG_ERROR(name() << ": " << desc << " tensor has null data");
+                LOG_ERROR(name() << ": " << desc << " tensor has empty shape");
                 return false;
             }
             return true;

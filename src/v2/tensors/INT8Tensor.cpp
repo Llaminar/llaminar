@@ -159,6 +159,7 @@ namespace llaminar2
                                                              << " rows (have scales) out of " << shape_[0] << " total rows (buffer size)");
             }
 
+#pragma omp parallel for schedule(static) if (rows_to_dequantize > 100)
             for (size_t r = 0; r < rows_to_dequantize; ++r)
             {
                 const float row_scale = row_scales_cache_[r];
@@ -173,6 +174,8 @@ namespace llaminar2
             const size_t total_rows = shape_[0];
             if (rows_to_dequantize < total_rows)
             {
+                const size_t remaining_rows = total_rows - rows_to_dequantize;
+#pragma omp parallel for schedule(static) if (remaining_rows > 100)
                 for (size_t r = rows_to_dequantize; r < total_rows; ++r)
                 {
                     for (size_t c = 0; c < cols; ++c)
@@ -186,6 +189,7 @@ namespace llaminar2
         else
         {
             // Global scale (default path for weight tensors)
+#pragma omp parallel for schedule(static) if (total > 10000)
             for (size_t i = 0; i < total; ++i)
             {
                 dequant_cache_[i] = static_cast<float>(host_int8_data_[i]) * scale_;

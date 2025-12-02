@@ -145,10 +145,6 @@ namespace llaminar2
 
     void Q4_0Tensor::decodeBlock(const Q4_0Block &block, float *output)
     {
-        // OPTIMIZATION: Removed debugEnv() string comparisons from hot path
-        // This function is called millions of times during dequantization.
-        // We default to the best available SIMD instruction set.
-
 #if defined(__AVX512F__)
         if (cpu_supports_avx512())
         {
@@ -293,6 +289,7 @@ namespace llaminar2
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
             size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
+#pragma omp parallel for schedule(static) if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
                 for (size_t b = 0; b < blocks_per_row; ++b)

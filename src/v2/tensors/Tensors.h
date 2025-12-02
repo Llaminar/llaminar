@@ -94,6 +94,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <any>
+#include <mutex>
 
 namespace llaminar2
 {
@@ -508,6 +509,15 @@ namespace llaminar2
     public:
         virtual ~TensorBase() = default;
 
+        // Non-copyable: tensors contain mutexes and cached kernels
+        // Use copyFrom() method to copy data between tensors
+        TensorBase(const TensorBase &) = delete;
+        TensorBase &operator=(const TensorBase &) = delete;
+
+        // Move is also disabled due to enable_shared_from_this semantics
+        TensorBase(TensorBase &&) = delete;
+        TensorBase &operator=(TensorBase &&) = delete;
+
         // Generic cache for kernel state (e.g. packed weights)
         mutable std::any cache_;
 
@@ -531,6 +541,27 @@ namespace llaminar2
         // Kernel creation (only for weight matrices - GEMM)
         // NOTE: RoPE, SwiGLU, Softmax, RMSNorm, Attention moved to IActivationTensor
         virtual std::unique_ptr<ITensorGemm> createGemm() = 0;
+
+        /**
+         * @brief Get or create a cached GEMM kernel for this weight tensor
+         *
+         * Unlike createGemm() which creates a new kernel every call, this method
+         * caches the kernel for reuse. This is critical for performance since
+         * GEMM kernel creation involves expensive weight repacking.
+         *
+         * @return Raw pointer to cached GEMM kernel (owned by tensor)
+         * @note Thread-safe via mutex protection
+         * @note Kernel lifetime is tied to tensor lifetime
+         */
+        ITensorGemm *getOrCreateGemm()
+        {
+            std::lock_guard<std::mutex> lock(gemm_cache_mutex_);
+            if (!cached_gemm_)
+            {
+                cached_gemm_ = createGemm();
+            }
+            return cached_gemm_.get();
+        }
 
         // ===== Generic Type Conversion API =====
 
@@ -617,6 +648,12 @@ namespace llaminar2
         void to_q8_0(Q8_0Block *dst) const;
 
     protected:
+        // Default constructor for derived classes
+        TensorBase() = default;
+
+        mutable std::mutex gemm_cache_mutex_;
+        mutable std::unique_ptr<ITensorGemm> cached_gemm_;
+
         ActivationPack pack_activation_rows_to_int8(int rows, int cols) const;
 
         /**

@@ -343,6 +343,27 @@ int main(int argc, char *argv[])
     const auto &model = model_ctx->model();
     std::string architecture = model_ctx->architecture();
 
+    // Validate max_seq_len against model's context length
+    if (model.context_length > 0)
+    {
+        if (pipeline_config.max_seq_len > static_cast<int>(model.context_length))
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_WARN("Requested max_seq_len (" << pipeline_config.max_seq_len
+                                                   << ") exceeds model's context_length ("
+                                                   << model.context_length << "). Clamping to model limit.");
+            }
+            pipeline_config.max_seq_len = static_cast<int>(model.context_length);
+        }
+
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("KV cache size: " << pipeline_config.max_seq_len
+                                       << " tokens (model max: " << model.context_length << ")");
+        }
+    }
+
     // Log selected precision modes
     if (mpi_ctx->rank() == 0)
     {
@@ -624,13 +645,20 @@ int main(int argc, char *argv[])
         sampling_params.top_p = args.top_p;
         sampling_params.seed = args.seed;
 
+        // Determine max tokens: -1 means unlimited (use context size as practical limit)
+        int max_tokens = args.n_predict;
+        if (max_tokens < 0)
+        {
+            max_tokens = args.max_seq_len - token_count;
+        }
+
         if (mpi_ctx->rank() == 0)
         {
-            LOG_INFO("Generating response (max " << args.n_predict << " tokens)...\n");
+            LOG_INFO("Generating response (max " << max_tokens << " tokens)...\n");
         }
 
         // Decode loop - all ranks participate in forward, rank 0 samples and outputs
-        for (int i = 0; i < args.n_predict; ++i)
+        for (int i = 0; i < max_tokens; ++i)
         {
             int next_token = -1;
 
@@ -651,8 +679,8 @@ int main(int argc, char *argv[])
                     next_token = sampler.sample(logits_vec, sampling_params);
                 }
 
-                // Output token text (streaming)
-                if (next_token != eos_token_id)
+                // Output token text (streaming) - don't print stop tokens
+                if (!tokenizer->is_stop_token(next_token))
                 {
                     std::string token_text = tokenizer->decode_token(next_token);
                     std::cout << token_text << std::flush;
@@ -662,12 +690,12 @@ int main(int argc, char *argv[])
             // Broadcast next token to all ranks
             MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-            // Check for EOS
-            if (next_token == eos_token_id)
+            // Check for stop tokens (EOS, <|im_end|>, etc.)
+            if (tokenizer->is_stop_token(next_token))
             {
                 if (mpi_ctx->rank() == 0)
                 {
-                    LOG_DEBUG("EOS token encountered, stopping generation");
+                    LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
                 }
                 break;
             }
@@ -857,15 +885,19 @@ int main(int argc, char *argv[])
             }
 
             // Decode and print the token immediately (streaming output)
-            std::string token_text = tokenizer->decode_token(next_token);
-            std::cout << token_text << std::flush;
+            // Don't print stop tokens
+            if (!tokenizer->is_stop_token(next_token))
+            {
+                std::string token_text = tokenizer->decode_token(next_token);
+                std::cout << token_text << std::flush;
+            }
 
-            // Check for early stopping
-            if (next_token == eos_token_id)
+            // Check for early stopping (EOS, <|im_end|>, etc.)
+            if (tokenizer->is_stop_token(next_token))
             {
                 if (args.verbose)
                 {
-                    LOG_DEBUG("\nGeneration stopped: EOS token encountered");
+                    LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
                 }
                 break;
             }
@@ -876,8 +908,8 @@ int main(int argc, char *argv[])
         MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Token broadcast complete: " << next_token);
 
-        // Check if rank 0 hit EOS
-        if (next_token == eos_token_id)
+        // Check if rank 0 hit stop token
+        if (tokenizer->is_stop_token(next_token))
         {
             break;
         }

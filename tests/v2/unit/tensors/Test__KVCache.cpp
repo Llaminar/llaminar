@@ -6,10 +6,17 @@
 
 #include "../../../../src/v2/tensors/KVCache.h"
 #include "../../../../src/v2/utils/Logger.h"
+#include "../../../../src/v2/utils/MPIContext.h"
 #include <gtest/gtest.h>
 #include <memory>
 
 using namespace llaminar2;
+
+// Single-rank MPI context for unit tests
+static MPIContext getTestMPIContext()
+{
+    return MPIContext(0, 1, MPI_COMM_WORLD);
+}
 
 class KVCacheTest : public ::testing::Test
 {
@@ -21,7 +28,7 @@ protected:
         n_kv_heads_ = 2;
         head_dim_ = 64;
 
-        cache_ = std::make_shared<KVCache>(n_layers_, max_seq_len_, n_kv_heads_, head_dim_);
+        cache_ = std::make_shared<KVCache>(getTestMPIContext(), n_layers_, max_seq_len_, n_kv_heads_, head_dim_);
     }
 
     int n_layers_;
@@ -267,7 +274,7 @@ TEST(KVCacheHeterogeneousTest, MultiDevicePlacement)
     // (Note: For MoE, FFN/experts might be on different devices)
     std::vector<int> attention_devices = {-1, -1, -1, -1, 0, 0, 0, 0};
 
-    auto cache = std::make_shared<KVCache>(n_layers, max_seq_len, n_kv_heads, head_dim, attention_devices);
+    auto cache = std::make_shared<KVCache>(getTestMPIContext(), n_layers, max_seq_len, n_kv_heads, head_dim, attention_devices);
 
     // Verify attention device affinity for each layer
     for (int i = 0; i < 4; ++i)
@@ -342,7 +349,7 @@ TEST(KVCacheHeterogeneousTest, ThreeDevicePlacement)
     // Layers 8-11: Attention on GPU 1
     std::vector<int> attention_devices = {-1, -1, -1, -1, 0, 0, 0, 0, 1, 1, 1, 1};
 
-    auto cache = std::make_shared<KVCache>(n_layers, max_seq_len, n_kv_heads, head_dim, attention_devices);
+    auto cache = std::make_shared<KVCache>(getTestMPIContext(), n_layers, max_seq_len, n_kv_heads, head_dim, attention_devices);
 
     // Verify each layer's attention device
     for (int i = 0; i < 4; ++i)

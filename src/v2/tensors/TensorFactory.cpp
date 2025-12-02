@@ -29,7 +29,7 @@ namespace llaminar2
         }
     }
 
-    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape)
+    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape, int device_idx)
     {
         // Ensure we're on the correct NUMA node
         if (numa_node_ >= 0)
@@ -37,7 +37,7 @@ namespace llaminar2
             bindToNumaNode();
         }
 
-        return std::make_unique<FP32Tensor>(shape);
+        return std::make_unique<FP32Tensor>(shape, device_idx);
     }
 
     std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape)

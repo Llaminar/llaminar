@@ -133,7 +133,7 @@ namespace llaminar2
         // Override KV cache with batched version
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
         kv_cache_batched_ = std::make_shared<BatchedKVCache>(
-            n_layers_, batch_size_, config.max_seq_len, n_kv_heads_, head_dim_, attention_devices);
+            *mpi_ctx_, n_layers_, batch_size_, config.max_seq_len, n_kv_heads_, head_dim_, attention_devices);
         LOG_DEBUG("Initialized batched KV cache: batch_size=" << batch_size_
                                                               << ", max_seq_len=" << config.max_seq_len);
 

@@ -96,6 +96,7 @@ namespace llaminar2
         const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
 
+#pragma omp parallel for schedule(static) if (num_elements > 10000)
         for (size_t i = 0; i < num_blocks; ++i)
         {
             decodeBlock(blocks[i], &dequant_cache_[i * Q5_0Block::BLOCK_SIZE]);

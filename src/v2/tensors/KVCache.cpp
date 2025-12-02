@@ -12,21 +12,23 @@
 namespace llaminar2
 {
 
-    KVCache::KVCache(int n_layers, int max_seq_len, int n_kv_heads, int head_dim, int device_idx)
+    KVCache::KVCache(const MPIContext &mpi_ctx, int n_layers, int max_seq_len, int n_kv_heads, int head_dim, int device_idx)
         : n_layers_(n_layers), max_seq_len_(max_seq_len), n_kv_heads_(n_kv_heads), head_dim_(head_dim), device_idx_(device_idx)
     {
         cache_.resize(n_layers);
+
+        // Create TensorFactory with MPI context for NUMA-aware allocation
+        TensorFactory factory(mpi_ctx);
 
         // Pre-allocate K/V buffers for all layers (single device)
         size_t kv_dim = n_kv_heads * head_dim;
         for (int i = 0; i < n_layers; ++i)
         {
-            cache_[i].K = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim},
-                device_idx);
-            cache_[i].V = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim},
-                device_idx);
+            // Use TensorFactory for NUMA-aware allocation with device tracking
+            cache_[i].K = factory.createFP32(
+                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim}, device_idx);
+            cache_[i].V = factory.createFP32(
+                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim}, device_idx);
             cache_[i].cached_tokens = 0;
             cache_[i].device_idx = device_idx; // Store device affinity
         }
@@ -37,7 +39,7 @@ namespace llaminar2
     }
 
     // Heterogeneous constructor with per-layer device placement
-    KVCache::KVCache(int n_layers, int max_seq_len, int n_kv_heads, int head_dim,
+    KVCache::KVCache(const MPIContext &mpi_ctx, int n_layers, int max_seq_len, int n_kv_heads, int head_dim,
                      const std::vector<int> &layer_devices)
         : n_layers_(n_layers), max_seq_len_(max_seq_len), n_kv_heads_(n_kv_heads), head_dim_(head_dim), device_idx_(-2) // -2 = heterogeneous
     {
@@ -50,6 +52,9 @@ namespace llaminar2
         cache_.resize(n_layers);
         size_t kv_dim = n_kv_heads * head_dim;
 
+        // Create TensorFactory with MPI context for NUMA-aware allocation
+        TensorFactory factory(mpi_ctx);
+
         // Track memory usage per device
         std::map<int, size_t> device_bytes;
 
@@ -57,12 +62,11 @@ namespace llaminar2
         for (int i = 0; i < n_layers; ++i)
         {
             int layer_device = layer_devices[i];
-            cache_[i].K = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim},
-                layer_device);
-            cache_[i].V = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim},
-                layer_device);
+            // Use TensorFactory for NUMA-aware allocation with device tracking
+            cache_[i].K = factory.createFP32(
+                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim}, layer_device);
+            cache_[i].V = factory.createFP32(
+                std::vector<size_t>{static_cast<size_t>(max_seq_len), kv_dim}, layer_device);
             cache_[i].cached_tokens = 0;
             cache_[i].device_idx = layer_device;
 
@@ -165,7 +169,14 @@ namespace llaminar2
             // Only evict on layer 0 (evict_oldest handles all layers atomically)
             if (layer == 0)
             {
-                LOG_INFO("[KVCache] Cache full, evicting " << tokens_to_evict << " oldest tokens (sliding window)");
+                // Warn on first eviction - sliding window is now active
+                if (total_evicted_ == 0)
+                {
+                    LOG_WARN("[KVCache] Cache capacity reached (" << max_seq_len_ << " tokens). "
+                                                                  << "Starting sliding window eviction. Context from oldest tokens will be lost. "
+                                                                  << "Consider using a model with larger context or chunked prompts.");
+                }
+                LOG_TRACE("[KVCache] Cache full, evicting " << tokens_to_evict << " oldest tokens (sliding window)");
                 evict_oldest(tokens_to_evict);
             }
             current_cached = cache_[layer].cached_tokens; // Re-read after eviction
@@ -199,6 +210,9 @@ namespace llaminar2
 
         size_t kv_dim = n_kv_heads_ * head_dim_;
 
+        // Track evicted tokens for position adjustment
+        total_evicted_ += tokens_to_evict;
+
 #pragma omp parallel for
         for (int layer = 0; layer < n_layers_; ++layer)
         {
@@ -225,7 +239,7 @@ namespace llaminar2
             cache_[layer].cached_tokens = tokens_to_keep;
         }
 
-        LOG_DEBUG("[KVCache] Evicted " << tokens_to_evict << " oldest tokens from all layers");
+        LOG_DEBUG("[KVCache] Evicted " << tokens_to_evict << " oldest tokens from all layers (total_evicted_=" << total_evicted_ << ")");
     }
 
     void KVCache::clear()
@@ -234,6 +248,7 @@ namespace llaminar2
         {
             cache_[i].cached_tokens = 0;
         }
+        total_evicted_ = 0; // Reset eviction counter on full clear
         LOG_DEBUG("[KVCache] Cleared all layers");
     }
 

@@ -75,6 +75,25 @@ namespace llaminar2
         virtual int eos_token() const = 0;
 
         /**
+         * @brief Get all stop token IDs
+         *
+         * Returns all tokens that should terminate generation, including:
+         * - EOS token (always)
+         * - Chat-specific tokens like <|im_end|> for ChatML models
+         *
+         * @return Vector of stop token IDs
+         */
+        virtual std::vector<int> stop_tokens() const = 0;
+
+        /**
+         * @brief Check if a token is a stop token
+         *
+         * @param token_id Token ID to check
+         * @return true if token should stop generation
+         */
+        virtual bool is_stop_token(int token_id) const = 0;
+
+        /**
          * @brief Get vocabulary size
          */
         virtual int vocab_size() const = 0;
@@ -185,6 +204,8 @@ namespace llaminar2
 
         int bos_token() const override { return bos_token_; }
         int eos_token() const override { return eos_token_; }
+        std::vector<int> stop_tokens() const override { return stop_tokens_; }
+        bool is_stop_token(int token_id) const override;
         int vocab_size() const override { return vocab_.size(); }
 
         // Chat template implementation
@@ -242,6 +263,10 @@ namespace llaminar2
         int eos_token_ = 0;
         int pad_token_ = 0;
 
+        // Stop tokens - tokens that should terminate generation
+        // Always includes EOS, plus chat-specific tokens like <|im_end|>
+        std::vector<int> stop_tokens_;
+
         // Special tokens (sorted by length descending for greedy matching)
         // e.g., <|im_start|>, <|im_end|>, <|endoftext|>
         std::vector<std::pair<std::string, int>> special_tokens_;
@@ -253,6 +278,14 @@ namespace llaminar2
          * sorted by length (longest first) for greedy matching.
          */
         void initializeSpecialTokens();
+
+        /**
+         * @brief Initialize stop tokens based on detected chat template
+         *
+         * Called after special tokens are initialized to identify which
+         * tokens should terminate generation.
+         */
+        void initializeStopTokens();
 
         /**
          * @brief Encode text with special token handling

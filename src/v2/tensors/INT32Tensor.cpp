@@ -43,6 +43,7 @@ namespace llaminar2
         float *row_scales,
         size_t m, size_t n)
     {
+#pragma omp parallel for schedule(static) if (m > 100)
         for (size_t i = 0; i < m; ++i)
         {
             const int32_t *row = int32_data + i * n;
@@ -84,6 +85,7 @@ namespace llaminar2
         float scale,
         size_t count)
     {
+#pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
             fp32_data[i] = static_cast<float>(int32_data[i]) * scale;
@@ -105,6 +107,7 @@ namespace llaminar2
         size_t count)
     {
         float inv_scale = 1.0f / scale;
+#pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
             int32_data[i] = static_cast<int32_t>(std::round(fp32_data[i] * inv_scale));

@@ -30,8 +30,24 @@ namespace llaminar2
         WeightDistributionStrategy strategy,
         WeightPrecision weight_precision)
     {
+        // Create TensorFactory from MPI context if not provided
+        // This ensures proper NUMA-aware allocation and avoids the ModelLoader
+        // creating an internal single-rank MPI context
+        std::unique_ptr<TensorFactory> owned_factory;
+        if (!factory && mpi_ctx)
+        {
+            owned_factory = std::make_unique<TensorFactory>(*mpi_ctx);
+            factory = owned_factory.get();
+        }
+
         auto ctx = std::shared_ptr<ModelContext>(
             new ModelContext(model_path, mpi_ctx, placement_map, factory, strategy));
+
+        // Store owned factory so it lives as long as the context
+        if (owned_factory)
+        {
+            ctx->owned_test_factory_ = std::move(owned_factory);
+        }
 
         // Load model metadata
         if (!ctx->loader_.loadModel(model_path))

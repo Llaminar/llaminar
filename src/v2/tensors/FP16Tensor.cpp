@@ -304,7 +304,8 @@ namespace llaminar2
             throw std::invalid_argument("FP16Tensor::to_fp32: size mismatch");
         }
 
-        // Convert FP16 → FP32 using utility function
+        // Convert FP16 → FP32 using utility function with OpenMP parallelization for large tensors
+#pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
             fp32_data[i] = fp16_to_fp32(fp16_ptr[i]);

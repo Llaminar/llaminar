@@ -11,6 +11,8 @@
 #pragma once
 
 #include "Tensors.h"
+#include "TensorFactory.h"
+#include "../utils/MPIContext.h"
 #include <vector>
 #include <memory>
 
@@ -46,6 +48,7 @@ namespace llaminar2
         /**
          * @brief Construct batched KV cache with uniform device placement
          *
+         * @param mpi_ctx MPI context for NUMA-aware allocation
          * @param n_layers Number of transformer layers
          * @param batch_size Number of sequences in batch
          * @param max_seq_len Maximum sequence length (cache capacity per sequence)
@@ -53,7 +56,7 @@ namespace llaminar2
          * @param head_dim Dimension per head
          * @param device_idx Default device for all layers (-1 = CPU)
          */
-        BatchedKVCache(int n_layers, int batch_size, int max_seq_len,
+        BatchedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, int device_idx = -1);
 
         /**
@@ -67,6 +70,7 @@ namespace llaminar2
          * - Standard heterogeneous: Layers 0-11 attention on CPU, 12-23 on GPU
          * - MoE with shared experts: Attention on CPU, experts on GPU → use CPU
          *
+         * @param mpi_ctx MPI context for NUMA-aware allocation
          * @param n_layers Number of transformer layers
          * @param batch_size Number of sequences in batch
          * @param max_seq_len Maximum sequence length (cache capacity per sequence)
@@ -75,7 +79,7 @@ namespace llaminar2
          * @param attention_devices Device where attention is computed per layer
          *                          (length = n_layers, -1 = CPU, ≥0 = GPU device)
          */
-        BatchedKVCache(int n_layers, int batch_size, int max_seq_len,
+        BatchedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim,
                        const std::vector<int> &attention_devices);
 
@@ -144,6 +148,25 @@ namespace llaminar2
         void clear_layer(int layer);
 
         /**
+         * @brief Evict oldest tokens from all sequences (sliding window)
+         *
+         * Removes the oldest tokens from all sequences across all layers,
+         * shifting remaining tokens to the beginning of the cache.
+         * Useful for sliding window attention or context length management.
+         *
+         * @param tokens_to_evict Number of oldest tokens to remove per sequence
+         */
+        void evict_oldest(int tokens_to_evict);
+
+        /**
+         * @brief Evict oldest tokens from a specific sequence (sliding window)
+         *
+         * @param seq_idx Sequence index
+         * @param tokens_to_evict Number of oldest tokens to remove
+         */
+        void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict);
+
+        /**
          * @brief Get total number of layers
          */
         int num_layers() const { return n_layers_; }
@@ -186,6 +209,9 @@ namespace llaminar2
 
         // Device placement per layer
         std::vector<int> layer_devices_;
+
+        // TensorFactory for NUMA-aware allocation (stored for initialize_layer)
+        std::unique_ptr<TensorFactory> tensor_factory_;
 
         // Helper: Initialize cache entries for a layer
         void initialize_layer(int layer, int device_idx);

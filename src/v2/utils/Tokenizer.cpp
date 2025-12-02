@@ -170,6 +170,9 @@ namespace llaminar2
             LOG_DEBUG("[BPETokenizer] No chat template in model metadata");
         }
 
+        // Initialize stop tokens (must be after chat template detection)
+        initializeStopTokens();
+
         return true;
     }
 
@@ -265,6 +268,139 @@ namespace llaminar2
                                               << special_tokens_[0].first << " -> "
                                               << special_tokens_[0].second << ")");
         }
+    }
+
+    void BPETokenizer::initializeStopTokens()
+    {
+        // Always include EOS token as a stop token
+        stop_tokens_.clear();
+        if (eos_token_ >= 0)
+        {
+            stop_tokens_.push_back(eos_token_);
+            LOG_DEBUG("[BPETokenizer] Added EOS as stop token: " << eos_token_);
+        }
+
+        // Add chat-template-specific stop tokens
+        // These are tokens that indicate end of assistant response
+        std::vector<std::string> additional_stop_patterns;
+
+        if (chat_template_)
+        {
+            ChatTemplateType template_type = chat_template_->type();
+
+            switch (template_type)
+            {
+            case ChatTemplateType::CHATML:
+            case ChatTemplateType::PHI4:
+                // ChatML-based templates use <|im_end|> to end turns
+                additional_stop_patterns.push_back("<|im_end|>");
+                break;
+
+            case ChatTemplateType::LLAMA3:
+                // Llama 3 uses <|eot_id|> for end of turn
+                additional_stop_patterns.push_back("<|eot_id|>");
+                break;
+
+            case ChatTemplateType::GEMMA:
+                // Gemma uses <end_of_turn>
+                additional_stop_patterns.push_back("<end_of_turn>");
+                break;
+
+            case ChatTemplateType::PHI3:
+                // Phi-3 uses <|end|>
+                additional_stop_patterns.push_back("<|end|>");
+                break;
+
+            case ChatTemplateType::ZEPHYR:
+                // Zephyr uses <|endoftext|> which should already be EOS
+                // but add it explicitly in case EOS is different
+                additional_stop_patterns.push_back("<|endoftext|>");
+                break;
+
+            case ChatTemplateType::MISTRAL_V1:
+            case ChatTemplateType::MISTRAL_V3:
+            case ChatTemplateType::MISTRAL_V7:
+            case ChatTemplateType::LLAMA2:
+            case ChatTemplateType::VICUNA:
+            case ChatTemplateType::DEEPSEEK:
+            case ChatTemplateType::DEEPSEEK2:
+            case ChatTemplateType::DEEPSEEK3:
+            case ChatTemplateType::COMMAND_R:
+            case ChatTemplateType::UNKNOWN:
+            default:
+                // These typically just use EOS token
+                break;
+            }
+        }
+
+        // Look up token IDs for additional stop patterns
+        for (const auto &pattern : additional_stop_patterns)
+        {
+            LOG_DEBUG("[BPETokenizer] Looking for stop pattern: " << pattern);
+            bool found = false;
+
+            // Check in special_tokens_ first (faster)
+            for (const auto &[token_str, token_id] : special_tokens_)
+            {
+                if (token_str == pattern)
+                {
+                    found = true;
+                    // Don't add duplicates
+                    if (std::find(stop_tokens_.begin(), stop_tokens_.end(), token_id) == stop_tokens_.end())
+                    {
+                        stop_tokens_.push_back(token_id);
+                        LOG_DEBUG("[BPETokenizer] Added stop token: " << pattern << " -> " << token_id);
+                    }
+                    else
+                    {
+                        LOG_DEBUG("[BPETokenizer] Stop token already exists: " << pattern << " -> " << token_id);
+                    }
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                // Fall back to vocab lookup
+                auto it = vocab_map_.find(pattern);
+                if (it != vocab_map_.end())
+                {
+                    if (std::find(stop_tokens_.begin(), stop_tokens_.end(), it->second) == stop_tokens_.end())
+                    {
+                        stop_tokens_.push_back(it->second);
+                        LOG_DEBUG("[BPETokenizer] Added stop token from vocab: " << pattern << " -> " << it->second);
+                    }
+                }
+                else
+                {
+                    LOG_WARN("[BPETokenizer] Stop pattern not found in vocabulary: " << pattern);
+                }
+            }
+        }
+
+        // Log stop tokens
+        if (stop_tokens_.size() > 1)
+        {
+            std::stringstream ss;
+            ss << "[BPETokenizer] Stop tokens: ";
+            for (size_t i = 0; i < stop_tokens_.size(); ++i)
+            {
+                if (i > 0)
+                    ss << ", ";
+                ss << stop_tokens_[i];
+                // Try to show token text
+                if (stop_tokens_[i] >= 0 && stop_tokens_[i] < static_cast<int>(vocab_.size()))
+                {
+                    ss << " (" << vocab_[stop_tokens_[i]] << ")";
+                }
+            }
+            LOG_INFO(ss.str());
+        }
+    }
+
+    bool BPETokenizer::is_stop_token(int token_id) const
+    {
+        return std::find(stop_tokens_.begin(), stop_tokens_.end(), token_id) != stop_tokens_.end();
     }
 
     std::vector<int> BPETokenizer::encodeWithSpecialTokens(const std::string &text) const

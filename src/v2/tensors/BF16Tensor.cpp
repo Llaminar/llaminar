@@ -280,7 +280,8 @@ namespace llaminar2
             throw std::invalid_argument("BF16Tensor::to_fp32: size mismatch");
         }
 
-        // Convert BF16 → FP32
+        // Convert BF16 → FP32 with OpenMP parallelization for large tensors
+#pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
             bfloat16 bf;

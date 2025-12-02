@@ -36,87 +36,120 @@ namespace llaminar2
 #endif
     }
 
+    namespace detail
+    {
+        /**
+         * @brief Internal: Perform actual AVX512 detection (called once)
+         */
+        inline bool detect_avx512()
+        {
+            uint32_t regs[4];
+            cpuid(1, 0, regs);
+            bool osxsave = (regs[2] & (1 << 27)) != 0;
+            if (!osxsave)
+                return false;
+
+            // Check OS supports AVX512 (ZMM state)
+            uint32_t xcr0;
+#if defined(_MSC_VER)
+            xcr0 = static_cast<uint32_t>(_xgetbv(0));
+#elif defined(__GNUC__) || defined(__clang__)
+            __asm__ __volatile__("xgetbv" : "=a"(xcr0) : "c"(0) : "%edx");
+#else
+            return false;
+#endif
+            constexpr uint32_t AVX512_MASK = 0xE6; // XMM, YMM, opmask, ZMM_Hi256, Hi16_ZMM
+            if ((xcr0 & AVX512_MASK) != AVX512_MASK)
+                return false;
+
+            // Check CPUID for AVX512F
+            cpuid(7, 0, regs);
+            return (regs[1] & (1 << 16)) != 0; // EBX bit 16 = AVX512F
+        }
+
+        /**
+         * @brief Internal: Perform actual AVX2 detection (called once)
+         */
+        inline bool detect_avx2()
+        {
+            uint32_t regs[4];
+            cpuid(1, 0, regs);
+            bool osxsave = (regs[2] & (1 << 27)) != 0;
+            if (!osxsave)
+                return false;
+
+            // Check OS supports AVX (YMM state)
+            uint32_t xcr0;
+#if defined(_MSC_VER)
+            xcr0 = static_cast<uint32_t>(_xgetbv(0));
+#elif defined(__GNUC__) || defined(__clang__)
+            __asm__ __volatile__("xgetbv" : "=a"(xcr0) : "c"(0) : "%edx");
+#else
+            return false;
+#endif
+            constexpr uint32_t AVX_MASK = 0x06; // XMM and YMM
+            if ((xcr0 & AVX_MASK) != AVX_MASK)
+                return false;
+
+            // Check CPUID for AVX2
+            cpuid(7, 0, regs);
+            return (regs[1] & (1 << 5)) != 0; // EBX bit 5 = AVX2
+        }
+
+        /**
+         * @brief Internal: Perform actual AVX detection (called once)
+         */
+        inline bool detect_avx()
+        {
+            uint32_t regs[4];
+            cpuid(1, 0, regs);
+            bool osxsave = (regs[2] & (1 << 27)) != 0;
+            bool avx = (regs[2] & (1 << 28)) != 0;
+            if (!osxsave || !avx)
+                return false;
+
+            // Check OS supports AVX
+            uint32_t xcr0;
+#if defined(_MSC_VER)
+            xcr0 = static_cast<uint32_t>(_xgetbv(0));
+#elif defined(__GNUC__) || defined(__clang__)
+            __asm__ __volatile__("xgetbv" : "=a"(xcr0) : "c"(0) : "%edx");
+#else
+            return false;
+#endif
+            constexpr uint32_t AVX_MASK = 0x06;
+            return (xcr0 & AVX_MASK) == AVX_MASK;
+        }
+    } // namespace detail
+
     /**
      * @brief Check if CPU supports AVX512 Foundation (AVX512F)
+     * @note Result is cached on first call - no cpuid overhead on subsequent calls
      */
     inline bool cpu_supports_avx512()
     {
-        uint32_t regs[4];
-        cpuid(1, 0, regs);
-        bool osxsave = (regs[2] & (1 << 27)) != 0;
-        if (!osxsave)
-            return false;
-
-        // Check OS supports AVX512 (ZMM state)
-        uint32_t xcr0;
-#if defined(_MSC_VER)
-        xcr0 = static_cast<uint32_t>(_xgetbv(0));
-#elif defined(__GNUC__) || defined(__clang__)
-        __asm__ __volatile__("xgetbv" : "=a"(xcr0) : "c"(0) : "%edx");
-#else
-        return false;
-#endif
-        constexpr uint32_t AVX512_MASK = 0xE6; // XMM, YMM, opmask, ZMM_Hi256, Hi16_ZMM
-        if ((xcr0 & AVX512_MASK) != AVX512_MASK)
-            return false;
-
-        // Check CPUID for AVX512F
-        cpuid(7, 0, regs);
-        return (regs[1] & (1 << 16)) != 0; // EBX bit 16 = AVX512F
+        static const bool result = detail::detect_avx512();
+        return result;
     }
 
     /**
      * @brief Check if CPU supports AVX2
+     * @note Result is cached on first call - no cpuid overhead on subsequent calls
      */
     inline bool cpu_supports_avx2()
     {
-        uint32_t regs[4];
-        cpuid(1, 0, regs);
-        bool osxsave = (regs[2] & (1 << 27)) != 0;
-        if (!osxsave)
-            return false;
-
-        // Check OS supports AVX (YMM state)
-        uint32_t xcr0;
-#if defined(_MSC_VER)
-        xcr0 = static_cast<uint32_t>(_xgetbv(0));
-#elif defined(__GNUC__) || defined(__clang__)
-        __asm__ __volatile__("xgetbv" : "=a"(xcr0) : "c"(0) : "%edx");
-#else
-        return false;
-#endif
-        constexpr uint32_t AVX_MASK = 0x06; // XMM and YMM
-        if ((xcr0 & AVX_MASK) != AVX_MASK)
-            return false;
-
-        // Check CPUID for AVX2
-        cpuid(7, 0, regs);
-        return (regs[1] & (1 << 5)) != 0; // EBX bit 5 = AVX2
+        static const bool result = detail::detect_avx2();
+        return result;
     }
 
     /**
      * @brief Check if CPU supports AVX
+     * @note Result is cached on first call - no cpuid overhead on subsequent calls
      */
     inline bool cpu_supports_avx()
     {
-        uint32_t regs[4];
-        cpuid(1, 0, regs);
-        bool osxsave = (regs[2] & (1 << 27)) != 0;
-        bool avx = (regs[2] & (1 << 28)) != 0;
-        if (!osxsave || !avx)
-            return false;
-
-        // Check OS supports AVX
-        uint32_t xcr0;
-#if defined(_MSC_VER)
-        xcr0 = static_cast<uint32_t>(_xgetbv(0));
-#elif defined(__GNUC__) || defined(__clang__)
-        __asm__ __volatile__("xgetbv" : "=a"(xcr0) : "c"(0) : "%edx");
-#else
-        return false;
-#endif
-        constexpr uint32_t AVX_MASK = 0x06;
-        return (xcr0 & AVX_MASK) == AVX_MASK;
+        static const bool result = detail::detect_avx();
+        return result;
     }
 
     /**

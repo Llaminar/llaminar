@@ -8,10 +8,17 @@
 #include <gtest/gtest.h>
 #include "../../../../src/v2/tensors/BatchedKVCache.h"
 #include "../../../../src/v2/tensors/Tensors.h"
+#include "../../../../src/v2/utils/MPIContext.h"
 #include <vector>
 #include <memory>
 
 using namespace llaminar2;
+
+// Single-rank MPI context for unit tests
+static MPIContext getTestMPIContext()
+{
+    return MPIContext(0, 1, MPI_COMM_WORLD);
+}
 
 class Test__BatchedKVCache : public ::testing::Test
 {
@@ -33,7 +40,7 @@ TEST_F(Test__BatchedKVCache, ConstructionUniformDevice)
     int head_dim = 64;
     int device_idx = -1; // CPU
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
 
     EXPECT_EQ(cache.num_layers(), n_layers);
     EXPECT_EQ(cache.batch_size(), batch_size);
@@ -66,7 +73,7 @@ TEST_F(Test__BatchedKVCache, ConstructionPerLayerDevices)
     // Heterogeneous placement: layers 0-1 on CPU, layers 2-3 on device 0
     std::vector<int> attention_devices = {-1, -1, 0, 0};
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
 
     EXPECT_EQ(cache.get_layer_device(0), -1);
     EXPECT_EQ(cache.get_layer_device(1), -1);
@@ -87,7 +94,7 @@ TEST_F(Test__BatchedKVCache, MultiSequenceAppend)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim; // 8
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Append K/V for different sequences in layer 0
     // Sequence 0: 3 tokens
@@ -151,7 +158,7 @@ TEST_F(Test__BatchedKVCache, PerSequenceRetrieval)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Append different data to each sequence
     auto k0 = std::make_shared<FP32Tensor>(std::vector<size_t>{3, static_cast<size_t>(kv_dim)}, -1);
@@ -226,7 +233,7 @@ TEST_F(Test__BatchedKVCache, IncrementalAppend)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Prefill: Append 3 tokens
     auto k_prefill = std::make_shared<FP32Tensor>(std::vector<size_t>{3, static_cast<size_t>(kv_dim)}, -1);
@@ -312,7 +319,7 @@ TEST_F(Test__BatchedKVCache, CapacityExceeded)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Append 5 tokens (exactly at capacity)
     auto k1 = std::make_shared<FP32Tensor>(std::vector<size_t>{5, static_cast<size_t>(kv_dim)}, -1);
@@ -342,7 +349,7 @@ TEST_F(Test__BatchedKVCache, ClearSequence)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Append to all sequences
     for (int seq = 0; seq < batch_size; ++seq)
@@ -373,7 +380,7 @@ TEST_F(Test__BatchedKVCache, ClearAll)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Append to all layers and sequences
     for (int layer = 0; layer < n_layers; ++layer)
@@ -417,7 +424,7 @@ TEST_F(Test__BatchedKVCache, ClearLayer)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    BatchedKVCache cache(n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    BatchedKVCache cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     // Append to all layers and sequences
     for (int layer = 0; layer < n_layers; ++layer)
