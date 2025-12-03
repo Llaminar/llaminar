@@ -202,6 +202,16 @@ namespace llaminar2
                 ctx.activation_precision = getNextArg(argv, argc, i, "activation-precision");
             }
 
+            // Weight sharding for tensor parallelism
+            else if (arg == "--shard-weights")
+            {
+                ctx.shard_weights = true;
+            }
+            else if (arg == "--no-shard-weights")
+            {
+                ctx.disable_weight_sharding = true;
+            }
+
             // Memory mapping
             else if (arg == "--no-mmap")
             {
@@ -327,6 +337,11 @@ namespace llaminar2
         std::cout << "  --act-prec M                bf16  - bfloat16 (Intel AMX, 2× faster)\n";
         std::cout << "                              fp16  - 16-bit float (ARM/GPU)\n";
         std::cout << "                              q8_1  - 8-bit quantized with per-block scaling\n\n";
+
+        std::cout << "Tensor Parallelism:\n";
+        std::cout << "  --no-shard-weights        Disable weight sharding (use replicated weights)\n";
+        std::cout << "                              By default, sharding is enabled when MPI ranks > 1\n";
+        std::cout << "                              Sharding reduces memory per rank by ~25-40%%\n\n";
 
         std::cout << "Chat Mode:\n";
         std::cout << "  --chat                    Interactive chat mode (FTXUI terminal UI)\n";

@@ -580,6 +580,19 @@ add_v2_test(V2_Unit_DeviceIndexCPUKernels
     MPI_PROCS 1  # CPU kernel tests, single rank
 )
 
+# Test: KernelFactory centralized kernel dispatch
+add_executable(v2_test_kernel_factory unit/Test__KernelFactory.cpp)
+target_link_libraries(v2_test_kernel_factory
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelFactory
+    COMMAND $<TARGET_FILE:v2_test_kernel_factory>
+    LABELS "V2;Unit;Kernels;DeviceManagement;KernelFactory;GEMM;Quantization"
+    MPI_PROCS 1  # Kernel factory tests, single rank
+)
+
 # Test: RMSNorm precision variants (FP32/BF16/FP16/INT32 scalar/AVX2/AVX512 parity)
 add_executable(v2_test_rmsnorm_precision unit/Test__RMSNormPrecision.cpp)
 target_link_libraries(v2_test_rmsnorm_precision 
@@ -1740,6 +1753,15 @@ add_v2_test(V2_Unit_WeightPlacementMap
     LABELS "V2;Unit;DeviceManagement;WeightPlacement;Heterogeneous;MoE"
 )
 
+# Test: WeightManager Sharding
+# Tests weight sharding for tensor parallelism (Phase 1: row-parallel only)
+add_executable(v2_test_weight_manager_sharding unit/loaders/Test__WeightManagerSharding.cpp)
+target_link_libraries(v2_test_weight_manager_sharding llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightManagerSharding
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_sharding>
+    LABELS "V2;Unit;TensorParallelism;WeightSharding;RowParallel"
+)
+
 # Test: PipelineBase Device Detection (Phase 3)
 add_executable(v2_test_pipeline_device_detection
     unit/pipelines/Test__PipelineBase_DeviceDetection.cpp
@@ -1780,6 +1802,44 @@ add_v2_test(V2_Integration_ModelLoader
     COMMAND $<TARGET_FILE:v2_test_model_loader>
     MPI_PROCS 1
     LABELS "V2;Integration;ModelLoading;GGUF;WeightLoading"
+)
+
+# Test: ModelLoader Row Slice (memory-efficient tensor row slicing from GGUF)
+add_executable(v2_test_model_loader_row_slice unit/Test__ModelLoaderRowSlice.cpp)
+target_link_libraries(v2_test_model_loader_row_slice 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ModelLoaderRowSlice 
+    COMMAND $<TARGET_FILE:v2_test_model_loader_row_slice>
+    MPI_PROCS 1
+    LABELS "V2;Unit;ModelLoading;GGUF;RowSlice;MemoryEfficient"
+)
+
+# Test: WeightManager Memory Efficient Slicing
+add_executable(v2_test_weight_manager_memory_efficient integration/Test__WeightManagerMemoryEfficient.cpp)
+target_link_libraries(v2_test_weight_manager_memory_efficient 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_WeightManagerMemoryEfficient 
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_memory_efficient>
+    MPI_PROCS 2
+    LABELS "V2;Integration;WeightManager;TensorSlice;MemoryEfficient;Sharding"
+)
+
+# Test: Quantised GEMM Sliced Parity (verifies sliced GEMM across MPI ranks matches unsliced)
+add_executable(v2_test_quantised_gemm_sliced_parity integration/Test__QuantisedGemmSlicedParity.cpp)
+target_link_libraries(v2_test_quantised_gemm_sliced_parity 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_QuantisedGemmSlicedParity 
+    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_sliced_parity>
+    MPI_PROCS 2
+    LABELS "V2;Integration;GEMM;Slicing;MPI;Parity;TensorParallel"
 )
 
 # Test: QuantisedGemmKernel Fused Operations (Bias, Softmax, SwiGLU)

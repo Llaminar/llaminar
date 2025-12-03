@@ -10,6 +10,7 @@
 #include "SIMDHelpers.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/Logger.h"
+#include "../backends/BackendManager.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -435,5 +436,167 @@ namespace llaminar2
     template void TensorBase::to<uint16_t>(uint16_t *dst, TensorType format) const;
     template void TensorBase::to<int8_t>(int8_t *dst, TensorType format) const;
     template void TensorBase::to<int32_t>(int32_t *dst, TensorType format) const;
+
+    // =========================================================================
+    // Lazy Transfer Implementation (Phase 1 GPU Device-Aware Slicing)
+    // =========================================================================
+
+    // Default implementations for raw_host_data_ptr and byte_size
+    // Tensors that support GPU transfer override these.
+    void *TensorBase::raw_host_data_ptr()
+    {
+        throw std::runtime_error("[TensorBase] raw_host_data_ptr() not implemented for this tensor type. "
+                                 "Override in derived class to support GPU transfer.");
+    }
+
+    const void *TensorBase::raw_host_data_ptr() const
+    {
+        throw std::runtime_error("[TensorBase] raw_host_data_ptr() const not implemented for this tensor type. "
+                                 "Override in derived class to support GPU transfer.");
+    }
+
+    size_t TensorBase::byte_size() const
+    {
+        throw std::runtime_error("[TensorBase] byte_size() not implemented for this tensor type. "
+                                 "Override in derived class to support GPU transfer.");
+    }
+
+    bool TensorBase::ensureOnDevice(int target_device)
+    {
+        // Validate target device
+        if (target_device < 0)
+        {
+            LOG_ERROR("[TensorBase::ensureOnDevice] Invalid device index: " << target_device);
+            return false;
+        }
+
+        // Check if already on target device with valid data
+        if (device_data_ptr_ && gpu_device_idx_ == target_device && !host_invalid_)
+        {
+            // Already on correct device with valid data
+            return true;
+        }
+
+        // Get backend
+        IBackend *backend = getGPUBackend();
+        if (!backend)
+        {
+            LOG_ERROR("[TensorBase::ensureOnDevice] No GPU backend available");
+            return false;
+        }
+
+        // Free existing device memory if on different device
+        if (device_data_ptr_ && gpu_device_idx_ != target_device)
+        {
+            backend->free(device_data_ptr_, gpu_device_idx_);
+            device_data_ptr_ = nullptr;
+            gpu_device_idx_ = -1;
+        }
+
+        // Allocate on target device if needed
+        size_t bytes = byte_size();
+        if (!device_data_ptr_)
+        {
+            device_data_ptr_ = backend->allocate(bytes, target_device);
+            if (!device_data_ptr_)
+            {
+                LOG_ERROR("[TensorBase::ensureOnDevice] Failed to allocate " << bytes
+                                                                             << " bytes on device " << target_device);
+                return false;
+            }
+            gpu_device_idx_ = target_device;
+        }
+
+        // Upload data from host
+        const void *src = raw_host_data_ptr();
+        if (!src)
+        {
+            LOG_ERROR("[TensorBase::ensureOnDevice] Host data pointer is null");
+            backend->free(device_data_ptr_, target_device);
+            device_data_ptr_ = nullptr;
+            gpu_device_idx_ = -1;
+            return false;
+        }
+
+        if (!backend->hostToDevice(device_data_ptr_, src, bytes, target_device))
+        {
+            LOG_ERROR("[TensorBase::ensureOnDevice] hostToDevice failed");
+            backend->free(device_data_ptr_, target_device);
+            device_data_ptr_ = nullptr;
+            gpu_device_idx_ = -1;
+            return false;
+        }
+
+        host_invalid_ = false; // Host still has valid data (dual residency)
+
+        LOG_DEBUG("[TensorBase::ensureOnDevice] Uploaded " << bytes
+                                                           << " bytes to device " << target_device);
+        return true;
+    }
+
+    bool TensorBase::ensureOnHost()
+    {
+        // If host is already valid, nothing to do
+        if (!host_invalid_)
+        {
+            return true;
+        }
+
+        // If GPU has data, download it
+        if (device_data_ptr_ && gpu_device_idx_ >= 0)
+        {
+            IBackend *backend = getGPUBackend();
+            if (!backend)
+            {
+                LOG_ERROR("[TensorBase::ensureOnHost] No GPU backend available");
+                return false;
+            }
+
+            size_t bytes = byte_size();
+            void *dst = raw_host_data_ptr();
+            if (!dst)
+            {
+                LOG_ERROR("[TensorBase::ensureOnHost] Host data pointer is null");
+                return false;
+            }
+
+            if (!backend->deviceToHost(dst, device_data_ptr_, bytes, gpu_device_idx_))
+            {
+                LOG_ERROR("[TensorBase::ensureOnHost] deviceToHost failed");
+                return false;
+            }
+
+            host_invalid_ = false;
+            LOG_DEBUG("[TensorBase::ensureOnHost] Downloaded " << bytes
+                                                               << " bytes from device " << gpu_device_idx_);
+        }
+
+        return true;
+    }
+
+    bool TensorBase::releaseDeviceMemory()
+    {
+        // Ensure host has current data
+        if (!ensureOnHost())
+        {
+            return false;
+        }
+
+        // Free device memory
+        if (device_data_ptr_)
+        {
+            IBackend *backend = getGPUBackend();
+            if (backend)
+            {
+                backend->free(device_data_ptr_, gpu_device_idx_);
+            }
+            device_data_ptr_ = nullptr;
+            LOG_DEBUG("[TensorBase::releaseDeviceMemory] Released device memory on device "
+                      << gpu_device_idx_);
+            gpu_device_idx_ = -1;
+        }
+
+        return true;
+    }
 
 } // namespace llaminar2

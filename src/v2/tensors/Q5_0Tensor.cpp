@@ -7,7 +7,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
 #include "FP16Utils.h"
@@ -117,8 +117,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q5_0Tensor::createGemm()
     {
-        // Use QuantisedGemmKernel - requires IINT8Unpackable interface
-        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::shared_ptr<TensorBase> Q5_0Tensor::create_view(

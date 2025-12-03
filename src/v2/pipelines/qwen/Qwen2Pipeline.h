@@ -55,11 +55,11 @@ namespace llaminar2
             std::shared_ptr<TensorBase> up_proj;   // FFN up projection [d_model, d_ff]
             std::shared_ptr<TensorBase> down_proj; // FFN down projection [d_ff, d_model]
             std::shared_ptr<TensorBase> ffn_norm;  // Pre-FFN norm gamma [d_model]
-            
+
             // Attention biases (Qwen2 uses Q/K/V biases)
-            std::shared_ptr<TensorBase> q_bias;    // Query bias [d_model]
-            std::shared_ptr<TensorBase> k_bias;    // Key bias [n_kv_heads * head_dim]
-            std::shared_ptr<TensorBase> v_bias;    // Value bias [n_kv_heads * head_dim]
+            std::shared_ptr<TensorBase> q_bias; // Query bias [d_model]
+            std::shared_ptr<TensorBase> k_bias; // Key bias [n_kv_heads * head_dim]
+            std::shared_ptr<TensorBase> v_bias; // Value bias [n_kv_heads * head_dim]
 
             // Fused GEMM kernels (lazily initialized)
             // These quantize activations once and reuse for multiple projections
@@ -186,7 +186,9 @@ namespace llaminar2
 
     private:
         // Qwen2-specific architecture parameters
-        int d_ff_ = 0;
+        int d_ff_ = 0;                     // Full FFN intermediate size
+        int d_ff_local_ = 0;               // Local FFN size per rank (d_ff_ / world_size when column-parallel)
+        bool ffn_column_parallel_ = false; // Whether FFN uses column-parallel sharding
 
         // Batch configuration
         int batch_size_ = 1;                // Number of sequences in batch
@@ -231,14 +233,16 @@ namespace llaminar2
 
         TensorSpec spec_ffn_intermediate(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_ff_)},
-                              "ffn_intermediate[" + std::to_string(effective_seq_len) + "," + std::to_string(d_ff_) + "]");
+            int dim = ffn_column_parallel_ ? d_ff_local_ : d_ff_;
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(dim)},
+                              "ffn_intermediate[" + std::to_string(effective_seq_len) + "," + std::to_string(dim) + "]");
         }
 
         TensorSpec spec_ffn_gate_up(int effective_seq_len) const
         {
-            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_ff_)},
-                              "ffn_gate_up[" + std::to_string(effective_seq_len) + "," + std::to_string(d_ff_) + "]");
+            int dim = ffn_column_parallel_ ? d_ff_local_ : d_ff_;
+            return TensorSpec({static_cast<size_t>(effective_seq_len), static_cast<size_t>(dim)},
+                              "ffn_gate_up[" + std::to_string(effective_seq_len) + "," + std::to_string(dim) + "]");
         }
 
         TensorSpec spec_logits(int effective_seq_len) const
@@ -258,6 +262,30 @@ namespace llaminar2
         bool ffn_block(const LayerWeights &layer, int layer_idx, int effective_seq_len);
         bool embedding_batch(const std::vector<std::vector<int>> &token_batches, TensorBase *output);
         bool lm_head_batch(TensorBase *hidden, int effective_seq_len);
+
+        /**
+         * @brief Ensure attention weights are on the target device (lazy GPU transfer)
+         *
+         * Triggers lazy transfer of Q/K/V/O weights to GPU if placement_map indicates GPU.
+         * No-op if weights are already on target device or target is CPU.
+         *
+         * @param layer Layer weights
+         * @param target_device Target device index (-1 = CPU)
+         * @return true if all transfers succeeded
+         */
+        bool ensureAttentionWeightsOnDevice(const LayerWeights &layer, int target_device);
+
+        /**
+         * @brief Ensure FFN weights are on the target device (lazy GPU transfer)
+         *
+         * Triggers lazy transfer of gate/up/down weights to GPU if placement_map indicates GPU.
+         * No-op if weights are already on target device or target is CPU.
+         *
+         * @param layer Layer weights
+         * @param target_device Target device index (-1 = CPU)
+         * @return true if all transfers succeeded
+         */
+        bool ensureFFNWeightsOnDevice(const LayerWeights &layer, int target_device);
 
         // NOTE: Composite operations (rms_norm, project, add_residual, etc.)
         // are now provided by PipelineBase. Child pipelines chain them to form

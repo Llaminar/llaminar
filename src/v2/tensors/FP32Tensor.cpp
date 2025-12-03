@@ -6,13 +6,15 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "TensorKernels.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
+#include "../backends/IBackend.h"
+#include "../backends/BackendManager.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
@@ -117,8 +119,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> FP32Tensor::createGemm()
     {
-        // FP32 tensors use OneDNN-backed floating-point GEMM kernel
-        return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(this);
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()
@@ -160,6 +163,29 @@ namespace llaminar2
         // TODO: Implement sync_from_device
         LOG_ERROR("[FP32Tensor] sync_from_device not yet implemented");
         return false;
+    }
+
+    // =========================================================================
+    // Lazy Transfer Accessors (Phase 1 GPU Device-Aware Slicing)
+    // TensorBase uses these to implement ensureOnDevice/ensureOnHost.
+    // =========================================================================
+
+    void *FP32Tensor::raw_host_data_ptr()
+    {
+        if (is_view_)
+        {
+            return parent_data_ptr_->data() + view_offset_;
+        }
+        return host_data_.data();
+    }
+
+    const void *FP32Tensor::raw_host_data_ptr() const
+    {
+        if (is_view_)
+        {
+            return parent_data_ptr_->data() + view_offset_;
+        }
+        return host_data_.data();
     }
 
     bool FP32Tensor::copyFrom(const TensorBase *src)

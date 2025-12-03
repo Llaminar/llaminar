@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "../utils/Logger.h"
 #include "../utils/BFloat16.h"
 #include "../utils/DebugEnv.h"
@@ -125,6 +125,28 @@ namespace llaminar2
         throw std::runtime_error("BF16Tensor::mutable_data: BF16 tensors are immutable (use from_fp32 to update)");
     }
 
+    // =========================================================================
+    // Lazy Transfer Accessors (Phase 3)
+    // =========================================================================
+
+    void *BF16Tensor::raw_host_data_ptr()
+    {
+        if (is_view_)
+        {
+            return parent_data_ptr_->data() + view_offset_;
+        }
+        return host_bf16_data_.data();
+    }
+
+    const void *BF16Tensor::raw_host_data_ptr() const
+    {
+        if (is_view_)
+        {
+            return parent_data_ptr_->data() + view_offset_;
+        }
+        return host_bf16_data_.data();
+    }
+
     bool BF16Tensor::copyFrom(const TensorBase *src)
     {
         if (!src)
@@ -163,45 +185,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> BF16Tensor::createGemm()
     {
-        // Route to appropriate backend based on tensor's device placement
-        if (device_idx_ >= 0)
-        {
-            // Tensor is on a GPU device - get device type from DeviceManager
-            auto &dm = DeviceManager::instance();
-            const auto &devices = dm.devices();
-
-            if (static_cast<size_t>(device_idx_) >= devices.size())
-            {
-                LOG_ERROR("[BF16Tensor] Invalid device_idx: " << device_idx_);
-                throw std::runtime_error("BF16Tensor::createGemm: invalid device index");
-            }
-
-            const auto &device = devices[device_idx_];
-
-            // Route based on backend type
-            switch (device.type)
-            {
-#ifdef HAVE_CUDA
-            case ComputeBackendType::GPU_CUDA:
-                LOG_DEBUG("[BF16Tensor] Creating CUDA GEMM kernel for device " << device_idx_);
-                return llaminar::v2::kernels::cuda::createCudaGemm(this);
-#endif
-#ifdef HAVE_ROCM
-            case ComputeBackendType::GPU_ROCM:
-                LOG_ERROR("[BF16Tensor] ROCm GEMM not yet implemented");
-                throw std::runtime_error("ROCm GEMM not implemented");
-#endif
-            default:
-                LOG_ERROR("[BF16Tensor] Unsupported GPU backend type: " << static_cast<int>(device.type));
-                throw std::runtime_error("Unsupported GPU backend type");
-            }
-        }
-        else
-        {
-            // Tensor is on CPU - use OneDNN-backed floating-point GEMM kernel
-            LOG_DEBUG("[BF16Tensor] Creating FloatingPointGemmKernel for BF16");
-            return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(this);
-        }
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> BF16Tensor::createRoPE()

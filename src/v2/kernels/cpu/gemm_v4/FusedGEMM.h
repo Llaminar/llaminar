@@ -146,7 +146,9 @@ namespace llaminar2
         bool supports_device(int device_idx) const { return device_idx == -1; }
 
     private:
-        std::vector<std::unique_ptr<gemm_v4::QuantisedGemmKernel>> gemm_kernels_;
+        /// Non-owning pointers to kernels obtained via TensorBase::getOrCreateGemm().
+        /// Kernel lifetime is tied to the tensor's lifetime, not FusedGEMM's.
+        std::vector<gemm_v4::QuantisedGemmKernel *> gemm_kernels_;
         std::vector<std::string> projection_names_;
         int k_dim_; ///< Shared input dimension
     };

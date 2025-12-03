@@ -254,6 +254,53 @@ namespace llaminar2
                                                int device_idx = 0,
                                                WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
+        /**
+         * @brief Load a row slice of a tensor from GGUF file (memory-efficient)
+         *
+         * Only reads the bytes for rows [row_start, row_end) from the GGUF file,
+         * creating a tensor with shape [row_end - row_start, cols]. This is used
+         * for tensor parallelism to avoid loading full weights on each MPI rank.
+         *
+         * @param tensor_name Name of tensor (e.g., "blk.0.attn_output.weight")
+         * @param row_start First row to load (0-indexed)
+         * @param row_end One past the last row to load
+         * @param device_idx Device index for tensor placement
+         * @param weight_precision How to load the weight (NATIVE recommended)
+         * @return Tensor with shape [row_end - row_start, cols] or nullptr on error
+         *
+         * @note Only works for 2D weight matrices
+         * @note row_start must be aligned to block boundaries for quantized tensors
+         */
+        std::shared_ptr<TensorBase> loadTensorRowSlice(const std::string &tensor_name,
+                                                       size_t row_start, size_t row_end,
+                                                       int device_idx = 0,
+                                                       WeightPrecision weight_precision = WeightPrecision::NATIVE);
+
+        /**
+         * @brief Load a column slice of a tensor from GGUF file (memory-efficient)
+         *
+         * Reads only the columns [col_start, col_end) from the GGUF file for each row,
+         * creating a tensor with shape [rows, col_end - col_start]. This is used for
+         * column-parallel tensor parallelism (e.g., FFN Gate/Up/Down weights).
+         *
+         * For quantized tensors, col_start and col_end must be aligned to block boundaries.
+         * The function reads row-by-row, extracting only the needed blocks per row.
+         *
+         * @param tensor_name Name of tensor (e.g., "blk.0.ffn_down.weight")
+         * @param col_start First column to load (0-indexed, block-aligned for quantized)
+         * @param col_end One past the last column to load (block-aligned for quantized)
+         * @param device_idx Device index for tensor placement
+         * @param weight_precision How to load the weight (NATIVE recommended)
+         * @return Tensor with shape [rows, col_end - col_start] or nullptr on error
+         *
+         * @note Only works for 2D weight matrices
+         * @note For quantized tensors, col_start/col_end must be multiples of block_size
+         */
+        std::shared_ptr<TensorBase> loadTensorColumnSlice(const std::string &tensor_name,
+                                                          size_t col_start, size_t col_end,
+                                                          int device_idx = 0,
+                                                          WeightPrecision weight_precision = WeightPrecision::NATIVE);
+
     private:
         // Tensor factory (created internally if not provided)
         TensorFactory *factory_;

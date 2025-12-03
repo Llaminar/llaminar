@@ -11,6 +11,7 @@
 #include "attention/MpiAttentionOrchestrator.h"
 #include "../tensors/TensorFactory.h"
 #include "../tensors/Tensors.h"
+#include "../tensors/TensorSlice.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include <iostream>
 #include <cstring>
@@ -539,6 +540,70 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // Weight Device Orchestration (Phase 5)
+    // =============================================================================
+
+    bool PipelineBase::ensureWeightsOnDevice(
+        const std::vector<std::shared_ptr<TensorBase>> &weights,
+        int target_device,
+        const std::string &context)
+    {
+        // CPU path: no transfer needed
+        if (target_device < 0)
+        {
+            return true;
+        }
+
+        // Lazy transfer all weights to GPU
+        // ensureOnDevice() is a no-op if already on target device
+        bool success = true;
+        int transfer_count = 0;
+
+        for (const auto &weight : weights)
+        {
+            if (weight && !weight->ensureOnDevice(target_device))
+            {
+                LOG_ERROR("Failed to transfer weight to device " << target_device
+                                                                 << (context.empty() ? "" : " (context: " + context + ")"));
+                success = false;
+            }
+            else if (weight)
+            {
+                ++transfer_count;
+            }
+        }
+
+        if (success && transfer_count > 0)
+        {
+            LOG_DEBUG("Ensured " << transfer_count << " weights on device " << target_device
+                                 << (context.empty() ? "" : " (" + context + ")"));
+        }
+
+        return success;
+    }
+
+    bool PipelineBase::ensureWeightOnDevice(
+        const std::shared_ptr<TensorBase> &weight,
+        int target_device,
+        const std::string &weight_name)
+    {
+        // CPU path or null weight: no transfer needed
+        if (target_device < 0 || !weight)
+        {
+            return true;
+        }
+
+        if (!weight->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer " << (weight_name.empty() ? "weight" : weight_name)
+                                            << " to device " << target_device);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =============================================================================
     // Generic Initialization (extracted from Qwen2Pipeline)
     // =============================================================================
 
@@ -953,6 +1018,249 @@ namespace llaminar2
                       snapshot_key.c_str(), mpi_ctx_.get(), target_device))
         {
             return false;
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, m, n);
+        return true;
+    }
+
+    bool PipelineBase::project_row_parallel(
+        const TensorBase *input, TensorBase *weight, TensorBase *output,
+        int m, int n, int k,
+        const std::string &snapshot_key, int device)
+    {
+        // Row-parallel projection: GEMM with output dimension partitioned across ranks
+        //
+        // For TensorSlice weights (ROW_PARALLEL mode):
+        //   - Weight is TensorSlice wrapping full [n, k] tensor
+        //   - TensorSlice::createGemm() creates kernel for rows [row_start, row_end)
+        //   - n_local = row_end - row_start (output dimension is sliced)
+        //   - Each rank computes: C_local = A @ W_local^T  (shape: [m, n_local])
+        //   - Concatenate C_local from all ranks to get C_global [m, n]
+        //
+        // For old FP32 sliced weights (K dimension sliced):
+        //   - Weight is [n, k_local] where k_local = k / world_size
+        //   - Input is [m, k_local] (the local slice)
+        //   - Each rank computes: C_local = A_local @ W_local^T
+        //   - Allreduce-sum to get: C_global = sum(C_local)
+
+        KernelType profile_type = (snapshot_key.find("FFN_DOWN") != std::string::npos) ? KernelType::FFN_DOWN
+                                                                                       : KernelType::GEMM_Q8;
+        KERNEL_PROFILE_SCOPE(profile_type);
+
+        int target_device = (device >= 0) ? device : device_idx_;
+
+        // Check if weight is a TensorSlice with row-parallel mode
+        auto *tensor_slice = dynamic_cast<TensorSlice *>(weight);
+        if (tensor_slice && tensor_slice->is_row_parallel() && mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            // NEW PATH: TensorSlice with row-parallel mode
+            // The TensorSlice::createGemm() returns a kernel for the sliced rows
+            const auto &meta = tensor_slice->metadata();
+            const int n_local = static_cast<int>(meta.slice_size());
+            const int n_start = static_cast<int>(meta.slice_start);
+            const int world_size = mpi_ctx_->world_size();
+            const int rank = mpi_ctx_->rank();
+
+            // Perform local GEMM: [m, k] @ [n_local, k]^T = [m, n_local]
+            // The kernel is already sliced, so we pass n_local as the output dimension
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+            if (!output_fp32)
+            {
+                LOG_ERROR("[TP GEMM] Row-parallel TensorSlice requires FP32 output");
+                return false;
+            }
+
+            // Create temporary output for local result [m, n_local]
+            std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(n_local)};
+            FP32Tensor output_local(local_shape);
+
+            // GEMM with sliced kernel: [m, k] @ [n_local, k]^T = [m, n_local]
+            if (!gemm_op_(input, weight, &output_local, m, n_local, k,
+                          snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+            {
+                LOG_ERROR("[TP GEMM] Row-parallel TensorSlice GEMM failed for " << snapshot_key);
+                return false;
+            }
+
+            // Gather results from all ranks into final output [m, n]
+            // Each rank writes to its slice: output[:, n_start:n_start+n_local]
+            float *out_data = output_fp32->mutable_data();
+            const float *local_data = output_local.data();
+
+// Copy local result to the correct slice of output
+#pragma omp parallel for
+            for (int row = 0; row < m; ++row)
+            {
+                float *dst_row = out_data + row * n + n_start;
+                const float *src_row = local_data + row * n_local;
+                std::memcpy(dst_row, src_row, n_local * sizeof(float));
+            }
+
+// Allgather to get all slices (each rank has different slice filled in)
+// Use allreduce with pre-zeroed non-local regions as workaround
+// Zero out non-local regions first
+#pragma omp parallel for
+            for (int row = 0; row < m; ++row)
+            {
+                float *row_ptr = out_data + row * n;
+                // Zero before our slice
+                std::memset(row_ptr, 0, n_start * sizeof(float));
+                // Zero after our slice
+                std::memset(row_ptr + n_start + n_local, 0, (n - n_start - n_local) * sizeof(float));
+            }
+
+            // Allreduce-sum combines all slices (since non-local regions are zero)
+            const size_t output_size = static_cast<size_t>(m) * n;
+            mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+
+            LOG_TRACE("[TP GEMM] Row-parallel TensorSlice completed for " << snapshot_key
+                                                                          << " (m=" << m << ", n_local=" << n_local << "/" << n << ", k=" << k << ")");
+            return true;
+        }
+
+        // OLD PATH: Check for FP32 sliced weights (K dimension sliced)
+        const auto &weight_shape = weight->shape();
+        const int weight_k = static_cast<int>(weight_shape.size() == 2 ? weight_shape[1] : 0);
+        const bool is_k_sliced = (weight_k > 0 && weight_k < k); // k_local < k_full means sharded
+
+        if (is_k_sliced && mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            // TRUE ROW-PARALLEL GEMM:
+            // Weight is [n, k_local], need to use local input slice [m, k_local]
+            const int world_size = mpi_ctx_->world_size();
+            const int rank = mpi_ctx_->rank();
+            const int k_local = weight_k;
+            const int k_start = k_local * rank;
+
+            // Extract local input slice from full input
+            const auto *input_fp32 = dynamic_cast<const FP32Tensor *>(input);
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+
+            if (!input_fp32 || !output_fp32)
+            {
+                LOG_ERROR("[TP GEMM] Row-parallel requires FP32 tensors");
+                return false;
+            }
+
+            // Create view of local input slice [m, k_local] starting at column k_start
+            // Note: For now we copy, but could use strided view for efficiency
+            std::vector<float> input_local(static_cast<size_t>(m) * k_local);
+            const float *src = input_fp32->data();
+
+#pragma omp parallel for
+            for (int row = 0; row < m; ++row)
+            {
+                const float *src_row = src + row * k + k_start;
+                float *dst_row = input_local.data() + row * k_local;
+                std::memcpy(dst_row, src_row, k_local * sizeof(float));
+            }
+
+            // Create temporary FP32Tensor for local input
+            std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
+            FP32Tensor input_local_tensor(local_shape);
+            std::memcpy(input_local_tensor.mutable_data(), input_local.data(), input_local.size() * sizeof(float));
+
+            // Perform GEMM: C_local = A_local @ W_local^T
+            // Dimensions: [m, k_local] @ [n, k_local]^T = [m, n]
+            if (!gemm_op_(&input_local_tensor, weight, output, m, n, k_local,
+                          snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+            {
+                LOG_ERROR("[TP GEMM] Row-parallel GEMM failed for " << snapshot_key);
+                return false;
+            }
+
+            // Allreduce-sum to combine partial results from all ranks
+            float *out_data = output_fp32->mutable_data();
+            const size_t output_size = static_cast<size_t>(m) * n;
+            mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+
+            LOG_TRACE("[TP GEMM] Row-parallel (sharded) completed for " << snapshot_key
+                                                                        << " (m=" << m << ", n=" << n << ", k_local=" << k_local << "/" << k << ")");
+        }
+        else
+        {
+            // FALLBACK: Full GEMM with workaround allreduce
+            // Perform local GEMM with full weights
+            if (!gemm_op_(input, weight, output, m, n, k,
+                          snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+            {
+                return false;
+            }
+
+            // For replicated weights: scale by 1/world_size then allreduce
+            // This produces the same result as a single-rank computation
+            if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+            {
+                auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+                if (output_fp32)
+                {
+                    float *out_data = output_fp32->mutable_data();
+                    const size_t output_size = static_cast<size_t>(m) * n;
+                    const int world_size = mpi_ctx_->world_size();
+                    const float scale = 1.0f / world_size;
+
+#pragma omp parallel for simd
+                    for (size_t i = 0; i < output_size; ++i)
+                    {
+                        out_data[i] *= scale;
+                    }
+
+                    mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+
+                    LOG_TRACE("[TP GEMM] Row-parallel (replicated fallback) for " << snapshot_key
+                                                                                  << " (m=" << m << ", n=" << n << ")");
+                }
+            }
+        }
+
+        // Capture snapshot
+        CAPTURE_SNAPSHOT_VIEW(snapshot_key.c_str(), output, m, n);
+        return true;
+    }
+
+    bool PipelineBase::project_column_parallel(
+        const TensorBase *input, TensorBase *weight, TensorBase *output,
+        int m, int n, int k_local,
+        const std::string &snapshot_key, int device)
+    {
+        // Column-parallel projection for cascaded tensor parallelism
+        // Input: [m, k_local] (local slice from previous column-parallel layer)
+        // Weight: [n, k_local] (column-parallel slice)
+        // Output: [m, n] (partial sum, needs allreduce)
+
+        KernelType profile_type = (snapshot_key.find("FFN_DOWN") != std::string::npos) ? KernelType::FFN_DOWN
+                                                                                       : KernelType::GEMM_Q8;
+        KERNEL_PROFILE_SCOPE(profile_type);
+
+        int target_device = (device >= 0) ? device : device_idx_;
+
+        // Perform local GEMM: [m, k_local] @ [n, k_local]^T = [m, n]
+        if (!gemm_op_(input, weight, output, m, n, k_local,
+                      snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        {
+            LOG_ERROR("[TP GEMM] Column-parallel GEMM failed for " << snapshot_key);
+            return false;
+        }
+
+        // Allreduce-sum to combine partial results from all ranks
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+            if (output_fp32)
+            {
+                float *out_data = output_fp32->mutable_data();
+                const size_t output_size = static_cast<size_t>(m) * n;
+                mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+
+                LOG_TRACE("[TP GEMM] Column-parallel allreduce completed for " << snapshot_key
+                                                                               << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
+            }
+            else
+            {
+                LOG_WARN("[TP GEMM] Column-parallel requires FP32 output for allreduce");
+            }
         }
 
         // Capture snapshot

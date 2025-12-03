@@ -741,6 +741,866 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // ROW-SLICED TENSOR LOADING (Memory-Efficient Tensor Parallelism)
+    // =============================================================================
+
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorRowSlice(
+        const std::string &tensor_name,
+        size_t row_start, size_t row_end,
+        int device_idx,
+        WeightPrecision weight_precision)
+    {
+        if (!loaded_)
+        {
+            LOG_ERROR("[ModelLoader] Model not loaded");
+            return nullptr;
+        }
+
+        // Find tensor metadata
+        const GGUFTensorInfo *info = model_.findTensor(tensor_name);
+        if (!info)
+        {
+            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
+            return nullptr;
+        }
+
+        // Validate tensor is 2D
+        if (info->dimensions.size() != 2)
+        {
+            LOG_ERROR("[ModelLoader] Row slicing requires 2D tensor, got "
+                      << info->dimensions.size() << "D for: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t total_rows = info->dimensions[0];
+        size_t cols = info->dimensions[1];
+
+        // Validate row range
+        if (row_start >= total_rows || row_end > total_rows || row_start >= row_end)
+        {
+            LOG_ERROR("[ModelLoader] Invalid row range [" << row_start << ", " << row_end
+                                                          << ") for tensor with " << total_rows << " rows: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t slice_rows = row_end - row_start;
+
+        // Calculate bytes per row based on tensor type
+        size_t bytes_per_row = 0;
+        size_t block_size = info->getBlockSize();
+        size_t type_size = info->getTypeSize();
+
+        if (block_size > 0)
+        {
+            // Quantized tensor: cols must be divisible by block_size
+            if (cols % block_size != 0)
+            {
+                LOG_ERROR("[ModelLoader] Columns (" << cols << ") not divisible by block size ("
+                                                    << block_size << ") for: " << tensor_name);
+                return nullptr;
+            }
+            size_t blocks_per_row = cols / block_size;
+            bytes_per_row = blocks_per_row * type_size;
+        }
+        else
+        {
+            // Non-quantized tensor (F32, F16, BF16)
+            bytes_per_row = cols * type_size;
+        }
+
+        // Calculate slice byte range
+        size_t slice_offset = row_start * bytes_per_row;
+        size_t slice_bytes = slice_rows * bytes_per_row;
+
+        LOG_DEBUG("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
+                                             << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
+
+        // Select correct file stream based on split index
+        std::ifstream *stream = &file_stream_;
+        uint64_t data_offset = model_.data_offset;
+
+        if (model_.split_count > 1)
+        {
+            if (info->split_idx == 0)
+            {
+                stream = &file_stream_;
+                data_offset = model_.split_data_offsets[0];
+            }
+            else if (info->split_idx < model_.split_count)
+            {
+                stream = &split_streams_[info->split_idx - 1];
+                data_offset = model_.split_data_offsets[info->split_idx];
+            }
+            else
+            {
+                LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                return nullptr;
+            }
+        }
+
+        // Seek to slice start within tensor data
+        stream->seekg(data_offset + info->offset + slice_offset, std::ios::beg);
+        if (!(*stream))
+        {
+            LOG_ERROR("[ModelLoader] Failed to seek to row slice for: " << tensor_name);
+            return nullptr;
+        }
+
+        // Read only the slice bytes
+        std::vector<uint8_t> raw(slice_bytes);
+        if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
+        {
+            LOG_ERROR("[ModelLoader] Failed to read row slice data for: " << tensor_name);
+            return nullptr;
+        }
+
+        // Create shape for sliced tensor
+        std::vector<size_t> slice_shape = {slice_rows, cols};
+
+        // Handle weight precision conversion (same as loadTensor)
+        bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
+
+        if (should_convert)
+        {
+            switch (weight_precision)
+            {
+            case WeightPrecision::CONVERT_TO_FP32:
+                return dequantizeToFP32(info, slice_shape, raw);
+            case WeightPrecision::CONVERT_TO_INT8:
+                return dequantizeToINT8(info, slice_shape, raw);
+            default:
+                LOG_WARN("[ModelLoader] Unsupported conversion for sliced tensor, keeping native");
+                break;
+            }
+        }
+
+        // Create tensor with sliced shape and data
+        // Use factory_ when available for NUMA-aware allocation and device placement
+        std::shared_ptr<TensorBase> tensor;
+
+        switch (info->type)
+        {
+        case GGUFTensorType::F32:
+            if (factory_)
+            {
+                auto fp32_tensor = factory_->createFP32(slice_shape, device_idx);
+                std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                tensor = std::move(fp32_tensor);
+            }
+            else
+            {
+                tensor = std::make_shared<FP32Tensor>(slice_shape);
+                std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+            }
+            break;
+
+        case GGUFTensorType::F16:
+        {
+            std::vector<uint16_t> fp16_data(raw.size() / 2);
+            std::memcpy(fp16_data.data(), raw.data(), raw.size());
+            if (factory_)
+            {
+                tensor = factory_->createFP16(slice_shape, fp16_data);
+            }
+            else
+            {
+                tensor = std::make_shared<FP16Tensor>(slice_shape, fp16_data);
+            }
+            break;
+        }
+
+        case GGUFTensorType::BF16:
+        {
+            std::vector<uint16_t> bf16_data(raw.size() / 2);
+            std::memcpy(bf16_data.data(), raw.data(), raw.size());
+            if (factory_)
+            {
+                tensor = factory_->createBF16(slice_shape, bf16_data);
+            }
+            else
+            {
+                tensor = std::make_shared<BF16Tensor>(slice_shape, bf16_data);
+            }
+            break;
+        }
+
+        case GGUFTensorType::Q4_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_0, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q4_1:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_1, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_0, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_1:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_1, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q8_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q8_0, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q2_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q2_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q2_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q3_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q3_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q3_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q4_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q6_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q6_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q6_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q8_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q8_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q8_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ4_NL:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ4_NL, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ4_XS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ4_XS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ3_S:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ3_S, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ3_STensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ3_XXS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ3_XXS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ2_S:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ2_S, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ2_STensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ2_XS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ2_XS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ2_XXS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ2_XXS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ1_S:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ1_S, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ1_STensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ1_M:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ1_M, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw);
+            }
+            break;
+
+        default:
+            LOG_ERROR("[ModelLoader] Unsupported tensor type for row slicing: "
+                      << static_cast<int>(info->type));
+            return nullptr;
+        }
+
+        return tensor;
+    }
+
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorColumnSlice(
+        const std::string &tensor_name,
+        size_t col_start, size_t col_end,
+        int device_idx,
+        WeightPrecision weight_precision)
+    {
+        if (!loaded_)
+        {
+            LOG_ERROR("[ModelLoader] Model not loaded");
+            return nullptr;
+        }
+
+        // Find tensor metadata
+        const GGUFTensorInfo *info = model_.findTensor(tensor_name);
+        if (!info)
+        {
+            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
+            return nullptr;
+        }
+
+        // Validate tensor is 2D
+        if (info->dimensions.size() != 2)
+        {
+            LOG_ERROR("[ModelLoader] Column slicing requires 2D tensor, got "
+                      << info->dimensions.size() << "D for: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t total_rows = info->dimensions[0];
+        size_t total_cols = info->dimensions[1];
+
+        // Validate column range
+        if (col_start >= total_cols || col_end > total_cols || col_start >= col_end)
+        {
+            LOG_ERROR("[ModelLoader] Invalid column range [" << col_start << ", " << col_end
+                                                             << ") for tensor with " << total_cols << " columns: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t slice_cols = col_end - col_start;
+        size_t block_size = info->getBlockSize();
+        size_t type_size = info->getTypeSize();
+
+        // For quantized tensors, validate block alignment
+        if (block_size > 0)
+        {
+            if (col_start % block_size != 0)
+            {
+                LOG_ERROR("[ModelLoader] Column start (" << col_start
+                                                         << ") must be aligned to block size (" << block_size
+                                                         << ") for: " << tensor_name);
+                return nullptr;
+            }
+            if (col_end % block_size != 0)
+            {
+                LOG_ERROR("[ModelLoader] Column end (" << col_end
+                                                       << ") must be aligned to block size (" << block_size
+                                                       << ") for: " << tensor_name);
+                return nullptr;
+            }
+            if (total_cols % block_size != 0)
+            {
+                LOG_ERROR("[ModelLoader] Total columns (" << total_cols
+                                                          << ") not divisible by block size (" << block_size
+                                                          << ") for: " << tensor_name);
+                return nullptr;
+            }
+        }
+
+        // Calculate byte layout
+        size_t bytes_per_row = 0;
+        size_t bytes_per_slice_row = 0;
+        size_t block_offset_bytes = 0;
+
+        if (block_size > 0)
+        {
+            // Quantized tensor
+            size_t blocks_per_row = total_cols / block_size;
+            size_t slice_blocks_per_row = slice_cols / block_size;
+            size_t start_block = col_start / block_size;
+
+            bytes_per_row = blocks_per_row * type_size;
+            bytes_per_slice_row = slice_blocks_per_row * type_size;
+            block_offset_bytes = start_block * type_size;
+        }
+        else
+        {
+            // Non-quantized tensor (F32, F16, BF16)
+            bytes_per_row = total_cols * type_size;
+            bytes_per_slice_row = slice_cols * type_size;
+            block_offset_bytes = col_start * type_size;
+        }
+
+        size_t slice_bytes = total_rows * bytes_per_slice_row;
+
+        LOG_DEBUG("[ModelLoader] Column slice " << tensor_name << ": cols [" << col_start << ", " << col_end
+                                                << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)"
+                                                << ", reading " << bytes_per_slice_row << " bytes from each of " << total_rows << " rows");
+
+        // Select correct file stream based on split index
+        std::ifstream *stream = &file_stream_;
+        uint64_t data_offset = model_.data_offset;
+
+        if (model_.split_count > 1)
+        {
+            if (info->split_idx == 0)
+            {
+                stream = &file_stream_;
+                data_offset = model_.split_data_offsets[0];
+            }
+            else if (info->split_idx < model_.split_count)
+            {
+                stream = &split_streams_[info->split_idx - 1];
+                data_offset = model_.split_data_offsets[info->split_idx];
+            }
+            else
+            {
+                LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                return nullptr;
+            }
+        }
+
+        // Allocate buffer for sliced data
+        std::vector<uint8_t> raw(slice_bytes);
+
+        // Read row by row, extracting only the needed column range
+        uint64_t tensor_start = data_offset + info->offset;
+        for (size_t row = 0; row < total_rows; ++row)
+        {
+            // Seek to the start of this row's slice
+            uint64_t row_offset = tensor_start + (row * bytes_per_row) + block_offset_bytes;
+            stream->seekg(row_offset, std::ios::beg);
+            if (!(*stream))
+            {
+                LOG_ERROR("[ModelLoader] Failed to seek to column slice for row " << row
+                                                                                  << " of: " << tensor_name);
+                return nullptr;
+            }
+
+            // Read the slice bytes for this row
+            uint8_t *dst = raw.data() + (row * bytes_per_slice_row);
+            if (!stream->read(reinterpret_cast<char *>(dst), bytes_per_slice_row))
+            {
+                LOG_ERROR("[ModelLoader] Failed to read column slice data for row " << row
+                                                                                    << " of: " << tensor_name);
+                return nullptr;
+            }
+        }
+
+        // Create shape for sliced tensor
+        std::vector<size_t> slice_shape = {total_rows, slice_cols};
+
+        // Handle weight precision conversion (same as loadTensor)
+        bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
+
+        if (should_convert)
+        {
+            switch (weight_precision)
+            {
+            case WeightPrecision::CONVERT_TO_FP32:
+                return dequantizeToFP32(info, slice_shape, raw);
+            case WeightPrecision::CONVERT_TO_INT8:
+                return dequantizeToINT8(info, slice_shape, raw);
+            default:
+                LOG_WARN("[ModelLoader] Unsupported conversion for sliced tensor, keeping native");
+                break;
+            }
+        }
+
+        // Create tensor with sliced shape and data (same switch as loadTensorRowSlice)
+        std::shared_ptr<TensorBase> tensor;
+
+        switch (info->type)
+        {
+        case GGUFTensorType::F32:
+            if (factory_)
+            {
+                auto fp32_tensor = factory_->createFP32(slice_shape, device_idx);
+                std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                tensor = std::move(fp32_tensor);
+            }
+            else
+            {
+                tensor = std::make_shared<FP32Tensor>(slice_shape);
+                std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+            }
+            break;
+
+        case GGUFTensorType::F16:
+        {
+            std::vector<uint16_t> fp16_data(raw.size() / 2);
+            std::memcpy(fp16_data.data(), raw.data(), raw.size());
+            if (factory_)
+            {
+                tensor = factory_->createFP16(slice_shape, fp16_data);
+            }
+            else
+            {
+                tensor = std::make_shared<FP16Tensor>(slice_shape, fp16_data);
+            }
+            break;
+        }
+
+        case GGUFTensorType::BF16:
+        {
+            std::vector<uint16_t> bf16_data(raw.size() / 2);
+            std::memcpy(bf16_data.data(), raw.data(), raw.size());
+            if (factory_)
+            {
+                tensor = factory_->createBF16(slice_shape, bf16_data);
+            }
+            else
+            {
+                tensor = std::make_shared<BF16Tensor>(slice_shape, bf16_data);
+            }
+            break;
+        }
+
+        case GGUFTensorType::Q4_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_0, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q4_1:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_1, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_0, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_1:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_1, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q8_0:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q8_0, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q2_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q2_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q2_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q3_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q3_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q3_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q4_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q4_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q4_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q5_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q5_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q5_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q6_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q6_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q6_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::Q8_K:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::Q8_K, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<Q8_KTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ4_NL:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ4_NL, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ4_XS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ4_XS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ3_S:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ3_S, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ3_STensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ3_XXS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ3_XXS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ2_S:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ2_S, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ2_STensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ2_XS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ2_XS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ2_XXS:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ2_XXS, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ1_S:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ1_S, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ1_STensor>(slice_shape, raw);
+            }
+            break;
+
+        case GGUFTensorType::IQ1_M:
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(TensorType::IQ1_M, slice_shape, raw);
+            }
+            else
+            {
+                tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw);
+            }
+            break;
+
+        default:
+            LOG_ERROR("[ModelLoader] Unsupported tensor type for column slicing: "
+                      << static_cast<int>(info->type));
+            return nullptr;
+        }
+
+        return tensor;
+    }
+
+    // =============================================================================
     // PARSING HELPERS
     // =============================================================================
 

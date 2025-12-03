@@ -103,6 +103,7 @@
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/Logger.h"
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -157,6 +158,29 @@ namespace llaminar2
             }
 
             /**
+             * @brief Row-sliced constructor for tensor parallelism weight sharding
+             *
+             * Creates a kernel that only packs rows [row_start, row_end) from the weight tensor.
+             * This is used for row-parallel tensor parallelism where each MPI rank owns
+             * a slice of the output dimension.
+             *
+             * For a weight matrix [N, K]:
+             * - Full kernel: packs all N rows
+             * - Sliced kernel: packs only (row_end - row_start) rows
+             *
+             * @param weights Pointer to quantized weight tensor (must implement IINT8Unpackable)
+             * @param row_start First row to include (0-indexed)
+             * @param row_end One past the last row to include
+             *
+             * @note The resulting kernel has N = (row_end - row_start), K unchanged
+             * @note This enables true row-parallel GEMM without dequantizing weights
+             */
+            QuantisedGemmKernel(const TensorBase *weights, int row_start, int row_end)
+            {
+                pack_weights_generic(weights, row_start, row_end);
+            }
+
+            /**
              * @brief Legacy constructor for Q8_1 tensors (deprecated)
              * @param weights Pointer to Q8_1 quantized weight tensor
              * @deprecated Use the generic TensorBase constructor instead
@@ -185,6 +209,69 @@ namespace llaminar2
             {
                 pack_weights_generic(weights);
             }
+
+            /**
+             * @brief Constructor that references externally-owned packed weights
+             *
+             * This constructor does NOT pack weights - it expects pre-packed weights
+             * that are owned elsewhere (typically in the tensor's cache_). This enables
+             * the pack-once-use-many pattern where packed data outlives individual kernels.
+             *
+             * @param packed Pointer to pre-packed weights (must outlive this kernel)
+             * @note Use this when tensor owns packed data and you want kernel to reference it
+             */
+            explicit QuantisedGemmKernel(const QuantisedPackedWeights *packed)
+                : external_packed_(packed)
+            {
+                // No packing - just reference external data
+            }
+
+            /**
+             * @brief Access packed weight dimensions
+             * @return Reference to packed weights structure (N, K, data)
+             */
+            const QuantisedPackedWeights &packed_weights() const
+            {
+                return external_packed_ ? *external_packed_ : packed_weights_;
+            }
+
+            /**
+             * @brief Get the output dimension (N) of the packed weights
+             * @return Number of output features this kernel produces
+             *
+             * This is useful for callers to determine weight dimensions when
+             * weights may have been sharded (tensor parallelism).
+             */
+            int get_n() const { return packed_weights().N; }
+
+            /**
+             * @brief Get the input dimension (K) of the packed weights
+             * @return Number of input features this kernel expects
+             *
+             * This is useful for callers to determine weight dimensions when
+             * weights may have been sharded (tensor parallelism).
+             */
+            int get_k() const { return packed_weights().K; }
+
+            // =========================================================================
+            // Static Packing API - for tensor-owned packed weights
+            // =========================================================================
+
+            /**
+             * @brief Pack weights into an externally-owned QuantisedPackedWeights
+             *
+             * This static method packs quantized weights into the VNNI-optimal format
+             * without creating a kernel. Use this when you want the tensor to own
+             * the packed data and have multiple kernels reference it.
+             *
+             * @param weights Source quantized tensor (must implement IINT8Unpackable)
+             * @param out_packed Output structure to populate with packed data
+             * @param row_start First row to pack (default 0)
+             * @param row_end Last row to pack, -1 = all rows (default -1)
+             * @return true on success, false on error
+             *
+             * @note See inline implementation below in public section.
+             */
 
         private:
             /**
@@ -259,6 +346,8 @@ namespace llaminar2
              * the IINT8Unpackable interface.
              *
              * @param weights Quantized weight tensor to pack
+             * @param row_start First row to pack (default: 0)
+             * @param row_end One past last row to pack (default: -1 means all rows)
              *
              * @details
              * ## Packing Process
@@ -267,6 +356,13 @@ namespace llaminar2
              * 2. **Buffer Allocation**: Allocate packed_data, compensation, scales, mins
              * 3. **Block Iteration**: Process 32-element K blocks for each output row
              * 4. **Layout Transformation**: Repack into `[N/64][K/4][64][4]` format
+             *
+             * ## Row Slicing for Tensor Parallelism
+             *
+             * When row_start and row_end are specified, only rows [row_start, row_end)
+             * are packed. The resulting kernel has N = (row_end - row_start).
+             * The IINT8Unpackable interface is called with the original tensor's row
+             * indices, so the quantized data is read correctly.
              *
              * ## Superblock Optimization
              *
@@ -284,14 +380,45 @@ namespace llaminar2
              *       typically the slowest part of kernel initialization, but it only
              *       happens once per weight matrix.
              */
-            void pack_weights_generic(const TensorBase *weights)
+            void pack_weights_generic(const TensorBase *weights, int row_start = 0, int row_end = -1)
+            {
+                // Delegate to static method that packs into our member
+                if (!packWeightsInto(weights, packed_weights_, row_start, row_end))
+                {
+                    LOG_ERROR("[QuantisedGemmKernel] Failed to pack weights");
+                }
+            }
+
+        public:
+            /**
+             * @brief Static method to pack weights into an external QuantisedPackedWeights
+             *
+             * This enables tensor-owned packed weights where the tensor stores the packed
+             * data in its cache_ and multiple kernels can reference it.
+             */
+            static bool packWeightsInto(const TensorBase *weights, QuantisedPackedWeights &out, int row_start = 0, int row_end = -1)
             {
                 // Weights are typically [N, K] (out_features, in_features)
-                int N = weights->shape()[0];
+                int full_N = weights->shape()[0];
                 int K = weights->shape()[1];
 
-                packed_weights_.K = K;
-                packed_weights_.N = N;
+                // Handle row slicing for tensor parallelism
+                if (row_end < 0)
+                    row_end = full_N; // Default: all rows
+                if (row_start < 0)
+                    row_start = 0;
+                if (row_end > full_N)
+                    row_end = full_N;
+                if (row_start >= row_end)
+                {
+                    LOG_ERROR("[QuantisedGemmKernel] Invalid row range: [" << row_start << ", " << row_end << ")");
+                    return false;
+                }
+
+                int N = row_end - row_start; // Number of rows to pack
+
+                out.K = K;
+                out.N = N;
 
                 // Pad N to multiple of 64 for SIMD blocking
                 int N_padded = (N + 63) / 64 * 64;
@@ -299,26 +426,30 @@ namespace llaminar2
                 int K_blocks = (K + 31) / 32;
 
                 // Allocate packed weight buffers
-                packed_weights_.packed_data.resize(K * N_padded);
-                packed_weights_.compensation.resize(K_blocks * N_padded);
-                packed_weights_.scales.resize(K_blocks * N_padded);
-                packed_weights_.mins.resize(K_blocks * N_padded);
+                out.packed_data.resize(K * N_padded);
+                out.compensation.resize(K_blocks * N_padded);
+                out.scales.resize(K_blocks * N_padded);
+                out.mins.resize(K_blocks * N_padded);
 
                 // Verify tensor implements IINT8Unpackable interface
                 const IINT8Unpackable *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
                 if (!unpackable)
                 {
-                    std::cerr << "Tensor type " << (int)weights->native_type() << " does not implement IINT8Unpackable" << std::endl;
-                    return;
+                    LOG_ERROR("Tensor type " << (int)weights->native_type() << " does not implement IINT8Unpackable");
+                    return false;
                 }
 
                 // Check if tensor uses 256-element superblocks (e.g., K-quants)
                 bool use_superblock = (unpackable->superblock_size() == 256);
 
                 // Parallel pack over N rows
+                // Note: 'n' is the local row index (0 to N-1) in the packed output
+                //       'src_row' = row_start + n is the row index in the source tensor
 #pragma omp parallel for schedule(static)
                 for (int n = 0; n < N; ++n)
                 {
+                    int src_row = row_start + n; // Map local row to source tensor row
+
                     // Calculate base offset for this row in packed layout
                     // Layout: [N/64][K/4][64][4]
                     int n_blk = n / 64;
@@ -338,12 +469,13 @@ namespace llaminar2
                             float sb_scales[8];
                             float sb_mins[8];
 
-                            unpackable->unpack_superblock_to_int8(n, k_sb, sb_vals, sb_scales, sb_mins);
+                            // Use src_row to read from the original tensor's row
+                            unpackable->unpack_superblock_to_int8(src_row, k_sb, sb_vals, sb_scales, sb_mins);
 
-                            // Pack each of the 8 blocks
+                            // Pack each of the 8 blocks (using local row index 'n' for output)
                             for (int i = 0; i < 8; ++i)
                             {
-                                pack_single_block(n, k_blk + i, row_base_offset, sb_vals + i * 32, sb_scales[i], sb_mins[i], N_padded);
+                                pack_single_block_static(out, n, k_blk + i, row_base_offset, sb_vals + i * 32, sb_scales[i], sb_mins[i], N_padded);
                             }
                             k_blk += 8;
                         }
@@ -353,12 +485,53 @@ namespace llaminar2
                     for (; k_blk < K_blocks; ++k_blk)
                     {
                         int8_t temp_vals[32];
-                        unpackable->unpack_block_to_int8(n, k_blk, temp_vals);
-                        float scale = unpackable->get_block_scale(n, k_blk);
-                        float min_val = unpackable->get_block_min(n, k_blk);
+                        // Use src_row to read from the original tensor's row
+                        unpackable->unpack_block_to_int8(src_row, k_blk, temp_vals);
+                        float scale = unpackable->get_block_scale(src_row, k_blk);
+                        float min_val = unpackable->get_block_min(src_row, k_blk);
 
-                        pack_single_block(n, k_blk, row_base_offset, temp_vals, scale, min_val, N_padded);
+                        pack_single_block_static(out, n, k_blk, row_base_offset, temp_vals, scale, min_val, N_padded);
                     }
+                }
+                return true;
+            }
+
+        private:
+            /**
+             * @brief Static version of pack_single_block for use in packWeightsInto
+             */
+            __attribute__((always_inline)) static void pack_single_block_static(
+                QuantisedPackedWeights &out,
+                int n,
+                int k_blk,
+                size_t row_base_offset,
+                const int8_t *temp_vals,
+                float scale,
+                float min_val,
+                int N_padded)
+            {
+                int K = out.K;
+
+                // Compute compensation (sum of INT8 values) for INT8→UINT8 correction
+                int comp = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    comp += temp_vals[i];
+                }
+
+                // Store metadata at block position
+                out.compensation[k_blk * N_padded + n] = comp;
+                out.scales[k_blk * N_padded + n] = scale;
+                out.mins[k_blk * N_padded + n] = min_val;
+
+                // Pack into VNNI layout: [N/64][K/4][64][4]
+                for (int i = 0; i < 32; i += 4)
+                {
+                    size_t pack_idx = row_base_offset + (size_t)(k_blk * 32 + i) * 64;
+                    out.packed_data[pack_idx + 0] = temp_vals[i + 0];
+                    out.packed_data[pack_idx + 1] = temp_vals[i + 1];
+                    out.packed_data[pack_idx + 2] = temp_vals[i + 2];
+                    out.packed_data[pack_idx + 3] = temp_vals[i + 3];
                 }
             }
 
@@ -460,10 +633,14 @@ namespace llaminar2
                                 bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx,
                                 const float *gate_input = nullptr, bool do_swiglu = false)
             {
+                // Get reference to packed weights (either external or owned)
+                const auto &pw = packed_weights();
+
                 // Validate dimensions match packed weights
-                if (n != packed_weights_.N || k != packed_weights_.K)
+                if (n != pw.N || k != pw.K)
                 {
-                    std::cerr << "Dimension mismatch in QuantisedGemmKernel" << std::endl;
+                    LOG_ERROR("Dimension mismatch in QuantisedGemmKernel: expected N=" << pw.N << ", K=" << pw.K
+                                                                                       << " but got N=" << n << ", K=" << k);
                     return false;
                 }
 
@@ -704,15 +881,15 @@ namespace llaminar2
                                     {
                                         // Calculate packed weights offset
                                         // Base offset for N-block + Offset for K-tile
-                                        // Note: packed_weights_ is [N_blocks][K_rows][64]
+                                        // Note: pw is [N_blocks][K_rows][64]
                                         // So offset = (n_blk/64) * (K*64) + (k_start*32)*64
                                         size_t weights_offset = (size_t)(n_blk / 64) * (k * 64) + (size_t)k_start * 32 * 64;
-                                        const int8_t *b_ptr = packed_weights_.packed_data.data() + weights_offset;
+                                        const int8_t *b_ptr = pw.packed_data.data() + weights_offset;
 
                                         // Fix: Offset compensation and scales by k_start * N_padded
-                                        const int32_t *comp_ptr = packed_weights_.compensation.data() + (size_t)k_start * N_padded + n_blk;
-                                        const float *scales_ptr = packed_weights_.scales.data() + (size_t)k_start * N_padded + n_blk;
-                                        const float *mins_ptr = packed_weights_.mins.data() + (size_t)k_start * N_padded + n_blk;
+                                        const int32_t *comp_ptr = pw.compensation.data() + (size_t)k_start * N_padded + n_blk;
+                                        const float *scales_ptr = pw.scales.data() + (size_t)k_start * N_padded + n_blk;
+                                        const float *mins_ptr = pw.mins.data() + (size_t)k_start * N_padded + n_blk;
 
                                         QuantisedGemmParams params;
                                         params.A = blocks;
@@ -827,11 +1004,11 @@ namespace llaminar2
                                 {
                                     // Calculate packed weights offset
                                     size_t weights_offset = (size_t)(n_blk / 64) * (k * 64);
-                                    const int8_t *b_ptr = packed_weights_.packed_data.data() + weights_offset;
+                                    const int8_t *b_ptr = pw.packed_data.data() + weights_offset;
 
-                                    const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
-                                    const float *scales_ptr = packed_weights_.scales.data() + n_blk;
-                                    const float *mins_ptr = packed_weights_.mins.data() + n_blk;
+                                    const int32_t *comp_ptr = pw.compensation.data() + n_blk;
+                                    const float *scales_ptr = pw.scales.data() + n_blk;
+                                    const float *mins_ptr = pw.mins.data() + n_blk;
 
                                     QuantisedGemmParams params;
                                     params.A = blocks;
@@ -944,7 +1121,7 @@ namespace llaminar2
                 }
 
                 // Activation-activation GEMM not supported - use FloatingPointGemmKernel
-                std::cerr << "[QuantisedGemmKernel] multiply_activations with two activation matrices not supported" << std::endl;
+                LOG_ERROR("[QuantisedGemmKernel] multiply_activations with two activation matrices not supported");
                 return false;
             }
 
@@ -970,7 +1147,7 @@ namespace llaminar2
                 (void)beta;
                 (void)ctx;
                 (void)device_idx;
-                std::cerr << "[QuantisedGemmKernel] multiply_activations_strided not supported - use FloatingPointGemmKernel" << std::endl;
+                LOG_ERROR("[QuantisedGemmKernel] multiply_activations_strided not supported - use FloatingPointGemmKernel");
                 return false;
             }
 
@@ -1087,6 +1264,12 @@ namespace llaminar2
              * Supports fused operations via GemmFusedOps:
              * - SwiGLU: output *= swish(gate)
              * - Softmax: output = softmax(output * scale + mask)
+             *
+             * MPI Tensor Parallelism:
+             * When mpi_ctx is provided with world_size > 1, this function uses
+             * column-parallel execution: each rank computes only its slice of
+             * output columns, reducing memory bandwidth (but not compute, since
+             * weights are replicated). For true compute savings, use weight sharding.
              */
             bool multiply_with_precomputed_q8_1(
                 const void *q8_1_activations,
@@ -1099,19 +1282,21 @@ namespace llaminar2
                 int device_idx,
                 const GemmFusedOps &fused_ops) override
             {
-                (void)mpi_ctx;
                 (void)device_idx;
                 (void)alpha; // Currently assumed 1.0
 
                 if (!q8_1_activations || !C)
                     return false;
 
+                // Get reference to packed weights (either external or owned)
+                const auto &pw = packed_weights();
+
                 // Check dimensions against packed weights
-                if (n != packed_weights_.N || k != packed_weights_.K)
+                if (n != pw.N || k != pw.K)
                 {
-                    std::cerr << "Dimension mismatch in multiply_with_precomputed_q8_1: "
-                              << "expected n=" << packed_weights_.N << ", k=" << packed_weights_.K
-                              << " got n=" << n << ", k=" << k << std::endl;
+                    LOG_ERROR("Dimension mismatch in multiply_with_precomputed_q8_1: "
+                              << "expected n=" << pw.N << ", k=" << pw.K
+                              << " got n=" << n << ", k=" << k);
                     return false;
                 }
 
@@ -1229,11 +1414,11 @@ namespace llaminar2
                             for (int n_blk = n_task; n_blk < n_end; n_blk += 64)
                             {
                                 size_t weights_offset = (size_t)(n_blk / 64) * (k * 64);
-                                const int8_t *b_ptr = packed_weights_.packed_data.data() + weights_offset;
+                                const int8_t *b_ptr = pw.packed_data.data() + weights_offset;
 
-                                const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
-                                const float *scales_ptr = packed_weights_.scales.data() + n_blk;
-                                const float *mins_ptr = packed_weights_.mins.data() + n_blk;
+                                const int32_t *comp_ptr = pw.compensation.data() + n_blk;
+                                const float *scales_ptr = pw.scales.data() + n_blk;
+                                const float *mins_ptr = pw.mins.data() + n_blk;
 
                                 QuantisedGemmParams params;
                                 params.A = blocks;
@@ -1321,7 +1506,7 @@ namespace llaminar2
                     // Quantize using tensor's type-specific implementation
                     if (!activation->quantize_to_q8_1(q8_1_buffer.data(), m, k))
                     {
-                        std::cerr << "quantize_to_q8_1 failed in multiply_tensor" << std::endl;
+                        LOG_ERROR("quantize_to_q8_1 failed in multiply_tensor");
                         return false;
                     }
 
@@ -1355,10 +1540,13 @@ namespace llaminar2
                 (void)device_idx;
                 (void)alpha; // Currently ignored (assumed 1.0)
 
+                // Get reference to packed weights (either external or owned)
+                const auto &pw = packed_weights();
+
                 // Check dimensions
-                if (n != packed_weights_.N || k != packed_weights_.K)
+                if (n != pw.N || k != pw.K)
                 {
-                    std::cerr << "Dimension mismatch in QuantisedGemmKernel::multiply_q8_1_direct" << std::endl;
+                    LOG_ERROR("Dimension mismatch in QuantisedGemmKernel::multiply_q8_1_direct");
                     return false;
                 }
 
@@ -1462,11 +1650,11 @@ namespace llaminar2
                             for (int n_blk = n_task; n_blk < n_end; n_blk += 64)
                             {
                                 size_t weights_offset = (size_t)(n_blk / 64) * (k * 64);
-                                const int8_t *b_ptr = packed_weights_.packed_data.data() + weights_offset;
+                                const int8_t *b_ptr = pw.packed_data.data() + weights_offset;
 
-                                const int32_t *comp_ptr = packed_weights_.compensation.data() + n_blk;
-                                const float *scales_ptr = packed_weights_.scales.data() + n_blk;
-                                const float *mins_ptr = packed_weights_.mins.data() + n_blk;
+                                const int32_t *comp_ptr = pw.compensation.data() + n_blk;
+                                const float *scales_ptr = pw.scales.data() + n_blk;
+                                const float *mins_ptr = pw.mins.data() + n_blk;
 
                                 QuantisedGemmParams params;
                                 params.A = blocks;
@@ -1497,7 +1685,12 @@ namespace llaminar2
                 return true;
             }
 
+            // Packed weights - owned by this kernel (used when external_packed_ is null)
             QuantisedPackedWeights packed_weights_;
+
+            // External packed weights - pointer to data owned by tensor's cache_
+            // When non-null, this kernel references external data instead of packed_weights_
+            const QuantisedPackedWeights *external_packed_ = nullptr;
         };
 
     }

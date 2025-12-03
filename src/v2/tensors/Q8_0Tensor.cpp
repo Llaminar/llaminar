@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "Tensors.h"
 #include "../utils/Logger.h"
 #include <algorithm>
@@ -187,8 +187,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
-        // Use optimized QuantisedGemmKernel (repacks Q8_0 weights to Q8_1 format internally)
-        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     void Q8_0Tensor::decodeBlockScalar(const Q8_0Block &block, float *output)

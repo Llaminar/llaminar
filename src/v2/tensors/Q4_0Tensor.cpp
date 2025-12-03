@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "Tensors.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
@@ -139,8 +139,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q4_0Tensor::createGemm()
     {
-        // Use QuantisedGemmKernel for AVX512 support
-        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     void Q4_0Tensor::decodeBlock(const Q4_0Block &block, float *output)

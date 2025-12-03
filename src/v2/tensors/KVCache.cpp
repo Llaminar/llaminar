@@ -172,7 +172,7 @@ namespace llaminar2
                 // Warn on first eviction - sliding window is now active
                 if (total_evicted_ == 0)
                 {
-                    LOG_WARN("[KVCache] Cache capacity reached (" << max_seq_len_ << " tokens). "
+                    LOG_DEBUG("[KVCache] Cache capacity reached (" << max_seq_len_ << " tokens). "
                                                                   << "Starting sliding window eviction. Context from oldest tokens will be lost. "
                                                                   << "Consider using a model with larger context or chunked prompts.");
                 }
@@ -196,7 +196,7 @@ namespace llaminar2
 
         cache_[layer].cached_tokens += new_tokens;
 
-        LOG_DEBUG("[KVCache] Layer " << layer << " appended " << new_tokens << " tokens (total: " << cache_[layer].cached_tokens << ")");
+        LOG_TRACE("[KVCache] Layer " << layer << " appended " << new_tokens << " tokens (total: " << cache_[layer].cached_tokens << ")");
 
         return true;
     }
@@ -239,7 +239,7 @@ namespace llaminar2
             cache_[layer].cached_tokens = tokens_to_keep;
         }
 
-        LOG_DEBUG("[KVCache] Evicted " << tokens_to_evict << " oldest tokens from all layers (total_evicted_=" << total_evicted_ << ")");
+        LOG_TRACE("[KVCache] Evicted " << tokens_to_evict << " oldest tokens from all layers (total_evicted_=" << total_evicted_ << ")");
     }
 
     void KVCache::clear()

@@ -19,6 +19,7 @@
 #include "../PipelineFactory.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
+#include "../../backends/ComputeBackend.h"
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
@@ -119,6 +120,42 @@ namespace llaminar2
         LOG_DEBUG("Attention: " << n_heads_ << " heads, "
                                 << n_kv_heads_ << " KV heads (GQA), " << head_dim_ << " head_dim");
         LOG_DEBUG("FFN: " << d_ff_ << " intermediate_size (SwiGLU)");
+
+        // =============================================================================
+        // FFN Column-Parallel Sharding Setup (Phase 4b-1)
+        // =============================================================================
+        // When weight sharding is enabled, Gate/Up are column-parallel:
+        // - Each rank produces [seq, d_ff_local] where d_ff_local = d_ff / world_size
+        // - Down projection (row-parallel) receives sharded input
+        // - Final allreduce sums partial Down outputs
+        // =============================================================================
+        bool has_mpi = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        bool has_weight_manager = model_ctx_->weightManager() != nullptr;
+        bool is_sharded = has_weight_manager &&
+                          model_ctx_->weightManager()->strategy() == WeightDistributionStrategy::SHARDED;
+
+        LOG_DEBUG("FFN column-parallel check: has_mpi=" << has_mpi
+                                                        << ", has_weight_manager=" << has_weight_manager
+                                                        << ", is_sharded=" << is_sharded);
+
+        if (has_mpi && is_sharded)
+        {
+            int world_size = mpi_ctx_->world_size();
+            if (d_ff_ % world_size != 0)
+            {
+                throw std::runtime_error("FFN intermediate size (" + std::to_string(d_ff_) +
+                                         ") not divisible by world_size (" + std::to_string(world_size) + ")");
+            }
+            d_ff_local_ = d_ff_ / world_size;
+            ffn_column_parallel_ = true;
+            LOG_INFO("FFN column-parallel enabled: d_ff=" << d_ff_ << " -> d_ff_local=" << d_ff_local_
+                                                          << " per rank (world_size=" << world_size << ")");
+        }
+        else
+        {
+            d_ff_local_ = d_ff_;
+            ffn_column_parallel_ = false;
+        }
 
         // Weights are loaded lazily via getLayerWeight() and model_ctx_->getWeight()
         // Resize layer weights vector for lazy loading
@@ -231,10 +268,12 @@ namespace llaminar2
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
         // FFN buffers (Qwen-specific d_ff_) - sized for batch
+        // Use d_ff_local_ for column-parallel sharding (each rank produces local output)
+        int ffn_dim = ffn_column_parallel_ ? d_ff_local_ : d_ff_;
         buffers.gate = createActivation(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)});
+            {static_cast<size_t>(effective_max), static_cast<size_t>(ffn_dim)});
         buffers.up = createActivation(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)});
+            {static_cast<size_t>(effective_max), static_cast<size_t>(ffn_dim)});
         buffers.ffn_output = createActivation(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
@@ -400,10 +439,145 @@ namespace llaminar2
         return true;
     }
 
+    // =============================================================================
+    // Phase 5: Device Orchestration - Lazy Weight Transfers
+    // =============================================================================
+
+    bool Qwen2Pipeline::ensureAttentionWeightsOnDevice(const LayerWeights &layer, int target_device)
+    {
+        // CPU path: no transfer needed
+        // Note: target_device < 0 is legacy CPU convention
+        // target_device >= 0 can also be CPU if DeviceManager enumerated it that way
+        if (target_device < 0)
+        {
+            return true;
+        }
+
+        // Check if target device is actually a CPU (DeviceManager style)
+        auto &dm = DeviceManager::instance();
+        if (static_cast<size_t>(target_device) < dm.devices().size())
+        {
+            const auto &dev = dm.devices()[target_device];
+            if (dev.type == ComputeBackendType::CPU_OPENBLAS ||
+                dev.type == ComputeBackendType::CPU_MKL)
+            {
+                // CPU device - no GPU transfer needed
+                return true;
+            }
+        }
+
+        // Lazy transfer attention weights to GPU
+        // ensureOnDevice() is a no-op if already on target device
+        bool success = true;
+
+        if (layer.wq && !layer.wq->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer wq to device " << target_device);
+            success = false;
+        }
+        if (layer.wk && !layer.wk->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer wk to device " << target_device);
+            success = false;
+        }
+        if (layer.wv && !layer.wv->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer wv to device " << target_device);
+            success = false;
+        }
+        if (layer.wo && !layer.wo->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer wo to device " << target_device);
+            success = false;
+        }
+        if (layer.attn_norm && !layer.attn_norm->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer attn_norm to device " << target_device);
+            success = false;
+        }
+
+        // Optional biases
+        if (layer.q_bias && !layer.q_bias->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer q_bias to device " << target_device);
+            success = false;
+        }
+        if (layer.k_bias && !layer.k_bias->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer k_bias to device " << target_device);
+            success = false;
+        }
+        if (layer.v_bias && !layer.v_bias->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer v_bias to device " << target_device);
+            success = false;
+        }
+
+        return success;
+    }
+
+    bool Qwen2Pipeline::ensureFFNWeightsOnDevice(const LayerWeights &layer, int target_device)
+    {
+        // CPU path: no transfer needed
+        // Note: target_device < 0 is legacy CPU convention
+        // target_device >= 0 can also be CPU if DeviceManager enumerated it that way
+        if (target_device < 0)
+        {
+            return true;
+        }
+
+        // Check if target device is actually a CPU (DeviceManager style)
+        auto &dm = DeviceManager::instance();
+        if (static_cast<size_t>(target_device) < dm.devices().size())
+        {
+            const auto &dev = dm.devices()[target_device];
+            if (dev.type == ComputeBackendType::CPU_OPENBLAS ||
+                dev.type == ComputeBackendType::CPU_MKL)
+            {
+                // CPU device - no GPU transfer needed
+                return true;
+            }
+        }
+
+        // Lazy transfer FFN weights to GPU
+        // ensureOnDevice() is a no-op if already on target device
+        bool success = true;
+
+        if (layer.gate_proj && !layer.gate_proj->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer gate_proj to device " << target_device);
+            success = false;
+        }
+        if (layer.up_proj && !layer.up_proj->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer up_proj to device " << target_device);
+            success = false;
+        }
+        if (layer.down_proj && !layer.down_proj->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer down_proj to device " << target_device);
+            success = false;
+        }
+        if (layer.ffn_norm && !layer.ffn_norm->ensureOnDevice(target_device))
+        {
+            LOG_ERROR("Failed to transfer ffn_norm to device " << target_device);
+            success = false;
+        }
+
+        return success;
+    }
+
     bool Qwen2Pipeline::attention_block(const LayerWeights &layer, int layer_idx, int effective_seq_len)
     {
         // Determine execution device based on weight placement
         int attn_device = placement_map_ ? getWeightDevice("attn_q", -1) : device_idx_;
+
+        // Phase 5: Lazy transfer weights to target device (no-op if already there or CPU)
+        if (!ensureAttentionWeightsOnDevice(layer, attn_device))
+        {
+            LOG_ERROR("Failed to ensure attention weights on device " << attn_device);
+            return false;
+        }
 
         // Prepare input activation for execution on attention device
         TensorBase *input_hidden = current_hidden_.get();
@@ -666,8 +840,10 @@ namespace llaminar2
             }
         }
 
-        // 5. Output projection
-        TRY_OP(project(
+        // 5. Output projection (row-parallel: needs allreduce for tensor parallelism)
+        // Wo projection: [seq, n_heads*head_dim] @ [d_model, n_heads*head_dim].T -> [seq, d_model]
+        // In tensor parallelism: attention output is partitioned by heads, so Wo sees partitioned input
+        TRY_OP(project_row_parallel(
             buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
             effective_seq_len, d_model_, n_heads_ * head_dim_,
             layer_prefix + "_ATTENTION_OUTPUT", attn_device));
@@ -711,6 +887,13 @@ namespace llaminar2
         // Determine execution device based on weight placement
         int ffn_device = placement_map_ ? getWeightDevice("ffn_gate", -1) : device_idx_;
 
+        // Phase 5: Lazy transfer weights to target device (no-op if already there or CPU)
+        if (!ensureFFNWeightsOnDevice(layer, ffn_device))
+        {
+            LOG_ERROR("Failed to ensure FFN weights on device " << ffn_device);
+            return false;
+        }
+
         // Prepare input activation for execution on FFN device
         TensorBase *input_hidden = current_hidden_.get();
         if (placement_map_ && current_hidden_->device_index() != ffn_device)
@@ -737,6 +920,9 @@ namespace llaminar2
             layer_prefix + "_FFN_NORM", ffn_device));
 
         // 2. Fused Gate/Up projections
+        // Use d_ff_local_ for column-parallel (each rank produces local output)
+        int ffn_output_dim = ffn_column_parallel_ ? d_ff_local_ : d_ff_;
+
         if (!layer.gate_up_fused)
         {
             layer.gate_up_fused = std::make_unique<FusedGEMM>(
@@ -745,27 +931,40 @@ namespace llaminar2
 
         VALIDATE_OP(layer.gate_up_fused->execute(
                         buffers.normalized->data(),
-                        {{buffers.gate->mutable_data(), nullptr, d_ff_, "gate"},
-                         {buffers.up->mutable_data(), nullptr, d_ff_, "up", nullptr, false}},
+                        {{buffers.gate->mutable_data(), nullptr, ffn_output_dim, "gate"},
+                         {buffers.up->mutable_data(), nullptr, ffn_output_dim, "up", nullptr, false}},
                         effective_seq_len, d_model_,
                         mpi_ctx_.get(), ffn_device),
                     "Fused Gate/Up projection");
 
-        // Capture gate/up projections
-        capture_snapshot(layer_prefix + "_FFN_GATE", buffers.gate.get(), effective_seq_len, d_ff_);
-        capture_snapshot(layer_prefix + "_FFN_UP", buffers.up.get(), effective_seq_len, d_ff_);
+        // Capture gate/up projections (with actual output dimension)
+        capture_snapshot(layer_prefix + "_FFN_GATE", buffers.gate.get(), effective_seq_len, ffn_output_dim);
+        capture_snapshot(layer_prefix + "_FFN_UP", buffers.up.get(), effective_seq_len, ffn_output_dim);
 
-        // 3. Apply SwiGLU
+        // 3. Apply SwiGLU (operates on local FFN dimension)
         TRY_OP(swiglu(
             buffers.gate.get(), buffers.up.get(), buffers.up.get(),
-            effective_seq_len, d_ff_,
+            effective_seq_len, ffn_output_dim,
             layer_prefix + "_FFN_SWIGLU", ffn_device));
 
         // 4. Down projection
-        TRY_OP(project(
-            buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
-            effective_seq_len, d_model_, d_ff_,
-            layer_prefix + "_FFN_DOWN", ffn_device));
+        // With column-parallel Gate/Up: input is [seq, d_ff_local], Down weight is [d_model, d_ff_local]
+        // Use project_column_parallel which does GEMM + allreduce-sum
+        if (ffn_column_parallel_)
+        {
+            TRY_OP(project_column_parallel(
+                buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
+                effective_seq_len, d_model_, ffn_output_dim,
+                layer_prefix + "_FFN_DOWN", ffn_device));
+        }
+        else
+        {
+            // Non-sharded path: standard row-parallel (or full GEMM)
+            TRY_OP(project_row_parallel(
+                buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
+                effective_seq_len, d_model_, d_ff_,
+                layer_prefix + "_FFN_DOWN", ffn_device));
+        }
 
         // 5. Residual connection
         TRY_OP(add_residual(

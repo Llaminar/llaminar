@@ -310,9 +310,43 @@ int main(int argc, char *argv[])
         pipeline_config.activation_precision = ActivationPrecision::FP32;
     }
 
+    // Determine weight distribution strategy
+    // Default: sharding enabled when world_size > 1 (unless explicitly disabled)
+    WeightDistributionStrategy weight_strategy = WeightDistributionStrategy::REPLICATED;
+    bool use_sharding = args.shard_weights ||
+                        (mpi_ctx->world_size() > 1 && !args.disable_weight_sharding);
+
+    if (use_sharding)
+    {
+        weight_strategy = WeightDistributionStrategy::SHARDED;
+
+        // Row-parallel sharding now uses TensorSlice which preserves quantized format!
+        // Column-parallel still requires FP32 for slicing (TODO: implement column-parallel TensorSlice)
+        if (mpi_ctx->rank() == 0)
+        {
+            if (args.shard_weights)
+            {
+                LOG_INFO("Weight sharding enabled (--shard-weights) - row-parallel weights use TensorSlice");
+            }
+            else
+            {
+                LOG_INFO("Weight sharding auto-enabled for " << mpi_ctx->world_size()
+                                                             << " MPI ranks (use --no-shard to disable)");
+            }
+        }
+    }
+    else if (mpi_ctx->world_size() > 1 && args.disable_weight_sharding)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("Weight sharding disabled (--no-shard) - using replicated weights across "
+                     << mpi_ctx->world_size() << " ranks");
+        }
+    }
+
     // Create model context (loads metadata but not weights yet)
     auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr, nullptr,
-                                          WeightDistributionStrategy::REPLICATED,
+                                          weight_strategy,
                                           pipeline_config.weight_precision);
     if (!model_ctx)
     {
@@ -329,7 +363,7 @@ int main(int argc, char *argv[])
 
     // Re-create model context with placement map (this creates WeightManager)
     model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map, nullptr,
-                                     WeightDistributionStrategy::REPLICATED,
+                                     weight_strategy,
                                      pipeline_config.weight_precision);
     if (!model_ctx)
     {

@@ -69,6 +69,10 @@ namespace llaminar2
         // Activation/accumulation precision
         std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "q8_1"
 
+        // Weight sharding for tensor parallelism
+        bool shard_weights = false;           // Explicitly enable weight sharding (legacy)
+        bool disable_weight_sharding = false; // Explicitly disable weight sharding (default is auto: enabled when world_size > 1)
+
         // Chat mode
         bool chat_mode = false;         // Enable interactive chat (FTXUI UI)
         bool single_shot_chat = false;  // Single prompt with chat template formatting

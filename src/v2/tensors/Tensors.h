@@ -571,6 +571,64 @@ namespace llaminar2
         virtual bool set_device(int device_idx) = 0; // Upload to device
         virtual bool is_on_device(int device_idx) const = 0;
 
+        // ===== Lazy Transfer API (Phase 1 GPU Device-Aware Slicing) =====
+        // These are NON-VIRTUAL - single implementation in TensorBase.cpp
+        // Each tensor type just implements raw_host_data_ptr() and byte_size() accessors.
+
+        /**
+         * @brief Ensure tensor data is available on target device
+         *
+         * Performs lazy upload: if data is already on target device, returns immediately.
+         * If data is on host (device_index() == -1), allocates GPU memory and uploads.
+         *
+         * @param target_device GPU device index (0-based from DeviceManager)
+         * @return true if data is now available on target device, false on error
+         *
+         * **Thread Safety**: Caller must ensure no concurrent modifications to tensor data
+         * **Memory**: GPU buffer is allocated if not present, host buffer retained (dual-residency)
+         *
+         * @note For quantized weight tensors, uploads quantized blocks (not dequantized FP32)
+         * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
+         */
+        bool ensureOnDevice(int target_device);
+
+        /**
+         * @brief Ensure tensor data is available on host (CPU)
+         *
+         * Performs lazy download: if data is already on host and valid, returns immediately.
+         * If GPU has newer data (device_dirty_), downloads to host buffer.
+         *
+         * @return true if data is now available on host, false on error
+         *
+         * **Thread Safety**: Caller must ensure no concurrent modifications to tensor data
+         * **Memory**: Host buffer is always retained; GPU buffer optionally freed (see releaseDeviceMemory)
+         * @note Implementation in TensorBase.cpp - uses raw_host_data_ptr() and byte_size()
+         */
+        bool ensureOnHost();
+
+        /**
+         * @brief Check if tensor data is currently resident on GPU
+         * @return true if GPU buffer is allocated and contains valid data
+         */
+        bool isOnGPU() const { return device_data_ptr_ != nullptr; }
+
+        /**
+         * @brief Check if tensor data is currently resident on host (CPU)
+         * @return true if host buffer contains valid data (always true unless in GPU-only mode)
+         */
+        bool isOnCPU() const { return !host_invalid_; }
+
+        /**
+         * @brief Release GPU memory, keeping only host copy
+         *
+         * Downloads data to host if needed, then frees GPU buffer.
+         * After this call, isOnGPU() returns false.
+         *
+         * @return true on success, false on error
+         * @note Implementation in TensorBase.cpp
+         */
+        bool releaseDeviceMemory();
+
         // Data access (fallback for non-fused operations)
         // NOTE: Returns pointer in native type - use convertTo<T>() for type conversion
         virtual const float *data() const = 0; // Returns host pointer (syncs from device if needed)
@@ -581,28 +639,37 @@ namespace llaminar2
 
         // Kernel creation (only for weight matrices - GEMM)
         // NOTE: RoPE, SwiGLU, Softmax, RMSNorm, Attention moved to IActivationTensor
+        // NOTE: For row-sliced GEMM (tensor parallelism), use TensorSlice wrapper
         virtual std::unique_ptr<ITensorGemm> createGemm() = 0;
 
         /**
-         * @brief Get or create a cached GEMM kernel for this weight tensor
+         * @brief Release raw weight data after GEMM kernel has been packed
          *
-         * Unlike createGemm() which creates a new kernel every call, this method
-         * caches the kernel for reuse. This is critical for performance since
-         * GEMM kernel creation involves expensive weight repacking.
+         * For quantized weight tensors (Q8_0, Q4_0, etc.), this releases the
+         * original GGUF format data after the GEMM kernel has repacked it into
+         * INT8 VNNI format. This cuts weight memory usage roughly in half.
          *
-         * @return Raw pointer to cached GEMM kernel (owned by tensor)
-         * @note Thread-safe via mutex protection
-         * @note Kernel lifetime is tied to tensor lifetime
+         * Call this after getOrCreateGemm() to free the original quantized data.
+         * The tensor remains usable for GEMM operations via the cached kernel,
+         * but other operations (to_fp32, decode_block_at, etc.) will fail.
+         *
+         * @note Default throws - each tensor type must implement explicitly
+         * @note Not thread-safe - caller must ensure no concurrent access
+         * @note For TensorSlice, this forwards to the inner tensor
          */
-        ITensorGemm *getOrCreateGemm()
+        virtual void release_raw_data()
         {
-            std::lock_guard<std::mutex> lock(gemm_cache_mutex_);
-            if (!cached_gemm_)
-            {
-                cached_gemm_ = createGemm();
-            }
-            return cached_gemm_.get();
+            throw std::runtime_error(
+                "release_raw_data() not implemented for tensor type " +
+                std::to_string(static_cast<int>(native_type())) +
+                " - add implementation to free raw_data_ after GEMM packing");
         }
+
+        /**
+         * @brief Check if raw data has been released
+         * @return true if raw data was released (GEMM still works via cached kernel)
+         */
+        virtual bool is_raw_data_released() const { return false; }
 
         // ===== Generic Type Conversion API =====
 
@@ -692,8 +759,36 @@ namespace llaminar2
         // Default constructor for derived classes
         TensorBase() = default;
 
-        mutable std::mutex gemm_cache_mutex_;
-        mutable std::unique_ptr<ITensorGemm> cached_gemm_;
+        // ===== Lazy Transfer State (Phase 1 GPU Device-Aware Slicing) =====
+        // Maintained by TensorBase::ensureOnDevice/ensureOnHost implementations.
+
+        void *device_data_ptr_ = nullptr; // GPU buffer pointer (nullptr = not on GPU)
+        bool host_invalid_ = false;       // true if GPU has newer data than host
+        int gpu_device_idx_ = -1;         // Which GPU device (-1 = not on GPU)
+
+        // ===== Abstract Accessors for Lazy Transfer =====
+        // Each tensor type can override these for GPU support.
+        // Default implementations throw - tensors that need GPU must override.
+        // TensorBase uses them in ensureOnDevice/ensureOnHost.
+
+        /**
+         * @brief Get raw pointer to host data buffer
+         * @return Pointer to start of host data (casted from internal storage type)
+         * @note For FP32Tensor: returns host_data_.data()
+         * @note For quantized: returns blocks_.data()
+         * @note Default throws - override in tensor types that support GPU transfer
+         */
+        virtual void *raw_host_data_ptr();
+        virtual const void *raw_host_data_ptr() const;
+
+        /**
+         * @brief Get total byte size of tensor data
+         * @return Number of bytes to transfer to/from GPU
+         * @note For FP32Tensor: element_count() * sizeof(float)
+         * @note For quantized: num_blocks * sizeof(BlockType)
+         * @note Default throws - override in tensor types that support GPU transfer
+         */
+        virtual size_t byte_size() const;
 
         ActivationPack pack_activation_rows_to_int8(int rows, int cols) const;
 
@@ -795,6 +890,10 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - FP32 doesn't have separate raw data to release
+        void release_raw_data() override { /* no-op: FP32 has no separate raw block data */ }
+        bool is_raw_data_released() const override { return false; /* FP32 always has its data */ }
 
         // ===== IActivationTensor Interface =====
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -898,6 +997,12 @@ namespace llaminar2
         // ===== IQ8_1Decodable Interface =====
         const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 1) =====
+        void *raw_host_data_ptr() override;
+        const void *raw_host_data_ptr() const override;
+        size_t byte_size() const override { return element_count() * sizeof(float); }
+
     private:
         // Private constructor for creating views
         FP32Tensor(const std::vector<size_t> &shape,
@@ -965,6 +1070,10 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - FP16 doesn't have separate raw data to release
+        void release_raw_data() override { /* no-op: FP16 has no separate raw block data */ }
+        bool is_raw_data_released() const override { return false; /* FP16 always has its data */ }
 
         // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -1075,6 +1184,12 @@ namespace llaminar2
         void from_fp32(const float *fp32_data, size_t count);
         void to_fp32(float *fp32_data, size_t count) const;
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override;
+        const void *raw_host_data_ptr() const override;
+        size_t byte_size() const override { return element_count() * sizeof(uint16_t); }
+
     private:
         // Private constructor for creating views
         FP16Tensor(const std::vector<size_t> &shape,
@@ -1142,6 +1257,10 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - BF16 doesn't have separate raw data to release
+        void release_raw_data() override { /* no-op: BF16 has no separate raw block data */ }
+        bool is_raw_data_released() const override { return false; /* BF16 always has its data */ }
 
         // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
@@ -1239,6 +1358,12 @@ namespace llaminar2
 
         // IQ8_1Decodable interface - returns pointer to thread-local block
         const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
+
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override;
+        const void *raw_host_data_ptr() const override;
+        size_t byte_size() const override { return element_count() * sizeof(uint16_t); }
 
     private:
         // Private constructor for creating views
@@ -1399,6 +1524,12 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return shape_[1]; } // Full row per block
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override { return host_int8_data_.data(); }
+        const void *raw_host_data_ptr() const override { return host_int8_data_.data(); }
+        size_t byte_size() const override { return element_count() * sizeof(int8_t); }
+
     private:
         std::vector<size_t> shape_;
         int device_idx_ = -1;
@@ -1513,6 +1644,12 @@ namespace llaminar2
          */
         bool requantize_to_int8(int8_t *dst_int8, float *dst_row_scales) const;
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override { return host_int32_data_.data(); }
+        const void *raw_host_data_ptr() const override { return host_int32_data_.data(); }
+        size_t byte_size() const override { return element_count() * sizeof(int32_t); }
+
     private:
         std::vector<size_t> shape_;
         int device_idx_ = -1;
@@ -1570,6 +1707,18 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override; // Fused dequant+GEMM
         ITensorGemm *createGemmRaw();
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -1706,6 +1855,18 @@ namespace llaminar2
         static void decodeBlockVectorizedAVX2(const IQ4_NLBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -1720,6 +1881,7 @@ namespace llaminar2
         void *device_blocks_; // Quantized blocks on device (if uploaded)
 
         mutable std::vector<float> dequant_cache_; // Temporary for data() calls
+        bool raw_data_released_ = false;           // Track if raw data was released after GEMM pack
 
         // Private view constructor
         IQ4_NLTensor(const std::vector<size_t> &shape,
@@ -1760,6 +1922,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1877,6 +2051,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q8_0Block &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -1890,6 +2076,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q8_0Tensor(const std::vector<size_t> &shape,
@@ -1938,6 +2125,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2097,6 +2296,18 @@ namespace llaminar2
             const float *src,
             const std::vector<size_t> &shape);
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2110,6 +2321,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q8_1Tensor(const std::vector<size_t> &shape,
@@ -2146,6 +2358,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2248,6 +2472,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q4_0Block &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2261,6 +2497,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q4_0Tensor(const std::vector<size_t> &shape,
@@ -2297,6 +2534,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2403,6 +2652,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q4_1Block &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2416,6 +2677,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q4_1Tensor(const std::vector<size_t> &shape,
@@ -2453,6 +2715,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2550,6 +2824,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q5_0Block &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2563,6 +2849,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q5_0Tensor(const std::vector<size_t> &shape,
@@ -2600,6 +2887,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2697,6 +2996,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q5_1Block &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2710,6 +3021,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q5_1Tensor(const std::vector<size_t> &shape,
@@ -2743,6 +3055,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -2805,6 +3129,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q6_KBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2818,6 +3154,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q6_KTensor(const std::vector<size_t> &shape,
@@ -2849,6 +3186,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -2910,6 +3259,18 @@ namespace llaminar2
         static void decodeBlockAVX512(const Q2_KBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -2923,6 +3284,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q2_KTensor(const std::vector<size_t> &shape,
@@ -2963,6 +3325,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3020,6 +3394,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q5_KBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         // View constructor (borrows parent's data)
         Q5_KTensor(
@@ -3033,6 +3419,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // View support fields
         bool is_view_;
@@ -3066,6 +3453,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // IINT8Unpackable interface
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
@@ -3128,6 +3527,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q3_KBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         std::vector<size_t> shape_;
 
@@ -3141,6 +3552,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // Private view constructor
         Q3_KTensor(const std::vector<size_t> &shape,
@@ -3172,6 +3584,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3236,6 +3660,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q4_KBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         // View constructor (borrows parent's data)
         Q4_KTensor(
@@ -3249,6 +3685,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // View support fields
         bool is_view_;
@@ -3282,6 +3719,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3339,6 +3788,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const Q8_KBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         // View constructor (borrows parent's data)
         Q8_KTensor(
@@ -3352,6 +3813,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
 
         // View support fields
         bool is_view_;
@@ -3385,6 +3847,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3481,6 +3955,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ4_XSBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                      size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -3497,6 +3983,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ2_XXSTensor.cpp
@@ -3522,6 +4009,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3606,6 +4105,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ2_XXSBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                       size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -3622,6 +4133,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ2_XSTensor.cpp
@@ -3647,6 +4159,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3731,6 +4255,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ2_XSBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                      size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -3747,6 +4283,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ3_XXSTensor.cpp
@@ -3772,6 +4309,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3860,6 +4409,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ3_XXSBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                       size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -3876,6 +4437,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ2_STensor.cpp
@@ -3901,6 +4463,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -3985,6 +4559,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ2_SBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                     size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -4001,6 +4587,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ3_STensor.cpp
@@ -4026,6 +4613,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -4114,6 +4713,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ3_SBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                     size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -4130,6 +4741,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ1_STensor.cpp
@@ -4155,6 +4767,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -4239,6 +4863,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ1_SBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                     size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -4255,6 +4891,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
     // Implementation: IQ1_MTensor.cpp
@@ -4280,6 +4917,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // Memory management - release raw data after GEMM packing
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+                raw_data_released_ = true;
+            }
+        }
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -4364,6 +5013,18 @@ namespace llaminar2
         static void decodeBlockAVX2(const IQ1_MBlock &block, float *output);
 #endif
 
+    protected:
+        // ===== Lazy Transfer Accessors (Phase 3) =====
+        void *raw_host_data_ptr() override
+        {
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        const void *raw_host_data_ptr() const override
+        {
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        size_t byte_size() const override { return raw_data_.size(); }
+
     private:
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                     size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
@@ -4380,6 +5041,7 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
 } // namespace llaminar2

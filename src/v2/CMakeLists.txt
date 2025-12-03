@@ -482,6 +482,7 @@ message(STATUS "V2: FTXUI v5.0.0 configured for interactive chat UI")
 # V2 Core Library
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
+    backends/BackendManager.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
@@ -544,6 +545,8 @@ add_library(llaminar2_core STATIC
     kernels/cpu/fused/FusedRMSNormQuantize.cpp  # Phase 1: RMSNorm + INT8 quantization
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     kernels/cpu/fused/FusedDequantSwiGLU.cpp    # Phase 2: Dequant + SwiGLU activation
+    # Kernel dispatch factory (centralized device-aware kernel creation)
+    kernels/KernelFactory.cpp
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp
     testing/AttentionTestHarness.cpp

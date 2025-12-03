@@ -6,7 +6,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
 #include "FP16Utils.h"
@@ -15,9 +15,6 @@
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
-#ifdef HAVE_CUDA
-#include "../kernels/cuda/CudaGemmFactory.h"
-#endif
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -240,85 +237,16 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ4_NLTensor::createGemm()
     {
-        // Route to appropriate backend based on tensor's device placement
-        if (device_idx_ >= 0)
-        {
-            // Tensor is on a GPU device - get device type from DeviceManager
-            auto &dm = DeviceManager::instance();
-            const auto &devices = dm.devices();
-
-            if (static_cast<size_t>(device_idx_) >= devices.size())
-            {
-                LOG_ERROR("[IQ4_NLTensor] Invalid device_idx: " << device_idx_);
-                throw std::runtime_error("IQ4_NLTensor::createGemm: invalid device index");
-            }
-
-            const auto &device = devices[device_idx_];
-
-            // Route based on backend type
-            switch (device.type)
-            {
-#ifdef HAVE_CUDA
-            case ComputeBackendType::GPU_CUDA:
-                LOG_DEBUG("[IQ4_NLTensor] Creating CUDA GEMM kernel for device " << device_idx_);
-                return llaminar::v2::kernels::cuda::createCudaGemm(this);
-#endif
-#ifdef HAVE_ROCM
-            case ComputeBackendType::GPU_ROCM:
-                LOG_ERROR("[IQ4_NLTensor] ROCm GEMM not yet implemented");
-                throw std::runtime_error("ROCm GEMM not implemented");
-#endif
-            default:
-                LOG_ERROR("[IQ4_NLTensor] Unsupported GPU backend type: " << static_cast<int>(device.type));
-                throw std::runtime_error("Unsupported GPU backend type");
-            }
-        }
-        else
-        {
-            // Tensor is on CPU - use QuantisedGemmKernel (requires IINT8Unpackable)
-            // LOG_DEBUG("[IQ4_NLTensor] Creating CPU GEMM kernel");
-            return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
-        }
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     ITensorGemm *IQ4_NLTensor::createGemmRaw()
     {
-        if (device_idx_ >= 0)
-        {
-            // Tensor is on a GPU device - get device type from DeviceManager
-            auto &dm = DeviceManager::instance();
-            const auto &devices = dm.devices();
-
-            if (static_cast<size_t>(device_idx_) >= devices.size())
-            {
-                LOG_ERROR("[IQ4_NLTensor] Invalid device_idx: " << device_idx_);
-                throw std::runtime_error("IQ4_NLTensor::createGemm: invalid device index");
-            }
-
-            const auto &device = devices[device_idx_];
-
-            // Route based on backend type
-            switch (device.type)
-            {
-#ifdef HAVE_CUDA
-            case ComputeBackendType::GPU_CUDA:
-                LOG_DEBUG("[IQ4_NLTensor] Creating CUDA GEMM kernel for device " << device_idx_);
-                return llaminar::v2::kernels::cuda::createCudaGemmRaw(this);
-#endif
-#ifdef HAVE_ROCM
-            case ComputeBackendType::GPU_ROCM:
-                LOG_ERROR("[IQ4_NLTensor] ROCm GEMM not yet implemented");
-                throw std::runtime_error("ROCm GEMM not implemented");
-#endif
-            default:
-                LOG_ERROR("[IQ4_NLTensor] Unsupported GPU backend type: " << static_cast<int>(device.type));
-                throw std::runtime_error("Unsupported GPU backend type");
-            }
-        }
-        else
-        {
-            return new llaminar2::gemm_v4::QuantisedGemmKernel(this);
-        }
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemmRaw(this, dev_type);
     }
 
     // ========== Decode API ==========

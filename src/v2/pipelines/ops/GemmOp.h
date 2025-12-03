@@ -31,6 +31,7 @@
 #pragma once
 
 #include "Op.h"
+#include "../../kernels/KernelFactory.h"
 
 namespace llaminar2
 {
@@ -101,8 +102,8 @@ namespace llaminar2
             if (!validateDimensions(m, n, "output C"))
                 return false;
 
-            // 2. Get cached kernel from weight tensor (avoids expensive repacking every call)
-            auto *gemm_kernel = W->getOrCreateGemm();
+            // 2. Get cached kernel from KernelFactory (avoids expensive repacking every call)
+            auto *gemm_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(W);
             if (!gemm_kernel)
             {
                 logError("failed to get GEMM kernel from weight tensor");
@@ -229,8 +230,8 @@ namespace llaminar2
             if (!validatePointer(C_data, "output data (C)"))
                 return false;
 
-            // 2. Get cached kernel from weight tensor
-            auto *gemm_kernel = W->getOrCreateGemm();
+            // 2. Get cached kernel from KernelFactory
+            auto *gemm_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(W);
             if (!gemm_kernel)
             {
                 logError("failed to get GEMM kernel from weight tensor");

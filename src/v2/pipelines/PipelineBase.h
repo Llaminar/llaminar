@@ -872,6 +872,41 @@ namespace llaminar2
          */
         std::pair<size_t, size_t> getTokenDistribution(int seq_len);
 
+        // ===== Weight Device Orchestration (Phase 5) =====
+        // Generic lazy GPU transfer helpers usable by all pipeline implementations
+
+        /**
+         * @brief Ensure a collection of weights are on the target device (lazy GPU transfer)
+         *
+         * Triggers lazy transfer of weights to GPU if target_device >= 0.
+         * No-op if weights are already on target device or target is CPU (-1).
+         * This is the generic building block for architecture-specific orchestration.
+         *
+         * @param weights Vector of weight tensors to transfer (nullptrs are skipped)
+         * @param target_device Target device index (-1 = CPU, >=0 = GPU)
+         * @param context Description for error logging (e.g., "attention_L5", "ffn_L3")
+         * @return true if all transfers succeeded (or no transfers needed)
+         */
+        bool ensureWeightsOnDevice(
+            const std::vector<std::shared_ptr<TensorBase>> &weights,
+            int target_device,
+            const std::string &context = "");
+
+        /**
+         * @brief Ensure a single weight tensor is on the target device
+         *
+         * Convenience overload for single tensor transfer.
+         *
+         * @param weight Weight tensor to transfer (nullptr = no-op)
+         * @param target_device Target device index (-1 = CPU, >=0 = GPU)
+         * @param weight_name Name for error logging
+         * @return true if transfer succeeded (or no transfer needed)
+         */
+        bool ensureWeightOnDevice(
+            const std::shared_ptr<TensorBase> &weight,
+            int target_device,
+            const std::string &weight_name = "");
+
         // ===== Snapshot Capture Helper (for derived classes) =====
         // Compiles to NOOP in release builds (ENABLE_PIPELINE_SNAPSHOTS not defined)
 
@@ -954,6 +989,56 @@ namespace llaminar2
         bool project(
             const TensorBase *input, TensorBase *weight, TensorBase *output,
             int m, int n, int k,
+            const std::string &snapshot_key, int device = -1);
+
+        /**
+         * @brief Row-parallel projection with MPI allreduce
+         *
+         * For tensor parallelism: In row-parallel projections (Wo, FFN Down),
+         * each rank processes a partition of the input and produces a partial
+         * contribution to the output. This method performs the local GEMM and
+         * then allreduces to sum contributions across all ranks.
+         *
+         * NOTE: Currently, all ranks compute the full GEMM (no compute savings).
+         * The allreduce ensures correctness for when we implement true row-parallel
+         * GEMM where each rank only computes its partition.
+         *
+         * @param input Input tensor [m, k]
+         * @param weight Weight tensor [n, k]
+         * @param output Output tensor [m, n]
+         * @param m Number of rows (sequence length)
+         * @param n Output dimension
+         * @param k Input dimension
+         * @param snapshot_key Snapshot identifier for parity testing
+         * @param device Target device (-1 to use current device)
+         * @return true on success
+         */
+        bool project_row_parallel(
+            const TensorBase *input, TensorBase *weight, TensorBase *output,
+            int m, int n, int k,
+            const std::string &snapshot_key, int device = -1);
+
+        /**
+         * @brief Column-parallel projection (for cascaded tensor parallelism)
+         *
+         * Used when input is from a column-parallel layer (e.g., FFN Gate/Up).
+         * Each rank has input [m, k_local] and weight [n, k_local].
+         * Computes local GEMM: [m, k_local] @ [n, k_local]^T = [m, n]
+         * Then allreduce-sum to combine partial results.
+         *
+         * @param input Input tensor [m, k_local] (local slice)
+         * @param weight Weight tensor [n, k_local] (column-parallel slice)
+         * @param output Output tensor [m, n] (full, allreduced)
+         * @param m Number of rows (sequence length)
+         * @param n Output dimension
+         * @param k_local Local input dimension (k_full / world_size)
+         * @param snapshot_key Snapshot identifier for parity testing
+         * @param device Target device (-1 to use current device)
+         * @return true on success
+         */
+        bool project_column_parallel(
+            const TensorBase *input, TensorBase *weight, TensorBase *output,
+            int m, int n, int k_local,
             const std::string &snapshot_key, int device = -1);
 
         /**

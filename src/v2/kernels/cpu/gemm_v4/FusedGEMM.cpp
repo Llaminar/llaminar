@@ -6,6 +6,7 @@
  */
 
 #include "FusedGEMM.h"
+#include "../../KernelFactory.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 
@@ -59,11 +60,19 @@ namespace llaminar2
             }
         }
 
-        // Create GEMM kernels for each weight tensor
+        // Get GEMM kernels from KernelFactory (don't create new ones!)
+        // This ensures we use the pre-packed weights and don't re-access raw data.
         gemm_kernels_.reserve(weights.size());
         for (const auto *weight : weights)
         {
-            gemm_kernels_.push_back(std::make_unique<gemm_v4::QuantisedGemmKernel>(weight));
+            // KernelFactory::getOrCreateGemm() returns cached ITensorGemm*
+            auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(weight);
+            auto *quantised_gemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
+            if (!quantised_gemm)
+            {
+                throw std::runtime_error("[FusedGEMM] Weight tensor returned non-QuantisedGemmKernel from KernelFactory::getOrCreateGemm()");
+            }
+            gemm_kernels_.push_back(quantised_gemm);
         }
     }
 

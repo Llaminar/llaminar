@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
@@ -192,8 +192,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
     {
-        // Use custom JIT GEMM kernel for Q8_1
-        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()

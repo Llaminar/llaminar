@@ -1007,6 +1007,38 @@ namespace llaminar2
         {
             return false; // Default: not supported
         }
+
+        // =============================================================================
+        // Weight Dimension Accessors (for Tensor Parallelism)
+        // =============================================================================
+        // These methods expose the actual dimensions of the packed weight matrix.
+        // Essential for tensor parallelism where weights may be sharded:
+        // - Column-parallel: N dimension is split across ranks
+        // - Row-parallel: K dimension is split across ranks
+        //
+        // Callers can query these to determine actual local dimensions when weights
+        // have been sharded, rather than assuming the full model dimensions.
+        // =============================================================================
+
+        /**
+         * @brief Get the output dimension (N) of the weight matrix
+         *
+         * For sharded column-parallel weights (QKV, Gate/Up), this returns the
+         * local N dimension (n_full / world_size), not the full model dimension.
+         *
+         * @return Number of output features this kernel produces, or 0 if unknown
+         */
+        virtual int get_n() const { return 0; }
+
+        /**
+         * @brief Get the input dimension (K) of the weight matrix
+         *
+         * For sharded row-parallel weights (Wo, Down), this returns the
+         * local K dimension (k_full / world_size), not the full model dimension.
+         *
+         * @return Number of input features this kernel expects, or 0 if unknown
+         */
+        virtual int get_k() const { return 0; }
     };
 
     class TensorBase;

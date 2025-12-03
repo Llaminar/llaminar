@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
 #include "../utils/CPUFeatures.h"
@@ -109,8 +109,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ4_XSTensor::createGemm()
     {
-        // Use QuantisedGemmKernel - requires IINT8Unpackable interface
-        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     void IQ4_XSTensor::decodeBlock(const IQ4_XSBlock &block, float *output)

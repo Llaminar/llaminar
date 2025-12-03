@@ -288,7 +288,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[BatchedKVCache] Evicted " << tokens_to_evict << " oldest tokens from all sequences");
+        LOG_TRACE("[BatchedKVCache] Evicted " << tokens_to_evict << " oldest tokens from all sequences");
     }
 
     void BatchedKVCache::evict_oldest_from_sequence(int seq_idx, int tokens_to_evict)
@@ -333,7 +333,7 @@ namespace llaminar2
             entry.cached_tokens = tokens_to_keep;
         }
 
-        LOG_DEBUG("[BatchedKVCache] Evicted " << tokens_to_evict << " oldest tokens from sequence " << seq_idx);
+        LOG_TRACE("[BatchedKVCache] Evicted " << tokens_to_evict << " oldest tokens from sequence " << seq_idx);
     }
 
 } // namespace llaminar2
