@@ -1496,6 +1496,301 @@ namespace llaminar2
         }
 
         // ==========================================
+        // Single-Block Q8_1 Quantization (SIMD-optimized)
+        // ==========================================
+        // These functions quantize a single 32-element block with SIMD optimization.
+        // Used by FP32Tensor::quantize_to_q8_1() and QuantisedGemmKernel::quantize_activations()
+        // for row-wise 2D tensor quantization with proper boundary handling.
+
+        /**
+         * @brief Quantize a single 32-element block from FP32 to Q8_1 (scalar fallback)
+         *
+         * Handles partial blocks at row boundaries by zero-padding.
+         *
+         * @param src Pointer to FP32 values
+         * @param dst Output Q8_1 block
+         * @param valid_elements Number of valid elements (≤32), rest are zero-padded
+         */
+        inline void quantize_single_block_scalar(const float *src, Q8_1Block &dst, int valid_elements)
+        {
+            // Find max absolute value
+            float max_abs = 0.0f;
+            for (int j = 0; j < valid_elements; ++j)
+            {
+                float val = std::abs(src[j]);
+                if (val > max_abs)
+                    max_abs = val;
+            }
+
+            // Handle zero/tiny values
+            constexpr float MIN_SCALE_THRESHOLD = 1e-10f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                dst.d = 0;
+                dst.sum_qs = 0;
+                std::memset(dst.qs, 0, 32);
+                return;
+            }
+
+            // Compute scale and inverse
+            float d = max_abs / 127.0f;
+            float id = 1.0f / d;
+            dst.d = fp32_to_fp16(d);
+
+            // Quantize values and compute sum
+            int32_t sum_qs = 0;
+            for (int j = 0; j < valid_elements; ++j)
+            {
+                int8_t q = static_cast<int8_t>(std::round(src[j] * id));
+                dst.qs[j] = q;
+                sum_qs += q;
+            }
+
+            // Zero-pad remaining elements
+            for (int j = valid_elements; j < 32; ++j)
+            {
+                dst.qs[j] = 0;
+            }
+
+            dst.sum_qs = static_cast<int16_t>(sum_qs);
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Quantize a single full 32-element block from FP32 to Q8_1 (AVX2)
+         *
+         * Uses AVX2 intrinsics for vectorized:
+         * - Absolute value computation
+         * - Max reduction across 32 elements
+         * - Scaling, rounding, clamping
+         * - Sum accumulation
+         * - INT32→INT8 packing
+         *
+         * @param src Pointer to 32 FP32 values (must be valid)
+         * @param dst Output Q8_1 block
+         *
+         * @note Only call this for full 32-element blocks. Use scalar for partial blocks.
+         */
+        inline void quantize_single_block_avx2(const float *src, Q8_1Block &dst)
+        {
+            // Load all 32 floats (4 × 8)
+            __m256 v0 = _mm256_loadu_ps(src);
+            __m256 v1 = _mm256_loadu_ps(src + 8);
+            __m256 v2 = _mm256_loadu_ps(src + 16);
+            __m256 v3 = _mm256_loadu_ps(src + 24);
+
+            // Compute absolute values using AND-NOT with sign bit mask
+            __m256 sign_mask = _mm256_set1_ps(-0.0f);
+            __m256 abs0 = _mm256_andnot_ps(sign_mask, v0);
+            __m256 abs1 = _mm256_andnot_ps(sign_mask, v1);
+            __m256 abs2 = _mm256_andnot_ps(sign_mask, v2);
+            __m256 abs3 = _mm256_andnot_ps(sign_mask, v3);
+
+            // Find max absolute value across all 32 elements
+            __m256 max_01 = _mm256_max_ps(abs0, abs1);
+            __m256 max_23 = _mm256_max_ps(abs2, abs3);
+            __m256 max_all = _mm256_max_ps(max_01, max_23);
+
+            // Horizontal max reduction
+            __m128 lo = _mm256_castps256_ps128(max_all);
+            __m128 hi = _mm256_extractf128_ps(max_all, 1);
+            __m128 vmax128 = _mm_max_ps(lo, hi);
+            vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+            vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+            float max_abs = _mm_cvtss_f32(vmax128);
+
+            // Handle zero/tiny values
+            constexpr float MIN_SCALE_THRESHOLD = 1e-10f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                dst.d = 0;
+                dst.sum_qs = 0;
+                std::memset(dst.qs, 0, 32);
+                return;
+            }
+
+            // Compute scale
+            float d = max_abs / 127.0f;
+            float id = 1.0f / d;
+            dst.d = fp32_to_fp16(d);
+
+            // Vectorized quantization
+            __m256 vinv = _mm256_set1_ps(id);
+            __m256 vmin = _mm256_set1_ps(-127.0f);
+            __m256 vmax_q = _mm256_set1_ps(127.0f);
+
+            // Scale and clamp
+            __m256 scaled0 = _mm256_mul_ps(v0, vinv);
+            __m256 scaled1 = _mm256_mul_ps(v1, vinv);
+            __m256 scaled2 = _mm256_mul_ps(v2, vinv);
+            __m256 scaled3 = _mm256_mul_ps(v3, vinv);
+
+            scaled0 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled0));
+            scaled1 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled1));
+            scaled2 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled2));
+            scaled3 = _mm256_max_ps(vmin, _mm256_min_ps(vmax_q, scaled3));
+
+            // Round to nearest integer
+            __m256 rounded0 = _mm256_round_ps(scaled0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 rounded1 = _mm256_round_ps(scaled1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 rounded2 = _mm256_round_ps(scaled2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 rounded3 = _mm256_round_ps(scaled3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            // Convert to int32
+            __m256i i0 = _mm256_cvtps_epi32(rounded0);
+            __m256i i1 = _mm256_cvtps_epi32(rounded1);
+            __m256i i2 = _mm256_cvtps_epi32(rounded2);
+            __m256i i3 = _mm256_cvtps_epi32(rounded3);
+
+            // Compute sum (horizontal add of all int32 values)
+            __m256i sum_01 = _mm256_add_epi32(i0, i1);
+            __m256i sum_23 = _mm256_add_epi32(i2, i3);
+            __m256i sum_all = _mm256_add_epi32(sum_01, sum_23);
+            __m128i sum_lo = _mm256_castsi256_si128(sum_all);
+            __m128i sum_hi = _mm256_extracti128_si256(sum_all, 1);
+            __m128i sum128 = _mm_add_epi32(sum_lo, sum_hi);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 0, 0, 1)));
+            int32_t sum_i32 = _mm_cvtsi128_si32(sum128);
+
+            // Pack int32 → int16 → int8
+            // packs_epi32 interleaves lanes, need permute to fix
+            __m256i i16_01 = _mm256_packs_epi32(i0, i1);
+            __m256i i16_23 = _mm256_packs_epi32(i2, i3);
+            i16_01 = _mm256_permute4x64_epi64(i16_01, _MM_SHUFFLE(3, 1, 2, 0));
+            i16_23 = _mm256_permute4x64_epi64(i16_23, _MM_SHUFFLE(3, 1, 2, 0));
+
+            __m256i i8_all = _mm256_packs_epi16(i16_01, i16_23);
+            i8_all = _mm256_permute4x64_epi64(i8_all, _MM_SHUFFLE(3, 1, 2, 0));
+
+            // Store 32 int8 values
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), i8_all);
+            dst.sum_qs = static_cast<int16_t>(sum_i32);
+        }
+#endif
+
+#if defined(__AVX512F__)
+        /**
+         * @brief Quantize a single full 32-element block from FP32 to Q8_1 (AVX-512)
+         *
+         * Uses AVX-512 intrinsics for maximum throughput:
+         * - Two 512-bit loads for 32 floats
+         * - Vectorized abs, max reduction with _mm512_reduce_max_ps
+         * - Efficient int32→int8 packing with saturating conversions
+         *
+         * @param src Pointer to 32 FP32 values (must be valid)
+         * @param dst Output Q8_1 block
+         *
+         * @note Only call this for full 32-element blocks. Use scalar for partial blocks.
+         */
+        inline void quantize_single_block_avx512(const float *src, Q8_1Block &dst)
+        {
+            // Load all 32 floats (2 × 16)
+            __m512 v0 = _mm512_loadu_ps(src);
+            __m512 v1 = _mm512_loadu_ps(src + 16);
+
+            // Compute absolute values and find max
+            __m512 abs0 = _mm512_abs_ps(v0);
+            __m512 abs1 = _mm512_abs_ps(v1);
+            __m512 max_vec = _mm512_max_ps(abs0, abs1);
+            float max_abs = _mm512_reduce_max_ps(max_vec);
+
+            // Handle zero/tiny values
+            constexpr float MIN_SCALE_THRESHOLD = 1e-10f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                dst.d = 0;
+                dst.sum_qs = 0;
+                std::memset(dst.qs, 0, 32);
+                return;
+            }
+
+            // Compute scale
+            float d = max_abs / 127.0f;
+            float id = 1.0f / d;
+
+            // Convert scale to FP16 using F16C intrinsic (faster than scalar bit manipulation)
+            // AVX512F implies F16C support
+            __m128 v_d = _mm_set_ss(d);
+            __m128i v_h = _mm_cvtps_ph(v_d, _MM_FROUND_TO_NEAREST_INT);
+            dst.d = (uint16_t)_mm_cvtsi128_si32(v_h);
+
+            // Vectorized quantization
+            __m512 vinv = _mm512_set1_ps(id);
+
+            // Scale (no clamping needed: values are naturally in [-127, 127] range)
+            // max_abs is the maximum absolute value in the block.
+            // scaled = v * (127.0 / max_abs).
+            // Since |v| <= max_abs, |scaled| <= 127.0.
+            // Rounding might push 127.000...1 to 128, but vpmovdb saturates to 127.
+            __m512 scaled0 = _mm512_mul_ps(v0, vinv);
+            __m512 scaled1 = _mm512_mul_ps(v1, vinv);
+
+            // Round and convert to int32
+            // Note: _mm512_cvtps_epi32 rounds to nearest-even (default MXCSR), which is slightly different
+            // from std::round (nearest, ties away from zero). We accept this for performance.
+            // Removing _mm512_roundscale_ps saves significant latency.
+            __m512i i0 = _mm512_cvtps_epi32(scaled0);
+            __m512i i1 = _mm512_cvtps_epi32(scaled1);
+
+            // Compute sum: Vertical add first, then single horizontal reduction
+            // This saves one expensive horizontal reduction compared to reducing separately
+            __m512i sum_vec = _mm512_add_epi32(i0, i1);
+            int32_t sum_i32 = _mm512_reduce_add_epi32(sum_vec);
+
+            // Pack 32-bit integers to 8-bit using AVX-512 vpmovdb (direct int32 → int8)
+            // This uses _mm512_cvtsepi32_epi8 which outputs a __m128i (16 bytes from 16 int32s)
+            __m128i i8_0 = _mm512_cvtsepi32_epi8(i0); // 16 int32 → 16 int8
+            __m128i i8_1 = _mm512_cvtsepi32_epi8(i1); // 16 int32 → 16 int8
+
+            // Combine into a single 256-bit register and store
+            __m256i i8_all = _mm256_set_m128i(i8_1, i8_0);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), i8_all);
+            dst.sum_qs = static_cast<int16_t>(sum_i32);
+        }
+#endif
+
+        /**
+         * @brief Quantize a single 32-element block from FP32 to Q8_1 (auto-dispatch)
+         *
+         * Dispatches to AVX-512, AVX2, or scalar based on runtime CPU detection.
+         * Handles partial blocks at row boundaries.
+         *
+         * @param src Pointer to FP32 values
+         * @param dst Output Q8_1 block
+         * @param valid_elements Number of valid elements (≤32), rest are zero-padded
+         */
+        inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_elements = 32)
+        {
+            // Partial blocks always use scalar (rare, at row boundaries only)
+            if (valid_elements < 32)
+            {
+                quantize_single_block_scalar(src, dst, valid_elements);
+                return;
+            }
+
+            // Full blocks: dispatch to best SIMD
+            static const bool has_avx512 = cpu_supports_avx512();
+            static const bool has_avx2 = cpu_supports_avx2();
+
+#if defined(__AVX512F__)
+            if (has_avx512)
+            {
+                quantize_single_block_avx512(src, dst);
+                return;
+            }
+#endif
+#if defined(__AVX2__)
+            if (has_avx2)
+            {
+                quantize_single_block_avx2(src, dst);
+                return;
+            }
+#endif
+            quantize_single_block_scalar(src, dst, 32);
+        }
+
+        // ==========================================
         // FP32 to Q8_0 Quantization (for TensorBase::to_q8_0())
         // ==========================================
 

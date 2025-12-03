@@ -99,6 +99,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/FP16Utils.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
@@ -521,11 +522,13 @@ namespace llaminar2
                         }
                     }
 
-                    // 1. Quantize A
-                    // If M is small, parallelize over K to utilize threads
+                    // 1. Quantize A using SIMD-optimized quantization
+                    // Uses AVX-512/AVX2 via simd::quantize_single_block()
                     int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
                     if (quant_thresh == 0)
                         quant_thresh = omp_get_num_threads();
+
+                    const bool k_aligned = (k % 32 == 0);
 
                     if (m < quant_thresh)
                     {
@@ -534,36 +537,11 @@ namespace llaminar2
                         {
                             for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                             {
-                                const float *a_row = A + i * k;
+                                const float *a_row = A + i * k + k_blk * 32;
                                 Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
-                                float max_abs = 0.0f;
-                                for (int j = 0; j < 32; ++j)
-                                {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
-                                    if (val > max_abs)
-                                        max_abs = val;
-                                }
-
-                                float d = max_abs / 127.0f;
-                                if (d < 1e-10f)
-                                    d = 1e-10f;
-                                float id = 1.0f / d;
-
-                                row_blocks[k_blk].d = fp32_to_fp16(d);
-
-                                int32_t sum_qs = 0;
-                                for (int j = 0; j < 32; ++j)
-                                {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
-                                    int8_t q = static_cast<int8_t>(std::round(val * id));
-                                    row_blocks[k_blk].qs[j] = q;
-                                    sum_qs += q;
-                                }
-
-                                row_blocks[k_blk].sum_qs = sum_qs;
+                                int valid_elements = std::min(32, k - k_blk * 32);
+                                simd::quantize_single_block(a_row, row_blocks[k_blk], valid_elements);
                             }
                         }
                     }
@@ -575,35 +553,27 @@ namespace llaminar2
                             const float *a_row = A + i * k;
                             Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
-                            for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                            if (k_aligned)
                             {
-                                float max_abs = 0.0f;
-                                for (int j = 0; j < 32; ++j)
+                                // Fast path: K is multiple of 32
+                                for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                                 {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
-                                    if (val > max_abs)
-                                        max_abs = val;
+                                    simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
                                 }
-
-                                float d = max_abs / 127.0f;
-                                if (d < 1e-10f)
-                                    d = 1e-10f;
-                                float id = 1.0f / d;
-
-                                row_blocks[k_blk].d = fp32_to_fp16(d);
-
-                                int32_t sum_qs = 0;
-                                for (int j = 0; j < 32; ++j)
+                            }
+                            else
+                            {
+                                // General path: handle partial last block
+                                for (int k_blk = 0; k_blk < k_blocks - 1; ++k_blk)
                                 {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
-                                    int8_t q = static_cast<int8_t>(std::round(val * id));
-                                    row_blocks[k_blk].qs[j] = q;
-                                    sum_qs += q;
+                                    simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
                                 }
-
-                                row_blocks[k_blk].sum_qs = sum_qs;
+                                if (k_blocks > 0)
+                                {
+                                    int last_k_blk = k_blocks - 1;
+                                    int valid_elements = k - last_k_blk * 32;
+                                    simd::quantize_single_block(a_row + last_k_blk * 32, row_blocks[last_k_blk], valid_elements);
+                                }
                             }
                         }
                     }
@@ -1031,6 +1001,8 @@ namespace llaminar2
              * This is the first step in the fused multi-GEMM workflow.
              * The resulting Q8_1 blocks can be passed to multiply_with_precomputed_q8_1()
              * multiple times without redundant quantization.
+             *
+             * Uses SIMD-optimized quantization (AVX-512/AVX2) via simd::quantize_single_block().
              */
             bool quantize_activations(
                 const float *A,
@@ -1044,6 +1016,7 @@ namespace llaminar2
 
                 int k_blocks = (k + 31) / 32;
                 Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
+                const bool k_aligned = (k % 32 == 0);
 
 #pragma omp parallel
                 {
@@ -1059,36 +1032,11 @@ namespace llaminar2
                         {
                             for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                             {
-                                const float *a_row = A + i * k;
+                                const float *a_row = A + i * k + k_blk * 32;
                                 Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
-                                float max_abs = 0.0f;
-                                for (int j = 0; j < 32; ++j)
-                                {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
-                                    if (val > max_abs)
-                                        max_abs = val;
-                                }
-
-                                float d = max_abs / 127.0f;
-                                if (d < 1e-10f)
-                                    d = 1e-10f;
-                                float id = 1.0f / d;
-
-                                row_blocks[k_blk].d = fp32_to_fp16(d);
-
-                                int32_t sum_qs = 0;
-                                for (int j = 0; j < 32; ++j)
-                                {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
-                                    int8_t q = static_cast<int8_t>(std::round(val * id));
-                                    row_blocks[k_blk].qs[j] = q;
-                                    sum_qs += q;
-                                }
-
-                                row_blocks[k_blk].sum_qs = sum_qs;
+                                int valid_elements = std::min(32, k - k_blk * 32);
+                                simd::quantize_single_block(a_row, row_blocks[k_blk], valid_elements);
                             }
                         }
                     }
@@ -1100,35 +1048,27 @@ namespace llaminar2
                             const float *a_row = A + i * k;
                             Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
-                            for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                            if (k_aligned)
                             {
-                                float max_abs = 0.0f;
-                                for (int j = 0; j < 32; ++j)
+                                // Fast path: K is multiple of 32
+                                for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                                 {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
-                                    if (val > max_abs)
-                                        max_abs = val;
+                                    simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
                                 }
-
-                                float d = max_abs / 127.0f;
-                                if (d < 1e-10f)
-                                    d = 1e-10f;
-                                float id = 1.0f / d;
-
-                                row_blocks[k_blk].d = fp32_to_fp16(d);
-
-                                int32_t sum_qs = 0;
-                                for (int j = 0; j < 32; ++j)
+                            }
+                            else
+                            {
+                                // General path: handle partial last block
+                                for (int k_blk = 0; k_blk < k_blocks - 1; ++k_blk)
                                 {
-                                    int col_idx = k_blk * 32 + j;
-                                    float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
-                                    int8_t q = static_cast<int8_t>(std::round(val * id));
-                                    row_blocks[k_blk].qs[j] = q;
-                                    sum_qs += q;
+                                    simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
                                 }
-
-                                row_blocks[k_blk].sum_qs = sum_qs;
+                                if (k_blocks > 0)
+                                {
+                                    int last_k_blk = k_blocks - 1;
+                                    int valid_elements = k - last_k_blk * 32;
+                                    simd::quantize_single_block(a_row + last_k_blk * 32, row_blocks[last_k_blk], valid_elements);
+                                }
                             }
                         }
                     }

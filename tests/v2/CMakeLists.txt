@@ -1638,6 +1638,19 @@ add_v2_test(V2_Unit_Q2_K_SIMD
     LABELS "V2;Unit;TensorOperations;Q2_K;Quantization;SIMD;AVX2;AVX512;Equivalency;KQuant;SuperBlock"
 )
 
+# Test: Q8_1 Quantize SIMD Equivalency (FP32 → Q8_1)
+add_executable(v2_test_q8_1_quantize_simd unit/Test__Q8_1_QuantizeSIMD.cpp)
+target_link_libraries(v2_test_q8_1_quantize_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_QuantizeSIMD 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_quantize_simd>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;SIMD;AVX2;AVX512;Equivalency"
+)
+
 # Test: Q8_0 SIMD Equivalency
 add_executable(v2_test_q8_0_simd integration/Test__Q8_0Tensor.cpp)
 target_link_libraries(v2_test_q8_0_simd 
@@ -1878,6 +1891,18 @@ target_link_libraries(v2_perf_q8_1_gemm_fused
 add_v2_test(V2_Perf_Q8_1_GEMM_Fused 
     COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_fused>
     LABELS "V2;Performance;GEMM;Q8_1;Fused;Softmax"
+)
+
+# Performance Test: Q8_1 Quantize SIMD (Scalar/AVX2/AVX512 throughput comparison)
+add_executable(v2_perf_q8_1_quantize_simd performance/Perf__Q8_1_QuantizeSIMD.cpp)
+target_link_libraries(v2_perf_q8_1_quantize_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q8_1_QuantizeSIMD 
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_quantize_simd>
+    LABELS "V2;Performance;Quantization;Q8_1;SIMD;AVX2;AVX512"
 )
 
 # Test: IQ4_XS Tensor Views

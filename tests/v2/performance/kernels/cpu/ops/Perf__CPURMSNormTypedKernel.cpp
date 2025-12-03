@@ -7,11 +7,18 @@
  * 2. CPURMSNormTypedKernel<FP32> (should match baseline)
  * 3. CPURMSNormTypedKernel<BF16> (2x memory compression)
  * 4. CPURMSNormTypedKernel<FP16> (2x memory compression)
- * 5. CPURMSNormTypedKernel<Q8_1> (3.5x memory compression)
+ * 5. CPURMSNormTypedKernel<Q8_1> (3.5x compression, direct SIMD quantization)
+ * 6. CPURMSNormTypedKernel<Q8_1> via IActivationTensor interface (OpenMP parallel)
+ *
+ * The Q8_1 benchmarks compare two quantization approaches:
+ * - **Direct SIMD** (`simd::quantize_fp32_to_q8_1_blocks`): Vectorized AVX512/AVX2,
+ *   single-threaded, optimal for small matrices
+ * - **IActivationTensor** (`FP32Tensor::quantize_to_q8_1`): OpenMP parallelized,
+ *   scalar inner loop, optimal for large matrices with many rows
  *
  * Success Criteria:
  * - FP32 typed kernel matches original FP32 performance (±5%)
- * - BF16/FP16/Q8_1 variants have ≤10% overhead vs FP32
+ * - BF16/FP16/Q8_1 variants have ≤20% overhead vs FP32
  *   (dequant/requant cost offset by reduced memory bandwidth)
  *
  * @author David Sanftenberg

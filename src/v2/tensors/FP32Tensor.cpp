@@ -26,6 +26,12 @@
 #include <cmath>
 #include <omp.h>
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace llaminar2
 {
 
@@ -730,6 +736,19 @@ namespace llaminar2
 
     // ===== Bulk Q8_1 Quantization =====
 
+    /**
+     * @brief Bulk quantize FP32 tensor to Q8_1 format (SIMD-optimized)
+     *
+     * Dispatches to AVX-512, AVX2, or scalar implementation based on CPU features.
+     * Uses OpenMP parallelization with adaptive strategy:
+     * - Large M: Parallelize over rows (better cache locality)
+     * - Small M: Collapse rows × blocks (more parallelism)
+     *
+     * @param q8_1_buffer Output buffer for Q8_1 blocks [m * k_blocks]
+     * @param m Number of rows (batch_size * seq_len)
+     * @param k Number of columns (must match tensor's K dimension)
+     * @return true on success, false on failure
+     */
     bool FP32Tensor::quantize_to_q8_1(void *q8_1_buffer, int m, int k) const
     {
         if (!q8_1_buffer || m <= 0 || k <= 0)
@@ -749,10 +768,12 @@ namespace llaminar2
         Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
         const float *fp32_data = data();
 
+        // Check if K is a multiple of 32 (enables fast path with no bounds checking)
+        const bool k_aligned = (k % 32 == 0);
+
 #pragma omp parallel
         {
             // Parallelize over rows for large M, or collapse(2) for small M
-            // to ensure we have enough work per thread
             int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
             if (quant_thresh == 0)
                 quant_thresh = omp_get_num_threads();
@@ -765,39 +786,11 @@ namespace llaminar2
                 {
                     for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                     {
-                        const float *a_row = fp32_data + i * cols;
+                        const float *a_row = fp32_data + i * cols + k_blk * 32;
                         Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
-                        // Find max absolute value in block
-                        float max_abs = 0.0f;
-                        for (int j = 0; j < 32; ++j)
-                        {
-                            int col_idx = k_blk * 32 + j;
-                            float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
-                            if (val > max_abs)
-                                max_abs = val;
-                        }
-
-                        // Compute scale
-                        float d = max_abs / 127.0f;
-                        if (d < 1e-10f)
-                            d = 1e-10f;
-                        float id = 1.0f / d;
-
-                        row_blocks[k_blk].d = fp32_to_fp16(d);
-
-                        // Quantize values and compute sum
-                        int32_t sum_qs = 0;
-                        for (int j = 0; j < 32; ++j)
-                        {
-                            int col_idx = k_blk * 32 + j;
-                            float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
-                            int8_t q = static_cast<int8_t>(std::round(val * id));
-                            row_blocks[k_blk].qs[j] = q;
-                            sum_qs += q;
-                        }
-
-                        row_blocks[k_blk].sum_qs = static_cast<int16_t>(sum_qs);
+                        int valid_elements = std::min(32, k - k_blk * 32);
+                        simd::quantize_single_block(a_row, row_blocks[k_blk], valid_elements);
                     }
                 }
             }
@@ -810,38 +803,29 @@ namespace llaminar2
                     const float *a_row = fp32_data + i * cols;
                     Q8_1Block *row_blocks = all_blocks + i * k_blocks;
 
-                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    if (k_aligned)
                     {
-                        // Find max absolute value in block
-                        float max_abs = 0.0f;
-                        for (int j = 0; j < 32; ++j)
+                        // Fast path: K is multiple of 32, no partial blocks
+                        for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                         {
-                            int col_idx = k_blk * 32 + j;
-                            float val = (col_idx < k) ? std::abs(a_row[col_idx]) : 0.0f;
-                            if (val > max_abs)
-                                max_abs = val;
+                            simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
+                        }
+                    }
+                    else
+                    {
+                        // General path: handle partial last block
+                        for (int k_blk = 0; k_blk < k_blocks - 1; ++k_blk)
+                        {
+                            simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
                         }
 
-                        // Compute scale
-                        float d = max_abs / 127.0f;
-                        if (d < 1e-10f)
-                            d = 1e-10f;
-                        float id = 1.0f / d;
-
-                        row_blocks[k_blk].d = fp32_to_fp16(d);
-
-                        // Quantize values and compute sum
-                        int32_t sum_qs = 0;
-                        for (int j = 0; j < 32; ++j)
+                        // Last block may be partial
+                        if (k_blocks > 0)
                         {
-                            int col_idx = k_blk * 32 + j;
-                            float val = (col_idx < k) ? a_row[col_idx] : 0.0f;
-                            int8_t q = static_cast<int8_t>(std::round(val * id));
-                            row_blocks[k_blk].qs[j] = q;
-                            sum_qs += q;
+                            int last_k_blk = k_blocks - 1;
+                            int valid_elements = k - last_k_blk * 32;
+                            simd::quantize_single_block(a_row + last_k_blk * 32, row_blocks[last_k_blk], valid_elements);
                         }
-
-                        row_blocks[k_blk].sum_qs = static_cast<int16_t>(sum_qs);
                     }
                 }
             }
