@@ -401,6 +401,14 @@ namespace llaminar2
          */
         std::unique_ptr<TensorFactory> tensor_factory_;
 
+        /**
+         * @brief Default MPI context for single-rank (non-MPI) operation
+         *
+         * Created when mpi_ctx_ is null, allows TensorFactory to work without
+         * explicit MPI initialization. Uses MPI_COMM_SELF for isolation.
+         */
+        std::unique_ptr<MPIContext> default_mpi_ctx_;
+
         // Model path for convenience (from model_ctx_)
         std::string model_path_;
 

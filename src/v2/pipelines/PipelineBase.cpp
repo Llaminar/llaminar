@@ -47,10 +47,18 @@ namespace llaminar2
 
         model_path_ = model_ctx_->path();
 
-        // Initialize tensor factory for NUMA-aware allocation (only if MPI context available)
+        // Initialize tensor factory for NUMA-aware allocation
+        // If MPI context available, use it for NUMA awareness; otherwise create default single-rank context
         if (mpi_ctx_)
         {
             tensor_factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
+        }
+        else
+        {
+            // Create a default single-rank MPI context for TensorFactory
+            // This allows pipelines to work without explicit MPI initialization
+            default_mpi_ctx_ = std::make_unique<MPIContext>(0, 1, MPI_COMM_SELF); // rank 0, world_size 1, self comm
+            tensor_factory_ = std::make_unique<TensorFactory>(*default_mpi_ctx_);
         }
 
         LOG_INFO("[PipelineBase] Initializing with model: " << model_path_);
@@ -671,11 +679,13 @@ namespace llaminar2
         DEBUG_ASSERT(n_layers_ > 0, "n_layers_ must be set before calling initializeKVCache");
         DEBUG_ASSERT(n_kv_heads_ > 0, "n_kv_heads_ must be set before calling initializeKVCache");
         DEBUG_ASSERT(head_dim_ > 0, "head_dim_ must be set before calling initializeKVCache");
-        DEBUG_ASSERT(mpi_ctx_ != nullptr, "mpi_ctx_ must be set before calling initializeKVCache");
+
+        // Use effective MPI context (user-provided or default single-rank)
+        const MPIContext &effective_mpi_ctx = mpi_ctx_ ? *mpi_ctx_ : *default_mpi_ctx_;
 
         // Phase 3: Use placement map to detect attention devices per layer
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
-        kv_cache_ = std::make_shared<KVCache>(*mpi_ctx_, n_layers_, max_seq_len, n_kv_heads_, head_dim_, attention_devices);
+        kv_cache_ = std::make_shared<KVCache>(effective_mpi_ctx, n_layers_, max_seq_len, n_kv_heads_, head_dim_, attention_devices);
         current_positions_.clear(); // Will be resized to batch_size in forward_batch()
 
         LOG_INFO("Initialized KV cache: " << n_layers_ << " layers, "

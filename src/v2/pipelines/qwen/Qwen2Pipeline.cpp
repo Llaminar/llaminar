@@ -132,9 +132,11 @@ namespace llaminar2
         initializeInfrastructureBatched();
 
         // Override KV cache with batched version
+        // Use effective MPI context (user-provided or default single-rank)
+        const MPIContext &effective_mpi_ctx = mpi_ctx_ ? *mpi_ctx_ : *default_mpi_ctx_;
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
         kv_cache_batched_ = std::make_shared<BatchedKVCache>(
-            *mpi_ctx_, n_layers_, batch_size_, config.max_seq_len, n_kv_heads_, head_dim_, attention_devices);
+            effective_mpi_ctx, n_layers_, batch_size_, config.max_seq_len, n_kv_heads_, head_dim_, attention_devices);
         LOG_DEBUG("Initialized batched KV cache: batch_size=" << batch_size_
                                                               << ", max_seq_len=" << config.max_seq_len);
 
