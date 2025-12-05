@@ -1416,7 +1416,7 @@ namespace llaminar2
      *
      * **NOT implemented**: IActivationTensor (INT8Tensor represents weights, not activations)
      */
-    class INT8Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
+    class INT8Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         explicit INT8Tensor(const std::vector<size_t> &shape);
@@ -1440,32 +1440,12 @@ namespace llaminar2
 
         bool copyFrom(const TensorBase *src) override;
 
-        // IActivationTensor interface - kernel factory methods
+        // TensorBase pure virtual - required implementation
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
 
         // Phase 2 fused kernel factory methods
         std::unique_ptr<class FusedGEMM> createFusedDualGemm(TensorBase *gate_weight, TensorBase *up_weight);
         std::unique_ptr<class FusedGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
-
-        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
-        bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
-        bool applyRoPE(float *K, const int *position_ids, int seq_len,
-                       int n_heads, int n_kv_heads, int head_dim,
-                       float rope_theta = 10000.0f, bool use_bf16 = false,
-                       const MPIContext *mpi_ctx = nullptr, int device_idx = 0) override;
-
-        bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
 
         bool from_int32_with_scales(
             const int32_t *accum,

@@ -12,7 +12,7 @@
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../kernels/cpu/ops/CPURMSNormTypedKernel.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
@@ -207,8 +207,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRMSNorm> BF16Tensor::createRMSNorm()
     {
-        // BF16 tensors use native BF16 RMSNorm kernel (no conversion to FP32)
-        return std::make_unique<CPURMSNormKernelT<BF16Tensor>>();
+        // BF16 tensors use typed RMSNorm kernel
+        return std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::BF16>>();
     }
 
     std::unique_ptr<ITensorAttention> BF16Tensor::createAttention()

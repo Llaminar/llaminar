@@ -7,7 +7,7 @@
 #include "Tensors.h"
 #include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
-#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../kernels/cpu/ops/CPURMSNormTypedKernel.h"
 
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
@@ -214,8 +214,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRMSNorm> Q8_1Tensor::createRMSNorm()
     {
-        // RMSNorm operates on dequantized FP32 data
-        return std::make_unique<llaminar2::CPURMSNormKernelT<Q8_1Tensor>>();
+        // Q8_1 tensors use typed RMSNorm kernel with pure-integer path
+        return std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::Q8_1>>();
     }
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()

@@ -193,19 +193,76 @@ namespace llaminar2
      * No dequant/requant overhead.
      */
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::FP32> : public CPUKernelBase
+    class CPURMSNormTypedKernel<ActivationPrecision::FP32> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = float;
 
         CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() override = default;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
 
+        // ===== ITensorRMSNorm interface =====
+        bool apply(
+            const float *input, const float *weight, float *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)use_bf16;
+            (void)mpi_ctx;
+            return apply_typed(input, weight, output, rows, cols, epsilon, device_idx);
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // FP32 kernel doesn't handle BF16
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // FP32 kernel doesn't handle FP16
+        }
+
+        bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // FP32 kernel doesn't handle Q8_1
+        }
+
+        // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with FP32 input/output (no conversion)
          */
@@ -241,19 +298,76 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::BF16> : public CPUKernelBase
+    class CPURMSNormTypedKernel<ActivationPrecision::BF16> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = uint16_t; // BF16 stored as uint16_t
 
         CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() override = default;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
 
+        // ===== ITensorRMSNorm interface =====
+        bool apply(
+            const float *input, const float *weight, float *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // BF16 kernel doesn't handle FP32
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            return apply_typed(input, weight, output, rows, cols, epsilon, device_idx);
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // BF16 kernel doesn't handle FP16
+        }
+
+        bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // BF16 kernel doesn't handle Q8_1
+        }
+
+        // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with BF16 input/output
          *
@@ -294,19 +408,76 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::FP16> : public CPUKernelBase
+    class CPURMSNormTypedKernel<ActivationPrecision::FP16> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = uint16_t; // FP16 stored as uint16_t
 
         CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() override = default;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
 
+        // ===== ITensorRMSNorm interface =====
+        bool apply(
+            const float *input, const float *weight, float *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // FP16 kernel doesn't handle FP32
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // FP16 kernel doesn't handle BF16
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            return apply_typed(input, weight, output, rows, cols, epsilon, device_idx);
+        }
+
+        bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // FP16 kernel doesn't handle Q8_1
+        }
+
+        // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with FP16 input/output
          */
@@ -345,19 +516,76 @@ namespace llaminar2
     struct Q8_1Block;
 
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::Q8_1> : public CPUKernelBase
+    class CPURMSNormTypedKernel<ActivationPrecision::Q8_1> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = Q8_1Block;
 
         CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() override = default;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
 
+        // ===== ITensorRMSNorm interface =====
+        bool apply(
+            const float *input, const float *weight, float *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Q8_1 kernel doesn't handle FP32
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // Q8_1 kernel doesn't handle BF16
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // Q8_1 kernel doesn't handle FP16
+        }
+
+        bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            return apply_typed(input, weight, output, rows, cols, epsilon, device_idx);
+        }
+
+        // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with Q8_1 input/output
          *

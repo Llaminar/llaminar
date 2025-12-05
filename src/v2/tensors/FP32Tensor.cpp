@@ -16,7 +16,7 @@
 #include "../backends/IBackend.h"
 #include "../backends/BackendManager.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
-#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../kernels/cpu/ops/CPURMSNormTypedKernel.h"
 
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
@@ -141,8 +141,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRMSNorm> FP32Tensor::createRMSNorm()
     {
-        // FP32 tensors use CPU RMSNorm kernel
-        return std::make_unique<CPURMSNormKernelT<FP32Tensor>>();
+        // FP32 tensors use typed RMSNorm kernel
+        return std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::FP32>>();
     }
 
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()

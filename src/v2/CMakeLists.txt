@@ -542,7 +542,6 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     # Fused kernels (operator fusion framework)
-    kernels/cpu/fused/FusedRMSNormQuantize.cpp  # Phase 1: RMSNorm + INT8 quantization
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     kernels/cpu/fused/FusedDequantSwiGLU.cpp    # Phase 2: Dequant + SwiGLU activation
     # Kernel dispatch factory (centralized device-aware kernel creation)

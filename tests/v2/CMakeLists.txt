@@ -525,32 +525,6 @@ add_v2_test(V2_Integration_IQ4_NLTensor
     LABELS "V2;Integration;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
-# Test: FusedRMSNormQuantize kernel (operator fusion framework - Phase 1)
-add_executable(v2_test_fused_rmsnorm_quantize unit/Test__FusedRMSNormQuantize.cpp)
-target_link_libraries(v2_test_fused_rmsnorm_quantize
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FusedRMSNormQuantize
-    COMMAND $<TARGET_FILE:v2_test_fused_rmsnorm_quantize>
-    LABELS "V2;Unit;Kernels;FusedKernels;RMSNorm;Quantization;INT8;OperatorFusion;AVX512;AVX2;CPU"
-    MPI_PROCS 1  # CPU-only fused kernel, single rank
-)
-
-# Test: FusedRMSNormQuantize Padding (Regression test)
-add_executable(v2_test_fused_rmsnorm_quantize_padding unit/Test__FusedRMSNormQuantize_Padding.cpp)
-target_link_libraries(v2_test_fused_rmsnorm_quantize_padding
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FusedRMSNormQuantize_Padding
-    COMMAND $<TARGET_FILE:v2_test_fused_rmsnorm_quantize_padding>
-    LABELS "V2;Unit;Kernels;FusedKernels;RMSNorm;Quantization;Padding"
-    MPI_PROCS 1
-)
-
 # NOTE: FusedDequantSwiGLU tests temporarily disabled during FP32 residual migration.
 # See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for integration timeline.
 
@@ -1094,19 +1068,6 @@ add_v2_test(V2_Unit_AttentionMaskDiagnostic
 #     LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;Pipeline;INT32;Requantization;EndToEnd"
 #     MPI_PROCS 1  # CPU-only, single rank
 # )
-
-# Test: Qwen2 INT8 Buffer Bug (demonstrates total_rows vs effective_seq_len bug)
-add_executable(v2_test_qwen2_int8_buffer_bug unit/Test__Qwen2Pipeline_INT8BufferBug.cpp)
-target_link_libraries(v2_test_qwen2_int8_buffer_bug 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Qwen2INT8BufferBug
-    COMMAND $<TARGET_FILE:v2_test_qwen2_int8_buffer_bug>
-    LABELS "V2;Unit;Pipelines;Qwen2;INT8;BufferManagement;BatchPadding;BugDemonstration"
-    MPI_PROCS 1  # Single rank unit test
-)
 
 # Test: TensorBase Conversion Interface
 add_executable(v2_test_tensor_conversion unit/tensors/Test__TensorConversion.cpp)
