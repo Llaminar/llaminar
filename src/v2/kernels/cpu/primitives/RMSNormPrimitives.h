@@ -9,12 +9,14 @@
  * - Thread-local scratch buffers
  * - T5 compatibility mode
  * - INT32→INT8 pipeline support for full INT8 inference
+ * - Q8_1 integer-space RMSNorm (avoids FP32 dequant overhead)
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives
 {
@@ -508,5 +510,81 @@ namespace llaminar2::primitives
         float &out_scale,
         int cols,
         float epsilon);
+
+    // ========================================================================
+    // Q8_1 Integer-Space RMSNorm (avoids FP32 dequantization for sum-of-squares)
+    // ========================================================================
+
+    /**
+     * @brief Q8_1 RMSNorm computed mostly in integer space
+     *
+     * Key insight: For Q8_1, the dequantized value is: x_i = d * qs[i]
+     * So sum(x_i²) = d² * sum(qs[i]²), where sum(qs[i]²) is pure integer!
+     *
+     * This avoids expensive FP32 dequantization in the sum-of-squares phase.
+     * Only the final normalization requires FP32 operations.
+     *
+     * Algorithm:
+     * 1. Integer phase: Compute sum(qs[i]²) using SIMD integer ops (AVX512-VNNI)
+     * 2. Scale phase: total_sum_sq = Σ(d_b² × int_sum_sq_b) over all blocks
+     * 3. FP phase: inv_rms = 1 / sqrt(total_sum_sq / n + eps)
+     * 4. Output: Re-quantize normalized values to Q8_1
+     *
+     * @param input Input Q8_1 blocks (blocks_per_row blocks)
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param output Output Q8_1 blocks (blocks_per_row blocks)
+     * @param blocks_per_row Number of Q8_1 blocks per row (cols / 32)
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_q8_1_integer_row(
+        const Q8_1Block *input,
+        const float *gamma,
+        Q8_1Block *output,
+        std::size_t blocks_per_row,
+        float epsilon);
+
+    /**
+     * @brief Q8_1 RMSNorm for multiple rows (parallelized)
+     *
+     * @param input Input Q8_1 blocks [rows * blocks_per_row]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param output Output Q8_1 blocks [rows * blocks_per_row]
+     * @param rows Number of rows
+     * @param blocks_per_row Number of Q8_1 blocks per row (cols / 32)
+     * @param epsilon Epsilon for numerical stability
+     * @param opts Execution options
+     */
+    void rmsnorm_q8_1_integer(
+        const Q8_1Block *input,
+        const float *gamma,
+        Q8_1Block *output,
+        std::size_t rows,
+        std::size_t blocks_per_row,
+        float epsilon,
+        const RMSNormExecOptions &opts = {});
+
+    /**
+     * @brief Pure-integer Q8_1 RMSNorm (EXPERIMENTAL)
+     *
+     * Performs RMSNorm entirely in the integer domain without any FP32 operations.
+     * Requires pre-quantized gamma weights. Uses AVX512 vectorization.
+     *
+     * Key simplification: Ignores the per-block FP16 scale 'd' during normalization,
+     * computing inv_rms based only on the integer qs values. This works because
+     * RMSNorm normalizes the distribution, and the relative magnitudes within
+     * the quantized representation are what matter.
+     *
+     * @param input Input Q8_1 blocks (blocks_per_row blocks)
+     * @param gamma_q8 Pre-quantized gamma weights [cols] in Q8 format (gamma * 256)
+     * @param output Output Q8_1 blocks (blocks_per_row blocks)
+     * @param blocks_per_row Number of Q8_1 blocks per row (cols / 32)
+     * @param epsilon_scaled Epsilon pre-scaled (typically 1-100 for stability)
+     */
+    void rmsnorm_q8_1_pure_integer_row(
+        const Q8_1Block *input,
+        const int16_t *gamma_q8,
+        Q8_1Block *output,
+        std::size_t blocks_per_row,
+        int32_t epsilon_scaled);
 
 } // namespace llaminar2::primitives

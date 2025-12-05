@@ -15,8 +15,9 @@
 
 namespace llaminar2
 {
-    // Forward declaration for tensor-based GEMM interface
+    // Forward declarations
     class TensorBase;
+    struct Q8_1Block; // For apply_q8_1() interface
 
     // =============================================================================
     // Fused Operation Configuration
@@ -1187,6 +1188,10 @@ namespace llaminar2
 
         virtual bool apply_fp16(
             const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) { return false; }
+
+        virtual bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
             int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) { return false; }
 
         virtual bool apply_int32_to_int8(

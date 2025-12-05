@@ -2,7 +2,8 @@
 
 **Author**: David Sanftenberg  
 **Date**: December 2, 2025  
-**Status**: In Progress (Phase 1 Complete, Phase 2 Started)
+**Last Updated**: December 3, 2025  
+**Status**: In Progress (Phase 1 Complete, Phase 2 Partial - RMSNorm Done)
 
 ## Executive Summary
 
@@ -19,6 +20,36 @@ This document outlines the implementation plan for **typed residuals** and **typ
 
 **Design Simplification**: All buffer formats (residuals, activations, KV cache) use a single `ActivationPrecision` enum. Kernels are treated as black boxes - they accept inputs in the configured precision and produce outputs in the same precision. This unified approach simplifies configuration and eliminates the need for separate format enums.
 
+### Canonical Implementation Pattern
+
+The `CPURMSNormTypedKernel<ActivationPrecision>` serves as the reference implementation for typed kernels:
+
+```cpp
+// Template on ActivationPrecision (not TensorT)
+template <ActivationPrecision Precision>
+class CPURMSNormTypedKernel : public CPUKernelBase {
+public:
+    using Metadata = detail::PrecisionMetadata<Precision>;
+    using StorageType = typename Metadata::StorageType;
+    
+    // Typed API: input/output in StorageType, gamma always FP32
+    bool apply_typed(const StorageType* input, const float* gamma,
+                     StorageType* output, int rows, int cols, float epsilon);
+    
+    // Fused residual + RMSNorm: dequant(residual) + fp32_input → RMSNorm → output
+    bool apply_with_residual_add(const StorageType* residual, const float* fp32_input,
+                                  const float* gamma, StorageType* output,
+                                  int rows, int cols, float epsilon);
+};
+```
+
+**Key characteristics:**
+- Template on `ActivationPrecision` enum (not tensor types)
+- Use `detail::PrecisionMetadata<Precision>` for storage type mapping
+- Call `simd::` functions from `SIMDHelpers.h` for SIMD-optimized conversions
+- Process row-by-row to keep scratch buffers in L1/L2 cache
+- Stack-allocate scratch for d_model ≤ 4096, heap for larger
+
 ### Memory Impact (Qwen2.5-7B, 4K context)
 
 | Component | FP32 Size | Q8_1 Size | BF16/FP16 Size |
@@ -30,36 +61,72 @@ This document outlines the implementation plan for **typed residuals** and **typ
 
 ### Existing Infrastructure
 
-1. **ActivationPrecision Enum** (`PipelineConfig.h:95`)
+1. **ActivationPrecision Enum** (`PipelineConfig.h`)
    ```cpp
-   enum class ActivationPrecision { FP32, BF16, FP16, INT32 };  // INT32 to be replaced with Q8_1
+   enum class ActivationPrecision { FP32, BF16, FP16, Q8_1 };
    ```
    - Already plumbed through pipeline configuration
    - Used to create activation tensors via `createActivationTensor()`
-   - NOT currently used for residuals (all residuals are FP32)
-   - **NOTE**: INT32 was intended for accumulation but is unused; will be replaced with Q8_1
+   - Q8_1 replaces unused INT32 enum value
+   - Single enum controls residuals, activations, and KV cache formats
 
-2. **Templated Kernels** (already implemented)
-   - `CpuAttentionKernelT<TensorT>` - FP32, BF16, FP16 specializations
-   - `CPURMSNormKernelT<TensorT>` - templated with precision-specific paths
-   - `CPURMSNormTypedKernel<ActivationPrecision>` - **NEW** typed kernel with fused precision conversion
-   - `CPUSwiGLUKernelT<TensorT>` - templated
-   - `CPURoPEKernelT<TensorT>` - templated
-
-3. **ActivationTraits** (`primitives/ActivationTraits.h`)
+2. **PrecisionMetadata Traits** (`CPURMSNormTypedKernel.h:detail`)
    ```cpp
-   template<typename TensorT> struct ActivationTraits {
-       using ElementType = ...;
-       static void apply_softmax(...);
-       static std::unique_ptr<ITensorGemm> create_activation_gemm();
-       static std::shared_ptr<TensorBase> allocate_workspace(...);
+   template <ActivationPrecision Precision>
+   struct PrecisionMetadata;
+   
+   template<> struct PrecisionMetadata<ActivationPrecision::FP32> {
+       using StorageType = float;
+       static constexpr const char* name = "FP32";
+       static constexpr float compression_ratio = 1.0f;
+   };
+   template<> struct PrecisionMetadata<ActivationPrecision::BF16> {
+       using StorageType = uint16_t;  // BF16 as raw bits
+       static constexpr const char* name = "BF16";
+       static constexpr float compression_ratio = 2.0f;
+   };
+   template<> struct PrecisionMetadata<ActivationPrecision::FP16> {
+       using StorageType = uint16_t;  // FP16 as raw bits
+       static constexpr const char* name = "FP16";
+       static constexpr float compression_ratio = 2.0f;
+   };
+   template<> struct PrecisionMetadata<ActivationPrecision::Q8_1> {
+       using StorageType = Q8_1Block;  // 36 bytes per 32 elements
+       static constexpr const char* name = "Q8_1";
+       static constexpr float compression_ratio = 3.5f;
    };
    ```
-   - Specializations exist for FP32Tensor, BF16Tensor, FP16Tensor, Q8_1Tensor
-   - INT32Tensor specialization will be removed (unused)
-   - Provides compile-time dispatch for precision-specific operations
 
-4. **Q8_1Block Structure** (`BlockStructures.h:68`)
+3. **SIMD Conversion Functions** (`SIMDHelpers.h`)
+   All precision conversion primitives live in `simd::` namespace with AVX512/AVX2/scalar fallbacks:
+   ```cpp
+   // BF16 ↔ FP32
+   simd::convert_bf16_to_fp32(src, dst, count);
+   simd::convert_fp32_to_bf16(src, dst, count);
+   
+   // FP16 ↔ FP32  
+   simd::convert_fp16_to_fp32(src, dst, count);
+   simd::convert_fp32_to_fp16(src, dst, count);
+   
+   // Q8_1 ↔ FP32
+   simd::dequantize_q8_1_to_fp32(src, dst, count);
+   simd::quantize_fp32_to_q8_1_blocks(src, dst, count);
+   
+   // Fused residual operations (dequant + add in single pass)
+   simd::fused_fp32_residual_add(residual, input, output, count);
+   simd::fused_bf16_residual_add(residual, input, output, count);
+   simd::fused_fp16_residual_add(residual, input, output, count);
+   simd::fused_q8_1_residual_add(residual, input, output, count);
+   ```
+
+4. **Templated Kernels** (existing tensor-typed kernels)
+   - `CpuAttentionKernelT<TensorT>` - FP32, BF16, FP16, Q8_1 specializations
+   - `CPURMSNormKernelT<TensorT>` - templated on tensor type
+   - `CPUSwiGLUKernelT<TensorT>` - templated
+   - `CPURoPEKernelT<TensorT>` - templated
+   - `CPUSoftmaxKernelT<TensorT>` - templated
+
+5. **Q8_1Block Structure** (`BlockStructures.h:68`)
    ```cpp
    struct Q8_1Block {
        uint16_t d;      // FP16 scale factor
@@ -154,40 +221,45 @@ Bandwidth Reduction: 168 MB → 108 MB = 36% reduction in residual traffic
 
 ## Implementation Progress
 
-### Phase 1: Infrastructure & Traits ✅ COMPLETE (Dec 2, 2025)
+### Phase 1: Infrastructure ✅ COMPLETE (Dec 2-3, 2025)
 
-- [x] `ResidualTraits<ActivationPrecision>` template with FP32, BF16, FP16, Q8_1 specializations
-- [x] `quantize()`, `dequantize()`, `fused_add()`, `allocate()` primitives
-- [x] SIMD-optimized implementations (AVX512/AVX2) for all precision types
-- [x] Unit tests for ResidualTraits (14 tests passing)
-- [x] Updated PipelineConfig.h to use unified `ActivationPrecision`
-- [x] Removed redundant `ResidualFormat` and `KVCacheFormat` enums
+- [x] Updated `ActivationPrecision` enum: replaced INT32 with Q8_1
+- [x] Created `detail::PrecisionMetadata<ActivationPrecision>` traits in `CPURMSNormTypedKernel.h`
+- [x] SIMD-optimized conversion functions in `SIMDHelpers.h`:
+  - `convert_bf16_to_fp32()`, `convert_fp32_to_bf16()`
+  - `convert_fp16_to_fp32()`, `convert_fp32_to_fp16()`
+  - `dequantize_q8_1_to_fp32()`, `quantize_fp32_to_q8_1_blocks()`
+  - `fused_bf16_residual_add()`, `fused_fp16_residual_add()`, `fused_q8_1_residual_add()`
+- [x] All conversions have AVX512, AVX2, and scalar fallback paths
 
-### Phase 2: Typed Kernel Interfaces 🔄 IN PROGRESS (Started Dec 4, 2025)
+**Design Decision**: ResidualTraits template class was **removed** from the design. Instead:
+- Storage types come from `detail::PrecisionMetadata<Precision>::StorageType`
+- Conversion primitives live directly in `simd::` namespace in `SIMDHelpers.h`
+- This is simpler and avoids an extra abstraction layer
 
-- [x] `CPURMSNormTypedKernel<ActivationPrecision>` - typed RMSNorm with fused precision conversion
+### Phase 2: Typed Kernel Implementations 🔄 IN PROGRESS
+
+**Completed:**
+- [x] `CPURMSNormTypedKernel<ActivationPrecision>` ✅ (18 unit tests passing)
   - `apply_typed()` - accepts typed input/output, computes in FP32, fused dequant/requant
-  - `apply_with_residual_add()` - fused residual addition + RMSNorm + requant
+  - `apply_with_residual_add()` - fused: dequant(residual) + fp32_input → RMSNorm → quantize(output)
   - Specializations: FP32, BF16, FP16, Q8_1
-  - Unit tests: 18 tests passing
-- [ ] Typed kernel integration with pipeline Op classes (RMSNormOp)
-- [ ] Pipeline instantiation based on `ActivationPrecision` config
+  - Row-by-row processing keeps scratch in L1/L2 cache
+  - Stack allocation for d_model ≤ 4096, heap fallback for larger
 
-### Phase 3: Fused Residual Addition 📋 NOT STARTED
+**Remaining kernels to implement with typed pattern:**
+- [ ] `CPUSwiGLUTypedKernel<ActivationPrecision>` - SwiGLU activation with fused precision conversion
+- [ ] `CPURoPETypedKernel<ActivationPrecision>` - RoPE with fused precision conversion
+- [ ] `CPUSoftmaxTypedKernel<ActivationPrecision>` - Softmax (attention scores) with typed I/O
+- [ ] `CpuAttentionTypedKernel<ActivationPrecision>` - Full attention block with typed K/V cache
 
-- [ ] RMSNorm with fused residual input (dequant + add + normalize in one pass)
-- [ ] Update pipeline to use fused residual patterns
+### Phase 3: Pipeline Integration 📋 NOT STARTED
 
-### Phase 4: Pipeline Integration 📋 NOT STARTED
+- [ ] Update `ActivationBuffers` to allocate typed residual buffers
+- [ ] Modify pipeline ops (RMSNormOp, SwiGLUOp, etc.) to use typed kernels
+- [ ] Config-driven kernel instantiation based on `ActivationPrecision`
 
-- [ ] `ActivationBuffers` with typed residual support
-- [ ] Config-driven kernel instantiation
-
-### Phase 5: KV Cache Integration 📋 NOT STARTED
-
-- [ ] Typed KV cache storage and retrieval
-
-### Phase 6: Typed KV Cache 📋 NOT STARTED
+### Phase 4: Typed KV Cache 📋 NOT STARTED
 
 - [ ] KV cache precision follows `ActivationPrecision` config
 - [ ] Modified K/V storage: store in configured precision after projection
@@ -198,494 +270,153 @@ Bandwidth Reduction: 168 MB → 108 MB = 36% reduction in residual traffic
 
 ## Implementation Phases (Detailed Design)
 
-### Phase 1: Infrastructure & Traits (2-3 days)
+### Phase 1: Infrastructure ✅ COMPLETE
 
-#### 1.1 Modify ActivationPrecision Enum (Replace INT32 with Q8_1)
+All infrastructure is in place. The key components are:
 
-```cpp
-// PipelineConfig.h
-enum class ActivationPrecision {
-    FP32,   // 32-bit float (default)
-    BF16,   // bfloat16
-    FP16,   // IEEE float16
-    Q8_1    // Block-quantized int8 with scale (36 bytes per 32 elements)
-            // REPLACES INT32 which was unused
-};
-```
-
-**Rationale for removing INT32**:
-- INT32 was intended for quantized GEMM accumulation but was never implemented
-- No existing code paths use `ActivationPrecision::INT32`
-- Q8_1 is more useful: provides 3.5x compression for residual/activation storage
-- Keeps enum size small (4 values) for switch statement efficiency
-```
-
-#### 1.2 Unified Buffer Format (No Separate ResidualFormat)
-
-**Design Decision**: After architectural review, we determined that a separate `ResidualFormat` enum is unnecessary. All buffer formats (activations, residuals, KV cache) use the single `ActivationPrecision` enum.
-
-**Rationale**:
-- Kernels are black boxes: they handle internal precision conversions transparently
-- Config layer only needs to specify DRAM storage format
-- Simpler mental model: one enum controls all intermediate buffer formats
-- Reduces configuration complexity and potential for mismatched formats
+#### 1.1 PrecisionMetadata Traits (in CPURMSNormTypedKernel.h)
 
 ```cpp
-// PipelineConfig.h - Simplified
-struct PipelineConfig {
-    ActivationPrecision activation_precision = ActivationPrecision::FP32;
-    // No separate residual_format - residuals use activation_precision
-    // ...
-};
-```
+namespace detail {
+    template <ActivationPrecision Precision>
+    struct PrecisionMetadata;
 
-#### 1.3 Create ResidualTraits Template
-
-```cpp
-// src/v2/kernels/cpu/primitives/ResidualTraits.h
-
-template<ActivationPrecision Precision>
-struct ResidualTraits;
-
-template<>
-struct ResidualTraits<ActivationPrecision::FP32> {
-    using StorageType = float;
-    static constexpr size_t bytes_per_element = 4;
-    static constexpr bool needs_quantization = false;
-    
-    static void save(const float* src, void* dst, size_t n) {
-        std::memcpy(dst, src, n * sizeof(float));
-    }
-    
-    static void add_to_output(const void* residual, const float* input, 
-                              float* output, size_t n) {
-        const float* res = static_cast<const float*>(residual);
-        #pragma omp parallel for simd
-        for (size_t i = 0; i < n; ++i) {
-            output[i] = res[i] + input[i];
-        }
-    }
-};
-
-template<>
-struct ResidualTraits<ActivationPrecision::Q8_1> {
-    using StorageType = Q8_1Block;
-    static constexpr size_t bytes_per_element = 36.0f / 32.0f;  // 1.125
-    static constexpr bool needs_quantization = true;
-    static constexpr size_t block_size = 32;
-    
-    static size_t storage_size(size_t n_elements) {
-        size_t n_blocks = (n_elements + 31) / 32;
-        return n_blocks * sizeof(Q8_1Block);
-    }
-    
-    static void save(const float* src, void* dst, size_t n);
-    static void add_to_output(const void* residual, const float* input,
-                              float* output, size_t n);
-};
-
-template<>
-struct ResidualTraits<ActivationPrecision::BF16> {
-    using StorageType = uint16_t;  // BF16 stored as uint16
-    static constexpr size_t bytes_per_element = 2;
-    static constexpr bool needs_quantization = true;  // FP32→BF16 truncation
-    
-    static void save(const float* src, void* dst, size_t n);
-    static void add_to_output(const void* residual, const float* input,
-                              float* output, size_t n);
-};
-
-template<>
-struct ResidualTraits<ActivationPrecision::FP16> {
-    using StorageType = uint16_t;  // FP16 stored as uint16
-    static constexpr size_t bytes_per_element = 2;
-    static constexpr bool needs_quantization = true;
-    
-    static void save(const float* src, void* dst, size_t n);
-    static void add_to_output(const void* residual, const float* input,
-                              float* output, size_t n);
-};
-```
-
-#### 1.4 Create Typed Residual Buffer Class
-
-```cpp
-// src/v2/tensors/ResidualBuffer.h
-
-class IResidualBuffer {
-public:
-    virtual ~IResidualBuffer() = default;
-    
-    // Save FP32 activation to residual (quantizes if needed)
-    virtual void save(const float* src, size_t n_elements) = 0;
-    
-    // Add residual to FP32 input, write to FP32 output
-    virtual void add_to(const float* input, float* output, size_t n_elements) = 0;
-    
-    // Get raw storage for advanced use
-    virtual void* raw_data() = 0;
-    virtual const void* raw_data() const = 0;
-    virtual size_t storage_bytes() const = 0;
-    virtual ActivationPrecision format() const = 0;
-};
-
-template<ActivationPrecision Precision>
-class TypedResidualBuffer : public IResidualBuffer {
-    using Traits = ResidualTraits<Precision>;
-    using StorageType = typename Traits::StorageType;
-    
-    std::vector<uint8_t> storage_;
-    size_t capacity_elements_;
-    
-public:
-    explicit TypedResidualBuffer(size_t max_elements);
-    
-    void save(const float* src, size_t n) override {
-        Traits::save(src, storage_.data(), n);
-    }
-    
-    void add_to(const float* input, float* output, size_t n) override {
-        Traits::add_to_output(storage_.data(), input, output, n);
-    }
-    
-    // ... other methods
-};
-
-// Factory function
-std::unique_ptr<IResidualBuffer> createResidualBuffer(
-    ActivationPrecision precision, size_t max_elements);
-```
-
-### Phase 2: Fused Kernel Epilogues (3-5 days)
-
-This is the **critical optimization**: output quantization must happen in kernel epilogues while data is still in registers/L1 cache.
-
-#### 2.1 GEMM Output with Fused Residual Save
-
-The key insight is that `QuantisedGemmKernel` already computes results tile-by-tile. We need to add an optional "write as Q8_1" path in the epilogue.
-
-```cpp
-// GemmFusedOps extension
-struct GemmFusedOps {
-    // ... existing fields ...
-    
-    // NEW: Residual save fusion
-    enum class OutputFormat {
-        FP32,      // Default: write FP32 to C
-        Q8_1,      // Quantize to Q8_1 while writing
-        BF16,      // Convert to BF16 while writing  
-        FP16       // Convert to FP16 while writing
+    template<> struct PrecisionMetadata<ActivationPrecision::FP32> {
+        using StorageType = float;
+        static constexpr const char* name = "FP32";
+        static constexpr float compression_ratio = 1.0f;
     };
     
-    OutputFormat output_format = OutputFormat::FP32;
-    void* residual_dst = nullptr;  // Destination for fused residual save
+    template<> struct PrecisionMetadata<ActivationPrecision::BF16> {
+        using StorageType = uint16_t;
+        static constexpr const char* name = "BF16";
+        static constexpr float compression_ratio = 2.0f;
+    };
     
-    static GemmFusedOps with_residual_save(OutputFormat fmt, void* dst) {
-        GemmFusedOps ops;
-        ops.output_format = fmt;
-        ops.residual_dst = dst;
-        return ops;
-    }
-};
-```
-
-#### 2.2 Kernel Microkernel Epilogue Modifications
-
-The actual kernel epilogues (in the VNNI microkernel) need modification:
-
-```cpp
-// In QuantisedGemmKernel - after accumulation, before store
-void kernel_epilogue_q8_1(float* accum, Q8_1Block* dst, int n_cols) {
-    // accum contains the FP32 results for this tile
-    // We need to quantize and write to dst
+    template<> struct PrecisionMetadata<ActivationPrecision::FP16> {
+        using StorageType = uint16_t;
+        static constexpr const char* name = "FP16";
+        static constexpr float compression_ratio = 2.0f;
+    };
     
-    // Find max for quantization scale
-    float max_abs = 0.0f;
-    for (int i = 0; i < n_cols; ++i) {
-        max_abs = std::max(max_abs, std::abs(accum[i]));
-    }
-    
-    float d = max_abs / 127.0f;
-    if (d < 1e-10f) d = 1e-10f;
-    float id = 1.0f / d;
-    
-    // Quantize in groups of 32
-    for (int blk = 0; blk < n_cols; blk += 32) {
-        Q8_1Block& block = dst[blk / 32];
-        block.d = fp32_to_fp16(d);  // Or per-block scale if needed
-        
-        int32_t sum_qs = 0;
-        for (int j = 0; j < 32 && blk + j < n_cols; ++j) {
-            int8_t q = static_cast<int8_t>(std::round(accum[blk + j] * id));
-            block.qs[j] = q;
-            sum_qs += q;
-        }
-        block.sum_qs = sum_qs;
-    }
+    template<> struct PrecisionMetadata<ActivationPrecision::Q8_1> {
+        using StorageType = Q8_1Block;
+        static constexpr const char* name = "Q8_1";
+        static constexpr float compression_ratio = 3.5f;
+    };
 }
 ```
 
-#### 2.3 Attention Output Projection with Fused Residual
+#### 1.2 SIMD Conversion Functions (in SIMDHelpers.h)
 
-Modify the attention output projection (`wo` GEMM) to optionally write Q8_1:
-
-```cpp
-// In Qwen2Pipeline::attention_block()
-
-// Option A: Separate residual buffer (current approach, but typed)
-if (activation_precision_ == ActivationPrecision::Q8_1) {
-    // Project wo with fused Q8_1 residual save
-    TRY_OP(project_with_residual_save(
-        buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
-        effective_seq_len, d_model_, n_heads_ * head_dim_,
-        buffers.residual.get(), ActivationPrecision::Q8_1,  // Fused save to Q8_1
-        layer_prefix + "_ATTENTION_OUTPUT"));
-}
-else {
-    // Standard FP32 path
-    TRY_OP(project(...));
-    TRY_OP(save_residual(...));
-}
-```
-
-#### 2.4 FFN Down Projection with Fused Residual
-
-Same pattern for FFN down projection:
+All conversion functions are implemented with AVX512 → AVX2 → scalar tiered fallback:
 
 ```cpp
-// In Qwen2Pipeline::ffn_block()
-
-if (activation_precision_ == ActivationPrecision::Q8_1) {
-    TRY_OP(project_with_residual_save(
-        buffers.up.get(), layer.down_proj.get(), buffers.ffn_output.get(),
-        effective_seq_len, d_model_, d_ff_,
-        buffers.residual.get(), ActivationPrecision::Q8_1,
-        layer_prefix + "_FFN_DOWN"));
+namespace simd {
+    // BF16 ↔ FP32
+    void convert_bf16_to_fp32(const uint16_t* src, float* dst, size_t count);
+    void convert_fp32_to_bf16(const float* src, uint16_t* dst, size_t count);
+    
+    // FP16 ↔ FP32
+    void convert_fp16_to_fp32(const uint16_t* src, float* dst, size_t count);
+    void convert_fp32_to_fp16(const float* src, uint16_t* dst, size_t count);
+    
+    // Q8_1 ↔ FP32
+    void dequantize_q8_1_to_fp32(const Q8_1Block* src, float* dst, size_t count);
+    void quantize_fp32_to_q8_1_blocks(const float* src, Q8_1Block* dst, size_t count);
+    
+    // Fused residual operations (dequant + add in single SIMD pass)
+    void fused_fp32_residual_add(const float* res, const float* in, float* out, size_t n);
+    void fused_bf16_residual_add(const uint16_t* res, const float* in, float* out, size_t n);
+    void fused_fp16_residual_add(const uint16_t* res, const float* in, float* out, size_t n);
+    void fused_q8_1_residual_add(const Q8_1Block* res, const float* in, float* out, size_t n);
 }
 ```
 
-### Phase 3: Fused Residual Addition (2-3 days)
+### Phase 2: Typed Kernel Implementations (Template Pattern)
 
-The residual addition should be fused into the **consumer** of the output, typically RMSNorm of the next operation.
+#### 2.1 Canonical Pattern: CPURMSNormTypedKernel
 
-#### 3.1 RMSNorm with Fused Residual Input
+This is the reference implementation. All other typed kernels should follow this pattern:
 
 ```cpp
-// New interface for RMSNorm with Q8_1 residual fusion
-class ITensorRMSNormFused {
+template <ActivationPrecision Precision>
+class CPURMSNormTypedKernel : public CPUKernelBase {
 public:
-    // Apply RMSNorm with fused residual addition
-    // output = RMSNorm(dequant(residual) + input)
-    virtual bool apply_with_residual(
-        const void* residual,        // Q8_1/BF16/FP16 residual
-        ActivationPrecision residual_precision,
-        const float* input,          // FP32 input to add
-        const float* weight,         // RMSNorm gamma
-        float* output,               // FP32 output
+    using Metadata = detail::PrecisionMetadata<Precision>;
+    using StorageType = typename Metadata::StorageType;
+
+    // Primary typed operation
+    bool apply_typed(
+        const StorageType* input,    // Typed input buffer
+        const float* gamma,          // Weights always FP32
+        StorageType* output,         // Typed output buffer
         int rows, int cols,
-        float epsilon = 1e-6f) = 0;
+        float epsilon = 1e-6f,
+        int device_idx = -1);
+
+    // Fused residual variant
+    bool apply_with_residual_add(
+        const StorageType* residual, // Typed residual from previous layer
+        const float* fp32_input,     // FP32 input to add (e.g., projection output)
+        const float* gamma,          // Weights always FP32
+        StorageType* output,         // Typed output buffer
+        int rows, int cols,
+        float epsilon = 1e-6f,
+        int device_idx = -1);
+
+    static constexpr ActivationPrecision precision() { return Precision; }
+    static const char* precision_name() { return Metadata::name; }
+    static constexpr float compression_ratio() { return Metadata::compression_ratio; }
 };
 ```
 
-#### 3.2 Fused Kernel Implementation
+**Implementation pattern (BF16 example):**
 
 ```cpp
-// CPURMSNormKernelT with residual fusion
-template<typename TensorT>
-bool CPURMSNormKernelT<TensorT>::apply_with_residual_q8(
-    const Q8_1Block* residual,
-    const float* input,
-    const float* weight,
-    float* output,
-    int rows, int cols,
-    float epsilon)
+bool CPURMSNormTypedKernel<ActivationPrecision::BF16>::apply_typed(
+    const uint16_t* input, const float* gamma, uint16_t* output,
+    int rows, int cols, float epsilon, int device_idx)
 {
-    #pragma omp parallel for
-    for (int row = 0; row < rows; ++row) {
-        // 1. Dequantize residual + add input into scratch
-        std::array<float, 4096> scratch;  // Or thread-local buffer
-        
-        int n_blocks = (cols + 31) / 32;
-        for (int blk = 0; blk < n_blocks; ++blk) {
-            const Q8_1Block& block = residual[row * n_blocks + blk];
-            float d = fp16_to_fp32(block.d);
-            
-            for (int j = 0; j < 32 && blk * 32 + j < cols; ++j) {
-                int idx = blk * 32 + j;
-                float dequant = block.qs[j] * d;
-                scratch[idx] = dequant + input[row * cols + idx];
-            }
-        }
-        
-        // 2. Compute RMS over fused input
-        float sum_sq = 0.0f;
-        for (int i = 0; i < cols; ++i) {
-            sum_sq += scratch[i] * scratch[i];
-        }
-        float rms = std::sqrt(sum_sq / cols + epsilon);
-        float inv_rms = 1.0f / rms;
-        
-        // 3. Normalize and scale
-        for (int i = 0; i < cols; ++i) {
-            output[row * cols + i] = scratch[i] * inv_rms * weight[i];
+    const size_t ucols = static_cast<size_t>(cols);
+
+    #pragma omp parallel
+    {
+        // Thread-local scratch (stack for small, heap for large)
+        std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+        std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+        float* fp32_in = (ucols <= MAX_STACK_ROW_SIZE) ? stack_fp32_in.data() : heap_alloc();
+        float* fp32_out = (ucols <= MAX_STACK_ROW_SIZE) ? stack_fp32_out.data() : heap_alloc();
+
+        #pragma omp for
+        for (int row = 0; row < rows; ++row) {
+            const uint16_t* in_row = input + row * ucols;
+            uint16_t* out_row = output + row * ucols;
+
+            // 1. Dequantize: BF16 → FP32 (one row, stays in L1)
+            simd::convert_bf16_to_fp32(in_row, fp32_in, ucols);
+
+            // 2. Compute: RMSNorm in FP32
+            primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
+
+            // 3. Quantize: FP32 → BF16 (one row)
+            simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
         }
     }
     return true;
 }
 ```
 
-### Phase 4: Pipeline Integration (2-3 days)
+#### 2.2 Remaining Kernels to Implement
 
-#### 4.1 ActivationBuffers with Typed Residual
+Apply the same pattern to these kernels:
 
-```cpp
-// PipelineBase.h
-struct ActivationBuffers {
-    // Residual now uses typed buffer instead of TensorBase
-    std::unique_ptr<IResidualBuffer> residual;
-    
-    // Other activation buffers (still FP32/BF16/FP16 based on activation_precision)
-    std::shared_ptr<TensorBase> normalized;
-    std::shared_ptr<TensorBase> Q;
-    // ...
-};
-```
-
-#### 4.2 Modified Qwen2Pipeline Methods
-
-```cpp
-// Qwen2Pipeline.cpp
-
-ActivationBuffers Qwen2Pipeline::createBuffersForDevice(int device_idx, int max_seq_len) {
-    ActivationBuffers buffers;
-    int effective_max = batch_size_ * max_seq_len;
-    buffers.max_seq_len = effective_max;
-    
-    // Create typed residual buffer based on activation precision
-    ActivationPrecision precision = config_.activation_precision;
-    
-    buffers.residual = createResidualBuffer(
-        precision, 
-        static_cast<size_t>(effective_max) * d_model_);
-    
-    // Rest of activation buffers unchanged...
-}
-
-bool Qwen2Pipeline::attention_block(...) {
-    // ...
-    
-    // Save residual (uses typed buffer's quantization)
-    buffers.residual->save(input_hidden->data(), effective_seq_len * d_model_);
-    
-    // ... attention computation ...
-    
-    // Add residual (uses typed buffer's dequant + add)
-    buffers.residual->add_to(
-        buffers.attn_proj->data(),
-        current_hidden_->mutable_data(),
-        effective_seq_len * d_model_);
-    
-    return true;
-}
-```
-
-### Phase 5: SIMD Optimization (3-4 days)
-
-#### 5.1 AVX512 Q8_1 Quantization
-
-```cpp
-// SIMDHelpers.h - Q8_1 quantization with AVX512
-
-inline void quantize_fp32_to_q8_1_avx512(
-    const float* src, Q8_1Block* dst, size_t n_blocks)
-{
-    for (size_t blk = 0; blk < n_blocks; ++blk) {
-        const float* src_blk = src + blk * 32;
-        Q8_1Block& out = dst[blk];
-        
-        // Load 32 floats
-        __m512 v0 = _mm512_loadu_ps(src_blk);
-        __m512 v1 = _mm512_loadu_ps(src_blk + 16);
-        
-        // Find max absolute value
-        __m512 abs0 = _mm512_abs_ps(v0);
-        __m512 abs1 = _mm512_abs_ps(v1);
-        __m512 max_abs = _mm512_max_ps(abs0, abs1);
-        float max_val = _mm512_reduce_max_ps(max_abs);
-        
-        // Compute scale
-        float d = max_val / 127.0f;
-        if (d < 1e-10f) d = 1e-10f;
-        float id = 1.0f / d;
-        
-        out.d = fp32_to_fp16(d);
-        
-        // Quantize: round(val * id)
-        __m512 scale_vec = _mm512_set1_ps(id);
-        __m512 q0 = _mm512_roundscale_ps(_mm512_mul_ps(v0, scale_vec), 
-                                          _MM_FROUND_TO_NEAREST_INT);
-        __m512 q1 = _mm512_roundscale_ps(_mm512_mul_ps(v1, scale_vec),
-                                          _MM_FROUND_TO_NEAREST_INT);
-        
-        // Convert to int8 and pack
-        __m512i i0 = _mm512_cvtps_epi32(q0);
-        __m512i i1 = _mm512_cvtps_epi32(q1);
-        
-        // Pack to int8 (AVX512BW)
-        __m256i packed = _mm512_cvtsepi32_epi8(_mm512_inserti64x4(
-            _mm512_castsi256_si512(_mm512_cvtsepi32_epi8(i0)),
-            _mm512_cvtsepi32_epi8(i1), 1));
-        
-        _mm256_storeu_si256((__m256i*)out.qs, packed);
-        
-        // Compute sum_qs using horizontal add
-        __m512i sum = _mm512_add_epi32(i0, i1);
-        out.sum_qs = _mm512_reduce_add_epi32(sum);
-    }
-}
-```
-
-#### 5.2 AVX512 Q8_1 Dequant + Add
-
-```cpp
-inline void dequant_q8_1_add_fp32_avx512(
-    const Q8_1Block* residual, 
-    const float* input,
-    float* output,
-    size_t n_blocks)
-{
-    for (size_t blk = 0; blk < n_blocks; ++blk) {
-        const Q8_1Block& block = residual[blk];
-        const float* in_ptr = input + blk * 32;
-        float* out_ptr = output + blk * 32;
-        
-        float d = fp16_to_fp32(block.d);
-        __m512 scale = _mm512_set1_ps(d);
-        
-        // Load int8 values
-        __m256i qs = _mm256_loadu_si256((__m256i*)block.qs);
-        
-        // Extend to int32
-        __m512i i0 = _mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs));
-        __m512i i1 = _mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs, 1));
-        
-        // Convert to float and scale
-        __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(i0), scale);
-        __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(i1), scale);
-        
-        // Load input and add
-        __m512 in0 = _mm512_loadu_ps(in_ptr);
-        __m512 in1 = _mm512_loadu_ps(in_ptr + 16);
-        
-        __m512 out0 = _mm512_add_ps(f0, in0);
-        __m512 out1 = _mm512_add_ps(f1, in1);
-        
-        // Store
-        _mm512_storeu_ps(out_ptr, out0);
-        _mm512_storeu_ps(out_ptr + 16, out1);
-    }
-}
-```
+| Kernel | Input | Output | Notes |
+|--------|-------|--------|-------|
+| `CPUSwiGLUTypedKernel` | gate (typed), up (typed) | output (typed) | SwiGLU: gate * silu(up) |
+| `CPURoPETypedKernel` | Q/K (typed) | Q/K (typed, in-place) | Rotary position embedding |
+| `CPUSoftmaxTypedKernel` | scores (typed) | probs (typed) | Attention softmax |
+| `CpuAttentionTypedKernel` | Q (typed), K_cache (typed), V_cache (typed) | output (typed) | Full GQA attention |
 
 ### Phase 6: Typed KV Cache (4-6 days)
 
@@ -1055,54 +786,59 @@ Update `.github/copilot-instructions.md` with:
 
 ## File List
 
-### New Files
+### Implemented Files ✅
 
 | File | Purpose |
 |------|---------|
-| `src/v2/kernels/cpu/primitives/ResidualTraits.h` | Compile-time traits for residual formats |
-| `src/v2/kernels/cpu/primitives/ResidualTraits.cpp` | Vectorized quantize/dequant implementations |
-| `src/v2/tensors/ResidualBuffer.h` | Typed residual buffer interface + implementations |
-| `src/v2/tensors/ResidualBuffer.cpp` | Non-inline implementations |
-| `tests/v2/unit/Test__ResidualTraits.cpp` | Unit tests for residual traits (COMPLETE ✓) |
-| `tests/v2/unit/Test__ResidualBuffer.cpp` | Unit tests for residual buffer operations |
-| `tests/v2/unit/Test__TypedKVCache.cpp` | Unit tests for typed KV cache |
-| `tests/v2/e2e/Test__TypedResidualParity.cpp` | E2E parity tests |
-| `tests/v2/e2e/Test__TypedKVCacheParity.cpp` | E2E parity tests for KV cache |
-| `tests/v2/performance/Perf__TypedResidual.cpp` | Performance benchmarks |
-| `tests/v2/performance/Perf__TypedKVCache.cpp` | KV cache performance benchmarks |
+| `src/v2/kernels/cpu/ops/CPURMSNormTypedKernel.h` | Typed RMSNorm kernel with `detail::PrecisionMetadata` traits |
+| `src/v2/kernels/cpu/ops/CPURMSNormTypedKernel.cpp` | Implementation for FP32, BF16, FP16, Q8_1 specializations |
+| `src/v2/tensors/SIMDHelpers.h` | SIMD conversion functions (AVX512/AVX2/scalar) |
+| `src/v2/pipelines/PipelineConfig.h` | `ActivationPrecision` enum with Q8_1 |
+| `tests/v2/unit/Test__CPURMSNormTypedKernel.cpp` | Unit tests (18 passing) |
 
-### Modified Files
+### Files to Create (Phase 2 Remaining Kernels)
+
+| File | Purpose |
+|------|---------|
+| `src/v2/kernels/cpu/ops/CPUSwiGLUTypedKernel.h` | Typed SwiGLU kernel |
+| `src/v2/kernels/cpu/ops/CPUSwiGLUTypedKernel.cpp` | Implementation |
+| `src/v2/kernels/cpu/ops/CPURoPETypedKernel.h` | Typed RoPE kernel |
+| `src/v2/kernels/cpu/ops/CPURoPETypedKernel.cpp` | Implementation |
+| `src/v2/kernels/cpu/ops/CPUSoftmaxTypedKernel.h` | Typed Softmax kernel |
+| `src/v2/kernels/cpu/ops/CPUSoftmaxTypedKernel.cpp` | Implementation |
+| `tests/v2/unit/Test__CPUSwiGLUTypedKernel.cpp` | Unit tests |
+| `tests/v2/unit/Test__CPURoPETypedKernel.cpp` | Unit tests |
+| `tests/v2/unit/Test__CPUSoftmaxTypedKernel.cpp` | Unit tests |
+
+### Files to Modify (Pipeline Integration)
 
 | File | Changes |
 |------|---------|
-| `src/v2/pipelines/PipelineConfig.h` | Replace INT32 with Q8_1 in ActivationPrecision (COMPLETE ✓) |
-| `src/v2/pipelines/PipelineBase.h` | Add TensorFactory member (COMPLETE ✓) |
-| `src/v2/pipelines/PipelineBase.cpp` | Initialize tensor_factory_ conditionally (COMPLETE ✓) |
-| `src/v2/pipelines/qwen/Qwen2Pipeline.cpp` | Use typed residual buffer, typed KV cache |
-| `src/v2/tensors/KVCache.h` | Add ActivationPrecision support, typed storage |
-| `src/v2/tensors/KVCache.cpp` | Implement typed storage based on ActivationPrecision |
-| `src/v2/tensors/TensorFactory.h` | Add createActivation(), createResidual() (COMPLETE ✓) |
-| `src/v2/tensors/TensorFactory.cpp` | Implement factory methods (COMPLETE ✓) |
-| `src/v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h` | Add fused residual save in epilogue |
-| `src/v2/kernels/cpu/ops/CPURMSNormKernelT.h` | Add `apply_with_residual()` fused method |
+| `src/v2/pipelines/qwen/Qwen2Pipeline.cpp` | Use typed kernels based on config |
+| `src/v2/tensors/KVCache.h` | Add typed storage support |
+| `src/v2/tensors/KVCache.cpp` | Implement typed K/V storage |
 | `src/v2/kernels/cpu/attention/GQAAttention.cpp` | Support typed K/V cache |
-| `src/v2/tensors/SIMDHelpers.h` | Add AVX512/AVX2 Q8_1 quant/dequant intrinsics |
-| `.github/copilot-instructions.md` | Document new features |
+
+### Removed from Design
+
+| File | Reason |
+|------|--------|
+| `src/v2/kernels/cpu/primitives/ResidualTraits.h` | Replaced by `detail::PrecisionMetadata` in kernel headers |
+| `src/v2/kernels/cpu/primitives/ResidualTraits.cpp` | Not needed - SIMD functions in `SIMDHelpers.h` |
+| `src/v2/tensors/ResidualBuffer.h` | Not needed - typed kernels handle conversion directly |
 
 ## Timeline Estimate
 
 | Phase | Duration | Dependencies | Status |
 |-------|----------|--------------|--------|
-| Phase 1: Infrastructure & Traits | 2-3 days | None | ✅ COMPLETE |
-| Phase 2: Fused Kernel Epilogues | 3-5 days | Phase 1 | Pending |
-| Phase 3: Fused Residual Addition | 2-3 days | Phase 1 | Pending |
-| Phase 4: Pipeline Integration (Residuals) | 2-3 days | Phases 2, 3 | Pending |
-| Phase 5: SIMD Optimization | 3-4 days | Phase 4 | Pending |
-| Phase 6: Typed KV Cache | 4-6 days | Phase 1 | Pending |
-| Phase 7: Testing & Validation | 2-3 days | Phases 5, 6 | Pending |
-| Phase 8: Documentation & CLI | 1 day | Phase 7 | Pending |
+| Phase 1: Infrastructure | 2-3 days | None | ✅ COMPLETE |
+| Phase 2: Typed Kernels | 4-6 days | Phase 1 | 🔄 IN PROGRESS (RMSNorm done) |
+| Phase 3: Pipeline Integration | 2-3 days | Phase 2 | 📋 NOT STARTED |
+| Phase 4: Typed KV Cache | 3-4 days | Phase 3 | 📋 NOT STARTED |
+| Phase 5: Testing & Validation | 2-3 days | Phase 4 | 📋 NOT STARTED |
+| Phase 6: Documentation & CLI | 1 day | Phase 5 | 📋 NOT STARTED |
 
-**Total**: ~19-29 days (4-6 weeks)
+**Total**: ~14-20 days (3-4 weeks)
 
 ## Risk Assessment
 

@@ -2270,6 +2270,61 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return Q8_1Block::BLOCK_SIZE; }
 
+        // ===== Q8_1-Specific Native Accessors =====
+        // These provide direct access to Q8_1Block storage for typed kernels.
+        // Use these instead of data()/mutable_data() when working with Q8_1 activations.
+
+        /**
+         * @brief Get const pointer to Q8_1 block storage
+         * @return Pointer to first Q8_1Block (row-major, blocks_per_row = ceil(cols/32))
+         */
+        const Q8_1Block *q8_1_blocks() const
+        {
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            return reinterpret_cast<const Q8_1Block *>(data_ptr);
+        }
+
+        /**
+         * @brief Get mutable pointer to Q8_1 block storage
+         * @return Pointer to first Q8_1Block for in-place modification
+         * @note Invalidates dequant_cache_ - call clear_dequant_cache() if needed
+         */
+        Q8_1Block *mutable_q8_1_blocks()
+        {
+            // Invalidate dequant cache since blocks are being modified
+            dequant_cache_.clear();
+            uint8_t *data_ptr = is_view_
+                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
+                                    : raw_data_.data();
+            return reinterpret_cast<Q8_1Block *>(data_ptr);
+        }
+
+        /**
+         * @brief Get number of Q8_1 blocks per row
+         * @return blocks_per_row = ceil(cols / 32)
+         */
+        size_t blocks_per_row() const
+        {
+            return (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        }
+
+        /**
+         * @brief Get total number of Q8_1 blocks
+         * @return rows * blocks_per_row
+         */
+        size_t total_blocks() const
+        {
+            return shape_[0] * blocks_per_row();
+        }
+
+        /**
+         * @brief Clear the FP32 dequantization cache
+         *
+         * Call this after modifying blocks via mutable_q8_1_blocks() if you
+         * subsequently need to use data() (which returns dequantized FP32).
+         */
+        void clear_dequant_cache() { dequant_cache_.clear(); }
+
         // Public decode methods for testing
         static void decodeBlock(const Q8_1Block &block, float *output);
         static void decodeBlockScalar(const Q8_1Block &block, float *output);

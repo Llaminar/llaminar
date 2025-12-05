@@ -5,7 +5,7 @@
  * Encapsulates the full RMSNorm workflow:
  * 1. Validate input/weight/output tensors
  * 2. Create RMSNorm kernel from activation tensor
- * 3. Execute kernel with error handling
+ * 3. Execute kernel with error handling (using native precision)
  * 4. Capture snapshot (if enabled)
  *
  * Usage:
@@ -21,12 +21,19 @@
  *     return false;
  * @endcode
  *
+ * Supports native precision execution:
+ * - FP32Tensor: apply() with float*
+ * - BF16Tensor: apply_bf16() with uint16_t*
+ * - FP16Tensor: apply_fp16() with uint16_t*
+ * - Q8_1Tensor: apply_q8_1() with Q8_1Block*
+ *
  * @author David Sanftenberg
  */
 
 #pragma once
 
 #include "Op.h"
+#include "../../tensors/Tensors.h" // For FP16Tensor, BF16Tensor, Q8_1Tensor
 
 namespace llaminar2
 {
@@ -105,8 +112,15 @@ namespace llaminar2
                 return false;
             }
 
-            // 3. Execute kernel
-            if (!kernel->apply(
+            // 3. Execute kernel using native precision based on output tensor type
+            bool success = false;
+            const TensorType out_type = output->native_type();
+
+            switch (out_type)
+            {
+            case TensorType::FP32:
+                // FP32: Use standard apply() with float*
+                success = kernel->apply(
                     input->data(),
                     weight->data(),
                     output->mutable_data(),
@@ -114,7 +128,69 @@ namespace llaminar2
                     eps,
                     false, // use_bf16
                     mpi_ctx,
-                    device_idx))
+                    device_idx);
+                break;
+
+            case TensorType::BF16:
+            {
+                // BF16: Use native apply_bf16() with uint16_t*
+                auto *bf16_input = dynamic_cast<const BF16Tensor *>(input);
+                auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
+                if (!bf16_input || !bf16_output)
+                {
+                    logError("BF16 RMSNorm requires BF16 input and output tensors");
+                    return false;
+                }
+                success = kernel->apply_bf16(
+                    bf16_input->bf16_data(),
+                    weight->data(),
+                    bf16_output->mutable_bf16_data(),
+                    rows, cols, eps, device_idx);
+                break;
+            }
+
+            case TensorType::FP16:
+            {
+                // FP16: Use native apply_fp16() with uint16_t*
+                auto *fp16_input = dynamic_cast<const FP16Tensor *>(input);
+                auto *fp16_output = dynamic_cast<FP16Tensor *>(output);
+                if (!fp16_input || !fp16_output)
+                {
+                    logError("FP16 RMSNorm requires FP16 input and output tensors");
+                    return false;
+                }
+                success = kernel->apply_fp16(
+                    fp16_input->fp16_data(),
+                    weight->data(),
+                    fp16_output->mutable_fp16_data(),
+                    rows, cols, eps, device_idx);
+                break;
+            }
+
+            case TensorType::Q8_1:
+            {
+                // Q8_1: Use native apply_q8_1() with Q8_1Block*
+                auto *q8_1_input = dynamic_cast<const Q8_1Tensor *>(input);
+                auto *q8_1_output = dynamic_cast<Q8_1Tensor *>(output);
+                if (!q8_1_input || !q8_1_output)
+                {
+                    logError("Q8_1 RMSNorm requires Q8_1 input and output tensors");
+                    return false;
+                }
+                success = kernel->apply_q8_1(
+                    q8_1_input->q8_1_blocks(),
+                    weight->data(),
+                    q8_1_output->mutable_q8_1_blocks(),
+                    rows, cols, eps, device_idx);
+                break;
+            }
+
+            default:
+                logError("unsupported output tensor type for RMSNorm");
+                return false;
+            }
+
+            if (!success)
             {
                 logError("kernel execution failed");
                 return false;
@@ -132,6 +208,8 @@ namespace llaminar2
          *
          * Alternative signature for cases where input is not a TensorBase
          * (e.g., using buffers from another location).
+         *
+         * Note: This signature only supports FP32 data.
          */
         bool operator()(
             const float *input_data,
@@ -153,6 +231,13 @@ namespace llaminar2
                 return false;
             if (!validateDimensions(rows, cols, "RMSNorm"))
                 return false;
+
+            // This overload only supports FP32 output
+            if (output->native_type() != TensorType::FP32)
+            {
+                logError("raw float pointer overload only supports FP32 output tensor");
+                return false;
+            }
 
             // 2. Create kernel from output tensor
             auto *activation = dynamic_cast<IActivationTensor *>(output);

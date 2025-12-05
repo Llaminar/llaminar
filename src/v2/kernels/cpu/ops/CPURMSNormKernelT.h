@@ -10,6 +10,7 @@
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/BlockStructures.h" // For Q8_1Block
 #include "../CPUKernelBase.h"
 
 namespace llaminar2
@@ -50,6 +51,10 @@ namespace llaminar2
 
         bool apply_fp16(
             const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override;
+
+        bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
             int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override;
 
         bool apply_int32_to_int8(

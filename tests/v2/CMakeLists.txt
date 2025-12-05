@@ -310,6 +310,32 @@ add_v2_test(V2_Unit_INT32RMSNorm
     MPI_PROCS 1  # RMSNorm is CPU-only, single rank
 )
 
+# Test: Q8_1 Integer-Space RMSNorm (computes sum-of-squares in integer domain)
+add_executable(v2_test_q8_1_integer_rmsnorm unit/Test__Q8_1IntegerRMSNorm.cpp)
+target_link_libraries(v2_test_q8_1_integer_rmsnorm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1IntegerRMSNorm 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_integer_rmsnorm>
+    LABELS "V2;Unit;Kernels;RMSNorm;Q8_1;IntegerSpace;TypedResiduals;AVX512;CPU"
+    MPI_PROCS 1
+)
+
+# Test: Q8_1 Pure-Integer RMSNorm (NO floating-point operations)
+add_executable(v2_test_q8_1_pure_integer_rmsnorm unit/Test__Q8_1PureIntegerRMSNorm.cpp)
+target_link_libraries(v2_test_q8_1_pure_integer_rmsnorm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1PureIntegerRMSNorm 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_pure_integer_rmsnorm>
+    LABELS "V2;Unit;Kernels;RMSNorm;Q8_1;PureInteger;TypedResiduals;CPU"
+    MPI_PROCS 1
+)
+
 # Test: Q4_1 SIMD Unpack
 add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
 target_link_libraries(v2_test_q4_1_simd_unpack 

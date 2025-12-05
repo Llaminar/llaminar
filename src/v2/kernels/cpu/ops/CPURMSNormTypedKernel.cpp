@@ -28,13 +28,55 @@ namespace llaminar2
 {
 
     // =========================================================================
-    // Constants for cache-friendly streaming
+    // Constants for cache-friendly streaming and parallelization
     // =========================================================================
 
     // Maximum row size we support with stack-allocated scratch (16KB per row)
     // This covers d_model up to 4096 (16KB) which fits comfortably in L1 (32KB)
     // For larger models, we fall back to heap allocation per-thread
     static constexpr size_t MAX_STACK_ROW_SIZE = 4096;
+
+    // Minimum number of rows to justify OpenMP parallelization overhead.
+    // For single-row decode, thread spawning cost (~200µs) dominates the
+    // actual computation (~2-5µs per row). Empirically determined threshold.
+    static constexpr int MIN_ROWS_FOR_PARALLEL = 8;
+
+    // Minimum total elements to justify parallelization for single-row case.
+    // Even with 1 row, if d_model is huge (>8K), parallelization may help.
+    static constexpr size_t MIN_ELEMENTS_FOR_PARALLEL = 65536; // 64K elements
+
+    /**
+     * @brief Determine if OpenMP parallelization is beneficial
+     *
+     * OpenMP thread spawning has fixed overhead (~100-200µs). For small workloads,
+     * this overhead dominates the actual computation. We only parallelize when:
+     * - Multiple rows (prefill) where work can be distributed, OR
+     * - Single row with very large d_model where SIMD parallelism helps
+     *
+     * @param rows Number of rows (sequence length)
+     * @param cols Number of columns (d_model)
+     * @return true if parallelization is likely beneficial
+     */
+    inline bool want_parallel(int rows, size_t cols)
+    {
+#ifdef _OPENMP
+        // Already in a parallel region - don't nest
+        if (omp_in_parallel())
+            return false;
+
+        // Multiple rows: parallelize if we have enough work per thread
+        if (rows >= MIN_ROWS_FOR_PARALLEL)
+            return true;
+
+        // Single row: only parallelize for very large d_model
+        size_t total_elements = static_cast<size_t>(rows) * cols;
+        return total_elements >= MIN_ELEMENTS_FOR_PARALLEL;
+#else
+        (void)rows;
+        (void)cols;
+        return false;
+#endif
+    }
 
     // =========================================================================
     // FP32 Specialization Implementation
@@ -84,44 +126,59 @@ namespace llaminar2
         }
 
         const size_t ucols = static_cast<size_t>(cols);
+        const bool use_parallel = want_parallel(rows, ucols);
 
-        // Process row-by-row to keep scratch in L1/L2
+        // Lambda for processing a single row
+        auto process_row = [&](int row, float *scratch)
+        {
+            const float *res_row = residual + row * ucols;
+            const float *in_row = fp32_input + row * ucols;
+            float *out_row = output + row * ucols;
+
+            // Fused add into scratch (stays in L1)
+            for (size_t i = 0; i < ucols; ++i)
+            {
+                scratch[i] = res_row[i] + in_row[i];
+            }
+
+            // RMSNorm on single row (scratch → out_row)
+            primitives::rmsnorm_fused_row_avx512(scratch, gamma, out_row, ucols, epsilon);
+        };
+
+        if (use_parallel)
+        {
+            // Parallel path: spawn threads, each with thread-local scratch
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-        {
-            // Thread-local scratch buffer (stack for small cols, heap for large)
-            std::array<float, MAX_STACK_ROW_SIZE> stack_scratch;
-            std::vector<float> heap_scratch;
-            float *scratch = nullptr;
-
-            if (ucols <= MAX_STACK_ROW_SIZE)
             {
-                scratch = stack_scratch.data();
-            }
-            else
-            {
-                heap_scratch.resize(ucols);
-                scratch = heap_scratch.data();
-            }
+                std::array<float, MAX_STACK_ROW_SIZE> stack_scratch;
+                std::vector<float> heap_scratch;
+                float *scratch = (ucols <= MAX_STACK_ROW_SIZE)
+                                     ? stack_scratch.data()
+                                     : (heap_scratch.resize(ucols), heap_scratch.data());
 
 #ifdef _OPENMP
 #pragma omp for
 #endif
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, scratch);
+                }
+            }
+        }
+        else
+        {
+            // Serial path: avoid thread spawning overhead for small workloads
+            std::array<float, MAX_STACK_ROW_SIZE> stack_scratch;
+            std::vector<float> heap_scratch;
+            float *scratch = (ucols <= MAX_STACK_ROW_SIZE)
+                                 ? stack_scratch.data()
+                                 : (heap_scratch.resize(ucols), heap_scratch.data());
+
             for (int row = 0; row < rows; ++row)
             {
-                const float *res_row = residual + row * ucols;
-                const float *in_row = fp32_input + row * ucols;
-                float *out_row = output + row * ucols;
-
-                // Fused add into scratch (stays in L1)
-                for (size_t i = 0; i < ucols; ++i)
-                {
-                    scratch[i] = res_row[i] + in_row[i];
-                }
-
-                // RMSNorm on single row (scratch → out_row)
-                primitives::rmsnorm_fused_row_avx512(scratch, gamma, out_row, ucols, epsilon);
+                process_row(row, scratch);
             }
         }
 
@@ -149,48 +206,65 @@ namespace llaminar2
         }
 
         const size_t ucols = static_cast<size_t>(cols);
+        const bool use_parallel = want_parallel(rows, ucols);
 
-        // Process row-by-row: BF16 → FP32 (L1) → RMSNorm → FP32 (L1) → BF16
+        // Lambda for processing a single row
+        auto process_row = [&](int row, float *fp32_in, float *fp32_out)
+        {
+            const uint16_t *in_row = input + row * ucols;
+            uint16_t *out_row = output + row * ucols;
+
+            // 1. Dequantize BF16 → FP32 (one row, stays in L1)
+            simd::convert_bf16_to_fp32(in_row, fp32_in, ucols);
+
+            // 2. RMSNorm in FP32 (one row)
+            primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
+
+            // 3. Quantize FP32 → BF16 (one row)
+            simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
+        };
+
+        if (use_parallel)
+        {
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-        {
-            // Thread-local scratch buffers for one row
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fp32_in, heap_fp32_out;
-            float *fp32_in = nullptr;
-            float *fp32_out = nullptr;
-
-            if (ucols <= MAX_STACK_ROW_SIZE)
             {
-                fp32_in = stack_fp32_in.data();
-                fp32_out = stack_fp32_out.data();
-            }
-            else
-            {
-                heap_fp32_in.resize(ucols);
-                heap_fp32_out.resize(ucols);
-                fp32_in = heap_fp32_in.data();
-                fp32_out = heap_fp32_out.data();
-            }
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+                std::vector<float> heap_fp32_in, heap_fp32_out;
+                float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
+                                     ? stack_fp32_in.data()
+                                     : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
+                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                      ? stack_fp32_out.data()
+                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
 #ifdef _OPENMP
 #pragma omp for
 #endif
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, fp32_in, fp32_out);
+                }
+            }
+        }
+        else
+        {
+            // Serial path for small workloads
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+            std::vector<float> heap_fp32_in, heap_fp32_out;
+            float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
+                                 ? stack_fp32_in.data()
+                                 : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
+            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                  ? stack_fp32_out.data()
+                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
             for (int row = 0; row < rows; ++row)
             {
-                const uint16_t *in_row = input + row * ucols;
-                uint16_t *out_row = output + row * ucols;
-
-                // 1. Dequantize BF16 → FP32 (one row, stays in L1)
-                simd::convert_bf16_to_fp32(in_row, fp32_in, ucols);
-
-                // 2. RMSNorm in FP32 (one row)
-                primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
-
-                // 3. Quantize FP32 → BF16 (one row)
-                simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
+                process_row(row, fp32_in, fp32_out);
             }
         }
 
@@ -215,48 +289,66 @@ namespace llaminar2
         }
 
         const size_t ucols = static_cast<size_t>(cols);
+        const bool use_parallel = want_parallel(rows, ucols);
 
+        // Lambda for processing a single row
+        auto process_row = [&](int row, float *fused, float *fp32_out)
+        {
+            const uint16_t *res_row = residual + row * ucols;
+            const float *in_row = fp32_input + row * ucols;
+            uint16_t *out_row = output + row * ucols;
+
+            // 1. Fused dequant + add (one row): fused = dequant(res_bf16) + fp32_in
+            simd::fused_bf16_residual_add(res_row, in_row, fused, ucols);
+
+            // 2. RMSNorm in FP32 (one row)
+            primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
+
+            // 3. Quantize FP32 → BF16 (one row)
+            simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
+        };
+
+        if (use_parallel)
+        {
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-        {
-            // Thread-local scratch for fused input and output (two rows worth)
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fused, heap_fp32_out;
-            float *fused = nullptr;
-            float *fp32_out = nullptr;
-
-            if (ucols <= MAX_STACK_ROW_SIZE)
             {
-                fused = stack_fused.data();
-                fp32_out = stack_fp32_out.data();
-            }
-            else
-            {
-                heap_fused.resize(ucols);
-                heap_fp32_out.resize(ucols);
-                fused = heap_fused.data();
-                fp32_out = heap_fp32_out.data();
-            }
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+                std::vector<float> heap_fused, heap_fp32_out;
+                float *fused = (ucols <= MAX_STACK_ROW_SIZE)
+                                   ? stack_fused.data()
+                                   : (heap_fused.resize(ucols), heap_fused.data());
+                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                      ? stack_fp32_out.data()
+                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
 #ifdef _OPENMP
 #pragma omp for
 #endif
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, fused, fp32_out);
+                }
+            }
+        }
+        else
+        {
+            // Serial path for small workloads
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+            std::vector<float> heap_fused, heap_fp32_out;
+            float *fused = (ucols <= MAX_STACK_ROW_SIZE)
+                               ? stack_fused.data()
+                               : (heap_fused.resize(ucols), heap_fused.data());
+            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                  ? stack_fp32_out.data()
+                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
             for (int row = 0; row < rows; ++row)
             {
-                const uint16_t *res_row = residual + row * ucols;
-                const float *in_row = fp32_input + row * ucols;
-                uint16_t *out_row = output + row * ucols;
-
-                // 1. Fused dequant + add (one row): fused = dequant(res_bf16) + fp32_in
-                simd::fused_bf16_residual_add(res_row, in_row, fused, ucols);
-
-                // 2. RMSNorm in FP32 (one row)
-                primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
-
-                // 3. Quantize FP32 → BF16 (one row)
-                simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
+                process_row(row, fused, fp32_out);
             }
         }
 
@@ -284,46 +376,65 @@ namespace llaminar2
         }
 
         const size_t ucols = static_cast<size_t>(cols);
+        const bool use_parallel = want_parallel(rows, ucols);
 
+        // Lambda for processing a single row
+        auto process_row = [&](int row, float *fp32_in, float *fp32_out)
+        {
+            const uint16_t *in_row = input + row * ucols;
+            uint16_t *out_row = output + row * ucols;
+
+            // 1. Dequantize FP16 → FP32 (one row)
+            simd::convert_fp16_to_fp32(in_row, fp32_in, ucols);
+
+            // 2. RMSNorm in FP32 (one row)
+            primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
+
+            // 3. Quantize FP32 → FP16 (one row)
+            simd::convert_fp32_to_fp16(fp32_out, out_row, ucols);
+        };
+
+        if (use_parallel)
+        {
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-        {
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fp32_in, heap_fp32_out;
-            float *fp32_in = nullptr;
-            float *fp32_out = nullptr;
-
-            if (ucols <= MAX_STACK_ROW_SIZE)
             {
-                fp32_in = stack_fp32_in.data();
-                fp32_out = stack_fp32_out.data();
-            }
-            else
-            {
-                heap_fp32_in.resize(ucols);
-                heap_fp32_out.resize(ucols);
-                fp32_in = heap_fp32_in.data();
-                fp32_out = heap_fp32_out.data();
-            }
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+                std::vector<float> heap_fp32_in, heap_fp32_out;
+                float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
+                                     ? stack_fp32_in.data()
+                                     : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
+                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                      ? stack_fp32_out.data()
+                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
 #ifdef _OPENMP
 #pragma omp for
 #endif
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, fp32_in, fp32_out);
+                }
+            }
+        }
+        else
+        {
+            // Serial path for small workloads
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+            std::vector<float> heap_fp32_in, heap_fp32_out;
+            float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
+                                 ? stack_fp32_in.data()
+                                 : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
+            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                  ? stack_fp32_out.data()
+                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
             for (int row = 0; row < rows; ++row)
             {
-                const uint16_t *in_row = input + row * ucols;
-                uint16_t *out_row = output + row * ucols;
-
-                // 1. Dequantize FP16 → FP32 (one row)
-                simd::convert_fp16_to_fp32(in_row, fp32_in, ucols);
-
-                // 2. RMSNorm in FP32 (one row)
-                primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
-
-                // 3. Quantize FP32 → FP16 (one row)
-                simd::convert_fp32_to_fp16(fp32_out, out_row, ucols);
+                process_row(row, fp32_in, fp32_out);
             }
         }
 
@@ -348,47 +459,66 @@ namespace llaminar2
         }
 
         const size_t ucols = static_cast<size_t>(cols);
+        const bool use_parallel = want_parallel(rows, ucols);
 
+        // Lambda for processing a single row
+        auto process_row = [&](int row, float *fused, float *fp32_out)
+        {
+            const uint16_t *res_row = residual + row * ucols;
+            const float *in_row = fp32_input + row * ucols;
+            uint16_t *out_row = output + row * ucols;
+
+            // 1. Fused dequant + add (one row)
+            simd::fused_fp16_residual_add(res_row, in_row, fused, ucols);
+
+            // 2. RMSNorm in FP32 (one row)
+            primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
+
+            // 3. Quantize FP32 → FP16 (one row)
+            simd::convert_fp32_to_fp16(fp32_out, out_row, ucols);
+        };
+
+        if (use_parallel)
+        {
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-        {
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fused, heap_fp32_out;
-            float *fused = nullptr;
-            float *fp32_out = nullptr;
-
-            if (ucols <= MAX_STACK_ROW_SIZE)
             {
-                fused = stack_fused.data();
-                fp32_out = stack_fp32_out.data();
-            }
-            else
-            {
-                heap_fused.resize(ucols);
-                heap_fp32_out.resize(ucols);
-                fused = heap_fused.data();
-                fp32_out = heap_fp32_out.data();
-            }
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+                std::vector<float> heap_fused, heap_fp32_out;
+                float *fused = (ucols <= MAX_STACK_ROW_SIZE)
+                                   ? stack_fused.data()
+                                   : (heap_fused.resize(ucols), heap_fused.data());
+                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                      ? stack_fp32_out.data()
+                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
 #ifdef _OPENMP
 #pragma omp for
 #endif
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, fused, fp32_out);
+                }
+            }
+        }
+        else
+        {
+            // Serial path for small workloads
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+            std::vector<float> heap_fused, heap_fp32_out;
+            float *fused = (ucols <= MAX_STACK_ROW_SIZE)
+                               ? stack_fused.data()
+                               : (heap_fused.resize(ucols), heap_fused.data());
+            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                  ? stack_fp32_out.data()
+                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
             for (int row = 0; row < rows; ++row)
             {
-                const uint16_t *res_row = residual + row * ucols;
-                const float *in_row = fp32_input + row * ucols;
-                uint16_t *out_row = output + row * ucols;
-
-                // 1. Fused dequant + add (one row)
-                simd::fused_fp16_residual_add(res_row, in_row, fused, ucols);
-
-                // 2. RMSNorm in FP32 (one row)
-                primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
-
-                // 3. Quantize FP32 → FP16 (one row)
-                simd::convert_fp32_to_fp16(fp32_out, out_row, ucols);
+                process_row(row, fused, fp32_out);
             }
         }
 
@@ -425,47 +555,14 @@ namespace llaminar2
         const size_t ucols = static_cast<size_t>(cols);
         const size_t blocks_per_row = ucols / 32;
 
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-        {
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fp32_in, heap_fp32_out;
-            float *fp32_in = nullptr;
-            float *fp32_out = nullptr;
+        // Use the optimized integer-space primitive
+        primitives::RMSNormExecOptions opts;
+        opts.allow_parallel = want_parallel(rows, ucols);
 
-            if (ucols <= MAX_STACK_ROW_SIZE)
-            {
-                fp32_in = stack_fp32_in.data();
-                fp32_out = stack_fp32_out.data();
-            }
-            else
-            {
-                heap_fp32_in.resize(ucols);
-                heap_fp32_out.resize(ucols);
-                fp32_in = heap_fp32_in.data();
-                fp32_out = heap_fp32_out.data();
-            }
-
-#ifdef _OPENMP
-#pragma omp for
-#endif
-            for (int row = 0; row < rows; ++row)
-            {
-                const Q8_1Block *in_row = input + row * blocks_per_row;
-                Q8_1Block *out_row = output + row * blocks_per_row;
-
-                // 1. Dequantize Q8_1 → FP32 (one row)
-                simd::dequantize_q8_1_to_fp32(in_row, fp32_in, ucols);
-
-                // 2. RMSNorm in FP32 (one row)
-                primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
-
-                // 3. Quantize FP32 → Q8_1 (one row)
-                simd::quantize_fp32_to_q8_1_blocks(fp32_out, out_row, ucols);
-            }
-        }
+        primitives::rmsnorm_q8_1_integer(
+            input, gamma, output,
+            static_cast<size_t>(rows), blocks_per_row,
+            epsilon, opts);
 
         return true;
     }
@@ -496,47 +593,66 @@ namespace llaminar2
 
         const size_t ucols = static_cast<size_t>(cols);
         const size_t blocks_per_row = ucols / 32;
+        const bool use_parallel = want_parallel(rows, ucols);
 
+        // Lambda for processing a single row
+        auto process_row = [&](int row, float *fused, float *fp32_out)
+        {
+            const Q8_1Block *res_row = residual + row * blocks_per_row;
+            const float *in_row = fp32_input + row * ucols;
+            Q8_1Block *out_row = output + row * blocks_per_row;
+
+            // 1. Fused dequant + add (one row)
+            simd::fused_q8_1_residual_add(res_row, in_row, fused, ucols);
+
+            // 2. RMSNorm in FP32 (one row)
+            primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
+
+            // 3. Quantize FP32 → Q8_1 (one row)
+            simd::quantize_fp32_to_q8_1_blocks(fp32_out, out_row, ucols);
+        };
+
+        if (use_parallel)
+        {
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
-        {
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
-            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
-            std::vector<float> heap_fused, heap_fp32_out;
-            float *fused = nullptr;
-            float *fp32_out = nullptr;
-
-            if (ucols <= MAX_STACK_ROW_SIZE)
             {
-                fused = stack_fused.data();
-                fp32_out = stack_fp32_out.data();
-            }
-            else
-            {
-                heap_fused.resize(ucols);
-                heap_fp32_out.resize(ucols);
-                fused = heap_fused.data();
-                fp32_out = heap_fp32_out.data();
-            }
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+                std::vector<float> heap_fused, heap_fp32_out;
+                float *fused = (ucols <= MAX_STACK_ROW_SIZE)
+                                   ? stack_fused.data()
+                                   : (heap_fused.resize(ucols), heap_fused.data());
+                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                      ? stack_fp32_out.data()
+                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
 #ifdef _OPENMP
 #pragma omp for
 #endif
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, fused, fp32_out);
+                }
+            }
+        }
+        else
+        {
+            // Serial path for small workloads
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+            std::vector<float> heap_fused, heap_fp32_out;
+            float *fused = (ucols <= MAX_STACK_ROW_SIZE)
+                               ? stack_fused.data()
+                               : (heap_fused.resize(ucols), heap_fused.data());
+            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                  ? stack_fp32_out.data()
+                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
             for (int row = 0; row < rows; ++row)
             {
-                const Q8_1Block *res_row = residual + row * blocks_per_row;
-                const float *in_row = fp32_input + row * ucols;
-                Q8_1Block *out_row = output + row * blocks_per_row;
-
-                // 1. Fused dequant + add (one row)
-                simd::fused_q8_1_residual_add(res_row, in_row, fused, ucols);
-
-                // 2. RMSNorm in FP32 (one row)
-                primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
-
-                // 3. Quantize FP32 → Q8_1 (one row)
-                simd::quantize_fp32_to_q8_1_blocks(fp32_out, out_row, ucols);
+                process_row(row, fused, fp32_out);
             }
         }
 
