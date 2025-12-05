@@ -394,6 +394,10 @@ protected:
             std::cout << "================================================================" << std::endl;
         }
 
+        // Run Q8_1 FIRST to avoid cache pollution from other benchmarks
+        // Typed Q8_1: 3.5x compression
+        auto typed_q8_1 = bench_typed_q8_1(config);
+
         // Baseline: original FP32 kernel
         auto baseline = bench_original_fp32(config);
         print_result("Original FP32 (baseline)", baseline);
@@ -410,8 +414,7 @@ protected:
         auto typed_fp16 = bench_typed_fp16(config);
         print_comparison("Typed FP16 (2x)", typed_fp16, baseline);
 
-        // Typed Q8_1: 3.5x compression
-        auto typed_q8_1 = bench_typed_q8_1(config);
+        // Print Q8_1 result (ran first but print in original order)
         print_comparison("Typed Q8_1 (3.5x)", typed_q8_1, baseline);
 
         // Validation assertions
@@ -513,8 +516,8 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen7B)
     BenchmarkConfig config;
     config.seq_len = 512;
     config.d_model = 3584;
-    config.warmup_iters = 10;
-    config.bench_iters = 100;
+    config.warmup_iters = 50;
+    config.bench_iters = 500;
     config.description = "Prefill 512 tokens - Qwen 7B (512×3584)";
 
     run_comparison_benchmark(config);
@@ -526,8 +529,8 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen7B)
     BenchmarkConfig config;
     config.seq_len = 2048;
     config.d_model = 3584;
-    config.warmup_iters = 5;
-    config.bench_iters = 50;
+    config.warmup_iters = 50;
+    config.bench_iters = 200;
     config.description = "Prefill 2048 tokens - Qwen 7B (2048×3584)";
 
     run_comparison_benchmark(config);
@@ -582,8 +585,8 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen32B)
     BenchmarkConfig config;
     config.seq_len = 512;
     config.d_model = 5120;
-    config.warmup_iters = 10;
-    config.bench_iters = 100;
+    config.warmup_iters = 50;
+    config.bench_iters = 500;
     config.description = "Prefill 512 tokens - Qwen 32B (512×5120)";
 
     run_comparison_benchmark(config);
@@ -595,8 +598,8 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen32B)
     BenchmarkConfig config;
     config.seq_len = 2048;
     config.d_model = 5120;
-    config.warmup_iters = 5;
-    config.bench_iters = 50;
+    config.warmup_iters = 50;
+    config.bench_iters = 200;
     config.description = "Prefill 2048 tokens - Qwen 32B (2048×5120)";
 
     run_comparison_benchmark(config);

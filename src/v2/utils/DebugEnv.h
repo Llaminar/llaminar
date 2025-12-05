@@ -265,12 +265,9 @@ namespace llaminar2
         int max_threads = 0;             ///< Maximum threads to use (0 = unlimited/OMP_NUM_THREADS)
 
         // Q8_1-specific parallelization thresholds (empirically tuned Dec 2025)
-        // Q8_1 is memory bandwidth bound - speedup capped at ~2x for most workloads
-        size_t q8_min_bytes_parallel = 512 * 1024;   ///< Min bytes for Q8_1 parallelization (512KB)
-        size_t q8_scale_threshold = 8 * 1024 * 1024; ///< Bytes threshold for scaling threads (8MB)
-        int q8_min_rows_per_thread = 8;              ///< Min rows per thread for Q8_1
-        int q8_base_threads = 2;                     ///< Base threads for 512KB-8MB range
-        int q8_max_scale_threads = 18;               ///< Max threads when scaling (>8MB)
+        // Dynamic thread scaling based on workload size
+        size_t q8_bytes_per_thread = 32 * 1024; ///< Target bytes per thread (32KB)
+        int q8_min_rows_per_thread = 4;         ///< Min rows per thread for Q8_1
 
         RMSNormConfig()
         {
@@ -316,34 +313,16 @@ namespace llaminar2
             }
 
             // Q8_1-specific thresholds
-            const char *q8_min_bytes_env = std::getenv("LLAMINAR_RMSNORM_Q8_MIN_BYTES_PARALLEL");
-            if (q8_min_bytes_env)
+            const char *q8_bytes_per_thread_env = std::getenv("LLAMINAR_RMSNORM_Q8_BYTES_PER_THREAD");
+            if (q8_bytes_per_thread_env)
             {
-                q8_min_bytes_parallel = static_cast<size_t>(std::atol(q8_min_bytes_env));
-            }
-
-            const char *q8_scale_env = std::getenv("LLAMINAR_RMSNORM_Q8_SCALE_THRESHOLD");
-            if (q8_scale_env)
-            {
-                q8_scale_threshold = static_cast<size_t>(std::atol(q8_scale_env));
+                q8_bytes_per_thread = static_cast<size_t>(std::atol(q8_bytes_per_thread_env));
             }
 
             const char *q8_min_rows_env = std::getenv("LLAMINAR_RMSNORM_Q8_MIN_ROWS_PER_THREAD");
             if (q8_min_rows_env)
             {
                 q8_min_rows_per_thread = std::atoi(q8_min_rows_env);
-            }
-
-            const char *q8_base_threads_env = std::getenv("LLAMINAR_RMSNORM_Q8_BASE_THREADS");
-            if (q8_base_threads_env)
-            {
-                q8_base_threads = std::atoi(q8_base_threads_env);
-            }
-
-            const char *q8_max_scale_env = std::getenv("LLAMINAR_RMSNORM_Q8_MAX_SCALE_THREADS");
-            if (q8_max_scale_env)
-            {
-                q8_max_scale_threads = std::atoi(q8_max_scale_env);
             }
         }
     };
