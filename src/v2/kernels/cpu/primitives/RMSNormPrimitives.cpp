@@ -5,6 +5,8 @@
  */
 
 #include "RMSNormPrimitives.h"
+#include "utils/DebugEnv.h"
+#include <omp.h>
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -2504,176 +2506,81 @@ namespace llaminar2::primitives
 
     void rmsnorm_q8_1_pure_integer_row(
         const Q8_1Block *input,
-        const int16_t *gamma_q8, // Pre-quantized gamma in Q8 format (gamma * 256)
+        const int16_t *gamma_q12, // Pre-quantized gamma in Q12 format (clamp(gamma, -8, 8) * 4095)
         Q8_1Block *output,
         std::size_t blocks_per_row,
         int32_t epsilon_scaled) // Epsilon pre-scaled appropriately
     {
-        if (!input || !gamma_q8 || !output || blocks_per_row == 0)
+        if (!input || !gamma_q12 || !output || blocks_per_row == 0)
             return;
 
         const size_t cols = blocks_per_row * 32;
 
         // ====================================================================
-        // Phase 1 & 2 Merged: Compute Sum(d² * sum_qs²)
-        // Optimized to avoid horizontal reductions inside the loop.
+        // Phase 1 & 2: Compute Sum(d² * sum_qs²) using double precision
+        // This avoids overflow/underflow issues with fixed-point accumulation
         // ====================================================================
-        uint64_t total_sum_sq_scaled = 0; // Scaled by 2^-50 relative to raw d^2*qs^2
+        double total_sum_sq = 0.0;
 
-#if defined(__AVX512F__)
-        // Process 16 blocks at a time
-        const size_t blocks_vec = blocks_per_row & ~15ULL;
-
-        // Precompute gather indices for stride 36 (Q8_1Block size)
-        __m512i v_idx_base = _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-        __m512i v_stride = _mm512_set1_epi32(36);
-        __m512i v_offsets = _mm512_mullo_epi32(v_idx_base, v_stride);
-        __m512i v_mask_ffff = _mm512_set1_epi32(0xFFFF);
-
-        // Accumulators for 16 x 64-bit partial sums
-        // We accumulate (d^2 * q^2) for each of the 16 pairs in a block
-        // acc_even accumulates q[0,2..30]^2 * d^2
-        // acc_odd  accumulates q[1,3..31]^2 * d^2
-        __m512i acc_even = _mm512_setzero_si512();
-        __m512i acc_odd = _mm512_setzero_si512();
-
-        // Helper lambda for variable shift
-        auto apply_shift_vec = [&](__m512i val, __m512i shift)
-        {
-            __mmask8 is_pos = _mm512_cmpge_epi64_mask(shift, _mm512_setzero_si512());
-            __m512i left = _mm512_sllv_epi64(val, shift);
-            __m512i right = _mm512_srlv_epi64(val, _mm512_sub_epi64(_mm512_setzero_si512(), shift));
-            return _mm512_mask_blend_epi64(is_pos, right, left);
-        };
-
-        for (size_t b = 0; b < blocks_vec; b += 16)
-        {
-            // 1. Gather d values for 16 blocks
-            const void *base_addr = (const void *)(input + b);
-            __m512i raw = _mm512_i32gather_epi32(v_offsets, base_addr, 1);
-            __m512i d32 = _mm512_and_si512(raw, v_mask_ffff);
-
-            // 2. Extract exp and mant
-            __m512i exp = _mm512_and_si512(_mm512_srli_epi32(d32, 10), _mm512_set1_epi32(0x1F));
-            __m512i mant = _mm512_and_si512(d32, _mm512_set1_epi32(0x03FF));
-            __mmask16 is_normal = _mm512_cmpneq_epi32_mask(exp, _mm512_setzero_si512());
-            mant = _mm512_mask_or_epi32(mant, is_normal, mant, _mm512_set1_epi32(0x0400));
-
-            // 3. Compute mant² and shift
-            __m512i mant_sq_vec = _mm512_mullo_epi32(mant, mant);
-            __m512i shift_vec = _mm512_sub_epi32(_mm512_slli_epi32(exp, 1), _mm512_set1_epi32(50));
-
-            // Store to stack to iterate
-            uint32_t mant_sq_buf[16];
-            int32_t shift_buf[16];
-            _mm512_storeu_si512(mant_sq_buf, mant_sq_vec);
-            _mm512_storeu_si512(shift_buf, shift_vec);
-
-            // 4. Inner loop over 16 blocks
-            for (int i = 0; i < 16; ++i)
-            {
-                // Load qs (32 int8)
-                __m256i qs_8 = _mm256_loadu_si256((const __m256i *)input[b + i].qs);
-                __m512i qs_16 = _mm512_cvtepi8_epi16(qs_8);
-
-                // Square: 16 x int32 sums (q0^2+q1^2, q2^2+q3^2, ...)
-                __m512i qs_sq = _mm512_madd_epi16(qs_16, qs_16);
-
-                // Broadcast mant^2 and shift
-                __m512i v_mant_sq = _mm512_set1_epi64(mant_sq_buf[i]); // Use 64-bit broadcast for mul_epu32
-                __m512i v_shift = _mm512_set1_epi64(shift_buf[i]);
-
-                // Multiply: term = qs_sq * mant^2
-                // Even lanes (0, 2...)
-                __m512i term_even = _mm512_mul_epu32(qs_sq, v_mant_sq);
-                // Odd lanes (1, 3...)
-                __m512i term_odd = _mm512_mul_epu32(_mm512_srli_epi64(qs_sq, 32), v_mant_sq);
-
-                // Shift
-                __m512i val_even = apply_shift_vec(term_even, v_shift);
-                __m512i val_odd = apply_shift_vec(term_odd, v_shift);
-
-                // Accumulate
-                acc_even = _mm512_add_epi64(acc_even, val_even);
-                acc_odd = _mm512_add_epi64(acc_odd, val_odd);
-            }
-        }
-
-        // Reduce accumulators
-        total_sum_sq_scaled = static_cast<uint64_t>(_mm512_reduce_add_epi64(acc_even)) +
-                              static_cast<uint64_t>(_mm512_reduce_add_epi64(acc_odd));
-
-        // Handle remaining blocks
-        for (size_t b = blocks_vec; b < blocks_per_row; ++b)
-        {
-            uint16_t d_bits = input[b].d;
-            int exp = (d_bits & 0x7C00) >> 10;
-            uint32_t mant = (d_bits & 0x03FF);
-            if (exp != 0)
-                mant |= 0x0400;
-
-            int32_t s = compute_sumsq_avx512(input[b].qs);
-            uint64_t term = static_cast<uint64_t>(mant) * mant * s;
-
-            int shift = 2 * exp - 50;
-            if (shift >= 0)
-                total_sum_sq_scaled += (term << shift);
-            else
-                total_sum_sq_scaled += (term >> (-shift));
-        }
-#else
         for (size_t b = 0; b < blocks_per_row; ++b)
         {
-            uint16_t d_bits = input[b].d;
-            int exp = (d_bits & 0x7C00) >> 10;
-            uint32_t mant = (d_bits & 0x03FF);
-            if (exp != 0)
-                mant |= 0x0400; // Add implicit 1 for normal numbers
-
+            float d = fp16_to_fp32_q8(input[b].d);
             int32_t s = 0;
+
+#if defined(__AVX512F__)
+            __m256i qs_8 = _mm256_loadu_si256((const __m256i *)input[b].qs);
+            __m512i qs_16 = _mm512_cvtepi8_epi16(qs_8);
+            __m512i qs_sq = _mm512_madd_epi16(qs_16, qs_16);
+            s = _mm512_reduce_add_epi32(qs_sq);
+#else
             for (int i = 0; i < 32; ++i)
                 s += input[b].qs[i] * input[b].qs[i];
-
-            uint64_t term = static_cast<uint64_t>(mant) * mant * s;
-            int shift = 2 * exp - 50;
-            if (shift >= 0)
-                total_sum_sq_scaled += (term << shift);
-            else
-                total_sum_sq_scaled += (term >> (-shift));
-        }
 #endif
+            total_sum_sq += static_cast<double>(d) * d * s;
+        }
 
         // ====================================================================
         // Phase 3: Compute RMS and inverse RMS
         // ====================================================================
 
         // Mean = Total / Cols
-        uint64_t mean_sq = (total_sum_sq_scaled + cols / 2) / cols;
+        double mean_sq = total_sum_sq / cols;
+        mean_sq += 1e-5; // Epsilon
 
-        // Add epsilon (scaled to prevent division by zero)
-        mean_sq += epsilon_scaled;
+        // Compute 1/sqrt(mean_qs_sq) in Q24 format
+        // inv_rms = 2^24 / sqrt(mean_sq)
+        double rms = std::sqrt(mean_sq);
+        double inv_rms_f = 16777216.0 / rms;
 
-        // Compute 1/sqrt(mean_qs_sq) in Q8 format
-        // This gives us the normalization factor for the qs values directly
-        uint32_t inv_rms_q8 = inv_sqrt_q16(mean_sq) >> 16; // Convert Q24 to Q8
-        if (inv_rms_q8 == 0)
-            inv_rms_q8 = 1;
+        // Clamp to uint32 range to avoid overflow in integer loop
+        if (inv_rms_f > 2147483647.0)
+            inv_rms_f = 2147483647.0;
+
+        uint32_t inv_rms_q24 = static_cast<uint32_t>(inv_rms_f);
+        if (inv_rms_q24 == 0)
+            inv_rms_q24 = 1;
 
         // ====================================================================
         // Phase 4: Apply normalization (vectorized)
-        // out_qs[i] = clamp((qs[i] * inv_rms * gamma[i]) >> shifts, -127, 127)
-        // The output d is recomputed from the resulting distribution
+        // For each block:
+        //   1) Compute y_high = qs * gamma * inv_rms (64-bit precision)
+        //      y_high scale: Q0 * Q12 * (2^14/RMS) = Q26 / RMS
+        //   2) y = y_high >> 20 (Q6 / RMS)
+        //   3) Find max_abs = max(|y|) across the block
+        //   4) d_out = d_in * max_abs / (127 * 64)
+        //   5) qs_out = clamp(y * 127 / max_abs, -127, 127)
         // ====================================================================
 
 #if defined(__AVX512F__)
-        __m512i v_inv_rms = _mm512_set1_epi32(inv_rms_q8);
-        __m512i v_127 = _mm512_set1_epi32(127);
-        __m512i v_neg127 = _mm512_set1_epi32(-127);
+        __m512i v_inv_rms = _mm512_set1_epi32(inv_rms_q24);
+        // Permutation indices for interleaving even/odd results
+        __m512i v_perm_idx = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
 
         for (size_t b = 0; b < blocks_per_row; ++b)
         {
             const Q8_1Block &in_blk = input[b];
             Q8_1Block &out_blk = output[b];
+            float d_in = fp16_to_fp32_q8(in_blk.d);
 
             // Load and expand qs to int32
             __m128i qs_lo = _mm_loadu_si128((const __m128i *)in_blk.qs);
@@ -2681,29 +2588,85 @@ namespace llaminar2::primitives
             __m512i qs32_lo = _mm512_cvtepi8_epi32(qs_lo);
             __m512i qs32_hi = _mm512_cvtepi8_epi32(qs_hi);
 
-            // Load gamma (int16, 32 values = 512 bits = one __m512i of int16)
-            // But we process 16 values at a time, so load as two __m256i
-            __m256i gamma16_lo = _mm256_loadu_si256((const __m256i *)(gamma_q8 + b * 32));      // 16 int16
-            __m256i gamma16_hi = _mm256_loadu_si256((const __m256i *)(gamma_q8 + b * 32 + 16)); // 16 int16
-
-            // Expand int16 to int32: _mm512_cvtepi16_epi32 takes __m256i and produces __m512i
+            // Load gamma (int16) -> int32
+            __m256i gamma16_lo = _mm256_loadu_si256((const __m256i *)(gamma_q12 + b * 32));
+            __m256i gamma16_hi = _mm256_loadu_si256((const __m256i *)(gamma_q12 + b * 32 + 16));
             __m512i gamma32_lo = _mm512_cvtepi16_epi32(gamma16_lo);
             __m512i gamma32_hi = _mm512_cvtepi16_epi32(gamma16_hi);
 
-            // Apply: y = qs * inv_rms * gamma >> 16
-            // First: qs * inv_rms
-            __m512i y_lo = _mm512_mullo_epi32(qs32_lo, v_inv_rms);
-            __m512i y_hi = _mm512_mullo_epi32(qs32_hi, v_inv_rms);
+            // Compute term = qs * gamma (int32)
+            __m512i term_lo = _mm512_mullo_epi32(qs32_lo, gamma32_lo);
+            __m512i term_hi = _mm512_mullo_epi32(qs32_hi, gamma32_hi);
 
-            // Then: * gamma >> 8 (gamma is Q8, inv_rms is Q8, so total shift is 16)
-            y_lo = _mm512_mullo_epi32(y_lo, gamma32_lo);
-            y_hi = _mm512_mullo_epi32(y_hi, gamma32_hi);
+            // Compute res = term * inv_rms (64-bit)
+            // Even lanes
+            __m512i res_lo_even = _mm512_mul_epi32(term_lo, v_inv_rms);
+            __m512i res_hi_even = _mm512_mul_epi32(term_hi, v_inv_rms);
+            // Odd lanes (shift term right by 32)
+            __m512i res_lo_odd = _mm512_mul_epi32(_mm512_srli_epi64(term_lo, 32), v_inv_rms);
+            __m512i res_hi_odd = _mm512_mul_epi32(_mm512_srli_epi64(term_hi, 32), v_inv_rms);
 
-            // Shift right by 16 (Q8 * Q8 = Q16)
-            y_lo = _mm512_srai_epi32(y_lo, 16);
-            y_hi = _mm512_srai_epi32(y_hi, 16);
+            // Shift right by 20 to get Q6 result (fits in int32)
+            __m512i y_lo_even = _mm512_srai_epi64(res_lo_even, 20);
+            __m512i y_hi_even = _mm512_srai_epi64(res_hi_even, 20);
+            __m512i y_lo_odd = _mm512_srai_epi64(res_lo_odd, 20);
+            __m512i y_hi_odd = _mm512_srai_epi64(res_hi_odd, 20);
+
+            // Pack back to int32
+            __m256i y256_lo_even = _mm512_cvtepi64_epi32(y_lo_even);
+            __m256i y256_lo_odd = _mm512_cvtepi64_epi32(y_lo_odd);
+            __m256i y256_hi_even = _mm512_cvtepi64_epi32(y_hi_even);
+            __m256i y256_hi_odd = _mm512_cvtepi64_epi32(y_hi_odd);
+
+            // Interleave even/odd results
+            __m512i y_lo = _mm512_castsi256_si512(y256_lo_even);
+            y_lo = _mm512_inserti64x4(y_lo, y256_lo_odd, 1);
+            y_lo = _mm512_permutexvar_epi32(v_perm_idx, y_lo);
+
+            __m512i y_hi = _mm512_castsi256_si512(y256_hi_even);
+            y_hi = _mm512_inserti64x4(y_hi, y256_hi_odd, 1);
+            y_hi = _mm512_permutexvar_epi32(v_perm_idx, y_hi);
+
+            // Find max absolute value
+            __m512i abs_lo = _mm512_abs_epi32(y_lo);
+            __m512i abs_hi = _mm512_abs_epi32(y_hi);
+            __m512i abs_max_vec = _mm512_max_epi32(abs_lo, abs_hi);
+            int32_t max_abs = _mm512_reduce_max_epi32(abs_max_vec);
+
+            // Compute output scale: d_out = d_in * max_abs / (127 * 65536)
+            // 65536 comes from the Q16 nature of y (result of >> 20 from Q36)
+            float d_out;
+            if (max_abs <= 127)
+            {
+                if (max_abs == 0)
+                {
+                    d_out = 0.0f;
+                }
+                else
+                {
+                    d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+                }
+            }
+            else
+            {
+                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+            }
+
+            // Rescale y values: y_rescaled = y * 127 / max_abs
+            if (max_abs > 0)
+            {
+                __m512 scale_factor = _mm512_set1_ps(127.0f / static_cast<float>(max_abs));
+                __m512 y_f32_lo = _mm512_cvtepi32_ps(y_lo);
+                __m512 y_f32_hi = _mm512_cvtepi32_ps(y_hi);
+                y_f32_lo = _mm512_mul_ps(y_f32_lo, scale_factor);
+                y_f32_hi = _mm512_mul_ps(y_f32_hi, scale_factor);
+                y_lo = _mm512_cvtps_epi32(y_f32_lo);
+                y_hi = _mm512_cvtps_epi32(y_f32_hi);
+            }
 
             // Clamp to [-127, 127]
+            __m512i v_127 = _mm512_set1_epi32(127);
+            __m512i v_neg127 = _mm512_set1_epi32(-127);
             y_lo = _mm512_max_epi32(y_lo, v_neg127);
             y_lo = _mm512_min_epi32(y_lo, v_127);
             y_hi = _mm512_max_epi32(y_hi, v_neg127);
@@ -2721,10 +2684,8 @@ namespace llaminar2::primitives
             int32_t sum_hi = _mm512_reduce_add_epi32(y_hi);
             out_blk.sum_qs = static_cast<int16_t>(sum_lo + sum_hi);
 
-            // Output scale: Since we normalized, the effective scale is
-            // d_out = d_in * d_representative / inv_rms_factor
-            // For simplicity, we set d_out = d_in (the distribution hasn't changed much)
-            out_blk.d = in_blk.d;
+            // Store output scale
+            out_blk.d = fp32_to_fp16_q8(d_out);
         }
 #else
         // Scalar fallback
@@ -2732,19 +2693,47 @@ namespace llaminar2::primitives
         {
             const Q8_1Block &in_blk = input[b];
             Q8_1Block &out_blk = output[b];
+            float d_in = fp16_to_fp32_q8(in_blk.d);
 
-            int32_t sum_qs = 0;
+            // First pass: compute raw y values and find max_abs
+            int32_t y_raw[32];
+            int32_t max_abs = 0;
             for (int i = 0; i < 32; ++i)
             {
                 size_t ch = b * 32 + i;
-                int32_t y = (static_cast<int32_t>(in_blk.qs[i]) * inv_rms_q8 * gamma_q8[ch]) >> 16;
+                // High precision computation: qs * gamma * inv_rms
+                int64_t term = static_cast<int64_t>(in_blk.qs[i]) * gamma_q12[ch];
+                int64_t res = term * inv_rms_q24;
+                y_raw[i] = static_cast<int32_t>(res >> 20);
+                max_abs = std::max(max_abs, std::abs(y_raw[i]));
+            }
+
+            // Compute output scale
+            float d_out;
+            float scale_factor = 1.0f;
+            if (max_abs == 0)
+            {
+                d_out = 0.0f;
+                scale_factor = 0.0f;
+            }
+            else
+            {
+                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+                scale_factor = 127.0f / static_cast<float>(max_abs);
+            }
+
+            // Second pass: rescale and clamp
+            int32_t sum_qs = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t y = static_cast<int32_t>(std::round(y_raw[i] * scale_factor));
                 y = (y > 127) ? 127 : (y < -127) ? -127
                                                  : y;
                 out_blk.qs[i] = static_cast<int8_t>(y);
                 sum_qs += y;
             }
             out_blk.sum_qs = static_cast<int16_t>(sum_qs);
-            out_blk.d = in_blk.d;
+            out_blk.d = fp32_to_fp16_q8(d_out);
         }
 #endif
     }
@@ -2790,6 +2779,172 @@ namespace llaminar2::primitives
                     blocks_per_row,
                     epsilon);
             }
+        }
+    }
+
+    void rmsnorm_q8_1_pure_integer(
+        const Q8_1Block *input,
+        const float *gamma,
+        Q8_1Block *output,
+        std::size_t rows,
+        std::size_t blocks_per_row,
+        float epsilon,
+        const RMSNormExecOptions &opts)
+    {
+        if (!input || !gamma || !output || rows == 0 || blocks_per_row == 0)
+            return;
+
+        const size_t cols = blocks_per_row * 32;
+
+        // Scale epsilon to integer domain
+        // Typical epsilon is 1e-5 to 1e-6. We scale to ~1-100 range.
+        int32_t epsilon_scaled = static_cast<int32_t>(epsilon * 1e10f);
+        if (epsilon_scaled < 1)
+            epsilon_scaled = 1;
+
+        // Get parallelization thresholds from DebugEnv
+        const auto &cfg = debugEnv().rmsnorm;
+
+        // ================================================================
+        // UNIFIED ROW-PARALLEL APPROACH
+        // 1. Quantize gamma once (sequential, ~1% of work)
+        // 2. Process rows in parallel (each row: sumsq -> inv_rms -> apply)
+        //
+        // This is simpler than 3-phase and avoids intermediate allocations
+        // for row_sumsq/row_inv_rms vectors. Each thread does complete
+        // per-row processing, which has better cache locality.
+        // ================================================================
+
+        // Phase 0: Quantize gamma ONCE (sequential, shared across all rows)
+        std::vector<int16_t> gamma_q12(cols);
+#ifdef __AVX512F__
+        {
+            size_t i = 0;
+            const __m512 scale = _mm512_set1_ps(4095.0f);
+            const __m512 clamp_lo = _mm512_set1_ps(-8.0f);
+            const __m512 clamp_hi = _mm512_set1_ps(8.0f);
+            const __m512 int16_lo = _mm512_set1_ps(-32767.0f);
+            const __m512 int16_hi = _mm512_set1_ps(32767.0f);
+
+            for (; i + 32 <= cols; i += 32)
+            {
+                __m512 v0 = _mm512_loadu_ps(gamma + i);
+                __m512 v1 = _mm512_loadu_ps(gamma + i + 16);
+                v0 = _mm512_max_ps(v0, clamp_lo);
+                v0 = _mm512_min_ps(v0, clamp_hi);
+                v1 = _mm512_max_ps(v1, clamp_lo);
+                v1 = _mm512_min_ps(v1, clamp_hi);
+                v0 = _mm512_mul_ps(v0, scale);
+                v1 = _mm512_mul_ps(v1, scale);
+                v0 = _mm512_max_ps(v0, int16_lo);
+                v0 = _mm512_min_ps(v0, int16_hi);
+                v1 = _mm512_max_ps(v1, int16_lo);
+                v1 = _mm512_min_ps(v1, int16_hi);
+                __m512i i0 = _mm512_cvtps_epi32(v0);
+                __m512i i1 = _mm512_cvtps_epi32(v1);
+                __m512i packed = _mm512_packs_epi32(i0, i1);
+                packed = _mm512_permutexvar_epi64(
+                    _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), packed);
+                _mm512_storeu_si512(reinterpret_cast<__m512i *>(gamma_q12.data() + i), packed);
+            }
+            for (; i < cols; ++i)
+            {
+                float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
+                float scaled = clamped * 4095.0f;
+                scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
+                gamma_q12[i] = static_cast<int16_t>(scaled);
+            }
+        }
+#else
+        for (size_t i = 0; i < cols; ++i)
+        {
+            float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
+            float scaled = clamped * 4095.0f;
+            scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
+            gamma_q12[i] = static_cast<int16_t>(scaled);
+        }
+#endif
+
+        // Process rows - parallelize if we have enough work
+        // Each row does: sumsq -> inv_rms -> apply (all in rmsnorm_q8_1_pure_integer_row)
+        //
+        // EMPIRICAL FINDINGS (Dec 2025 thread sweep):
+        // Q8_1 RMSNorm is MEMORY BANDWIDTH BOUND, not compute bound.
+        // Speedup is capped at ~2x for most workloads due to memory bandwidth saturation.
+        //
+        // Key observations from sweep (OMP_NUM_THREADS=28):
+        //   - 64-128 tokens: Almost NO parallelization benefit (1.02-1.06x speedup)
+        //   - 256-1024 tokens: ~2x speedup with 2+ threads, more threads don't help
+        //   - 2048+ tokens (>8MB): Can scale beyond 2x (up to 3.78x with 18 threads)
+        //   - 2 threads gives within 5% of optimal for most cases
+        //
+        // Strategy (configurable via LLAMINAR_RMSNORM_Q8_* env vars):
+        //   - < q8_min_bytes_parallel (512KB): Sequential (parallelization overhead > benefit)
+        //   - q8_min_bytes_parallel-q8_scale_threshold: q8_base_threads (2) (memory bandwidth saturated)
+        //   - > q8_scale_threshold (8MB): Scale threads based on size (can exceed 2x speedup)
+#ifdef _OPENMP
+        size_t total_elems = rows * cols;
+        size_t total_bytes = (total_elems * 36) / 32; // Q8_1: 36 bytes per 32 elements
+
+        if (opts.allow_parallel &&
+            total_bytes >= cfg.q8_min_bytes_parallel && // Need at least min bytes to benefit from parallelism
+            static_cast<int>(rows) >= cfg.parallel_min_rows &&
+            !omp_in_parallel())
+        {
+            int num_threads = 1;
+
+            if (total_bytes >= cfg.q8_scale_threshold)
+            {
+                // >= scale_threshold: Can scale beyond 2x speedup
+                // Empirically ~4 threads for 8MB, scaling up with size
+                // Use 1 thread per 2MB as heuristic
+                int threads_by_size = static_cast<int>(total_bytes / (2 * 1024 * 1024)); // 1 thread per 2MB
+                threads_by_size = std::max(4, std::min(cfg.q8_max_scale_threads, threads_by_size));
+                num_threads = threads_by_size;
+            }
+            else
+            {
+                // min_bytes-scale_threshold: base_threads is optimal (memory bandwidth bound)
+                num_threads = cfg.q8_base_threads;
+            }
+
+            // Apply config limits
+            int max_threads = omp_get_max_threads();
+            if (cfg.max_threads > 0 && cfg.max_threads < max_threads)
+            {
+                max_threads = cfg.max_threads;
+            }
+            num_threads = std::min(num_threads, max_threads);
+
+            // Also need at least min_rows_per_thread to amortize overhead
+            int threads_by_rows = static_cast<int>(rows / cfg.q8_min_rows_per_thread);
+            num_threads = std::min(num_threads, std::max(1, threads_by_rows));
+
+            if (num_threads > 1)
+            {
+#pragma omp parallel for num_threads(num_threads) schedule(static)
+                for (long long r = 0; r < static_cast<long long>(rows); ++r)
+                {
+                    rmsnorm_q8_1_pure_integer_row(
+                        input + r * blocks_per_row,
+                        gamma_q12.data(),
+                        output + r * blocks_per_row,
+                        blocks_per_row,
+                        epsilon_scaled);
+                }
+                return;
+            }
+        }
+#endif
+        // Sequential fallback
+        for (size_t r = 0; r < rows; ++r)
+        {
+            rmsnorm_q8_1_pure_integer_row(
+                input + r * blocks_per_row,
+                gamma_q12.data(),
+                output + r * blocks_per_row,
+                blocks_per_row,
+                epsilon_scaled);
         }
     }
 

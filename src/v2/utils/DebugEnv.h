@@ -222,14 +222,130 @@ namespace llaminar2
             if (quant_thresh_env)
                 gemm_quant_parallel_threshold = std::atoi(quant_thresh_env);
         }
-    }; /**
-        * @brief Global debug environment snapshot
-        */
+    };
+
+    /**
+     * @brief RMSNorm kernel configuration group
+     *
+     * Parallelization Tuning (Q8_1 Pure Integer RMSNorm):
+     *   The Q8_1 pure integer path uses a 3-phase parallel structure:
+     *   - Phase 0: Quantize gamma (sequential, once per call, ~1% of work)
+     *   - Phase 1: Parallel compute sumsq for all rows (all threads active)
+     *   - Phase 2: Compute inv_rms (sequential, tiny per-row)
+     *   - Phase 3: Parallel apply normalization (all threads active)
+     *
+     *   This avoids the "omp single" bottleneck where threads waited idle during
+     *   gamma quantization.
+     *
+     * Environment Variables:
+     *   LLAMINAR_Q8_PURE_INTEGER_RMSNORM - Enable pure integer path (default: 1)
+     *   LLAMINAR_RMSNORM_PARALLEL_MIN_ROWS - Min rows for parallelism (default: 64)
+     *   LLAMINAR_RMSNORM_PARALLEL_MIN_ELEMS - Min elements for parallelism (default: 65536)
+     *   LLAMINAR_RMSNORM_MIN_ELEMS_PER_THREAD - Min elements per thread (default: 8192)
+     *   LLAMINAR_RMSNORM_MAX_THREADS - Max threads to use (0=unlimited, default: 0)
+     *   LLAMINAR_RMSNORM_Q8_MIN_BYTES_PARALLEL - Min bytes for Q8_1 parallelization (default: 512KB)
+     *   LLAMINAR_RMSNORM_Q8_SCALE_THRESHOLD - Bytes threshold for scaling threads (default: 8MB)
+     *   LLAMINAR_RMSNORM_Q8_MIN_ROWS_PER_THREAD - Min rows per thread (default: 8)
+     */
+    struct RMSNormConfig
+    {
+        // Q8_1 pure integer path - default ON (faster, ~0.995 cosine similarity vs FP32)
+        // Disable with LLAMINAR_Q8_PURE_INTEGER_RMSNORM=0 if needed
+        bool q8_pure_integer = true; ///< Use pure integer RMSNorm (default: enabled)
+
+        // Parallelization tuning parameters (3-phase parallel structure)
+        int parallel_min_rows = 64;      ///< Minimum rows before considering parallelism
+        int parallel_min_elems = 65536;  ///< Minimum total elements (rows * cols) for parallelism (~64K)
+        int min_elems_per_thread = 8192; ///< Min elements per thread to avoid false sharing (~8K)
+        int max_threads = 0;             ///< Maximum threads to use (0 = unlimited/OMP_NUM_THREADS)
+
+        // Q8_1-specific parallelization thresholds (empirically tuned Dec 2025)
+        // Q8_1 is memory bandwidth bound - speedup capped at ~2x for most workloads
+        size_t q8_min_bytes_parallel = 512 * 1024;   ///< Min bytes for Q8_1 parallelization (512KB)
+        size_t q8_scale_threshold = 8 * 1024 * 1024; ///< Bytes threshold for scaling threads (8MB)
+        int q8_min_rows_per_thread = 8;              ///< Min rows per thread for Q8_1
+        int q8_base_threads = 2;                     ///< Base threads for 512KB-8MB range
+        int q8_max_scale_threads = 18;               ///< Max threads when scaling (>8MB)
+
+        RMSNormConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *pure_int_env = std::getenv("LLAMINAR_Q8_PURE_INTEGER_RMSNORM");
+            if (pure_int_env)
+            {
+                q8_pure_integer = (std::atoi(pure_int_env) != 0);
+            }
+
+            const char *min_rows_env = std::getenv("LLAMINAR_RMSNORM_PARALLEL_MIN_ROWS");
+            if (min_rows_env)
+            {
+                parallel_min_rows = std::atoi(min_rows_env);
+            }
+
+            const char *min_elems_env = std::getenv("LLAMINAR_RMSNORM_PARALLEL_MIN_ELEMS");
+            if (min_elems_env)
+            {
+                parallel_min_elems = std::atoi(min_elems_env);
+            }
+
+            const char *elems_per_thread_env = std::getenv("LLAMINAR_RMSNORM_MIN_ELEMS_PER_THREAD");
+            if (elems_per_thread_env)
+            {
+                min_elems_per_thread = std::atoi(elems_per_thread_env);
+            }
+
+            const char *max_threads_env = std::getenv("LLAMINAR_RMSNORM_MAX_THREADS");
+            if (max_threads_env)
+            {
+                max_threads = std::atoi(max_threads_env);
+            }
+
+            // Q8_1-specific thresholds
+            const char *q8_min_bytes_env = std::getenv("LLAMINAR_RMSNORM_Q8_MIN_BYTES_PARALLEL");
+            if (q8_min_bytes_env)
+            {
+                q8_min_bytes_parallel = static_cast<size_t>(std::atol(q8_min_bytes_env));
+            }
+
+            const char *q8_scale_env = std::getenv("LLAMINAR_RMSNORM_Q8_SCALE_THRESHOLD");
+            if (q8_scale_env)
+            {
+                q8_scale_threshold = static_cast<size_t>(std::atol(q8_scale_env));
+            }
+
+            const char *q8_min_rows_env = std::getenv("LLAMINAR_RMSNORM_Q8_MIN_ROWS_PER_THREAD");
+            if (q8_min_rows_env)
+            {
+                q8_min_rows_per_thread = std::atoi(q8_min_rows_env);
+            }
+
+            const char *q8_base_threads_env = std::getenv("LLAMINAR_RMSNORM_Q8_BASE_THREADS");
+            if (q8_base_threads_env)
+            {
+                q8_base_threads = std::atoi(q8_base_threads_env);
+            }
+
+            const char *q8_max_scale_env = std::getenv("LLAMINAR_RMSNORM_Q8_MAX_SCALE_THREADS");
+            if (q8_max_scale_env)
+            {
+                q8_max_scale_threads = std::atoi(q8_max_scale_env);
+            }
+        }
+    };
+
+    /**
+     * @brief Global debug environment snapshot
+     */
     struct DebugEnv
     {
         DequantConfig dequant;
         GemmConfig gemm;
         ProfileConfig profile;
+        RMSNormConfig rmsnorm;
 
         // Add more config groups as needed:
         // AttentionConfig attention;
@@ -242,6 +358,7 @@ namespace llaminar2
         {
             gemm.reload();
             profile.reload();
+            rmsnorm.reload();
         }
     };
 

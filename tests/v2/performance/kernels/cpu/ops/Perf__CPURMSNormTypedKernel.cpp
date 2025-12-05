@@ -534,6 +534,75 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen7B)
 }
 
 // ============================================================================
+// Qwen 32B Tests (d_model=5120)
+// ============================================================================
+
+// Single token decode - Qwen 32B
+TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen32B)
+{
+    BenchmarkConfig config;
+    config.seq_len = 1;
+    config.d_model = 5120; // Qwen 2.5 32B
+    config.warmup_iters = 100;
+    config.bench_iters = 1000;
+    config.description = "Single Token - Qwen 32B (1×5120)";
+
+    run_comparison_benchmark(config);
+}
+
+// Small batch prefill - Qwen 32B
+TEST_F(CPURMSNormTypedKernel_Perf, Prefill_32_Qwen32B)
+{
+    BenchmarkConfig config;
+    config.seq_len = 32;
+    config.d_model = 5120;
+    config.warmup_iters = 50;
+    config.bench_iters = 500;
+    config.description = "Prefill 32 tokens - Qwen 32B (32×5120)";
+
+    run_comparison_benchmark(config);
+}
+
+// Medium batch prefill - Qwen 32B
+TEST_F(CPURMSNormTypedKernel_Perf, Prefill_128_Qwen32B)
+{
+    BenchmarkConfig config;
+    config.seq_len = 128;
+    config.d_model = 5120;
+    config.warmup_iters = 20;
+    config.bench_iters = 200;
+    config.description = "Prefill 128 tokens - Qwen 32B (128×5120)";
+
+    run_comparison_benchmark(config);
+}
+
+// Large batch prefill - Qwen 32B
+TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen32B)
+{
+    BenchmarkConfig config;
+    config.seq_len = 512;
+    config.d_model = 5120;
+    config.warmup_iters = 10;
+    config.bench_iters = 100;
+    config.description = "Prefill 512 tokens - Qwen 32B (512×5120)";
+
+    run_comparison_benchmark(config);
+}
+
+// Very large prefill - Qwen 32B
+TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen32B)
+{
+    BenchmarkConfig config;
+    config.seq_len = 2048;
+    config.d_model = 5120;
+    config.warmup_iters = 5;
+    config.bench_iters = 50;
+    config.description = "Prefill 2048 tokens - Qwen 32B (2048×5120)";
+
+    run_comparison_benchmark(config);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 

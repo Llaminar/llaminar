@@ -575,16 +575,39 @@ namespace llaminar2::primitives
      * the quantized representation are what matter.
      *
      * @param input Input Q8_1 blocks (blocks_per_row blocks)
-     * @param gamma_q8 Pre-quantized gamma weights [cols] in Q8 format (gamma * 256)
+     * @param gamma_q10 Pre-quantized gamma weights [cols] in Q10 format (gamma * 1024)
      * @param output Output Q8_1 blocks (blocks_per_row blocks)
      * @param blocks_per_row Number of Q8_1 blocks per row (cols / 32)
      * @param epsilon_scaled Epsilon pre-scaled (typically 1-100 for stability)
      */
     void rmsnorm_q8_1_pure_integer_row(
         const Q8_1Block *input,
-        const int16_t *gamma_q8,
+        const int16_t *gamma_q10,
         Q8_1Block *output,
         std::size_t blocks_per_row,
         int32_t epsilon_scaled);
+
+    /**
+     * @brief Pure-integer Q8_1 RMSNorm for multiple rows (parallelized)
+     *
+     * Wrapper that handles gamma quantization and row dispatch.
+     * Converts FP32 gamma to Q10 format internally (10-bit fractional precision).
+     *
+     * @param input Input Q8_1 blocks [rows * blocks_per_row]
+     * @param gamma Gamma weights [cols] (FP32, will be quantized to Q10)
+     * @param output Output Q8_1 blocks [rows * blocks_per_row]
+     * @param rows Number of rows
+     * @param blocks_per_row Number of Q8_1 blocks per row (cols / 32)
+     * @param epsilon Epsilon for numerical stability
+     * @param opts Execution options
+     */
+    void rmsnorm_q8_1_pure_integer(
+        const Q8_1Block *input,
+        const float *gamma,
+        Q8_1Block *output,
+        std::size_t rows,
+        std::size_t blocks_per_row,
+        float epsilon,
+        const RMSNormExecOptions &opts = {});
 
 } // namespace llaminar2::primitives

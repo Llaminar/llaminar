@@ -2238,6 +2238,7 @@ add_v2_test(V2_Perf_Q3K_Unpack
     LABELS "V2;Performance;Q3_K;Unpack"
 )
 
+
 # Performance Test: CPURMSNormTypedKernel (typed residuals performance)
 add_executable(v2_perf_rmsnorm_typed performance/kernels/cpu/ops/Perf__CPURMSNormTypedKernel.cpp)
 target_link_libraries(v2_perf_rmsnorm_typed 
@@ -2248,4 +2249,19 @@ target_link_libraries(v2_perf_rmsnorm_typed
 add_v2_test(V2_Perf_RMSNormTyped 
     COMMAND $<TARGET_FILE:v2_perf_rmsnorm_typed>
     LABELS "V2;Performance;RMSNorm;TypedResiduals;Kernels"
+    MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
+
+# Performance Test: RMSNorm Thread Sweep (optimal thread count discovery)
+add_executable(v2_perf_rmsnorm_thread_sweep performance/kernels/cpu/ops/Perf__RMSNormThreadSweep.cpp)
+target_link_libraries(v2_perf_rmsnorm_thread_sweep 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_RMSNormThreadSweep 
+    COMMAND $<TARGET_FILE:v2_perf_rmsnorm_thread_sweep>
+    LABELS "V2;Performance;RMSNorm;ThreadSweep;Kernels"
+    MPI_PROCS 1
+)
+
