@@ -253,6 +253,11 @@ namespace llaminar2
         // Disable with LLAMINAR_Q8_PURE_INTEGER_RMSNORM=0 if needed
         bool q8_pure_integer = true; ///< Use pure integer RMSNorm (default: enabled)
 
+        // Two-pass approach - default ON (enables block pipelining by separating y-compute from rescale)
+        // Uses global max_abs for entire row instead of per-block max_abs
+        // Slight precision tradeoff but enables better vectorization
+        bool q8_twopass = true; ///< Use two-pass approach (default: enabled)
+
         // Parallelization tuning parameters (3-phase parallel structure)
         int parallel_min_rows = 64;      ///< Minimum rows before considering parallelism
         int parallel_min_elems = 65536;  ///< Minimum total elements (rows * cols) for parallelism (~64K)
@@ -278,6 +283,12 @@ namespace llaminar2
             if (pure_int_env)
             {
                 q8_pure_integer = (std::atoi(pure_int_env) != 0);
+            }
+
+            const char *twopass_env = std::getenv("LLAMINAR_Q8_RMSNORM_TWOPASS");
+            if (twopass_env)
+            {
+                q8_twopass = (std::atoi(twopass_env) != 0);
             }
 
             const char *min_rows_env = std::getenv("LLAMINAR_RMSNORM_PARALLEL_MIN_ROWS");

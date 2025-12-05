@@ -2504,6 +2504,268 @@ namespace llaminar2::primitives
 #endif
     }
 
+    /**
+     * @brief Two-pass RMSNorm for Q8_1: enables block pipelining by separating
+     *        y-value computation from rescaling.
+     *
+     * Pass 1: Compute all y values for all blocks, find GLOBAL max_abs across entire row
+     * Pass 2: Rescale all blocks using the same scale factor (no per-block dependency)
+     *
+     * This approach:
+     * - Removes the per-block max_abs -> rescale dependency chain
+     * - Allows better vectorization and prefetching in Pass 2
+     * - Uses a single output scale for the entire row (slight precision tradeoff)
+     * - Requires temporary storage for y values (blocks_per_row * 32 * sizeof(int32_t))
+     *
+     * @param input Input Q8_1 blocks for this row
+     * @param gamma_q12 Pre-quantized gamma in Q12 format
+     * @param output Output Q8_1 blocks for this row
+     * @param blocks_per_row Number of blocks per row
+     * @param epsilon_scaled Pre-scaled epsilon value
+     * @param y_buffer Pre-allocated buffer for intermediate y values (cols elements)
+     */
+    void rmsnorm_q8_1_pure_integer_row_twopass(
+        const Q8_1Block *input,
+        const int16_t *gamma_q12,
+        Q8_1Block *output,
+        std::size_t blocks_per_row,
+        int32_t epsilon_scaled,
+        int32_t *y_buffer) // Pre-allocated: blocks_per_row * 32 elements
+    {
+        if (!input || !gamma_q12 || !output || blocks_per_row == 0 || !y_buffer)
+            return;
+
+        const size_t cols = blocks_per_row * 32;
+
+        // ====================================================================
+        // Phase 1: Compute Sum(d² * sum_qs²) using double precision
+        // ====================================================================
+        double total_sum_sq = 0.0;
+
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            float d = fp16_to_fp32_q8(input[b].d);
+            int32_t s = 0;
+
+#if defined(__AVX512F__)
+            __m256i qs_8 = _mm256_loadu_si256((const __m256i *)input[b].qs);
+            __m512i qs_16 = _mm512_cvtepi8_epi16(qs_8);
+            __m512i qs_sq = _mm512_madd_epi16(qs_16, qs_16);
+            s = _mm512_reduce_add_epi32(qs_sq);
+#else
+            for (int i = 0; i < 32; ++i)
+                s += input[b].qs[i] * input[b].qs[i];
+#endif
+            total_sum_sq += static_cast<double>(d) * d * s;
+        }
+
+        // ====================================================================
+        // Phase 2: Compute RMS and inverse RMS
+        // ====================================================================
+        double mean_sq = total_sum_sq / cols;
+        mean_sq += 1e-5; // Epsilon
+
+        double rms = std::sqrt(mean_sq);
+        double inv_rms_f = 16777216.0 / rms;
+
+        if (inv_rms_f > 2147483647.0)
+            inv_rms_f = 2147483647.0;
+
+        uint32_t inv_rms_q24 = static_cast<uint32_t>(inv_rms_f);
+        if (inv_rms_q24 == 0)
+            inv_rms_q24 = 1;
+
+        // ====================================================================
+        // Phase 3 (PASS 1): Compute ALL y values and find GLOBAL max_abs
+        // This decouples max_abs computation from rescaling, enabling pipelining
+        // ====================================================================
+        int32_t global_max_abs = 0;
+
+#if defined(__AVX512F__)
+        __m512i v_inv_rms = _mm512_set1_epi32(inv_rms_q24);
+        __m512i v_perm_idx = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+        __m512i v_global_max = _mm512_setzero_si512();
+
+        // Pass 1: Compute y values for all blocks, accumulate global max
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            const Q8_1Block &in_blk = input[b];
+            int32_t *y_out = y_buffer + b * 32;
+
+            // Load and expand qs to int32
+            __m128i qs_lo = _mm_loadu_si128((const __m128i *)in_blk.qs);
+            __m128i qs_hi = _mm_loadu_si128((const __m128i *)(in_blk.qs + 16));
+            __m512i qs32_lo = _mm512_cvtepi8_epi32(qs_lo);
+            __m512i qs32_hi = _mm512_cvtepi8_epi32(qs_hi);
+
+            // Load gamma (int16) -> int32
+            __m256i gamma16_lo = _mm256_loadu_si256((const __m256i *)(gamma_q12 + b * 32));
+            __m256i gamma16_hi = _mm256_loadu_si256((const __m256i *)(gamma_q12 + b * 32 + 16));
+            __m512i gamma32_lo = _mm512_cvtepi16_epi32(gamma16_lo);
+            __m512i gamma32_hi = _mm512_cvtepi16_epi32(gamma16_hi);
+
+            // Compute term = qs * gamma (int32)
+            __m512i term_lo = _mm512_mullo_epi32(qs32_lo, gamma32_lo);
+            __m512i term_hi = _mm512_mullo_epi32(qs32_hi, gamma32_hi);
+
+            // Compute res = term * inv_rms (64-bit) - even lanes
+            __m512i res_lo_even = _mm512_mul_epi32(term_lo, v_inv_rms);
+            __m512i res_hi_even = _mm512_mul_epi32(term_hi, v_inv_rms);
+            // Odd lanes
+            __m512i res_lo_odd = _mm512_mul_epi32(_mm512_srli_epi64(term_lo, 32), v_inv_rms);
+            __m512i res_hi_odd = _mm512_mul_epi32(_mm512_srli_epi64(term_hi, 32), v_inv_rms);
+
+            // Shift right by 20
+            __m512i y_lo_even = _mm512_srai_epi64(res_lo_even, 20);
+            __m512i y_hi_even = _mm512_srai_epi64(res_hi_even, 20);
+            __m512i y_lo_odd = _mm512_srai_epi64(res_lo_odd, 20);
+            __m512i y_hi_odd = _mm512_srai_epi64(res_hi_odd, 20);
+
+            // Pack back to int32
+            __m256i y256_lo_even = _mm512_cvtepi64_epi32(y_lo_even);
+            __m256i y256_lo_odd = _mm512_cvtepi64_epi32(y_lo_odd);
+            __m256i y256_hi_even = _mm512_cvtepi64_epi32(y_hi_even);
+            __m256i y256_hi_odd = _mm512_cvtepi64_epi32(y_hi_odd);
+
+            // Interleave even/odd results
+            __m512i y_lo = _mm512_castsi256_si512(y256_lo_even);
+            y_lo = _mm512_inserti64x4(y_lo, y256_lo_odd, 1);
+            y_lo = _mm512_permutexvar_epi32(v_perm_idx, y_lo);
+
+            __m512i y_hi = _mm512_castsi256_si512(y256_hi_even);
+            y_hi = _mm512_inserti64x4(y_hi, y256_hi_odd, 1);
+            y_hi = _mm512_permutexvar_epi32(v_perm_idx, y_hi);
+
+            // Store y values to buffer
+            _mm512_storeu_si512((__m512i *)(y_out), y_lo);
+            _mm512_storeu_si512((__m512i *)(y_out + 16), y_hi);
+
+            // Accumulate global max (no horizontal reduce yet - defer to end)
+            __m512i abs_lo = _mm512_abs_epi32(y_lo);
+            __m512i abs_hi = _mm512_abs_epi32(y_hi);
+            v_global_max = _mm512_max_epi32(v_global_max, abs_lo);
+            v_global_max = _mm512_max_epi32(v_global_max, abs_hi);
+        }
+
+        // Single horizontal reduce at end of Pass 1
+        global_max_abs = _mm512_reduce_max_epi32(v_global_max);
+
+        // ====================================================================
+        // Phase 4 (PASS 2): Rescale all blocks using GLOBAL scale factor
+        // No per-block dependencies - can be fully pipelined!
+        // ====================================================================
+
+        // Compute scale factor once for entire row
+        float scale_factor = (global_max_abs > 0) ? (127.0f / static_cast<float>(global_max_abs)) : 0.0f;
+        __m512 v_scale = _mm512_set1_ps(scale_factor);
+        __m512i v_127 = _mm512_set1_epi32(127);
+        __m512i v_neg127 = _mm512_set1_epi32(-127);
+
+        // Compute average d_in for this row (used for output scale)
+        // Note: This is an approximation - using geometric mean of input scales
+        double d_product = 1.0;
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            d_product *= fp16_to_fp32_q8(input[b].d);
+        }
+        float d_avg = static_cast<float>(std::pow(d_product, 1.0 / blocks_per_row));
+        float d_out = (global_max_abs > 0) ? (d_avg * static_cast<float>(global_max_abs) / (127.0f * 65536.0f)) : 0.0f;
+        uint16_t d_out_fp16 = fp32_to_fp16_q8(d_out);
+
+        // Pass 2: Rescale and write output (fully pipelined, no dependencies)
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            Q8_1Block &out_blk = output[b];
+            const int32_t *y_in = y_buffer + b * 32;
+
+            // Load y values from buffer
+            __m512i y_lo = _mm512_loadu_si512((const __m512i *)(y_in));
+            __m512i y_hi = _mm512_loadu_si512((const __m512i *)(y_in + 16));
+
+            // Rescale: y_rescaled = y * 127 / global_max_abs
+            if (global_max_abs > 0)
+            {
+                __m512 y_f32_lo = _mm512_cvtepi32_ps(y_lo);
+                __m512 y_f32_hi = _mm512_cvtepi32_ps(y_hi);
+                y_f32_lo = _mm512_mul_ps(y_f32_lo, v_scale);
+                y_f32_hi = _mm512_mul_ps(y_f32_hi, v_scale);
+                y_lo = _mm512_cvtps_epi32(y_f32_lo);
+                y_hi = _mm512_cvtps_epi32(y_f32_hi);
+            }
+
+            // Clamp to [-127, 127]
+            y_lo = _mm512_max_epi32(y_lo, v_neg127);
+            y_lo = _mm512_min_epi32(y_lo, v_127);
+            y_hi = _mm512_max_epi32(y_hi, v_neg127);
+            y_hi = _mm512_min_epi32(y_hi, v_127);
+
+            // Pack to int8
+            __m128i out8_lo = _mm512_cvtepi32_epi8(y_lo);
+            __m128i out8_hi = _mm512_cvtepi32_epi8(y_hi);
+
+            _mm_storeu_si128((__m128i *)out_blk.qs, out8_lo);
+            _mm_storeu_si128((__m128i *)(out_blk.qs + 16), out8_hi);
+
+            // Compute sum_qs
+            int32_t sum_qs = _mm512_reduce_add_epi32(y_lo) + _mm512_reduce_add_epi32(y_hi);
+            out_blk.sum_qs = static_cast<int16_t>(sum_qs);
+
+            // Use same d_out for all blocks in row
+            out_blk.d = d_out_fp16;
+        }
+
+#else
+        // Scalar fallback - two pass
+        // Pass 1: Compute y values and find global max
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            const Q8_1Block &in_blk = input[b];
+            int32_t *y_out = y_buffer + b * 32;
+
+            for (int i = 0; i < 32; ++i)
+            {
+                size_t ch = b * 32 + i;
+                int64_t term = static_cast<int64_t>(in_blk.qs[i]) * gamma_q12[ch];
+                int64_t res = term * inv_rms_q24;
+                y_out[i] = static_cast<int32_t>(res >> 20);
+                global_max_abs = std::max(global_max_abs, std::abs(y_out[i]));
+            }
+        }
+
+        // Compute scale factor
+        float scale_factor = (global_max_abs > 0) ? (127.0f / static_cast<float>(global_max_abs)) : 0.0f;
+
+        // Compute average d_in
+        double d_sum = 0.0;
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            d_sum += fp16_to_fp32_q8(input[b].d);
+        }
+        float d_avg = static_cast<float>(d_sum / blocks_per_row);
+        float d_out = (global_max_abs > 0) ? (d_avg * static_cast<float>(global_max_abs) / (127.0f * 65536.0f)) : 0.0f;
+        uint16_t d_out_fp16 = fp32_to_fp16_q8(d_out);
+
+        // Pass 2: Rescale and write output
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            Q8_1Block &out_blk = output[b];
+            const int32_t *y_in = y_buffer + b * 32;
+
+            int32_t sum_qs = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t y = static_cast<int32_t>(std::round(y_in[i] * scale_factor));
+                y = (y > 127) ? 127 : (y < -127) ? -127
+                                                 : y;
+                out_blk.qs[i] = static_cast<int8_t>(y);
+                sum_qs += y;
+            }
+            out_blk.sum_qs = static_cast<int16_t>(sum_qs);
+            out_blk.d = d_out_fp16;
+        }
+#endif
+    }
+
     void rmsnorm_q8_1_pure_integer_row(
         const Q8_1Block *input,
         const int16_t *gamma_q12, // Pre-quantized gamma in Q12 format (clamp(gamma, -8, 8) * 4095)
@@ -2816,54 +3078,79 @@ namespace llaminar2::primitives
         // ================================================================
 
         // Phase 0: Quantize gamma ONCE (sequential, shared across all rows)
-        std::vector<int16_t> gamma_q12(cols);
-#ifdef __AVX512F__
-        {
-            size_t i = 0;
-            const __m512 scale = _mm512_set1_ps(4095.0f);
-            const __m512 clamp_lo = _mm512_set1_ps(-8.0f);
-            const __m512 clamp_hi = _mm512_set1_ps(8.0f);
-            const __m512 int16_lo = _mm512_set1_ps(-32767.0f);
-            const __m512 int16_hi = _mm512_set1_ps(32767.0f);
+        // Use thread-local cache to avoid repeated allocations across calls
+        // Cache key: gamma pointer + cols (assumes same gamma pointer = same weights)
+        thread_local std::vector<int16_t> gamma_q12_cache;
+        thread_local const float *cached_gamma_ptr = nullptr;
+        thread_local size_t cached_cols = 0;
 
-            for (; i + 32 <= cols; i += 32)
+        int16_t *gamma_q12 = nullptr;
+
+        if (cached_gamma_ptr == gamma && cached_cols == cols)
+        {
+            // Cache hit - reuse previous quantization
+            gamma_q12 = gamma_q12_cache.data();
+        }
+        else
+        {
+            // Cache miss - quantize gamma and update cache
+            if (gamma_q12_cache.size() < cols)
             {
-                __m512 v0 = _mm512_loadu_ps(gamma + i);
-                __m512 v1 = _mm512_loadu_ps(gamma + i + 16);
-                v0 = _mm512_max_ps(v0, clamp_lo);
-                v0 = _mm512_min_ps(v0, clamp_hi);
-                v1 = _mm512_max_ps(v1, clamp_lo);
-                v1 = _mm512_min_ps(v1, clamp_hi);
-                v0 = _mm512_mul_ps(v0, scale);
-                v1 = _mm512_mul_ps(v1, scale);
-                v0 = _mm512_max_ps(v0, int16_lo);
-                v0 = _mm512_min_ps(v0, int16_hi);
-                v1 = _mm512_max_ps(v1, int16_lo);
-                v1 = _mm512_min_ps(v1, int16_hi);
-                __m512i i0 = _mm512_cvtps_epi32(v0);
-                __m512i i1 = _mm512_cvtps_epi32(v1);
-                __m512i packed = _mm512_packs_epi32(i0, i1);
-                packed = _mm512_permutexvar_epi64(
-                    _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), packed);
-                _mm512_storeu_si512(reinterpret_cast<__m512i *>(gamma_q12.data() + i), packed);
+                gamma_q12_cache.resize(cols);
             }
-            for (; i < cols; ++i)
+            gamma_q12 = gamma_q12_cache.data();
+
+#ifdef __AVX512F__
+            {
+                size_t i = 0;
+                const __m512 scale = _mm512_set1_ps(4095.0f);
+                const __m512 clamp_lo = _mm512_set1_ps(-8.0f);
+                const __m512 clamp_hi = _mm512_set1_ps(8.0f);
+                const __m512 int16_lo = _mm512_set1_ps(-32767.0f);
+                const __m512 int16_hi = _mm512_set1_ps(32767.0f);
+
+                for (; i + 32 <= cols; i += 32)
+                {
+                    __m512 v0 = _mm512_loadu_ps(gamma + i);
+                    __m512 v1 = _mm512_loadu_ps(gamma + i + 16);
+                    v0 = _mm512_max_ps(v0, clamp_lo);
+                    v0 = _mm512_min_ps(v0, clamp_hi);
+                    v1 = _mm512_max_ps(v1, clamp_lo);
+                    v1 = _mm512_min_ps(v1, clamp_hi);
+                    v0 = _mm512_mul_ps(v0, scale);
+                    v1 = _mm512_mul_ps(v1, scale);
+                    v0 = _mm512_max_ps(v0, int16_lo);
+                    v0 = _mm512_min_ps(v0, int16_hi);
+                    v1 = _mm512_max_ps(v1, int16_lo);
+                    v1 = _mm512_min_ps(v1, int16_hi);
+                    __m512i i0 = _mm512_cvtps_epi32(v0);
+                    __m512i i1 = _mm512_cvtps_epi32(v1);
+                    __m512i packed = _mm512_packs_epi32(i0, i1);
+                    packed = _mm512_permutexvar_epi64(
+                        _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), packed);
+                    _mm512_storeu_si512(reinterpret_cast<__m512i *>(gamma_q12 + i), packed);
+                }
+                for (; i < cols; ++i)
+                {
+                    float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
+                    float scaled = clamped * 4095.0f;
+                    scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    gamma_q12[i] = static_cast<int16_t>(scaled);
+                }
+            }
+#else
+            for (size_t i = 0; i < cols; ++i)
             {
                 float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
                 float scaled = clamped * 4095.0f;
                 scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
                 gamma_q12[i] = static_cast<int16_t>(scaled);
             }
-        }
-#else
-        for (size_t i = 0; i < cols; ++i)
-        {
-            float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
-            float scaled = clamped * 4095.0f;
-            scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
-            gamma_q12[i] = static_cast<int16_t>(scaled);
-        }
 #endif
+            // Update cache metadata
+            cached_gamma_ptr = gamma;
+            cached_cols = cols;
+        }
 
         // Process rows - parallelize if we have enough work
         // Each row does: sumsq -> inv_rms -> apply (all in rmsnorm_q8_1_pure_integer_row)
@@ -2922,29 +3209,72 @@ namespace llaminar2::primitives
 
             if (num_threads > 1)
             {
-#pragma omp parallel for num_threads(num_threads) schedule(static)
-                for (long long r = 0; r < static_cast<long long>(rows); ++r)
+                if (cfg.q8_twopass)
                 {
-                    rmsnorm_q8_1_pure_integer_row(
-                        input + r * blocks_per_row,
-                        gamma_q12.data(),
-                        output + r * blocks_per_row,
-                        blocks_per_row,
-                        epsilon_scaled);
+                    // Two-pass approach: each thread gets its own y_buffer
+                    // Allocate per-thread buffers for intermediate y values
+#pragma omp parallel num_threads(num_threads)
+                    {
+                        // Per-thread y buffer (blocks_per_row * 32 int32 values)
+                        std::vector<int32_t> y_buffer(cols);
+
+#pragma omp for schedule(static)
+                        for (long long r = 0; r < static_cast<long long>(rows); ++r)
+                        {
+                            rmsnorm_q8_1_pure_integer_row_twopass(
+                                input + r * blocks_per_row,
+                                gamma_q12,
+                                output + r * blocks_per_row,
+                                blocks_per_row,
+                                epsilon_scaled,
+                                y_buffer.data());
+                        }
+                    }
+                }
+                else
+                {
+                    // Single-pass approach (original)
+#pragma omp parallel for num_threads(num_threads) schedule(static)
+                    for (long long r = 0; r < static_cast<long long>(rows); ++r)
+                    {
+                        rmsnorm_q8_1_pure_integer_row(
+                            input + r * blocks_per_row,
+                            gamma_q12,
+                            output + r * blocks_per_row,
+                            blocks_per_row,
+                            epsilon_scaled);
+                    }
                 }
                 return;
             }
         }
 #endif
         // Sequential fallback
-        for (size_t r = 0; r < rows; ++r)
+        if (cfg.q8_twopass)
         {
-            rmsnorm_q8_1_pure_integer_row(
-                input + r * blocks_per_row,
-                gamma_q12.data(),
-                output + r * blocks_per_row,
-                blocks_per_row,
-                epsilon_scaled);
+            std::vector<int32_t> y_buffer(cols);
+            for (size_t r = 0; r < rows; ++r)
+            {
+                rmsnorm_q8_1_pure_integer_row_twopass(
+                    input + r * blocks_per_row,
+                    gamma_q12,
+                    output + r * blocks_per_row,
+                    blocks_per_row,
+                    epsilon_scaled,
+                    y_buffer.data());
+            }
+        }
+        else
+        {
+            for (size_t r = 0; r < rows; ++r)
+            {
+                rmsnorm_q8_1_pure_integer_row(
+                    input + r * blocks_per_row,
+                    gamma_q12,
+                    output + r * blocks_per_row,
+                    blocks_per_row,
+                    epsilon_scaled);
+            }
         }
     }
 
