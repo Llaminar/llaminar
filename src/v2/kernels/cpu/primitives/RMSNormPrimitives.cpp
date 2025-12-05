@@ -2526,47 +2526,53 @@ namespace llaminar2::primitives
         const size_t cols = blocks_per_row * 32;
 
         // ====================================================================
-        // Phase 1 & 2: Compute Sum(d² * sum_qs²) using double precision
+        // Phase 1 & 2: Compute Sum(d² * sum_qs²) using vector accumulation
         // ====================================================================
-        double total_sum_sq = 0.0;
+
+#if defined(__AVX512F__)
+        __m512 v_total_sum = _mm512_setzero_ps();
 
         // Unrolled sum loop (4x)
         size_t b = 0;
-#if defined(__AVX512F__)
         for (; b + 4 <= blocks_per_row; b += 4)
         {
             // Block 0
             float d0 = fp16_to_fp32_q8(input[b].d);
+            __m512 v_d0_sq = _mm512_set1_ps(d0 * d0);
             __m256i qs8_0 = _mm256_loadu_si256((const __m256i *)input[b].qs);
             __m512i qs16_0 = _mm512_cvtepi8_epi16(qs8_0);
             __m512i qs_sq0 = _mm512_madd_epi16(qs16_0, qs16_0);
-            int32_t s0 = _mm512_reduce_add_epi32(qs_sq0);
-            total_sum_sq += static_cast<double>(d0) * d0 * s0;
+            v_total_sum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(qs_sq0), v_d0_sq, v_total_sum);
 
             // Block 1
             float d1 = fp16_to_fp32_q8(input[b + 1].d);
+            __m512 v_d1_sq = _mm512_set1_ps(d1 * d1);
             __m256i qs8_1 = _mm256_loadu_si256((const __m256i *)input[b + 1].qs);
             __m512i qs16_1 = _mm512_cvtepi8_epi16(qs8_1);
             __m512i qs_sq1 = _mm512_madd_epi16(qs16_1, qs16_1);
-            int32_t s1 = _mm512_reduce_add_epi32(qs_sq1);
-            total_sum_sq += static_cast<double>(d1) * d1 * s1;
+            v_total_sum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(qs_sq1), v_d1_sq, v_total_sum);
 
             // Block 2
             float d2 = fp16_to_fp32_q8(input[b + 2].d);
+            __m512 v_d2_sq = _mm512_set1_ps(d2 * d2);
             __m256i qs8_2 = _mm256_loadu_si256((const __m256i *)input[b + 2].qs);
             __m512i qs16_2 = _mm512_cvtepi8_epi16(qs8_2);
             __m512i qs_sq2 = _mm512_madd_epi16(qs16_2, qs16_2);
-            int32_t s2 = _mm512_reduce_add_epi32(qs_sq2);
-            total_sum_sq += static_cast<double>(d2) * d2 * s2;
+            v_total_sum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(qs_sq2), v_d2_sq, v_total_sum);
 
             // Block 3
             float d3 = fp16_to_fp32_q8(input[b + 3].d);
+            __m512 v_d3_sq = _mm512_set1_ps(d3 * d3);
             __m256i qs8_3 = _mm256_loadu_si256((const __m256i *)input[b + 3].qs);
             __m512i qs16_3 = _mm512_cvtepi8_epi16(qs8_3);
             __m512i qs_sq3 = _mm512_madd_epi16(qs16_3, qs16_3);
-            int32_t s3 = _mm512_reduce_add_epi32(qs_sq3);
-            total_sum_sq += static_cast<double>(d3) * d3 * s3;
+            v_total_sum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(qs_sq3), v_d3_sq, v_total_sum);
         }
+
+        double total_sum_sq = static_cast<double>(_mm512_reduce_add_ps(v_total_sum));
+#else
+        double total_sum_sq = 0.0;
+        size_t b = 0;
 #endif
         for (; b < blocks_per_row; ++b)
         {
@@ -2602,161 +2608,245 @@ namespace llaminar2::primitives
         // ====================================================================
 
 #if defined(__AVX512F__)
-        __m512i v_inv_rms = _mm512_set1_epi32(inv_rms_q24);
-        __m512i v_perm_idx = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
-        __m512i v_127 = _mm512_set1_epi32(127);
-        __m512i v_neg127 = _mm512_set1_epi32(-127);
+        // Optimized implementation using float scaling to avoid 64-bit integer ops
+        float inv_rms_float = 1.0f / static_cast<float>(rms);
+        __m512 v_inv_rms_f = _mm512_set1_ps(inv_rms_float);
+        __m512i v_127_i = _mm512_set1_epi32(127);
+        __m512i v_neg127_i = _mm512_set1_epi32(-127);
+        __m512i v_abs_mask = _mm512_set1_epi32(0x7FFFFFFF);
 
+        // Unrolled loop (4x) with Vectorized Division
         b = 0;
-        for (; b + 2 <= blocks_per_row; b += 2)
+        for (; b + 4 <= blocks_per_row; b += 4)
         {
-            // --- Block 0 Setup ---
+            // Block 0
             const Q8_1Block &in0 = input[b];
-            Q8_1Block &out0 = output[b];
-            float d_in0 = fp16_to_fp32_q8(in0.d);
+            __m256i qs8_0 = _mm256_loadu_si256((const __m256i *)in0.qs);
+            __m512i qs16_0 = _mm512_cvtepi8_epi16(qs8_0);
+            __m512i g16_0 = _mm512_loadu_si512((const __m512i *)(gamma_q12 + b * 32));
 
-            __m128i qs_lo0 = _mm_loadu_si128((const __m128i *)in0.qs);
-            __m128i qs_hi0 = _mm_loadu_si128((const __m128i *)(in0.qs + 16));
-            __m512i qs32_lo0 = _mm512_cvtepi8_epi32(qs_lo0);
-            __m512i qs32_hi0 = _mm512_cvtepi8_epi32(qs_hi0);
+            __m512i qs32_lo_0 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(qs16_0));
+            __m512i qs32_hi_0 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(qs16_0, 1));
+            __m512i g32_lo_0 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(g16_0));
+            __m512i g32_hi_0 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(g16_0, 1));
 
-            __m256i g16_lo0 = _mm256_loadu_si256((const __m256i *)(gamma_q12 + b * 32));
-            __m256i g16_hi0 = _mm256_loadu_si256((const __m256i *)(gamma_q12 + b * 32 + 16));
-            __m512i g32_lo0 = _mm512_cvtepi16_epi32(g16_lo0);
-            __m512i g32_hi0 = _mm512_cvtepi16_epi32(g16_hi0);
+            __m512i prod32_lo_0 = _mm512_mullo_epi32(qs32_lo_0, g32_lo_0);
+            __m512i prod32_hi_0 = _mm512_mullo_epi32(qs32_hi_0, g32_hi_0);
 
-            // --- Block 1 Setup ---
+            __m512i max_int_v_0 = _mm512_max_epi32(_mm512_abs_epi32(prod32_lo_0), _mm512_abs_epi32(prod32_hi_0));
+            float m0 = (float)_mm512_reduce_max_epi32(max_int_v_0);
+
+            // Block 1
             const Q8_1Block &in1 = input[b + 1];
-            Q8_1Block &out1 = output[b + 1];
-            float d_in1 = fp16_to_fp32_q8(in1.d);
+            __m256i qs8_1 = _mm256_loadu_si256((const __m256i *)in1.qs);
+            __m512i qs16_1 = _mm512_cvtepi8_epi16(qs8_1);
+            __m512i g16_1 = _mm512_loadu_si512((const __m512i *)(gamma_q12 + (b + 1) * 32));
 
-            __m128i qs_lo1 = _mm_loadu_si128((const __m128i *)in1.qs);
-            __m128i qs_hi1 = _mm_loadu_si128((const __m128i *)(in1.qs + 16));
-            __m512i qs32_lo1 = _mm512_cvtepi8_epi32(qs_lo1);
-            __m512i qs32_hi1 = _mm512_cvtepi8_epi32(qs_hi1);
+            __m512i qs32_lo_1 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(qs16_1));
+            __m512i qs32_hi_1 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(qs16_1, 1));
+            __m512i g32_lo_1 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(g16_1));
+            __m512i g32_hi_1 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(g16_1, 1));
 
-            __m256i g16_lo1 = _mm256_loadu_si256((const __m256i *)(gamma_q12 + (b + 1) * 32));
-            __m256i g16_hi1 = _mm256_loadu_si256((const __m256i *)(gamma_q12 + (b + 1) * 32 + 16));
-            __m512i g32_lo1 = _mm512_cvtepi16_epi32(g16_lo1);
-            __m512i g32_hi1 = _mm512_cvtepi16_epi32(g16_hi1);
+            __m512i prod32_lo_1 = _mm512_mullo_epi32(qs32_lo_1, g32_lo_1);
+            __m512i prod32_hi_1 = _mm512_mullo_epi32(qs32_hi_1, g32_hi_1);
 
-            // --- Block 0 Compute Y ---
-            __m512i term_lo0 = _mm512_mullo_epi32(qs32_lo0, g32_lo0);
-            __m512i term_hi0 = _mm512_mullo_epi32(qs32_hi0, g32_hi0);
-            __m512i res_lo_e0 = _mm512_mul_epi32(term_lo0, v_inv_rms);
-            __m512i res_hi_e0 = _mm512_mul_epi32(term_hi0, v_inv_rms);
-            __m512i res_lo_o0 = _mm512_mul_epi32(_mm512_srli_epi64(term_lo0, 32), v_inv_rms);
-            __m512i res_hi_o0 = _mm512_mul_epi32(_mm512_srli_epi64(term_hi0, 32), v_inv_rms);
-            __m512i y_lo_e0 = _mm512_srai_epi64(res_lo_e0, 20);
-            __m512i y_hi_e0 = _mm512_srai_epi64(res_hi_e0, 20);
-            __m512i y_lo_o0 = _mm512_srai_epi64(res_lo_o0, 20);
-            __m512i y_hi_o0 = _mm512_srai_epi64(res_hi_o0, 20);
-            __m256i y256_lo_e0 = _mm512_cvtepi64_epi32(y_lo_e0);
-            __m256i y256_lo_o0 = _mm512_cvtepi64_epi32(y_lo_o0);
-            __m256i y256_hi_e0 = _mm512_cvtepi64_epi32(y_hi_e0);
-            __m256i y256_hi_o0 = _mm512_cvtepi64_epi32(y_hi_o0);
-            __m512i y_lo0 = _mm512_castsi256_si512(y256_lo_e0);
-            y_lo0 = _mm512_inserti64x4(y_lo0, y256_lo_o0, 1);
-            y_lo0 = _mm512_permutexvar_epi32(v_perm_idx, y_lo0);
-            __m512i y_hi0 = _mm512_castsi256_si512(y256_hi_e0);
-            y_hi0 = _mm512_inserti64x4(y_hi0, y256_hi_o0, 1);
-            y_hi0 = _mm512_permutexvar_epi32(v_perm_idx, y_hi0);
+            __m512i max_int_v_1 = _mm512_max_epi32(_mm512_abs_epi32(prod32_lo_1), _mm512_abs_epi32(prod32_hi_1));
+            float m1 = (float)_mm512_reduce_max_epi32(max_int_v_1);
 
-            // --- Block 1 Compute Y (Interleaved) ---
-            __m512i term_lo1 = _mm512_mullo_epi32(qs32_lo1, g32_lo1);
-            __m512i term_hi1 = _mm512_mullo_epi32(qs32_hi1, g32_hi1);
-            __m512i res_lo_e1 = _mm512_mul_epi32(term_lo1, v_inv_rms);
-            __m512i res_hi_e1 = _mm512_mul_epi32(term_hi1, v_inv_rms);
-            __m512i res_lo_o1 = _mm512_mul_epi32(_mm512_srli_epi64(term_lo1, 32), v_inv_rms);
-            __m512i res_hi_o1 = _mm512_mul_epi32(_mm512_srli_epi64(term_hi1, 32), v_inv_rms);
-            __m512i y_lo_e1 = _mm512_srai_epi64(res_lo_e1, 20);
-            __m512i y_hi_e1 = _mm512_srai_epi64(res_hi_e1, 20);
-            __m512i y_lo_o1 = _mm512_srai_epi64(res_lo_o1, 20);
-            __m512i y_hi_o1 = _mm512_srai_epi64(res_hi_o1, 20);
-            __m256i y256_lo_e1 = _mm512_cvtepi64_epi32(y_lo_e1);
-            __m256i y256_lo_o1 = _mm512_cvtepi64_epi32(y_lo_o1);
-            __m256i y256_hi_e1 = _mm512_cvtepi64_epi32(y_hi_e1);
-            __m256i y256_hi_o1 = _mm512_cvtepi64_epi32(y_hi_o1);
-            __m512i y_lo1 = _mm512_castsi256_si512(y256_lo_e1);
-            y_lo1 = _mm512_inserti64x4(y_lo1, y256_lo_o1, 1);
-            y_lo1 = _mm512_permutexvar_epi32(v_perm_idx, y_lo1);
-            __m512i y_hi1 = _mm512_castsi256_si512(y256_hi_e1);
-            y_hi1 = _mm512_inserti64x4(y_hi1, y256_hi_o1, 1);
-            y_hi1 = _mm512_permutexvar_epi32(v_perm_idx, y_hi1);
+            // Block 2
+            const Q8_1Block &in2 = input[b + 2];
+            __m256i qs8_2 = _mm256_loadu_si256((const __m256i *)in2.qs);
+            __m512i qs16_2 = _mm512_cvtepi8_epi16(qs8_2);
+            __m512i g16_2 = _mm512_loadu_si512((const __m512i *)(gamma_q12 + (b + 2) * 32));
 
-            // --- Block 0 Max Abs ---
-            __m512i abs_lo0 = _mm512_abs_epi32(y_lo0);
-            __m512i abs_hi0 = _mm512_abs_epi32(y_hi0);
-            __m512i abs_max0 = _mm512_max_epi32(abs_lo0, abs_hi0);
-            int32_t max_abs0 = _mm512_reduce_max_epi32(abs_max0);
+            __m512i qs32_lo_2 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(qs16_2));
+            __m512i qs32_hi_2 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(qs16_2, 1));
+            __m512i g32_lo_2 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(g16_2));
+            __m512i g32_hi_2 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(g16_2, 1));
 
-            // --- Block 1 Max Abs ---
-            __m512i abs_lo1 = _mm512_abs_epi32(y_lo1);
-            __m512i abs_hi1 = _mm512_abs_epi32(y_hi1);
-            __m512i abs_max1 = _mm512_max_epi32(abs_lo1, abs_hi1);
-            int32_t max_abs1 = _mm512_reduce_max_epi32(abs_max1);
+            __m512i prod32_lo_2 = _mm512_mullo_epi32(qs32_lo_2, g32_lo_2);
+            __m512i prod32_hi_2 = _mm512_mullo_epi32(qs32_hi_2, g32_hi_2);
 
-            // --- Block 0 Scale & Output ---
-            float d_out0;
-            if (max_abs0 <= 127)
+            __m512i max_int_v_2 = _mm512_max_epi32(_mm512_abs_epi32(prod32_lo_2), _mm512_abs_epi32(prod32_hi_2));
+            float m2 = (float)_mm512_reduce_max_epi32(max_int_v_2);
+
+            // Block 3
+            const Q8_1Block &in3 = input[b + 3];
+            __m256i qs8_3 = _mm256_loadu_si256((const __m256i *)in3.qs);
+            __m512i qs16_3 = _mm512_cvtepi8_epi16(qs8_3);
+            __m512i g16_3 = _mm512_loadu_si512((const __m512i *)(gamma_q12 + (b + 3) * 32));
+
+            __m512i qs32_lo_3 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(qs16_3));
+            __m512i qs32_hi_3 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(qs16_3, 1));
+            __m512i g32_lo_3 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(g16_3));
+            __m512i g32_hi_3 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(g16_3, 1));
+
+            __m512i prod32_lo_3 = _mm512_mullo_epi32(qs32_lo_3, g32_lo_3);
+            __m512i prod32_hi_3 = _mm512_mullo_epi32(qs32_hi_3, g32_hi_3);
+
+            __m512i max_int_v_3 = _mm512_max_epi32(_mm512_abs_epi32(prod32_lo_3), _mm512_abs_epi32(prod32_hi_3));
+            float m3 = (float)_mm512_reduce_max_epi32(max_int_v_3);
+
+            // Vectorized Reciprocal
+            __m128 v_max = _mm_set_ps(m3, m2, m1, m0);
+            v_max = _mm_max_ps(v_max, _mm_set1_ps(1e-9f)); // Avoid div/0
+            __m128 v_rcp = _mm_rcp_ps(v_max);
+            // Newton-Raphson: x1 = x0 * (2 - a * x0)
+            v_rcp = _mm_mul_ps(v_rcp, _mm_sub_ps(_mm_set1_ps(2.0f), _mm_mul_ps(v_max, v_rcp)));
+            __m128 v_scale = _mm_mul_ps(v_rcp, _mm_set1_ps(127.0f));
+
+            // Extract scales
+            float s0 = _mm_cvtss_f32(v_scale);
+            float s1 = _mm_cvtss_f32(_mm_shuffle_ps(v_scale, v_scale, 0x55));
+            float s2 = _mm_cvtss_f32(_mm_shuffle_ps(v_scale, v_scale, 0xAA));
+            float s3 = _mm_cvtss_f32(_mm_shuffle_ps(v_scale, v_scale, 0xFF));
+
+            // Finish Block 0
             {
-                d_out0 = (max_abs0 == 0) ? 0.0f : (d_in0 * static_cast<float>(max_abs0) / (127.0f * 65536.0f));
-            }
-            else
-            {
-                d_out0 = d_in0 * static_cast<float>(max_abs0) / (127.0f * 65536.0f);
-            }
-            if (max_abs0 > 0)
-            {
-                __m512 scale0 = _mm512_set1_ps(127.0f / static_cast<float>(max_abs0));
-                __m512 yf_lo0 = _mm512_cvtepi32_ps(y_lo0);
-                __m512 yf_hi0 = _mm512_cvtepi32_ps(y_hi0);
-                yf_lo0 = _mm512_mul_ps(yf_lo0, scale0);
-                yf_hi0 = _mm512_mul_ps(yf_hi0, scale0);
-                y_lo0 = _mm512_cvtps_epi32(yf_lo0);
-                y_hi0 = _mm512_cvtps_epi32(yf_hi0);
-            }
-            y_lo0 = _mm512_max_epi32(y_lo0, v_neg127);
-            y_lo0 = _mm512_min_epi32(y_lo0, v_127);
-            y_hi0 = _mm512_max_epi32(y_hi0, v_neg127);
-            y_hi0 = _mm512_min_epi32(y_hi0, v_127);
-            __m128i out8_lo0 = _mm512_cvtepi32_epi8(y_lo0);
-            __m128i out8_hi0 = _mm512_cvtepi32_epi8(y_hi0);
-            _mm_storeu_si128((__m128i *)out0.qs, out8_lo0);
-            _mm_storeu_si128((__m128i *)(out0.qs + 16), out8_hi0);
-            out0.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(y_lo0) + _mm512_reduce_add_epi32(y_hi0));
-            out0.d = fp32_to_fp16_q8(d_out0);
+                Q8_1Block &out = output[b];
+                float d_in = fp16_to_fp32_q8(in0.d);
+                float d_out_val = d_in * m0 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                out.d = fp32_to_fp16_q8(d_out_val);
 
-            // --- Block 1 Scale & Output ---
-            float d_out1;
-            if (max_abs1 <= 127)
-            {
-                d_out1 = (max_abs1 == 0) ? 0.0f : (d_in1 * static_cast<float>(max_abs1) / (127.0f * 65536.0f));
+                __m512 v_s0 = _mm512_set1_ps(s0);
+                __m512 prod_ps_lo = _mm512_cvtepi32_ps(prod32_lo_0);
+                __m512 prod_ps_hi = _mm512_cvtepi32_ps(prod32_hi_0);
+                __m512i final_i_lo = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_lo, v_s0));
+                __m512i final_i_hi = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_hi, v_s0));
+
+                final_i_lo = _mm512_max_epi32(final_i_lo, v_neg127_i);
+                final_i_lo = _mm512_min_epi32(final_i_lo, v_127_i);
+                final_i_hi = _mm512_max_epi32(final_i_hi, v_neg127_i);
+                final_i_hi = _mm512_min_epi32(final_i_hi, v_127_i);
+
+                __m128i out8_lo = _mm512_cvtepi32_epi8(final_i_lo);
+                __m128i out8_hi = _mm512_cvtepi32_epi8(final_i_hi);
+                __m256i out8 = _mm256_inserti128_si256(_mm256_castsi128_si256(out8_lo), out8_hi, 1);
+                _mm256_storeu_si256((__m256i *)out.qs, out8);
+                out.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(final_i_lo) + _mm512_reduce_add_epi32(final_i_hi));
             }
-            else
+
+            // Finish Block 1
             {
-                d_out1 = d_in1 * static_cast<float>(max_abs1) / (127.0f * 65536.0f);
+                Q8_1Block &out = output[b + 1];
+                float d_in = fp16_to_fp32_q8(in1.d);
+                float d_out_val = d_in * m1 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                out.d = fp32_to_fp16_q8(d_out_val);
+
+                __m512 v_s1 = _mm512_set1_ps(s1);
+                __m512 prod_ps_lo = _mm512_cvtepi32_ps(prod32_lo_1);
+                __m512 prod_ps_hi = _mm512_cvtepi32_ps(prod32_hi_1);
+                __m512i final_i_lo = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_lo, v_s1));
+                __m512i final_i_hi = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_hi, v_s1));
+
+                final_i_lo = _mm512_max_epi32(final_i_lo, v_neg127_i);
+                final_i_lo = _mm512_min_epi32(final_i_lo, v_127_i);
+                final_i_hi = _mm512_max_epi32(final_i_hi, v_neg127_i);
+                final_i_hi = _mm512_min_epi32(final_i_hi, v_127_i);
+
+                __m128i out8_lo = _mm512_cvtepi32_epi8(final_i_lo);
+                __m128i out8_hi = _mm512_cvtepi32_epi8(final_i_hi);
+                __m256i out8 = _mm256_inserti128_si256(_mm256_castsi128_si256(out8_lo), out8_hi, 1);
+                _mm256_storeu_si256((__m256i *)out.qs, out8);
+                out.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(final_i_lo) + _mm512_reduce_add_epi32(final_i_hi));
             }
-            if (max_abs1 > 0)
+
+            // Finish Block 2
             {
-                __m512 scale1 = _mm512_set1_ps(127.0f / static_cast<float>(max_abs1));
-                __m512 yf_lo1 = _mm512_cvtepi32_ps(y_lo1);
-                __m512 yf_hi1 = _mm512_cvtepi32_ps(y_hi1);
-                yf_lo1 = _mm512_mul_ps(yf_lo1, scale1);
-                yf_hi1 = _mm512_mul_ps(yf_hi1, scale1);
-                y_lo1 = _mm512_cvtps_epi32(yf_lo1);
-                y_hi1 = _mm512_cvtps_epi32(yf_hi1);
+                Q8_1Block &out = output[b + 2];
+                float d_in = fp16_to_fp32_q8(in2.d);
+                float d_out_val = d_in * m2 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                out.d = fp32_to_fp16_q8(d_out_val);
+
+                __m512 v_s2 = _mm512_set1_ps(s2);
+                __m512 prod_ps_lo = _mm512_cvtepi32_ps(prod32_lo_2);
+                __m512 prod_ps_hi = _mm512_cvtepi32_ps(prod32_hi_2);
+                __m512i final_i_lo = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_lo, v_s2));
+                __m512i final_i_hi = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_hi, v_s2));
+
+                final_i_lo = _mm512_max_epi32(final_i_lo, v_neg127_i);
+                final_i_lo = _mm512_min_epi32(final_i_lo, v_127_i);
+                final_i_hi = _mm512_max_epi32(final_i_hi, v_neg127_i);
+                final_i_hi = _mm512_min_epi32(final_i_hi, v_127_i);
+
+                __m128i out8_lo = _mm512_cvtepi32_epi8(final_i_lo);
+                __m128i out8_hi = _mm512_cvtepi32_epi8(final_i_hi);
+                __m256i out8 = _mm256_inserti128_si256(_mm256_castsi128_si256(out8_lo), out8_hi, 1);
+                _mm256_storeu_si256((__m256i *)out.qs, out8);
+                out.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(final_i_lo) + _mm512_reduce_add_epi32(final_i_hi));
             }
-            y_lo1 = _mm512_max_epi32(y_lo1, v_neg127);
-            y_lo1 = _mm512_min_epi32(y_lo1, v_127);
-            y_hi1 = _mm512_max_epi32(y_hi1, v_neg127);
-            y_hi1 = _mm512_min_epi32(y_hi1, v_127);
-            __m128i out8_lo1 = _mm512_cvtepi32_epi8(y_lo1);
-            __m128i out8_hi1 = _mm512_cvtepi32_epi8(y_hi1);
-            _mm_storeu_si128((__m128i *)out1.qs, out8_lo1);
-            _mm_storeu_si128((__m128i *)(out1.qs + 16), out8_hi1);
-            out1.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(y_lo1) + _mm512_reduce_add_epi32(y_hi1));
-            out1.d = fp32_to_fp16_q8(d_out1);
+
+            // Finish Block 3
+            {
+                Q8_1Block &out = output[b + 3];
+                float d_in = fp16_to_fp32_q8(in3.d);
+                float d_out_val = d_in * m3 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                out.d = fp32_to_fp16_q8(d_out_val);
+
+                __m512 v_s3 = _mm512_set1_ps(s3);
+                __m512 prod_ps_lo = _mm512_cvtepi32_ps(prod32_lo_3);
+                __m512 prod_ps_hi = _mm512_cvtepi32_ps(prod32_hi_3);
+                __m512i final_i_lo = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_lo, v_s3));
+                __m512i final_i_hi = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_hi, v_s3));
+
+                final_i_lo = _mm512_max_epi32(final_i_lo, v_neg127_i);
+                final_i_lo = _mm512_min_epi32(final_i_lo, v_127_i);
+                final_i_hi = _mm512_max_epi32(final_i_hi, v_neg127_i);
+                final_i_hi = _mm512_min_epi32(final_i_hi, v_127_i);
+
+                __m128i out8_lo = _mm512_cvtepi32_epi8(final_i_lo);
+                __m128i out8_hi = _mm512_cvtepi32_epi8(final_i_hi);
+                __m256i out8 = _mm256_inserti128_si256(_mm256_castsi128_si256(out8_lo), out8_hi, 1);
+                _mm256_storeu_si256((__m256i *)out.qs, out8);
+                out.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(final_i_lo) + _mm512_reduce_add_epi32(final_i_hi));
+            }
+        }
+        // Remaining blocks
+        for (; b < blocks_per_row; ++b)
+        {
+            const Q8_1Block &in = input[b];
+            Q8_1Block &out = output[b];
+            float d_in = fp16_to_fp32_q8(in.d);
+
+            __m256i qs8 = _mm256_loadu_si256((const __m256i *)in.qs);
+            __m512i qs16 = _mm512_cvtepi8_epi16(qs8);
+            __m512i g16 = _mm512_loadu_si512((const __m512i *)(gamma_q12 + b * 32));
+
+            __m512i qs32_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(qs16));
+            __m512i qs32_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(qs16, 1));
+            __m512i g32_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(g16));
+            __m512i g32_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(g16, 1));
+
+            __m512i prod32_lo = _mm512_mullo_epi32(qs32_lo, g32_lo);
+            __m512i prod32_hi = _mm512_mullo_epi32(qs32_hi, g32_hi);
+
+            __m512i abs_int_lo = _mm512_abs_epi32(prod32_lo);
+            __m512i abs_int_hi = _mm512_abs_epi32(prod32_hi);
+            __m512i max_int_v = _mm512_max_epi32(abs_int_lo, abs_int_hi);
+            int32_t max_int = _mm512_reduce_max_epi32(max_int_v);
+            float max_prod = static_cast<float>(max_int);
+
+            float d_out_val = (max_prod > 1e-9f) ? (d_in * max_prod * inv_rms_float / (127.0f * 4096.0f)) : 0.0f;
+            out.d = fp32_to_fp16_q8(d_out_val);
+
+            float combined_scale_val = (max_prod > 1e-9f) ? (127.0f / max_prod) : 0.0f;
+            __m512 v_combined_scale = _mm512_set1_ps(combined_scale_val);
+
+            __m512 prod_ps_lo = _mm512_cvtepi32_ps(prod32_lo);
+            __m512 prod_ps_hi = _mm512_cvtepi32_ps(prod32_hi);
+            __m512i final_i_lo = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_lo, v_combined_scale));
+            __m512i final_i_hi = _mm512_cvtps_epi32(_mm512_mul_ps(prod_ps_hi, v_combined_scale));
+
+            final_i_lo = _mm512_max_epi32(final_i_lo, v_neg127_i);
+            final_i_lo = _mm512_min_epi32(final_i_lo, v_127_i);
+            final_i_hi = _mm512_max_epi32(final_i_hi, v_neg127_i);
+            final_i_hi = _mm512_min_epi32(final_i_hi, v_127_i);
+
+            __m128i out8_lo = _mm512_cvtepi32_epi8(final_i_lo);
+            __m128i out8_hi = _mm512_cvtepi32_epi8(final_i_hi);
+            __m256i out8 = _mm256_inserti128_si256(_mm256_castsi128_si256(out8_lo), out8_hi, 1);
+            _mm256_storeu_si256((__m256i *)out.qs, out8);
+            out.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(final_i_lo) + _mm512_reduce_add_epi32(final_i_hi));
         }
 #endif
         // Scalar fallback for remaining blocks

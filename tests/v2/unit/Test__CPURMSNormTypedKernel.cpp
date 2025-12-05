@@ -602,4 +602,151 @@ namespace llaminar2
             << "Large batch BF16 RMSNorm max diff: " << max_diff;
     }
 
+    TEST_F(CPURMSNormTypedKernelTest, Q8_1_large_batch)
+    {
+        int large_rows = 32;
+        int large_cols = 2048;
+
+        auto fp32_input = generate_random_fp32(large_rows * large_cols);
+        auto gamma = generate_random_fp32(large_cols, 0.5f, 1.5f);
+
+        // Calculate number of Q8_1 blocks needed
+        size_t n_blocks = (large_rows * large_cols + 31) / 32;
+        std::vector<Q8_1Block> q8_input(n_blocks);
+        std::vector<Q8_1Block> q8_output(n_blocks);
+
+        // Convert input to Q8_1
+        simd::quantize_fp32_to_q8_1_blocks(
+            fp32_input.data(), q8_input.data(), large_rows * large_cols);
+
+        // Test typed kernel
+        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        ASSERT_TRUE(kernel.apply_typed(
+            q8_input.data(), gamma.data(), q8_output.data(),
+            large_rows, large_cols, EPSILON));
+
+        // Dequantize output for comparison
+        std::vector<float> fp32_output(large_rows * large_cols);
+        simd::dequantize_q8_1_to_fp32(
+            q8_output.data(), fp32_output.data(), large_rows * large_cols);
+
+        // Compute reference with dequantized input
+        std::vector<float> dequant_input(large_rows * large_cols);
+        simd::dequantize_q8_1_to_fp32(
+            q8_input.data(), dequant_input.data(), large_rows * large_cols);
+
+        std::vector<float> expected(large_rows * large_cols);
+        reference_rmsnorm(dequant_input.data(), gamma.data(), expected.data(),
+                          large_rows, large_cols, EPSILON);
+
+        // Verify
+        float max_diff = max_abs_diff(fp32_output.data(), expected.data(), large_rows * large_cols);
+        EXPECT_LT(max_diff, Q8_1_TOLERANCE)
+            << "Large batch Q8_1 RMSNorm max diff: " << max_diff;
+    }
+
+    TEST_F(CPURMSNormTypedKernelTest, Q8_1_minimum_size)
+    {
+        int min_rows = 1;
+        int min_cols = 32;
+
+        auto fp32_input = generate_random_fp32(min_rows * min_cols);
+        auto gamma = generate_random_fp32(min_cols, 0.5f, 1.5f);
+
+        size_t n_blocks = (min_rows * min_cols + 31) / 32;
+        std::vector<Q8_1Block> q8_input(n_blocks);
+        std::vector<Q8_1Block> q8_output(n_blocks);
+
+        simd::quantize_fp32_to_q8_1_blocks(
+            fp32_input.data(), q8_input.data(), min_rows * min_cols);
+
+        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        ASSERT_TRUE(kernel.apply_typed(
+            q8_input.data(), gamma.data(), q8_output.data(),
+            min_rows, min_cols, EPSILON));
+
+        std::vector<float> fp32_output(min_rows * min_cols);
+        simd::dequantize_q8_1_to_fp32(
+            q8_output.data(), fp32_output.data(), min_rows * min_cols);
+
+        std::vector<float> dequant_input(min_rows * min_cols);
+        simd::dequantize_q8_1_to_fp32(
+            q8_input.data(), dequant_input.data(), min_rows * min_cols);
+
+        std::vector<float> expected(min_rows * min_cols);
+        reference_rmsnorm(dequant_input.data(), gamma.data(), expected.data(),
+                          min_rows, min_cols, EPSILON);
+
+        float max_diff = max_abs_diff(fp32_output.data(), expected.data(), min_rows * min_cols);
+        EXPECT_LT(max_diff, Q8_1_TOLERANCE)
+            << "Minimum size Q8_1 RMSNorm max diff: " << max_diff;
+    }
+
+    TEST_F(CPURMSNormTypedKernelTest, Q8_1_odd_rows)
+    {
+        int odd_rows = 7;
+        int test_cols = 128;
+
+        auto fp32_input = generate_random_fp32(odd_rows * test_cols);
+        auto gamma = generate_random_fp32(test_cols, 0.5f, 1.5f);
+
+        size_t n_blocks = (odd_rows * test_cols + 31) / 32;
+        std::vector<Q8_1Block> q8_input(n_blocks);
+        std::vector<Q8_1Block> q8_output(n_blocks);
+
+        simd::quantize_fp32_to_q8_1_blocks(
+            fp32_input.data(), q8_input.data(), odd_rows * test_cols);
+
+        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        ASSERT_TRUE(kernel.apply_typed(
+            q8_input.data(), gamma.data(), q8_output.data(),
+            odd_rows, test_cols, EPSILON));
+
+        std::vector<float> fp32_output(odd_rows * test_cols);
+        simd::dequantize_q8_1_to_fp32(
+            q8_output.data(), fp32_output.data(), odd_rows * test_cols);
+
+        std::vector<float> dequant_input(odd_rows * test_cols);
+        simd::dequantize_q8_1_to_fp32(
+            q8_input.data(), dequant_input.data(), odd_rows * test_cols);
+
+        std::vector<float> expected(odd_rows * test_cols);
+        reference_rmsnorm(dequant_input.data(), gamma.data(), expected.data(),
+                          odd_rows, test_cols, EPSILON);
+
+        float max_diff = max_abs_diff(fp32_output.data(), expected.data(), odd_rows * test_cols);
+        EXPECT_LT(max_diff, Q8_1_TOLERANCE)
+            << "Odd rows Q8_1 RMSNorm max diff: " << max_diff;
+    }
+
+    TEST_F(CPURMSNormTypedKernelTest, Q8_1_zero_input)
+    {
+        // All zeros input
+        std::vector<float> fp32_input(rows_ * cols_, 0.0f);
+        auto gamma = generate_random_fp32(cols_, 0.5f, 1.5f);
+
+        size_t n_blocks = (rows_ * cols_ + 31) / 32;
+        std::vector<Q8_1Block> q8_input(n_blocks);
+        std::vector<Q8_1Block> q8_output(n_blocks);
+
+        simd::quantize_fp32_to_q8_1_blocks(
+            fp32_input.data(), q8_input.data(), rows_ * cols_);
+
+        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        ASSERT_TRUE(kernel.apply_typed(
+            q8_input.data(), gamma.data(), q8_output.data(),
+            rows_, cols_, EPSILON));
+
+        std::vector<float> fp32_output(rows_ * cols_);
+        simd::dequantize_q8_1_to_fp32(
+            q8_output.data(), fp32_output.data(), rows_ * cols_);
+
+        // Expected output should be all zeros (0 * anything = 0)
+        // RMSNorm of 0 vector is 0 because of epsilon in denominator but 0 in numerator
+        for (float val : fp32_output)
+        {
+            EXPECT_NEAR(val, 0.0f, Q8_1_TOLERANCE);
+        }
+    }
+
 } // namespace llaminar2
