@@ -1114,7 +1114,7 @@ namespace llaminar2::primitives
         double sum = 0.0;
         // Note: max_prob_unnorm is always 1.0 since exp(row_max - row_max) = exp(0) = 1
         // This is mathematically guaranteed, so we don't need to track it!
-        
+
         for (int b = 0; b < n_blocks; ++b)
         {
             const Q8_1Block &block = row[b];
@@ -1136,12 +1136,12 @@ namespace llaminar2::primitives
             sum = 1.0;
 
         const float inv_sum = static_cast<float>(1.0 / sum);
-        
+
         // max_prob = 1.0 / sum (the maximum softmax value is always exp(0)/sum = 1/sum)
         // Wait, that's not right. max_prob = exp(max - max) * inv_sum = 1.0 * inv_sum = inv_sum
         // But inv_sum = 1/sum, and softmax max is 1/sum only if there's one dominant element.
         // For proper requantization, we need to find actual max prob.
-        // 
+        //
         // OPTIMIZATION: For softmax, max_prob = inv_sum (occurs at the position where v == row_max)
         // This is exact: prob_max = exp(row_max - row_max) / sum = 1 / sum
         const float max_prob = inv_sum;
@@ -1151,7 +1151,7 @@ namespace llaminar2::primitives
         // ========================================================================
         // NO HEAP ALLOCATION: Use stack buffer for one block at a time
         // This keeps working set in L1 cache (32 floats = 128 bytes)
-        
+
         // Compute requantization scale
         const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
         const float inv_d = 1.0f / new_d;
@@ -1351,7 +1351,7 @@ namespace llaminar2::primitives
             sum = 1.0;
 
         const float inv_sum = static_cast<float>(1.0 / sum);
-        
+
         // max_prob = inv_sum (occurs at position where v == row_max)
         const float max_prob = inv_sum;
 
@@ -1602,7 +1602,7 @@ namespace llaminar2::primitives
             sum = 1.0;
 
         const float inv_sum = static_cast<float>(1.0 / sum);
-        
+
         // max_prob = inv_sum (occurs at position where v == row_max)
         const float max_prob = inv_sum;
 

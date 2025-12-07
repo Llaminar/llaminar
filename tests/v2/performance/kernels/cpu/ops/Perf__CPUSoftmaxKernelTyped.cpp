@@ -55,24 +55,24 @@ using namespace llaminar2;
 
 struct BenchmarkConfig
 {
-    int rows;            ///< Number of rows (e.g., num_heads or batch * num_heads)
-    int cols;            ///< Number of columns (e.g., seq_len for attention)
-    int warmup_iters;    ///< Number of warmup iterations
-    int bench_iters;     ///< Number of timed benchmark iterations
-    bool use_causal;     ///< Whether to use causal masking
-    float scale;         ///< Scale factor (typically 1/sqrt(d_k))
+    int rows;         ///< Number of rows (e.g., num_heads or batch * num_heads)
+    int cols;         ///< Number of columns (e.g., seq_len for attention)
+    int warmup_iters; ///< Number of warmup iterations
+    int bench_iters;  ///< Number of timed benchmark iterations
+    bool use_causal;  ///< Whether to use causal masking
+    float scale;      ///< Scale factor (typically 1/sqrt(d_k))
     std::string description;
 };
 
 struct BenchmarkStats
 {
-    double mean_ms;              ///< Mean time per iteration (ms)
-    double stddev_ms;            ///< Standard deviation (ms)
-    double min_ms;               ///< Minimum time (ms)
-    double max_ms;               ///< Maximum time (ms)
-    double bandwidth_gbps;       ///< Memory bandwidth (GB/s)
-    double gflops;               ///< Throughput (GFLOPS)
-    double elements_per_sec;     ///< Elements processed per second
+    double mean_ms;          ///< Mean time per iteration (ms)
+    double stddev_ms;        ///< Standard deviation (ms)
+    double min_ms;           ///< Minimum time (ms)
+    double max_ms;           ///< Maximum time (ms)
+    double bandwidth_gbps;   ///< Memory bandwidth (GB/s)
+    double gflops;           ///< Throughput (GFLOPS)
+    double elements_per_sec; ///< Elements processed per second
 };
 
 // ============================================================================
@@ -90,7 +90,7 @@ protected:
     {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
         MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
-        
+
         if (rank_ == 0)
         {
             std::cout << "\n[Performance Test] CPUSoftmaxKernelTyped Benchmark" << std::endl;
@@ -260,8 +260,9 @@ protected:
 
         // Initialize with random data
         std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
-        
-        auto reinit = [&]() {
+
+        auto reinit = [&]()
+        {
             for (auto &v : fp32_temp)
                 v = dist(rng_);
             simd::convert_fp32_to_bf16(fp32_temp.data(), data.data(), size);
@@ -310,8 +311,9 @@ protected:
 
         // Initialize with random data
         std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
-        
-        auto reinit = [&]() {
+
+        auto reinit = [&]()
+        {
             for (auto &v : fp32_temp)
                 v = dist(rng_);
             simd::convert_fp32_to_fp16(fp32_temp.data(), data.data(), size);
@@ -366,7 +368,8 @@ protected:
         size_t fp32_size = static_cast<size_t>(config.rows) * config.cols;
         std::vector<float> fp32_temp(fp32_size);
 
-        auto reinit = [&]() {
+        auto reinit = [&]()
+        {
             for (auto &v : fp32_temp)
                 v = dist(rng_);
             simd::quantize_fp32_to_q8_1_blocks(fp32_temp.data(), data.data(), fp32_size);
@@ -435,7 +438,7 @@ protected:
         {
             std::cout << "\n--- Summary ---" << std::endl;
             std::cout << std::fixed << std::setprecision(2);
-            
+
             double bf16_speedup = fp32_stats.mean_ms / bf16_stats.mean_ms;
             double fp16_speedup = fp32_stats.mean_ms / fp16_stats.mean_ms;
             double q8_1_speedup = fp32_stats.mean_ms / q8_1_stats.mean_ms;
@@ -478,14 +481,13 @@ protected:
 TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_ShortContext)
 {
     BenchmarkConfig config{
-        .rows = 14,        // Qwen 0.5B num_heads
-        .cols = 128,       // Short context
+        .rows = 14,  // Qwen 0.5B num_heads
+        .cols = 128, // Short context
         .warmup_iters = 10,
         .bench_iters = 100,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f), // 1/sqrt(d_k)
-        .description = "Single Token Decode - Short Context (14 heads × 128 seq)"
-    };
+        .description = "Single Token Decode - Short Context (14 heads × 128 seq)"};
     run_comparison_benchmark(config);
 }
 
@@ -498,8 +500,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_MediumContext)
         .bench_iters = 100,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Single Token Decode - Medium Context (14 heads × 512 seq)"
-    };
+        .description = "Single Token Decode - Medium Context (14 heads × 512 seq)"};
     run_comparison_benchmark(config);
 }
 
@@ -512,8 +513,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_LongContext)
         .bench_iters = 50,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Single Token Decode - Long Context (14 heads × 2048 seq)"
-    };
+        .description = "Single Token Decode - Long Context (14 heads × 2048 seq)"};
     run_comparison_benchmark(config);
 }
 
@@ -528,14 +528,13 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_SmallPrompt)
 {
     // 64 tokens × 14 heads = 896 rows, each attending to up to 64 positions
     BenchmarkConfig config{
-        .rows = 64 * 14,   // seq_len * num_heads
-        .cols = 64,        // seq_len (attention width)
+        .rows = 64 * 14, // seq_len * num_heads
+        .cols = 64,      // seq_len (attention width)
         .warmup_iters = 5,
         .bench_iters = 50,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Prefill - Small Prompt (64 tokens × 14 heads)"
-    };
+        .description = "Prefill - Small Prompt (64 tokens × 14 heads)"};
     run_comparison_benchmark(config);
 }
 
@@ -549,8 +548,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_MediumPrompt)
         .bench_iters = 20,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Prefill - Medium Prompt (256 tokens × 14 heads)"
-    };
+        .description = "Prefill - Medium Prompt (256 tokens × 14 heads)"};
     run_comparison_benchmark(config);
 }
 
@@ -564,8 +562,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_LargePrompt)
         .bench_iters = 10,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Prefill - Large Prompt (512 tokens × 14 heads)"
-    };
+        .description = "Prefill - Large Prompt (512 tokens × 14 heads)"};
     run_comparison_benchmark(config);
 }
 
@@ -586,8 +583,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Qwen7B_SingleTokenDecode)
         .bench_iters = 50,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(128.0f),
-        .description = "Qwen 7B - Single Token Decode (32 heads × 512 seq)"
-    };
+        .description = "Qwen 7B - Single Token Decode (32 heads × 512 seq)"};
     run_comparison_benchmark(config);
 }
 
@@ -601,8 +597,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Qwen7B_Prefill)
         .bench_iters = 20,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(128.0f),
-        .description = "Qwen 7B - Prefill (128 tokens × 32 heads)"
-    };
+        .description = "Qwen 7B - Prefill (128 tokens × 32 heads)"};
     run_comparison_benchmark(config);
 }
 
@@ -614,14 +609,13 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, NonCausal_Bidirectional)
 {
     // Encoder-style attention (no causal masking)
     BenchmarkConfig config{
-        .rows = 256 * 12,  // 256 tokens × 12 heads
+        .rows = 256 * 12, // 256 tokens × 12 heads
         .cols = 256,
         .warmup_iters = 3,
         .bench_iters = 20,
         .use_causal = false,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Non-Causal - Bidirectional Attention (256 × 12 heads)"
-    };
+        .description = "Non-Causal - Bidirectional Attention (256 × 12 heads)"};
     run_comparison_benchmark(config);
 }
 
@@ -639,8 +633,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, StressTest_VeryLongContext)
         .bench_iters = 10,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(64.0f),
-        .description = "Stress - Very Long Context (14 heads × 8192 seq)"
-    };
+        .description = "Stress - Very Long Context (14 heads × 8192 seq)"};
     run_comparison_benchmark(config);
 }
 
@@ -648,14 +641,13 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, StressTest_ManyHeads)
 {
     // Many heads (large model)
     BenchmarkConfig config{
-        .rows = 128,       // 128 heads
+        .rows = 128, // 128 heads
         .cols = 512,
         .warmup_iters = 5,
         .bench_iters = 30,
         .use_causal = true,
         .scale = 1.0f / std::sqrt(128.0f),
-        .description = "Stress - Many Heads (128 heads × 512 seq)"
-    };
+        .description = "Stress - Many Heads (128 heads × 512 seq)"};
     run_comparison_benchmark(config);
 }
 
