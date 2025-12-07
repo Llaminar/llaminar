@@ -13,6 +13,7 @@
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorSlice.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
+#include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -1486,14 +1487,14 @@ namespace llaminar2
             }
         }
 
-        // Use CpuAttentionKernelT's compute_decode which handles asymmetric lengths
+        // Use CPUAttentionKernelTyped's compute_decode which handles asymmetric lengths
         // Since ITensorAttention doesn't expose compute_decode, we need to cast to the concrete type
-        auto *cpu_kernel = dynamic_cast<CpuAttentionKernelT<FP32Tensor> *>(attention_kernel.get());
-        if (cpu_kernel)
+        // Note: FP32Tensor::createAttention() returns CPUAttentionKernelTyped<ActivationPrecision::FP32>
+        auto *typed_kernel = dynamic_cast<CPUAttentionKernelTyped<ActivationPrecision::FP32> *>(attention_kernel.get());
+        if (typed_kernel)
         {
-            // Pass -1 for device_idx since CpuAttentionKernelT expects -1 for CPU execution
-            // (DeviceManager uses index 0 for CPU, but kernels use -1 convention)
-            bool success = cpu_kernel->compute_decode(
+            // Pass -1 for device_idx since CPUAttentionKernelTyped expects -1 for CPU execution
+            bool success = typed_kernel->compute_decode(
                 Q_view->data(),
                 K_view->data(),
                 V_view->data(),
@@ -1516,8 +1517,36 @@ namespace llaminar2
         }
         else
         {
-            LOG_ERROR("compute_attention_with_kv_cache: could not get CpuAttentionKernelT");
-            return false;
+            // Fallback: try legacy CpuAttentionKernelT for backwards compatibility
+            auto *legacy_kernel = dynamic_cast<CpuAttentionKernelT<FP32Tensor> *>(attention_kernel.get());
+            if (legacy_kernel)
+            {
+                bool success = legacy_kernel->compute_decode(
+                    Q_view->data(),
+                    K_view->data(),
+                    V_view->data(),
+                    out_view->mutable_data(),
+                    q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                    causal, /*window_size=*/-1,
+                    scores_workspace.get(),
+                    nullptr, // workspace_buffer
+                    nullptr, // workspace_context
+                    mask_tensor.get(),
+                    false, // use_bf16
+                    mpi_ctx_.get(),
+                    -1); // CPU device index for kernel
+
+                if (!success)
+                {
+                    LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed");
+                    return false;
+                }
+            }
+            else
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: could not get CPUAttentionKernelTyped or CpuAttentionKernelT");
+                return false;
+            }
         }
 
         // Capture snapshot
