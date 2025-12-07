@@ -295,18 +295,17 @@ namespace llaminar2
                                 vfmadd231ps(Xmm(acc_idx), Xmm(dq_idx), xmm29);
                             }
 
-                            // Dot products - reload Q pointers but combine with scale load
+                            // Dot products - fused accumulation: acc += dot * (d_Q * d_K)
                             for (int i = 0; i < m_blocking_; ++i)
                             {
                                 mov(reg_Q_cursor, ptr[rsp + 8 * unroll_n_ + 8 * i]);
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]); // d_Q
                                 vcvtph2ps(Ymm(26), xmm31);
+                                vmulps(Ymm(26), Ymm(26), Ymm(27));      // d_Q * d_K (combined scale)
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
                                 vcvtdq2ps(Ymm(28), Ymm(28));
-                                vmulps(Ymm(28), Ymm(28), Ymm(26));
-                                vmulps(Ymm(28), Ymm(28), Ymm(27));
-                                vaddps(Ymm(i * unroll_n_ + j), Ymm(i * unroll_n_ + j), Ymm(28));
+                                vfmadd231ps(Ymm(i * unroll_n_ + j), Ymm(28), Ymm(26)); // acc += dot * scale
                             }
                         }
 
@@ -364,17 +363,17 @@ namespace llaminar2
                                 vfmadd231ps(Xmm(acc_idx), Xmm(dq_idx), xmm29);
                             }
 
+                            // Fused accumulation: acc += dot * (d_Q * d_K)
                             for (int i = 0; i < m_blocking_; ++i)
                             {
                                 mov(reg_Q_cursor, ptr[rsp + 8 * unroll_n_ + 8 * i]);
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
                                 vcvtph2ps(Ymm(26), xmm31);
+                                vmulps(Ymm(26), Ymm(26), Ymm(27));      // d_Q * d_K (combined scale)
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
                                 vcvtdq2ps(Ymm(28), Ymm(28));
-                                vmulps(Ymm(28), Ymm(28), Ymm(26));
-                                vmulps(Ymm(28), Ymm(28), Ymm(27));
-                                vaddps(Ymm(i * unroll_n_ + j), Ymm(i * unroll_n_ + j), Ymm(28));
+                                vfmadd231ps(Ymm(i * unroll_n_ + j), Ymm(28), Ymm(26)); // acc += dot * scale
                             }
                         }
 
@@ -441,17 +440,17 @@ namespace llaminar2
                                 vfmadd231ps(Xmm(acc_idx), Xmm(dq_idx), xmm29);
                             }
 
+                            // Fused accumulation: acc += dot * (d_Q * d_K)
                             for (int i = 0; i < m_blocking_; ++i)
                             {
                                 mov(reg_Q_cursor, ptr[rsp + 8 * unroll_n_ + 8 * i]);
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
                                 vcvtph2ps(Ymm(26), xmm31);
+                                vmulps(Ymm(26), Ymm(26), Ymm(27));      // d_Q * d_K (combined scale)
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
                                 vcvtdq2ps(Ymm(28), Ymm(28));
-                                vmulps(Ymm(28), Ymm(28), Ymm(26));
-                                vmulps(Ymm(28), Ymm(28), Ymm(27));
-                                vaddps(Ymm(i * unroll_n_ + j), Ymm(i * unroll_n_ + j), Ymm(28));
+                                vfmadd231ps(Ymm(i * unroll_n_ + j), Ymm(28), Ymm(26)); // acc += dot * scale
                             }
                         }
                     }
