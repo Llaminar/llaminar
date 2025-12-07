@@ -301,7 +301,7 @@ namespace llaminar2
                                 mov(reg_Q_cursor, ptr[rsp + 8 * unroll_n_ + 8 * i]);
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]); // d_Q
                                 vcvtph2ps(Ymm(26), xmm31);
-                                vmulps(Ymm(26), Ymm(26), Ymm(27));      // d_Q * d_K (combined scale)
+                                vmulps(Ymm(26), Ymm(26), Ymm(27)); // d_Q * d_K (combined scale)
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
                                 vcvtdq2ps(Ymm(28), Ymm(28));
@@ -369,7 +369,7 @@ namespace llaminar2
                                 mov(reg_Q_cursor, ptr[rsp + 8 * unroll_n_ + 8 * i]);
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
                                 vcvtph2ps(Ymm(26), xmm31);
-                                vmulps(Ymm(26), Ymm(26), Ymm(27));      // d_Q * d_K (combined scale)
+                                vmulps(Ymm(26), Ymm(26), Ymm(27)); // d_Q * d_K (combined scale)
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
                                 vcvtdq2ps(Ymm(28), Ymm(28));
@@ -446,7 +446,7 @@ namespace llaminar2
                                 mov(reg_Q_cursor, ptr[rsp + 8 * unroll_n_ + 8 * i]);
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
                                 vcvtph2ps(Ymm(26), xmm31);
-                                vmulps(Ymm(26), Ymm(26), Ymm(27));      // d_Q * d_K (combined scale)
+                                vmulps(Ymm(26), Ymm(26), Ymm(27)); // d_Q * d_K (combined scale)
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
                                 vcvtdq2ps(Ymm(28), Ymm(28));
