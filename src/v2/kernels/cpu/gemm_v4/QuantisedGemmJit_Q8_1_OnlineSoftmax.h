@@ -93,6 +93,17 @@ namespace llaminar2
                 // For m=1, unroll_n=2 is OK (1*2=2 corrections at Xmm4-5, Q at Ymm8 OK)
                 int unroll_n_ = (m_blocking_ > 1) ? 1 : 2;
 
+                // Vectorized Correction Registers
+                // We use XMM registers starting after the main accumulators to store vectorized corrections.
+                // VecAccCorr: Stores accumulated corrections for each K column (vectorized over M rows).
+                // VecDQ: Stores packed d_Q values for M rows.
+                // Base index: m_blocking_ * unroll_n_ (start of free regs after Acc)
+                // We need ceil(m/4) registers for VecDQ and ceil(m/4) * unroll_n_ for VecAccCorr.
+                // For m=4, n=1: Acc=0-3. VecAccCorr=4. VecDQ=5. Q=8. Safe.
+                // For m=1, n=2: Acc=0-1. VecAccCorr=2,3. VecDQ=4. Q=8. Safe.
+                int vec_acc_corr_base = m_blocking_ * unroll_n_;
+                int vec_dq_base = vec_acc_corr_base + unroll_n_ * ((m_blocking_ + 3) / 4);
+
                 // Accumulators: m_blocking_ * unroll_n_ (Ymm0-7)
                 // Q values: m_blocking_ regs (Ymm8-11)
                 // K values: unroll_n_ regs (Ymm12-13)
@@ -175,12 +186,14 @@ namespace llaminar2
                     {
                         vxorps(Ymm(i), Ymm(i), Ymm(i));
                     }
-                    // Clear scalar correction accumulators
-                    // These accumulate: Σ_k (sum_qs_K[k] × d_Q[k] × d_K[k]) per output element
-                    // Need m_blocking_ * unroll_n_ of them to match the main accumulators
-                    for (int i = 0; i < m_blocking_ * unroll_n_; ++i)
+                    // Clear Vector Correction Accumulators
+                    for (int j = 0; j < unroll_n_; ++j)
                     {
-                        vxorps(Xmm(4 + i), Xmm(4 + i), Xmm(4 + i));
+                        for (int ii = 0; ii < m_blocking_; ii += 4)
+                        {
+                            int reg_idx = vec_acc_corr_base + j * ((m_blocking_ + 3) / 4) + (ii / 4);
+                            vxorps(Xmm(reg_idx), Xmm(reg_idx), Xmm(reg_idx));
+                        }
                     }
 
                     // Inner Loop K
@@ -204,6 +217,30 @@ namespace llaminar2
                             vpxord(Ymm(8 + i), Ymm(8 + i), ymm_128);     // Unsigned
                         }
 
+                        // Construct VecDQ (Packed d_Q values)
+                        for (int ii = 0; ii < m_blocking_; ii += 4)
+                        {
+                            int reg_idx = vec_dq_base + (ii / 4);
+                            // No need to clear if we fill all 4, but safe to clear
+                            vxorps(Xmm(reg_idx), Xmm(reg_idx), Xmm(reg_idx));
+
+                            for (int r = 0; r < 4 && (ii + r) < m_blocking_; ++r)
+                            {
+                                int i = ii + r;
+                                // Load d_Q[i] address
+                                mov(reg_tmp, reg_Q_stride);
+                                imul(reg_tmp, reg_tmp, i);
+                                add(reg_tmp, reg_Q_base);
+                                mov(reg_Q_cursor, reg_k);
+                                imul(reg_Q_cursor, reg_Q_cursor, 36);
+                                add(reg_Q_cursor, reg_tmp);
+
+                                // Insert word
+                                vpinsrw(Xmm(reg_idx), Xmm(reg_idx), ptr[reg_Q_cursor], r);
+                            }
+                            vcvtph2ps(Xmm(reg_idx), Xmm(reg_idx)); // Convert 4 halfs to 4 floats
+                        }
+
                         // Load K cols
                         for (int j = 0; j < unroll_n_; ++j)
                         {
@@ -221,57 +258,62 @@ namespace llaminar2
                             vmovdqu8(Ymm(12 + j), ptr[reg_tmp + 4]); // Load K8_1 (32 bytes)
                         }
 
-                        // Compute Dot Products
-                        for (int i = 0; i < m_blocking_; ++i)
+                        // Compute Dot Products and Corrections
+                        // Loop over K columns (j)
+                        for (int j = 0; j < unroll_n_; ++j)
                         {
-                            // Load Q_scale[i] -> ymm26
-                            mov(reg_tmp, reg_Q_stride);
-                            imul(reg_tmp, reg_tmp, i);
-                            add(reg_tmp, reg_Q_base);
+                            // Address for K block metadata
+                            mov(reg_tmp, reg_K_stride);
+                            mov(reg_Q_cursor, reg_n);
+                            add(reg_Q_cursor, j);
+                            imul(reg_tmp, reg_Q_cursor);
+                            add(reg_tmp, reg_K_base);
                             mov(reg_Q_cursor, reg_k);
                             imul(reg_Q_cursor, reg_Q_cursor, 36);
-                            add(reg_Q_cursor, reg_tmp);
+                            add(reg_tmp, reg_Q_cursor);
 
-                            // Broadcast 16-bit scale to 8 words (128-bit XMM)
-                            vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
-                            // Convert 8 halfs to 8 floats (YMM)
-                            vcvtph2ps(Ymm(26), xmm31);
+                            // Load d_K (FP16) -> Float -> Broadcast
+                            vpbroadcastw(xmm31, ptr[reg_tmp]);
+                            vcvtph2ps(Ymm(27), xmm31); // Ymm27 holds d_K broadcasted
 
-                            for (int j = 0; j < unroll_n_; ++j)
+                            // Load S_K (INT16) -> Float -> Broadcast
+                            vpbroadcastw(xmm31, ptr[reg_tmp + 2]);
+                            vpmovsxwd(xmm29, xmm31);
+                            vcvtdq2ps(xmm29, xmm29); // xmm29 holds S_K broadcasted
+
+                            // Compute T_K = d_K * S_K
+                            vmulps(xmm29, xmm29, Xmm(27)); // xmm29 = T_K broadcasted
+
+                            // Accumulate Correction: VecAccCorr[j] += VecDQ * T_K
+                            for (int ii = 0; ii < m_blocking_; ii += 4)
                             {
-                                // Load K_scale[j] -> ymm27
-                                mov(reg_tmp, reg_K_stride);
-                                mov(reg_Q_cursor, reg_n);
-                                add(reg_Q_cursor, j);
-                                imul(reg_tmp, reg_Q_cursor);
-                                add(reg_tmp, reg_K_base);
+                                int acc_idx = vec_acc_corr_base + j * ((m_blocking_ + 3) / 4) + (ii / 4);
+                                int dq_idx = vec_dq_base + (ii / 4);
+                                vfmadd231ps(Xmm(acc_idx), Xmm(dq_idx), xmm29);
+                            }
+
+                            // Dot Products for all M rows
+                            for (int i = 0; i < m_blocking_; ++i)
+                            {
+                                // Load d_Q[i] (reload for scaling)
+                                mov(reg_tmp, reg_Q_stride);
+                                imul(reg_tmp, reg_tmp, i);
+                                add(reg_tmp, reg_Q_base);
                                 mov(reg_Q_cursor, reg_k);
                                 imul(reg_Q_cursor, reg_Q_cursor, 36);
-                                add(reg_tmp, reg_Q_cursor);
+                                add(reg_Q_cursor, reg_tmp);
 
-                                vpbroadcastw(xmm31, ptr[reg_tmp]);
-                                vcvtph2ps(Ymm(27), xmm31);
-
-                                // Accumulate correction term: sum_qs_K × d_Q × d_K
-                                // This will be multiplied by 128 and subtracted after horizontal sum
-                                // sum_qs_K is at offset 2 (int16) = sum of all 32 K values
-                                vpbroadcastw(xmm31, ptr[reg_tmp + 2]);                                 // Load sum_qs_K
-                                vpmovsxwd(xmm29, xmm31);                                               // Sign-extend to int32 (only need scalar)
-                                vcvtdq2ps(xmm29, xmm29);                                               // Convert to float
-                                vmulss(xmm29, xmm29, Xmm(26));                                         // * d_Q (scalar from lane 0)
-                                vmulss(xmm29, xmm29, Xmm(27));                                         // * d_K (scalar from lane 0)
-                                vaddss(Xmm(4 + i * unroll_n_ + j), Xmm(4 + i * unroll_n_ + j), xmm29); // Accumulate per output element
-
-                                // Scale product: d_Q × d_K for VNNI result
-                                vmulps(Ymm(27), Ymm(27), Ymm(26));
+                                vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
+                                vcvtph2ps(Ymm(26), xmm31); // Ymm26 = d_Q[i] broadcasted
 
                                 // Dot product
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
                                 vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j)); // 8 int32 results
                                 vcvtdq2ps(Ymm(28), Ymm(28));                // 8 floats
 
-                                // Apply scale
-                                vmulps(Ymm(28), Ymm(28), Ymm(27));
+                                // Apply scale: d_Q * d_K
+                                vmulps(Ymm(28), Ymm(28), Ymm(26)); // * d_Q
+                                vmulps(Ymm(28), Ymm(28), Ymm(27)); // * d_K (already in Ymm27)
 
                                 // Accumulate
                                 vaddps(Ymm(i * unroll_n_ + j), Ymm(i * unroll_n_ + j), Ymm(28));
@@ -299,14 +341,27 @@ namespace llaminar2
                             vaddps(xmm28, xmm28, xmm29);         // xmm28[0] = raw dot product (with unsigned bias)
 
                             // Apply correction: subtract 128 × Σ_k(sum_qs_K[k] × d_Q[k] × d_K[k])
-                            // xmm(4 + i*unroll_n_ + j) holds the accumulated correction term
+                            // Extract correction from VecAccCorr
+                            int acc_reg_idx = vec_acc_corr_base + j * ((m_blocking_ + 3) / 4) + (i / 4);
+                            int elem_idx = i % 4;
+
+                            if (elem_idx == 0)
+                            {
+                                vmovss(xmm29, Xmm(acc_reg_idx));
+                            }
+                            else
+                            {
+                                vpermilps(xmm29, Xmm(acc_reg_idx), elem_idx);
+                            }
+
                             // NOTE: Must reload 128.0f because softmax code below clobbers ymm30
-                            mov(eax, 0x43000000); // 128.0f in IEEE754
-                            vmovd(xmm29, eax);
-                            vmulss(xmm29, xmm29, Xmm(4 + i * unroll_n_ + j)); // 128 * correction
-                            vsubss(xmm28, xmm28, xmm29);                      // Subtract correction
+                            mov(eax, 0x43000000);        // 128.0f in IEEE754
+                            vmovd(xmm30, eax);           // Use xmm30 for 128.0f
+                            vmulss(xmm29, xmm29, xmm30); // 128 * correction
+                            vsubss(xmm28, xmm28, xmm29); // Subtract correction
 
                             // Apply Attention Scale
+
                             vmulss(xmm28, xmm28, Xmm(ymm_scale.getIdx()));
 
                             // Apply Mask

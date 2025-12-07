@@ -257,6 +257,7 @@ protected:
         }
 
         // DEBUG: Print sum_qs of first 10 blocks
+        /*
         {
             const Q8_1Block *blocks = K_tensor->decode_to_q8_1(0, 0);
             std::cout << "DEBUG: K_tensor sum_qs[0..9]: ";
@@ -277,6 +278,7 @@ protected:
             std::cout << "DEBUG: K_stride_bytes=" << K_stride_bytes
                       << " (= " << k_blocks << " * 36)" << std::endl;
         }
+        */
 
         // Create output tensor C (FP32)
         std::vector<float> C(S * KV);
@@ -301,10 +303,12 @@ protected:
         params.mask_stride_bytes = 0;
 
         // DEBUG: Print params
+        /*
         std::cout << "DEBUG params: K_stride_bytes=" << params.K_stride_bytes
                   << ", K_blocks=" << params.K_blocks
                   << ", N=" << params.N
                   << ", M=" << params.M << std::endl;
+        */
 
         // Lambda to run the kernel
         auto run_kernel = [&]()
@@ -378,94 +382,96 @@ protected:
         // auto [l2_manual, cos_manual] = verify_correctness(S, KV, C.data(), C_manual.data());
 
         // Verify against FP32 reference
+        /*
         std::cout << "DEBUG: K_deq row 1 [0..3]: ";
         for (int i = 0; i < 4; ++i)
             std::cout << K_deq[1 * D + i] << " ";
         std::cout << std::endl;
-    }
+        */
 
-    // DEBUG: Compare raw GEMM scores (not softmax)
-    std::vector<float> C_ref(S *KV);
-    compute_raw_gemm(S, KV, D, Q_deq.data(), K_deq.data(), scale, nullptr, C_ref.data());
+        // DEBUG: Compare raw GEMM scores (not softmax)
+        std::vector<float> C_ref(S * KV);
+        compute_raw_gemm(S, KV, D, Q_deq.data(), K_deq.data(), scale, nullptr, C_ref.data());
 
-    auto [l2_error, cosine_sim] = verify_correctness(S, KV, C.data(), C_ref.data());
+        auto [l2_error, cosine_sim] = verify_correctness(S, KV, C.data(), C_ref.data());
 
-    if (rank_ == 0 && l2_error > 0.1)
-    {
-        std::cout << "DEBUG: Large Error Detected!" << std::endl;
-        std::cout << "C_act[0..9]: ";
-        for (int i = 0; i < 10; ++i)
-            std::cout << C[i] << " ";
-        std::cout << std::endl;
-        std::cout << "C_ref[0..9]: ";
-        for (int i = 0; i < 10; ++i)
-            std::cout << C_ref[i] << " ";
-        std::cout << std::endl;
-    }
+        if (rank_ == 0 && l2_error > 0.1)
+        {
+            std::cout << "DEBUG: Large Error Detected!" << std::endl;
+            std::cout << "C_act[0..9]: ";
+            for (int i = 0; i < 10; ++i)
+                std::cout << C[i] << " ";
+            std::cout << std::endl;
+            std::cout << "C_ref[0..9]: ";
+            for (int i = 0; i < 10; ++i)
+                std::cout << C_ref[i] << " ";
+            std::cout << std::endl;
+        }
 
-    // Warmup
-    for (int i = 0; i < config.warmup_iters; ++i)
-    {
-        run_kernel();
-    }
-
-    // Benchmark trials
-    std::vector<double> trial_times_ms;
-    trial_times_ms.reserve(config.num_trials);
-
-    for (int t = 0; t < config.num_trials; ++t)
-    {
-        MPI_Barrier(MPI_COMM_WORLD);
-        auto start = std::chrono::high_resolution_clock::now();
-
-        for (int i = 0; i < config.bench_iters; ++i)
+        // Warmup
+        for (int i = 0; i < config.warmup_iters; ++i)
         {
             run_kernel();
         }
 
-        MPI_Barrier(MPI_COMM_WORLD);
-        auto end = std::chrono::high_resolution_clock::now();
+        // Benchmark trials
+        std::vector<double> trial_times_ms;
+        trial_times_ms.reserve(config.num_trials);
 
-        double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        trial_times_ms.push_back(total_ms / config.bench_iters);
+        for (int t = 0; t < config.num_trials; ++t)
+        {
+            MPI_Barrier(MPI_COMM_WORLD);
+            auto start = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < config.bench_iters; ++i)
+            {
+                run_kernel();
+            }
+
+            MPI_Barrier(MPI_COMM_WORLD);
+            auto end = std::chrono::high_resolution_clock::now();
+
+            double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            trial_times_ms.push_back(total_ms / config.bench_iters);
+        }
+
+        // Calculate stats
+        double sum = std::accumulate(trial_times_ms.begin(), trial_times_ms.end(), 0.0);
+        double mean_ms = sum / config.num_trials;
+
+        double sq_sum = std::inner_product(trial_times_ms.begin(), trial_times_ms.end(), trial_times_ms.begin(), 0.0);
+        double stddev_ms = std::sqrt(sq_sum / config.num_trials - mean_ms * mean_ms);
+
+        double min_ms = *std::min_element(trial_times_ms.begin(), trial_times_ms.end());
+        double max_ms = *std::max_element(trial_times_ms.begin(), trial_times_ms.end());
+
+        // GFLOPS for attention: 2 * S * KV * D (matmul) + S * KV (softmax ~ignored)
+        double ops = 2.0 * S * KV * D;
+        double mean_gflops = (ops / (mean_ms * 1e-3)) / 1e9;
+
+        return {mean_ms, stddev_ms, min_ms, max_ms, mean_gflops, l2_error, cosine_sim};
     }
 
-    // Calculate stats
-    double sum = std::accumulate(trial_times_ms.begin(), trial_times_ms.end(), 0.0);
-    double mean_ms = sum / config.num_trials;
+    void
+    print_results(const AttentionBenchmarkConfig &config, const BenchmarkStats &stats)
+    {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        if (rank != 0)
+            return;
 
-    double sq_sum = std::inner_product(trial_times_ms.begin(), trial_times_ms.end(), trial_times_ms.begin(), 0.0);
-    double stddev_ms = std::sqrt(sq_sum / config.num_trials - mean_ms * mean_ms);
-
-    double min_ms = *std::min_element(trial_times_ms.begin(), trial_times_ms.end());
-    double max_ms = *std::max_element(trial_times_ms.begin(), trial_times_ms.end());
-
-    // GFLOPS for attention: 2 * S * KV * D (matmul) + S * KV (softmax ~ignored)
-    double ops = 2.0 * S * KV * D;
-    double mean_gflops = (ops / (mean_ms * 1e-3)) / 1e9;
-
-    return {mean_ms, stddev_ms, min_ms, max_ms, mean_gflops, l2_error, cosine_sim};
-}
-
-void
-print_results(const AttentionBenchmarkConfig &config, const BenchmarkStats &stats)
-{
-    if (rank_ != 0)
-        return;
-
-    std::cout << std::left << std::setw(45) << config.description
-              << " | S=" << std::setw(4) << config.seq_len
-              << " KV=" << std::setw(5) << config.kv_len
-              << " D=" << std::setw(4) << config.model.head_dim
-              << " H=" << std::setw(3) << config.model.n_heads
-              << " | Time: " << std::fixed << std::setprecision(3) << stats.mean_ms << " ms"
-              << " | T-put: " << std::setprecision(2) << stats.mean_gflops << " GFLOPS"
-              << " | L2 Err: " << std::scientific << std::setprecision(2) << stats.l2_error
-              << " | Cos Sim: " << std::fixed << std::setprecision(5) << stats.cosine_sim
-              << std::endl;
-}
-}
-;
+        std::cout << std::left << std::setw(45) << config.description
+                  << " | S=" << std::setw(4) << config.seq_len
+                  << " KV=" << std::setw(5) << config.kv_len
+                  << " D=" << std::setw(4) << config.model.head_dim
+                  << " H=" << std::setw(3) << config.model.n_heads
+                  << " | Time: " << std::fixed << std::setprecision(3) << stats.mean_ms << " ms"
+                  << " | T-put: " << std::setprecision(2) << stats.mean_gflops << " GFLOPS"
+                  << " | L2 Err: " << std::scientific << std::setprecision(2) << stats.l2_error
+                  << " | Cos Sim: " << std::fixed << std::setprecision(5) << stats.cosine_sim
+                  << std::endl;
+    }
+};
 
 // =============================================================================
 // Qwen 0.5B Tests
