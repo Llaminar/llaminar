@@ -197,18 +197,43 @@ namespace llaminar2
                     }
 
                     // Inner Loop K
+                    // OPTIMIZATION: Pre-compute Q row base pointers and K column base pointers
+                    // to avoid repeated imul in the hot loop. Use pointer increment (+36 per K iter)
+                    // instead of k * 36 computation.
+
+                    // Pre-compute Q row base addresses (invariant across K)
+                    // Q_row_base[i] = Q_base + i * Q_stride
+                    // We'll store these on the stack temporarily
+                    sub(rsp, 8 * m_blocking_); // Allocate stack space for Q row bases
+                    for (int i = 0; i < m_blocking_; ++i)
+                    {
+                        mov(reg_tmp, reg_Q_stride);
+                        imul(reg_tmp, reg_tmp, i);
+                        add(reg_tmp, reg_Q_base);
+                        mov(ptr[rsp + 8 * i], reg_tmp); // Store Q_row_base[i]
+                    }
+
+                    // Pre-compute K column base addresses (for this N iteration)
+                    // K_col_base[j] = K_base + (n + j) * K_stride
+                    sub(rsp, 8 * unroll_n_); // Allocate stack space for K col bases
+                    for (int j = 0; j < unroll_n_; ++j)
+                    {
+                        mov(reg_tmp, reg_n);
+                        add(reg_tmp, j);
+                        imul(reg_tmp, reg_K_stride);
+                        add(reg_tmp, reg_K_base);
+                        mov(ptr[rsp + 8 * j], reg_tmp); // Store K_col_base[j]
+                    }
+
                     xor_(reg_k, reg_k);
                     Label loop_K;
                     L(loop_K);
                     {
-                        // Load Q rows
+                        // Load Q rows using pre-computed bases + k*36
                         for (int i = 0; i < m_blocking_; ++i)
                         {
-                            // Q_ptr = Q_base + i * Q_stride + k * 36
-                            mov(reg_tmp, reg_Q_stride);
-                            imul(reg_tmp, reg_tmp, i);
-                            add(reg_tmp, reg_Q_base);
-
+                            // Q_ptr = Q_row_base[i] + k * 36
+                            mov(reg_tmp, ptr[rsp + 8 * unroll_n_ + 8 * i]); // Q_row_base[i]
                             mov(reg_Q_cursor, reg_k);
                             imul(reg_Q_cursor, reg_Q_cursor, 36);
                             add(reg_Q_cursor, reg_tmp);
@@ -221,68 +246,54 @@ namespace llaminar2
                         for (int ii = 0; ii < m_blocking_; ii += 4)
                         {
                             int reg_idx = vec_dq_base + (ii / 4);
-                            // No need to clear if we fill all 4, but safe to clear
                             vxorps(Xmm(reg_idx), Xmm(reg_idx), Xmm(reg_idx));
 
                             for (int r = 0; r < 4 && (ii + r) < m_blocking_; ++r)
                             {
                                 int i = ii + r;
-                                // Load d_Q[i] address
-                                mov(reg_tmp, reg_Q_stride);
-                                imul(reg_tmp, reg_tmp, i);
-                                add(reg_tmp, reg_Q_base);
+                                // Use pre-computed Q_row_base
+                                mov(reg_tmp, ptr[rsp + 8 * unroll_n_ + 8 * i]); // Q_row_base[i]
                                 mov(reg_Q_cursor, reg_k);
                                 imul(reg_Q_cursor, reg_Q_cursor, 36);
                                 add(reg_Q_cursor, reg_tmp);
 
-                                // Insert word
                                 vpinsrw(Xmm(reg_idx), Xmm(reg_idx), ptr[reg_Q_cursor], r);
                             }
-                            vcvtph2ps(Xmm(reg_idx), Xmm(reg_idx)); // Convert 4 halfs to 4 floats
+                            vcvtph2ps(Xmm(reg_idx), Xmm(reg_idx));
                         }
 
-                        // Load K cols
+                        // Load K cols using pre-computed bases + k*36
                         for (int j = 0; j < unroll_n_; ++j)
                         {
-                            // K_ptr = K_base + (n+j) * K_stride + k * 36
-                            mov(reg_tmp, reg_K_stride);
-                            mov(reg_Q_cursor, reg_n);
-                            add(reg_Q_cursor, j);
-                            imul(reg_tmp, reg_Q_cursor);
-                            add(reg_tmp, reg_K_base);
-
+                            // K_ptr = K_col_base[j] + k * 36
+                            mov(reg_tmp, ptr[rsp + 8 * j]); // K_col_base[j]
                             mov(reg_Q_cursor, reg_k);
                             imul(reg_Q_cursor, reg_Q_cursor, 36);
-                            add(reg_tmp, reg_Q_cursor);
+                            add(reg_Q_cursor, reg_tmp);
 
-                            vmovdqu8(Ymm(12 + j), ptr[reg_tmp + 4]); // Load K8_1 (32 bytes)
+                            vmovdqu8(Ymm(12 + j), ptr[reg_Q_cursor + 4]); // Load K8_1 (32 bytes)
                         }
 
                         // Compute Dot Products and Corrections
-                        // Loop over K columns (j)
                         for (int j = 0; j < unroll_n_; ++j)
                         {
-                            // Address for K block metadata
-                            mov(reg_tmp, reg_K_stride);
-                            mov(reg_Q_cursor, reg_n);
-                            add(reg_Q_cursor, j);
-                            imul(reg_tmp, reg_Q_cursor);
-                            add(reg_tmp, reg_K_base);
+                            // K block metadata address (using pre-computed base)
+                            mov(reg_tmp, ptr[rsp + 8 * j]); // K_col_base[j]
                             mov(reg_Q_cursor, reg_k);
                             imul(reg_Q_cursor, reg_Q_cursor, 36);
                             add(reg_tmp, reg_Q_cursor);
 
                             // Load d_K (FP16) -> Float -> Broadcast
                             vpbroadcastw(xmm31, ptr[reg_tmp]);
-                            vcvtph2ps(Ymm(27), xmm31); // Ymm27 holds d_K broadcasted
+                            vcvtph2ps(Ymm(27), xmm31);
 
                             // Load S_K (INT16) -> Float -> Broadcast
                             vpbroadcastw(xmm31, ptr[reg_tmp + 2]);
                             vpmovsxwd(xmm29, xmm31);
-                            vcvtdq2ps(xmm29, xmm29); // xmm29 holds S_K broadcasted
+                            vcvtdq2ps(xmm29, xmm29);
 
                             // Compute T_K = d_K * S_K
-                            vmulps(xmm29, xmm29, Xmm(27)); // xmm29 = T_K broadcasted
+                            vmulps(xmm29, xmm29, Xmm(27));
 
                             // Accumulate Correction: VecAccCorr[j] += VecDQ * T_K
                             for (int ii = 0; ii < m_blocking_; ii += 4)
@@ -295,25 +306,23 @@ namespace llaminar2
                             // Dot Products for all M rows
                             for (int i = 0; i < m_blocking_; ++i)
                             {
-                                // Load d_Q[i] (reload for scaling)
-                                mov(reg_tmp, reg_Q_stride);
-                                imul(reg_tmp, reg_tmp, i);
-                                add(reg_tmp, reg_Q_base);
+                                // Load d_Q[i] using pre-computed Q_row_base
+                                mov(reg_tmp, ptr[rsp + 8 * unroll_n_ + 8 * i]); // Q_row_base[i]
                                 mov(reg_Q_cursor, reg_k);
                                 imul(reg_Q_cursor, reg_Q_cursor, 36);
                                 add(reg_Q_cursor, reg_tmp);
 
                                 vpbroadcastw(xmm31, ptr[reg_Q_cursor]);
-                                vcvtph2ps(Ymm(26), xmm31); // Ymm26 = d_Q[i] broadcasted
+                                vcvtph2ps(Ymm(26), xmm31);
 
                                 // Dot product
                                 vxorps(Ymm(28), Ymm(28), Ymm(28));
-                                vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j)); // 8 int32 results
-                                vcvtdq2ps(Ymm(28), Ymm(28));                // 8 floats
+                                vpdpbusd(Ymm(28), Ymm(8 + i), Ymm(12 + j));
+                                vcvtdq2ps(Ymm(28), Ymm(28));
 
                                 // Apply scale: d_Q * d_K
-                                vmulps(Ymm(28), Ymm(28), Ymm(26)); // * d_Q
-                                vmulps(Ymm(28), Ymm(28), Ymm(27)); // * d_K (already in Ymm27)
+                                vmulps(Ymm(28), Ymm(28), Ymm(26));
+                                vmulps(Ymm(28), Ymm(28), Ymm(27));
 
                                 // Accumulate
                                 vaddps(Ymm(i * unroll_n_ + j), Ymm(i * unroll_n_ + j), Ymm(28));
@@ -324,6 +333,9 @@ namespace llaminar2
                         cmp(reg_k, reg_K_blocks);
                         jl(loop_K, T_NEAR);
                     }
+
+                    // Clean up stack space
+                    add(rsp, 8 * (m_blocking_ + unroll_n_));
 
                     // Horizontal Sum and Update
                     for (int i = 0; i < m_blocking_; ++i)
