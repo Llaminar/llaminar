@@ -43,6 +43,10 @@ option(USE_ONNX_HEURISTIC "Enable ONNX Runtime for neural network heuristic" ON)
 # OneDNN option for optimized INT8 GEMM
 option(USE_ONEDNN "Enable OneDNN for INT8 GEMM acceleration" ON)
 
+# Attention input dumping (for debugging JIT kernel issues)
+# When enabled, dumps Q/K/V/mask inputs to disk for each JIT attention invocation
+option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging" OFF)
+
 # =============================================================================
 # GPU Backend Mutual Exclusion Check (Phase 3)
 # =============================================================================
@@ -586,6 +590,12 @@ else()
     else()
         message(STATUS "V2: Pipeline snapshot capture disabled (Release build, use -DENABLE_SNAPSHOTS=ON to enable)")
     endif()
+endif()
+
+# Attention input dumping for debugging
+if(DUMP_ATTENTION_INPUTS)
+    target_compile_definitions(llaminar2_core PUBLIC LLAMINAR_DUMP_ATTENTION_INPUTS)
+    message(STATUS "V2: Attention input dumping ENABLED (will dump Q/K/V/mask to disk)")
 endif()
 
 # Compile features

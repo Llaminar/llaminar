@@ -25,6 +25,7 @@
 #include "../gemm_v4/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
 #include "../gemm_v4/QuantisedGemmJit_FP32_x_Q8_1.h"
 #include "../gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
+#include "../gemm_v4/AttentionInputDumper.h"
 #include "../../../pipelines/AttentionUtils.h"
 #include "../../../pipelines/PipelineConfig.h"
 #include "../../../utils/Logger.h"
@@ -415,6 +416,7 @@ namespace llaminar2
             static std::mutex jit_mutex;
 
             gemm_v4::QuantisedAttentionJit_Q8_1_Fused *jit_kernel = nullptr;
+
             {
                 std::lock_guard<std::mutex> lock(jit_mutex);
                 if (head_dim == 64)
@@ -432,6 +434,16 @@ namespace llaminar2
                         jit_fused_128 = std::make_unique<gemm_v4::QuantisedAttentionJit_Q8_1_Fused>(128);
                     }
                     jit_kernel = jit_fused_128.get();
+                }
+            }
+
+            if (jit_kernel)
+            {
+                static bool logged = false;
+                if (!logged)
+                {
+                    LOG_INFO("[CPUAttentionKernelTyped] Using JIT kernel for head_dim=" << head_dim);
+                    logged = true;
                 }
             }
 
@@ -509,6 +521,9 @@ namespace llaminar2
                 params.scale = scale;
                 params.mask = mask;
                 params.mask_stride = kv_len;
+
+                // Dump inputs for debugging (compile-time optional)
+                gemm_v4::dump_attention_inputs(params, h, -1);
 
                 // Execute fused kernel
                 auto func = jit_kernel->get_kernel();

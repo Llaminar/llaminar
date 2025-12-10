@@ -147,17 +147,17 @@
  * Usage: CAPTURE_SNAPSHOT("layer5_ATTENTION_CONTEXT", buffers.attn_output.get())
  *
  * @param key Human-readable snapshot identifier
- * @param tensor_ptr Pointer to TensorBase with data() and shape() methods
+ * @param tensor_ptr Pointer to TensorBase with fp32_data() and shape() methods
  */
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-#define CAPTURE_SNAPSHOT(key, tensor_ptr)                     \
-    do                                                        \
-    {                                                         \
-        const auto &_shape = (tensor_ptr)->shape();           \
-        size_t _numel = 1;                                    \
-        for (auto _dim : _shape)                              \
-            _numel *= _dim;                                   \
-        captureSnapshot((key), (tensor_ptr)->data(), _numel); \
+#define CAPTURE_SNAPSHOT(key, tensor_ptr)                          \
+    do                                                             \
+    {                                                              \
+        const auto &_shape = (tensor_ptr)->shape();                \
+        size_t _numel = 1;                                         \
+        for (auto _dim : _shape)                                   \
+            _numel *= _dim;                                        \
+        captureSnapshot((key), (tensor_ptr)->fp32_data(), _numel); \
     } while (0)
 
 /**
@@ -184,7 +184,7 @@
             size_t _numel = 1;                                                                          \
             for (auto _dim : _shape)                                                                    \
                 _numel *= _dim;                                                                         \
-            captureSnapshot((key), _view->data(), _numel);                                              \
+            captureSnapshot((key), _view->fp32_data(), _numel);                                         \
         }                                                                                               \
     } while (0)
 #else

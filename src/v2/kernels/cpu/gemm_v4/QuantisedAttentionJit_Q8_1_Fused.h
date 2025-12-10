@@ -111,10 +111,12 @@ namespace llaminar2
                 // Compute dynamic stack layout offsets
                 // Q blocks area: num_blocks * 64 bytes, rounded up to 64-byte alignment
                 q_area_size_ = ((num_blocks_ * 64) + 63) & ~63;
-                // Metadata area immediately after Q blocks: 64 bytes (K_base, V_base, reg_n, padding)
+                // Metadata area immediately after Q blocks: 64 bytes (K_base, V_base, reg_n, Q_norm_sq, padding)
                 k_base_offset_ = q_area_size_;
                 v_base_offset_ = q_area_size_ + 8;
                 reg_n_offset_ = q_area_size_ + 16;
+                q_norm_sq_offset_ = q_area_size_ + 24; // |Q|² for online normalization
+                // q_stride_offset_ will be calculated later to ensure it's in a safe zone
                 // Spill area starts at q_area_size_ + 64 (metadata area is 64 bytes)
                 spill_base_ = q_area_size_ + 64;
 
@@ -170,11 +172,13 @@ namespace llaminar2
             bool debug_generate_ = false;
 
             // Dynamic stack layout offsets (computed in constructor)
-            int q_area_size_;   // Size of Q blocks area (rounded to 64)
-            int k_base_offset_; // Offset for K_base pointer storage
-            int v_base_offset_; // Offset for V_base pointer storage
-            int reg_n_offset_;  // Offset for reg_n save slot
-            int spill_base_;    // Base offset for spilled context accumulators
+            int q_area_size_;      // Size of Q blocks area (rounded to 64)
+            int k_base_offset_;    // Offset for K_base pointer storage
+            int v_base_offset_;    // Offset for V_base pointer storage
+            int reg_n_offset_;     // Offset for reg_n save slot
+            int q_norm_sq_offset_; // Offset for |Q|² (online normalization)
+            int q_stride_offset_;  // Offset for Q_stride save slot
+            int spill_base_;       // Base offset for spilled context accumulators
 
             // Helper: Fast exp approximation using vexp2ps (2^x) and log2(e) scaling
             // exp(x) = 2^(x * log2(e))
@@ -196,54 +200,64 @@ namespace llaminar2
                 emit_exp2_poly(dst, dst);
             }
 
-            // Polynomial approximation for 2^x (good for x in [-127, 127])
-            // Uses minimax polynomial for accuracy
+            // Polynomial approximation for 2^x (good for x in [-0.5, 0.5])
+            // Uses Taylor series centered at 0
             void emit_exp2_poly(const Xbyak::Zmm &dst, const Xbyak::Zmm &src)
             {
                 using namespace Xbyak;
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG]     emit_exp2_poly: vrndscaleps" << std::endl;
                 // Split into integer and fractional parts
-                // n = floor(x), f = x - n
+                // n = round(x), f = x - n
                 // 2^x = 2^n * 2^f
-                vrndscaleps(zmm30, src, 1); // floor(x) -> zmm30
-                vsubps(zmm31, src, zmm30);  // f = x - floor(x) -> zmm31
+                // Use round-to-nearest-even (imm=8) to keep f in [-0.5, 0.5] for better precision
+                vrndscaleps(zmm30, src, 8); // round(x) -> zmm30
+                vsubps(zmm31, src, zmm30);  // f = x - round(x) -> zmm31
 
-                // 2^f using polynomial (for f in [0, 1))
-                // p(f) ≈ 1 + f*(ln2 + f*(ln2^2/2 + f*(ln2^3/6 + ...)))
-                // Simplified: use Horner's method with precomputed coefficients
-                // Coefficients for 2^x: c0=1, c1=0.693147, c2=0.240227, c3=0.055504, c4=0.009618, c5=0.001333
+                // 2^f using polynomial (for f in [-0.5, 0.5])
+                // p(f) = 1 + f*(ln2 + f*(ln2^2/2 + f*(ln2^3/6 + ...)))
 
-                // For speed, use 4th order polynomial
+                // 5th order Taylor coefficients for 2^x
                 static const float c0 = 1.0f;
                 static const float c1 = 0.6931472f; // ln(2)
                 static const float c2 = 0.2402265f; // ln(2)^2/2
                 static const float c3 = 0.0555041f; // ln(2)^3/6
-                static const float c4 = 0.0096139f; // ln(2)^4/24
+                static const float c4 = 0.0096181f; // ln(2)^4/24
+                static const float c5 = 0.0013334f; // ln(2)^5/120
 
                 if (debug_generate_)
-                    std::cerr << "[JIT_DEBUG]     emit_exp2_poly: load c4 and start Horner" << std::endl;
-                // Load coefficients (ideally from constant pool, but inline for now)
-                mov(rax, reinterpret_cast<uintptr_t>(&c4));
+                    std::cerr << "[JIT_DEBUG]     emit_exp2_poly: load c5 and start Horner" << std::endl;
+
+                // Horner's method: c0 + f*(c1 + f*(c2 + f*(c3 + f*(c4 + f*c5))))
+
+                // Load c5
+                mov(rax, reinterpret_cast<uintptr_t>(&c5));
                 vbroadcastss(dst, ptr[rax]);
+
+                // dst = c5*f + c4
+                mov(rax, reinterpret_cast<uintptr_t>(&c4));
+                vbroadcastss(zmm25, ptr[rax]);
+                vfmadd213ps(dst, zmm31, zmm25);
+
+                // dst = (c5*f + c4)*f + c3
                 mov(rax, reinterpret_cast<uintptr_t>(&c3));
                 vbroadcastss(zmm25, ptr[rax]);
-                vfmadd213ps(dst, zmm31, zmm25); // dst = c4*f + c3
-                if (debug_generate_)
-                    std::cerr << "[JIT_DEBUG]     emit_exp2_poly: c2" << std::endl;
+                vfmadd213ps(dst, zmm31, zmm25);
+
+                // dst = ((...)*f + c3)*f + c2
                 mov(rax, reinterpret_cast<uintptr_t>(&c2));
                 vbroadcastss(zmm25, ptr[rax]);
-                vfmadd213ps(dst, zmm31, zmm25); // dst = (c4*f + c3)*f + c2
-                if (debug_generate_)
-                    std::cerr << "[JIT_DEBUG]     emit_exp2_poly: c1" << std::endl;
+                vfmadd213ps(dst, zmm31, zmm25);
+
+                // dst = ((...)*f + c2)*f + c1
                 mov(rax, reinterpret_cast<uintptr_t>(&c1));
                 vbroadcastss(zmm25, ptr[rax]);
-                vfmadd213ps(dst, zmm31, zmm25); // dst = ((c4*f + c3)*f + c2)*f + c1
-                if (debug_generate_)
-                    std::cerr << "[JIT_DEBUG]     emit_exp2_poly: c0" << std::endl;
+                vfmadd213ps(dst, zmm31, zmm25);
+
+                // dst = ((...)*f + c1)*f + c0
                 mov(rax, reinterpret_cast<uintptr_t>(&c0));
                 vbroadcastss(zmm25, ptr[rax]);
-                vfmadd213ps(dst, zmm31, zmm25); // dst = (((c4*f + c3)*f + c2)*f + c1)*f + c0
+                vfmadd213ps(dst, zmm31, zmm25);
 
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG]     emit_exp2_poly: vscalefps" << std::endl;
@@ -370,23 +384,45 @@ namespace llaminar2
                 const int stack_size = spill_base_ + spill_size;
                 // Round up to 64-byte alignment for ZMM
                 stack_alloc_size_ = (stack_size + 63) & ~63;
+
+                // Place Q_stride at the end of the stack frame to avoid any potential overwrites
+                q_stride_offset_ = stack_alloc_size_;
+                stack_alloc_size_ += 64; // Add extra space for Q_stride and alignment padding
+
                 sub(rsp, stack_alloc_size_);
 
                 // Save K and V base addresses to stack (they'll be clobbered in inner loop)
-                mov(ptr[rsp + k_base_offset_], reg_K); // Save K base
-                mov(ptr[rsp + v_base_offset_], reg_V); // Save V base
+                mov(ptr[rsp + k_base_offset_], reg_K);          // Save K base
+                mov(ptr[rsp + v_base_offset_], reg_V);          // Save V base
+                mov(ptr[rsp + q_stride_offset_], reg_Q_stride); // Save Q stride
 
                 // ============================================================
                 // OUTER LOOP: For each Q row (m = 0..M-1)
                 // ============================================================
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG] Section 5: Outer loop setup" << std::endl;
+
                 xor_(reg_m, reg_m);
 
                 Label loop_M, end_M;
                 L(loop_M);
                 cmp(reg_m, reg_M);
                 jge(end_M, T_NEAR);
+
+                // CRITICAL: Re-initialize constants that get clobbered by output quantization
+                // at the end of each M iteration. Must be done BEFORE Section 6b (Compute |Q|²)
+                // because |Q|² computation uses zmm_128!
+                //   zmm26 (zmm_128): clobbered by sum_qs calculation
+                //   zmm22 (zmm_log2e): clobbered by xmm22 used for scale calculation
+                //   zmm23 (zmm_exp_min): clobbered by xmm23 used for FP16 conversion
+                if (debug_generate_)
+                    std::cerr << "[JIT_DEBUG] Section 5b: Re-init constants" << std::endl;
+                mov(reg_tmp.cvt32(), 0x80808080);
+                vpbroadcastd(zmm_128, reg_tmp.cvt32());
+                mov(reg_tmp.cvt32(), 0x3FB8AA3B); // log2(e) ≈ 1.4427f
+                vpbroadcastd(zmm_log2e, reg_tmp.cvt32());
+                mov(reg_tmp.cvt32(), 0xC2AE0000); // -87.0f (exp min clamp)
+                vpbroadcastd(zmm_exp_min, reg_tmp.cvt32());
 
                 // --------------------------------------------------------
                 // Load Q[m] blocks into stack (reused across all N iterations)
@@ -395,6 +431,7 @@ namespace llaminar2
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG] Section 6: Load Q blocks to stack" << std::endl;
                 mov(reg_tmp, reg_m);
+                mov(reg_Q_stride, ptr[rsp + q_stride_offset_]); // Reload Q stride
                 imul(reg_tmp, reg_Q_stride);
                 add(reg_tmp, reg_Q);
 
@@ -404,10 +441,19 @@ namespace llaminar2
                     // Load 36 bytes per block, store to stack
                     // Use vmovdqu32 for extended registers (ymm16-31) which require EVEX encoding
                     vmovdqu32(ymm30, ptr[reg_tmp + b * 36]); // 32 bytes
-                    vmovdqu32(ptr[rsp + b * 64], ymm30);     // Store to stack (padded)
-                    mov(eax, ptr[reg_tmp + b * 36 + 32]);    // Last 4 bytes
+
+                    vmovdqu32(ptr[rsp + b * 64], ymm30);  // Store to stack (padded)
+                    mov(eax, ptr[reg_tmp + b * 36 + 32]); // Last 4 bytes
                     mov(ptr[rsp + b * 64 + 32], eax);
                 }
+
+                // --------------------------------------------------------
+                // Section 6b: [REMOVED] Q/K normalization removed for standard attention
+                // Standard attention uses: score = (Q · K) * scale
+                // NOT: score = (Q · K) * scale / (|Q| * |K|)
+                // --------------------------------------------------------
+                if (debug_generate_)
+                    std::cerr << "[JIT_DEBUG] Section 6b: SKIPPED (Q/K normalization removed)" << std::endl;
 
                 // --------------------------------------------------------
                 // Initialize accumulators for this Q row
@@ -438,19 +484,7 @@ namespace llaminar2
                     }
                 }
 
-                // CRITICAL: Re-initialize constants that get clobbered by output quantization
-                // at the end of each M iteration:
-                //   zmm26 (zmm_128): clobbered by sum_qs calculation
-                //   zmm22 (zmm_log2e): clobbered by xmm22 used for scale calculation
-                //   zmm23 (zmm_exp_min): clobbered by xmm23 used for FP16 conversion
-                if (debug_generate_)
-                    std::cerr << "[JIT_DEBUG] Section 7b: Re-init constants" << std::endl;
-                mov(reg_tmp.cvt32(), 0x80808080);
-                vpbroadcastd(zmm_128, reg_tmp.cvt32());
-                mov(reg_tmp.cvt32(), 0x3FB8AA3B); // log2(e) ≈ 1.4427f
-                vpbroadcastd(zmm_log2e, reg_tmp.cvt32());
-                mov(reg_tmp.cvt32(), 0xC2AE0000); // -87.0f (exp min clamp)
-                vpbroadcastd(zmm_exp_min, reg_tmp.cvt32());
+                // CRITICAL: Re-initialize constants moved to start of loop
 
                 // --------------------------------------------------------
                 // INNER LOOP: For each K/V position (n = 0..N-1)
@@ -483,6 +517,7 @@ namespace llaminar2
                 // Step 1: Compute score = dot(Q[m], K[n]) * scale
                 // ========================================
                 // Accumulate dot product across all blocks
+                // Standard attention: NO Q/K normalization
                 // Use xmm_score_acc for accumulation (lower part of zmm_score)
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG] Section 10: Score computation loop" << std::endl;
@@ -505,6 +540,7 @@ namespace llaminar2
                     //   xmm9: d_K (FP32)
                     //   xmm15: sum_qs_K (float), correction
                     //   xmm14: scratch for 128.0f constant
+                    //   xmm31: |K|² accumulator
                     vpbroadcastw(xmm8, ptr[rsp + b * 64]); // d_Q (FP16) - broadcast to xmm
                     vcvtph2ps(xmm8, xmm8);                 // Convert FP16->FP32 (xmm->xmm)
                     if (debug_generate_)
@@ -526,7 +562,7 @@ namespace llaminar2
                     // K remains SIGNED - do NOT XOR with 0x80!
 
                     if (debug_generate_)
-                        std::cerr << "[JIT_DEBUG]   Block " << b << ": VPDPBUSD" << std::endl;
+                        std::cerr << "[JIT_DEBUG]   Block " << b << ": VPDPBUSD for Q*K" << std::endl;
                     // vpdpbusd: src1=unsigned (Q+128), src2=signed (K)
                     // Computes: acc += (Q+128) * K = Q*K + 128*K
                     // Need correction: subtract 128 * sum_qs_K
@@ -559,8 +595,8 @@ namespace llaminar2
                     vmulps(xmm8, xmm8, xmm9); // d_Q * d_K -> xmm8
 
                     // Correction = 128.0f * sum_qs_K (xmm15 has sum_qs_K as float)
-                    mov(eax, 0x43000000); // 128.0f in IEEE 754
-                    vmovd(xmm14, eax);
+                    mov(reg_tmp.cvt32(), 0x43000000); // 128.0f in IEEE 754
+                    vmovd(xmm14, reg_tmp.cvt32());
                     vbroadcastss(xmm14, xmm14);
                     vmulps(xmm15, xmm15, xmm14); // 128 * sum_qs_K -> xmm15
 
@@ -575,6 +611,7 @@ namespace llaminar2
                 }
 
                 // Apply attention scale (scalar)
+                // Standard attention: score = (Q · K) * scale (no Q/K normalization)
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG] Section 11: Apply scale and mask" << std::endl;
                 vmulss(xmm_score_acc, xmm_score_acc, Xmm(zmm_scale.getIdx()));
@@ -584,13 +621,15 @@ namespace llaminar2
                 jz("no_mask", T_NEAR);
                 {
                     // mask_val = mask[m * mask_stride + n]
-                    // NOTE: reg_n is aliased to rax, which we need as scratch here.
-                    // reg_n was saved to [rsp + reg_n_offset_] earlier, so load it into reg_tmp.
-                    mov(reg_tmp, ptr[rsp + reg_n_offset_]); // reg_tmp = n (from stack)
-                    mov(rax, reg_m);
-                    imul(rax, reg_mask_stride);
-                    add(rax, reg_tmp); // rax = m * mask_stride + n
-                    vaddss(xmm_score_acc, xmm_score_acc, ptr[reg_mask + rax * 4]);
+                    // We use reg_tmp (rdi) for the calculation to avoid clobbering reg_n (rax).
+                    // reg_n (rax) holds the current n loop counter.
+
+                    mov(reg_tmp.cvt32(), reg_m.cvt32());            // edi = m (zero extends rdi)
+                    imul(reg_tmp.cvt32(), reg_mask_stride.cvt32()); // edi = m * stride
+                    add(reg_tmp.cvt32(), reg_n.cvt32());            // edi = m * stride + n
+
+                    // Add mask value to accumulator
+                    vaddss(xmm_score_acc, xmm_score_acc, ptr[reg_mask + reg_tmp * 4]);
                 }
                 L("no_mask");
 
@@ -733,8 +772,11 @@ namespace llaminar2
                 // ========================================
 
                 // Broadcast 1/sum for normalization
-                // NOTE: vrcpps is VEX-only (XMM/YMM), use vrcp14ps for ZMM (AVX-512)
-                vrcp14ps(zmm14, zmm_sum); // Approximate 1/sum
+                // NOTE: vrcp14ps is approximate (error < 2^-14), which causes divergence.
+                // We use full precision division: 1.0f / sum
+                mov(reg_tmp.cvt32(), 0x3f800000);     // 1.0f as int32
+                vpbroadcastd(zmm14, reg_tmp.cvt32()); // Broadcast 1.0f
+                vdivps(zmm14, zmm14, zmm_sum);        // 1.0f / sum
 
                 // Normalize context accumulators (blocks 0-1 in registers)
                 vmulps(zmm_ctx0, zmm_ctx0, zmm14);
@@ -817,11 +859,25 @@ namespace llaminar2
                     vpextrw(eax, xmm23, 0);
                     mov(ptr[reg_tmp + b * 36], ax); // Store d (FP16)
 
-                    // Compute inverse scale for quantization
-                    // Use xmm6 as temp (avoid xmm4 which may hold ctx_lo for spilled blocks)
-                    vmovaps(xmm6, xmm22);      // Copy to xmm6
-                    vrcpss(xmm6, xmm6, xmm6);  // inv_d ≈ 1/d
-                    vbroadcastss(zmm24, xmm6); // Broadcast to zmm24
+                    // Convert back to FP32 to match what the next layer will see
+                    vcvtph2ps(xmm22, xmm23);
+
+                    // Compute inverse scale for quantization using precise division
+                    // inv_d = 1.0f / d_recon
+                    // Handle d_recon == 0 case to avoid Inf/NaN -> -128 artifact
+
+                    // Check if d_recon (xmm22) is not zero
+                    vxorps(xmm6, xmm6, xmm6);   // 0.0f
+                    vcmpss(k1, xmm22, xmm6, 4); // 4 = _CMP_NEQ_UQ (Not Equal)
+
+                    // Initialize result to 0.0f
+                    vxorps(xmm24, xmm24, xmm24);
+
+                    // Compute division only where d_recon != 0
+                    vmovaps(xmm6, Xmm(zmm_one.getIdx())); // 1.0f
+                    vdivss(xmm24 | k1, xmm6, xmm22);      // xmm24 = 1.0f / d_recon (masked)
+
+                    vbroadcastss(zmm24, xmm24); // Broadcast to zmm24
 
                     // Quantize: qs[i] = round(ctx[i] * inv_d)
                     vmulps(zmm20, ctx_lo, zmm24);
@@ -914,6 +970,20 @@ namespace llaminar2
                     {
                         float d_q = simd::fp16_to_fp32(Q_row[b].d);
                         float d_k = simd::fp16_to_fp32(K_row[b].d);
+
+                        if (m == 0 && n == 0 && b == 0)
+                        {
+                            printf("[REF] m=0 n=0 b=0 d_q=%.6f d_k=%.6f\n", d_q, d_k);
+                            printf("[REF] Q[0:8]: ");
+                            for (int i = 0; i < 8; ++i)
+                                printf("%.6f ", d_q * Q_row[b].qs[i]);
+                            printf("\n");
+                            printf("[REF] K[0:8]: ");
+                            for (int i = 0; i < 8; ++i)
+                                printf("%.6f ", d_k * K_row[b].qs[i]);
+                            printf("\n");
+                        }
+
                         int32_t acc = 0;
                         for (int i = 0; i < 32; ++i)
                         {
@@ -922,7 +992,16 @@ namespace llaminar2
                         dot += static_cast<float>(acc) * d_q * d_k;
                     }
 
+                    // Apply attention scale (standard attention, no Q/K normalization)
+                    // score = (Q · K) * scale
                     float score = dot * scale;
+
+                    if (m == 0 && n < 5)
+                    {
+                        printf("[REF] m=%d n=%d dot=%.4f scale=%.4f score=%.4f mask=%.4f\n",
+                               m, n, dot, scale, score, mask ? mask[m * mask_stride + n] : 0.0f);
+                    }
+
                     if (mask)
                     {
                         score += mask[m * mask_stride + n];
@@ -942,6 +1021,12 @@ namespace llaminar2
 
                     float weight = std::exp(score - max_score);
                     sum_exp += weight;
+
+                    if (m == 0 && n < 5)
+                    {
+                        printf("[REF] m=%d n=%d max_score=%.4f weight=%.4f sum_exp=%.4f\n",
+                               m, n, max_score, weight, sum_exp);
+                    }
 
                     // Accumulate weighted V
                     for (int b = 0; b < num_blocks; ++b)

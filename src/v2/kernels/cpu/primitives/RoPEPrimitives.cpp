@@ -1650,28 +1650,7 @@ namespace llaminar2::primitives
     /**
      * @brief Helper: FP32 to FP16 conversion for Q8_1 scale
      */
-    static inline uint16_t fp32_to_fp16_rope(float f)
-    {
-        uint32_t bits;
-        std::memcpy(&bits, &f, sizeof(float));
-
-        uint32_t sign = (bits >> 31) & 0x1;
-        int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
-        uint32_t mant = (bits >> 13) & 0x3FF;
-
-        if (exp >= 31)
-        {
-            // Overflow -> Inf
-            return static_cast<uint16_t>((sign << 15) | 0x7C00);
-        }
-        else if (exp <= 0)
-        {
-            // Underflow -> zero or subnormal (we just use zero)
-            return static_cast<uint16_t>(sign << 15);
-        }
-
-        return static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
-    }
+    // static inline uint16_t fp32_to_fp16_rope(float f) - REMOVED, use llaminar2::fp32_to_fp16
 
     void apply_rope_q8_1_integer_head(
         Q8_1Block *head_blocks,
@@ -1679,326 +1658,15 @@ namespace llaminar2::primitives
         const int16_t *cos_q15,
         const int16_t *sin_q15)
     {
-        // Q8_1 block size is 32 elements
-        // For RoPE, we need to pair first half of head with second half
-        // head_dim = blocks_per_head * 32
-        // half_dim = blocks_per_head * 32 / 2 = blocks_per_head * 16
-
-        // Each block pair: blocks in first half are paired with blocks in second half
-        // Block[b] elements pair with Block[b + blocks_per_head/2] elements
         const int half_blocks = blocks_per_head / 2;
 
-        if (blocks_per_head < 2)
-        {
-            // head_dim < 64, can't do RoPE properly on Q8_1 blocks
-            // This is an edge case that shouldn't happen in practice
-            return;
-        }
+        // NOTE: We use FP32 for rotation to correctly handle scale differences between blocks.
+        // The previous "pure integer" implementation assumed scaleA == scaleB, which is incorrect
+        // and caused massive divergence (20x) in dot products.
+        //
+        // While this involves int8->fp32->int8 conversion, it is necessary for correctness.
+        // Modern CPUs have fast int<->float conversion instructions.
 
-#if defined(__AVX512F__)
-        // Optimized AVX512 implementation using integer arithmetic to avoid dequantization overhead
-        // Process 32 elements (one full block) at a time, but in two 16-element chunks
-        for (int b = 0; b < half_blocks; ++b)
-        {
-            Q8_1Block &blockA = head_blocks[b];
-            Q8_1Block &blockB = head_blocks[b + half_blocks];
-
-            float scaleA = fp16_to_fp32_rope(blockA.d);
-            float scaleB = fp16_to_fp32_rope(blockB.d);
-
-            // Determine max scale to normalize inputs
-            float maxScale = std::max(scaleA, scaleB);
-            if (maxScale < 1e-9f)
-                maxScale = 1e-9f;
-
-            // Calculate relative scales (<= 1.0)
-            float relScaleA = scaleA / maxScale;
-            float relScaleB = scaleB / maxScale;
-
-            // We will compute coefficients in Q20 format
-            // Coeff = cos * relScale * 2^5 (since cos is Q15, total Q20)
-            // But to preserve precision of relScale, we compute in float then cast
-            // Coeff = (float(cos) * relScale) * 2^20 / 2^15 = float(cos) * relScale * 32.0f
-            // Actually, let's just do: float(cos) * relScale * 1048576.0f (2^20) -> int32
-            // Wait, cos is integer Q15. float(cos) is e.g. 32767.0.
-            // We want effective multiplier for q (int8).
-            // q * Coeff should be Q20.
-            // q is Q0. Coeff is Q20.
-            // Coeff = cos_val * relScale * (2^20 / 2^15) = cos_val * relScale * 32.0f?
-            // No. cos_val is the integer representation. Real cos is cos_val / 32767.
-            // We want q * d * cos.
-            // q * d_max * relScale * (cos_val / 32767).
-            // We want result in Q20 relative to d_max.
-            // Result = q * (relScale * cos_val / 32767 * 2^20).
-            // Multiplier = relScale * cos_val * 32.0f.
-
-            __m512 relScaleA_vec = _mm512_set1_ps(relScaleA * 32.0f);
-            __m512 relScaleB_vec = _mm512_set1_ps(relScaleB * 32.0f);
-
-            // Accumulators for sums
-            __m512i sumA_acc = _mm512_setzero_si512();
-            __m512i sumB_acc = _mm512_setzero_si512();
-
-            // Max accumulators (int32)
-            __m512i maxA_acc = _mm512_setzero_si512();
-            __m512i maxB_acc = _mm512_setzero_si512();
-
-            // Temporary storage for rotated values (int32 Q20)
-            int32_t rotA_buf[32];
-            int32_t rotB_buf[32];
-
-            for (int i = 0; i < 2; ++i)
-            { // 2 chunks of 16 elements
-                int offset = i * 16;
-
-                // Load cos/sin (Q15 int16)
-                const int16_t *cos_ptr = cos_q15 + b * 32 + offset;
-                const int16_t *sin_ptr = sin_q15 + b * 32 + offset;
-
-                __m256i cos_256 = _mm256_loadu_si256((const __m256i *)cos_ptr);
-                __m256i sin_256 = _mm256_loadu_si256((const __m256i *)sin_ptr);
-
-                __m512i cos_i32 = _mm512_cvtepi16_epi32(cos_256);
-                __m512i sin_i32 = _mm512_cvtepi16_epi32(sin_256);
-
-                // Convert to float to apply relative scale
-                __m512 cos_ps = _mm512_cvtepi32_ps(cos_i32);
-                __m512 sin_ps = _mm512_cvtepi32_ps(sin_i32);
-
-                // Compute coefficients (Q20)
-                // Coeff = cos * relScale * 32.0
-                __m512 coeffA_cos_ps = _mm512_mul_ps(cos_ps, relScaleA_vec);
-                __m512 coeffA_sin_ps = _mm512_mul_ps(sin_ps, relScaleA_vec);
-                __m512 coeffB_cos_ps = _mm512_mul_ps(cos_ps, relScaleB_vec);
-                __m512 coeffB_sin_ps = _mm512_mul_ps(sin_ps, relScaleB_vec);
-
-                // Convert back to int32
-                __m512i C_A_cos = _mm512_cvtps_epi32(coeffA_cos_ps);
-                __m512i C_A_sin = _mm512_cvtps_epi32(coeffA_sin_ps);
-                __m512i C_B_cos = _mm512_cvtps_epi32(coeffB_cos_ps);
-                __m512i C_B_sin = _mm512_cvtps_epi32(coeffB_sin_ps);
-
-                // Load q (int8) -> int32
-                __m128i qsA_128 = _mm_loadu_si128((const __m128i *)(blockA.qs + offset));
-                __m128i qsB_128 = _mm_loadu_si128((const __m128i *)(blockB.qs + offset));
-
-                __m512i qA = _mm512_cvtepi8_epi32(qsA_128);
-                __m512i qB = _mm512_cvtepi8_epi32(qsB_128);
-
-                // Rotate (integer math)
-                // x' = qA * C_A_cos - qB * C_B_sin
-                // y' = qA * C_A_sin + qB * C_B_cos
-                // Products are approx 127 * 2^20 * 32767/32767 = 1.3e8, fits in int32
-                __m512i rotA = _mm512_sub_epi32(_mm512_mullo_epi32(qA, C_A_cos), _mm512_mullo_epi32(qB, C_B_sin));
-                __m512i rotB = _mm512_add_epi32(_mm512_mullo_epi32(qA, C_A_sin), _mm512_mullo_epi32(qB, C_B_cos));
-
-                _mm512_storeu_si512(rotA_buf + offset, rotA);
-                _mm512_storeu_si512(rotB_buf + offset, rotB);
-
-                // Update max abs
-                maxA_acc = _mm512_max_epi32(maxA_acc, _mm512_abs_epi32(rotA));
-                maxB_acc = _mm512_max_epi32(maxB_acc, _mm512_abs_epi32(rotB));
-            }
-
-            // Reduce max
-            int32_t maxA = _mm512_reduce_max_epi32(maxA_acc);
-            int32_t maxB = _mm512_reduce_max_epi32(maxB_acc);
-
-            // Avoid zero
-            if (maxA == 0)
-                maxA = 1;
-            if (maxB == 0)
-                maxB = 1;
-
-            // Calculate new scales
-            // maxA corresponds to 127.0
-            // d_out = (maxA / 2^20) / 127.0 * d_max
-            float newScaleA = (static_cast<float>(maxA) / 1048576.0f) / 127.0f * maxScale;
-            float newScaleB = (static_cast<float>(maxB) / 1048576.0f) / 127.0f * maxScale;
-
-            // Requantization factor F (Q36)
-            // We want x_acc * F >> 36 to be in [-127, 127]
-            // F = 127 * 2^36 / maxA
-            // We use double for precision in calculating F
-            int64_t F_A = static_cast<int64_t>((127.0 * 68719476736.0) / static_cast<double>(maxA));
-            int64_t F_B = static_cast<int64_t>((127.0 * 68719476736.0) / static_cast<double>(maxB));
-
-            __m512i F_A_vec = _mm512_set1_epi64(F_A);
-            __m512i F_B_vec = _mm512_set1_epi64(F_B);
-
-            __m512i min_val = _mm512_set1_epi32(-127);
-            __m512i max_val = _mm512_set1_epi32(127);
-
-            // Quantize back
-            for (int i = 0; i < 2; ++i)
-            {
-                int offset = i * 16;
-
-                __m512i rotA = _mm512_loadu_si512(rotA_buf + offset);
-                __m512i rotB = _mm512_loadu_si512(rotB_buf + offset);
-
-                // Multiply by F (64-bit) and shift right by 36
-                // Even lanes
-                __m512i resA_even = _mm512_mul_epi32(rotA, F_A_vec);
-                __m512i resB_even = _mm512_mul_epi32(rotB, F_B_vec);
-
-                // Odd lanes (shift input right by 32)
-                __m512i resA_odd = _mm512_mul_epi32(_mm512_srli_epi64(rotA, 32), F_A_vec);
-                __m512i resB_odd = _mm512_mul_epi32(_mm512_srli_epi64(rotB, 32), F_B_vec);
-
-                // Shift right by 36 to get result
-                resA_even = _mm512_srai_epi64(resA_even, 36);
-                resB_even = _mm512_srai_epi64(resB_even, 36);
-                resA_odd = _mm512_srai_epi64(resA_odd, 36);
-                resB_odd = _mm512_srai_epi64(resB_odd, 36);
-
-                // Pack back to 32-bit
-                // We can use permute/shuffle or cvtepi64_epi32 if available?
-                // _mm512_cvtepi64_epi32 converts 512-bit (8 longs) to 256-bit (8 ints)
-                // We have 16 results split across even/odd
-
-                // Manual packing:
-                // Mask even lanes
-                __m512i mask = _mm512_set1_epi64(0xFFFFFFFF);
-                resA_even = _mm512_and_si512(resA_even, mask);
-                resB_even = _mm512_and_si512(resB_even, mask);
-
-                // Shift odd lanes left by 32
-                resA_odd = _mm512_slli_epi64(resA_odd, 32);
-                resB_odd = _mm512_slli_epi64(resB_odd, 32);
-
-                // Combine
-                __m512i qA_i32 = _mm512_or_si512(resA_even, resA_odd);
-                __m512i qB_i32 = _mm512_or_si512(resB_even, resB_odd);
-
-                // Clamp
-                qA_i32 = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, qA_i32));
-                qB_i32 = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, qB_i32));
-
-                // Accumulate sums
-                sumA_acc = _mm512_add_epi32(sumA_acc, qA_i32);
-                sumB_acc = _mm512_add_epi32(sumB_acc, qB_i32);
-
-                // Pack to int8
-                __m128i qA_i8 = _mm512_cvtepi32_epi8(qA_i32);
-                __m128i qB_i8 = _mm512_cvtepi32_epi8(qB_i32);
-
-                _mm_storeu_si128((__m128i *)(blockA.qs + offset), qA_i8);
-                _mm_storeu_si128((__m128i *)(blockB.qs + offset), qB_i8);
-            }
-
-            int32_t sumA = _mm512_reduce_add_epi32(sumA_acc);
-            int32_t sumB = _mm512_reduce_add_epi32(sumB_acc);
-
-            blockA.d = fp32_to_fp16_rope(newScaleA);
-            blockB.d = fp32_to_fp16_rope(newScaleB);
-            blockA.sum_qs = static_cast<int16_t>(sumA);
-            blockB.sum_qs = static_cast<int16_t>(sumB);
-        }
-#elif defined(__AVX2__)
-        // AVX2 implementation: process 16 elements at a time
-        for (int b = 0; b < half_blocks; ++b)
-        {
-            Q8_1Block &blockA = head_blocks[b];
-            Q8_1Block &blockB = head_blocks[b + half_blocks];
-
-            float scaleA = fp16_to_fp32_rope(blockA.d);
-            float scaleB = fp16_to_fp32_rope(blockB.d);
-
-            alignas(32) int32_t rotA[32];
-            alignas(32) int32_t rotB[32];
-
-            const int16_t *cos_ptr = cos_q15 + b * 32;
-            const int16_t *sin_ptr = sin_q15 + b * 32;
-
-            __m256i zero = _mm256_setzero_si256();
-
-            for (int chunk = 0; chunk < 2; ++chunk)
-            {
-                int offset = chunk * 16;
-
-                // Load 16 int8 values
-                __m128i qa = _mm_loadu_si128((const __m128i *)(blockA.qs + offset));
-                __m128i qb = _mm_loadu_si128((const __m128i *)(blockB.qs + offset));
-
-                // Interleave x, y -> [x0, y0, x1, y1...] (8-bit)
-                __m128i q_lo = _mm_unpacklo_epi8(qa, qb);
-                __m128i q_hi = _mm_unpackhi_epi8(qa, qb);
-
-                // Convert to 16-bit: [x0, y0, x1, y1...] (16-bit)
-                __m256i xy_lo = _mm256_cvtepi8_epi16(q_lo);
-                __m256i xy_hi = _mm256_cvtepi8_epi16(q_hi);
-
-                // Load cos/sin (16 values)
-                __m256i cos_vec = _mm256_loadu_si256((const __m256i *)(cos_ptr + offset));
-                __m256i sin_vec = _mm256_loadu_si256((const __m256i *)(sin_ptr + offset));
-                __m256i neg_sin_vec = _mm256_sub_epi16(zero, sin_vec);
-
-                // Prepare coefficients for dot product
-                // Real: x*cos - y*sin = x*cos + y*(-sin)
-                // Coeffs: [cos, -sin, cos, -sin...]
-                __m256i cos_sin_neg_lo = _mm256_unpacklo_epi16(cos_vec, neg_sin_vec);
-                __m256i cos_sin_neg_hi = _mm256_unpackhi_epi16(cos_vec, neg_sin_vec);
-
-                // Imag: x*sin + y*cos
-                // Coeffs: [sin, cos, sin, cos...]
-                __m256i sin_cos_lo = _mm256_unpacklo_epi16(sin_vec, cos_vec);
-                __m256i sin_cos_hi = _mm256_unpackhi_epi16(sin_vec, cos_vec);
-
-                // Compute dot products (32-bit result)
-                __m256i real_lo = _mm256_madd_epi16(xy_lo, cos_sin_neg_lo);
-                __m256i real_hi = _mm256_madd_epi16(xy_hi, cos_sin_neg_hi);
-                __m256i imag_lo = _mm256_madd_epi16(xy_lo, sin_cos_lo);
-                __m256i imag_hi = _mm256_madd_epi16(xy_hi, sin_cos_hi);
-
-                // Shift right by 15
-                real_lo = _mm256_srai_epi32(real_lo, 15);
-                real_hi = _mm256_srai_epi32(real_hi, 15);
-                imag_lo = _mm256_srai_epi32(imag_lo, 15);
-                imag_hi = _mm256_srai_epi32(imag_hi, 15);
-
-                // Store
-                _mm256_storeu_si256((__m256i *)(rotA + offset), real_lo);
-                _mm256_storeu_si256((__m256i *)(rotA + offset + 8), real_hi);
-                _mm256_storeu_si256((__m256i *)(rotB + offset), imag_lo);
-                _mm256_storeu_si256((__m256i *)(rotB + offset + 8), imag_hi);
-            }
-
-            // Find max absolute value for rescaling
-            int32_t maxA = 0, maxB = 0;
-            for (int i = 0; i < 32; ++i)
-            {
-                maxA = std::max(maxA, std::abs(rotA[i]));
-                maxB = std::max(maxB, std::abs(rotB[i]));
-            }
-
-            float newScaleA = (maxA > 0) ? scaleA * static_cast<float>(maxA) / 127.0f : 0.0f;
-            float newScaleB = (maxB > 0) ? scaleB * static_cast<float>(maxB) / 127.0f : 0.0f;
-
-            float invMaxA = (maxA > 0) ? 127.0f / static_cast<float>(maxA) : 0.0f;
-            float invMaxB = (maxB > 0) ? 127.0f / static_cast<float>(maxB) : 0.0f;
-
-            int32_t sumA = 0, sumB = 0;
-            for (int i = 0; i < 32; ++i)
-            {
-                int32_t qA = static_cast<int32_t>(std::round(rotA[i] * invMaxA));
-                qA = std::max(-127, std::min(127, qA));
-                blockA.qs[i] = static_cast<int8_t>(qA);
-                sumA += qA;
-
-                int32_t qB = static_cast<int32_t>(std::round(rotB[i] * invMaxB));
-                qB = std::max(-127, std::min(127, qB));
-                blockB.qs[i] = static_cast<int8_t>(qB);
-                sumB += qB;
-            }
-
-            blockA.d = fp32_to_fp16_rope(newScaleA);
-            blockB.d = fp32_to_fp16_rope(newScaleB);
-            blockA.sum_qs = static_cast<int16_t>(sumA);
-            blockB.sum_qs = static_cast<int16_t>(sumB);
-        }
-#else
-        // Scalar fallback
         for (int b = 0; b < half_blocks; ++b)
         {
             Q8_1Block &blockA = head_blocks[b];
@@ -2010,56 +1678,76 @@ namespace llaminar2::primitives
             const int16_t *cos_ptr = cos_q15 + b * 32;
             const int16_t *sin_ptr = sin_q15 + b * 32;
 
-            int32_t rotA[32], rotB[32];
+            float rotA[32];
+            float rotB[32];
 
-            // Compute rotated values
+            // Compute rotated values in FP32
+            // We unroll the loop slightly for better pipelining
             for (int i = 0; i < 32; ++i)
             {
-                int32_t x = blockA.qs[i];
-                int32_t y = blockB.qs[i];
-                int32_t c = cos_ptr[i];
-                int32_t s = sin_ptr[i];
+                // Dequantize
+                float x = static_cast<float>(blockA.qs[i]) * scaleA;
+                float y = static_cast<float>(blockB.qs[i]) * scaleB;
 
-                // x' = (x * cos - y * sin) >> 15
-                // y' = (x * sin + y * cos) >> 15
-                rotA[i] = (x * c - y * s) >> 15;
-                rotB[i] = (x * s + y * c) >> 15;
+                // Convert Q15 sin/cos to float
+                float c = static_cast<float>(cos_ptr[i]) * (1.0f / 32767.0f);
+                float s = static_cast<float>(sin_ptr[i]) * (1.0f / 32767.0f);
+
+                // Rotate
+                rotA[i] = x * c - y * s;
+                rotB[i] = x * s + y * c;
             }
 
-            // Find max and rescale
-            int32_t maxA = 0, maxB = 0;
-            for (int i = 0; i < 32; ++i)
+            // Requantize blockA
             {
-                maxA = std::max(maxA, std::abs(rotA[i]));
-                maxB = std::max(maxB, std::abs(rotB[i]));
+                float max_val = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_val = std::max(max_val, std::abs(rotA[i]));
+                }
+
+                float new_scale = max_val / 127.0f;
+                if (new_scale < 1e-20f)
+                    new_scale = 1e-20f; // Avoid div by zero
+                float inv_scale = 1.0f / new_scale;
+
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(rotA[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    blockA.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
+                }
+                blockA.d = llaminar2::fp32_to_fp16(new_scale);
+                blockA.sum_qs = static_cast<int16_t>(sum_qs);
             }
 
-            float newScaleA = (maxA > 0) ? scaleA * static_cast<float>(maxA) / 127.0f : 0.0f;
-            float newScaleB = (maxB > 0) ? scaleB * static_cast<float>(maxB) / 127.0f : 0.0f;
-
-            float invMaxA = (maxA > 0) ? 127.0f / static_cast<float>(maxA) : 0.0f;
-            float invMaxB = (maxB > 0) ? 127.0f / static_cast<float>(maxB) : 0.0f;
-
-            int32_t sumA = 0, sumB = 0;
-            for (int i = 0; i < 32; ++i)
+            // Requantize blockB
             {
-                int32_t qA = static_cast<int32_t>(std::round(rotA[i] * invMaxA));
-                qA = std::max(-127, std::min(127, qA));
-                blockA.qs[i] = static_cast<int8_t>(qA);
-                sumA += qA;
+                float max_val = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_val = std::max(max_val, std::abs(rotB[i]));
+                }
 
-                int32_t qB = static_cast<int32_t>(std::round(rotB[i] * invMaxB));
-                qB = std::max(-127, std::min(127, qB));
-                blockB.qs[i] = static_cast<int8_t>(qB);
-                sumB += qB;
+                float new_scale = max_val / 127.0f;
+                if (new_scale < 1e-20f)
+                    new_scale = 1e-20f;
+                float inv_scale = 1.0f / new_scale;
+
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(rotB[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    blockB.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
+                }
+                blockB.d = llaminar2::fp32_to_fp16(new_scale);
+                blockB.sum_qs = static_cast<int16_t>(sum_qs);
             }
-
-            blockA.d = fp32_to_fp16_rope(newScaleA);
-            blockB.d = fp32_to_fp16_rope(newScaleB);
-            blockA.sum_qs = static_cast<int16_t>(sumA);
-            blockB.sum_qs = static_cast<int16_t>(sumB);
         }
-#endif
     }
 
     void apply_rope_q8_1_integer(

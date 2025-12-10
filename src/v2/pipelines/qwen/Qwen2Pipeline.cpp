@@ -23,6 +23,7 @@
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "../../tensors/SIMDHelpers.h"
 #include "../ops/EmbeddingOp.h"
 #include <iostream>
 #include <fstream>
@@ -1055,6 +1056,7 @@ namespace llaminar2
         }
 
         // 5. Residual connection
+        // DEBUG: Inspect Layer 21 FFN Residual inputs
         TRY_OP(add_residual(
             buffers.residual.get(), buffers.ffn_output.get(), current_hidden_.get(),
             batch_size_, padded_seq_len_, d_model_,

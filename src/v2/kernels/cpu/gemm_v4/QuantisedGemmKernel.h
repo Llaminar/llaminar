@@ -94,6 +94,7 @@
 #pragma once
 
 #include <immintrin.h>
+#include <atomic>
 #include "QuantisedGemmJit_M1.h"
 #include "QuantisedGemmJit_M2.h"
 #include "QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
@@ -425,12 +426,18 @@ namespace llaminar2
                 int N_padded = (N + 63) / 64 * 64;
                 // K_blocks covers all K elements (32 per block)
                 int K_blocks = (K + 31) / 32;
+                // K_padded is K rounded up to multiple of 32 (VNNI block size)
+                int K_padded = K_blocks * 32;
 
                 // Allocate packed weight buffers
-                out.packed_data.resize(K * N_padded);
+                // Layout: [N/64][K_padded/4][64][4] flattened, so total size = K_padded * N_padded
+                out.packed_data.resize(K_padded * N_padded);
                 out.compensation.resize(K_blocks * N_padded);
                 out.scales.resize(K_blocks * N_padded);
                 out.mins.resize(K_blocks * N_padded);
+
+                // Track if we have any non-zero mins (for JIT optimization)
+                std::atomic<bool> has_mins_atomic(false);
 
                 // Verify tensor implements IINT8Unpackable interface
                 const IINT8Unpackable *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
@@ -476,6 +483,8 @@ namespace llaminar2
                             // Pack each of the 8 blocks (using local row index 'n' for output)
                             for (int i = 0; i < 8; ++i)
                             {
+                                if (sb_mins[i] != 0.0f)
+                                    has_mins_atomic.store(true, std::memory_order_relaxed);
                                 pack_single_block_static(out, n, k_blk + i, row_base_offset, sb_vals + i * 32, sb_scales[i], sb_mins[i], N_padded);
                             }
                             k_blk += 8;
@@ -490,10 +499,13 @@ namespace llaminar2
                         unpackable->unpack_block_to_int8(src_row, k_blk, temp_vals);
                         float scale = unpackable->get_block_scale(src_row, k_blk);
                         float min_val = unpackable->get_block_min(src_row, k_blk);
+                        if (min_val != 0.0f)
+                            has_mins_atomic.store(true, std::memory_order_relaxed);
 
                         pack_single_block_static(out, n, k_blk, row_base_offset, temp_vals, scale, min_val, N_padded);
                     }
                 }
+                out.has_mins = has_mins_atomic.load();
                 return true;
             }
 
@@ -897,7 +909,7 @@ namespace llaminar2
                                         params.B_packed = b_ptr;
                                         params.comp = comp_ptr;
                                         params.scales = scales_ptr;
-                                        params.mins = mins_ptr;
+                                        params.mins = pw.has_mins ? mins_ptr : nullptr;
                                         params.K_blocks = k_count;
                                         params.N = 64;
                                         params.ldc = N_padded;
@@ -1016,7 +1028,7 @@ namespace llaminar2
                                     params.B_packed = b_ptr;
                                     params.comp = comp_ptr;
                                     params.scales = scales_ptr;
-                                    params.mins = mins_ptr;
+                                    params.mins = pw.has_mins ? mins_ptr : nullptr;
                                     params.K_blocks = k_blocks;
                                     params.N = 64;
                                     params.ldc = N_padded;
@@ -1505,7 +1517,7 @@ namespace llaminar2
                                 params.B_packed = b_ptr;
                                 params.comp = comp_ptr;
                                 params.scales = scales_ptr;
-                                params.mins = mins_ptr;
+                                params.mins = pw.has_mins ? mins_ptr : nullptr;
                                 params.C = C + i * n + n_blk;
                                 params.K_blocks = k_blocks;
                                 params.N = 64;
@@ -1681,7 +1693,7 @@ namespace llaminar2
                                 params.B_packed = b_ptr;
                                 params.comp = comp_ptr;
                                 params.scales = scales_ptr;
-                                params.mins = mins_ptr;
+                                params.mins = pw.has_mins ? mins_ptr : nullptr;
                                 params.C = nullptr; // FP32 output not used
                                 params.K_blocks = k_blocks;
                                 params.N = 64;
@@ -2209,7 +2221,7 @@ namespace llaminar2
                                 params.B_packed = b_ptr;
                                 params.comp = comp_ptr;
                                 params.scales = scales_ptr;
-                                params.mins = mins_ptr;
+                                params.mins = pw.has_mins ? mins_ptr : nullptr;
                                 params.C = C + i * n + n_blk;
                                 params.K_blocks = k_blocks;
                                 params.N = 64;

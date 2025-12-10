@@ -163,6 +163,14 @@ namespace llaminar2
 
             /** @brief Original N dimension (number of output features). */
             int N;
+
+            /**
+             * @brief Flag indicating if mins contains non-zero values.
+             *
+             * If false, mins vector may be empty or contain zeros, and the JIT kernel
+             * can skip the asymmetric correction step for performance.
+             */
+            bool has_mins = false;
         };
 
         /**
@@ -512,7 +520,11 @@ namespace llaminar2
                 const Reg64 &reg_Scales = rcx;  ///< params->scales: scale pointer
                 const Reg64 &reg_C = r8;        ///< params->C: output pointer
                 const Reg64 &reg_K_blocks = r9; ///< params->K_blocks: number of K blocks
-                // N is stored on stack at [rsp + 0]
+                // Stack layout after prologue:
+                //   [rsp]      = N value (pushed)
+                //   [rsp + 8]  = params_ptr (pushed)
+                //   [rsp + 16..271] = 256-byte zero buffer (for null mins fallback)
+                //   [rsp + 264] = mins_stride (stored, overlaps end of zero buffer)
 
                 // Working registers (callee-saved, pushed in prologue)
                 const Reg64 &reg_tmp = rax;           ///< General temporary register
@@ -566,7 +578,19 @@ namespace llaminar2
                 push(r14);
                 push(r15);
 
+                // ==================== ZERO BUFFER ALLOCATION ====================
+                // Allocate 256 bytes (64 floats) of zeros on stack
+                // Used when mins pointer is null (symmetric quantization)
+                // This avoids conditional branches in the hot K-loop
+                sub(rsp, 256);
+                vpxord(zmm0, zmm0, zmm0);         // Zero register
+                vmovups(ptr[rsp + 0 * 64], zmm0); // Store 64 bytes of zeros
+                vmovups(ptr[rsp + 1 * 64], zmm0); // ...
+                vmovups(ptr[rsp + 2 * 64], zmm0); // ...
+                vmovups(ptr[rsp + 3 * 64], zmm0); // Total: 256 bytes
+
                 // Save params pointer to stack (we need it for bias/mask)
+                // NOTE: Stack offsets after this point are shifted by 256 bytes
                 const Reg64 &reg_params = rdi;
                 push(reg_params);
 
@@ -580,14 +604,31 @@ namespace llaminar2
                 mov(reg_K_blocks.cvt32(), ptr[reg_params + 48]); // K_blocks
 
                 // ==================== STACK FRAME SETUP ====================
+                // Stack layout (from current rsp after params push):
+                //   [rsp] = params_ptr (just pushed)
+                //   [rsp + 8..263] = 256-byte zero buffer
+                //   [rsp + 264] = mins_stride (stored via mov)
+
                 // Push N to stack for later comparison in N-loop
-                // Stack layout after push: [rsp+0]=N, [rsp+8]=params_ptr
                 mov(reg_loop_N.cvt32(), ptr[reg_params + 52]); // N
-                push(reg_loop_N);                              // Push N to stack (now at rsp)
+                push(reg_loop_N);                              // Push N to stack
+                // Now: [rsp] = N, [rsp + 8] = params_ptr, [rsp + 16..271] = zero buffer
 
                 // Calculate stride in bytes for B and scales arrays
                 mov(reg_stride.cvt32(), ptr[reg_params + 56]); // ldc
                 shl(reg_stride, 2);                            // ldc * 4 (stride in bytes)
+
+                // ==================== MINS POINTER HANDLING ====================
+                // If mins is null (symmetric quantization), use stride=0 to keep reading zeros
+                mov(rax, ptr[reg_params + 32]); // Load mins pointer
+                test(rax, rax);                 // Check if null
+                mov(rax, reg_stride);           // Preserve stride in rax
+                Label mins_stride_ok;
+                jnz(mins_stride_ok, T_NEAR); // Jump if mins is not null
+                xor_(rax, rax);              // Set mins stride to 0
+                L(mins_stride_ok);
+                // Store mins stride at [rsp + 264] (inside zero buffer area, ok since we only need 256 bytes for loads)
+                mov(ptr[rsp + 264], rax);
 
                 // Load A last (overwrites params pointer in rdi)
                 mov(reg_A, ptr[reg_params + 0]); // A
@@ -609,7 +650,7 @@ namespace llaminar2
                 L(loop_N_label);
                 {
                     // Check if we have processed all N columns
-                    cmp(reg_loop_N, ptr[rsp]); // Compare with N stored on stack
+                    cmp(reg_loop_N, ptr[rsp]); // Compare with N stored on stack (after zero buffer)
                     jge("end_kernel", T_NEAR); // Exit if loop_N >= N
 
                     // Reset A cursor to start of A for this N-block
@@ -664,10 +705,23 @@ namespace llaminar2
                     // Repurpose reg_C_cursor (r14) temporarily for mins pointer
                     mov(rax, ptr[rsp + 8]);  // Reload params
                     mov(r14, ptr[rax + 32]); // mins pointer (offset 32)
+
+                    // Null check: if mins is nullptr, use stack zero buffer
+                    test(r14, r14);
+                    Label mins_null, mins_ready;
+                    jz(mins_null, T_NEAR); // Jump if mins is null
+
+                    // Mins is valid: add offset
                     mov(reg_tmp, reg_loop_N);
                     shl(reg_tmp, 2);   // loop_N * 4
                     add(r14, reg_tmp); // r14 = &mins[loop_N]
-                    // Now r14 is reg_Mins_cursor
+                    jmp(mins_ready, T_NEAR);
+
+                    L(mins_null);
+                    lea(r14, ptr[rsp + 16]); // Point to stack zero buffer (at rsp + 16, after 2 pushes)
+
+                    L(mins_ready);
+                    // Now r14 is reg_Mins_cursor (either valid or pointing to zeros)
 
                     // B cursor calculation: (loop_N / 64) * (K_blocks * 2048)
                     mov(reg_tmp, reg_loop_N);
@@ -728,7 +782,8 @@ namespace llaminar2
                         vaddps(zmm_c3, zmm_c3, zmm24);
 
                         // Advance mins cursor to next K-block
-                        add(r14, reg_stride);
+                        // Use stored stride (0 for symmetric weights, reg_stride for asymmetric)
+                        add(r14, ptr[rsp + 264]);
 
                         // ==================== COMPENSATION FOR UNSIGNED CONVERSION ====================
                         // vpdpbusd expects unsigned A operand, but Q8_1 uses signed INT8.
@@ -1391,7 +1446,8 @@ namespace llaminar2
 
                 // ==================== EPILOGUE ====================
                 L("end_kernel");
-                add(rsp, 16); // Deallocate stack: N (8 bytes) + params ptr (8 bytes)
+                add(rsp, 16);  // Deallocate stack: N (8 bytes) + params ptr (8 bytes)
+                add(rsp, 256); // Deallocate zero buffer
 
                 // Restore callee-saved registers (reverse order of prologue)
                 pop(r15);

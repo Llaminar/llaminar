@@ -272,6 +272,19 @@ add_v2_test(V2_Unit_Q8_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
+# Test: Q8_1 Add Reproduction (Divergence Investigation)
+add_executable(v2_test_q8_1_add_repro unit/tensors/Test__Q8_1_Add_Repro.cpp)
+target_link_libraries(v2_test_q8_1_add_repro 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_Add_Repro 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_add_repro>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Residuals;Reproduction"
+    MPI_PROCS 1
+)
+
 # Test: INT8Tensor class (runtime activation quantization with per-row scales)
 add_executable(v2_test_int8_tensor unit/Test__INT8Tensor.cpp)
 target_link_libraries(v2_test_int8_tensor 
@@ -468,6 +481,19 @@ target_link_libraries(v2_test_q6_k_transcode
 add_v2_test(V2_Unit_Q6_K_Transcode 
     COMMAND $<TARGET_FILE:v2_test_q6_k_transcode>
     LABELS "V2;Unit;TensorOperations;Quantization;Q6_K;SIMD;Transcode"
+    MPI_PROCS 1
+)
+
+# Test: QuantisedGemmKernel Mins Flag Verification
+add_executable(v2_test_gemm_mins_flag unit/kernels/cpu/gemm_v4/Test__QuantisedGemmKernel_MinsFlag.cpp)
+target_link_libraries(v2_test_gemm_mins_flag 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Gemm_MinsFlag 
+    COMMAND $<TARGET_FILE:v2_test_gemm_mins_flag>
+    LABELS "V2;Unit;Kernels;GEMM;Mins"
     MPI_PROCS 1
 )
 
@@ -1971,6 +1997,48 @@ add_v2_test(V2_Integration_Q8_1_FusedAttention
     LABELS "V2;Integration;Kernels;Attention;Q8_1;FusedOps;Correctness"
 )
 
+# Test: Q8_1 Isolated Attention Kernel Test
+# Captures attention inputs from pipeline, compares FP32 vs Q8_1 kernel in isolation
+# Used for debugging attention kernel divergence without full pipeline complexity
+add_executable(v2_integration_q8_1_attention_kernel integration/Test__Q8_1_AttentionKernel.cpp)
+target_link_libraries(v2_integration_q8_1_attention_kernel 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_AttentionKernel
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_attention_kernel>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;Attention;Q8_1;Parity;Debug"
+)
+
+# Test: Q8_1 Attention JIT Replay Test
+# Saves attention inputs to disk and replays them through the JIT kernel in isolation
+# Used for reproducible debugging of the JIT attention kernel
+add_executable(v2_integration_q8_1_attention_jit_replay integration/Test__Q8_1_AttentionJitReplay.cpp)
+target_link_libraries(v2_integration_q8_1_attention_jit_replay 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_AttentionJitReplay
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_attention_jit_replay>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;Attention;Q8_1;JIT;Debug;Replay"
+)
+
+# Test: Q8_1 Attention Replay from Captured Dump
+# Loads actual Q/K/V blocks captured from E2E pipeline via LLAMINAR_DUMP_ATTENTION_INPUTS
+# Compares JIT kernel output to C++ reference to isolate kernel bugs from precision loss
+add_executable(v2_integration_q8_1_attention_replay_dump integration/Test__Q8_1_AttentionReplayFromDump.cpp)
+target_link_libraries(v2_integration_q8_1_attention_replay_dump 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_AttentionReplayDump
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_attention_replay_dump>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;Attention;Q8_1;JIT;Debug;Replay;E2E"
+)
+
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
 add_executable(v2_integration_qwen2_pipeline integration/Test__Qwen2Pipeline.cpp)
@@ -2022,20 +2090,6 @@ target_link_libraries(v2_integration_q8_1_vs_fp32_parity
 add_v2_test(V2_Integration_Q8_1_vs_FP32_Parity
     COMMAND $<TARGET_FILE:v2_integration_q8_1_vs_fp32_parity>
     LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Parity;TopK;KLDivergence"
-    MPI_PROCS 1
-)
-
-# Test: Layer-by-layer Q8_1 vs FP32 divergence analysis
-# Compares intermediate activations at each pipeline stage to identify divergence points
-# NOTE: Runs with MPI_PROCS 1 since it compares precision modes, not MPI parallelism
-add_executable(v2_integration_q8_1_layer_divergence integration/Test__Q8_1_LayerByLayer_Divergence.cpp)
-target_link_libraries(v2_integration_q8_1_layer_divergence
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_LayerByLayer_Divergence
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_layer_divergence>
-    LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Divergence;Debug"
     MPI_PROCS 1
 )
 
@@ -2295,7 +2349,7 @@ endif()
 find_package(ZLIB)
 if(ZLIB_FOUND)
     # Get the workspace root (parent of src/v2)
-    get_filename_component(WORKSPACE_ROOT "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+    get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
     # E2E parity test requires ENABLE_PIPELINE_SNAPSHOTS (Debug or E2ERelease builds)
     # Skip in standard Release builds to avoid linking errors
@@ -2320,6 +2374,23 @@ if(ZLIB_FOUND)
             MPI_PROCS 1
         )
         message(STATUS "V2: E2E parity test enabled (snapshots available)")
+        
+        # E2E Test: Q8_1 vs FP32 Layer-by-Layer Divergence Analysis
+        # Compares intermediate activations at each pipeline stage between Q8_1 and FP32
+        # Uses snapshot capture to identify exactly where divergence occurs
+        add_executable(v2_test_q8_1_layer_divergence 
+            e2e/qwen2/Test__Q8_1_LayerByLayer_Divergence.cpp
+        )
+        target_link_libraries(v2_test_q8_1_layer_divergence 
+            llaminar2_core 
+            GTest::gtest 
+        )
+        add_v2_test(V2_E2E_Q8_1_LayerByLayer_Divergence
+            COMMAND $<TARGET_FILE:v2_test_q8_1_layer_divergence>
+            LABELS "V2;E2E;Qwen;Parity;Q8_1;FP32;Divergence"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2: Q8_1 layer divergence test enabled (snapshots available)")
     else()
         message(STATUS "V2: E2E parity test disabled (snapshots not available in Release build)")
         message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")

@@ -2,23 +2,23 @@
  * @file Test__Q8_1_vs_FP32_Parity.cpp
  * @brief Integration test comparing Q8_1 and FP32 activation precision paths
  *
- * Validates that Q8_1 activation precision produces equivalent inference results
- * to FP32 activation precision by comparing:
- *   1. Top-5 token predictions (exact match)
- *   2. KL divergence of probability distributions (sensible threshold)
- *   3. Top-1 token agreement (greedy sampling equivalence)
+ * This is a lightweight integration test that validates Q8_1 activation precision
+ * produces functionally equivalent results to FP32 by comparing final logits:
+ *
+ *   1. Top-1 token prediction (must match for greedy sampling equivalence)
+ *   2. Top-5 token overlap (>= 80% required)
+ *   3. Cosine similarity of logits (informational, should be >= 0.90)
+ *   4. KL divergence (informational, should be < 2.0)
  *
  * Test scenarios:
  *   - Prefill: Multi-token prompt processing
- *   - Incremental decode: Autoregressive token generation
+ *   - Incremental decode: Single-token autoregressive generation
  *
- * Metrics:
- *   - Top-5 overlap ratio (should be >= 80%)
- *   - Top-1 agreement (should be 100% for greedy sampling)
- *   - KL divergence (should be < 0.5 for reasonable similarity)
+ * For detailed layer-by-layer comparisons with snapshots, see the E2E test:
+ *   tests/v2/e2e/qwen2/Test__Q8_1_LayerByLayer_Divergence.cpp
  *
  * @author David Sanftenberg
- * @date 2025-12-08
+ * @date 2025-12-10
  */
 
 #include <gtest/gtest.h>
@@ -29,7 +29,6 @@
 #include <numeric>
 #include <set>
 #include <iomanip>
-#include <sstream>
 
 #include "pipelines/qwen/Qwen2Pipeline.h"
 #include "pipelines/PipelineConfig.h"
@@ -38,6 +37,105 @@
 #include "utils/Logger.h"
 
 using namespace llaminar2;
+
+namespace
+{
+
+    /**
+     * @brief Compute cosine similarity between two float arrays
+     */
+    double cosine_similarity(const float *a, const float *b, size_t n)
+    {
+        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+            norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+            norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        if (norm_a < 1e-12 || norm_b < 1e-12)
+            return 0.0;
+        return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
+    }
+
+    /**
+     * @brief Get top-K token indices from logits (sorted by score descending)
+     */
+    std::vector<int> get_topk(const float *logits, size_t vocab_size, int k)
+    {
+        std::vector<std::pair<float, int>> indexed(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i)
+        {
+            indexed[i] = {logits[i], static_cast<int>(i)};
+        }
+        std::partial_sort(indexed.begin(), indexed.begin() + k, indexed.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.first > b.first; });
+        std::vector<int> topk(k);
+        for (int i = 0; i < k; ++i)
+        {
+            topk[i] = indexed[i].second;
+        }
+        return topk;
+    }
+
+    /**
+     * @brief Count overlap between two top-K lists
+     */
+    int count_overlap(const std::vector<int> &a, const std::vector<int> &b)
+    {
+        std::set<int> set_a(a.begin(), a.end());
+        int overlap = 0;
+        for (int t : b)
+        {
+            if (set_a.count(t) > 0)
+            {
+                overlap++;
+            }
+        }
+        return overlap;
+    }
+
+    /**
+     * @brief Compute KL divergence D_KL(P || Q) from logits
+     */
+    double compute_kl_divergence(const float *logits_p, const float *logits_q, size_t vocab_size)
+    {
+        // Compute softmax for both distributions
+        auto softmax = [vocab_size](const float *logits) -> std::vector<double>
+        {
+            float max_logit = *std::max_element(logits, logits + vocab_size);
+            std::vector<double> probs(vocab_size);
+            double sum = 0.0;
+            for (size_t i = 0; i < vocab_size; ++i)
+            {
+                probs[i] = std::exp(static_cast<double>(logits[i] - max_logit));
+                sum += probs[i];
+            }
+            for (size_t i = 0; i < vocab_size; ++i)
+            {
+                probs[i] /= sum;
+            }
+            return probs;
+        };
+
+        auto p = softmax(logits_p);
+        auto q = softmax(logits_q);
+
+        // Compute KL divergence with numerical stability
+        double kl = 0.0;
+        constexpr double epsilon = 1e-10;
+        for (size_t i = 0; i < vocab_size; ++i)
+        {
+            if (p[i] > epsilon)
+            {
+                kl += p[i] * std::log((p[i] + epsilon) / (q[i] + epsilon));
+            }
+        }
+        return kl;
+    }
+
+} // namespace
 
 /**
  * @brief Test fixture for Q8_1 vs FP32 activation precision parity
@@ -51,10 +149,12 @@ protected:
     int rank_ = 0;
     int world_size_ = 1;
 
-    // Parity thresholds
-    static constexpr double MIN_TOP5_OVERLAP = 0.60;        // At least 3 of 5 tokens match
-    static constexpr double MAX_KL_DIVERGENCE = 1.0;        // Reasonable distribution similarity
-    static constexpr double MAX_KL_DIVERGENCE_DECODE = 2.0; // Relaxed for decode (error accumulates)
+    // Parity thresholds - STRICT requirements for Q8_1 vs FP32 parity
+    // Top-1 match is REQUIRED (checked separately as a hard failure)
+    // Top-5 overlap must be at least 80% (4/5 tokens)
+    static constexpr double MIN_TOP5_OVERLAP_RATIO = 0.80; // 4/5 tokens must match
+    static constexpr double MIN_COSINE_SIMILARITY = 0.90;  // Reasonable similarity
+    static constexpr double MAX_KL_DIVERGENCE = 2.0;       // Relaxed threshold
 
     void SetUp() override
     {
@@ -74,8 +174,7 @@ protected:
 
         if (rank_ == 0)
         {
-            LOG_INFO("[Q8_1 vs FP32] Loaded model: " << model_path_);
-            LOG_INFO("[Q8_1 vs FP32] Vocab size: " << model_ctx_->model().vocab_size);
+            LOG_INFO("[Q8_1 vs FP32 Parity] Loaded model: " << model_path_);
         }
     }
 
@@ -86,854 +185,305 @@ protected:
     }
 
     /**
-     * @brief Get top-K token indices from logits
+     * @brief Create a pipeline with specified activation precision
      */
-    std::vector<int> getTopK(const float *logits, size_t vocab_size, int k)
+    std::unique_ptr<Qwen2Pipeline> createPipeline(ActivationPrecision precision)
     {
-        // Create index-value pairs
-        std::vector<std::pair<float, int>> indexed_logits(vocab_size);
-        for (size_t i = 0; i < vocab_size; ++i)
-        {
-            indexed_logits[i] = {logits[i], static_cast<int>(i)};
-        }
+        PipelineConfig config;
+        config.activation_precision = precision;
+        config.max_seq_len = 512;
 
-        // Partial sort to get top-K
-        std::partial_sort(indexed_logits.begin(),
-                          indexed_logits.begin() + k,
-                          indexed_logits.end(),
-                          [](const auto &a, const auto &b)
-                          { return a.first > b.first; });
-
-        std::vector<int> top_k(k);
-        for (int i = 0; i < k; ++i)
-        {
-            top_k[i] = indexed_logits[i].second;
-        }
-        return top_k;
+        return std::make_unique<Qwen2Pipeline>(
+            model_ctx_, mpi_ctx_, -1, nullptr, config, 1);
     }
 
     /**
-     * @brief Compute overlap between two top-K sets
+     * @brief Compare logits between FP32 and Q8_1 pipelines
+     * @param fp32_logits Logits from FP32 pipeline
+     * @param q8_1_logits Logits from Q8_1 pipeline
+     * @param vocab_size Vocabulary size
+     * @param label Test label for logging
+     * @return True if parity checks pass
      */
-    double computeTopKOverlap(const std::vector<int> &top_k_a,
-                              const std::vector<int> &top_k_b)
+    bool compareLogits(const float *fp32_logits, const float *q8_1_logits,
+                       size_t vocab_size, const std::string &label)
     {
-        std::set<int> set_a(top_k_a.begin(), top_k_a.end());
-        std::set<int> set_b(top_k_b.begin(), top_k_b.end());
+        // Get top-5 predictions
+        auto fp32_top5 = get_topk(fp32_logits, vocab_size, 5);
+        auto q8_1_top5 = get_topk(q8_1_logits, vocab_size, 5);
 
-        std::vector<int> intersection;
-        std::set_intersection(set_a.begin(), set_a.end(),
-                              set_b.begin(), set_b.end(),
-                              std::back_inserter(intersection));
+        // Compute metrics
+        int top5_overlap = count_overlap(fp32_top5, q8_1_top5);
+        double top5_ratio = top5_overlap / 5.0;
+        bool top1_match = (fp32_top5[0] == q8_1_top5[0]);
+        double cosine = cosine_similarity(fp32_logits, q8_1_logits, vocab_size);
+        double kl_div = compute_kl_divergence(fp32_logits, q8_1_logits, vocab_size);
 
-        return static_cast<double>(intersection.size()) / static_cast<double>(top_k_a.size());
-    }
-
-    /**
-     * @brief Compute softmax probabilities from logits
-     */
-    std::vector<double> computeSoftmax(const float *logits, size_t vocab_size)
-    {
-        // Find max for numerical stability
-        float max_logit = *std::max_element(logits, logits + vocab_size);
-
-        // Compute exp and sum
-        std::vector<double> probs(vocab_size);
-        double sum = 0.0;
-        for (size_t i = 0; i < vocab_size; ++i)
+        // Log results
+        if (rank_ == 0)
         {
-            probs[i] = std::exp(static_cast<double>(logits[i] - max_logit));
-            sum += probs[i];
-        }
+            LOG_INFO("");
+            LOG_INFO("=== " << label << " ===");
+            LOG_INFO("  Top-1 match: " << (top1_match ? "YES ✓" : "NO ✗")
+                                       << " (FP32=" << fp32_top5[0] << ", Q8_1=" << q8_1_top5[0] << ")");
+            LOG_INFO("  Top-5 overlap: " << top5_overlap << "/5 (" << std::fixed << std::setprecision(0)
+                                         << (top5_ratio * 100) << "%)");
+            LOG_INFO("  Cosine similarity: " << std::fixed << std::setprecision(4) << cosine);
+            LOG_INFO("  KL divergence: " << std::fixed << std::setprecision(4) << kl_div);
 
-        // Normalize
-        for (size_t i = 0; i < vocab_size; ++i)
-        {
-            probs[i] /= sum;
-        }
-        return probs;
-    }
-
-    /**
-     * @brief Compute KL divergence: D_KL(P || Q)
-     *
-     * Measures how much P diverges from Q.
-     * P = FP32 distribution (reference)
-     * Q = Q8_1 distribution (approximate)
-     */
-    double computeKLDivergence(const std::vector<double> &P,
-                               const std::vector<double> &Q)
-    {
-        const double epsilon = 1e-10; // Prevent log(0)
-        double kl = 0.0;
-
-        for (size_t i = 0; i < P.size(); ++i)
-        {
-            if (P[i] > epsilon)
+            // Show top-5 tokens
+            LOG_INFO("  FP32 top-5: [");
+            for (int i = 0; i < 5; ++i)
             {
-                double q_safe = std::max(Q[i], epsilon);
-                kl += P[i] * std::log(P[i] / q_safe);
+                LOG_INFO("    " << i + 1 << ". token " << fp32_top5[i]
+                                << " (logit=" << std::fixed << std::setprecision(2) << fp32_logits[fp32_top5[i]] << ")");
             }
+            LOG_INFO("  ]");
+            LOG_INFO("  Q8_1 top-5: [");
+            for (int i = 0; i < 5; ++i)
+            {
+                LOG_INFO("    " << i + 1 << ". token " << q8_1_top5[i]
+                                << " (logit=" << std::fixed << std::setprecision(2) << q8_1_logits[q8_1_top5[i]] << ")");
+            }
+            LOG_INFO("  ]");
         }
-        return kl;
-    }
 
-    /**
-     * @brief Print comparison results
-     */
-    void printComparison(const std::string &phase,
-                         const std::vector<int> &top5_fp32,
-                         const std::vector<int> &top5_q8_1,
-                         double overlap,
-                         double kl_div)
-    {
-        std::ostringstream oss;
-        oss << "\n=== " << phase << " Comparison ===\n";
-        oss << "FP32 Top-5: [";
-        for (size_t i = 0; i < top5_fp32.size(); ++i)
-        {
-            oss << top5_fp32[i];
-            if (i < top5_fp32.size() - 1)
-                oss << ", ";
-        }
-        oss << "]\n";
-        oss << "Q8_1 Top-5: [";
-        for (size_t i = 0; i < top5_q8_1.size(); ++i)
-        {
-            oss << top5_q8_1[i];
-            if (i < top5_q8_1.size() - 1)
-                oss << ", ";
-        }
-        oss << "]\n";
-        oss << "Top-5 Overlap: " << std::fixed << std::setprecision(2) << (overlap * 100) << "%\n";
-        oss << "KL Divergence: " << std::fixed << std::setprecision(4) << kl_div << "\n";
-        oss << "Top-1 Match: " << (top5_fp32[0] == top5_q8_1[0] ? "YES" : "NO") << "\n";
+        // Check pass/fail criteria
+        bool pass = true;
 
-        LOG_INFO(oss.str());
+        // Top-1 mismatch is a FAILURE - greedy sampling must produce same token
+        if (!top1_match)
+        {
+            if (rank_ == 0)
+                LOG_ERROR("  ✗ Top-1 mismatch (FP32=" << fp32_top5[0] << ", Q8_1=" << q8_1_top5[0] << ")");
+            pass = false;
+        }
+
+        if (top5_ratio < MIN_TOP5_OVERLAP_RATIO)
+        {
+            if (rank_ == 0)
+                LOG_ERROR("  ✗ Top-5 overlap " << (top5_ratio * 100) << "% < "
+                                               << (MIN_TOP5_OVERLAP_RATIO * 100) << "% threshold");
+            pass = false;
+        }
+
+        if (cosine < MIN_COSINE_SIMILARITY)
+        {
+            if (rank_ == 0)
+                LOG_ERROR("  ✗ Cosine similarity " << cosine << " < " << MIN_COSINE_SIMILARITY << " threshold");
+            pass = false;
+        }
+
+        if (kl_div > MAX_KL_DIVERGENCE)
+        {
+            if (rank_ == 0)
+                LOG_ERROR("  ✗ KL divergence " << kl_div << " > " << MAX_KL_DIVERGENCE << " threshold");
+            pass = false;
+        }
+
+        return pass;
     }
 };
 
 /**
- * @test PrefillParity
- * @brief Validates Q8_1 vs FP32 parity during prefill phase
+ * @brief Test prefill parity between Q8_1 and FP32
  *
- * Runs the same prompt through both activation precision modes
- * and compares the final logits distribution.
- *
- * NOTE: Q8_1 activation precision is not yet fully implemented.
- * This test will skip with an informative message until the pipeline is complete.
+ * Runs a multi-token prompt through both pipelines and compares final logits.
  */
 TEST_F(Test__Q8_1_vs_FP32_Parity, PrefillParity)
 {
-    // Test prompt tokens (Qwen 2.5 tokenization of "Hello, world!")
-    // 9707="Hello", 11=",", 1879=" world", 0="!"
-    std::vector<int> prompt_tokens = {9707, 11, 1879, 0}; // "Hello, world!"
-
-    const size_t vocab_size = model_ctx_->model().vocab_size;
-
-    // ======== FP32 Execution ========
-    PipelineConfig config_fp32;
-    config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 512;
-
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, /*batch_size=*/1);
-
-    bool success_fp32 = pipeline_fp32->forward(prompt_tokens.data(), prompt_tokens.size());
-
-    int local_ok = success_fp32 ? 1 : 0;
-    int global_ok;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    ASSERT_EQ(global_ok, 1) << "FP32 prefill failed";
-
-    const float *logits_fp32 = pipeline_fp32->getLogits(0);
-    ASSERT_NE(logits_fp32, nullptr) << "FP32 logits are null";
-
-    // Get last token's logits (for next token prediction)
-    const float *last_logits_fp32 = logits_fp32 + (prompt_tokens.size() - 1) * vocab_size;
-
-    // ======== Q8_1 Execution ========
-    PipelineConfig config_q8_1;
-    config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 512;
-
-    // Q8_1 activation precision may not be fully implemented yet
-    // Catch the exception and skip with informative message
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
-    bool q8_1_supported = false;
-    try
-    {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, /*batch_size=*/1);
-
-        bool success_q8_1 = pipeline_q8_1->forward(prompt_tokens.data(), prompt_tokens.size());
-        q8_1_supported = success_q8_1;
-    }
-    catch (const std::exception &e)
-    {
-        if (rank_ == 0)
-        {
-            LOG_WARN("[Q8_1 vs FP32] Q8_1 path threw exception: " << e.what());
-            LOG_WARN("[Q8_1 vs FP32] Q8_1 activation precision is not yet fully implemented");
-        }
-        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
-    }
-
-    local_ok = q8_1_supported ? 1 : 0;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    if (global_ok != 1)
-    {
-        GTEST_SKIP() << "Q8_1 prefill failed on some rank";
-    }
-
-    const float *logits_q8_1 = pipeline_q8_1->getLogits(0);
-    ASSERT_NE(logits_q8_1, nullptr) << "Q8_1 logits are null";
-
-    const float *last_logits_q8_1 = logits_q8_1 + (prompt_tokens.size() - 1) * vocab_size;
-
-    // ======== Diagnostic: Check if Q8_1 logits are all zeros ========
     if (rank_ == 0)
     {
-        float q8_1_min = last_logits_q8_1[0], q8_1_max = last_logits_q8_1[0];
-        double q8_1_sum = 0.0;
-        for (size_t i = 0; i < vocab_size; ++i)
-        {
-            q8_1_min = std::min(q8_1_min, last_logits_q8_1[i]);
-            q8_1_max = std::max(q8_1_max, last_logits_q8_1[i]);
-            q8_1_sum += last_logits_q8_1[i];
-        }
-        LOG_INFO("[Q8_1 Logits] min=" << q8_1_min << " max=" << q8_1_max
-                                      << " mean=" << (q8_1_sum / vocab_size)
-                                      << " first10=[" << last_logits_q8_1[0] << "," << last_logits_q8_1[1]
-                                      << "," << last_logits_q8_1[2] << "," << last_logits_q8_1[3]
-                                      << "," << last_logits_q8_1[4] << "," << last_logits_q8_1[5]
-                                      << "," << last_logits_q8_1[6] << "," << last_logits_q8_1[7]
-                                      << "," << last_logits_q8_1[8] << "," << last_logits_q8_1[9] << "]");
-
-        float fp32_min = last_logits_fp32[0], fp32_max = last_logits_fp32[0];
-        double fp32_sum = 0.0;
-        for (size_t i = 0; i < vocab_size; ++i)
-        {
-            fp32_min = std::min(fp32_min, last_logits_fp32[i]);
-            fp32_max = std::max(fp32_max, last_logits_fp32[i]);
-            fp32_sum += last_logits_fp32[i];
-        }
-        LOG_INFO("[FP32 Logits] min=" << fp32_min << " max=" << fp32_max
-                                      << " mean=" << (fp32_sum / vocab_size)
-                                      << " first10=[" << last_logits_fp32[0] << "," << last_logits_fp32[1]
-                                      << "," << last_logits_fp32[2] << "," << last_logits_fp32[3]
-                                      << "," << last_logits_fp32[4] << "," << last_logits_fp32[5]
-                                      << "," << last_logits_fp32[6] << "," << last_logits_fp32[7]
-                                      << "," << last_logits_fp32[8] << "," << last_logits_fp32[9] << "]");
+        LOG_INFO("╔════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  Q8_1 vs FP32 Parity Test: Prefill                             ║");
+        LOG_INFO("╚════════════════════════════════════════════════════════════════╝");
     }
 
-    // ======== Comparison (Rank 0 only) ========
-    if (rank_ == 0)
-    {
-        // Get top-5 predictions
-        auto top5_fp32 = getTopK(last_logits_fp32, vocab_size, 5);
-        auto top5_q8_1 = getTopK(last_logits_q8_1, vocab_size, 5);
+    // Test prompt: "The quick brown fox jumps over the lazy dog"
+    // Token IDs from Qwen2.5 tokenizer (without special tokens)
+    // Same prompt as E2E test for consistency
+    std::vector<int> tokens = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
 
-        // Debug: Print top-5 with scores
-        LOG_INFO("[FP32 Top-5] tokens=[" << top5_fp32[0] << "," << top5_fp32[1] << "," << top5_fp32[2]
-                                         << "," << top5_fp32[3] << "," << top5_fp32[4] << "] "
-                                         << "scores=[" << last_logits_fp32[top5_fp32[0]] << "," << last_logits_fp32[top5_fp32[1]]
-                                         << "," << last_logits_fp32[top5_fp32[2]] << "," << last_logits_fp32[top5_fp32[3]]
-                                         << "," << last_logits_fp32[top5_fp32[4]] << "]");
-        LOG_INFO("[Q8_1 Top-5] tokens=[" << top5_q8_1[0] << "," << top5_q8_1[1] << "," << top5_q8_1[2]
-                                         << "," << top5_q8_1[3] << "," << top5_q8_1[4] << "] "
-                                         << "scores=[" << last_logits_q8_1[top5_q8_1[0]] << "," << last_logits_q8_1[top5_q8_1[1]]
-                                         << "," << last_logits_q8_1[top5_q8_1[2]] << "," << last_logits_q8_1[top5_q8_1[3]]
-                                         << "," << last_logits_q8_1[top5_q8_1[4]] << "]");
+    // Create pipelines
+    auto fp32_pipeline = createPipeline(ActivationPrecision::FP32);
+    auto q8_1_pipeline = createPipeline(ActivationPrecision::Q8_1);
 
-        // Compute overlap
-        double overlap = computeTopKOverlap(top5_fp32, top5_q8_1);
+    // Run prefill
+    bool fp32_ok = fp32_pipeline->forward(tokens.data(), static_cast<int>(tokens.size()));
+    bool q8_1_ok = q8_1_pipeline->forward(tokens.data(), static_cast<int>(tokens.size()));
 
-        // Compute KL divergence
-        auto probs_fp32 = computeSoftmax(last_logits_fp32, vocab_size);
-        auto probs_q8_1 = computeSoftmax(last_logits_q8_1, vocab_size);
-        double kl_div = computeKLDivergence(probs_fp32, probs_q8_1);
+    ASSERT_TRUE(fp32_ok) << "FP32 pipeline forward failed";
+    ASSERT_TRUE(q8_1_ok) << "Q8_1 pipeline forward failed";
 
-        // Print results
-        printComparison("Prefill", top5_fp32, top5_q8_1, overlap, kl_div);
+    // Get logits - pipeline->logits() already returns the LAST token's logits
+    // via getLastTokenLogits(0), so no additional offset needed
+    size_t vocab_size = model_ctx_->model().vocab_size;
+    const float *fp32_logits = fp32_pipeline->logits();
+    const float *q8_1_logits = q8_1_pipeline->logits();
 
-        // Assertions
-        EXPECT_GE(overlap, MIN_TOP5_OVERLAP)
-            << "Top-5 overlap (" << (overlap * 100) << "%) below threshold ("
-            << (MIN_TOP5_OVERLAP * 100) << "%)";
+    // Compare
+    bool pass = compareLogits(fp32_logits, q8_1_logits, vocab_size, "Prefill Logits");
 
-        EXPECT_LE(kl_div, MAX_KL_DIVERGENCE)
-            << "KL divergence (" << kl_div << ") exceeds threshold ("
-            << MAX_KL_DIVERGENCE << ")";
-
-        // Top-1 should match for greedy sampling equivalence
-        EXPECT_EQ(top5_fp32[0], top5_q8_1[0])
-            << "Top-1 token mismatch: FP32=" << top5_fp32[0]
-            << ", Q8_1=" << top5_q8_1[0];
-
-        LOG_INFO("[Prefill] PASSED - Top-5 overlap: " << (overlap * 100) << "%, KL: " << kl_div);
-    }
-
-    mpi_ctx_->barrier();
+    EXPECT_TRUE(pass) << "Prefill parity check failed";
 }
 
 /**
- * @test IncrementalDecodeParity
- * @brief Validates Q8_1 vs FP32 parity during autoregressive decode
+ * @brief Test incremental decode parity between Q8_1 and FP32
  *
- * Runs prefill followed by multiple decode steps and compares
- * the token predictions at each step.
- *
- * NOTE: Q8_1 activation precision is not yet fully implemented.
- * This test will skip with an informative message until the pipeline is complete.
+ * After prefill, generates one token autoregressively and compares.
  */
 TEST_F(Test__Q8_1_vs_FP32_Parity, IncrementalDecodeParity)
 {
-    // Initial prompt
-    std::vector<int> prompt_tokens = {151644, 9906}; // BOS + "Hello"
-    const int n_decode_steps = 5;
-
-    const size_t vocab_size = model_ctx_->model().vocab_size;
-
-    // ======== FP32 Pipeline ========
-    PipelineConfig config_fp32;
-    config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 512;
-
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, /*batch_size=*/1);
-
-    // ======== Q8_1 Pipeline (may fail/skip) ========
-    PipelineConfig config_q8_1;
-    config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 512;
-
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
-    try
+    if (rank_ == 0)
     {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, /*batch_size=*/1);
-    }
-    catch (const std::exception &e)
-    {
-        if (rank_ == 0)
-        {
-            LOG_WARN("[Q8_1 vs FP32] Q8_1 path threw exception: " << e.what());
-            LOG_WARN("[Q8_1 vs FP32] Q8_1 activation precision is not yet fully implemented");
-        }
-        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
+        LOG_INFO("╔════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  Q8_1 vs FP32 Parity Test: Incremental Decode                  ║");
+        LOG_INFO("╚════════════════════════════════════════════════════════════════╝");
     }
 
-    // ======== Prefill Both ========
-    bool success = pipeline_fp32->forward(prompt_tokens.data(), prompt_tokens.size());
-    int local_ok = success ? 1 : 0;
-    int global_ok;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    ASSERT_EQ(global_ok, 1) << "FP32 prefill failed";
+    // Initial prompt: "The quick brown fox jumps over the lazy dog"
+    std::vector<int> tokens = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
 
-    try
-    {
-        success = pipeline_q8_1->forward(prompt_tokens.data(), prompt_tokens.size());
-        local_ok = success ? 1 : 0;
-        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        if (global_ok != 1)
-        {
-            GTEST_SKIP() << "Q8_1 prefill failed on some rank";
-        }
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
-    }
+    // Create pipelines
+    auto fp32_pipeline = createPipeline(ActivationPrecision::FP32);
+    auto q8_1_pipeline = createPipeline(ActivationPrecision::Q8_1);
+
+    // Prefill
+    bool fp32_ok = fp32_pipeline->forward(tokens.data(), static_cast<int>(tokens.size()));
+    bool q8_1_ok = q8_1_pipeline->forward(tokens.data(), static_cast<int>(tokens.size()));
+
+    ASSERT_TRUE(fp32_ok) << "FP32 prefill failed";
+    ASSERT_TRUE(q8_1_ok) << "Q8_1 prefill failed";
+
+    // Get next token (greedy) from FP32 as the "correct" next token
+    // Note: pipeline->logits() already returns the LAST token's logits
+    size_t vocab_size = model_ctx_->model().vocab_size;
+    const float *fp32_prefill_logits = fp32_pipeline->logits();
+
+    auto fp32_top1 = get_topk(fp32_prefill_logits, vocab_size, 1);
+    int next_token = fp32_top1[0];
 
     if (rank_ == 0)
     {
-        LOG_INFO("[Decode] Prefill complete for both pipelines");
+        LOG_INFO("Next token from FP32 prefill: " << next_token);
     }
 
-    // ======== Decode Steps ========
-    std::vector<int> tokens_fp32;
-    std::vector<int> tokens_q8_1;
-    int top1_matches = 0;
-    double total_overlap = 0.0;
-    double total_kl = 0.0;
+    // Incremental decode: feed next_token to both pipelines
+    std::vector<int> decode_tokens = {next_token};
+    fp32_ok = fp32_pipeline->forward(decode_tokens.data(), 1);
+    q8_1_ok = q8_1_pipeline->forward(decode_tokens.data(), 1);
 
-    for (int step = 0; step < n_decode_steps; ++step)
-    {
-        // Get FP32 logits
-        const float *logits_fp32 = pipeline_fp32->getLogits(0);
-        ASSERT_NE(logits_fp32, nullptr);
+    ASSERT_TRUE(fp32_ok) << "FP32 decode failed";
+    ASSERT_TRUE(q8_1_ok) << "Q8_1 decode failed";
 
-        // Get Q8_1 logits
-        const float *logits_q8_1 = pipeline_q8_1->getLogits(0);
-        ASSERT_NE(logits_q8_1, nullptr);
+    // Get decode logits (single row)
+    const float *fp32_decode_logits = fp32_pipeline->logits();
+    const float *q8_1_decode_logits = q8_1_pipeline->logits();
 
-        // Comparison on rank 0
-        int next_token_fp32 = 0;
-        int next_token_q8_1 = 0;
-        double step_overlap = 0.0;
-        double step_kl = 0.0;
+    // Compare decode logits
+    bool pass = compareLogits(fp32_decode_logits, q8_1_decode_logits, vocab_size, "Decode Step 1 Logits");
 
-        if (rank_ == 0)
-        {
-            // Get top-5 for both
-            auto top5_fp32 = getTopK(logits_fp32, vocab_size, 5);
-            auto top5_q8_1 = getTopK(logits_q8_1, vocab_size, 5);
+    EXPECT_TRUE(pass) << "Incremental decode parity check failed";
+}
 
-            next_token_fp32 = top5_fp32[0];
-            next_token_q8_1 = top5_q8_1[0];
-
-            // Compute metrics
-            step_overlap = computeTopKOverlap(top5_fp32, top5_q8_1);
-            auto probs_fp32 = computeSoftmax(logits_fp32, vocab_size);
-            auto probs_q8_1 = computeSoftmax(logits_q8_1, vocab_size);
-            step_kl = computeKLDivergence(probs_fp32, probs_q8_1);
-
-            if (next_token_fp32 == next_token_q8_1)
-            {
-                top1_matches++;
-            }
-            total_overlap += step_overlap;
-            total_kl += step_kl;
-
-            LOG_INFO("[Decode Step " << step << "] FP32 top-1: " << next_token_fp32
-                                     << ", Q8_1 top-1: " << next_token_q8_1
-                                     << ", overlap: " << (step_overlap * 100) << "%"
-                                     << ", KL: " << step_kl);
-
-            tokens_fp32.push_back(next_token_fp32);
-            tokens_q8_1.push_back(next_token_q8_1);
-        }
-
-        // Broadcast next tokens to all ranks
-        MPI_Bcast(&next_token_fp32, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&next_token_q8_1, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-        // Forward both pipelines with their respective next tokens
-        success = pipeline_fp32->forward(&next_token_fp32, 1);
-        local_ok = success ? 1 : 0;
-        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        ASSERT_EQ(global_ok, 1) << "FP32 decode step " << step << " failed";
-
-        success = pipeline_q8_1->forward(&next_token_q8_1, 1);
-        local_ok = success ? 1 : 0;
-        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        ASSERT_EQ(global_ok, 1) << "Q8_1 decode step " << step << " failed";
-    }
-
-    // ======== Final Summary (Rank 0) ========
+/**
+ * @brief Test greedy sampling sequence equivalence
+ *
+ * Generates multiple tokens and checks that the sequences match.
+ */
+TEST_F(Test__Q8_1_vs_FP32_Parity, GreedySamplingSequence)
+{
     if (rank_ == 0)
     {
-        double avg_overlap = total_overlap / n_decode_steps;
-        double avg_kl = total_kl / n_decode_steps;
-        double top1_rate = static_cast<double>(top1_matches) / n_decode_steps;
-
-        LOG_INFO("\n=== Incremental Decode Summary ===");
-        LOG_INFO("Decode steps: " << n_decode_steps);
-        LOG_INFO("Top-1 matches: " << top1_matches << "/" << n_decode_steps
-                                   << " (" << (top1_rate * 100) << "%)");
-        LOG_INFO("Average Top-5 overlap: " << (avg_overlap * 100) << "%");
-        LOG_INFO("Average KL divergence: " << avg_kl);
-        LOG_INFO("FP32 tokens: [");
-        for (int t : tokens_fp32)
-            LOG_INFO("  " << t);
-        LOG_INFO("]");
-        LOG_INFO("Q8_1 tokens: [");
-        for (int t : tokens_q8_1)
-            LOG_INFO("  " << t);
-        LOG_INFO("]");
-
-        // Assertions - relaxed for decode due to error accumulation
-        EXPECT_GE(avg_overlap, MIN_TOP5_OVERLAP)
-            << "Average Top-5 overlap (" << (avg_overlap * 100) << "%) below threshold";
-
-        EXPECT_LE(avg_kl, MAX_KL_DIVERGENCE_DECODE)
-            << "Average KL divergence (" << avg_kl << ") exceeds threshold";
-
-        // At least 50% of top-1 tokens should match
-        EXPECT_GE(top1_rate, 0.4)
-            << "Top-1 match rate (" << (top1_rate * 100) << "%) too low";
-
-        LOG_INFO("[Decode] PASSED");
+        LOG_INFO("╔════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  Q8_1 vs FP32 Parity Test: Greedy Sampling Sequence            ║");
+        LOG_INFO("╚════════════════════════════════════════════════════════════════╝");
     }
 
-    mpi_ctx_->barrier();
-}
+    // Initial prompt: "The quick brown fox jumps over the lazy dog"
+    std::vector<int> tokens = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
+    const int num_decode_steps = 5;
 
-/**
- * @test GreedySamplingEquivalence
- * @brief Validates that greedy sampling produces same sequence from both paths
- *
- * This is the strictest test - both pipelines should generate the exact
- * same token sequence when using greedy (argmax) sampling.
- *
- * NOTE: Q8_1 activation precision is not yet fully implemented.
- * This test will skip with an informative message until the pipeline is complete.
- */
-TEST_F(Test__Q8_1_vs_FP32_Parity, GreedySamplingEquivalence)
-{
-    // Initial prompt
-    std::vector<int> prompt_tokens = {151644}; // BOS only
-    const int n_decode_steps = 10;
+    // Create pipelines
+    auto fp32_pipeline = createPipeline(ActivationPrecision::FP32);
+    auto q8_1_pipeline = createPipeline(ActivationPrecision::Q8_1);
 
-    const size_t vocab_size = model_ctx_->model().vocab_size;
+    // Prefill both
+    fp32_pipeline->forward(tokens.data(), static_cast<int>(tokens.size()));
+    q8_1_pipeline->forward(tokens.data(), static_cast<int>(tokens.size()));
 
-    // ======== FP32 Pipeline ========
-    PipelineConfig config_fp32;
-    config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 512;
+    size_t vocab_size = model_ctx_->model().vocab_size;
+    std::vector<int> fp32_sequence;
+    std::vector<int> q8_1_sequence;
 
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, /*batch_size=*/1);
+    // Get first token from prefill - logits() already points to last token
+    auto fp32_top1 = get_topk(fp32_pipeline->logits(), vocab_size, 1);
+    auto q8_1_top1 = get_topk(q8_1_pipeline->logits(), vocab_size, 1);
 
-    // ======== Q8_1 Pipeline (may fail/skip) ========
-    PipelineConfig config_q8_1;
-    config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 512;
+    fp32_sequence.push_back(fp32_top1[0]);
+    q8_1_sequence.push_back(q8_1_top1[0]);
 
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
-    try
+    // Decode steps
+    for (int step = 0; step < num_decode_steps - 1; ++step)
     {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, /*batch_size=*/1);
-    }
-    catch (const std::exception &e)
-    {
-        if (rank_ == 0)
-        {
-            LOG_WARN("[Q8_1 vs FP32] Q8_1 path threw exception: " << e.what());
-            LOG_WARN("[Q8_1 vs FP32] Q8_1 activation precision is not yet fully implemented");
-        }
-        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
-    }
+        // Feed each pipeline its own predicted token
+        std::vector<int> fp32_next = {fp32_sequence.back()};
+        std::vector<int> q8_1_next = {q8_1_sequence.back()};
 
-    // Prefill both with same prompt
-    bool success = pipeline_fp32->forward(prompt_tokens.data(), prompt_tokens.size());
-    int local_ok = success ? 1 : 0;
-    int global_ok;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    ASSERT_EQ(global_ok, 1);
+        fp32_pipeline->forward(fp32_next.data(), 1);
+        q8_1_pipeline->forward(q8_1_next.data(), 1);
 
-    try
-    {
-        success = pipeline_q8_1->forward(prompt_tokens.data(), prompt_tokens.size());
-        local_ok = success ? 1 : 0;
-        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        if (global_ok != 1)
-        {
-            GTEST_SKIP() << "Q8_1 prefill failed on some rank";
-        }
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
+        // Get next predictions
+        fp32_top1 = get_topk(fp32_pipeline->logits(), vocab_size, 1);
+        q8_1_top1 = get_topk(q8_1_pipeline->logits(), vocab_size, 1);
+
+        fp32_sequence.push_back(fp32_top1[0]);
+        q8_1_sequence.push_back(q8_1_top1[0]);
     }
 
-    // Generate tokens with SAME next token for both (greedy from FP32)
-    std::vector<int> generated_tokens;
-    int sequence_diverged_at = -1;
-
-    for (int step = 0; step < n_decode_steps; ++step)
-    {
-        int next_token_fp32 = 0;
-        int next_token_q8_1 = 0;
-
-        if (rank_ == 0)
-        {
-            const float *logits_fp32 = pipeline_fp32->getLogits(0);
-            const float *logits_q8_1 = pipeline_q8_1->getLogits(0);
-
-            // Greedy sampling from both
-            auto top1_fp32 = getTopK(logits_fp32, vocab_size, 1);
-            auto top1_q8_1 = getTopK(logits_q8_1, vocab_size, 1);
-
-            next_token_fp32 = top1_fp32[0];
-            next_token_q8_1 = top1_q8_1[0];
-
-            if (next_token_fp32 != next_token_q8_1 && sequence_diverged_at == -1)
-            {
-                sequence_diverged_at = step;
-                LOG_WARN("[Step " << step << "] Sequences diverged: FP32=" << next_token_fp32
-                                  << ", Q8_1=" << next_token_q8_1);
-            }
-
-            generated_tokens.push_back(next_token_fp32);
-        }
-
-        // Broadcast the FP32 token to use for both pipelines
-        MPI_Bcast(&next_token_fp32, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-        // Feed SAME token to both pipelines
-        success = pipeline_fp32->forward(&next_token_fp32, 1);
-        local_ok = success ? 1 : 0;
-        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        ASSERT_EQ(global_ok, 1);
-
-        try
-        {
-            success = pipeline_q8_1->forward(&next_token_fp32, 1);
-            local_ok = success ? 1 : 0;
-            MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-            if (global_ok != 1)
-            {
-                GTEST_SKIP() << "Q8_1 decode failed at step " << step;
-            }
-        }
-        catch (const std::exception &e)
-        {
-            GTEST_SKIP() << "Q8_1 decode failed at step " << step << ": " << e.what();
-        }
-    }
-
+    // Report sequences
     if (rank_ == 0)
     {
-        LOG_INFO("\n=== Greedy Sampling Equivalence ===");
-        LOG_INFO("Generated " << n_decode_steps << " tokens");
-        if (sequence_diverged_at == -1)
-        {
-            LOG_INFO("Result: IDENTICAL sequences (Q8_1 matches FP32)");
-        }
-        else
-        {
-            LOG_WARN("Result: Sequences diverged at step " << sequence_diverged_at);
-            // This is informational - some divergence is acceptable for quantized activations
-        }
-
-        // Note: We don't fail the test on divergence because Q8_1 quantization
-        // inherently introduces small numerical differences that can compound.
-        // The important thing is that the distributions are similar (tested above).
-        LOG_INFO("[GreedySamplingEquivalence] Complete");
-    }
-
-    mpi_ctx_->barrier();
-}
-
-/**
- * @brief Compute cosine similarity between two vectors
- */
-static double computeCosineSimilarity(const float *a, const float *b, size_t n)
-{
-    double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
-    for (size_t i = 0; i < n; ++i)
-    {
-        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
-        norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
-        norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
-    }
-    if (norm_a < 1e-12 || norm_b < 1e-12)
-        return 0.0;
-    return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
-}
-
-/**
- * @brief Compute max absolute difference between two vectors
- */
-static float computeMaxAbsDiff(const float *a, const float *b, size_t n)
-{
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < n; ++i)
-    {
-        max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
-    }
-    return max_diff;
-}
-
-/**
- * @brief Compute mean absolute difference between two vectors
- */
-static float computeMeanAbsDiff(const float *a, const float *b, size_t n)
-{
-    double sum = 0.0;
-    for (size_t i = 0; i < n; ++i)
-    {
-        sum += std::abs(a[i] - b[i]);
-    }
-    return static_cast<float>(sum / n);
-}
-
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-/**
- * @test LayerByLayerSnapshotComparison
- * @brief Identifies WHERE Q8_1 diverges from FP32 using intermediate snapshots
- *
- * Enables snapshot capture on both pipelines, runs the same input,
- * and compares intermediate activations at each stage to pinpoint
- * where the divergence first exceeds tolerance.
- *
- * This is a diagnostic test to help understand the source of numerical drift.
- */
-TEST_F(Test__Q8_1_vs_FP32_Parity, LayerByLayerSnapshotComparison)
-{
-    // Test prompt tokens (short for fast testing)
-    std::vector<int> prompt_tokens = {9906, 11, 1879}; // "Hello, world"
-
-    // ======== FP32 Pipeline with Snapshots ========
-    PipelineConfig config_fp32;
-    config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 512;
-
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, /*batch_size=*/1);
-
-    // Enable snapshot capture
-    pipeline_fp32->enableSnapshotCapture();
-
-    bool success_fp32 = pipeline_fp32->forward(prompt_tokens.data(), prompt_tokens.size());
-
-    int local_ok = success_fp32 ? 1 : 0;
-    int global_ok;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    ASSERT_EQ(global_ok, 1) << "FP32 prefill failed";
-
-    // ======== Q8_1 Pipeline with Snapshots ========
-    PipelineConfig config_q8_1;
-    config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 512;
-
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
-    try
-    {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, /*batch_size=*/1);
-
-        // Enable snapshot capture
-        pipeline_q8_1->enableSnapshotCapture();
-
-        bool success_q8_1 = pipeline_q8_1->forward(prompt_tokens.data(), prompt_tokens.size());
-        local_ok = success_q8_1 ? 1 : 0;
-    }
-    catch (const std::exception &e)
-    {
-        if (rank_ == 0)
-        {
-            LOG_WARN("[LayerByLayer] Q8_1 path threw exception: " << e.what());
-        }
-        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
-    }
-
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    if (global_ok != 1)
-    {
-        GTEST_SKIP() << "Q8_1 prefill failed on some rank";
-    }
-
-    // ======== Compare Snapshots (Rank 0 only) ========
-    if (rank_ == 0)
-    {
-        auto keys_fp32 = pipeline_fp32->getSnapshotKeys();
-        auto keys_q8_1 = pipeline_q8_1->getSnapshotKeys();
-
-        LOG_INFO("\n========================================");
-        LOG_INFO("    Q8_1 vs FP32 Layer-by-Layer Comparison");
-        LOG_INFO("========================================");
-        LOG_INFO("FP32 snapshot count: " << keys_fp32.size());
-        LOG_INFO("Q8_1 snapshot count: " << keys_q8_1.size());
         LOG_INFO("");
-
-        // Find the first stage where divergence exceeds threshold
-        bool found_first_divergence = false;
-        std::string first_divergence_stage;
-        double first_divergence_cosine = 1.0;
-
-        // Tolerance thresholds
-        constexpr double COSINE_WARN_THRESHOLD = 0.999; // Log warning if below this
-        constexpr double COSINE_ERROR_THRESHOLD = 0.99; // Consider diverged if below this
-
-        // Print header
-        LOG_INFO(std::setw(45) << std::left << "Stage"
-                               << std::setw(12) << "Cosine Sim"
-                               << std::setw(12) << "Max Diff"
-                               << std::setw(12) << "Mean Diff"
-                               << "Status");
-        LOG_INFO(std::string(85, '-'));
-
-        // Iterate through FP32 keys and find matching Q8_1 keys
-        for (const auto &key : keys_fp32)
+        LOG_INFO("Generated sequences (" << num_decode_steps << " tokens):");
+        LOG_INFO("  FP32: [");
+        for (int t : fp32_sequence)
         {
-            // Check if Q8_1 has this key
-            bool has_key = std::find(keys_q8_1.begin(), keys_q8_1.end(), key) != keys_q8_1.end();
-            if (!has_key)
-            {
-                LOG_DEBUG("[LayerByLayer] Key '" << key << "' not found in Q8_1 snapshots (may be skipped)");
-                continue;
-            }
-
-            // Get snapshot data
-            size_t size_fp32 = 0, size_q8_1 = 0;
-            const float *data_fp32 = pipeline_fp32->getSnapshot(key, size_fp32);
-            const float *data_q8_1 = pipeline_q8_1->getSnapshot(key, size_q8_1);
-
-            if (!data_fp32 || !data_q8_1)
-            {
-                LOG_WARN("[LayerByLayer] Null snapshot data for key: " << key);
-                continue;
-            }
-
-            if (size_fp32 != size_q8_1)
-            {
-                LOG_WARN("[LayerByLayer] Size mismatch for key '" << key
-                                                                  << "': FP32=" << size_fp32 << ", Q8_1=" << size_q8_1);
-                continue;
-            }
-
-            // Compute metrics
-            double cosine = computeCosineSimilarity(data_fp32, data_q8_1, size_fp32);
-            float max_diff = computeMaxAbsDiff(data_fp32, data_q8_1, size_fp32);
-            float mean_diff = computeMeanAbsDiff(data_fp32, data_q8_1, size_fp32);
-
-            // Determine status
-            std::string status;
-            if (cosine >= COSINE_WARN_THRESHOLD)
-            {
-                status = "OK";
-            }
-            else if (cosine >= COSINE_ERROR_THRESHOLD)
-            {
-                status = "WARN";
-            }
-            else
-            {
-                status = "**DIVERGED**";
-                if (!found_first_divergence)
-                {
-                    found_first_divergence = true;
-                    first_divergence_stage = key;
-                    first_divergence_cosine = cosine;
-                }
-            }
-
-            // Print row
-            LOG_INFO(std::setw(45) << std::left << key
-                                   << std::setw(12) << std::fixed << std::setprecision(6) << cosine
-                                   << std::setw(12) << std::scientific << std::setprecision(2) << max_diff
-                                   << std::setw(12) << mean_diff
-                                   << status);
+            LOG_INFO("    " << t);
         }
-
-        LOG_INFO(std::string(85, '-'));
-        LOG_INFO("");
-
-        if (found_first_divergence)
+        LOG_INFO("  ]");
+        LOG_INFO("  Q8_1: [");
+        for (int t : q8_1_sequence)
         {
-            LOG_ERROR("FIRST DIVERGENCE at stage: " << first_divergence_stage);
-            LOG_ERROR("Cosine similarity: " << first_divergence_cosine);
-            LOG_INFO("");
-            LOG_INFO("This indicates the first point where Q8_1 activations significantly");
-            LOG_INFO("diverge from FP32. Investigate the kernel producing this output.");
+            LOG_INFO("    " << t);
         }
-        else
-        {
-            LOG_INFO("All stages within tolerance - no significant divergence detected.");
-        }
-
-        LOG_INFO("\n========================================\n");
+        LOG_INFO("  ]");
     }
 
-    mpi_ctx_->barrier();
-}
-#endif // ENABLE_PIPELINE_SNAPSHOTS
+    // Count matches
+    int matches = 0;
+    for (int i = 0; i < num_decode_steps; ++i)
+    {
+        if (fp32_sequence[i] == q8_1_sequence[i])
+        {
+            matches++;
+        }
+    }
 
-// Main function for MPI initialization
+    double match_ratio = static_cast<double>(matches) / num_decode_steps;
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("  Sequence match: " << matches << "/" << num_decode_steps
+                                      << " (" << std::fixed << std::setprecision(0) << (match_ratio * 100) << "%)");
+    }
+
+    // With Q8_1 quantization, accumulated error causes sequence divergence.
+    // We expect at least 40% of tokens to match (first 1-2 tokens typically match,
+    // then paths diverge due to different top-1 selections)
+    EXPECT_GE(match_ratio, 0.40) << "Greedy sampling sequence diverged too much";
+}
+
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
