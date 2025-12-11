@@ -1112,6 +1112,79 @@ TEST(Qwen2Parity, PrefillParity) {
 
 ---
 
+## Tensor Dump Feature (Implemented)
+
+**Status**: Implemented (December 2025)
+
+The tensor dump feature allows saving raw tensor data to disk for debugging, integrated with the snapshot framework but available in any build (including Release).
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable tensor dump to disk | `0` (disabled) |
+| `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory | `/tmp/llaminar_tensor_dumps` |
+| `LLAMINAR_SNAPSHOT_DUMP_LAYERS` | Layers to dump (comma-separated, or `all`) | `all` |
+| `LLAMINAR_SNAPSHOT_DUMP_STAGES` | Stages to dump (comma-separated, or `all`) | `all` |
+| `LLAMINAR_SNAPSHOT_DUMP_RANK` | MPI rank to dump (-1 for all) | `0` |
+
+### Output Files
+
+For each captured stage, three files are written:
+- `<key>_rank<N>_fp32.bin` - FP32 dequantized data (raw float32 binary)
+- `<key>_rank<N>_q8_1_blocks.bin` - Raw Q8_1 blocks (for Q8_1 tensors only)
+- `<key>_rank<N>_metadata.txt` - Shape, type, and sample scale information
+
+### Stage Names
+
+**Global stages** (layer_idx = -1):
+- `EMBEDDING` - Token embedding lookup
+- `FINAL_NORM` - Final RMSNorm before LM head
+- `LM_HEAD` - Final vocabulary projection (logits)
+
+**Per-layer stages** (layer_idx = 0, 1, 2, ...):
+- `ATTENTION_NORM` - Pre-attention RMSNorm
+- `Q_PROJECTION`, `K_PROJECTION`, `V_PROJECTION` - QKV projections
+- `Q_ROPE`, `K_ROPE` - After RoPE application
+- `ATTENTION_CONTEXT` - Attention output (before output projection)
+- `ATTENTION_OUTPUT` - After attention output projection
+- `ATTENTION_RESIDUAL` - After attention residual connection
+- `FFN_NORM` - Pre-FFN RMSNorm
+- `FFN_GATE`, `FFN_UP` - FFN gate and up projections
+- `FFN_SWIGLU` - After SwiGLU activation
+- `FFN_DOWN` - FFN down projection
+- `FFN_INPUT_RESIDUAL` - Saved residual before FFN processing
+- `FFN_RESIDUAL` - After FFN residual connection
+
+### Usage Example
+
+```bash
+# Dump only layer 21 FFN stages for debugging Q8_1 divergence
+LLAMINAR_SNAPSHOT_TENSOR_DUMP=1 \
+LLAMINAR_SNAPSHOT_DUMP_LAYERS=21 \
+LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_INPUT_RESIDUAL,FFN_DOWN,FFN_RESIDUAL \
+LLAMINAR_SNAPSHOT_DUMP_DIR=/tmp/layer21_debug \
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q8_0.gguf -p "test prompt"
+
+# View metadata
+cat /tmp/layer21_debug/layer21_FFN_RESIDUAL_rank0_metadata.txt
+
+# Load FP32 data in Python
+import numpy as np
+data = np.fromfile('/tmp/layer21_debug/layer21_FFN_RESIDUAL_rank0_fp32.bin', dtype=np.float32)
+rows, cols = 9, 896  # From metadata
+data = data.reshape(rows, cols)
+```
+
+### Implementation Details
+
+- **Source**: `src/v2/utils/DebugEnv.h` (SnapshotConfig struct), `src/v2/pipelines/PipelineBase.cpp` (maybeDumpTensor method)
+- **Integration**: Automatically called by CAPTURE_SNAPSHOT* macros
+- **Thread Safety**: Uses debugEnv() singleton (parsed once at startup)
+- **Zero Overhead**: Quick exits if dump not enabled (no getenv calls on hot path)
+
+---
+
 ## References
 
 - V1 Parity Framework: `docs/parity-test-framework.instructions.md`
@@ -1129,5 +1202,6 @@ This design provides a robust, zero-overhead snapshot framework for V2 parity te
 - **Supports batch processing** natively
 - **Reuses V1's proven comparison infrastructure** (variance thresholds)
 - **Compiles to zero overhead** in release builds
+- **Provides tensor dump capability** for detailed debugging in any build
 
 Next steps: Implement Phase 1 (core infrastructure) and validate with Qwen2 parity test.

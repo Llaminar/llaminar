@@ -967,6 +967,9 @@ namespace llaminar2
         // Save residual for later
         TRY_OP(save_residual(input_hidden, buffers.residual.get(), effective_seq_len, d_model_));
 
+        // Capture FFN input residual (before FFN processing)
+        capture_snapshot(layer_prefix + "_FFN_INPUT_RESIDUAL", buffers.residual.get(), effective_seq_len, d_model_);
+
         // 1. Pre-FFN RMSNorm
         TRY_OP(rms_norm(
             buffers.residual.get(), layer.ffn_norm.get(), buffers.normalized.get(),
@@ -1056,7 +1059,6 @@ namespace llaminar2
         }
 
         // 5. Residual connection
-        // DEBUG: Inspect Layer 21 FFN Residual inputs
         TRY_OP(add_residual(
             buffers.residual.get(), buffers.ffn_output.get(), current_hidden_.get(),
             batch_size_, padded_seq_len_, d_model_,

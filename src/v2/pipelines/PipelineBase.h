@@ -144,20 +144,24 @@
  * Only active when ENABLE_PIPELINE_SNAPSHOTS is defined (E2E/Debug builds).
  * Compiles to no-op in Release builds for zero overhead.
  *
+ * Also triggers tensor dump to disk if LLAMINAR_SNAPSHOT_TENSOR_DUMP is enabled.
+ *
  * Usage: CAPTURE_SNAPSHOT("layer5_ATTENTION_CONTEXT", buffers.attn_output.get())
  *
  * @param key Human-readable snapshot identifier
  * @param tensor_ptr Pointer to TensorBase with fp32_data() and shape() methods
  */
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-#define CAPTURE_SNAPSHOT(key, tensor_ptr)                          \
-    do                                                             \
-    {                                                              \
-        const auto &_shape = (tensor_ptr)->shape();                \
-        size_t _numel = 1;                                         \
-        for (auto _dim : _shape)                                   \
-            _numel *= _dim;                                        \
-        captureSnapshot((key), (tensor_ptr)->fp32_data(), _numel); \
+#define CAPTURE_SNAPSHOT(key, tensor_ptr)                                                         \
+    do                                                                                            \
+    {                                                                                             \
+        const auto &_shape = (tensor_ptr)->shape();                                               \
+        size_t _numel = 1;                                                                        \
+        for (auto _dim : _shape)                                                                  \
+            _numel *= _dim;                                                                       \
+        captureSnapshot((key), (tensor_ptr)->fp32_data(), _numel);                                \
+        maybeDumpTensor((key), (tensor_ptr), static_cast<int>(_shape.size() > 0 ? _shape[0] : 1), \
+                        static_cast<int>(_shape.size() > 1 ? _shape[1] : _numel));                \
     } while (0)
 
 /**
@@ -166,6 +170,8 @@
  * Creates a view of the specified dimensions before capturing, useful when
  * activation buffers are pre-allocated larger than the current sequence length.
  * Only active when ENABLE_PIPELINE_SNAPSHOTS is defined (E2E/Debug builds).
+ *
+ * Also triggers tensor dump to disk if LLAMINAR_SNAPSHOT_TENSOR_DUMP is enabled.
  *
  * Usage: CAPTURE_SNAPSHOT_VIEW("layer0_Q_PROJECTION", buffers.Q, seq_len, n_heads * head_dim)
  *
@@ -186,15 +192,22 @@
                 _numel *= _dim;                                                                         \
             captureSnapshot((key), _view->fp32_data(), _numel);                                         \
         }                                                                                               \
+        maybeDumpTensor((key), (tensor_ptr), (rows), (cols));                                           \
     } while (0)
 #else
-#define CAPTURE_SNAPSHOT(key, tensor_ptr) \
-    do                                    \
-    {                                     \
+// Without ENABLE_PIPELINE_SNAPSHOTS, we still support tensor dumps for production debugging
+#define CAPTURE_SNAPSHOT(key, tensor_ptr)                                     \
+    do                                                                        \
+    {                                                                         \
+        const auto &_shape = (tensor_ptr)->shape();                           \
+        maybeDumpTensor((key), (tensor_ptr),                                  \
+                        static_cast<int>(_shape.size() > 0 ? _shape[0] : 1),  \
+                        static_cast<int>(_shape.size() > 1 ? _shape[1] : 1)); \
     } while (0)
-#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols) \
-    do                                                     \
-    {                                                      \
+#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols)    \
+    do                                                        \
+    {                                                         \
+        maybeDumpTensor((key), (tensor_ptr), (rows), (cols)); \
     } while (0)
 #endif
 
@@ -344,7 +357,48 @@ namespace llaminar2
          * @return Vector of snapshot identifiers
          */
         std::vector<std::string> getSnapshotKeys() const;
+
+        /**
+         * @brief Dump tensor data to disk for debugging
+         *
+         * Writes tensor data to files in the configured dump directory.
+         * Supports both FP32 (dequantized) and native Q8_1 block formats.
+         * Controlled by LLAMINAR_SNAPSHOT_TENSOR_DUMP and related env vars.
+         *
+         * Output files created:
+         *   - <key>_fp32.bin: FP32 dequantized data
+         *   - <key>_q8_1_blocks.bin: Raw Q8_1 blocks (if tensor is Q8_1)
+         *   - <key>_metadata.txt: Shape, type, and scale information
+         *
+         * @param key Snapshot key (e.g., "layer21_FFN_RESIDUAL")
+         * @param tensor Tensor to dump
+         * @param rows Effective rows (sequence length)
+         * @param cols Effective columns (hidden dimension)
+         */
+        void dumpTensorToDisk(const std::string &key, TensorBase *tensor, int rows, int cols);
 #endif // ENABLE_PIPELINE_SNAPSHOTS
+
+        // ===== Tensor Dump API (always available, controlled by debugEnv) =====
+        // Unlike snapshots which require ENABLE_PIPELINE_SNAPSHOTS, tensor dumps
+        // can be triggered in any build via environment variables.
+        // This allows debugging production builds without recompilation.
+
+        /**
+         * @brief Check if tensor dump should occur for this key and dump if so
+         *
+         * Uses debugEnv().snapshot configuration to determine if this tensor
+         * should be dumped. If tensor dump is enabled and the key matches
+         * the configured layers/stages, dumps the tensor to disk.
+         *
+         * This is the primary entry point for the tensor dump feature.
+         * Called automatically by capture_snapshot() when appropriate.
+         *
+         * @param key Snapshot key (e.g., "layer21_FFN_RESIDUAL")
+         * @param tensor Tensor to potentially dump
+         * @param rows Effective rows (sequence length)
+         * @param cols Effective columns (hidden dimension)
+         */
+        void maybeDumpTensor(const std::string &key, TensorBase *tensor, int rows, int cols);
 
         /**
          * @brief Get model architecture name

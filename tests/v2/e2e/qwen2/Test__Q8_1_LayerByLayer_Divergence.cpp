@@ -106,6 +106,7 @@ protected:
     std::shared_ptr<MPIContext> mpi_ctx_;
     int rank_ = 0;
     int world_size_ = 1;
+    std::string model_path_;
 
     void SetUp() override
     {
@@ -113,10 +114,14 @@ protected:
         MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
         mpi_ctx_ = std::make_shared<MPIContext>(rank_, world_size_, MPI_COMM_WORLD);
 
-        model_ctx_ = ModelContext::create("models/qwen2.5-0.5b-instruct-q4_0.gguf", mpi_ctx_);
+        // Allow model path override via environment variable
+        const char *env_model = std::getenv("LLAMINAR_TEST_MODEL");
+        model_path_ = env_model ? env_model : "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+        model_ctx_ = ModelContext::create(model_path_, mpi_ctx_);
         if (!model_ctx_)
         {
-            GTEST_SKIP() << "Model not found";
+            GTEST_SKIP() << "Model not found: " << model_path_;
         }
     }
 
@@ -296,7 +301,7 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
 
     LOG_INFO("╔════════════════════════════════════════════════════════════════════════════╗");
     LOG_INFO("║          Q8_1 vs FP32 LAYER-BY-LAYER SNAPSHOT COMPARISON                   ║");
-    LOG_INFO("║  Tokens: 9, Model: qwen2.5-0.5b-instruct-q4_0                              ║");
+    LOG_INFO("║  Tokens: " << seq_len << ", Model: " << model_path_);
     LOG_INFO("╚════════════════════════════════════════════════════════════════════════════╝");
     LOG_INFO("");
 
@@ -382,18 +387,20 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
                     stage_order = 7;
                 else if (stage_type == "ATTENTION_RESIDUAL")
                     stage_order = 8;
-                else if (stage_type == "FFN_NORM")
+                else if (stage_type == "FFN_INPUT_RESIDUAL")
                     stage_order = 9;
-                else if (stage_type == "FFN_GATE")
+                else if (stage_type == "FFN_NORM")
                     stage_order = 10;
-                else if (stage_type == "FFN_UP")
+                else if (stage_type == "FFN_GATE")
                     stage_order = 11;
-                else if (stage_type == "FFN_SWIGLU")
+                else if (stage_type == "FFN_UP")
                     stage_order = 12;
-                else if (stage_type == "FFN_DOWN")
+                else if (stage_type == "FFN_SWIGLU")
                     stage_order = 13;
-                else if (stage_type == "FFN_RESIDUAL")
+                else if (stage_type == "FFN_DOWN")
                     stage_order = 14;
+                else if (stage_type == "FFN_RESIDUAL")
+                    stage_order = 15;
 
                 return {layer_num + 1, stage_order}; // +1 so layers come after EMBEDDING
             }
@@ -499,7 +506,7 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
     LOG_INFO("");
     LOG_INFO("╔══════════════════════════════════════════════════════════════════════════════════════════╗");
     LOG_INFO("║                    Q8_1 vs FP32 STAGE-BY-STAGE DIVERGENCE REPORT                         ║");
-    LOG_INFO("║                    Model: qwen2.5-0.5b-instruct-q4_0 (9 tokens)                          ║");
+    LOG_INFO("║  Model: " << model_path_ << " (" << seq_len << " tokens)");
     LOG_INFO("╠══════════════════════════════════════════════════════════════════════════════════════════╣");
     LOG_INFO("║  #  │ Stage                                    │ Cosine   │ Rel L2   │ Status           ║");
     LOG_INFO("╠═════╪══════════════════════════════════════════╪══════════╪══════════╪══════════════════╣");
@@ -638,7 +645,7 @@ TEST_F(Test__Q8_1_LayerByLayer, SingleLayerDetailed)
 
     LOG_INFO("========================================");
     LOG_INFO("Q8_1 vs FP32 Layer-by-Layer Comparison");
-    LOG_INFO("Tokens: " << seq_len << ", Model: qwen2.5-0.5b-instruct-q4_0");
+    LOG_INFO("Tokens: " << seq_len << ", Model: " << model_path_);
     LOG_INFO("========================================");
 
     // ===== FP32 Pipeline =====

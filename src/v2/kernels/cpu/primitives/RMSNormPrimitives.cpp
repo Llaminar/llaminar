@@ -2546,7 +2546,7 @@ namespace llaminar2::primitives
             {
                 Q8_1Block &out = output[b];
                 float d_in = fp16_to_fp32_q8(in0.d);
-                float d_out_val = d_in * m0 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                float d_out_val = d_in * m0 * inv_rms_float * (1.0f / (127.0f * 2048.0f));
                 out.d = fp32_to_fp16_q8(d_out_val);
 
                 __m512 v_s0 = _mm512_set1_ps(s0);
@@ -2571,7 +2571,7 @@ namespace llaminar2::primitives
             {
                 Q8_1Block &out = output[b + 1];
                 float d_in = fp16_to_fp32_q8(in1.d);
-                float d_out_val = d_in * m1 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                float d_out_val = d_in * m1 * inv_rms_float * (1.0f / (127.0f * 2048.0f));
                 out.d = fp32_to_fp16_q8(d_out_val);
 
                 __m512 v_s1 = _mm512_set1_ps(s1);
@@ -2596,7 +2596,7 @@ namespace llaminar2::primitives
             {
                 Q8_1Block &out = output[b + 2];
                 float d_in = fp16_to_fp32_q8(in2.d);
-                float d_out_val = d_in * m2 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                float d_out_val = d_in * m2 * inv_rms_float * (1.0f / (127.0f * 2048.0f));
                 out.d = fp32_to_fp16_q8(d_out_val);
 
                 __m512 v_s2 = _mm512_set1_ps(s2);
@@ -2621,7 +2621,7 @@ namespace llaminar2::primitives
             {
                 Q8_1Block &out = output[b + 3];
                 float d_in = fp16_to_fp32_q8(in3.d);
-                float d_out_val = d_in * m3 * inv_rms_float * (1.0f / (127.0f * 4096.0f));
+                float d_out_val = d_in * m3 * inv_rms_float * (1.0f / (127.0f * 2048.0f));
                 out.d = fp32_to_fp16_q8(d_out_val);
 
                 __m512 v_s3 = _mm512_set1_ps(s3);
@@ -2667,7 +2667,7 @@ namespace llaminar2::primitives
             int32_t max_int = _mm512_reduce_max_epi32(max_int_v);
             float max_prod = static_cast<float>(max_int);
 
-            float d_out_val = (max_prod > 1e-9f) ? (d_in * max_prod * inv_rms_float / (127.0f * 4096.0f)) : 0.0f;
+            float d_out_val = (max_prod > 1e-9f) ? (d_in * max_prod * inv_rms_float / (127.0f * 2048.0f)) : 0.0f;
             out.d = fp32_to_fp16_q8(d_out_val);
 
             float combined_scale_val = (max_prod > 1e-9f) ? (127.0f / max_prod) : 0.0f;
@@ -2717,7 +2717,7 @@ namespace llaminar2::primitives
             }
             else
             {
-                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 32768.0f);
                 scale_factor = 127.0f / static_cast<float>(max_abs);
             }
 
@@ -2737,7 +2737,7 @@ namespace llaminar2::primitives
 
     void rmsnorm_q8_1_pure_integer_row(
         const Q8_1Block *input,
-        const int16_t *gamma_q12, // Pre-quantized gamma in Q12 format (clamp(gamma, -8, 8) * 4095)
+        const int16_t *gamma_q12, // Pre-quantized gamma in Q11 format (clamp(gamma, -16, 16) * 2047)
         Q8_1Block *output,
         std::size_t blocks_per_row,
         int32_t epsilon_scaled) // Epsilon pre-scaled appropriately
@@ -2875,12 +2875,12 @@ namespace llaminar2::primitives
                 }
                 else
                 {
-                    d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+                    d_out = d_in * static_cast<float>(max_abs) / (127.0f * 32768.0f);
                 }
             }
             else
             {
-                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 32768.0f);
             }
 
             // Rescale y values: y_rescaled = y * 127 / max_abs
@@ -2949,7 +2949,7 @@ namespace llaminar2::primitives
             }
             else
             {
-                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 65536.0f);
+                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 32768.0f);
                 scale_factor = 127.0f / static_cast<float>(max_abs);
             }
 
@@ -3025,12 +3025,16 @@ namespace llaminar2::primitives
             }
             gamma_q12 = gamma_q12_cache.data();
 
+            // NOTE: Using Q11 format with [-16, 16] range to support larger gamma values
+            // found in Qwen2.5 models (some gamma weights exceed 13.0).
+            // Previous Q12 format with [-8, 8] range caused ~38% error on these elements.
+            // Scale factor: 2047 (11 fractional bits) instead of 4095 (12 fractional bits)
 #ifdef __AVX512F__
             {
                 size_t i = 0;
-                const __m512 scale = _mm512_set1_ps(4095.0f);
-                const __m512 clamp_lo = _mm512_set1_ps(-8.0f);
-                const __m512 clamp_hi = _mm512_set1_ps(8.0f);
+                const __m512 scale = _mm512_set1_ps(2047.0f); // Q11 scale for [-16, 16] range
+                const __m512 clamp_lo = _mm512_set1_ps(-16.0f);
+                const __m512 clamp_hi = _mm512_set1_ps(16.0f);
                 const __m512 int16_lo = _mm512_set1_ps(-32767.0f);
                 const __m512 int16_hi = _mm512_set1_ps(32767.0f);
 
@@ -3057,8 +3061,8 @@ namespace llaminar2::primitives
                 }
                 for (; i < cols; ++i)
                 {
-                    float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
-                    float scaled = clamped * 4095.0f;
+                    float clamped = std::max(-16.0f, std::min(16.0f, gamma[i]));
+                    float scaled = clamped * 2047.0f;
                     scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
                     gamma_q12[i] = static_cast<int16_t>(scaled);
                 }
@@ -3066,8 +3070,8 @@ namespace llaminar2::primitives
 #else
             for (size_t i = 0; i < cols; ++i)
             {
-                float clamped = std::max(-8.0f, std::min(8.0f, gamma[i]));
-                float scaled = clamped * 4095.0f;
+                float clamped = std::max(-16.0f, std::min(16.0f, gamma[i]));
+                float scaled = clamped * 2047.0f;
                 scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
                 gamma_q12[i] = static_cast<int16_t>(scaled);
             }

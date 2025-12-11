@@ -2,14 +2,18 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
+#include <set>
+#include <sstream>
+#include <algorithm>
 
 /**
  * @file DebugEnv.h
  * @brief Runtime configuration via environment variables for v2 architecture
  * @author David Sanftenberg
  *
- * Minimal stub for IQ4_NL migration. Full implementation pending.
- * For now, provides tile size configuration and basic feature flags.
+ * Centralized configuration for debug/instrumentation features.
+ * All environment variables are parsed once at startup to avoid hot-path overhead.
  */
 
 namespace llaminar2
@@ -360,6 +364,218 @@ namespace llaminar2
     };
 
     /**
+     * @brief Snapshot and tensor dump configuration group
+     *
+     * Controls the snapshot framework for E2E parity testing and debugging.
+     * When tensor_dump is enabled, raw tensor data (both FP32 dequantized and
+     * native Q8_1 blocks) are saved to disk for detailed analysis.
+     *
+     * Environment Variables:
+     *   LLAMINAR_SNAPSHOT_TENSOR_DUMP      - Enable tensor dump to disk (default: 0)
+     *   LLAMINAR_SNAPSHOT_DUMP_DIR         - Output directory (default: "/tmp/llaminar_tensor_dumps")
+     *   LLAMINAR_SNAPSHOT_DUMP_LAYERS      - Comma-separated layer indices to dump (default: "all")
+     *                                        Examples: "21", "0,5,21", "all"
+     *   LLAMINAR_SNAPSHOT_DUMP_STAGES      - Comma-separated stage names to dump (default: "all")
+     *                                        Examples: "FFN_RESIDUAL", "FFN_DOWN,FFN_RESIDUAL", "all"
+     *   LLAMINAR_SNAPSHOT_DUMP_RANK        - Only dump from this MPI rank (-1=all, default: 0)
+     *
+     * Stage Names (for LLAMINAR_SNAPSHOT_DUMP_STAGES):
+     *   EMBEDDING, FINAL_NORM, LM_HEAD
+     *   Per-layer: ATTENTION_NORM, Q_PROJECTION, K_PROJECTION, V_PROJECTION,
+     *              Q_ROPE, K_ROPE, ATTENTION_CONTEXT, ATTENTION_OUTPUT,
+     *              ATTENTION_RESIDUAL, FFN_NORM, FFN_GATE, FFN_UP,
+     *              FFN_SWIGLU, FFN_DOWN, FFN_INPUT_RESIDUAL, FFN_RESIDUAL
+     *
+     * Example Usage:
+     *   # Dump layer 21 FFN stages for debugging residual add issues
+     *   LLAMINAR_SNAPSHOT_TENSOR_DUMP=1 \
+     *   LLAMINAR_SNAPSHOT_DUMP_LAYERS=21 \
+     *   LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_INPUT_RESIDUAL,FFN_DOWN,FFN_RESIDUAL \
+     *   ./run_llaminar.sh -m model.gguf -p "test"
+     */
+    struct SnapshotConfig
+    {
+        bool tensor_dump_enabled = false;                    ///< Enable raw tensor dump to disk
+        std::string dump_dir = "/tmp/llaminar_tensor_dumps"; ///< Output directory for dumps
+        std::set<int> dump_layers;                           ///< Layer indices to dump (empty=all)
+        std::set<std::string> dump_stages;                   ///< Stage names to dump (empty=all)
+        int dump_rank = 0;                                   ///< MPI rank to dump (-1=all)
+        bool dump_all_layers = true;                         ///< Whether to dump all layers
+        bool dump_all_stages = true;                         ///< Whether to dump all stages
+
+        SnapshotConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *enabled_env = std::getenv("LLAMINAR_SNAPSHOT_TENSOR_DUMP");
+            if (enabled_env)
+            {
+                tensor_dump_enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            const char *dir_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_DIR");
+            if (dir_env)
+            {
+                dump_dir = dir_env;
+            }
+
+            const char *layers_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_LAYERS");
+            if (layers_env)
+            {
+                std::string layers_str(layers_env);
+                if (layers_str == "all")
+                {
+                    dump_all_layers = true;
+                    dump_layers.clear();
+                }
+                else
+                {
+                    dump_all_layers = false;
+                    dump_layers.clear();
+                    std::istringstream iss(layers_str);
+                    std::string token;
+                    while (std::getline(iss, token, ','))
+                    {
+                        // Trim whitespace
+                        token.erase(0, token.find_first_not_of(" \t"));
+                        token.erase(token.find_last_not_of(" \t") + 1);
+                        if (!token.empty())
+                        {
+                            dump_layers.insert(std::atoi(token.c_str()));
+                        }
+                    }
+                }
+            }
+
+            const char *stages_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_STAGES");
+            if (stages_env)
+            {
+                std::string stages_str(stages_env);
+                if (stages_str == "all")
+                {
+                    dump_all_stages = true;
+                    dump_stages.clear();
+                }
+                else
+                {
+                    dump_all_stages = false;
+                    dump_stages.clear();
+                    std::istringstream iss(stages_str);
+                    std::string token;
+                    while (std::getline(iss, token, ','))
+                    {
+                        // Trim whitespace
+                        token.erase(0, token.find_first_not_of(" \t"));
+                        token.erase(token.find_last_not_of(" \t") + 1);
+                        if (!token.empty())
+                        {
+                            dump_stages.insert(token);
+                        }
+                    }
+                }
+            }
+
+            const char *rank_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_RANK");
+            if (rank_env)
+            {
+                dump_rank = std::atoi(rank_env);
+            }
+        }
+
+        /**
+         * @brief Check if a specific layer should be dumped
+         * @param layer_idx Layer index to check
+         * @return true if this layer should be dumped
+         */
+        bool shouldDumpLayer(int layer_idx) const
+        {
+            return dump_all_layers || dump_layers.count(layer_idx) > 0;
+        }
+
+        /**
+         * @brief Check if a specific stage should be dumped
+         * @param stage_name Stage name to check (e.g., "FFN_RESIDUAL")
+         * @return true if this stage should be dumped
+         */
+        bool shouldDumpStage(const std::string &stage_name) const
+        {
+            return dump_all_stages || dump_stages.count(stage_name) > 0;
+        }
+
+        /**
+         * @brief Check if a specific layer/stage combination should be dumped
+         * @param layer_idx Layer index (-1 for non-layer stages like EMBEDDING)
+         * @param stage_name Stage name suffix (e.g., "FFN_RESIDUAL")
+         * @return true if this combination should be dumped
+         */
+        bool shouldDump(int layer_idx, const std::string &stage_name) const
+        {
+            if (!tensor_dump_enabled)
+                return false;
+            if (layer_idx >= 0 && !shouldDumpLayer(layer_idx))
+                return false;
+            return shouldDumpStage(stage_name);
+        }
+
+        /**
+         * @brief Parse a snapshot key to extract layer index and stage name
+         *
+         * Handles keys like "layer21_FFN_RESIDUAL" → (21, "FFN_RESIDUAL")
+         * and "EMBEDDING" → (-1, "EMBEDDING")
+         *
+         * @param key Full snapshot key
+         * @param layer_idx Output: layer index (-1 if not a layer-specific key)
+         * @param stage_name Output: stage name suffix
+         */
+        static void parseSnapshotKey(const std::string &key, int &layer_idx, std::string &stage_name)
+        {
+            // Check for "layer<N>_" prefix
+            if (key.substr(0, 5) == "layer")
+            {
+                size_t underscore = key.find('_');
+                if (underscore != std::string::npos)
+                {
+                    layer_idx = std::atoi(key.substr(5, underscore - 5).c_str());
+                    stage_name = key.substr(underscore + 1);
+                    return;
+                }
+            }
+            // No layer prefix - global stage
+            layer_idx = -1;
+            stage_name = key;
+        }
+
+        /**
+         * @brief Check if a snapshot key should be dumped based on current config
+         * @param key Full snapshot key (e.g., "layer21_FFN_RESIDUAL")
+         * @return true if this snapshot should be dumped
+         */
+        bool shouldDumpKey(const std::string &key) const
+        {
+            if (!tensor_dump_enabled)
+                return false;
+
+            int layer_idx;
+            std::string stage_name;
+            parseSnapshotKey(key, layer_idx, stage_name);
+            return shouldDump(layer_idx, stage_name);
+        }
+
+        /**
+         * @brief Check if this MPI rank should perform dumps
+         * @param rank Current MPI rank
+         * @return true if this rank should dump
+         */
+        bool shouldDumpRank(int rank) const
+        {
+            return dump_rank == -1 || dump_rank == rank;
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -368,6 +584,7 @@ namespace llaminar2
         GemmConfig gemm;
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
+        SnapshotConfig snapshot; ///< Snapshot and tensor dump configuration
 
         // Add more config groups as needed:
         // AttentionConfig attention;
@@ -381,6 +598,7 @@ namespace llaminar2
             gemm.reload();
             profile.reload();
             rmsnorm.reload();
+            snapshot.reload();
         }
     };
 

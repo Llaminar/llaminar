@@ -6,6 +6,7 @@
 
 #include "../utils/Logger.h"
 #include "../utils/DebugAssert.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/KernelProfiler.h"
 #include "PipelineBase.h"
 #include "attention/MpiAttentionOrchestrator.h"
@@ -23,6 +24,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include <limits>
+#include <fstream>
+#include <sys/stat.h>
 #include <omp.h>
 
 #if defined(__AVX512F__)
@@ -817,7 +820,254 @@ namespace llaminar2
         return keys;
     }
 
+    void PipelineBase::dumpTensorToDisk(const std::string &key, TensorBase *tensor, int rows, int cols)
+    {
+        const auto &snap_cfg = debugEnv().snapshot;
+        if (!snap_cfg.tensor_dump_enabled)
+            return;
+
+        // Check MPI rank filter
+        int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        if (!snap_cfg.shouldDumpRank(rank))
+            return;
+
+        // Create output directory if needed
+        struct stat st;
+        if (stat(snap_cfg.dump_dir.c_str(), &st) != 0)
+        {
+            mkdir(snap_cfg.dump_dir.c_str(), 0755);
+        }
+
+        std::string base_path = snap_cfg.dump_dir + "/" + key + "_rank" + std::to_string(rank);
+
+        // Get shape info
+        size_t effective_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+        // Dump FP32 dequantized data
+        auto view = tensor->create_view({static_cast<size_t>(rows), static_cast<size_t>(cols)});
+        if (view)
+        {
+            const float *fp32_data = view->fp32_data();
+            if (fp32_data)
+            {
+                std::ofstream fp32_file(base_path + "_fp32.bin", std::ios::binary);
+                if (fp32_file)
+                {
+                    fp32_file.write(reinterpret_cast<const char *>(fp32_data),
+                                    effective_elements * sizeof(float));
+                    LOG_DEBUG("[TensorDump] Wrote FP32 data to " << base_path << "_fp32.bin"
+                                                                 << " (" << effective_elements << " elements)");
+                }
+            }
+        }
+
+        // Check if tensor is Q8_1 and dump native blocks
+        auto *q8_1_tensor = dynamic_cast<Q8_1Tensor *>(tensor);
+        if (q8_1_tensor)
+        {
+            size_t blocks_per_row = (cols + 31) / 32;
+            size_t total_blocks = rows * blocks_per_row;
+            const Q8_1Block *blocks = q8_1_tensor->q8_1_blocks();
+
+            std::ofstream blocks_file(base_path + "_q8_1_blocks.bin", std::ios::binary);
+            if (blocks_file)
+            {
+                blocks_file.write(reinterpret_cast<const char *>(blocks),
+                                  total_blocks * sizeof(Q8_1Block));
+                LOG_DEBUG("[TensorDump] Wrote Q8_1 blocks to " << base_path << "_q8_1_blocks.bin"
+                                                               << " (" << total_blocks << " blocks)");
+            }
+        }
+
+        // Write metadata
+        std::ofstream meta_file(base_path + "_metadata.txt");
+        if (meta_file)
+        {
+            meta_file << "key=" << key << "\n";
+            meta_file << "rows=" << rows << "\n";
+            meta_file << "cols=" << cols << "\n";
+            meta_file << "elements=" << effective_elements << "\n";
+            meta_file << "tensor_type=" << static_cast<int>(tensor->native_type()) << "\n";
+            meta_file << "rank=" << rank << "\n";
+
+            if (q8_1_tensor)
+            {
+                size_t blocks_per_row = (cols + 31) / 32;
+                meta_file << "q8_1_blocks_per_row=" << blocks_per_row << "\n";
+                meta_file << "q8_1_total_blocks=" << rows * blocks_per_row << "\n";
+
+                // Sample first few block scales
+                const Q8_1Block *blocks = q8_1_tensor->q8_1_blocks();
+                meta_file << "sample_scales=";
+                for (int i = 0; i < std::min(5, rows); ++i)
+                {
+                    uint16_t d_bits = blocks[i * blocks_per_row].d;
+                    float scale;
+                    std::memcpy(&scale, &d_bits, sizeof(uint16_t));
+                    // FP16 to FP32 conversion (manual)
+                    uint32_t sign = (d_bits >> 15) & 0x1;
+                    uint32_t exp = (d_bits >> 10) & 0x1F;
+                    uint32_t mant = d_bits & 0x3FF;
+                    uint32_t fp32_bits;
+                    if (exp == 0)
+                    {
+                        fp32_bits = sign << 31;
+                    }
+                    else if (exp == 31)
+                    {
+                        fp32_bits = (sign << 31) | 0x7F800000 | (mant << 13);
+                    }
+                    else
+                    {
+                        fp32_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                    }
+                    std::memcpy(&scale, &fp32_bits, sizeof(float));
+                    meta_file << scale;
+                    if (i < std::min(5, rows) - 1)
+                        meta_file << ",";
+                }
+                meta_file << "\n";
+            }
+
+            LOG_DEBUG("[TensorDump] Wrote metadata to " << base_path << "_metadata.txt");
+        }
+    }
+
 #endif // ENABLE_PIPELINE_SNAPSHOTS
+
+    // ===== Tensor Dump (always available, controlled by debugEnv) =====
+
+    void PipelineBase::maybeDumpTensor(const std::string &key, TensorBase *tensor, int rows, int cols)
+    {
+        const auto &snap_cfg = debugEnv().snapshot;
+
+        // Quick exit if tensor dump not enabled
+        if (!snap_cfg.tensor_dump_enabled)
+            return;
+
+        // Check if this key matches the configured filters
+        if (!snap_cfg.shouldDumpKey(key))
+            return;
+
+        // Check MPI rank filter
+        int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        if (!snap_cfg.shouldDumpRank(rank))
+            return;
+
+        // Create output directory if needed
+        struct stat st;
+        if (stat(snap_cfg.dump_dir.c_str(), &st) != 0)
+        {
+            mkdir(snap_cfg.dump_dir.c_str(), 0755);
+        }
+
+        // Prefix with pipeline activation precision so we can distinguish FP32 vs Q8_1 runs
+        std::string precision_prefix;
+        switch (config_.activation_precision)
+        {
+        case ActivationPrecision::FP32:
+            precision_prefix = "fp32_pipeline_";
+            break;
+        case ActivationPrecision::Q8_1:
+            precision_prefix = "q8_1_pipeline_";
+            break;
+        default:
+            precision_prefix = "unknown_";
+            break;
+        }
+
+        std::string base_path = snap_cfg.dump_dir + "/" + precision_prefix + key + "_rank" + std::to_string(rank);
+
+        // Get shape info
+        size_t effective_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+        // Dump FP32 dequantized data
+        auto view = tensor->create_view({static_cast<size_t>(rows), static_cast<size_t>(cols)});
+        if (view)
+        {
+            const float *fp32_data = view->fp32_data();
+            if (fp32_data)
+            {
+                std::ofstream fp32_file(base_path + "_fp32.bin", std::ios::binary);
+                if (fp32_file)
+                {
+                    fp32_file.write(reinterpret_cast<const char *>(fp32_data),
+                                    effective_elements * sizeof(float));
+                    LOG_INFO("[TensorDump] Wrote " << key << " FP32 data (" << rows << "x" << cols
+                                                   << " = " << effective_elements << " elements) to " << base_path << "_fp32.bin");
+                }
+            }
+        }
+
+        // Check if tensor is Q8_1 and dump native blocks
+        auto *q8_1_tensor = dynamic_cast<Q8_1Tensor *>(tensor);
+        if (q8_1_tensor)
+        {
+            size_t blocks_per_row = (cols + 31) / 32;
+            size_t total_blocks = rows * blocks_per_row;
+            const Q8_1Block *blocks = q8_1_tensor->q8_1_blocks();
+
+            std::ofstream blocks_file(base_path + "_q8_1_blocks.bin", std::ios::binary);
+            if (blocks_file)
+            {
+                blocks_file.write(reinterpret_cast<const char *>(blocks),
+                                  total_blocks * sizeof(Q8_1Block));
+                LOG_INFO("[TensorDump] Wrote " << key << " Q8_1 blocks (" << total_blocks << " blocks) to "
+                                               << base_path << "_q8_1_blocks.bin");
+            }
+        }
+
+        // Write metadata
+        std::ofstream meta_file(base_path + "_metadata.txt");
+        if (meta_file)
+        {
+            meta_file << "key=" << key << "\n";
+            meta_file << "rows=" << rows << "\n";
+            meta_file << "cols=" << cols << "\n";
+            meta_file << "elements=" << effective_elements << "\n";
+            meta_file << "tensor_type=" << static_cast<int>(tensor->native_type()) << "\n";
+            int rank_val = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            meta_file << "rank=" << rank_val << "\n";
+
+            if (q8_1_tensor)
+            {
+                size_t blocks_per_row = (cols + 31) / 32;
+                meta_file << "q8_1_blocks_per_row=" << blocks_per_row << "\n";
+                meta_file << "q8_1_total_blocks=" << rows * blocks_per_row << "\n";
+
+                // Sample first few block scales for sanity check
+                const Q8_1Block *blocks = q8_1_tensor->q8_1_blocks();
+                meta_file << "sample_scales=";
+                for (int i = 0; i < std::min(5, rows); ++i)
+                {
+                    uint16_t d_bits = blocks[i * blocks_per_row].d;
+                    // FP16 to FP32 conversion
+                    uint32_t sign = (d_bits >> 15) & 0x1;
+                    uint32_t exp = (d_bits >> 10) & 0x1F;
+                    uint32_t mant = d_bits & 0x3FF;
+                    uint32_t fp32_bits;
+                    if (exp == 0)
+                    {
+                        fp32_bits = sign << 31;
+                    }
+                    else if (exp == 31)
+                    {
+                        fp32_bits = (sign << 31) | 0x7F800000 | (mant << 13);
+                    }
+                    else
+                    {
+                        fp32_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                    }
+                    float scale;
+                    std::memcpy(&scale, &fp32_bits, sizeof(float));
+                    meta_file << scale;
+                    if (i < std::min(5, rows) - 1)
+                        meta_file << ",";
+                }
+                meta_file << "\n";
+            }
+        }
+    }
 
     // =============================================================================
     // Numerical Health Checks (Debug builds only)
@@ -1884,6 +2134,7 @@ namespace llaminar2
     void PipelineBase::capture_snapshot(const std::string &key, TensorBase *tensor, int rows, int cols)
     {
         CAPTURE_SNAPSHOT_VIEW(key.c_str(), tensor, rows, cols);
+        maybeDumpTensor(key, tensor, rows, cols);
     }
 
 } // namespace llaminar2

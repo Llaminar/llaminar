@@ -452,6 +452,115 @@ for (const auto& key : seq_keys) {
 - Snapshots are **NOT automatically cleaned up** - useful for post-test analysis
 - Each snapshot is a binary file containing FP32 tensor data
 
+#### Debugging Layer Divergence with Tensor Dumps
+
+When Q8_1 (or other quantized) inference produces different results than FP32, use the tensor dump feature to trace divergence layer-by-layer and element-by-element. This is the systematic approach used to find and fix issues like gamma weight clipping bugs.
+
+**Step 1: Run the comparison test with tensor dumps enabled**
+
+First, identify which layer shows divergence by running the parity test with tensor dumps:
+
+```bash
+# Clean previous dumps
+rm -rf /tmp/layer_debug
+
+# Run with tensor dump enabled for all layers
+export LLAMINAR_SNAPSHOT_TENSOR_DUMP=1
+export LLAMINAR_SNAPSHOT_DUMP_DIR=/tmp/layer_debug
+export LLAMINAR_SNAPSHOT_DUMP_LAYERS=all
+export LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_RESIDUAL,ATTENTION_RESIDUAL
+export LLAMINAR_LOG_LEVEL=ERROR
+
+# Run the Q8_1 vs FP32 parity test
+timeout 180 mpirun -np 2 --bind-to socket --map-by socket \
+  ./build_v2_e2e/tests/v2/v2_test_q8_1_layer_divergence \
+  --gtest_filter="Test__Q8_1_LayerByLayer.SnapshotComparison"
+```
+
+**Step 2: Analyze dumps to find first divergence point**
+
+Use Python to trace a specific element through layers:
+
+```python
+import numpy as np
+import os
+
+dump_dir = "/tmp/layer_debug"
+element_idx = 62  # Index to trace (find by looking at max diff elements)
+
+for layer in range(24):
+    for stage in ["ATTENTION_RESIDUAL", "FFN_RESIDUAL"]:
+        fp32_file = f"{dump_dir}/fp32_pipeline_layer{layer}_{stage}_rank0_fp32.bin"
+        q8_1_file = f"{dump_dir}/q8_1_pipeline_layer{layer}_{stage}_rank0_fp32.bin"
+        
+        if not os.path.exists(fp32_file):
+            continue
+            
+        fp32_data = np.fromfile(fp32_file, dtype=np.float32)
+        q8_1_data = np.fromfile(q8_1_file, dtype=np.float32)
+        
+        diff = abs(fp32_data[element_idx] - q8_1_data[element_idx])
+        print(f"L{layer} {stage}: FP32={fp32_data[element_idx]:.4f}, "
+              f"Q8_1={q8_1_data[element_idx]:.4f}, diff={diff:.4f}")
+```
+
+**Step 3: Drill down into the divergent layer**
+
+Once you identify which layer diverges (e.g., Layer 3 FFN), capture all stages for that layer:
+
+```bash
+rm -rf /tmp/layer3_detail
+export LLAMINAR_SNAPSHOT_DUMP_DIR=/tmp/layer3_detail
+export LLAMINAR_SNAPSHOT_DUMP_LAYERS=3
+export LLAMINAR_SNAPSHOT_DUMP_STAGES=all  # All stages within layer 3
+
+# Re-run the test
+timeout 180 mpirun -np 2 ... ./build_v2_e2e/tests/v2/v2_test_q8_1_layer_divergence
+```
+
+Then analyze each stage to pinpoint where divergence begins:
+
+```python
+stage_order = [
+    "ATTENTION_NORM", "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+    "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
+    "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN", "FFN_RESIDUAL"
+]
+
+for stage in stage_order:
+    # Load and compare FP32 vs Q8_1 for each stage
+    # Find where the big jump happens (e.g., FFN_NORM if gamma clipping issue)
+```
+
+**Step 4: Check model weights for problematic values**
+
+If the divergence originates in a norm layer, check the gamma weights:
+
+```python
+from gguf import GGUFReader
+
+reader = GGUFReader("models/qwen2.5-0.5b-instruct-q8_0.gguf")
+for tensor in reader.tensors:
+    if "blk.3.ffn_norm" in tensor.name:
+        weights = np.frombuffer(tensor.data, dtype=np.float32)
+        print(f"Min: {weights.min()}, Max: {weights.max()}")
+        # Check for values exceeding kernel limits (e.g., |gamma| > 8 for Q12)
+        large = np.where(np.abs(weights) > 8)[0]
+        print(f"Elements > 8: {large}")
+```
+
+**Real-World Example: Q8_1 RMSNorm Gamma Clipping Bug**
+
+Using this approach, we discovered that the Q8_1 RMSNorm kernel used Q12 fixed-point format for gamma weights with a [-8, 8] clamp range. In Qwen2.5-0.5B, gamma[62] = 13.015625, which got clipped to 8.0, causing 38% error that cascaded through layers and eventually caused sign flips in layer 21.
+
+The fix was to expand the gamma range from Q12 [-8, 8] to Q11 [-16, 16] in `src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp`.
+
+**Key Indicators of Common Issues**:
+- **Sudden large diff at specific element**: Check if model weights exceed kernel limits
+- **Gradual accumulation across layers**: Normal quantization noise, may need tighter tolerances
+- **Sign flips in residual connections**: Usually caused by large errors in inputs that cancel incorrectly
+- **Specific layer consistently bad**: Check that layer's norm weights or attention parameters
+
 #### Compile-Time Safety
 
 E2E tests include compile-time checks to prevent building against non-snapshot builds:
@@ -1427,13 +1536,41 @@ All files and functions should be documented with the Doxygen format for readabi
 
 Llaminar uses a "DebugEnv" singleton that loads all environment variables at startup and exposes them to classes at runtime. This avoids heavy getEnv() calls.
 
-For a full list of environment variables available, check 
+For a full list of environment variables available, check `src/v2/utils/DebugEnv.h`.
 
 | Variable | Description | Default / Activation | Primary Scope |
 |----------|-------------|----------------------|---------------|
 | `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing breakdown in benchmark mode. | Disabled unless set to non-zero. | Performance profiling |
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
 | `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
+| `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk for debugging. | Disabled (0) | Snapshot framework |
+| `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps. | `/tmp/llaminar_tensor_dumps` | Snapshot framework |
+| `LLAMINAR_SNAPSHOT_DUMP_LAYERS` | Comma-separated layer indices to dump. | `all` | Snapshot framework |
+| `LLAMINAR_SNAPSHOT_DUMP_STAGES` | Comma-separated stage names to dump. | `all` | Snapshot framework |
+| `LLAMINAR_SNAPSHOT_DUMP_RANK` | Only dump from this MPI rank (-1=all). | `0` | Snapshot framework |
+
+### Tensor Dump Feature
+
+The tensor dump feature allows you to save raw tensor data (both FP32 dequantized and native Q8_1 blocks) to disk for detailed debugging and analysis. This is integrated with the snapshot framework but works in any build (including Release).
+
+**Example: Debug layer 21 FFN residual add divergence**
+```bash
+# Dump only layer 21 FFN stages
+LLAMINAR_SNAPSHOT_TENSOR_DUMP=1 \
+LLAMINAR_SNAPSHOT_DUMP_LAYERS=21 \
+LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_INPUT_RESIDUAL,FFN_DOWN,FFN_RESIDUAL \
+LLAMINAR_SNAPSHOT_DUMP_DIR=/tmp/layer21_debug \
+./run_llaminar.sh -m model.gguf -p "test prompt"
+```
+
+**Output Files:**
+- `<stage>_rank<N>_fp32.bin` - FP32 dequantized data (raw float32 binary)
+- `<stage>_rank<N>_q8_1_blocks.bin` - Raw Q8_1 blocks (for Q8_1 tensors)
+- `<stage>_rank<N>_metadata.txt` - Shape, type, and sample scale information
+
+**Stage Names:**
+- Global: `EMBEDDING`, `FINAL_NORM`, `LM_HEAD`
+- Per-layer: `ATTENTION_NORM`, `Q_PROJECTION`, `K_PROJECTION`, `V_PROJECTION`, `Q_ROPE`, `K_ROPE`, `ATTENTION_CONTEXT`, `ATTENTION_OUTPUT`, `ATTENTION_RESIDUAL`, `FFN_NORM`, `FFN_GATE`, `FFN_UP`, `FFN_SWIGLU`, `FFN_DOWN`, `FFN_INPUT_RESIDUAL`, `FFN_RESIDUAL`
 
 
 ## Common Pitfalls and Solutions

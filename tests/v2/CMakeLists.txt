@@ -285,6 +285,58 @@ add_v2_test(V2_Unit_Q8_1_Add_Repro
     MPI_PROCS 1
 )
 
+# Test: Q8_1 Add Extreme Tests (Comprehensive Edge Case Coverage)
+add_executable(v2_test_q8_1_add_extreme unit/tensors/Test__Q8_1_Add_Extreme.cpp)
+target_link_libraries(v2_test_q8_1_add_extreme 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_Add_Extreme 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_add_extreme>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Residuals;EdgeCases;CatastrophicCancellation"
+    MPI_PROCS 1
+)
+
+# Test: Q8_1 Add Debug (Layer 21 pattern investigation)
+add_executable(v2_test_q8_1_add_debug unit/tensors/Test__Q8_1_Add_Debug.cpp)
+target_link_libraries(v2_test_q8_1_add_debug 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_Add_Debug 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_add_debug>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Debug"
+    MPI_PROCS 1
+)
+
+# Test: Q8_1 Add Comprehensive (exhaustive test suite for q8_1_add_q8_1)
+add_executable(v2_test_q8_1_add_comprehensive unit/tensors/Test__Q8_1_Add_Comprehensive.cpp)
+target_link_libraries(v2_test_q8_1_add_comprehensive 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_Add_Comprehensive 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_add_comprehensive>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Comprehensive;CatastrophicCancellation"
+    MPI_PROCS 1
+)
+
+# Test: Q8_1 Residual Add Layer 21 (using actual layer 21 dump data patterns)
+add_executable(v2_test_q8_1_residual_layer21 unit/Test__Q8_1_ResidualAdd_Layer21.cpp)
+target_link_libraries(v2_test_q8_1_residual_layer21 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_ResidualAdd_Layer21 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_residual_layer21>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Residuals;Layer21;RealData"
+    MPI_PROCS 1
+)
+
 # Test: INT8Tensor class (runtime activation quantization with per-row scales)
 add_executable(v2_test_int8_tensor unit/Test__INT8Tensor.cpp)
 target_link_libraries(v2_test_int8_tensor 
