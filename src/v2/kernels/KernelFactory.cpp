@@ -7,6 +7,7 @@
 #include "KernelFactory.h"
 #include "cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "../tensors/TensorSlice.h"
 #include "cpu/ops/CPURoPEKernelT.h"
 #include "cpu/ops/CPUSwiGLUKernelT.h"
 #include "cpu/ops/CPUSoftmaxKernelT.h"
@@ -1505,6 +1506,46 @@ namespace llaminar
 
                 auto dev_type = getDeviceType(tensor->device_index());
 
+                // Handle TensorSlice: delegate to inner tensor's kernel creation
+                // TensorSlice always implements IINT8Unpackable, but the inner tensor may not
+                if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
+                {
+                    // Check if inner tensor actually supports quantized GEMM
+                    if (!slice->supports_int8_unpack())
+                    {
+                        // Inner tensor is FP32/FP16/BF16 - dispatch based on inner type
+                        const auto *inner = slice->inner();
+                        if (auto *t = dynamic_cast<const llaminar2::FP32Tensor *>(inner))
+                        {
+                            auto kernel = createGemm(t, dev_type);
+                            auto *raw_ptr = kernel.get();
+                            kernel_cache_[tensor] = std::move(kernel);
+                            return raw_ptr;
+                        }
+                        else if (auto *t = dynamic_cast<const llaminar2::FP16Tensor *>(inner))
+                        {
+                            auto kernel = createGemm(t, dev_type);
+                            auto *raw_ptr = kernel.get();
+                            kernel_cache_[tensor] = std::move(kernel);
+                            return raw_ptr;
+                        }
+                        else if (auto *t = dynamic_cast<const llaminar2::BF16Tensor *>(inner))
+                        {
+                            auto kernel = createGemm(t, dev_type);
+                            auto *raw_ptr = kernel.get();
+                            kernel_cache_[tensor] = std::move(kernel);
+                            return raw_ptr;
+                        }
+                        else
+                        {
+                            LOG_ERROR("[KernelFactory] TensorSlice wraps unknown non-quantized type: "
+                                      << static_cast<int>(inner->native_type()));
+                            throw std::runtime_error("KernelFactory: TensorSlice wraps unknown type");
+                        }
+                    }
+                    // Inner tensor supports INT8 unpack - fall through to quantized path below
+                }
+
                 // For CPU quantized tensors, use tensor-owned packed weights pattern
                 if (dev_type == DeviceType::CPU)
                 {
@@ -1512,6 +1553,17 @@ namespace llaminar
                     const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
                     if (unpackable)
                     {
+                        // For TensorSlice, verify inner actually supports it (already checked above but be safe)
+                        if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
+                        {
+                            if (!slice->supports_int8_unpack())
+                            {
+                                // This should not happen if the above check passed
+                                LOG_ERROR("[KernelFactory] TensorSlice passed IINT8Unpackable check but supports_int8_unpack=false");
+                                throw std::runtime_error("KernelFactory: TensorSlice type mismatch");
+                            }
+                        }
+
                         // Get or create packed weights in tensor's cache_
                         TensorPackedWeightsCache *packed_cache = nullptr;
 

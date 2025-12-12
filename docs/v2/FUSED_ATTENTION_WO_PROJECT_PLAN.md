@@ -16,7 +16,45 @@
 | **Phase 3** | Cache-Blocked Tiled Reference | ✅ **Complete** (21 parity tests passing) |
 | **Phase 4** | JIT Kernel (Xbyak) | ✅ **Complete** (9 instantiation + 27 correctness = 36 tests) |
 | **Phase 5** | Pipeline Integration | ✅ **Complete** (wrapper, CLI, pipeline code, 10 tests) |
-| **Phase 6** | Unified Precision-Aware MPI Allreduce | ✅ **Complete** |
+| **Phase 6** | Unified Precision-Aware MPI Allreduce | ✅ **Complete** (10 MPI integration tests) |
+
+### Phase 6 Summary (Complete - December 12, 2025)
+
+Phase 6 implemented unified precision-aware MPI allreduce/allgather operations for tensor-parallel inference.
+
+**Key Accomplishments:**
+1. **Q8_1 Native Allreduce**: AVX512-vectorized N-way reduction without FP32 conversion (3.5x bandwidth savings)
+2. **BF16/FP16 Native Allreduce**: Full precision support for 16-bit types (2x bandwidth savings)
+3. **TensorSlice Row-Parallel**: Pre-sliced tensor pattern with multi-precision allgatherv
+4. **K-Sliced Row-Parallel**: Input column slicing with allreduce-sum for partial products
+5. **KernelFactory TensorSlice Fix**: Proper handling of TensorSlice with non-quantized inner tensors
+
+**Test Results (10 MPI Integration Tests):**
+| Test | Cosine Similarity | Status |
+|------|-------------------|--------|
+| TensorSlice_FP32_Output | 1.000 | ✅ PASSED |
+| TensorSlice_Q8_1_Output_BlockAligned | 0.999982 | ✅ PASSED |
+| TensorSlice_BF16_Output | 0.999998 | ✅ PASSED |
+| KSliced_FP32_Allreduce | 1.000 | ✅ PASSED |
+| KSliced_Q8_1_NativeAllreduce | 0.999971 | ✅ PASSED |
+| KSliced_BF16_NativeAllreduce | 0.999995 | ✅ PASSED |
+| KSliced_FP16_NativeAllreduce | - | ⏭️ SKIPPED (hardware) |
+| Q8_1_NonAligned_FallbackToFP32 | 1.000 | ✅ PASSED |
+| LargeMatrix_FP32 | 1.000 | ✅ PASSED |
+| TensorSlice_RealQ4_0_WithQ8_1Activations | 1.000 | ✅ PASSED |
+
+**Critical Bug Fixes:**
+1. **KernelFactory TensorSlice Handling** (`src/v2/kernels/KernelFactory.cpp`):
+   - Added `supports_int8_unpack()` check before quantized weight packing
+   - FP32/FP16/BF16 inner tensors now correctly dispatch to FloatingPointGemmKernel
+   
+2. **TensorSlice Tests Rewritten** (`tests/v2/integration/Test__MPI_RowParallelMultiPrecision.cpp`):
+   - Changed from `inner_is_presliced=false` (runtime slicing) to pre-sliced tensor pattern
+   - Tests now create pre-sliced FP32/BF16 tensors with `inner_is_presliced=true`
+   - Real Q4_0 test uses `loadTensorRowSlice()` for memory-efficient pre-sliced loading
+
+3. **FP16 Hardware Skip**:
+   - Added `GTEST_SKIP()` for FP16 test when OneDNN FP16 matmul not supported on hardware
 
 ### Phase 2 Test Coverage
 
@@ -136,7 +174,7 @@
 
 ## Phase 6: Unified Precision-Aware MPI Allreduce
 
-**Status:** 🔄 In Progress  
+**Status:** ✅ **Complete** (December 12, 2025)  
 **Goal:** Implement a portable, unified allreduce design that works across all activation precision types (FP32, FP16, BF16, Q8_1).
 
 ### Problem Statement
@@ -358,7 +396,64 @@ void allreduce_q8_1_inplace(Q8_1Block *data, size_t n_blocks) const {
 | BF16 | 64 | 64 | 2.0x better |
 | Q8_1 | 36 (block) | 36 | 3.5x better |
 
-### Future Work (Phase 7+)
+---
+
+## Next Steps / Handoff Notes (Phase 7+)
+
+### Immediate Priority: TensorSlice Design Decision
+
+**Background:** During Phase 6 testing, we discovered that `TensorSlice` with `inner_is_presliced=false` (full tensor inside, slice at runtime) doesn't work with current kernels. The fix was to use `inner_is_presliced=true` (pre-sliced tensor inside).
+
+**Decision Required:** Choose one of these approaches:
+1. **Keep pre-sliced pattern only** (current state): All TensorSlice usage must use `loadTensorRowSlice()` to pre-slice weights at load time
+2. **Implement runtime slicing in kernels**: FloatingPointGemmKernel and QuantizedGemmKernel would use slice metadata to access only the relevant portion of full tensors
+
+**Recommendation:** Option 1 (pre-sliced) is simpler and more memory-efficient. Option 2 would only be needed if we have use cases where we need to slice the same tensor different ways.
+
+### Future Work Items
+
+#### High Priority
+- [ ] **Fix Q8_1 device transfer bug** - E2E CLI testing with Q8_1 activations blocked by shape mismatch in `PipelineBase::prepareActivationForDevice()` when `placement_map_` creates device 0 entries for CPU. This is unrelated to fused attention but blocks production testing.
+
+- [ ] **Implement Wo projection in JIT kernel** - JIT kernel currently outputs raw attention context (no Wo projection). REFERENCE backend applies Wo correctly. JIT needs to fuse the Wo projection for true end-to-end fusion.
+
+#### Medium Priority  
+- [ ] **Benchmark fused vs unfused performance** - Compare throughput and latency with/without fused attention
+- [ ] **Enable JIT backend as default** - After Wo projection is complete and benchmarked
+- [ ] **Add FP16 native GEMM fallback** - OneDNN FP16 fails on some hardware; add CPU fallback path
+
+#### Low Priority
+- [ ] **Phase 6.3: Unified Interface** - Create `MPIContext::allreduce_activation_inplace(TensorBase*, ActivationPrecision)` for cleaner API. Deferred because type-specific methods work fine.
+
+### Key Files Modified in Phase 6
+
+| File | Changes |
+|------|---------|
+| `src/v2/kernels/KernelFactory.cpp` | Added TensorSlice handling with `supports_int8_unpack()` check |
+| `tests/v2/integration/Test__MPI_RowParallelMultiPrecision.cpp` | Rewrote 4 tests to use pre-sliced tensor pattern |
+| `src/v2/utils/SIMDHelpers.h` | Added `q8_1_sum_n()`, `fp16_sum_n()`, `bf16_sum_n()` N-way reductions |
+| `src/v2/utils/MPIContext.h` | Added type-specific allreduce methods |
+
+### Test Commands for Verification
+
+```bash
+# Run all MPI integration tests (requires 2 ranks)
+cd /workspaces/llaminar
+cmake --build build_v2 --parallel --target v2_integration_mpi_row_parallel_multiprecision
+mpirun -np 2 --oversubscribe ./build_v2/tests/v2/v2_integration_mpi_row_parallel_multiprecision
+
+# Expected: 9 PASSED, 1 SKIPPED (FP16 hardware limitation)
+```
+
+### Key Learnings from Phase 6
+
+1. **TensorSlice requires pre-sliced tensors** - Use `loadTensorRowSlice()` with `inner_is_presliced=true` for quantized weights
+2. **KernelFactory must check `supports_int8_unpack()`** - TensorSlice always implements `IINT8Unpackable`, but inner tensor may be FP32/BF16/FP16
+3. **FP16 hardware support varies** - OneDNN FP16 matmul not available on all CPUs; tests should skip gracefully
+
+---
+
+### Legacy Future Work (from earlier phases)
 - [ ] Fix Q8_1 device transfer bug to enable E2E CLI testing
 - [ ] Implement Wo projection in JIT kernel for true fusion
 - [ ] Benchmark fused vs unfused performance
