@@ -1316,7 +1316,8 @@ namespace llaminar2
         auto *tensor_slice = dynamic_cast<TensorSlice *>(weight);
         if (tensor_slice && tensor_slice->is_row_parallel() && mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
-            // NEW PATH: TensorSlice with row-parallel mode
+            // ROW-PARALLEL PATH: TensorSlice with row-parallel mode
+            // Each rank has a slice of the output columns (rows in transposed weight matrix)
             // The TensorSlice::createGemm() returns a kernel for the sliced rows
             const auto &meta = tensor_slice->metadata();
             const int n_local = static_cast<int>(meta.slice_size());
@@ -1324,21 +1325,236 @@ namespace llaminar2
             const int world_size = mpi_ctx_->world_size();
             const int rank = mpi_ctx_->rank();
 
-            // Perform local GEMM: [m, k] @ [n_local, k]^T = [m, n_local]
-            // The kernel is already sliced, so we pass n_local as the output dimension
+            // Detect output tensor type
             auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
-            if (!output_fp32)
+            auto *output_q8_1 = dynamic_cast<Q8_1Tensor *>(output);
+            auto *output_bf16 = dynamic_cast<BF16Tensor *>(output);
+            auto *output_fp16 = dynamic_cast<FP16Tensor *>(output);
+
+            // Check if Q8_1 native path is viable (requires block-aligned slices)
+            // Block boundaries must align with slice boundaries for clean allgather
+            constexpr size_t BLOCK_SIZE = Q8_1Block::BLOCK_SIZE; // 32
+            const bool n_start_aligned = (n_start % BLOCK_SIZE) == 0;
+            const bool n_local_aligned = (n_local % BLOCK_SIZE) == 0;
+            const bool q8_block_aligned = n_start_aligned && n_local_aligned;
+
+            // =====================================================================
+            // Q8_1 NATIVE PATH: Direct Q8_1 GEMM + block-level allgatherv
+            // Avoids FP32 intermediate when slices are block-aligned
+            // =====================================================================
+            if (output_q8_1 && q8_block_aligned)
             {
-                LOG_ERROR("[TP GEMM] Row-parallel TensorSlice requires FP32 output");
+                // Calculate block counts
+                const size_t blocks_per_row_full = n / BLOCK_SIZE;
+                const size_t blocks_per_row_local = n_local / BLOCK_SIZE;
+                const size_t block_start = n_start / BLOCK_SIZE;
+
+                // Create Q8_1 temporary for local GEMM result [m, n_local]
+                std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(n_local)};
+                Q8_1Tensor output_local(local_shape);
+
+                // GEMM with sliced kernel: [m, k] @ [n_local, k]^T = [m, n_local] in Q8_1
+                if (!typed_gemm_op_->execute(input, weight, &output_local, m, n_local, k,
+                                             mpi_ctx_.get(), target_device))
+                {
+                    LOG_ERROR("[TP GEMM] Row-parallel TensorSlice Q8_1 GEMM failed for " << snapshot_key);
+                    return false;
+                }
+
+                // Get Q8_1 block pointers
+                const Q8_1Block *local_blocks = output_local.q8_1_blocks();
+                Q8_1Block *output_blocks = output_q8_1->mutable_q8_1_blocks();
+
+                // Allgather Q8_1 blocks from all ranks
+                // Each rank contributes blocks for its column slice
+                // We gather row-by-row to handle the strided layout
+
+                // For each row, gather blocks from all ranks into correct positions
+                // Use allgatherv with displacement arrays
+                std::vector<int> recv_counts(world_size);
+                std::vector<int> displs(world_size);
+
+                // Calculate counts and displacements for one row
+                // Each rank sends blocks_per_row_local blocks per row
+                for (int r = 0; r < world_size; ++r)
+                {
+                    size_t r_n_local = meta.original_cols / world_size;
+                    if (r == world_size - 1)
+                    {
+                        r_n_local = meta.original_cols - r_n_local * (world_size - 1);
+                    }
+                    size_t r_blocks_local = r_n_local / BLOCK_SIZE;
+                    size_t r_block_start = (r * (meta.original_cols / world_size)) / BLOCK_SIZE;
+
+                    recv_counts[r] = static_cast<int>(r_blocks_local * sizeof(Q8_1Block));
+                    displs[r] = static_cast<int>(r_block_start * sizeof(Q8_1Block));
+                }
+
+                // Gather blocks row by row (strided pattern)
+                const int local_row_bytes = static_cast<int>(blocks_per_row_local * sizeof(Q8_1Block));
+
+                for (int row = 0; row < m; ++row)
+                {
+                    const Q8_1Block *src_row = local_blocks + row * blocks_per_row_local;
+                    Q8_1Block *dst_row = output_blocks + row * blocks_per_row_full;
+
+                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                               dst_row, recv_counts.data(), displs.data());
+                }
+
+                LOG_TRACE("[TP GEMM] Row-parallel TensorSlice Q8_1-native completed for " << snapshot_key
+                                                                                          << " (m=" << m << ", n_local=" << n_local << "/" << n
+                                                                                          << ", blocks_local=" << blocks_per_row_local << ")");
+                return true;
+            }
+
+            // =====================================================================
+            // BF16 NATIVE PATH: Direct BF16 GEMM + element-level allgatherv
+            // =====================================================================
+            if (output_bf16)
+            {
+                // Create BF16 temporary for local GEMM result [m, n_local]
+                std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(n_local)};
+                BF16Tensor output_local(local_shape);
+
+                // GEMM with sliced kernel
+                if (!typed_gemm_op_->execute(input, weight, &output_local, m, n_local, k,
+                                             mpi_ctx_.get(), target_device))
+                {
+                    LOG_ERROR("[TP GEMM] Row-parallel TensorSlice BF16 GEMM failed for " << snapshot_key);
+                    return false;
+                }
+
+                // Get BF16 data pointers
+                const uint16_t *local_data = output_local.bf16_data();
+                uint16_t *output_data = output_bf16->mutable_bf16_data();
+
+                // Calculate counts and displacements for allgatherv
+                std::vector<int> recv_counts(world_size);
+                std::vector<int> displs(world_size);
+
+                for (int r = 0; r < world_size; ++r)
+                {
+                    size_t r_n_local = meta.original_cols / world_size;
+                    if (r == world_size - 1)
+                    {
+                        r_n_local = meta.original_cols - r_n_local * (world_size - 1);
+                    }
+                    size_t r_start = r * (meta.original_cols / world_size);
+
+                    recv_counts[r] = static_cast<int>(r_n_local * sizeof(uint16_t));
+                    displs[r] = static_cast<int>(r_start * sizeof(uint16_t));
+                }
+
+                // Gather elements row by row
+                const int local_row_bytes = static_cast<int>(n_local * sizeof(uint16_t));
+
+                for (int row = 0; row < m; ++row)
+                {
+                    const uint16_t *src_row = local_data + row * n_local;
+                    uint16_t *dst_row = output_data + row * n;
+
+                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                               dst_row, recv_counts.data(), displs.data());
+                }
+
+                LOG_TRACE("[TP GEMM] Row-parallel TensorSlice BF16-native completed for " << snapshot_key);
+                return true;
+            }
+
+            // =====================================================================
+            // FP16 NATIVE PATH: Direct FP16 GEMM + element-level allgatherv
+            // =====================================================================
+            if (output_fp16)
+            {
+                // Create FP16 temporary for local GEMM result [m, n_local]
+                std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(n_local)};
+                FP16Tensor output_local(local_shape);
+
+                // GEMM with sliced kernel
+                if (!typed_gemm_op_->execute(input, weight, &output_local, m, n_local, k,
+                                             mpi_ctx_.get(), target_device))
+                {
+                    LOG_ERROR("[TP GEMM] Row-parallel TensorSlice FP16 GEMM failed for " << snapshot_key);
+                    return false;
+                }
+
+                // Get FP16 data pointers
+                const uint16_t *local_data = output_local.fp16_data();
+                uint16_t *output_data = output_fp16->mutable_fp16_data();
+
+                // Calculate counts and displacements for allgatherv
+                std::vector<int> recv_counts(world_size);
+                std::vector<int> displs(world_size);
+
+                for (int r = 0; r < world_size; ++r)
+                {
+                    size_t r_n_local = meta.original_cols / world_size;
+                    if (r == world_size - 1)
+                    {
+                        r_n_local = meta.original_cols - r_n_local * (world_size - 1);
+                    }
+                    size_t r_start = r * (meta.original_cols / world_size);
+
+                    recv_counts[r] = static_cast<int>(r_n_local * sizeof(uint16_t));
+                    displs[r] = static_cast<int>(r_start * sizeof(uint16_t));
+                }
+
+                // Gather elements row by row
+                const int local_row_bytes = static_cast<int>(n_local * sizeof(uint16_t));
+
+                for (int row = 0; row < m; ++row)
+                {
+                    const uint16_t *src_row = local_data + row * n_local;
+                    uint16_t *dst_row = output_data + row * n;
+
+                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                               dst_row, recv_counts.data(), displs.data());
+                }
+
+                LOG_TRACE("[TP GEMM] Row-parallel TensorSlice FP16-native completed for " << snapshot_key);
+                return true;
+            }
+
+            // =====================================================================
+            // FP32 PATH (default) or Q8_1 FALLBACK (non-block-aligned)
+            // Uses FP32 for communication, quantizes to Q8_1 at end if needed
+            // =====================================================================
+            if (!output_fp32 && !output_q8_1)
+            {
+                LOG_ERROR("[TP GEMM] Row-parallel TensorSlice requires FP32, Q8_1, BF16, or FP16 output");
                 return false;
             }
 
-            // Create temporary output for local result [m, n_local]
+            // Log if Q8_1 fallback due to alignment
+            if (output_q8_1 && !q8_block_aligned)
+            {
+                LOG_DEBUG("[TP GEMM] Q8_1 output using FP32 fallback (n_start=" << n_start
+                                                                                << " aligned=" << n_start_aligned
+                                                                                << ", n_local=" << n_local
+                                                                                << " aligned=" << n_local_aligned << ")");
+            }
+
+            // Create FP32 buffer for communication
+            std::unique_ptr<FP32Tensor> output_fp32_temp;
+            FP32Tensor *output_for_comm = nullptr;
+
+            if (output_fp32)
+            {
+                output_for_comm = output_fp32;
+            }
+            else
+            {
+                // Q8_1 output with non-aligned slices: use FP32 temporary
+                output_fp32_temp = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
+                output_for_comm = output_fp32_temp.get();
+            }
+
+            // Create FP32 temporary for local GEMM result [m, n_local]
             std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(n_local)};
             FP32Tensor output_local(local_shape);
 
             // GEMM with sliced kernel: [m, k] @ [n_local, k]^T = [m, n_local]
-            // Use typed_gemm_op_ for consistency (though FP32 is required here)
             if (!typed_gemm_op_->execute(input, weight, &output_local, m, n_local, k,
                                          mpi_ctx_.get(), target_device))
             {
@@ -1346,101 +1562,405 @@ namespace llaminar2
                 return false;
             }
 
-            // Gather results from all ranks into final output [m, n]
-            // Each rank writes to its slice: output[:, n_start:n_start+n_local]
-            float *out_data = output_fp32->mutable_data();
+            // Gather results using allgatherv (more efficient than zero+allreduce)
+            float *out_data = output_for_comm->mutable_data();
             const float *local_data = output_local.data();
 
-// Copy local result to the correct slice of output
-#pragma omp parallel for
+            // Calculate counts and displacements for allgatherv
+            std::vector<int> recv_counts(world_size);
+            std::vector<int> displs(world_size);
+
+            for (int r = 0; r < world_size; ++r)
+            {
+                size_t r_n_local = meta.original_cols / world_size;
+                if (r == world_size - 1)
+                {
+                    r_n_local = meta.original_cols - r_n_local * (world_size - 1);
+                }
+                size_t r_start = r * (meta.original_cols / world_size);
+
+                recv_counts[r] = static_cast<int>(r_n_local * sizeof(float));
+                displs[r] = static_cast<int>(r_start * sizeof(float));
+            }
+
+            // Gather elements row by row
+            const int local_row_bytes = static_cast<int>(n_local * sizeof(float));
+
             for (int row = 0; row < m; ++row)
             {
-                float *dst_row = out_data + row * n + n_start;
                 const float *src_row = local_data + row * n_local;
-                std::memcpy(dst_row, src_row, n_local * sizeof(float));
+                float *dst_row = out_data + row * n;
+
+                mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                           dst_row, recv_counts.data(), displs.data());
             }
 
-// Allgather to get all slices (each rank has different slice filled in)
-// Use allreduce with pre-zeroed non-local regions as workaround
-// Zero out non-local regions first
-#pragma omp parallel for
-            for (int row = 0; row < m; ++row)
+            // If output is Q8_1, quantize FP32 result into Q8_1 blocks
+            if (output_q8_1)
             {
-                float *row_ptr = out_data + row * n;
-                // Zero before our slice
-                std::memset(row_ptr, 0, n_start * sizeof(float));
-                // Zero after our slice
-                std::memset(row_ptr + n_start + n_local, 0, (n - n_start - n_local) * sizeof(float));
-            }
+                Q8_1Block *q8_blocks = output_q8_1->mutable_q8_1_blocks();
+                const float *fp32_data = output_for_comm->data();
 
-            // Allreduce-sum combines all slices (since non-local regions are zero)
-            const size_t output_size = static_cast<size_t>(m) * n;
-            mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+                const size_t blocks_per_row = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+#pragma omp parallel for
+                for (int row = 0; row < m; ++row)
+                {
+                    const float *src_row = fp32_data + row * n;
+                    Q8_1Block *dst_blocks = q8_blocks + row * blocks_per_row;
+
+                    const size_t n_full_blocks = n / BLOCK_SIZE;
+                    simd::quantize_fp32_to_q8_1_blocks(src_row, dst_blocks, n_full_blocks * BLOCK_SIZE);
+
+                    // Handle tail elements if any
+                    const size_t tail_start = n_full_blocks * BLOCK_SIZE;
+                    if (tail_start < static_cast<size_t>(n))
+                    {
+                        const size_t tail_count = n - tail_start;
+                        Q8_1Block &tail_block = dst_blocks[n_full_blocks];
+
+                        float tail_buf[BLOCK_SIZE] = {0};
+                        std::memcpy(tail_buf, src_row + tail_start, tail_count * sizeof(float));
+                        simd::quantize_fp32_to_q8_1_blocks(tail_buf, &tail_block, BLOCK_SIZE);
+                    }
+                }
+            }
 
             LOG_TRACE("[TP GEMM] Row-parallel TensorSlice completed for " << snapshot_key
                                                                           << " (m=" << m << ", n_local=" << n_local << "/" << n << ", k=" << k << ")");
             return true;
         }
 
-        // OLD PATH: Check for FP32 sliced weights (K dimension sliced)
+        // K-SLICED ROW-PARALLEL PATH: Weight K dimension is partitioned
+        // Weight is [n, k_local], input slice is [m, k_local]
+        // Each rank computes partial product, allreduce-sum combines results
         const auto &weight_shape = weight->shape();
         const int weight_k = static_cast<int>(weight_shape.size() == 2 ? weight_shape[1] : 0);
         const bool is_k_sliced = (weight_k > 0 && weight_k < k); // k_local < k_full means sharded
 
         if (is_k_sliced && mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
-            // TRUE ROW-PARALLEL GEMM:
-            // Weight is [n, k_local], need to use local input slice [m, k_local]
             const int world_size = mpi_ctx_->world_size();
             const int rank = mpi_ctx_->rank();
             const int k_local = weight_k;
             const int k_start = k_local * rank;
 
-            // Extract local input slice from full input
+            // Detect input/output tensor types
             const auto *input_fp32 = dynamic_cast<const FP32Tensor *>(input);
-            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+            auto *input_q8_1_mutable = const_cast<Q8_1Tensor *>(dynamic_cast<const Q8_1Tensor *>(input));
+            const auto *input_bf16 = dynamic_cast<const BF16Tensor *>(input);
+            const auto *input_fp16 = dynamic_cast<const FP16Tensor *>(input);
 
-            if (!input_fp32 || !output_fp32)
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
+            auto *output_q8_1 = dynamic_cast<Q8_1Tensor *>(output);
+            auto *output_bf16 = dynamic_cast<BF16Tensor *>(output);
+            auto *output_fp16 = dynamic_cast<FP16Tensor *>(output);
+
+            // Check Q8_1 block alignment for native k-slicing
+            constexpr size_t BLOCK_SIZE = Q8_1Block::BLOCK_SIZE; // 32
+            const bool k_start_aligned = Q8_1Tensor::is_k_aligned(k_start);
+            const bool k_local_aligned = Q8_1Tensor::is_k_aligned(k_local);
+            const bool q8_k_aligned = k_start_aligned && k_local_aligned;
+
+            // =====================================================================
+            // Q8_1 NATIVE PATH: Q8_1 input + Q8_1 output + aligned k-slicing
+            // GEMM produces Q8_1 output, native Q8_1 allreduce
+            // =====================================================================
+            if (input_q8_1_mutable && output_q8_1 && q8_k_aligned)
             {
-                LOG_ERROR("[TP GEMM] Row-parallel requires FP32 tensors");
-                return false;
+                // Native Q8_1 k-slicing for input
+                auto input_q8_1_sliced = input_q8_1_mutable->slice_k_blocks(k_start, k_local);
+                if (!input_q8_1_sliced)
+                {
+                    LOG_WARN("[TP GEMM] Q8_1 slice_k_blocks() failed, falling back to FP32 path");
+                    goto k_sliced_fp32_fallback;
+                }
+
+                // GEMM: [m, k_local] (Q8_1) @ [n, k_local]^T → [m, n] (Q8_1)
+                if (!typed_gemm_op_->execute(input_q8_1_sliced.get(), weight, output_q8_1, m, n, k_local,
+                                             mpi_ctx_.get(), target_device))
+                {
+                    LOG_ERROR("[TP GEMM] K-sliced Q8_1-native GEMM failed for " << snapshot_key);
+                    return false;
+                }
+
+                // Native Q8_1 allreduce-sum (AVX512 dequant→sum→requant)
+                Q8_1Block *blocks = output_q8_1->mutable_q8_1_blocks();
+                const size_t output_size = static_cast<size_t>(m) * n;
+                const size_t n_blocks = (output_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks);
+
+                LOG_TRACE("[TP GEMM] K-sliced Q8_1-native completed for " << snapshot_key
+                                                                          << " (m=" << m << ", n=" << n
+                                                                          << ", k_local=" << k_local << "/" << k << ")");
+                return true;
             }
 
-            // Create view of local input slice [m, k_local] starting at column k_start
-            // Note: For now we copy, but could use strided view for efficiency
-            std::vector<float> input_local(static_cast<size_t>(m) * k_local);
-            const float *src = input_fp32->data();
+            // =====================================================================
+            // BF16 NATIVE PATH: BF16 input + BF16 output
+            // GEMM produces BF16 output, native BF16 allreduce
+            // =====================================================================
+            if (input_bf16 && output_bf16)
+            {
+                // Create BF16 k-sliced input view
+                std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
+                BF16Tensor input_local(local_shape);
+
+                const uint16_t *src = input_bf16->bf16_data();
+                uint16_t *dst = input_local.mutable_bf16_data();
 
 #pragma omp parallel for
-            for (int row = 0; row < m; ++row)
-            {
-                const float *src_row = src + row * k + k_start;
-                float *dst_row = input_local.data() + row * k_local;
-                std::memcpy(dst_row, src_row, k_local * sizeof(float));
+                for (int row = 0; row < m; ++row)
+                {
+                    const uint16_t *src_row = src + row * k + k_start;
+                    uint16_t *dst_row = dst + row * k_local;
+                    std::memcpy(dst_row, src_row, k_local * sizeof(uint16_t));
+                }
+
+                // GEMM: [m, k_local] (BF16) @ [n, k_local]^T → [m, n] (BF16)
+                if (!typed_gemm_op_->execute(&input_local, weight, output_bf16, m, n, k_local,
+                                             mpi_ctx_.get(), target_device))
+                {
+                    LOG_ERROR("[TP GEMM] K-sliced BF16-native GEMM failed for " << snapshot_key);
+                    return false;
+                }
+
+                // Native BF16 allreduce-sum
+                uint16_t *out_data = output_bf16->mutable_bf16_data();
+                const size_t output_size = static_cast<size_t>(m) * n;
+                mpi_ctx_->allreduce_bf16_inplace(out_data, output_size);
+
+                LOG_TRACE("[TP GEMM] K-sliced BF16-native completed for " << snapshot_key);
+                return true;
             }
 
-            // Create temporary FP32Tensor for local input
-            std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
-            FP32Tensor input_local_tensor(local_shape);
-            std::memcpy(input_local_tensor.mutable_data(), input_local.data(), input_local.size() * sizeof(float));
-
-            // Perform GEMM: C_local = A_local @ W_local^T
-            // Dimensions: [m, k_local] @ [n, k_local]^T = [m, n]
-            // Use typed_gemm_op_ for consistency (though this path requires FP32)
-            if (!typed_gemm_op_->execute(&input_local_tensor, weight, output, m, n, k_local,
-                                         mpi_ctx_.get(), target_device))
+            // =====================================================================
+            // FP16 NATIVE PATH: FP16 input + FP16 output
+            // GEMM produces FP16 output, native FP16 allreduce
+            // =====================================================================
+            if (input_fp16 && output_fp16)
             {
-                LOG_ERROR("[TP GEMM] Row-parallel GEMM failed for " << snapshot_key);
+                // Create FP16 k-sliced input view
+                std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
+                FP16Tensor input_local(local_shape);
+
+                const uint16_t *src = input_fp16->fp16_data();
+                uint16_t *dst = input_local.mutable_fp16_data();
+
+#pragma omp parallel for
+                for (int row = 0; row < m; ++row)
+                {
+                    const uint16_t *src_row = src + row * k + k_start;
+                    uint16_t *dst_row = dst + row * k_local;
+                    std::memcpy(dst_row, src_row, k_local * sizeof(uint16_t));
+                }
+
+                // GEMM: [m, k_local] (FP16) @ [n, k_local]^T → [m, n] (FP16)
+                if (!typed_gemm_op_->execute(&input_local, weight, output_fp16, m, n, k_local,
+                                             mpi_ctx_.get(), target_device))
+                {
+                    LOG_ERROR("[TP GEMM] K-sliced FP16-native GEMM failed for " << snapshot_key);
+                    return false;
+                }
+
+                // Native FP16 allreduce-sum
+                uint16_t *out_data = output_fp16->mutable_fp16_data();
+                const size_t output_size = static_cast<size_t>(m) * n;
+                mpi_ctx_->allreduce_fp16_inplace(out_data, output_size);
+
+                LOG_TRACE("[TP GEMM] K-sliced FP16-native completed for " << snapshot_key);
+                return true;
+            }
+
+        // =====================================================================
+        // FP32 PATH (default) or Q8_1 FALLBACK (unaligned k)
+        // Uses FP32 for allreduce, requantizes to Q8_1 if needed
+        // =====================================================================
+        k_sliced_fp32_fallback:
+
+            // Prepare input for GEMM
+            std::shared_ptr<Q8_1Tensor> input_q8_1_sliced;
+            std::unique_ptr<FP32Tensor> input_local_tensor;
+            TensorBase *input_for_gemm = nullptr;
+
+            // Try Q8_1 native k-slicing if aligned (even if output will be FP32)
+            if (input_q8_1_mutable && q8_k_aligned)
+            {
+                input_q8_1_sliced = input_q8_1_mutable->slice_k_blocks(k_start, k_local);
+                if (input_q8_1_sliced)
+                {
+                    input_for_gemm = input_q8_1_sliced.get();
+                    LOG_DEBUG("[TP GEMM] Using Q8_1 k-slicing with FP32 output for " << snapshot_key);
+                }
+            }
+
+            // Fallback: dequantize Q8_1 or use FP32/BF16/FP16 directly with FP32 slice
+            if (!input_for_gemm)
+            {
+                const float *src = nullptr;
+                if (input_fp32)
+                {
+                    src = input_fp32->data();
+                }
+                else if (input_q8_1_mutable)
+                {
+                    src = input_q8_1_mutable->fp32_data(); // Dequantizes on-demand
+                }
+                else if (input_bf16)
+                {
+                    // BF16 input with non-BF16 output: dequantize to FP32
+                    LOG_DEBUG("[TP GEMM] BF16 input with non-BF16 output, using FP32 fallback");
+                    std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
+                    input_local_tensor = std::make_unique<FP32Tensor>(local_shape);
+                    float *dst = input_local_tensor->mutable_data();
+                    const uint16_t *bf16_src = input_bf16->bf16_data();
+
+#pragma omp parallel for
+                    for (int row = 0; row < m; ++row)
+                    {
+                        for (int col = 0; col < k_local; ++col)
+                        {
+                            uint16_t bf16_val = bf16_src[row * k + k_start + col];
+                            dst[row * k_local + col] = simd::bf16_to_fp32(bf16_val);
+                        }
+                    }
+                    input_for_gemm = input_local_tensor.get();
+                }
+                else if (input_fp16)
+                {
+                    // FP16 input with non-FP16 output: dequantize to FP32
+                    LOG_DEBUG("[TP GEMM] FP16 input with non-FP16 output, using FP32 fallback");
+                    std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
+                    input_local_tensor = std::make_unique<FP32Tensor>(local_shape);
+                    float *dst = input_local_tensor->mutable_data();
+                    const uint16_t *fp16_src = input_fp16->fp16_data();
+
+#pragma omp parallel for
+                    for (int row = 0; row < m; ++row)
+                    {
+                        for (int col = 0; col < k_local; ++col)
+                        {
+                            uint16_t fp16_val = fp16_src[row * k + k_start + col];
+                            dst[row * k_local + col] = simd::fp16_to_fp32(fp16_val);
+                        }
+                    }
+                    input_for_gemm = input_local_tensor.get();
+                }
+                else
+                {
+                    LOG_ERROR("[TP GEMM] K-sliced row-parallel requires FP32, Q8_1, BF16, or FP16 input");
+                    return false;
+                }
+
+                // Create FP32 slice if needed (FP32 or dequantized Q8_1 source)
+                if (src && !input_for_gemm)
+                {
+                    std::vector<float> input_local(static_cast<size_t>(m) * k_local);
+
+#pragma omp parallel for
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const float *src_row = src + row * k + k_start;
+                        float *dst_row = input_local.data() + row * k_local;
+                        std::memcpy(dst_row, src_row, k_local * sizeof(float));
+                    }
+
+                    std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
+                    input_local_tensor = std::make_unique<FP32Tensor>(local_shape);
+                    std::memcpy(input_local_tensor->mutable_data(), input_local.data(), input_local.size() * sizeof(float));
+                    input_for_gemm = input_local_tensor.get();
+                }
+            }
+
+            // Validate we have an input
+            if (!input_for_gemm)
+            {
+                LOG_ERROR("[TP GEMM] Failed to prepare input for k-sliced GEMM");
                 return false;
             }
 
-            // Allreduce-sum to combine partial results from all ranks
-            float *out_data = output_fp32->mutable_data();
+            // Prepare FP32 output buffer for allreduce
+            std::unique_ptr<FP32Tensor> output_fp32_temp;
+            FP32Tensor *output_for_allreduce = nullptr;
+
+            if (output_fp32)
+            {
+                output_for_allreduce = output_fp32;
+            }
+            else
+            {
+                // Non-FP32 output: use FP32 temporary for allreduce
+                output_fp32_temp = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
+                output_for_allreduce = output_fp32_temp.get();
+            }
+
+            // GEMM: [m, k_local] @ [n, k_local]^T → [m, n]
+            if (!typed_gemm_op_->execute(input_for_gemm, weight, output_for_allreduce, m, n, k_local,
+                                         mpi_ctx_.get(), target_device))
+            {
+                LOG_ERROR("[TP GEMM] K-sliced row-parallel GEMM failed for " << snapshot_key);
+                return false;
+            }
+
+            // FP32 allreduce-sum
+            float *out_data = output_for_allreduce->mutable_data();
             const size_t output_size = static_cast<size_t>(m) * n;
             mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
 
-            LOG_TRACE("[TP GEMM] Row-parallel (sharded) completed for " << snapshot_key
-                                                                        << " (m=" << m << ", n=" << n << ", k_local=" << k_local << "/" << k << ")");
+            // Convert FP32 result to output tensor type if needed
+            if (output_q8_1)
+            {
+                Q8_1Block *q8_blocks = output_q8_1->mutable_q8_1_blocks();
+                const float *fp32_data = output_for_allreduce->data();
+                const size_t blocks_per_row = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+#pragma omp parallel for
+                for (int row = 0; row < m; ++row)
+                {
+                    const float *src_row = fp32_data + row * n;
+                    Q8_1Block *dst_blocks = q8_blocks + row * blocks_per_row;
+
+                    const size_t n_full_blocks = n / BLOCK_SIZE;
+                    simd::quantize_fp32_to_q8_1_blocks(src_row, dst_blocks, n_full_blocks * BLOCK_SIZE);
+
+                    const size_t tail_start = n_full_blocks * BLOCK_SIZE;
+                    if (tail_start < static_cast<size_t>(n))
+                    {
+                        const size_t tail_count = n - tail_start;
+                        Q8_1Block &tail_block = dst_blocks[n_full_blocks];
+
+                        float tail_buf[BLOCK_SIZE] = {0};
+                        std::memcpy(tail_buf, src_row + tail_start, tail_count * sizeof(float));
+                        simd::quantize_fp32_to_q8_1_blocks(tail_buf, &tail_block, BLOCK_SIZE);
+                    }
+                }
+            }
+            else if (output_bf16)
+            {
+                const float *fp32_data = output_for_allreduce->data();
+                uint16_t *bf16_data = output_bf16->mutable_bf16_data();
+
+#pragma omp parallel for simd
+                for (size_t i = 0; i < output_size; ++i)
+                {
+                    bf16_data[i] = simd::fp32_to_bf16(fp32_data[i]);
+                }
+            }
+            else if (output_fp16)
+            {
+                const float *fp32_data = output_for_allreduce->data();
+                uint16_t *fp16_data = output_fp16->mutable_fp16_data();
+
+#pragma omp parallel for simd
+                for (size_t i = 0; i < output_size; ++i)
+                {
+                    fp16_data[i] = simd::fp32_to_fp16(fp32_data[i]);
+                }
+            }
+
+            LOG_TRACE("[TP GEMM] K-sliced row-parallel (FP32 path) completed for " << snapshot_key
+                                                                                   << " (m=" << m << ", n=" << n << ", k_local=" << k_local << "/" << k << ")");
+            return true;
         }
         else
         {
@@ -1455,17 +1975,17 @@ namespace llaminar2
 
             // For replicated weights: scale by 1/world_size then allreduce
             // This produces the same result as a single-rank computation
-            // NOTE: Only applies to FP32 output - Q8_1 output skips allreduce
-            // because Q8_1 blocks can't be allreduced (quantized values can't be summed)
+            // Dispatch by tensor type to use the appropriate native allreduce
             if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
             {
-                auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
-                if (output_fp32)
+                const size_t output_size = static_cast<size_t>(m) * n;
+                const int world_size = mpi_ctx_->world_size();
+                const float scale = 1.0f / world_size;
+
+                if (auto *output_fp32 = dynamic_cast<FP32Tensor *>(output))
                 {
+                    // FP32: Scale then allreduce
                     float *out_data = output_fp32->mutable_data();
-                    const size_t output_size = static_cast<size_t>(m) * n;
-                    const int world_size = mpi_ctx_->world_size();
-                    const float scale = 1.0f / world_size;
 
 #pragma omp parallel for simd
                     for (size_t i = 0; i < output_size; ++i)
@@ -1475,8 +1995,72 @@ namespace llaminar2
 
                     mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
 
-                    LOG_TRACE("[TP GEMM] Row-parallel (replicated fallback) for " << snapshot_key
-                                                                                  << " (m=" << m << ", n=" << n << ")");
+                    LOG_TRACE("[TP GEMM] Row-parallel (replicated) FP32 allreduce for " << snapshot_key
+                                                                                        << " (m=" << m << ", n=" << n << ")");
+                }
+                else if (auto *output_q8 = dynamic_cast<Q8_1Tensor *>(output))
+                {
+                    // Q8_1: Scale blocks then native Q8_1 allreduce
+                    Q8_1Block *blocks = output_q8->mutable_q8_1_blocks();
+                    if (!blocks)
+                    {
+                        LOG_ERROR("[TP GEMM] Row-parallel (replicated) failed to get mutable Q8_1 blocks");
+                        return false;
+                    }
+
+                    // Scale Q8_1 blocks by 1/world_size (scale the 'd' field)
+                    const size_t n_blocks = (output_size + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+#pragma omp parallel for
+                    for (size_t b = 0; b < n_blocks; ++b)
+                    {
+                        float d = fp16_to_fp32(blocks[b].d);
+                        blocks[b].d = fp32_to_fp16(d * scale);
+                    }
+
+                    mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks);
+
+                    LOG_TRACE("[TP GEMM] Row-parallel (replicated) Q8_1-native allreduce for " << snapshot_key
+                                                                                               << " (m=" << m << ", n=" << n << ", n_blocks=" << n_blocks << ")");
+                }
+                else if (auto *output_fp16 = dynamic_cast<FP16Tensor *>(output))
+                {
+                    // FP16: Scale then native FP16 allreduce
+                    uint16_t *fp16_data = output_fp16->mutable_fp16_data();
+                    if (!fp16_data)
+                    {
+                        LOG_ERROR("[TP GEMM] Row-parallel (replicated) failed to get mutable FP16 data");
+                        return false;
+                    }
+
+                    // Scale FP16 values by 1/world_size
+                    simd::fp16_scale_inplace(fp16_data, output_size, scale);
+
+                    mpi_ctx_->allreduce_fp16_inplace(fp16_data, output_size);
+
+                    LOG_TRACE("[TP GEMM] Row-parallel (replicated) FP16-native allreduce for " << snapshot_key
+                                                                                               << " (m=" << m << ", n=" << n << ")");
+                }
+                else if (auto *output_bf16 = dynamic_cast<BF16Tensor *>(output))
+                {
+                    // BF16: Scale then native BF16 allreduce
+                    uint16_t *bf16_data = output_bf16->mutable_bf16_data();
+                    if (!bf16_data)
+                    {
+                        LOG_ERROR("[TP GEMM] Row-parallel (replicated) failed to get mutable BF16 data");
+                        return false;
+                    }
+
+                    // Scale BF16 values by 1/world_size
+                    simd::bf16_scale_inplace(bf16_data, output_size, scale);
+
+                    mpi_ctx_->allreduce_bf16_inplace(bf16_data, output_size);
+
+                    LOG_TRACE("[TP GEMM] Row-parallel (replicated) BF16-native allreduce for " << snapshot_key
+                                                                                               << " (m=" << m << ", n=" << n << ")");
+                }
+                else
+                {
+                    LOG_WARN("[TP GEMM] Row-parallel (replicated) allreduce unsupported for output tensor type");
                 }
             }
         }
@@ -1512,47 +2096,69 @@ namespace llaminar2
         }
 
         // Allreduce-sum to combine partial results from all ranks
-        // NOTE: Required for BOTH FP32 and Q8_1 output when using column-parallel sharding.
+        // NOTE: Required for all activation precisions when using column-parallel sharding.
+        // Dispatch by tensor type to use the appropriate native allreduce.
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
-            auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
-            if (output_fp32)
+            const size_t output_size = static_cast<size_t>(m) * n;
+
+            if (auto *output_fp32 = dynamic_cast<FP32Tensor *>(output))
             {
+                // FP32: Use native MPI_FLOAT allreduce
                 float *out_data = output_fp32->mutable_data();
-                const size_t output_size = static_cast<size_t>(m) * n;
                 mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
 
-                LOG_TRACE("[TP GEMM] Column-parallel allreduce completed for " << snapshot_key
-                                                                               << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
+                LOG_TRACE("[TP GEMM] Column-parallel FP32 allreduce completed for " << snapshot_key
+                                                                                    << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
             }
             else if (auto *output_q8 = dynamic_cast<Q8_1Tensor *>(output))
             {
-                // Q8_1 output: allreduce in FP32 domain, then requantize.
-                // This is necessary because each rank computes only a partial sum.
-                const size_t output_size = static_cast<size_t>(m) * n;
-
-                const float *local_fp32 = output_q8->data();
-                if (!local_fp32)
+                // Q8_1: Use Q8_1-native allreduce (AVX512 vectorized)
+                // Each block is dequantized, summed, and requantized in SIMD registers.
+                Q8_1Block *blocks = output_q8->mutable_q8_1_blocks();
+                if (!blocks)
                 {
-                    LOG_ERROR("[TP GEMM] Column-parallel failed to dequantize Q8_1 output for allreduce");
+                    LOG_ERROR("[TP GEMM] Column-parallel failed to get mutable Q8_1 blocks for allreduce");
                     return false;
                 }
 
-                std::vector<float> reduced(output_size);
-                std::memcpy(reduced.data(), local_fp32, output_size * sizeof(float));
-                mpi_ctx_->allreduce_sum_inplace(reduced.data(), output_size);
+                // Calculate number of blocks: ceil(elements / 32)
+                const size_t n_blocks = (output_size + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks);
 
-                Q8_1Block *dst_blocks = output_q8->mutable_q8_1_blocks();
-                if (!dst_blocks)
+                LOG_TRACE("[TP GEMM] Column-parallel Q8_1-native allreduce completed for " << snapshot_key
+                                                                                           << " (m=" << m << ", n=" << n << ", k_local=" << k_local
+                                                                                           << ", n_blocks=" << n_blocks << ")");
+            }
+            else if (auto *output_fp16 = dynamic_cast<FP16Tensor *>(output))
+            {
+                // FP16: Use FP16-native allreduce (AVX512/AVX2 F16C vectorized)
+                uint16_t *fp16_data = output_fp16->mutable_fp16_data();
+                if (!fp16_data)
                 {
-                    LOG_ERROR("[TP GEMM] Column-parallel failed to get mutable Q8_1 blocks for requantization");
+                    LOG_ERROR("[TP GEMM] Column-parallel failed to get mutable FP16 data for allreduce");
                     return false;
                 }
 
-                simd::quantize_fp32_to_q8_1_blocks(reduced.data(), dst_blocks, output_size);
+                mpi_ctx_->allreduce_fp16_inplace(fp16_data, output_size);
 
-                LOG_TRACE("[TP GEMM] Column-parallel allreduce+requant completed for " << snapshot_key
-                                                                                       << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
+                LOG_TRACE("[TP GEMM] Column-parallel FP16-native allreduce completed for " << snapshot_key
+                                                                                           << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
+            }
+            else if (auto *output_bf16 = dynamic_cast<BF16Tensor *>(output))
+            {
+                // BF16: Use BF16-native allreduce (AVX512 vectorized)
+                uint16_t *bf16_data = output_bf16->mutable_bf16_data();
+                if (!bf16_data)
+                {
+                    LOG_ERROR("[TP GEMM] Column-parallel failed to get mutable BF16 data for allreduce");
+                    return false;
+                }
+
+                mpi_ctx_->allreduce_bf16_inplace(bf16_data, output_size);
+
+                LOG_TRACE("[TP GEMM] Column-parallel BF16-native allreduce completed for " << snapshot_key
+                                                                                           << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
             }
             else
             {

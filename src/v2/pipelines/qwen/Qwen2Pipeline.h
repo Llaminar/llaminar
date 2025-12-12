@@ -24,6 +24,7 @@
 #include "../ops/Ops.h"
 #include "../../tensors/BatchedKVCache.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "../../kernels/cpu/attention/FusedAttentionWoKernel.h"
 
 namespace llaminar2
 {
@@ -207,6 +208,9 @@ namespace llaminar2
 
         // Batched KV cache
         std::shared_ptr<BatchedKVCache> kv_cache_batched_;
+
+        // Fused attention + Wo projection kernel (optional, enabled via config.use_fused_attention)
+        std::unique_ptr<FusedAttentionWoKernel> fused_attn_wo_kernel_;
 
         // NOTE: Ops are now in PipelineBase (rmsnorm_op_, gemm_op_, etc.)
         // Child pipelines use the declarative methods: rms_norm(), project(), add_residual(), etc.

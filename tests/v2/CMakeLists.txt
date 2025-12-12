@@ -272,6 +272,36 @@ add_v2_test(V2_Unit_Q8_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
+# Test: Q8_1 Block-Aligned Slicing for tensor-parallel GEMM
+# Phase 6.4: Validates slice_k_blocks() for k-dimension splitting at 32-element boundaries
+add_executable(v2_test_q8_1_block_aligned_slicing unit/tensors/Test__Q8_1_BlockAlignedSlicing.cpp)
+target_link_libraries(v2_test_q8_1_block_aligned_slicing 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_BlockAlignedSlicing 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_block_aligned_slicing>
+    LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;TensorParallel;KSlicing"
+    MPI_PROCS 1  # Block slicing is local, no MPI needed
+)
+
+# Test: TensorFactory device_index assignment (regression test for CLI Q8_1 bug)
+# Verifies that Q8_1, BF16, FP16 activation tensors have correct device_index
+# after creation via createActivation(). Bug: tensors were created with device=-1
+# even when device_idx=0 was passed, causing spurious device transfer attempts.
+add_executable(v2_test_tensor_factory_device_idx unit/Test__TensorFactory_DeviceIndex.cpp)
+target_link_libraries(v2_test_tensor_factory_device_idx 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorFactory_DeviceIndex 
+    COMMAND $<TARGET_FILE:v2_test_tensor_factory_device_idx>
+    LABELS "V2;Unit;TensorOperations;TensorFactory;DeviceManagement;RegressionTest"
+    MPI_PROCS 1  # Single-rank test, no MPI needed
+)
+
 # Test: Q8_1 Add Reproduction (Divergence Investigation)
 add_executable(v2_test_q8_1_add_repro unit/tensors/Test__Q8_1_Add_Repro.cpp)
 target_link_libraries(v2_test_q8_1_add_repro 
@@ -928,6 +958,19 @@ add_v2_test(V2_Unit_BF16_SIMD_Accuracy
     COMMAND $<TARGET_FILE:v2_test_bf16_simd_accuracy>
     LABELS "V2;Unit;TensorOperations;SIMD;BF16;AVX2;AVX512;Quantization;AccuracyTest"
     MPI_PROCS 1  # CPU-only SIMD tests, single rank
+)
+
+# Test: Precision-aware allreduce N-way sum functions (FP16, BF16, Q8_1)
+add_executable(v2_test_precision_aware_allreduce unit/mpi/Test__PrecisionAwareAllreduce.cpp)
+target_link_libraries(v2_test_precision_aware_allreduce 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PrecisionAwareAllreduce
+    COMMAND $<TARGET_FILE:v2_test_precision_aware_allreduce>
+    LABELS "V2;Unit;MPI;Allreduce;SIMD;FP16;BF16;Q8_1;AVX512;Precision"
+    MPI_PROCS 1  # Tests SIMD sum functions locally, no MPI communication needed
 )
 
 # NOTE: Q8_0 decode vectorization test removed - depends on obsolete gemm implementations
@@ -2169,6 +2212,34 @@ add_v2_test(V2_Integration_Q8_1_MPI_TensorParallel
     LABELS "V2;Integration;Attention;MPI;TensorParallel;Q8_1;GQA;Orchestration"
 )
 
+# Test: Precision-Aware MPI Allreduce Integration Tests
+# Tests actual MPI communication for FP32, FP16, BF16, and Q8_1 formats
+# Validates correctness of partial sum accumulation across ranks
+add_executable(v2_integration_mpi_precision_allreduce integration/Test__MPI_PrecisionAwareAllreduce.cpp)
+target_link_libraries(v2_integration_mpi_precision_allreduce
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_PrecisionAwareAllreduce
+    COMMAND $<TARGET_FILE:v2_integration_mpi_precision_allreduce>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;Allreduce;FP32;FP16;BF16;Q8_1;Bandwidth"
+)
+
+# Test: Row-Parallel Multi-Precision MPI Integration Tests
+# Tests TensorSlice and k-sliced row-parallel GEMM with FP32, BF16, FP16, Q8_1
+# Validates allgatherv (TensorSlice) and allreduce-sum (k-sliced) patterns
+add_executable(v2_integration_mpi_row_parallel_multiprecision integration/Test__MPI_RowParallelMultiPrecision.cpp)
+target_link_libraries(v2_integration_mpi_row_parallel_multiprecision
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_RowParallelMultiPrecision
+    COMMAND $<TARGET_FILE:v2_integration_mpi_row_parallel_multiprecision>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;RowParallel;TensorSlice;KSliced;Allgatherv;Allreduce;FP32;BF16;FP16;Q8_1;TensorParallel"
+)
+
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
 # Large matrices, mixed precision, strided layouts, fused softmax, causal masking
 add_executable(v2_integration_fp_gemm integration/Test__FloatingPointGemmKernel.cpp)
@@ -2713,6 +2784,7 @@ add_v2_test(V2_Unit_FusedAttentionWo_Tiled
     MPI_PROCS 1
 )
 
+
 # Test: JIT Microkernels - Modular JIT attention microkernels (Phase 4)
 # Tests for: JitFastExp, JitQ8DotProduct, JitOnlineSoftmax, JitVWeightedAccum, JitWoProjection
 add_executable(v2_test_jit_microkernels unit/attention/Test__JitMicrokernels.cpp)
@@ -2726,3 +2798,51 @@ add_v2_test(V2_Unit_JitMicrokernels
     LABELS "V2;Unit;JIT;Microkernels;FusedAttention;AVX512;Xbyak;FastExp;Q8DotProduct;OnlineSoftmax"
     MPI_PROCS 1
 )
+
+# Test: JIT Fused Attention + Wo - Composed JIT kernel (Phase 4)
+# Tests the complete fused attention + Wo projection JIT kernel
+add_executable(v2_test_jit_fused_attention_wo unit/attention/Test__JitFusedAttentionWo.cpp)
+target_link_libraries(v2_test_jit_fused_attention_wo 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttentionWo 
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo>
+    LABELS "V2;Unit;JIT;FusedAttention;WoProjection;AVX512;Xbyak;Q8_1"
+    MPI_PROCS 1
+)
+
+# Test: JIT Fused Attention + Wo - Numerical Correctness Tests
+# Comprehensive tests comparing JIT kernel against reference implementation
+# Covers Qwen 0.5B, 7B, 32B model configurations with various sequence lengths
+add_executable(v2_test_jit_fused_attention_wo_correctness unit/attention/Test__JitFusedAttentionWo_Correctness.cpp)
+target_link_libraries(v2_test_jit_fused_attention_wo_correctness 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness 
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_correctness>
+    LABELS "V2;Unit;JIT;FusedAttention;Correctness;AVX512;Q8_1;NumericalParity"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Phase 5: Pipeline Integration - FusedAttentionWoKernel wrapper
+# =============================================================================
+
+# Test: FusedAttentionWoKernel - Pipeline-compatible wrapper for fused attention
+# Tests all backends (Reference, Tiled, JIT) and verifies cross-backend parity
+add_executable(v2_test_fused_attention_wo_kernel integration/attention/Test__FusedAttentionWoKernel.cpp)
+target_link_libraries(v2_test_fused_attention_wo_kernel 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_FusedAttentionWoKernel 
+    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_kernel>
+    LABELS "V2;Integration;FusedAttention;PipelineWrapper;JIT;Tiled;Reference;Q8_1"
+    MPI_PROCS 1
+)
+

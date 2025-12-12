@@ -310,6 +310,18 @@ int main(int argc, char *argv[])
         pipeline_config.activation_precision = ActivationPrecision::FP32;
     }
 
+    // Fused attention + Wo kernel (experimental)
+    pipeline_config.use_fused_attention = args.use_fused_attention;
+    if (args.use_fused_attention && mpi_ctx->rank() == 0)
+    {
+        LOG_INFO("Fused attention+Wo kernel enabled (experimental)");
+        if (pipeline_config.activation_precision != ActivationPrecision::Q8_1)
+        {
+            LOG_WARN("Fused attention requires Q8_1 activation precision, current: "
+                     << args.activation_precision << ". Will use unfused path.");
+        }
+    }
+
     // Determine weight distribution strategy
     // Default: sharding enabled when world_size > 1 (unless explicitly disabled)
     WeightDistributionStrategy weight_strategy = WeightDistributionStrategy::REPLICATED;

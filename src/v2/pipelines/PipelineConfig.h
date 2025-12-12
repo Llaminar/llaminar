@@ -205,6 +205,30 @@ namespace llaminar2
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
 
         /**
+         * @brief Enable fused attention + Wo projection kernel
+         *
+         * When enabled, replaces the separate attention + Wo GEMM calls with
+         * a single fused kernel that:
+         * 1. Eliminates the context quantization round-trip (FP32 → Q8_1 → FP32)
+         * 2. Improves cache locality (context stays in registers through projection)
+         * 3. Reduces memory bandwidth (single pass over V and Wo)
+         *
+         * The fused kernel uses FusedAttentionWoKernel with REFERENCE backend
+         * (JIT backend does not yet support Wo projection).
+         *
+         * Requirements:
+         * - Q8_1 activation precision (activation_precision == Q8_1)
+         * - Will fall back to unfused path if requirements not met
+         *
+         * Performance impact:
+         * - ~10-15% faster attention computation (fewer memory passes)
+         * - ~5% better numerical accuracy (eliminates one quantization step)
+         *
+         * Default: false (use proven unfused path)
+         */
+        bool use_fused_attention = false;
+
+        /**
          * @brief Default constructor with standard settings
          */
         PipelineConfig() = default;

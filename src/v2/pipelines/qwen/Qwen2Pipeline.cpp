@@ -181,6 +181,32 @@ namespace llaminar2
         LOG_DEBUG("Initialized batched KV cache: batch_size=" << batch_size_
                                                               << ", max_seq_len=" << config.max_seq_len);
 
+        // =============================================================================
+        // Fused Attention + Wo Kernel (Phase 5: experimental, optional)
+        // =============================================================================
+        // When enabled via config.use_fused_attention, use fused kernel that:
+        // 1. Eliminates context quantization round-trip (FP32 → Q8_1 → FP32)
+        // 2. Improves cache locality (context stays in registers through projection)
+        // Only supported with Q8_1 activation precision currently.
+        // =============================================================================
+        if (config_.use_fused_attention && config_.activation_precision == ActivationPrecision::Q8_1)
+        {
+            FusedAttentionWoKernel::Config fused_config;
+            fused_config.num_heads = n_heads_;
+            fused_config.num_kv_heads = n_kv_heads_;
+            fused_config.head_dim = head_dim_;
+            fused_config.d_model = d_model_;
+            // Use REFERENCE backend initially (JIT doesn't apply Wo projection yet)
+            fused_config.backend = FusedAttentionBackend::REFERENCE;
+
+            fused_attn_wo_kernel_ = std::make_unique<FusedAttentionWoKernel>(fused_config);
+            LOG_INFO("Fused attention+Wo kernel enabled (backend=REFERENCE)");
+        }
+        else if (config_.use_fused_attention)
+        {
+            LOG_WARN("Fused attention requires Q8_1 activation precision, using unfused path");
+        }
+
         LOG_DEBUG("Pipeline initialized (weights loaded on-demand)");
     }
 
@@ -854,53 +880,104 @@ namespace llaminar2
             }
         }
 
-        // Compute attention
-        if (use_kv_cache && kv_seq_len != effective_seq_len)
+        // Compute attention + Wo projection
+        // Two paths: fused kernel (when enabled) or unfused (separate attention + GEMM)
+
+        if (fused_attn_wo_kernel_)
         {
-            // Decode path: Q has fewer tokens than cached K/V
-            // Use compute_attention_with_kv_cache which handles asymmetric lengths
-            TRY_OP(compute_attention_with_kv_cache(
-                buffers.Q.get(), K_for_attention, V_for_attention, buffers.attn_output.get(),
-                effective_seq_len, kv_seq_len, n_heads_, n_kv_heads_, head_dim_,
-                batch_size_, sequence_lengths_,
-                /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
+            // =================================================================
+            // FUSED PATH: Attention + Wo in single kernel
+            // Benefits:
+            // 1. Eliminates context quantization round-trip (FP32 → Q8_1 → FP32)
+            // 2. Better cache locality (context stays in registers through projection)
+            // 3. Single pass over V and Wo (reduced memory bandwidth)
+            // =================================================================
+
+            // The fused kernel takes Q8_1 inputs (Q, K, V) and Q8_1 Wo weight,
+            // outputs directly to FP32 attn_proj (skipping intermediate attn_output)
+            int position_offset = 0;
+            if (use_kv_cache && kv_seq_len > effective_seq_len)
+            {
+                // Decode mode: position offset for causal mask
+                position_offset = kv_seq_len - effective_seq_len;
+            }
+
+            bool fused_success = fused_attn_wo_kernel_->compute(
+                buffers.Q.get(),
+                K_for_attention,
+                V_for_attention,
+                layer.wo.get(),
+                buffers.attn_proj.get(), // Output directly to projection buffer (skip attn_output)
+                effective_seq_len,
+                kv_seq_len,
+                /*causal=*/true,
+                position_offset);
+
+            if (!fused_success)
+            {
+                LOG_ERROR("Fused attention+Wo kernel failed at layer " << layer_idx);
+                return false;
+            }
+
+            capture_snapshot(layer_prefix + "_ATTENTION_CONTEXT", buffers.attn_proj.get(),
+                             effective_seq_len, d_model_);
+            capture_snapshot(layer_prefix + "_ATTENTION_OUTPUT", buffers.attn_proj.get(),
+                             effective_seq_len, d_model_);
         }
         else
         {
-            // Prefill path or no KV cache: Q/K/V have same length
-            TRY_OP(compute_attention(
-                buffers.Q.get(), K_for_attention, V_for_attention, buffers.attn_output.get(),
-                effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
-                batch_size_, sequence_lengths_, padded_seq_len_,
-                /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
-        }
+            // =================================================================
+            // UNFUSED PATH: Separate attention + Wo GEMM (original flow)
+            // =================================================================
 
-        // DEBUG: Print attention output for layer 0
-        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-        {
-            auto *attn_out_fp32 = dynamic_cast<FP32Tensor *>(buffers.attn_output.get());
-            if (attn_out_fp32)
+            // Compute attention
+            if (use_kv_cache && kv_seq_len != effective_seq_len)
             {
-                const float *attn_data = attn_out_fp32->data();
-                int last_pos = effective_seq_len - 1;
-                int attn_dim = n_heads_ * head_dim_;
-                std::ostringstream oss;
-                oss << "Layer 0 attention output (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, attn_dim); ++i)
-                {
-                    oss << attn_data[last_pos * attn_dim + i] << ", ";
-                }
-                LOG_TRACE(oss.str());
+                // Decode path: Q has fewer tokens than cached K/V
+                // Use compute_attention_with_kv_cache which handles asymmetric lengths
+                TRY_OP(compute_attention_with_kv_cache(
+                    buffers.Q.get(), K_for_attention, V_for_attention, buffers.attn_output.get(),
+                    effective_seq_len, kv_seq_len, n_heads_, n_kv_heads_, head_dim_,
+                    batch_size_, sequence_lengths_,
+                    /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
             }
-        }
+            else
+            {
+                // Prefill path or no KV cache: Q/K/V have same length
+                TRY_OP(compute_attention(
+                    buffers.Q.get(), K_for_attention, V_for_attention, buffers.attn_output.get(),
+                    effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
+                    batch_size_, sequence_lengths_, padded_seq_len_,
+                    /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
+            }
 
-        // 5. Output projection (row-parallel: needs allreduce for tensor parallelism)
-        // Wo projection: [seq, n_heads*head_dim] @ [d_model, n_heads*head_dim].T -> [seq, d_model]
-        // In tensor parallelism: attention output is partitioned by heads, so Wo sees partitioned input
-        TRY_OP(project_row_parallel(
-            buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
-            effective_seq_len, d_model_, n_heads_ * head_dim_,
-            layer_prefix + "_ATTENTION_OUTPUT", attn_device));
+            // DEBUG: Print attention output for layer 0
+            if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
+            {
+                auto *attn_out_fp32 = dynamic_cast<FP32Tensor *>(buffers.attn_output.get());
+                if (attn_out_fp32)
+                {
+                    const float *attn_data = attn_out_fp32->data();
+                    int last_pos = effective_seq_len - 1;
+                    int attn_dim = n_heads_ * head_dim_;
+                    std::ostringstream oss;
+                    oss << "Layer 0 attention output (last position, first 10 values): ";
+                    for (int i = 0; i < std::min(10, attn_dim); ++i)
+                    {
+                        oss << attn_data[last_pos * attn_dim + i] << ", ";
+                    }
+                    LOG_TRACE(oss.str());
+                }
+            }
+
+            // 5. Output projection (row-parallel: needs allreduce for tensor parallelism)
+            // Wo projection: [seq, n_heads*head_dim] @ [d_model, n_heads*head_dim].T -> [seq, d_model]
+            // In tensor parallelism: attention output is partitioned by heads, so Wo sees partitioned input
+            TRY_OP(project_row_parallel(
+                buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
+                effective_seq_len, d_model_, n_heads_ * head_dim_,
+                layer_prefix + "_ATTENTION_OUTPUT", attn_device));
+        }
 
         // DEBUG: Print output projection for layer 0
         if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)

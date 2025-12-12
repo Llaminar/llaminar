@@ -978,4 +978,72 @@ namespace llaminar2
         return true;
     }
 
+    // ===== Q8_1 Block-Aligned K-Slicing (Phase 6.4) =====
+
+    std::shared_ptr<Q8_1Tensor> Q8_1Tensor::slice_k_blocks(size_t k_start, size_t k_size) const
+    {
+        // Validate k_start alignment (must be multiple of BLOCK_SIZE=32)
+        if (!is_k_aligned(k_start))
+        {
+            LOG_ERROR("[Q8_1Tensor::slice_k_blocks] k_start=" << k_start
+                                                              << " is not aligned to block boundary (must be multiple of "
+                                                              << Q8_1Block::BLOCK_SIZE << ")");
+            return nullptr;
+        }
+
+        // Validate k_size alignment (must be multiple of BLOCK_SIZE=32, or extend to end)
+        const size_t cols = shape_[1];
+        const size_t k_end = k_start + k_size;
+        const bool extends_to_end = (k_end == cols);
+        const bool is_tail_aligned = (k_size % Q8_1Block::BLOCK_SIZE == 0) || extends_to_end;
+
+        if (!is_tail_aligned)
+        {
+            LOG_ERROR("[Q8_1Tensor::slice_k_blocks] k_size=" << k_size
+                                                             << " is not aligned (must be multiple of "
+                                                             << Q8_1Block::BLOCK_SIZE << " or extend to end of tensor)");
+            return nullptr;
+        }
+
+        // Validate bounds
+        if (k_end > cols)
+        {
+            LOG_ERROR("[Q8_1Tensor::slice_k_blocks] slice exceeds bounds: k_start=" << k_start
+                                                                                    << ", k_size=" << k_size
+                                                                                    << ", cols=" << cols);
+            return nullptr;
+        }
+
+        // Calculate block counts
+        const size_t rows = shape_[0];
+        const size_t src_blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const size_t dst_blocks_per_row = (k_size + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const size_t start_block_idx = k_start / Q8_1Block::BLOCK_SIZE;
+
+        // Create new Q8_1Tensor with sliced shape
+        std::vector<size_t> new_shape = {rows, k_size};
+        auto result = std::make_shared<Q8_1Tensor>(new_shape, device_idx_);
+
+        // Get source and destination block pointers
+        const uint8_t *src_data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q8_1Block *src_blocks = reinterpret_cast<const Q8_1Block *>(src_data_ptr);
+        Q8_1Block *dst_blocks = result->mutable_q8_1_blocks();
+
+        // Copy blocks row by row (cannot be a zero-copy view since we're slicing columns)
+#pragma omp parallel for schedule(static)
+        for (size_t row = 0; row < rows; ++row)
+        {
+            const Q8_1Block *src_row = src_blocks + row * src_blocks_per_row + start_block_idx;
+            Q8_1Block *dst_row = dst_blocks + row * dst_blocks_per_row;
+            std::memcpy(dst_row, src_row, dst_blocks_per_row * sizeof(Q8_1Block));
+        }
+
+        LOG_TRACE("[Q8_1Tensor::slice_k_blocks] Created k-slice: [" << rows << ", " << k_size
+                                                                    << "] from [" << rows << ", " << cols
+                                                                    << "] at k_start=" << k_start
+                                                                    << " (" << dst_blocks_per_row << " blocks/row)");
+
+        return result;
+    }
+
 } // namespace llaminar2

@@ -1528,6 +1528,646 @@ namespace llaminar2
         }
 
         /**
+         * @brief Sum multiple Q8_1 block arrays into one (N-way reduction)
+         *
+         * Used for MPI allreduce operations where we need to sum Q8_1 contributions
+         * from N ranks. This is more efficient than N-1 pairwise additions.
+         *
+         * Algorithm per block:
+         * 1. Dequantize all N blocks to FP32 (accumulated in registers)
+         * 2. Sum all FP32 values
+         * 3. Find new max_abs for quantization
+         * 4. Requantize to Q8_1
+         *
+         * @param inputs Array of N pointers to Q8_1 block arrays
+         * @param n_inputs Number of input arrays (typically world_size)
+         * @param output Output Q8_1 block buffer
+         * @param n_blocks Number of blocks per array
+         */
+        inline void q8_1_sum_n(
+            const Q8_1Block *const *inputs, size_t n_inputs, Q8_1Block *output, size_t n_blocks)
+        {
+            if (n_inputs == 0)
+                return;
+            if (n_inputs == 1)
+            {
+                // Copy directly (q8_1_copy may not be declared yet)
+                std::memcpy(output, inputs[0], n_blocks * sizeof(Q8_1Block));
+                return;
+            }
+            if (n_inputs == 2)
+            {
+                q8_1_add_q8_1(inputs[0], inputs[1], output, n_blocks * 32);
+                return;
+            }
+
+            // N-way reduction (N >= 3)
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                alignas(64) float sum_vals[32] = {0.0f};
+
+#ifdef __AVX512F__
+                // Initialize accumulators to zero
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+
+                // Accumulate all inputs
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q8_1Block &block = inputs[i][blk];
+                    const float scale = fp16_to_fp32(block.d);
+
+                    __m128i q_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+                    __m128i q_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + 16));
+
+                    __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q_lo)), _mm512_set1_ps(scale));
+                    __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q_hi)), _mm512_set1_ps(scale));
+
+                    acc0 = _mm512_add_ps(acc0, f0);
+                    acc1 = _mm512_add_ps(acc1, f1);
+                }
+
+                // Find max_abs for requantization
+                __m512 abs0 = _mm512_abs_ps(acc0);
+                __m512 abs1 = _mm512_abs_ps(acc1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
+
+                Q8_1Block &block_out = output[blk];
+
+                if (max_abs < 1e-6f)
+                {
+                    block_out.d = 0;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 32);
+                    continue;
+                }
+
+                // Compute scale and inverse
+                float out_scale = max_abs / 127.0f;
+                float inv_scale = 127.0f / max_abs;
+                block_out.d = fp32_to_fp16(out_scale);
+
+                // Quantize: round(sum * inv_scale), clamp to [-127, 127]
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(acc0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(acc1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                // Clamp to [-127, 127] and pack to int8
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
+
+                // Pack 32-bit to 8-bit
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+                __m128i bytes0 = _mm256_cvtepi16_epi8(packed0);
+                __m128i bytes1 = _mm256_cvtepi16_epi8(packed1);
+
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block_out.qs), bytes0);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block_out.qs + 16), bytes1);
+
+                // Compute sum_qs (raw integer sum)
+                int32_t sum_qs = 0;
+                for (int j = 0; j < 32; ++j)
+                {
+                    sum_qs += block_out.qs[j];
+                }
+                block_out.sum_qs = static_cast<int16_t>(sum_qs);
+
+#elif defined(__AVX2__)
+                // AVX2: Accumulate to temp buffer then quantize
+                __m256 acc_0 = _mm256_setzero_ps();
+                __m256 acc_1 = _mm256_setzero_ps();
+                __m256 acc_2 = _mm256_setzero_ps();
+                __m256 acc_3 = _mm256_setzero_ps();
+
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q8_1Block &block = inputs[i][blk];
+                    const float scale = fp16_to_fp32(block.d);
+                    __m256 scale_vec = _mm256_set1_ps(scale);
+
+                    for (int chunk = 0; chunk < 4; ++chunk)
+                    {
+                        __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + chunk * 8));
+                        __m256i q32 = _mm256_cvtepi8_epi32(q8);
+                        __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(q32), scale_vec);
+                        switch (chunk)
+                        {
+                        case 0:
+                            acc_0 = _mm256_add_ps(acc_0, f);
+                            break;
+                        case 1:
+                            acc_1 = _mm256_add_ps(acc_1, f);
+                            break;
+                        case 2:
+                            acc_2 = _mm256_add_ps(acc_2, f);
+                            break;
+                        case 3:
+                            acc_3 = _mm256_add_ps(acc_3, f);
+                            break;
+                        }
+                    }
+                }
+
+                // Store to temp buffer for max_abs and quantization
+                _mm256_store_ps(sum_vals, acc_0);
+                _mm256_store_ps(sum_vals + 8, acc_1);
+                _mm256_store_ps(sum_vals + 16, acc_2);
+                _mm256_store_ps(sum_vals + 24, acc_3);
+
+                // Find max_abs
+                __m256 abs0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), acc_0);
+                __m256 abs1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), acc_1);
+                __m256 abs2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), acc_2);
+                __m256 abs3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), acc_3);
+                __m256 vmax_01 = _mm256_max_ps(abs0, abs1);
+                __m256 vmax_23 = _mm256_max_ps(abs2, abs3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                Q8_1Block &block_out = output[blk];
+
+                if (max_abs < 1e-6f)
+                {
+                    block_out.d = 0;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 32);
+                    continue;
+                }
+
+                float out_scale = max_abs / 127.0f;
+                float inv_scale = 127.0f / max_abs;
+                block_out.d = fp32_to_fp16(out_scale);
+
+                int32_t sum_qs_val = 0;
+                for (int j = 0; j < 32; ++j)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(sum_vals[j] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    block_out.qs[j] = static_cast<int8_t>(q);
+                    sum_qs_val += q;
+                }
+                block_out.sum_qs = static_cast<int16_t>(sum_qs_val);
+
+#else
+                // Scalar fallback
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q8_1Block &block = inputs[i][blk];
+                    const float scale = fp16_to_fp32(block.d);
+                    for (int j = 0; j < 32; ++j)
+                    {
+                        sum_vals[j] += scale * static_cast<float>(block.qs[j]);
+                    }
+                }
+
+                float max_abs = 0.0f;
+                for (int j = 0; j < 32; ++j)
+                {
+                    max_abs = std::max(max_abs, std::abs(sum_vals[j]));
+                }
+
+                Q8_1Block &block_out = output[blk];
+
+                if (max_abs < 1e-6f)
+                {
+                    block_out.d = 0;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 32);
+                    continue;
+                }
+
+                float out_scale = max_abs / 127.0f;
+                float inv_scale = 127.0f / max_abs;
+                block_out.d = fp32_to_fp16(out_scale);
+
+                int32_t sum_qs_val = 0;
+                for (int j = 0; j < 32; ++j)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(sum_vals[j] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    block_out.qs[j] = static_cast<int8_t>(q);
+                    sum_qs_val += q;
+                }
+                block_out.sum_qs = static_cast<int16_t>(sum_qs_val);
+#endif
+            }
+        }
+
+        /**
+         * @brief Sum multiple FP16 arrays into one (N-way reduction)
+         *
+         * Used for MPI allreduce operations where we need to sum FP16 contributions
+         * from N ranks. Uses AVX512 FP16 intrinsics when available, otherwise
+         * converts to FP32 for the reduction.
+         *
+         * @param inputs Array of N pointers to FP16 arrays (uint16_t representing FP16)
+         * @param n_inputs Number of input arrays (typically world_size)
+         * @param output Output FP16 buffer
+         * @param count Number of FP16 elements per array
+         */
+        inline void fp16_sum_n(
+            const uint16_t *const *inputs, size_t n_inputs, uint16_t *output, size_t count)
+        {
+            if (n_inputs == 0)
+                return;
+            if (n_inputs == 1)
+            {
+                std::memcpy(output, inputs[0], count * sizeof(uint16_t));
+                return;
+            }
+
+#ifdef __AVX512F__
+            // AVX512: Process 16 FP16 values at a time
+            const size_t vec_count = count / 16;
+            const size_t tail_start = vec_count * 16;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                // Initialize accumulator with first input (convert FP16 -> FP32)
+                __m256i fp16_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(inputs[0] + i * 16));
+                __m512 acc = _mm512_cvtph_ps(fp16_0);
+
+                // Accumulate remaining inputs
+                for (size_t j = 1; j < n_inputs; ++j)
+                {
+                    __m256i fp16_j = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(inputs[j] + i * 16));
+                    __m512 fp32_j = _mm512_cvtph_ps(fp16_j);
+                    acc = _mm512_add_ps(acc, fp32_j);
+                }
+
+                // Convert back to FP16 and store
+                __m256i result = _mm512_cvtps_ph(acc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + i * 16), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float sum = 0.0f;
+                for (size_t j = 0; j < n_inputs; ++j)
+                {
+                    sum += fp16_to_fp32(inputs[j][i]);
+                }
+                output[i] = fp32_to_fp16(sum);
+            }
+
+#elif defined(__AVX2__)
+            // AVX2: Process 8 FP16 values at a time using F16C
+            const size_t vec_count = count / 8;
+            const size_t tail_start = vec_count * 8;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                // Initialize accumulator with first input
+                __m128i fp16_0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(inputs[0] + i * 8));
+                __m256 acc = _mm256_cvtph_ps(fp16_0);
+
+                // Accumulate remaining inputs
+                for (size_t j = 1; j < n_inputs; ++j)
+                {
+                    __m128i fp16_j = _mm_loadu_si128(reinterpret_cast<const __m128i *>(inputs[j] + i * 8));
+                    __m256 fp32_j = _mm256_cvtph_ps(fp16_j);
+                    acc = _mm256_add_ps(acc, fp32_j);
+                }
+
+                // Convert back to FP16 and store
+                __m128i result = _mm256_cvtps_ph(acc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(output + i * 8), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float sum = 0.0f;
+                for (size_t j = 0; j < n_inputs; ++j)
+                {
+                    sum += fp16_to_fp32(inputs[j][i]);
+                }
+                output[i] = fp32_to_fp16(sum);
+            }
+
+#else
+            // Scalar fallback
+            for (size_t i = 0; i < count; ++i)
+            {
+                float sum = 0.0f;
+                for (size_t j = 0; j < n_inputs; ++j)
+                {
+                    sum += fp16_to_fp32(inputs[j][i]);
+                }
+                output[i] = fp32_to_fp16(sum);
+            }
+#endif
+        }
+
+        /**
+         * @brief Sum multiple BF16 arrays into one (N-way reduction)
+         *
+         * Used for MPI allreduce operations where we need to sum BF16 contributions
+         * from N ranks. Uses AVX512 BF16 intrinsics when available (with AVX512BF16),
+         * otherwise uses FP32 conversion.
+         *
+         * @param inputs Array of N pointers to BF16 arrays (uint16_t representing BF16)
+         * @param n_inputs Number of input arrays (typically world_size)
+         * @param output Output BF16 buffer
+         * @param count Number of BF16 elements per array
+         */
+        inline void bf16_sum_n(
+            const uint16_t *const *inputs, size_t n_inputs, uint16_t *output, size_t count)
+        {
+            if (n_inputs == 0)
+                return;
+            if (n_inputs == 1)
+            {
+                std::memcpy(output, inputs[0], count * sizeof(uint16_t));
+                return;
+            }
+
+#ifdef __AVX512F__
+            // AVX512: Process 16 BF16 values at a time
+            // BF16 to FP32: Just shift left by 16 bits (zeros in low bits)
+            const size_t vec_count = count / 16;
+            const size_t tail_start = vec_count * 16;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                // Initialize accumulator with first input (BF16 -> FP32)
+                // BF16 conversion: load 16-bit, sign-extend to 32-bit, shift left 16
+                __m256i bf16_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(inputs[0] + i * 16));
+                __m512i bf16_32_0 = _mm512_cvtepu16_epi32(bf16_0);
+                __m512i fp32_bits_0 = _mm512_slli_epi32(bf16_32_0, 16);
+                __m512 acc = _mm512_castsi512_ps(fp32_bits_0);
+
+                // Accumulate remaining inputs
+                for (size_t j = 1; j < n_inputs; ++j)
+                {
+                    __m256i bf16_j = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(inputs[j] + i * 16));
+                    __m512i bf16_32_j = _mm512_cvtepu16_epi32(bf16_j);
+                    __m512i fp32_bits_j = _mm512_slli_epi32(bf16_32_j, 16);
+                    __m512 fp32_j = _mm512_castsi512_ps(fp32_bits_j);
+                    acc = _mm512_add_ps(acc, fp32_j);
+                }
+
+                // Convert FP32 back to BF16: round and shift right 16
+                // Use round-to-nearest-even by adding rounding bias
+                __m512i acc_bits = _mm512_castps_si512(acc);
+                // Add rounding bias: 0x7FFF + ((bits >> 16) & 1) for round-to-nearest-even
+                __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(acc_bits, 16), _mm512_set1_epi32(1));
+                __m512i rounding = _mm512_add_epi32(_mm512_set1_epi32(0x7FFF), lsb);
+                __m512i rounded = _mm512_add_epi32(acc_bits, rounding);
+                __m512i bf16_32 = _mm512_srli_epi32(rounded, 16);
+                __m256i result = _mm512_cvtepi32_epi16(bf16_32);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + i * 16), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float sum = 0.0f;
+                for (size_t j = 0; j < n_inputs; ++j)
+                {
+                    sum += bf16_to_fp32(inputs[j][i]);
+                }
+                output[i] = fp32_to_bf16(sum);
+            }
+
+#elif defined(__AVX2__)
+            // AVX2: Process 8 BF16 values at a time
+            const size_t vec_count = count / 8;
+            const size_t tail_start = vec_count * 8;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                // Initialize accumulator with first input
+                __m128i bf16_0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(inputs[0] + i * 8));
+                __m256i bf16_32_0 = _mm256_cvtepu16_epi32(bf16_0);
+                __m256i fp32_bits_0 = _mm256_slli_epi32(bf16_32_0, 16);
+                __m256 acc = _mm256_castsi256_ps(fp32_bits_0);
+
+                // Accumulate remaining inputs
+                for (size_t j = 1; j < n_inputs; ++j)
+                {
+                    __m128i bf16_j = _mm_loadu_si128(reinterpret_cast<const __m128i *>(inputs[j] + i * 8));
+                    __m256i bf16_32_j = _mm256_cvtepu16_epi32(bf16_j);
+                    __m256i fp32_bits_j = _mm256_slli_epi32(bf16_32_j, 16);
+                    __m256 fp32_j = _mm256_castsi256_ps(fp32_bits_j);
+                    acc = _mm256_add_ps(acc, fp32_j);
+                }
+
+                // Convert FP32 back to BF16 with rounding
+                __m256i acc_bits = _mm256_castps_si256(acc);
+                __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(acc_bits, 16), _mm256_set1_epi32(1));
+                __m256i rounding = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
+                __m256i rounded = _mm256_add_epi32(acc_bits, rounding);
+                __m256i bf16_32 = _mm256_srli_epi32(rounded, 16);
+                // Pack 32-bit to 16-bit
+                __m128i lo = _mm256_castsi256_si128(bf16_32);
+                __m128i hi = _mm256_extracti128_si256(bf16_32, 1);
+                __m128i result = _mm_packus_epi32(lo, hi);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(output + i * 8), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float sum = 0.0f;
+                for (size_t j = 0; j < n_inputs; ++j)
+                {
+                    sum += bf16_to_fp32(inputs[j][i]);
+                }
+                output[i] = fp32_to_bf16(sum);
+            }
+
+#else
+            // Scalar fallback
+            for (size_t i = 0; i < count; ++i)
+            {
+                float sum = 0.0f;
+                for (size_t j = 0; j < n_inputs; ++j)
+                {
+                    sum += bf16_to_fp32(inputs[j][i]);
+                }
+                output[i] = fp32_to_bf16(sum);
+            }
+#endif
+        }
+
+        /**
+         * @brief Scale FP16 array in-place by a scalar factor
+         *
+         * Used for MPI allreduce operations where we need to scale values
+         * before summing (e.g., scale by 1/world_size for replicated weights).
+         * Uses AVX512/AVX2 F16C instructions when available.
+         *
+         * @param data FP16 array (uint16_t representing FP16)
+         * @param count Number of FP16 elements
+         * @param scale Scalar multiplier
+         */
+        inline void fp16_scale_inplace(uint16_t *data, size_t count, float scale)
+        {
+#ifdef __AVX512F__
+            // AVX512: Process 16 FP16 values at a time
+            const __m512 scale_vec = _mm512_set1_ps(scale);
+            const size_t vec_count = count / 16;
+            const size_t tail_start = vec_count * 16;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                __m256i fp16_in = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + i * 16));
+                __m512 fp32_vals = _mm512_cvtph_ps(fp16_in);
+                __m512 scaled = _mm512_mul_ps(fp32_vals, scale_vec);
+                __m256i result = _mm512_cvtps_ph(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(data + i * 16), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float val = fp16_to_fp32(data[i]);
+                data[i] = fp32_to_fp16(val * scale);
+            }
+
+#elif defined(__AVX2__)
+            // AVX2: Process 8 FP16 values at a time using F16C
+            const __m256 scale_vec = _mm256_set1_ps(scale);
+            const size_t vec_count = count / 8;
+            const size_t tail_start = vec_count * 8;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                __m128i fp16_in = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i * 8));
+                __m256 fp32_vals = _mm256_cvtph_ps(fp16_in);
+                __m256 scaled = _mm256_mul_ps(fp32_vals, scale_vec);
+                __m128i result = _mm256_cvtps_ph(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(data + i * 8), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float val = fp16_to_fp32(data[i]);
+                data[i] = fp32_to_fp16(val * scale);
+            }
+
+#else
+            // Scalar fallback
+            for (size_t i = 0; i < count; ++i)
+            {
+                float val = fp16_to_fp32(data[i]);
+                data[i] = fp32_to_fp16(val * scale);
+            }
+#endif
+        }
+
+        /**
+         * @brief Scale BF16 array in-place by a scalar factor
+         *
+         * Used for MPI allreduce operations where we need to scale values
+         * before summing (e.g., scale by 1/world_size for replicated weights).
+         * Uses AVX512 BF16 bit manipulation when available.
+         *
+         * @param data BF16 array (uint16_t representing BF16)
+         * @param count Number of BF16 elements
+         * @param scale Scalar multiplier
+         */
+        inline void bf16_scale_inplace(uint16_t *data, size_t count, float scale)
+        {
+#ifdef __AVX512F__
+            // AVX512: Process 16 BF16 values at a time
+            const __m512 scale_vec = _mm512_set1_ps(scale);
+            const size_t vec_count = count / 16;
+            const size_t tail_start = vec_count * 16;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                // Load 16 BF16 values
+                __m256i bf16_in = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + i * 16));
+
+                // Expand BF16 to FP32: zero-extend to 32-bit then shift left by 16
+                __m512i bf16_32 = _mm512_cvtepu16_epi32(bf16_in);
+                __m512i fp32_bits = _mm512_slli_epi32(bf16_32, 16);
+                __m512 fp32_vals = _mm512_castsi512_ps(fp32_bits);
+
+                // Scale
+                __m512 scaled = _mm512_mul_ps(fp32_vals, scale_vec);
+
+                // Convert FP32 back to BF16 with rounding
+                __m512i scaled_bits = _mm512_castps_si512(scaled);
+                __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(scaled_bits, 16), _mm512_set1_epi32(1));
+                __m512i rounding = _mm512_add_epi32(_mm512_set1_epi32(0x7FFF), lsb);
+                __m512i rounded = _mm512_add_epi32(scaled_bits, rounding);
+                __m512i bf16_result = _mm512_srli_epi32(rounded, 16);
+
+                // Pack 32-bit to 16-bit (truncate high bits)
+                __m256i result = _mm512_cvtepi32_epi16(bf16_result);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(data + i * 16), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float val = bf16_to_fp32(data[i]);
+                data[i] = fp32_to_bf16(val * scale);
+            }
+
+#elif defined(__AVX2__)
+            // AVX2: Process 8 BF16 values at a time
+            const __m256 scale_vec = _mm256_set1_ps(scale);
+            const size_t vec_count = count / 8;
+            const size_t tail_start = vec_count * 8;
+
+            for (size_t i = 0; i < vec_count; ++i)
+            {
+                // Load 8 BF16 values
+                __m128i bf16_in = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i * 8));
+
+                // Expand BF16 to FP32: zero-extend to 32-bit then shift left by 16
+                __m256i bf16_32 = _mm256_cvtepu16_epi32(bf16_in);
+                __m256i fp32_bits = _mm256_slli_epi32(bf16_32, 16);
+                __m256 fp32_vals = _mm256_castsi256_ps(fp32_bits);
+
+                // Scale
+                __m256 scaled = _mm256_mul_ps(fp32_vals, scale_vec);
+
+                // Convert FP32 back to BF16 with rounding
+                __m256i scaled_bits = _mm256_castps_si256(scaled);
+                __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(scaled_bits, 16), _mm256_set1_epi32(1));
+                __m256i rounding = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
+                __m256i rounded = _mm256_add_epi32(scaled_bits, rounding);
+                __m256i bf16_32_result = _mm256_srli_epi32(rounded, 16);
+
+                // Pack 32-bit to 16-bit
+                __m128i lo = _mm256_castsi256_si128(bf16_32_result);
+                __m128i hi = _mm256_extracti128_si256(bf16_32_result, 1);
+                __m128i result = _mm_packus_epi32(lo, hi);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(data + i * 8), result);
+            }
+
+            // Handle tail elements
+            for (size_t i = tail_start; i < count; ++i)
+            {
+                float val = bf16_to_fp32(data[i]);
+                data[i] = fp32_to_bf16(val * scale);
+            }
+
+#else
+            // Scalar fallback
+            for (size_t i = 0; i < count; ++i)
+            {
+                float val = bf16_to_fp32(data[i]);
+                data[i] = fp32_to_bf16(val * scale);
+            }
+#endif
+        }
+
+        /**
          * @brief Copy Q8_1 blocks (native copy, no dequant/requant)
          *
          * Simple memcpy of Q8_1 block data. Use this instead of copy_tensor

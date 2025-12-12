@@ -2294,6 +2294,46 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
+        // ===== Q8_1 Block-Aligned K-Slicing (Phase 6.4) =====
+
+        /**
+         * @brief Check if a k-slice offset is block-aligned (multiple of 32)
+         * @param k_start Starting column index for k-slice
+         * @return true if k_start is aligned to Q8_1Block::BLOCK_SIZE (32) boundary
+         */
+        static constexpr bool is_k_aligned(size_t k_start)
+        {
+            return (k_start % Q8_1Block::BLOCK_SIZE) == 0;
+        }
+
+        /**
+         * @brief Create a k-sliced view (column slice) at block boundaries
+         *
+         * This enables block-native k-slicing for tensor parallelism without
+         * FP32 dequantization. Only works when k_start is aligned to 32-element
+         * block boundaries.
+         *
+         * @param k_start Starting column index (must be multiple of 32)
+         * @param k_size Number of columns in slice (must be multiple of 32, or extend to end)
+         * @return New Q8_1Tensor that's a k-sliced view, or nullptr if alignment fails
+         *
+         * @note Unlike create_view() which slices rows, this slices columns (K dimension).
+         *       The returned tensor has shape [rows, k_size] with blocks copied to
+         *       a new contiguous buffer (views for k-slicing are not zero-copy since
+         *       Q8_1 blocks are row-major and we need column-contiguous blocks).
+         *
+         * Usage pattern (tensor parallelism k-sliced GEMM):
+         *   const int k_local = k / world_size;
+         *   const int k_start = k_local * rank;
+         *   if (Q8_1Tensor::is_k_aligned(k_start) && Q8_1Tensor::is_k_aligned(k_local)) {
+         *       auto input_local = input_q8_1->slice_k_blocks(k_start, k_local);
+         *       // GEMM with Q8_1 input directly - no FP32 dequantization!
+         *   } else {
+         *       // Fallback to FP32 path with fp32_data() dequantization
+         *   }
+         */
+        std::shared_ptr<Q8_1Tensor> slice_k_blocks(size_t k_start, size_t k_size) const;
+
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {

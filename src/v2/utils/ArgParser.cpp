@@ -245,6 +245,12 @@ namespace llaminar2
                 ctx.benchmark_mode = true;
             }
 
+            // Fused attention kernel (experimental)
+            else if (arg == "--fused-attention")
+            {
+                ctx.use_fused_attention = true;
+            }
+
             // Verbose logging levels
             else if (arg == "-vv" || arg == "--vverbose")
             {

@@ -125,24 +125,42 @@ namespace llaminar2
             bindToNumaNode();
         }
 
+        std::unique_ptr<TensorBase> tensor;
+
         switch (precision)
         {
         case ActivationPrecision::FP32:
+            // FP32 createFP32 already accepts device_idx
             return createFP32(shape, device_idx);
 
         case ActivationPrecision::BF16:
-            return createBF16(shape);
+            tensor = createBF16(shape);
+            break;
 
         case ActivationPrecision::FP16:
-            return createFP16(shape);
+            tensor = createFP16(shape);
+            break;
 
         case ActivationPrecision::Q8_1:
-            return createQ8_1(shape);
+            tensor = createQ8_1(shape);
+            break;
 
         default:
             LOG_ERROR("TensorFactory::createActivation: unknown precision, defaulting to FP32");
             return createFP32(shape, device_idx);
         }
+
+        // Set device_idx on the created tensor to ensure consistent device tracking
+        // This is critical for pipelines that use placement maps to route tensors
+        // between devices. Without this, Q8_1/BF16/FP16 tensors would have device_idx=-1
+        // even when they should be associated with device 0 (CPU), causing spurious
+        // "device transfer" attempts in prepareActivationForDevice().
+        if (tensor && device_idx >= 0)
+        {
+            tensor->set_device(device_idx);
+        }
+
+        return tensor;
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createQuantized(TensorType type,

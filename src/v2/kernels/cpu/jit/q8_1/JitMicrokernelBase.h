@@ -19,6 +19,7 @@
 #pragma once
 
 #include "../../../../../../external/onednn/third_party/xbyak/xbyak.h"
+#include <array>
 #include <cstdint>
 #include <string>
 #include <iostream>
@@ -84,6 +85,7 @@ namespace llaminar::v2::kernels::jit
         static constexpr int ZMM_SUM = 17;    ///< Running softmax sum
         static constexpr int ZMM_WEIGHT = 18; ///< Current softmax weight
         static constexpr int ZMM_CORR = 19;   ///< Correction factor
+        static constexpr int ZMM_SCORE = 15;  ///< Current attention score (shared with scratch)
     };
 
     /**
@@ -142,6 +144,7 @@ namespace llaminar::v2::kernels::jit
         Xbyak::Zmm zmm_sum() const { return Xbyak::Zmm(StateRegs::ZMM_SUM); }
         Xbyak::Zmm zmm_weight() const { return Xbyak::Zmm(StateRegs::ZMM_WEIGHT); }
         Xbyak::Zmm zmm_corr() const { return Xbyak::Zmm(StateRegs::ZMM_CORR); }
+        Xbyak::Zmm zmm_score() const { return Xbyak::Zmm(StateRegs::ZMM_SCORE); }
 
         // Scratch registers
         Xbyak::Zmm zmm_scratch(int idx) const
@@ -313,6 +316,74 @@ namespace llaminar::v2::kernels::jit
         {
             mov(tmp_reg.cvt32(), value);
             vpbroadcastd(dst, tmp_reg.cvt32());
+        }
+
+        // ========================================================================
+        // Stack Frame Management (for standalone kernels)
+        // ========================================================================
+
+        /**
+         * @brief List of callee-saved registers we preserve
+         */
+        static constexpr std::array<Xbyak::Reg64, 6> callee_saved_regs()
+        {
+            return {Xbyak::util::rbx, Xbyak::util::rbp, Xbyak::util::r12,
+                    Xbyak::util::r13, Xbyak::util::r14, Xbyak::util::r15};
+        }
+
+        /**
+         * @brief Size of the stack frame for callee-saved registers
+         *
+         * @return Size in bytes (6 registers × 8 bytes = 48 bytes)
+         */
+        static constexpr size_t stack_frame_size()
+        {
+            return 6 * 8; // 6 callee-saved registers
+        }
+
+        /**
+         * @brief Push all callee-saved registers
+         *
+         * Call at the start of a function that uses rbx, rbp, r12-r15.
+         */
+        void push_callee_saved()
+        {
+            debug_emit("push_callee_saved");
+            push(rbx);
+            push(rbp);
+            push(r12);
+            push(r13);
+            push(r14);
+            push(r15);
+        }
+
+        /**
+         * @brief Pop all callee-saved registers (in reverse order)
+         *
+         * Call at the end of a function before ret.
+         */
+        void pop_callee_saved()
+        {
+            debug_emit("pop_callee_saved");
+            pop(r15);
+            pop(r14);
+            pop(r13);
+            pop(r12);
+            pop(rbp);
+            pop(rbx);
+        }
+
+        /**
+         * @brief Load a 32-bit float constant into a ZMM register (broadcasted)
+         *
+         * @param dst Destination ZMM register
+         * @param value Float value to load
+         *
+         * Uses rax as a temporary register for the integer representation.
+         */
+        void load_constant_f32(const Xbyak::Zmm &dst, float value)
+        {
+            emit_broadcast_fp32_const(dst, value, rax);
         }
     };
 

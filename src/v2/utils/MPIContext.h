@@ -16,6 +16,9 @@
 #include <memory>
 #include <utility>
 #include <cstddef>
+#include <vector>
+#include "../tensors/BlockStructures.h"
+#include "../tensors/SIMDHelpers.h"
 
 namespace llaminar2
 {
@@ -67,6 +70,134 @@ namespace llaminar2
         void allreduce_sum_inplace(float *data, size_t count) const
         {
             MPI_Allreduce(MPI_IN_PLACE, data, count, MPI_FLOAT, MPI_SUM, comm_);
+        }
+
+        /**
+         * @brief All-reduce sum operation for Q8_1 blocks (in-place)
+         *
+         * Performs N-way reduction of Q8_1 blocks across all MPI ranks without
+         * FP32 conversion overhead. Uses allgather + vectorized local reduction.
+         *
+         * Algorithm:
+         * 1. Allgather all Q8_1 blocks from all ranks (total: n_blocks * world_size)
+         * 2. Sum blocks using AVX512-vectorized reduction (dequant→sum→requant per block)
+         * 3. Store result back to input buffer
+         *
+         * Memory: Temporarily allocates n_blocks * world_size * sizeof(Q8_1Block) bytes.
+         * Bandwidth: Q8_1 is 36 bytes/32 elements vs FP32's 128 bytes/32 elements = 3.5x less.
+         *
+         * @param data Q8_1 block buffer (input and output), size = n_blocks
+         * @param n_blocks Number of Q8_1 blocks per rank
+         */
+        void allreduce_q8_1_inplace(Q8_1Block *data, size_t n_blocks) const
+        {
+            if (world_size_ == 1)
+            {
+                return; // No reduction needed for single rank
+            }
+
+            const size_t block_bytes = sizeof(Q8_1Block); // 36 bytes
+            const size_t total_bytes = n_blocks * block_bytes;
+            const size_t gathered_blocks = n_blocks * world_size_;
+
+            // Allocate buffer for all ranks' contributions
+            std::vector<Q8_1Block> gathered(gathered_blocks);
+
+            // Allgather Q8_1 blocks from all ranks
+            MPI_Allgather(data, total_bytes, MPI_BYTE,
+                          gathered.data(), total_bytes, MPI_BYTE, comm_);
+
+            // Build pointer array for q8_1_sum_n
+            std::vector<const Q8_1Block *> inputs(world_size_);
+            for (int r = 0; r < world_size_; ++r)
+            {
+                inputs[r] = gathered.data() + r * n_blocks;
+            }
+
+            // Sum all contributions using AVX512-vectorized reduction
+            simd::q8_1_sum_n(inputs.data(), world_size_, data, n_blocks);
+        }
+
+        /**
+         * @brief All-reduce sum operation for FP16 elements (in-place)
+         *
+         * Performs N-way reduction of FP16 values across all MPI ranks without
+         * FP32 conversion overhead in communication. Uses allgather + vectorized
+         * local reduction with AVX512/AVX2 F16C instructions.
+         *
+         * Memory: Temporarily allocates count * world_size * sizeof(uint16_t) bytes.
+         * Bandwidth: FP16 is 2 bytes/element vs FP32's 4 bytes/element = 2x less.
+         *
+         * @param data FP16 buffer (uint16_t, input and output)
+         * @param count Number of FP16 elements per rank
+         */
+        void allreduce_fp16_inplace(uint16_t *data, size_t count) const
+        {
+            if (world_size_ == 1)
+            {
+                return; // No reduction needed for single rank
+            }
+
+            const size_t total_bytes = count * sizeof(uint16_t);
+            const size_t gathered_count = count * world_size_;
+
+            // Allocate buffer for all ranks' contributions
+            std::vector<uint16_t> gathered(gathered_count);
+
+            // Allgather FP16 elements from all ranks
+            MPI_Allgather(data, total_bytes, MPI_BYTE,
+                          gathered.data(), total_bytes, MPI_BYTE, comm_);
+
+            // Build pointer array for fp16_sum_n
+            std::vector<const uint16_t *> inputs(world_size_);
+            for (int r = 0; r < world_size_; ++r)
+            {
+                inputs[r] = gathered.data() + r * count;
+            }
+
+            // Sum all contributions using AVX512-vectorized reduction
+            simd::fp16_sum_n(inputs.data(), world_size_, data, count);
+        }
+
+        /**
+         * @brief All-reduce sum operation for BF16 elements (in-place)
+         *
+         * Performs N-way reduction of BF16 values across all MPI ranks without
+         * FP32 conversion overhead in communication. Uses allgather + vectorized
+         * local reduction with AVX512 BF16 conversion.
+         *
+         * Memory: Temporarily allocates count * world_size * sizeof(uint16_t) bytes.
+         * Bandwidth: BF16 is 2 bytes/element vs FP32's 4 bytes/element = 2x less.
+         *
+         * @param data BF16 buffer (uint16_t, input and output)
+         * @param count Number of BF16 elements per rank
+         */
+        void allreduce_bf16_inplace(uint16_t *data, size_t count) const
+        {
+            if (world_size_ == 1)
+            {
+                return; // No reduction needed for single rank
+            }
+
+            const size_t total_bytes = count * sizeof(uint16_t);
+            const size_t gathered_count = count * world_size_;
+
+            // Allocate buffer for all ranks' contributions
+            std::vector<uint16_t> gathered(gathered_count);
+
+            // Allgather BF16 elements from all ranks
+            MPI_Allgather(data, total_bytes, MPI_BYTE,
+                          gathered.data(), total_bytes, MPI_BYTE, comm_);
+
+            // Build pointer array for bf16_sum_n
+            std::vector<const uint16_t *> inputs(world_size_);
+            for (int r = 0; r < world_size_; ++r)
+            {
+                inputs[r] = gathered.data() + r * count;
+            }
+
+            // Sum all contributions using AVX512-vectorized reduction
+            simd::bf16_sum_n(inputs.data(), world_size_, data, count);
         }
 
         /**

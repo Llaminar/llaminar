@@ -21,11 +21,17 @@
 
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/FP16Utils.h"
+#include "tensors/SIMDHelpers.h"
 
 namespace llaminar2
 {
     namespace
     {
+        // Use shared conversion utilities from SIMDHelpers.h
+        using simd::bf16_to_fp32;
+        using simd::fp32_to_bf16;
+        // FP16 utilities from FP16Utils.h are in llaminar2:: namespace
 
         // ============================================================================
         // Helper Functions
@@ -45,85 +51,6 @@ namespace llaminar2
         inline float swiglu_reference(float gate, float up)
         {
             return silu_reference(gate) * up;
-        }
-
-        /**
-         * @brief Convert FP32 to BF16 (truncation)
-         */
-        inline uint16_t fp32_to_bf16(float val)
-        {
-            uint32_t bits;
-            std::memcpy(&bits, &val, sizeof(float));
-            return static_cast<uint16_t>(bits >> 16);
-        }
-
-        /**
-         * @brief Convert BF16 to FP32
-         */
-        inline float bf16_to_fp32(uint16_t val)
-        {
-            uint32_t bits = static_cast<uint32_t>(val) << 16;
-            float result;
-            std::memcpy(&result, &bits, sizeof(float));
-            return result;
-        }
-
-        /**
-         * @brief Convert FP32 to FP16
-         */
-        inline uint16_t fp32_to_fp16(float val)
-        {
-            uint32_t bits;
-            std::memcpy(&bits, &val, sizeof(float));
-
-            uint32_t sign = (bits >> 16) & 0x8000;
-            int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
-            uint32_t mantissa = (bits >> 13) & 0x3FF;
-
-            if (exponent <= 0)
-            {
-                return static_cast<uint16_t>(sign); // Flush to zero
-            }
-            if (exponent >= 31)
-            {
-                return static_cast<uint16_t>(sign | 0x7C00); // Infinity
-            }
-
-            return static_cast<uint16_t>(sign | (exponent << 10) | mantissa);
-        }
-
-        /**
-         * @brief Convert FP16 to FP32
-         */
-        inline float fp16_to_fp32(uint16_t val)
-        {
-            uint32_t sign = (val & 0x8000) << 16;
-            uint32_t exponent = (val >> 10) & 0x1F;
-            uint32_t mantissa = val & 0x3FF;
-
-            if (exponent == 0)
-            {
-                if (mantissa == 0)
-                {
-                    uint32_t bits = sign;
-                    float result;
-                    std::memcpy(&result, &bits, sizeof(float));
-                    return result;
-                }
-                return 0.0f;
-            }
-            if (exponent == 31)
-            {
-                uint32_t bits = sign | 0x7F800000 | (mantissa << 13);
-                float result;
-                std::memcpy(&result, &bits, sizeof(float));
-                return result;
-            }
-
-            uint32_t bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
-            float result;
-            std::memcpy(&result, &bits, sizeof(float));
-            return result;
         }
 
         /**

@@ -81,6 +81,9 @@ namespace llaminar2
 
         // Benchmark mode
         bool benchmark_mode = false; // Run benchmark (prefill + decode timing)
+
+        // Fused attention kernel
+        bool use_fused_attention = false; // Use fused attention+Wo kernel (experimental)
     };
 
     /**

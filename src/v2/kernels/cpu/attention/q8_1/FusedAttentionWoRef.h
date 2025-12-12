@@ -17,13 +17,13 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
-#include "../../microkernels/q8_1/Q8DotProduct.h" // For Q8_1Block definition
+#include "../../microkernels/q8_1/Q8DotProduct.h" // Brings in llaminar2::Q8_1Block via using declaration
 #include "../../microkernels/q8_1/WoProjection.h" // For WoWeightType
 
 namespace llaminar::v2::kernels
 {
 
-    // Use types from microkernels namespace
+    // Use types from microkernels namespace (Q8_1Block is now llaminar2::Q8_1Block)
     using microkernels::Q8_1Block;
     using microkernels::WoWeightType;
 
