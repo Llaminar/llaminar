@@ -302,6 +302,21 @@ add_v2_test(V2_Unit_TensorFactory_DeviceIndex
     MPI_PROCS 1  # Single-rank test, no MPI needed
 )
 
+# Test: ITensor Runtime Interface
+# Tests the ITensor interface including native_type_id(), is<T>(), typed_as<T>(),
+# try_as<T>(), and static_type_id() for type-safe runtime polymorphism.
+add_executable(v2_test_itensor unit/Test__ITensor.cpp)
+target_link_libraries(v2_test_itensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ITensor 
+    COMMAND $<TARGET_FILE:v2_test_itensor>
+    LABELS "V2;Unit;TensorOperations;ITensor;TypeSafety"
+    MPI_PROCS 1  # Single-rank test, no MPI needed
+)
+
 # Test: Q8_1 Add Reproduction (Divergence Investigation)
 add_executable(v2_test_q8_1_add_repro unit/tensors/Test__Q8_1_Add_Repro.cpp)
 target_link_libraries(v2_test_q8_1_add_repro 

@@ -84,6 +84,7 @@
 
 #pragma once
 
+#include "ITensor.h"
 #include "TensorKernels.h"
 #include "FP16Utils.h"
 #include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
@@ -545,8 +546,19 @@ namespace llaminar2
 
     /**
      * @brief Abstract tensor interface
+     *
+     * TensorBase extends ITensor to provide the common functionality needed by all tensor types:
+     * - Device management (upload, download, affinity)
+     * - Kernel factory methods (GEMM, RoPE, etc.)
+     * - Format conversion (to_fp32, to_bf16, etc.)
+     * - View support
+     *
+     * The ITensor interface provides:
+     * - Runtime type introspection (native_type_id, is<T>, typed_as<T>)
+     * - Raw data access (raw_data, raw_mutable_data)
+     * - Basic shape/size queries
      */
-    class TensorBase : public std::enable_shared_from_this<TensorBase>
+    class TensorBase : public ITensor, public std::enable_shared_from_this<TensorBase>
     {
     public:
         virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
@@ -566,6 +578,44 @@ namespace llaminar2
         // Shape and type
         virtual const std::vector<size_t> &shape() const = 0;
         virtual TensorType native_type() const = 0;
+
+        // ===== ITensor Interface Implementation =====
+
+        /**
+         * @brief Get runtime type ID for this tensor
+         * @return Integer type ID matching TensorTypeId constants
+         * @note Derived from native_type() enum value
+         */
+        int native_type_id() const override { return static_cast<int>(native_type()); }
+
+        /**
+         * @brief Get total number of logical elements
+         * @return Product of all shape dimensions
+         * @note Implements ITensor::numel() via existing element_count()
+         */
+        size_t numel() const override { return element_count(); }
+
+        /**
+         * @brief Get size in bytes of the raw data buffer
+         * @return Number of bytes for underlying storage
+         * @note Implements ITensor::size_bytes() - delegates to byte_size()
+         * @note Override in derived class for quantized formats with different byte_size()
+         */
+        size_t size_bytes() const override { return byte_size(); }
+
+        /**
+         * @brief Get raw pointer to data buffer (const)
+         * @return Void pointer to start of data buffer
+         * @note Implements ITensor::raw_data() - delegates to raw_host_data_ptr()
+         */
+        const void *raw_data() const override { return raw_host_data_ptr(); }
+
+        /**
+         * @brief Get raw mutable pointer to data buffer
+         * @return Void pointer to start of data buffer
+         * @note Implements ITensor::raw_mutable_data() - delegates to raw_host_data_ptr()
+         */
+        void *raw_mutable_data() override { return raw_host_data_ptr(); }
 
         // Device affinity
         virtual int device_index() const = 0;        // -1 = host, ≥0 = device index from DeviceManager
@@ -889,6 +939,12 @@ namespace llaminar2
     class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = float;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::FP32; }
+
         explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
         ~FP32Tensor() override;
 
@@ -1069,6 +1125,12 @@ namespace llaminar2
     class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = uint16_t;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::FP16; }
+
         explicit FP16Tensor(const std::vector<size_t> &shape);
         FP16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &fp16_data);
         ~FP16Tensor() override;
@@ -1257,6 +1319,12 @@ namespace llaminar2
     class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = uint16_t;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::BF16; }
+
         explicit BF16Tensor(const std::vector<size_t> &shape);
         BF16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &bf16_data);
         ~BF16Tensor() override;
@@ -1438,6 +1506,12 @@ namespace llaminar2
     class INT8Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = int8_t;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::INT8; }
+
         explicit INT8Tensor(const std::vector<size_t> &shape);
         INT8Tensor(const std::vector<size_t> &shape,
                    const std::vector<int8_t> &data,
@@ -1569,6 +1643,12 @@ namespace llaminar2
     class INT32Tensor : public TensorBase
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = int32_t;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::INT32; }
+
         explicit INT32Tensor(const std::vector<size_t> &shape);
         INT32Tensor(const std::vector<size_t> &shape,
                     const std::vector<int32_t> &data);
@@ -1688,6 +1768,12 @@ namespace llaminar2
     class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ4_NLBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ4_NL; }
+
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ4_NLTensor() override;
 
@@ -1904,6 +1990,12 @@ namespace llaminar2
     class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q8_0Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q8_0; }
+
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q8_0Tensor() override;
 
@@ -2119,7 +2211,11 @@ namespace llaminar2
     class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
         using value_type = Q8_1Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q8_1; }
 
         /// Construct from existing raw Q8_1 block data (for rare cases like loaded data)
         /// Most Q8_1 tensors should be created as mutable activation buffers.
@@ -2512,6 +2608,12 @@ namespace llaminar2
     class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q4_0Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q4_0; }
+
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q4_0Tensor() override;
 
@@ -2688,6 +2790,12 @@ namespace llaminar2
     class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q4_1Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q4_1; }
+
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q4_1Tensor() override;
 
@@ -2869,6 +2977,12 @@ namespace llaminar2
     class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q5_0Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q5_0; }
+
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q5_0Tensor() override;
 
@@ -3041,6 +3155,12 @@ namespace llaminar2
     class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q5_1Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q5_1; }
+
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q5_1Tensor() override;
 
@@ -3209,6 +3329,12 @@ namespace llaminar2
     class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q6_KBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q6_K; }
+
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q6_KTensor() override;
 
@@ -3340,6 +3466,12 @@ namespace llaminar2
     class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q2_KBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q2_K; }
+
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q2_KTensor() override;
 
@@ -3472,6 +3604,12 @@ namespace llaminar2
     class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q5_KBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q5_K; }
+
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q5_KTensor() override;
 
@@ -3607,6 +3745,12 @@ namespace llaminar2
     class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q3_KBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q3_K; }
+
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q3_KTensor() override;
 
@@ -3738,6 +3882,12 @@ namespace llaminar2
     class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q4_KBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q4_K; }
+
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q4_KTensor() override;
 
@@ -3873,6 +4023,12 @@ namespace llaminar2
     class Q8_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = Q8_KBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::Q8_K; }
+
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q8_KTensor() override;
 
@@ -4001,6 +4157,12 @@ namespace llaminar2
     class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ4_XSBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ4_XS; }
+
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ4_XSTensor() override;
 
@@ -4163,6 +4325,12 @@ namespace llaminar2
     class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ2_XXSBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ2_XXS; }
+
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ2_XXSTensor() override;
 
@@ -4313,6 +4481,12 @@ namespace llaminar2
     class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ2_XSBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ2_XS; }
+
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ2_XSTensor() override;
 
@@ -4463,6 +4637,12 @@ namespace llaminar2
     class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ3_XXSBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ3_XXS; }
+
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ3_XXSTensor() override;
 
@@ -4617,6 +4797,12 @@ namespace llaminar2
     class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ2_SBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ2_S; }
+
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ2_STensor() override;
 
@@ -4767,6 +4953,12 @@ namespace llaminar2
     class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ3_SBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ3_S; }
+
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ3_STensor() override;
 
@@ -4921,6 +5113,12 @@ namespace llaminar2
     class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ1_SBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ1_S; }
+
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ1_STensor() override;
 
@@ -5071,6 +5269,12 @@ namespace llaminar2
     class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = IQ1_MBlock;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::IQ1_M; }
+
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ1_MTensor() override;
 
