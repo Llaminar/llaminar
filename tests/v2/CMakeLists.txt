@@ -2582,3 +2582,147 @@ add_v2_test(V2_Perf_CPURoPEKernel
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
+# =============================================================================
+# Microkernels for Fused Attention + Wo Projection
+# =============================================================================
+# These are composable, independently-testable units for the fused attention kernel.
+# See docs/v2/FUSED_ATTENTION_WO_PROJECT_PLAN.md for design documentation.
+
+# Test: μK1 - Q8_1 Dot Product Microkernel
+add_executable(v2_test_microkernel_q8_dot_product unit/microkernels/Test__Q8DotProduct.cpp)
+target_link_libraries(v2_test_microkernel_q8_dot_product 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_Q8DotProduct 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_q8_dot_product>
+    LABELS "V2;Unit;Microkernels;Q8_1;DotProduct;VNNI;AVX512;FusedAttention"
+    MPI_PROCS 1
+)
+
+# Test: μK2 - Online Softmax Microkernel
+add_executable(v2_test_microkernel_online_softmax unit/microkernels/Test__OnlineSoftmax.cpp)
+target_link_libraries(v2_test_microkernel_online_softmax 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_OnlineSoftmax 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_online_softmax>
+    LABELS "V2;Unit;Microkernels;Softmax;Online;StreamingSoftmax;FlashAttention;FusedAttention"
+    MPI_PROCS 1
+)
+
+# Test: μK3 - V Weighted Accumulation Microkernel
+add_executable(v2_test_microkernel_v_weighted_accum unit/microkernels/Test__VWeightedAccum.cpp)
+target_link_libraries(v2_test_microkernel_v_weighted_accum 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_VWeightedAccum 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_v_weighted_accum>
+    LABELS "V2;Unit;Microkernels;Attention;Accumulation;AVX512;Q8_1;FusedAttention"
+    MPI_PROCS 1
+)
+
+# Test: μK4 - Wo Projection Microkernel
+add_executable(v2_test_microkernel_wo_projection unit/microkernels/Test__WoProjection.cpp)
+target_link_libraries(v2_test_microkernel_wo_projection 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_WoProjection 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_wo_projection>
+    LABELS "V2;Unit;Microkernels;Projection;GEMV;Wo;FP32;Q8_1;AVX512;FusedAttention"
+    MPI_PROCS 1
+)
+
+# Test: μK5 - Fast Exp Microkernel
+add_executable(v2_test_microkernel_fast_exp unit/microkernels/Test__FastExp.cpp)
+target_link_libraries(v2_test_microkernel_fast_exp 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_FastExp 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_fast_exp>
+    LABELS "V2;Unit;Microkernels;FastExp;Softmax;Polynomial;AVX512;FusedAttention"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Phase 2: Fused Attention + Wo Reference Kernel (Composed from Microkernels)
+# =============================================================================
+
+# Test: FusedAttentionWoRef - Reference implementation using all microkernels
+add_executable(v2_test_fused_attention_wo_ref integration/Test__FusedAttentionWoRef.cpp)
+target_link_libraries(v2_test_fused_attention_wo_ref 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_FusedAttentionWoRef 
+    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_ref>
+    LABELS "V2;Integration;FusedAttention;Q8_1;Wo;GEMM;GQA;Causal;KVCache"
+    MPI_PROCS 1
+)
+
+# Test: FusedAttentionWoRef Robustness - Edge cases from real pipeline issues
+# Tests for: softmax saturation, catastrophic cancellation, quantization clipping,
+#            scale disparity, sign flips, residual collapse, extreme outliers
+add_executable(v2_test_fused_attention_wo_robustness integration/Test__FusedAttentionWoRef_Robustness.cpp)
+target_link_libraries(v2_test_fused_attention_wo_robustness 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_FusedAttentionWo_Robustness 
+    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_robustness>
+    LABELS "V2;Integration;FusedAttention;Robustness;Saturation;Quantization;EdgeCases"
+    MPI_PROCS 1
+)
+
+# Test: FusedAttentionWoRef Batch - Batched execution modes
+# Tests for: prefill, incremental decode, batched decode uniform/variable KV
+add_executable(v2_test_fused_attention_wo_batch integration/Test__FusedAttentionWoRef_Batch.cpp)
+target_link_libraries(v2_test_fused_attention_wo_batch 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_FusedAttentionWo_Batch 
+    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_batch>
+    LABELS "V2;Integration;FusedAttention;Batch;Prefill;Decode;VariableKV"
+    MPI_PROCS 1
+)
+
+# Test: FusedAttentionWoTiled - Cache-blocked tiled implementation (Phase 3)
+# Tests for: tile size computation, tiled vs reference parity, various configs
+add_executable(v2_test_fused_attention_wo_tiled unit/attention/Test__FusedAttentionWoTiled.cpp)
+target_link_libraries(v2_test_fused_attention_wo_tiled 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedAttentionWo_Tiled 
+    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_tiled>
+    LABELS "V2;Unit;FusedAttention;Tiled;CacheBlocking;FlashAttention;Parity"
+    MPI_PROCS 1
+)
+
+# Test: JIT Microkernels - Modular JIT attention microkernels (Phase 4)
+# Tests for: JitFastExp, JitQ8DotProduct, JitOnlineSoftmax, JitVWeightedAccum, JitWoProjection
+add_executable(v2_test_jit_microkernels unit/attention/Test__JitMicrokernels.cpp)
+target_link_libraries(v2_test_jit_microkernels 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitMicrokernels 
+    COMMAND $<TARGET_FILE:v2_test_jit_microkernels>
+    LABELS "V2;Unit;JIT;Microkernels;FusedAttention;AVX512;Xbyak;FastExp;Q8DotProduct;OnlineSoftmax"
+    MPI_PROCS 1
+)

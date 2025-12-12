@@ -1,6 +1,7 @@
 # Q8_1 Pipeline Divergence Handover Guide
 
-**Date:** 2025-12-12
+**Date:** 2025-12-12  
+**Updated:** 2025-01-17  
 **Topic:** Debugging and improving Q8_1 pipeline accuracy vs FP32 ground truth
 
 ## 1. Current Status
@@ -11,11 +12,22 @@ We have successfully established a baseline for Q8_1 inference accuracy.
   - **Logit Cosine Similarity:** ~0.91 (Threshold is 0.90).
   - **Layer 0-5 Similarity:** > 0.99.
 
-**Next Steps for Optimization:**
-While the pipeline works, there is still "noise" accumulating. The next agent should focus on:
-1.  Investigating `ATTENTION_CONTEXT` precision (it is currently the noisiest stage).
-2.  Checking if `FFN_DOWN` projection adds unnecessary quantization noise.
-3.  Verifying behavior on larger models (7B, 14B, 72B) where weights might exceed `[-16, 16]`.
+### Update (2025-01-17): Attention Divergence Root Cause Analysis
+
+Investigated the `ATTENTION_CONTEXT` divergence (~0.89 cosine at layer 0 while Q/K/V projections are >0.999):
+
+**Key Finding:** The attention kernel is mathematically correct. The divergence is caused by **softmax amplification of quantization noise** in Q/K/V projections. 
+
+- Implemented `LLAMINAR_Q8_ATTENTION_FP32_SCORES=1` mode (dequantizes Q/K for score computation)
+- Result: No improvement - mathematically equivalent to integer path
+- Root cause: Quantization noise is in Q/K/V *inputs*, not attention computation
+
+**See:** `changelog/2025-01-17-q8_1-attention-precision-analysis.md` for full analysis.
+
+**Future Improvements Require:**
+1. Higher precision activations (Q16) for attention Q/K/V
+2. Per-channel/per-head quantization for better outlier handling  
+3. Mixed-precision approaches (FP16 Q/K, Q8_1 V)
 
 ---
 

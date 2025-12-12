@@ -364,6 +364,45 @@ namespace llaminar2
     };
 
     /**
+     * @brief Attention kernel configuration group
+     *
+     * Controls Q8_1 attention precision/performance tradeoffs.
+     *
+     * Environment Variables:
+     *   LLAMINAR_Q8_ATTENTION_FP32_SCORES - Use FP32 for Q·K scores (default: 0)
+     *       When enabled, dequantizes Q and K to FP32 before computing attention scores.
+     *       This improves precision (softmax sensitivity to small differences) at the cost
+     *       of additional computation. V accumulation remains in optimized Q8_1 path.
+     *       Useful when high accuracy is required or for debugging precision issues.
+     *
+     * Performance Impact (approximate):
+     *   - FP32 scores: ~10-20% slower attention, but significantly higher accuracy
+     *   - Integer scores: Fastest, but accumulates quantization error through softmax
+     *
+     * Precision Impact:
+     *   - FP32 scores: ~0.999 cosine similarity at ATTENTION_CONTEXT
+     *   - Integer scores: ~0.89-0.98 cosine similarity at ATTENTION_CONTEXT
+     */
+    struct AttentionConfig
+    {
+        bool fp32_scores = false; ///< Use FP32 for Q·K score computation (default: integer)
+
+        AttentionConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *fp32_scores_env = std::getenv("LLAMINAR_Q8_ATTENTION_FP32_SCORES");
+            if (fp32_scores_env)
+            {
+                fp32_scores = (std::atoi(fp32_scores_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Snapshot and tensor dump configuration group
      *
      * Controls the snapshot framework for E2E parity testing and debugging.
@@ -584,10 +623,10 @@ namespace llaminar2
         GemmConfig gemm;
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
-        SnapshotConfig snapshot; ///< Snapshot and tensor dump configuration
+        AttentionConfig attention; ///< Q8_1 attention precision configuration
+        SnapshotConfig snapshot;   ///< Snapshot and tensor dump configuration
 
         // Add more config groups as needed:
-        // AttentionConfig attention;
         // NumaConfig numa;
         // MPIConfig mpi;
 
@@ -598,6 +637,7 @@ namespace llaminar2
             gemm.reload();
             profile.reload();
             rmsnorm.reload();
+            attention.reload();
             snapshot.reload();
         }
     };

@@ -546,6 +546,15 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     kernels/cpu/attention/CPUAttentionKernelTyped.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
+    # Microkernels for fused attention + Wo projection (composable, testable units)
+    kernels/cpu/microkernels/q8_1/Q8DotProduct.cpp       # μK1: Q8_1 dot product with VNNI
+    kernels/cpu/microkernels/q8_1/OnlineSoftmax.cpp      # μK2: Streaming online softmax
+    kernels/cpu/microkernels/q8_1/VWeightedAccum.cpp     # μK3: Weighted V accumulation
+    kernels/cpu/microkernels/q8_1/WoProjection.cpp       # μK4: Wo output projection
+    kernels/cpu/microkernels/q8_1/FastExp.cpp            # μK5: Fast exponential approximation
+    # Fused attention + Wo kernel (composed from microkernels)
+    kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp   # Reference implementation (Phase 2)
+    kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp # Cache-blocked tiled implementation (Phase 3)
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)
