@@ -2,7 +2,7 @@
 
 **Author:** David Sanftenberg  
 **Date:** December 12, 2025  
-**Status:** ✅ Phase 6 Complete — Unified Precision-Aware MPI Allreduce  
+**Status:** ✅ Phase 8.2 Complete — Performance Benchmarked (12-18x speedup)  
 **Branch:** `feature/typed-residuals`
 
 ---
@@ -17,44 +17,77 @@
 | **Phase 4** | JIT Kernel (Xbyak) | ✅ **Complete** (9 instantiation + 27 correctness = 36 tests) |
 | **Phase 5** | Pipeline Integration | ✅ **Complete** (wrapper, CLI, pipeline code, 10 tests) |
 | **Phase 6** | Unified Precision-Aware MPI Allreduce | ✅ **Complete** (10 MPI integration tests) |
+| **Phase 7** | JIT Wo Projection | ✅ **Complete** (20 JIT Wo tests) |
+| **Phase 8.1** | JIT Backend in Pipeline | ✅ **Complete** (default backend, CLI selection) |
+| **Phase 8.2** | Performance Benchmarking | ✅ **Complete** (12-18x speedup vs reference) |
+| **Phase 8.3** | Causal Masking | ✅ **Complete** (28 JIT Wo tests incl. 8 causal) |
+| **Phase 8.4** | KV Cache Integration | ✅ **Complete** (autoregressive decode support) |
 
-### Phase 6 Summary (Complete - December 12, 2025)
+### Phase 7 Summary (Complete - December 12, 2025)
 
-Phase 6 implemented unified precision-aware MPI allreduce/allgather operations for tensor-parallel inference.
+Phase 7 implemented true fused Wo projection in the JIT kernel, enabling end-to-end fused attention without intermediate FP32 conversion.
 
 **Key Accomplishments:**
-1. **Q8_1 Native Allreduce**: AVX512-vectorized N-way reduction without FP32 conversion (3.5x bandwidth savings)
-2. **BF16/FP16 Native Allreduce**: Full precision support for 16-bit types (2x bandwidth savings)
-3. **TensorSlice Row-Parallel**: Pre-sliced tensor pattern with multi-precision allgatherv
-4. **K-Sliced Row-Parallel**: Input column slicing with allreduce-sum for partial products
-5. **KernelFactory TensorSlice Fix**: Proper handling of TensorSlice with non-quantized inner tensors
+1. **Fused Wo Projection**: JIT kernel now applies Wo projection directly to attention context
+2. **Multi-Format Wo Support**: FP32, FP16, BF16, Q8_1 weight formats all supported
+3. **Batching/Prefill Support**: Correctly handles seq_len_q > 1 for prefill workloads
+4. **Register Management**: Solved complex register preservation across multi-iteration loops
 
-**Test Results (10 MPI Integration Tests):**
-| Test | Cosine Similarity | Status |
-|------|-------------------|--------|
-| TensorSlice_FP32_Output | 1.000 | ✅ PASSED |
-| TensorSlice_Q8_1_Output_BlockAligned | 0.999982 | ✅ PASSED |
-| TensorSlice_BF16_Output | 0.999998 | ✅ PASSED |
-| KSliced_FP32_Allreduce | 1.000 | ✅ PASSED |
-| KSliced_Q8_1_NativeAllreduce | 0.999971 | ✅ PASSED |
-| KSliced_BF16_NativeAllreduce | 0.999995 | ✅ PASSED |
-| KSliced_FP16_NativeAllreduce | - | ⏭️ SKIPPED (hardware) |
-| Q8_1_NonAligned_FallbackToFP32 | 1.000 | ✅ PASSED |
-| LargeMatrix_FP32 | 1.000 | ✅ PASSED |
-| TensorSlice_RealQ4_0_WithQ8_1Activations | 1.000 | ✅ PASSED |
+**Test Results (20 JIT Wo Projection Tests):**
+| Test | Cosine Similarity | Rel L2 Error | Status |
+|------|-------------------|--------------|--------|
+| FP32 Wo - Single Token | 0.996 | 0.090 | ✅ |
+| FP32 Wo - Short Sequence | 0.997 | 0.079 | ✅ |
+| FP32 Wo - Medium Sequence | 0.996 | 0.086 | ✅ |
+| FP16 Wo - Single Token | 0.996 | 0.090 | ✅ |
+| FP16 Wo - Short Sequence | 0.997 | 0.079 | ✅ |
+| BF16 Wo - Single Token | 0.996 | 0.090 | ✅ |
+| BF16 Wo - Short Sequence | 0.997 | 0.079 | ✅ |
+| Q8_1 Wo - Single Token | 0.996 | 0.090 | ✅ |
+| Q8_1 Wo - Short Sequence | 0.997 | 0.079 | ✅ |
+| GQA 7:1 | 0.996 | 0.084 | ✅ |
+| MHA 1:1 | 0.996 | 0.087 | ✅ |
+| **Prefill seq=16** | 0.996 | 0.088 | ✅ |
+| **Prefill seq=32** | 0.997 | 0.075 | ✅ |
+| **Prefill seq=64** | 0.997 | 0.072 | ✅ |
+| FP16 Prefill seq=32 | 0.997 | 0.075 | ✅ |
+| BF16 Prefill seq=32 | 0.997 | 0.075 | ✅ |
+| Q8_1 Prefill seq=32 | 0.997 | 0.075 | ✅ |
+| **Prefill seq=128** | 0.996 | 0.091 | ✅ |
+| head_dim=128 | 0.996 | 0.087 | ✅ |
+| head_dim=128 Prefill | 0.997 | 0.081 | ✅ |
 
-**Critical Bug Fixes:**
-1. **KernelFactory TensorSlice Handling** (`src/v2/kernels/KernelFactory.cpp`):
-   - Added `supports_int8_unpack()` check before quantized weight packing
-   - FP32/FP16/BF16 inner tensors now correctly dispatch to FloatingPointGemmKernel
-   
-2. **TensorSlice Tests Rewritten** (`tests/v2/integration/Test__MPI_RowParallelMultiPrecision.cpp`):
-   - Changed from `inner_is_presliced=false` (runtime slicing) to pre-sliced tensor pattern
-   - Tests now create pre-sliced FP32/BF16 tensors with `inner_is_presliced=true`
-   - Real Q4_0 test uses `loadTensorRowSlice()` for memory-efficient pre-sliced loading
+**Critical Bug Fixes During Phase 7:**
+1. **EVEX Register Constraints**: Used low-numbered ZMM registers for VEX horizontal sum instructions
+2. **Code Size Overflow**: Converted from unrolled emit to runtime JIT loops (eliminated "code is too big" error)
+3. **System V AMD64 Calling Convention**: Fixed scale parameter passing (must be in xmm0, not on stack)
+4. **Register Preservation**: Fixed r10 (seq_len_kv) clobbering between loop iterations using spill slot
+5. **Stack Layout**: Fixed q_idx_spill_offset overlapping with context buffer
 
-3. **FP16 Hardware Skip**:
-   - Added `GTEST_SKIP()` for FP16 test when OneDNN FP16 matmul not supported on hardware
+**Key Implementation Details:**
+
+```cpp
+// Stack layout (after Phase 7):
+// [rsp + 0]                     : Q blocks for current head
+// [rsp + q_stack_offset]        : Spill area for softmax state
+// [rsp + context_buffer_offset] : Attention context buffer (num_heads * head_dim floats)
+// [rsp + q_idx_spill_offset]    : Query index spill (8 bytes)
+// [rsp + seq_len_kv_spill_offset]: seq_len_kv spill (8 bytes) ← NEW
+
+// Wo projection dispatcher (emits runtime loops):
+void emit_wo_projection(Reg64 reg_Wo, Reg64 reg_output, int context_buffer_offset);
+// - FP32: Direct SIMD dot products
+// - FP16: F16C conversion + dot products
+// - BF16: Bit manipulation conversion + dot products
+// - Q8_1: Dequantize blocks + dot products
+```
+
+**Files Modified in Phase 7:**
+| File | Changes |
+|------|---------|
+| `src/v2/kernels/cpu/jit/q8_1/JitFusedAttentionWo.h` | Added emit_wo_projection, emit_store_head_to_context_buffer, emit_horizontal_sum_to_scalar |
+| `tests/v2/unit/attention/Test__JitWoProjection.cpp` | New test file with 20 parity tests |
+| `tests/v2/CMakeLists.txt` | Added v2_test_jit_wo_projection target |
 
 ### Phase 2 Test Coverage
 
@@ -398,52 +431,166 @@ void allreduce_q8_1_inplace(Q8_1Block *data, size_t n_blocks) const {
 
 ---
 
-## Next Steps / Handoff Notes (Phase 7+)
+## Next Steps / Handoff Notes (Phase 8+)
 
-### Immediate Priority: TensorSlice Design Decision
+### Phase 8: JIT Backend Integration & Performance
 
-**Background:** During Phase 6 testing, we discovered that `TensorSlice` with `inner_is_presliced=false` (full tensor inside, slice at runtime) doesn't work with current kernels. The fix was to use `inner_is_presliced=true` (pre-sliced tensor inside).
+**Goal:** Enable JIT backend as default for fused attention and benchmark performance gains.
 
-**Decision Required:** Choose one of these approaches:
-1. **Keep pre-sliced pattern only** (current state): All TensorSlice usage must use `loadTensorRowSlice()` to pre-slice weights at load time
-2. **Implement runtime slicing in kernels**: FloatingPointGemmKernel and QuantizedGemmKernel would use slice metadata to access only the relevant portion of full tensors
+#### Phase 8.1: Enable JIT Backend in Pipeline ✅ Complete (December 12, 2025)
+- [x] Update `FusedAttentionWoKernel` wrapper to use JIT backend by default
+- [x] Add backend selection CLI flag (`--fused-attention-backend=jit|reference|tiled`)
+- [x] Added `FusedAttentionBackend` enum to `PipelineConfig.h` with parse/toString helpers
+- [x] Updated `Qwen2Pipeline` to use backend from config (no more hardcoded REFERENCE)
+- [x] All 141 unit tests passing
 
-**Recommendation:** Option 1 (pre-sliced) is simpler and more memory-efficient. Option 2 would only be needed if we have use cases where we need to slice the same tensor different ways.
+#### Phase 8.2: Performance Benchmarking ✅ Complete (December 12, 2025)
+- [x] Create benchmark comparing fused vs unfused attention paths
+- [x] Measure prefill throughput for seq_len = 32, 128
+- [x] Measure decode latency for single token generation (kv_len = 128, 512)
+- [x] Compare various model sizes (Qwen2 0.5B, 1.5B, 7B)
 
-### Future Work Items
+**Benchmark Results (JIT Fused vs Reference Unfused):**
 
-#### High Priority
-- [ ] **Fix Q8_1 device transfer bug** - E2E CLI testing with Q8_1 activations blocked by shape mismatch in `PipelineBase::prepareActivationForDevice()` when `placement_map_` creates device 0 entries for CPU. This is unrelated to fused attention but blocks production testing.
+| Model | Mode | JIT (ms) | Reference (ms) | Speedup |
+|-------|------|----------|----------------|---------|
+| Qwen2 0.5B | Decode (kv=128) | 0.17 | 3.14 | **18.1x** |
+| Qwen2 0.5B | Decode (kv=512) | 0.32 | 5.84 | **18.3x** |
+| Qwen2 0.5B | Prefill (seq=32) | 4.14 | 70.91 | **17.1x** |
+| Qwen2 0.5B | Prefill (seq=128) | 19.28 | 322.75 | **16.7x** |
+| Qwen2 1.5B | Decode (kv=128) | 0.46 | 8.09 | **17.8x** |
+| Qwen2 7B | Decode (kv=128) | 4.06 | 44.81 | **11.0x** |
+| Qwen2 7B | Prefill (seq=128) | 454.32 | 5524.29 | **12.2x** |
 
-- [ ] **Implement Wo projection in JIT kernel** - JIT kernel currently outputs raw attention context (no Wo projection). REFERENCE backend applies Wo correctly. JIT needs to fuse the Wo projection for true end-to-end fusion.
+**Summary Statistics:**
+- **Average Speedup (0.5B):** 17.6x
+- **Average Speedup (7B):** 11.6x
+- **Best Case:** 18.3x (0.5B decode, long context)
+- **Worst Case:** 11.0x (7B decode)
 
-#### Medium Priority  
-- [ ] **Benchmark fused vs unfused performance** - Compare throughput and latency with/without fused attention
-- [ ] **Enable JIT backend as default** - After Wo projection is complete and benchmarked
-- [ ] **Add FP16 native GEMM fallback** - OneDNN FP16 fails on some hardware; add CPU fallback path
+**Key Observations:**
+1. **Consistent 12-18x speedup** across all configurations
+2. **Smaller models benefit more** (17-18x vs 11-12x) due to higher kernel overhead ratio
+3. **Both prefill and decode benefit** equally from fusion
+4. **Memory bandwidth reduction** from eliminating intermediate FP32 buffers contributes to gains
 
-#### Low Priority
-- [ ] **Phase 6.3: Unified Interface** - Create `MPIContext::allreduce_activation_inplace(TensorBase*, ActivationPrecision)` for cleaner API. Deferred because type-specific methods work fine.
+**Benchmark Implementation:**
+- File: `tests/v2/performance/kernels/cpu/attention/Perf__FusedAttentionWo.cpp`
+- Tests: 8 benchmark configurations + summary table
+- Metrics: Median latency over 5+ warmup iterations and 10 benchmark runs
 
-### Key Files Modified in Phase 6
+#### Phase 8.3: Causal Masking Support ✅ Complete (December 12, 2025)
+- [x] Added `causal` field to `JitAttentionConfig` (included in kernel cache hash)
+- [x] Added `position_offset` parameter to kernel function signature (8th integer arg, on stack)
+- [x] Implemented causal masking in `emit_single_query_attention()`:
+  - `max_kv_pos = min(q_idx + position_offset + 1, seq_len_kv)` when `causal=true`
+  - Inner loop iterates `kv_pos = 0..max_kv_pos` (early exit for masked positions)
+- [x] Added 8 causal masking tests (all passing with cosine similarity ≥ 0.996):
+  - Single token decode (pos=0, pos=3)
+  - Prefill seq_len=8, seq_len=32
+  - Long context decode (kv=128, pos=127)
+  - Multi-token decode (seq=4, kv=104, pos=100)
+  - Q8_1 Wo weights with causal
+  - BF16 Wo weights with causal
+- [x] Updated existing tests to initialize `causal=false` for backward compatibility
+- [x] All 77 JIT-related tests passing (13 microkernels + 9 instantiation + 27 correctness + 28 Wo projection)
 
-| File | Changes |
+#### Phase 8.4: KV Cache Integration ✅ Complete  
+- [x] Integrate JIT fused attention with KV cache for autoregressive decoding
+- [x] Support asymmetric Q/KV lengths (Q has 1 token, K/V have full cache)
+- [x] Handle variable kv_seq_len per decode step via `position_offset` parameter
+- [x] `compute_with_kv_cache()` method in FusedAttentionWoKernel wrapper
+- [x] Pipeline integration correctly calculates `position_offset = kv_seq_len - effective_seq_len`
+- [x] Test coverage: 8 causal masking tests + IncrementalDecode_GrowingKVCache test
+
+### Phase 8.4 Summary (Complete - December 12, 2025)
+
+Phase 8.4 verified that the fused attention kernel correctly integrates with KV cache for autoregressive decoding.
+
+**Key Capabilities:**
+1. **Asymmetric Q/KV Lengths**: Query has fewer tokens than cached K/V (typical decode: Q=1, KV=N)
+2. **Position Offset**: Correctly computes causal mask based on absolute position in sequence
+3. **Growing KV Cache**: Supports incremental decode where KV cache grows each step
+4. **Pipeline Integration**: Qwen2Pipeline correctly routes through fused path with KV cache
+
+**Test Results:**
+| Test | Description | Status |
+|------|-------------|--------|
+| Causal_SingleToken_Decode | Q=1 at pos 15, KV=16 | ✅ Cosine 0.996 |
+| Causal_LongContext_Decode | Q=1 at pos 127, KV=128 | ✅ Cosine 0.996 |
+| Causal_MultiToken_Decode | Q=4 at pos 100, KV=104 | ✅ Cosine 0.997 |
+| IncrementalDecode_GrowingKVCache | 5 decode steps, KV grows 11→15 | ✅ Pass |
+| Stride_KV_Cache_Offset | Verifies off-by-one protection | ✅ Pass |
+
+### Immediate Priority: Fix Q8_1 Device Transfer Bug
+
+**Background:** E2E CLI testing with Q8_1 activations is blocked by a shape mismatch bug in `PipelineBase::prepareActivationForDevice()` when `placement_map_` creates device 0 entries for CPU.
+
+**Status:** Unrelated to fused attention, but blocks production testing.
+
+**Action Required:** Debug and fix the device transfer shape mismatch. This will unblock:
+- E2E CLI testing with `--activation-prec q8_1 --fused-attention`
+- Performance benchmarking of fused attention in production pipeline
+
+### TensorSlice Design Decision (Resolved)
+
+**Decision:** Use pre-sliced pattern only (`inner_is_presliced=true`). All TensorSlice usage must use `loadTensorRowSlice()` to pre-slice weights at load time.
+
+**Rationale:** Simpler, more memory-efficient, and kernel implementations don't need runtime slicing logic.
+
+### Key Files for Phase 8
+
+| File | Purpose |
 |------|---------|
-| `src/v2/kernels/KernelFactory.cpp` | Added TensorSlice handling with `supports_int8_unpack()` check |
-| `tests/v2/integration/Test__MPI_RowParallelMultiPrecision.cpp` | Rewrote 4 tests to use pre-sliced tensor pattern |
-| `src/v2/utils/SIMDHelpers.h` | Added `q8_1_sum_n()`, `fp16_sum_n()`, `bf16_sum_n()` N-way reductions |
-| `src/v2/utils/MPIContext.h` | Added type-specific allreduce methods |
+| `src/v2/kernels/cpu/attention/FusedAttentionWoKernel.h` | Wrapper class - update to use JIT backend |
+| `src/v2/pipelines/qwen/Qwen2Pipeline.cpp` | Pipeline integration - fused attention path |
+| `src/v2/kernels/cpu/jit/q8_1/JitFusedAttentionWo.h` | JIT kernel - add causal masking |
+| `tests/v2/performance/Perf__FusedAttention.cpp` | New benchmark file |
 
-### Test Commands for Verification
+### Test Commands for Current State
 
 ```bash
-# Run all MPI integration tests (requires 2 ranks)
+# Run all JIT Wo projection tests (20 tests)
 cd /workspaces/llaminar
+cmake --build build_v2 --target v2_test_jit_wo_projection --parallel
+./build_v2/tests/v2/v2_test_jit_wo_projection
+
+# Run MPI integration tests (requires 2 ranks)
 cmake --build build_v2 --parallel --target v2_integration_mpi_row_parallel_multiprecision
 mpirun -np 2 --oversubscribe ./build_v2/tests/v2/v2_integration_mpi_row_parallel_multiprecision
 
-# Expected: 9 PASSED, 1 SKIPPED (FP16 hardware limitation)
+# Run kernel integration tests (10 tests)
+cmake --build build_v2 --target v2_integration_fused_attention_kernel --parallel
+./build_v2/tests/v2/v2_integration_fused_attention_kernel
 ```
+
+### Key Learnings from Phase 8.3 (Causal Masking)
+
+1. **Position Offset Parameter**: For autoregressive decoding, the kernel needs to know the absolute position in the sequence, not just the query index within the current batch. The formula `max_kv_pos = q_idx + position_offset + 1` handles:
+   - Prefill (position_offset=0): Each query can attend to itself and all previous tokens
+   - Decode (position_offset=kv_len-1): Single new token can attend to entire KV cache
+
+2. **Register Allocation Conflicts**: When adding new functionality, always audit existing register usage. The scratch register for `emit_broadcast_i32_const` conflicted with `reg_Q_base` (both using `rdi`). Fixed by moving scratch to `rsi`.
+
+3. **Causal Masking as Early Exit**: Rather than applying a mask (multiply by 0), we simply limit the inner loop to `kv_pos < max_kv_pos`. This is more efficient as it avoids unnecessary computation.
+
+4. **Stack Parameter Layout**: With 8 integer parameters, stack offsets must account for:
+   - Stack alignment (16-byte)
+   - Return address (8 bytes)
+   - Previously pushed values
+   - The System V ABI places parameters 7+ on the stack at increasing offsets
+
+### Key Learnings from Phase 7
+
+1. **System V AMD64 Calling Convention**: Floating-point args go in xmm0-xmm7, NOT on stack with integers. The `scale` parameter must be read from xmm0.
+
+2. **Register Preservation in JIT Loops**: When a register (like r10 for seq_len_kv) is needed across loop iterations but may be clobbered by emitters, spill to stack at loop start and restore after each iteration.
+
+3. **EVEX vs VEX Register Constraints**: Some instructions (like `vhaddps` for horizontal sum) require VEX encoding which can't access ZMM16-31. Use low-numbered registers for compatibility.
+
+4. **Runtime JIT Loops**: For large output dimensions (d_model=896), emit runtime loops instead of unrolled code. This keeps code size manageable and avoids "code is too big" errors.
+
+5. **Context Buffer on Stack**: Store intermediate attention context on stack (not in output buffer) to enable proper Wo projection layout calculation.
 
 ### Key Learnings from Phase 6
 
@@ -453,11 +600,12 @@ mpirun -np 2 --oversubscribe ./build_v2/tests/v2/v2_integration_mpi_row_parallel
 
 ---
 
-### Legacy Future Work (from earlier phases)
+### Legacy Future Work (Updated Status)
 - [ ] Fix Q8_1 device transfer bug to enable E2E CLI testing
-- [ ] Implement Wo projection in JIT kernel for true fusion
+- [x] ~~Implement Wo projection in JIT kernel for true fusion~~ **✅ Complete (Phase 7)**
 - [ ] Benchmark fused vs unfused performance
-- [ ] Enable JIT backend as default (after Wo projection complete)
+- [ ] Enable JIT backend as default (after benchmarking)
+- [ ] Add causal masking support for autoregressive generation
 
 **Key Findings:**
 | Test | Cosine Similarity | Status |

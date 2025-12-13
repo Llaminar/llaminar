@@ -24,19 +24,10 @@
 #include "utils/Logger.h"
 #include <memory>
 #include <cmath>
+#include "pipelines/PipelineConfig.h" // For FusedAttentionBackend enum
 
 namespace llaminar2
 {
-
-    /**
-     * @brief Execution backend for fused attention kernel
-     */
-    enum class FusedAttentionBackend
-    {
-        REFERENCE, ///< Pure C++ reference (slowest, for testing)
-        TILED,     ///< Cache-blocked tiled (good balance)
-        JIT        ///< AVX-512 VNNI JIT (fastest)
-    };
 
     /**
      * @brief Pipeline-compatible fused attention + Wo projection kernel

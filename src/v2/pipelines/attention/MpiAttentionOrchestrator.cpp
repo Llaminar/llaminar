@@ -64,17 +64,17 @@ namespace llaminar2
 
             if (dynamic_cast<const Q8_1Tensor *>(tensor))
             {
-                LOG_DEBUG("[detectTensorPrecision] detected Q8_1Tensor");
+                LOG_TRACE("[detectTensorPrecision] detected Q8_1Tensor");
                 return ActivationPrecision::Q8_1;
             }
             if (dynamic_cast<const BF16Tensor *>(tensor))
             {
-                LOG_DEBUG("[detectTensorPrecision] detected BF16Tensor");
+                LOG_TRACE("[detectTensorPrecision] detected BF16Tensor");
                 return ActivationPrecision::BF16;
             }
             if (dynamic_cast<const FP16Tensor *>(tensor))
             {
-                LOG_DEBUG("[detectTensorPrecision] detected FP16Tensor");
+                LOG_TRACE("[detectTensorPrecision] detected FP16Tensor");
                 return ActivationPrecision::FP16;
             }
             // Default to FP32 (FP32Tensor or any other type that provides float data())
@@ -308,7 +308,7 @@ namespace llaminar2
 
             // Check if output supports Q8_1 native path
             const bool output_is_q8_1 = (output_q8 != nullptr);
-            LOG_DEBUG("[MPI TP Q8_1] Output tensor type: " << (output_is_q8_1 ? "Q8_1" : "FP32"));
+            LOG_TRACE("[MPI TP Q8_1] Output tensor type: " << (output_is_q8_1 ? "Q8_1" : "FP32"));
 
             // Get Q8_1 block pointers (native format, no dequantization!)
             const Q8_1Block *Q_blocks = Q_q8->q8_1_blocks();
@@ -346,14 +346,14 @@ namespace llaminar2
                 total_tokens, config.n_kv_heads, config.head_dim,
                 start_head, local_n_heads, config.n_heads);
 
-            LOG_DEBUG("[MPI TP Q8_1] Rank " << rank << ": sliced Q to " << q_local_blocks
+            LOG_TRACE("[MPI TP Q8_1] Rank " << rank << ": sliced Q to " << q_local_blocks
                                             << " blocks, broadcast K/V to " << kv_local_blocks << " blocks (GQA ratio="
                                             << (config.n_heads / config.n_kv_heads) << ")");
 
             // Create attention mask if needed
             const bool needs_mask = config.causal || (sequence_lengths && !sequence_lengths->empty());
             TensorBase *mask_tensor = config.workspace_mask.get();
-            LOG_DEBUG("[MPI TP Q8_1] needs_mask=" << needs_mask << " config.causal=" << config.causal
+            LOG_TRACE("[MPI TP Q8_1] needs_mask=" << needs_mask << " config.causal=" << config.causal
                                                   << " mask_tensor=" << (mask_tensor ? "valid" : "nullptr"));
             if (needs_mask && !mask_tensor)
             {
@@ -368,7 +368,7 @@ namespace llaminar2
                 {
                     if (config.causal)
                     {
-                        LOG_DEBUG("[MPI TP Q8_1] Creating causal mask for " << total_tokens << " tokens");
+                        LOG_TRACE("[MPI TP Q8_1] Creating causal mask for " << total_tokens << " tokens");
                         attention_utils::create_causal_mask(mask_data, total_tokens, config.window_size);
                         // Debug: print mask contents for 3x3
                         if (total_tokens <= 5 && rank == 0)
@@ -554,7 +554,7 @@ namespace llaminar2
                     }
                 }
 
-                LOG_DEBUG("[MPI TP Q8_1] Rank " << rank << ": Q8_1 allgatherv complete, "
+                LOG_TRACE("[MPI TP Q8_1] Rank " << rank << ": Q8_1 allgatherv complete, "
                                                 << blocks_per_rank << " blocks per rank");
             }
             else
@@ -749,10 +749,10 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
-        LOG_INFO("[MpiAttentionOrchestrator::compute_tensor_parallel] precision="
-                 << static_cast<int>(config.precision)
-                 << ", Q type=" << (dynamic_cast<Q8_1Tensor *>(Q) ? "Q8_1" : "FP32")
-                 << ", output type=" << (dynamic_cast<Q8_1Tensor *>(output) ? "Q8_1" : "FP32"));
+        LOG_TRACE("[MpiAttentionOrchestrator::compute_tensor_parallel] precision="
+                  << static_cast<int>(config.precision)
+                  << ", Q type=" << (dynamic_cast<Q8_1Tensor *>(Q) ? "Q8_1" : "FP32")
+                  << ", output type=" << (dynamic_cast<Q8_1Tensor *>(output) ? "Q8_1" : "FP32"));
 
         // Validate MPI context
         if (!config.mpi_ctx)
@@ -791,7 +791,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[MPI TP] Batch-aware attention: total_tokens=" << total_tokens
+        LOG_TRACE("[MPI TP] Batch-aware attention: total_tokens=" << total_tokens
                                                                   << " batch_size=" << effective_batch_size << " seq_len_per_batch=" << seq_len);
 
         int padded_seq_len = seq_len;
@@ -813,7 +813,7 @@ namespace llaminar2
         ActivationPrecision detected_precision;
         if (shouldUseNativeTensorParallel(Q, K, V, output, config, detected_precision))
         {
-            LOG_DEBUG("[MPI TP] Using native " << static_cast<int>(detected_precision)
+            LOG_TRACE("[MPI TP] Using native " << static_cast<int>(detected_precision)
                                                << " tensor-parallel path");
 
             switch (detected_precision)

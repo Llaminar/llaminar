@@ -170,19 +170,12 @@ namespace llaminar2
         // =============================================================================
 
         // Initialize infrastructure with batched workspace buffers
+        // This calls initializeKVCache() which now creates the unified KV cache
+        // supporting both single-sequence and batched modes.
         initializeInfrastructureBatched();
 
-        // Override KV cache with batched version
-        // Use effective MPI context (user-provided or default single-rank)
-        const MPIContext &effective_mpi_ctx = mpi_ctx_ ? *mpi_ctx_ : *default_mpi_ctx_;
-        std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
-        kv_cache_batched_ = std::make_shared<BatchedKVCache>(
-            effective_mpi_ctx, n_layers_, batch_size_, config.max_seq_len, n_kv_heads_, head_dim_, attention_devices);
-        LOG_DEBUG("Initialized batched KV cache: batch_size=" << batch_size_
-                                                              << ", max_seq_len=" << config.max_seq_len);
-
         // =============================================================================
-        // Fused Attention + Wo Kernel (Phase 5: experimental, optional)
+        // Fused Attention + Wo Kernel (Phase 8.1: production-ready)
         // =============================================================================
         // When enabled via config.use_fused_attention, use fused kernel that:
         // 1. Eliminates context quantization round-trip (FP32 → Q8_1 → FP32)
@@ -196,11 +189,11 @@ namespace llaminar2
             fused_config.num_kv_heads = n_kv_heads_;
             fused_config.head_dim = head_dim_;
             fused_config.d_model = d_model_;
-            // Use REFERENCE backend initially (JIT doesn't apply Wo projection yet)
-            fused_config.backend = FusedAttentionBackend::REFERENCE;
+            fused_config.backend = config_.fused_attention_backend;
 
             fused_attn_wo_kernel_ = std::make_unique<FusedAttentionWoKernel>(fused_config);
-            LOG_INFO("Fused attention+Wo kernel enabled (backend=REFERENCE)");
+            LOG_INFO("Fused attention+Wo kernel enabled (backend="
+                     << fusedAttentionBackendToString(config_.fused_attention_backend) << ")");
         }
         else if (config_.use_fused_attention)
         {

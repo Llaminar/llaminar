@@ -245,10 +245,16 @@ namespace llaminar2
                 ctx.benchmark_mode = true;
             }
 
-            // Fused attention kernel (experimental)
+            // Fused attention kernel
             else if (arg == "--fused-attention")
             {
                 ctx.use_fused_attention = true;
+            }
+            // Fused attention backend selection
+            else if (arg.rfind("--fused-attention-backend=", 0) == 0)
+            {
+                ctx.fused_attention_backend_str = arg.substr(26);
+                ctx.use_fused_attention = true; // Implicitly enable fused attention
             }
 
             // Verbose logging levels
@@ -360,6 +366,13 @@ namespace llaminar2
         std::cout << "  --benchmark               Run benchmark mode (separate prefill/decode timing)\n";
         std::cout << "                            Uses greedy sampling for deterministic results\n";
         std::cout << "                            Default: 128 tokens if -n not specified\n\n";
+
+        std::cout << "Fused Attention:\n";
+        std::cout << "  --fused-attention         Enable fused attention+Wo kernel (requires Q8_1 activations)\n";
+        std::cout << "  --fused-attention-backend=B  Select backend: jit (default), reference, tiled\n";
+        std::cout << "                              jit       - AVX-512 VNNI optimized (fastest)\n";
+        std::cout << "                              reference - Pure C++ (for debugging)\n";
+        std::cout << "                              tiled     - Cache-blocked (balanced)\n\n";
 
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";

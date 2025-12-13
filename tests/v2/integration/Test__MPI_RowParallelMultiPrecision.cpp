@@ -37,7 +37,7 @@ using namespace llaminar::v2::kernels;
 namespace
 {
     // Path to test model with Q4_0 weights
-    constexpr const char* TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+    constexpr const char *TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     /**
      * @brief Test fixture for MPI row-parallel multi-precision integration tests

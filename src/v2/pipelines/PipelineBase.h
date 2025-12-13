@@ -23,10 +23,10 @@
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
 #include "../tensors/TensorKernels.h"
-#include "../tensors/KVCache.h" // KV cache for autoregressive decode
-#include "PipelineConfig.h"     // Runtime configuration
-#include "MPIStrategy.h"        // MPI parallelization strategies
-#include "ops/Ops.h"            // Self-validating operations
+#include "../tensors/UnifiedKVCache.h" // Unified KV cache for single-sequence and batched decode
+#include "PipelineConfig.h"            // Runtime configuration
+#include "MPIStrategy.h"               // MPI parallelization strategies
+#include "ops/Ops.h"                   // Self-validating operations
 #include <vector>
 #include <memory>
 #include <string>
@@ -537,16 +537,16 @@ namespace llaminar2
         ActivationBuffers activation_buffers_;
 
         /**
-         * @brief KV cache for autoregressive decode (Phase 3)
+         * @brief Unified KV cache for autoregressive decode
          *
          * Stores past key/value projections for incremental generation.
+         * Supports both single-sequence (batch_size=1) and batched modes.
          * Initialized by initializeKVCache() with per-layer device placement.
-         * Per-layer device affinity enables heterogeneous execution.
          *
-         * December 2025: Now uses IKVCache interface for typed precision support.
+         * December 2025: Unified cache replaces separate IKVCache and BatchedKVCache.
          * Cache precision matches pipeline's ActivationPrecision by default.
          */
-        std::unique_ptr<IKVCache> kv_cache_;
+        std::unique_ptr<IUnifiedKVCache> kv_cache_;
 
         /**
          * @brief Current position per sequence (for incremental decode, batch-aware)
@@ -688,8 +688,9 @@ namespace llaminar2
          * Must be called AFTER n_layers_, n_kv_heads_, head_dim_ are set.
          *
          * @param max_seq_len Maximum sequence length for KV cache (e.g., 2048)
+         * @param batch_size Number of sequences to support (default: 1 for single-sequence)
          */
-        void initializeKVCache(int max_seq_len);
+        void initializeKVCache(int max_seq_len, int batch_size = 1);
 
         /**
          * @brief Complete pipeline infrastructure initialization

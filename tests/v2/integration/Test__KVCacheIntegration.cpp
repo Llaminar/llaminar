@@ -13,7 +13,7 @@
  */
 
 #include "gtest/gtest.h"
-#include "../../../src/v2/tensors/KVCache.h"
+#include "../../../src/v2/tensors/UnifiedKVCache.h"
 #include "../../../src/v2/tensors/Tensors.h"
 #include "../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
 #include "../../../src/v2/loaders/ModelContext.h"
@@ -24,8 +24,8 @@
 #include <vector>
 #include <cmath>
 
-// Use FP32 KVCache for integration tests
-using TestKVCache = llaminar2::KVCache<llaminar2::ActivationPrecision::FP32>;
+// Use FP32 UnifiedKVCache for integration tests
+using TestKVCache = llaminar2::UnifiedKVCache<llaminar2::ActivationPrecision::FP32>;
 #include <algorithm>
 #include <numeric>
 
@@ -665,7 +665,7 @@ TEST_F(KVCacheIntegrationTest, KVCacheDataIntegrity)
     int max_seq_len = 256;
 
     // Create KV cache directly with MPI context for NUMA-aware allocation
-    auto cache = std::make_shared<TestKVCache>(*mpi_ctx_, n_layers, max_seq_len, n_kv_heads, head_dim);
+    auto cache = std::make_shared<TestKVCache>(*mpi_ctx_, n_layers, /*batch_size=*/1, max_seq_len, n_kv_heads, head_dim);
 
     if (rank_ == 0)
     {

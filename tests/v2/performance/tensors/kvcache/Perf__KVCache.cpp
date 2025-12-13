@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "tensors/KVCache.h"
+#include "tensors/UnifiedKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
@@ -22,6 +22,9 @@
 #include <omp.h>
 
 using namespace llaminar2;
+
+// Alias for backward compatibility with tests
+using KVCache = UnifiedKVCache<ActivationPrecision::FP32>;
 
 // Single-rank MPI context for performance tests
 static MPIContext getTestMPIContext()
@@ -113,7 +116,7 @@ TEST_F(KVCachePerformanceTest, SingleTokenAppend)
     const int num_tokens = 256; // Simulate 256 decode steps
     const int warmup_steps = 10;
 
-    KVCache cache(getTestMPIContext(), N_LAYERS, max_seq_len, N_KV_HEADS, HEAD_DIM);
+    KVCache cache(getTestMPIContext(), N_LAYERS, /*batch_size=*/1, max_seq_len, N_KV_HEADS, HEAD_DIM);
 
     // Pre-create K/V tensors for single token
     auto [K, V] = create_kv_tensors(1, KV_DIM);
@@ -177,7 +180,7 @@ TEST_F(KVCachePerformanceTest, BatchPrefill)
 
     for (int prefill_len : prefill_sizes)
     {
-        KVCache cache(getTestMPIContext(), N_LAYERS, max_seq_len, N_KV_HEADS, HEAD_DIM);
+        KVCache cache(getTestMPIContext(), N_LAYERS, /*batch_size=*/1, max_seq_len, N_KV_HEADS, HEAD_DIM);
         auto [K, V] = create_kv_tensors(prefill_len, KV_DIM);
 
         // Warmup
@@ -239,7 +242,7 @@ TEST_F(KVCachePerformanceTest, EvictionLatency)
             if (evict >= fill)
                 continue;
 
-            KVCache cache(getTestMPIContext(), N_LAYERS, max_seq_len, N_KV_HEADS, HEAD_DIM);
+            KVCache cache(getTestMPIContext(), N_LAYERS, /*batch_size=*/1, max_seq_len, N_KV_HEADS, HEAD_DIM);
 
             // Fill cache to specified level
             auto [K, V] = create_kv_tensors(fill, KV_DIM);
@@ -288,7 +291,7 @@ TEST_F(KVCachePerformanceTest, LargeModelScale)
     const int max_seq_len = 8192;
     const int prefill_len = 1024;
 
-    KVCache cache(getTestMPIContext(), N_LAYERS_7B, max_seq_len, N_KV_HEADS_7B, HEAD_DIM_7B);
+    KVCache cache(getTestMPIContext(), N_LAYERS_7B, /*batch_size=*/1, max_seq_len, N_KV_HEADS_7B, HEAD_DIM_7B);
     auto [K, V] = create_kv_tensors(prefill_len, KV_DIM_7B);
 
     // Warmup
@@ -338,7 +341,7 @@ TEST_F(KVCachePerformanceTest, ParallelLayerPotential)
     const int iterations = 50;
 
     // Create cache and fill it
-    KVCache cache(getTestMPIContext(), N_LAYERS, max_seq_len, N_KV_HEADS, HEAD_DIM);
+    KVCache cache(getTestMPIContext(), N_LAYERS, /*batch_size=*/1, max_seq_len, N_KV_HEADS, HEAD_DIM);
     auto [K, V] = create_kv_tensors(fill_level, KV_DIM);
     for (int layer = 0; layer < N_LAYERS; ++layer)
     {

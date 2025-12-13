@@ -1305,6 +1305,19 @@ target_link_libraries(v2_test_iq4nl_views
 # GEMM v4 paths. IQ4_NL is now validated via tensor views and activation-
 # centric kernels.
 
+# Test: UnifiedKVCache (supports both single-sequence and batched modes, all precisions)
+add_executable(v2_test_unified_kv_cache unit/tensors/Test__UnifiedKVCache.cpp)
+target_link_libraries(v2_test_unified_kv_cache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_UnifiedKVCache 
+    COMMAND $<TARGET_FILE:v2_test_unified_kv_cache>
+    LABELS "V2;Unit;KVCache;Batched;SingleSequence;FP32;BF16;FP16;Q8_1;Eviction"
+    MPI_PROCS 1
+)
+
 # Test: Q4_0 SIMD Unpacking (AVX-512, AVX2, SSE, Scalar)
 add_executable(v2_test_q4_0_simd_unpack unit/tensors/Test__Q4_0_SIMD_Unpack.cpp)
 target_link_libraries(v2_test_q4_0_simd_unpack 
@@ -1930,18 +1943,6 @@ add_v2_test(V2_Unit_Q8_K_SIMD
     COMMAND $<TARGET_FILE:v2_test_q8_k_simd>
     MPI_PROCS 1
     LABELS "V2;Unit;TensorOperations;Q8_K;Quantization;SIMD;AVX2;AVX512;Equivalency;KQuant;SuperBlock;Int8Conversion"
-)
-
-# Test: KVCache
-add_executable(v2_test_kv_cache unit/tensors/Test__KVCache.cpp)
-target_link_libraries(v2_test_kv_cache 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_KVCache 
-    COMMAND $<TARGET_FILE:v2_test_kv_cache>
-    LABELS "V2;Unit;TensorOperations;KVCache;AutoregressiveDecode"
 )
 
 # Test: WeightPlacementMap
@@ -2843,6 +2844,20 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness
     MPI_PROCS 1
 )
 
+# Test: JIT Wo Projection - Tests the Wo projection implementation in JIT kernel
+# Validates FP32, FP16, BF16, Q8_1 Wo formats against REFERENCE backend
+add_executable(v2_test_jit_wo_projection unit/attention/Test__JitWoProjection.cpp)
+target_link_libraries(v2_test_jit_wo_projection 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitWoProjection 
+    COMMAND $<TARGET_FILE:v2_test_jit_wo_projection>
+    LABELS "V2;Unit;JIT;WoProjection;FusedAttention;AVX512;Q8_1;FP16;BF16;NumericalParity"
+    MPI_PROCS 1
+)
+
 # =============================================================================
 # Phase 5: Pipeline Integration - FusedAttentionWoKernel wrapper
 # =============================================================================
@@ -2860,4 +2875,23 @@ add_v2_test(V2_Integration_FusedAttentionWoKernel
     LABELS "V2;Integration;FusedAttention;PipelineWrapper;JIT;Tiled;Reference;Q8_1"
     MPI_PROCS 1
 )
+
+# =============================================================================
+# Phase 8.2: Performance Benchmarking - Fused Attention + Wo
+# =============================================================================
+# Compares fused JIT attention+Wo vs unfused Reference attention+Wo
+# Measures: prefill throughput, decode latency, speedup percentages
+
+add_executable(v2_perf_fused_attention_wo performance/kernels/cpu/attention/Perf__FusedAttentionWo.cpp)
+target_link_libraries(v2_perf_fused_attention_wo 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_FusedAttentionWo 
+    COMMAND $<TARGET_FILE:v2_perf_fused_attention_wo>
+    LABELS "V2;Performance;FusedAttention;JIT;Reference;Tiled;Prefill;Decode;Throughput"
+    MPI_PROCS 1
+)
+
 

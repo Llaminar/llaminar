@@ -1411,6 +1411,7 @@ namespace llaminar2
                 bool needs_scale = (!needs_zero && beta != 1.0f);
 
                 int k_blocks = k / 32;
+                int N_padded = ((n + 63) / 64) * 64; // Stride for compensation/scales arrays
                 const Q8_1Block *all_blocks = static_cast<const Q8_1Block *>(q8_1_activations);
 
 #pragma omp parallel
@@ -1512,24 +1513,31 @@ namespace llaminar2
                                 const float *scales_ptr = pw.scales.data() + n_blk;
                                 const float *mins_ptr = pw.mins.data() + n_blk;
 
+                                volatile QuantisedGemmParams params_v;
+                                params_v.A = blocks;
+                                params_v.B_packed = b_ptr;
+                                params_v.comp = comp_ptr;
+                                params_v.scales = scales_ptr;
+                                params_v.mins = pw.has_mins ? mins_ptr : nullptr;
+                                params_v.C = C + i * n + n_blk;
+                                params_v.K_blocks = k_blocks;
+                                params_v.N = 64;
+                                params_v.ldc = N_padded; // Stride for comp/scales arrays, NOT C output
+                                params_v.bias = bias ? bias + n_blk : nullptr;
+                                params_v.mask = softmax_mask ? (softmax_mask + i * n + n_blk) : nullptr;
+                                params_v.A_stride = k_blocks * sizeof(Q8_1Block);
+                                params_v.local_max = local_max;
+                                params_v.local_sum = local_sum;
+                                params_v.do_softmax = do_softmax;
+                                params_v.gate_input = gate_input ? (gate_input + i * n + n_blk) : nullptr;
+                                params_v.do_swiglu = do_swiglu;
+
+                                // Copy to non-volatile for kernel call
                                 QuantisedGemmParams params;
-                                params.A = blocks;
-                                params.B_packed = b_ptr;
-                                params.comp = comp_ptr;
-                                params.scales = scales_ptr;
-                                params.mins = pw.has_mins ? mins_ptr : nullptr;
-                                params.C = C + i * n + n_blk;
-                                params.K_blocks = k_blocks;
-                                params.N = 64;
-                                params.ldc = n;
-                                params.bias = bias ? bias + n_blk : nullptr;
-                                params.mask = softmax_mask ? (softmax_mask + i * n + n_blk) : nullptr;
-                                params.A_stride = k_blocks * sizeof(Q8_1Block);
-                                params.local_max = local_max;
-                                params.local_sum = local_sum;
-                                params.do_softmax = do_softmax;
-                                params.gate_input = gate_input ? (gate_input + i * n + n_blk) : nullptr;
-                                params.do_swiglu = do_swiglu;
+                                std::memcpy(&params, const_cast<QuantisedGemmParams *>(&params_v), sizeof(params));
+
+                                // Memory barrier to prevent reordering
+                                asm volatile("" ::: "memory");
 
                                 if (rows_to_process == 2)
                                     kernel_m2(&params);
@@ -1606,6 +1614,7 @@ namespace llaminar2
                 auto kernel_m2 = jit_m2.get_kernel();
 
                 int k_blocks = k / 32;
+                int N_padded = ((n + 63) / 64) * 64; // Stride for compensation/scales arrays
                 const Q8_1Block *all_blocks = static_cast<const Q8_1Block *>(q8_1_activations);
                 Q8_1Block *output_blocks = static_cast<Q8_1Block *>(C_q8_1);
 
@@ -1688,28 +1697,28 @@ namespace llaminar2
                                 const float *scales_ptr = pw.scales.data() + n_blk;
                                 const float *mins_ptr = pw.mins.data() + n_blk;
 
-                                QuantisedGemmParams params;
-                                params.A = blocks;
-                                params.B_packed = b_ptr;
-                                params.comp = comp_ptr;
-                                params.scales = scales_ptr;
-                                params.mins = pw.has_mins ? mins_ptr : nullptr;
-                                params.C = nullptr; // FP32 output not used
-                                params.K_blocks = k_blocks;
-                                params.N = 64;
-                                params.ldc = n;
+                                volatile QuantisedGemmParams params_v;
+                                params_v.A = blocks;
+                                params_v.B_packed = b_ptr;
+                                params_v.comp = comp_ptr;
+                                params_v.scales = scales_ptr;
+                                params_v.mins = pw.has_mins ? mins_ptr : nullptr;
+                                params_v.C = nullptr; // FP32 output not used
+                                params_v.K_blocks = k_blocks;
+                                params_v.N = 64;
+                                params_v.ldc = N_padded; // Stride for comp/scales arrays, NOT C output
                                 // Bias is added before Q8_1 requantization (if provided)
-                                params.bias = bias ? (bias + n_blk) : nullptr;
-                                params.mask = nullptr;
-                                params.A_stride = k_blocks * sizeof(Q8_1Block);
-                                params.local_max = nullptr;
-                                params.local_sum = nullptr;
-                                params.do_softmax = false;
-                                params.gate_input = nullptr;
-                                params.do_swiglu = false;
+                                params_v.bias = bias ? (bias + n_blk) : nullptr;
+                                params_v.mask = nullptr;
+                                params_v.A_stride = k_blocks * sizeof(Q8_1Block);
+                                params_v.local_max = nullptr;
+                                params_v.local_sum = nullptr;
+                                params_v.do_softmax = false;
+                                params_v.gate_input = nullptr;
+                                params_v.do_swiglu = false;
 
                                 // Q8_1 output parameters
-                                params.output_format = GemmOutputFormat::Q8_1;
+                                params_v.output_format = GemmOutputFormat::Q8_1;
 
                                 // Handle tail case: N < 64 or remaining columns < 64
                                 // JIT kernel always writes 64 columns (2 Q8_1 blocks per row)
@@ -1720,16 +1729,23 @@ namespace llaminar2
                                 if (is_tail)
                                 {
                                     // Write to temporary buffer, then copy valid blocks
-                                    params.C_q8_1 = reinterpret_cast<uint8_t *>(temp_blocks);
-                                    params.C_q8_1_stride = 2 * sizeof(Q8_1Block); // Always 2 blocks per row in temp
+                                    params_v.C_q8_1 = reinterpret_cast<uint8_t *>(temp_blocks);
+                                    params_v.C_q8_1_stride = 2 * sizeof(Q8_1Block); // Always 2 blocks per row in temp
                                 }
                                 else
                                 {
                                     // Direct write: output block pointer at row i, starting at n_blk/32 blocks
-                                    params.C_q8_1 = reinterpret_cast<uint8_t *>(
+                                    params_v.C_q8_1 = reinterpret_cast<uint8_t *>(
                                         output_blocks + i * output_blocks_per_row + (n_blk / 32));
-                                    params.C_q8_1_stride = output_stride;
+                                    params_v.C_q8_1_stride = output_stride;
                                 }
+
+                                // Copy to non-volatile for kernel call
+                                QuantisedGemmParams params;
+                                std::memcpy(&params, const_cast<QuantisedGemmParams *>(&params_v), sizeof(params));
+
+                                // Memory barrier to prevent reordering
+                                asm volatile("" ::: "memory");
 
                                 if (rows_to_process == 2)
                                     kernel_m2(&params);
@@ -2100,21 +2116,93 @@ namespace llaminar2
                 (void)device_idx;
                 (void)alpha; // Currently ignored (assumed 1.0)
 
+                // Validate Q8_1Tensor before processing
+                if (!A_tensor)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] A_tensor is null");
+                    return false;
+                }
+
+                // Check tensor dimensions match expected
+                const auto &shape = A_tensor->shape();
+                if (shape.size() != 2)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] A_tensor has " << shape.size() << " dims, expected 2");
+                    return false;
+                }
+                if (static_cast<int>(shape[0]) < m || static_cast<int>(shape[1]) < k)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] A_tensor shape [" << shape[0] << "," << shape[1]
+                                                                        << "] too small for m=" << m << " k=" << k);
+                    return false;
+                }
+
+                // Validate Q8_1 blocks are accessible
+                const size_t expected_blocks = ((m * ((k + 31) / 32)));
+                const void *raw_ptr = A_tensor->get_raw_block_at(0, 0);
+                if (!raw_ptr)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] get_raw_block_at(0,0) returned null");
+                    return false;
+                }
+
+                LOG_TRACE("[multiply_q8_1_direct] Q8_1 input validated: m=" << m << " n=" << n << " k=" << k
+                                                                            << " shape=[" << shape[0] << "," << shape[1] << "]"
+                                                                            << " expected_blocks=" << expected_blocks
+                                                                            << " raw_ptr=" << raw_ptr);
+
                 // Get reference to packed weights (either external or owned)
                 const auto &pw = packed_weights();
 
                 // Check dimensions
                 if (n != pw.N || k != pw.K)
                 {
-                    LOG_ERROR("Dimension mismatch in QuantisedGemmKernel::multiply_q8_1_direct");
+                    LOG_ERROR("Dimension mismatch in QuantisedGemmKernel::multiply_q8_1_direct: "
+                              << "n=" << n << " pw.N=" << pw.N << " k=" << k << " pw.K=" << pw.K);
                     return false;
                 }
+
+                // Validate packed weights data is allocated
+                if (pw.packed_data.empty())
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] packed_data is empty! n=" << n << " k=" << k);
+                    return false;
+                }
+
+                // Calculate expected sizes for validation
+                int K_blocks = (k + 31) / 32;
+                int K_padded = K_blocks * 32;
+                int N_padded = (n + 63) / 64 * 64;
+                size_t expected_packed_size = (size_t)K_padded * N_padded;
+
+                if (pw.packed_data.size() < expected_packed_size)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] packed_data too small: " << pw.packed_data.size()
+                                                                               << " < expected " << expected_packed_size
+                                                                               << " (n=" << n << " k=" << k << " N_padded=" << N_padded << " K_padded=" << K_padded << ")");
+                    return false;
+                }
+
+                LOG_TRACE("[multiply_q8_1_direct] packed_data validated: size=" << pw.packed_data.size()
+                                                                                << " expected=" << expected_packed_size << " has_mins=" << pw.has_mins);
 
                 // Get JIT kernels
                 static QuantisedGemmJit_M1 jit;
                 static QuantisedGemmJit_M2 jit_m2;
                 auto kernel = jit.get_kernel();
                 auto kernel_m2 = jit_m2.get_kernel();
+
+                // Validate JIT kernel function pointers
+                if (!kernel)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] JIT M1 kernel is null!");
+                    return false;
+                }
+                if (!kernel_m2)
+                {
+                    LOG_ERROR("[multiply_q8_1_direct] JIT M2 kernel is null!");
+                    return false;
+                }
 
                 // Handle beta scaling / zeroing
                 if (!accumulate || beta == 0.0f)
@@ -2132,6 +2220,7 @@ namespace llaminar2
 
                 int k_blocks = k / 32;
                 int blocks_per_row_output = (n + 63) / 64;
+                // N_padded already defined above for validation
 
                 // Get direct access to Q8_1 blocks (zero-copy!)
                 // A_tensor stores blocks in row-major order: [m, k_blocks] of Q8_1Block
@@ -2216,22 +2305,30 @@ namespace llaminar2
                                 const float *scales_ptr = pw.scales.data() + n_blk;
                                 const float *mins_ptr = pw.mins.data() + n_blk;
 
+                                // Use volatile to prevent aggressive optimization of params struct
+                                volatile QuantisedGemmParams params_v;
+                                params_v.A = blocks;
+                                params_v.B_packed = b_ptr;
+                                params_v.comp = comp_ptr;
+                                params_v.scales = scales_ptr;
+                                params_v.mins = pw.has_mins ? mins_ptr : nullptr;
+                                params_v.C = C + i * n + n_blk;
+                                params_v.K_blocks = k_blocks;
+                                params_v.N = 64;
+                                params_v.ldc = N_padded; // Stride for comp/scales arrays, NOT C output
+                                params_v.bias = nullptr;
+                                params_v.mask = nullptr;
+                                params_v.A_stride = blocks_per_row_input * sizeof(Q8_1Block);
+                                params_v.local_max = nullptr;
+                                params_v.local_sum = nullptr;
+                                params_v.do_softmax = false;
+
+                                // Copy to non-volatile for kernel call
                                 QuantisedGemmParams params;
-                                params.A = blocks;
-                                params.B_packed = b_ptr;
-                                params.comp = comp_ptr;
-                                params.scales = scales_ptr;
-                                params.mins = pw.has_mins ? mins_ptr : nullptr;
-                                params.C = C + i * n + n_blk;
-                                params.K_blocks = k_blocks;
-                                params.N = 64;
-                                params.ldc = n;
-                                params.bias = nullptr;
-                                params.mask = nullptr;
-                                params.A_stride = blocks_per_row_input * sizeof(Q8_1Block);
-                                params.local_max = nullptr;
-                                params.local_sum = nullptr;
-                                params.do_softmax = false;
+                                std::memcpy(&params, const_cast<QuantisedGemmParams *>(&params_v), sizeof(params));
+
+                                // Memory barrier to prevent reordering (workaround for optimization issue)
+                                asm volatile("" ::: "memory");
 
                                 if (rows_to_process == 2)
                                     kernel_m2(&params);

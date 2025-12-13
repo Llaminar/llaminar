@@ -263,6 +263,7 @@ namespace llaminar::v2::kernels::jit::test
             jit_config.num_kv_heads = num_kv_heads;
             jit_config.batch_size = 1;
             jit_config.wo_format = WoFormat::FP32;
+            jit_config.causal = false; // Non-causal to match reference with causal=false
 
             JitFusedAttentionWo jit_kernel(jit_config);
             jit_kernel.compute(
@@ -273,7 +274,8 @@ namespace llaminar::v2::kernels::jit::test
                 output_jit.data(),
                 seq_len,
                 kv_seq_len,
-                scale);
+                scale,
+                0); // position_offset = 0
 
             // Compare outputs
             int output_size = seq_len * d_model;

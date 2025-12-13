@@ -310,11 +310,16 @@ int main(int argc, char *argv[])
         pipeline_config.activation_precision = ActivationPrecision::FP32;
     }
 
-    // Fused attention + Wo kernel (experimental)
+    // Fused attention + Wo kernel
     pipeline_config.use_fused_attention = args.use_fused_attention;
+    if (!args.fused_attention_backend_str.empty())
+    {
+        pipeline_config.fused_attention_backend = parseFusedAttentionBackend(args.fused_attention_backend_str);
+    }
     if (args.use_fused_attention && mpi_ctx->rank() == 0)
     {
-        LOG_INFO("Fused attention+Wo kernel enabled (experimental)");
+        LOG_INFO("Fused attention+Wo kernel enabled (backend="
+                 << fusedAttentionBackendToString(pipeline_config.fused_attention_backend) << ")");
         if (pipeline_config.activation_precision != ActivationPrecision::Q8_1)
         {
             LOG_WARN("Fused attention requires Q8_1 activation precision, current: "

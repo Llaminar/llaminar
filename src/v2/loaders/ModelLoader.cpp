@@ -812,7 +812,7 @@ namespace llaminar2
         size_t slice_offset = row_start * bytes_per_row;
         size_t slice_bytes = slice_rows * bytes_per_row;
 
-        LOG_DEBUG("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
+        LOG_TRACE("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
                                              << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
 
         // Select correct file stream based on split index
@@ -1248,7 +1248,7 @@ namespace llaminar2
 
         size_t slice_bytes = total_rows * bytes_per_slice_row;
 
-        LOG_DEBUG("[ModelLoader] Column slice " << tensor_name << ": cols [" << col_start << ", " << col_end
+        LOG_TRACE("[ModelLoader] Column slice " << tensor_name << ": cols [" << col_start << ", " << col_end
                                                 << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)"
                                                 << ", reading " << bytes_per_slice_row << " bytes from each of " << total_rows << " rows");
 

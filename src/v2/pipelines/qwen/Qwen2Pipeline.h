@@ -22,7 +22,6 @@
 #include "../PipelineBase.h"
 #include "../TensorDimensions.h"
 #include "../ops/Ops.h"
-#include "../../tensors/BatchedKVCache.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "../../kernels/cpu/attention/FusedAttentionWoKernel.h"
 
@@ -206,8 +205,8 @@ namespace llaminar2
         std::shared_ptr<TensorBase> current_hidden_; // [batch_size * padded_seq_len, d_model]
         std::shared_ptr<TensorBase> logits_buffer_;  // [batch_size * padded_seq_len, vocab_size]
 
-        // Batched KV cache
-        std::shared_ptr<BatchedKVCache> kv_cache_batched_;
+        // NOTE: KV cache is now inherited from PipelineBase (kv_cache_) as IUnifiedKVCache
+        // Supports both single-sequence and batched modes with typed precision.
 
         // Fused attention + Wo projection kernel (optional, enabled via config.use_fused_attention)
         std::unique_ptr<FusedAttentionWoKernel> fused_attn_wo_kernel_;

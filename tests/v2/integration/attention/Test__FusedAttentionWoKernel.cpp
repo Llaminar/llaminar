@@ -293,6 +293,7 @@ TEST_F(Test__FusedAttentionWoKernel, Parity_Reference_vs_JIT_SingleToken)
     jit_config.num_kv_heads = num_kv_heads;
     jit_config.batch_size = 1;
     jit_config.wo_format = llaminar::v2::kernels::jit::WoFormat::FP32;
+    jit_config.causal = false; // Non-causal for parity test
 
     llaminar::v2::kernels::jit::JitFusedAttentionWo jit_kernel(jit_config);
     jit_kernel.compute(
@@ -432,6 +433,7 @@ TEST_F(Test__FusedAttentionWoKernel, Q8_1Tensor_vs_VectorBlocks_Parity)
     jit_config.num_kv_heads = num_kv_heads;
     jit_config.batch_size = 1;
     jit_config.wo_format = llaminar::v2::kernels::jit::WoFormat::FP32;
+    jit_config.causal = false; // Non-causal for parity test
 
     llaminar::v2::kernels::jit::JitFusedAttentionWo jit_kernel(jit_config);
     jit_kernel.compute(Q_vec.data(), K_vec.data(), V_vec.data(), Wo_fp32.data(),
@@ -511,6 +513,7 @@ TEST_F(Test__FusedAttentionWoKernel, JIT_With_Q8_1Tensor_Objects)
     jit_config.num_kv_heads = num_kv_heads;
     jit_config.batch_size = 1;
     jit_config.wo_format = llaminar::v2::kernels::jit::WoFormat::FP32;
+    jit_config.causal = false; // Non-causal for parity test
 
     llaminar::v2::kernels::jit::JitFusedAttentionWo jit_kernel(jit_config);
     jit_kernel.compute(
@@ -599,6 +602,7 @@ TEST_F(Test__FusedAttentionWoKernel, Parity_Reference_vs_JIT_Prefill)
     jit_config.num_kv_heads = num_kv_heads;
     jit_config.batch_size = 1;
     jit_config.wo_format = llaminar::v2::kernels::jit::WoFormat::FP32;
+    jit_config.causal = false; // Non-causal for parity test
 
     llaminar::v2::kernels::jit::JitFusedAttentionWo jit_kernel(jit_config);
     jit_kernel.compute(
@@ -684,6 +688,7 @@ TEST_F(Test__FusedAttentionWoKernel, Parity_Tiled_vs_JIT_LongKV)
     jit_config.num_kv_heads = num_kv_heads;
     jit_config.batch_size = 1;
     jit_config.wo_format = llaminar::v2::kernels::jit::WoFormat::FP32;
+    jit_config.causal = false; // Non-causal for parity test
 
     llaminar::v2::kernels::jit::JitFusedAttentionWo jit_kernel(jit_config);
     jit_kernel.compute(

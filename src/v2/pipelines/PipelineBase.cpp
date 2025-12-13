@@ -746,7 +746,7 @@ namespace llaminar2
         }
     }
 
-    void PipelineBase::initializeKVCache(int max_seq_len)
+    void PipelineBase::initializeKVCache(int max_seq_len, int batch_size)
     {
         DEBUG_ASSERT(n_layers_ > 0, "n_layers_ must be set before calling initializeKVCache");
         DEBUG_ASSERT(n_kv_heads_ > 0, "n_kv_heads_ must be set before calling initializeKVCache");
@@ -758,16 +758,17 @@ namespace llaminar2
         // Phase 3: Use placement map to detect attention devices per layer
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
 
-        // Create typed KV cache matching pipeline's activation precision
-        kv_cache_ = createKVCache(config_.activation_precision, effective_mpi_ctx,
-                                  n_layers_, max_seq_len, n_kv_heads_, head_dim_,
-                                  attention_devices);
+        // Create unified KV cache matching pipeline's activation precision
+        kv_cache_ = createUnifiedKVCache(config_.activation_precision, effective_mpi_ctx,
+                                         n_layers_, batch_size, max_seq_len, n_kv_heads_, head_dim_,
+                                         attention_devices);
         current_positions_.clear(); // Will be resized to batch_size in forward_batch()
 
-        LOG_DEBUG("Initialized KV cache: " << n_layers_ << " layers, "
-                                           << max_seq_len << " max_seq_len, "
-                                           << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
-                                           << ", precision: " << static_cast<int>(config_.activation_precision));
+        LOG_DEBUG("Initialized unified KV cache: " << n_layers_ << " layers, "
+                                                   << "batch_size=" << batch_size << ", "
+                                                   << max_seq_len << " max_seq_len, "
+                                                   << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
+                                                   << ", precision: " << static_cast<int>(config_.activation_precision));
     }
 
     // ===== Snapshot Capture Implementation =====

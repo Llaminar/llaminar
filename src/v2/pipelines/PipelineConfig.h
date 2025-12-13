@@ -13,9 +13,54 @@
 #include "backends/ComputeBackend.h"
 #include "utils/CPUFeatures.h"
 #include "utils/Logger.h"
+#include <string>
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Fused attention execution backend
+     *
+     * Selects which implementation to use for fused attention + Wo projection.
+     */
+    enum class FusedAttentionBackend
+    {
+        JIT,       ///< AVX-512 VNNI JIT (fastest, default)
+        REFERENCE, ///< Pure C++ reference (for testing/debugging)
+        TILED      ///< Cache-blocked tiled (balanced)
+    };
+
+    /**
+     * @brief Parse FusedAttentionBackend from string
+     * @param s Backend name ("jit", "reference", "tiled")
+     * @return Corresponding backend enum, or JIT if unrecognized
+     */
+    inline FusedAttentionBackend parseFusedAttentionBackend(const std::string &s)
+    {
+        if (s == "reference" || s == "ref")
+            return FusedAttentionBackend::REFERENCE;
+        if (s == "tiled")
+            return FusedAttentionBackend::TILED;
+        return FusedAttentionBackend::JIT; // Default
+    }
+
+    /**
+     * @brief Convert FusedAttentionBackend to string
+     */
+    inline const char *fusedAttentionBackendToString(FusedAttentionBackend b)
+    {
+        switch (b)
+        {
+        case FusedAttentionBackend::JIT:
+            return "JIT";
+        case FusedAttentionBackend::REFERENCE:
+            return "REFERENCE";
+        case FusedAttentionBackend::TILED:
+            return "TILED";
+        default:
+            return "UNKNOWN";
+        }
+    }
 
     /**
      * @brief Weight loading strategy
@@ -213,9 +258,6 @@ namespace llaminar2
          * 2. Improves cache locality (context stays in registers through projection)
          * 3. Reduces memory bandwidth (single pass over V and Wo)
          *
-         * The fused kernel uses FusedAttentionWoKernel with REFERENCE backend
-         * (JIT backend does not yet support Wo projection).
-         *
          * Requirements:
          * - Q8_1 activation precision (activation_precision == Q8_1)
          * - Will fall back to unfused path if requirements not met
@@ -227,6 +269,18 @@ namespace llaminar2
          * Default: false (use proven unfused path)
          */
         bool use_fused_attention = false;
+
+        /**
+         * @brief Fused attention execution backend
+         *
+         * Selects which implementation to use when use_fused_attention=true:
+         * - JIT (default): AVX-512 VNNI optimized, fastest
+         * - REFERENCE: Pure C++ implementation, for testing
+         * - TILED: Cache-blocked implementation, good balance
+         *
+         * Only affects fused attention path; ignored if use_fused_attention=false.
+         */
+        FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
         /**
          * @brief Default constructor with standard settings

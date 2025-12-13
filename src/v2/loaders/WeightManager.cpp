@@ -444,7 +444,7 @@ namespace llaminar2
                 return nullptr;
             }
 
-            LOG_DEBUG("[WeightManager] Rank " << rank << " row-parallel " << name
+            LOG_TRACE("[WeightManager] Rank " << rank << " row-parallel " << name
                                               << " [" << total_rows << ", " << cols
                                               << "] -> loaded ONLY rows [" << row_start << ", " << row_end
                                               << ") = " << (row_end - row_start) << " rows (memory efficient)");
@@ -504,7 +504,7 @@ namespace llaminar2
                 return nullptr;
             }
 
-            LOG_DEBUG("[WeightManager] Rank " << rank << " column-parallel " << name
+            LOG_TRACE("[WeightManager] Rank " << rank << " column-parallel " << name
                                               << " [" << total_rows << ", " << cols
                                               << "] -> loaded ONLY rows [" << row_start << ", " << row_end
                                               << ") = " << (row_end - row_start) << " rows (memory efficient, quantized)");
@@ -562,7 +562,7 @@ namespace llaminar2
                 return nullptr;
             }
 
-            LOG_DEBUG("[WeightManager] Rank " << rank << " input-parallel " << name
+            LOG_TRACE("[WeightManager] Rank " << rank << " input-parallel " << name
                                               << " [" << rows << ", " << total_cols
                                               << "] -> loaded ONLY cols [" << col_start << ", " << col_end
                                               << ") = " << (col_end - col_start) << " cols (memory efficient, quantized)");

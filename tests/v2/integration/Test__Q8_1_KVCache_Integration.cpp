@@ -4,7 +4,7 @@
  *
  * This test validates the complete data flow:
  * 1. FusedGEMM produces Q8_1 Q/K/V tensors
- * 2. K/V are stored in typed KVCache<Q8_1>
+ * 2. K/V are stored in typed UnifiedKVCache<Q8_1>
  * 3. K/V are retrieved from cache
  * 4. Attention kernel computes with Q and cached K/V
  *
@@ -26,7 +26,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
-#include "tensors/KVCache.h"
+#include "tensors/UnifiedKVCache.h"
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include "kernels/cpu/gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
@@ -200,9 +200,10 @@ TEST_F(Test__Q8_1_KVCache_Integration, KVCache_Q8_1_RoundTrip)
     const int LAYER = 0;
 
     // Create typed KV cache
-    auto kv_cache = std::make_unique<KVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::Q8_1>>(
         /*mpi_ctx=*/*mpi_ctx_,
         /*n_layers=*/1,
+        /*batch_size=*/1,
         /*max_seq_len=*/512,
         /*n_kv_heads=*/N_KV_HEADS,
         /*head_dim=*/HEAD_DIM,
@@ -271,9 +272,10 @@ TEST_F(Test__Q8_1_KVCache_Integration, Attention_Q8_1_WithKVCache)
     const int LAYER = 0;
 
     // Create typed KV cache
-    auto kv_cache = std::make_unique<KVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::Q8_1>>(
         /*mpi_ctx=*/*mpi_ctx_,
         /*n_layers=*/1,
+        /*batch_size=*/1,
         /*max_seq_len=*/512,
         /*n_kv_heads=*/N_KV_HEADS,
         /*head_dim=*/HEAD_DIM,
@@ -391,9 +393,10 @@ TEST_F(Test__Q8_1_KVCache_Integration, Attention_Direct_vs_CacheRetrieved)
     const int LAYER = 0;
 
     // Create typed KV cache
-    auto kv_cache = std::make_unique<KVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::Q8_1>>(
         /*mpi_ctx=*/*mpi_ctx_,
         /*n_layers=*/1,
+        /*batch_size=*/1,
         /*max_seq_len=*/512,
         /*n_kv_heads=*/N_KV_HEADS,
         /*head_dim=*/HEAD_DIM,
@@ -707,9 +710,10 @@ TEST_F(Test__Q8_1_KVCache_Integration, KVCache_BlockCopy_Semantics)
     const int SEQ_LEN = 9;
     const int LAYER = 0;
 
-    auto kv_cache = std::make_unique<KVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::Q8_1>>(
         /*mpi_ctx=*/*mpi_ctx_,
         /*n_layers=*/1,
+        /*batch_size=*/1,
         /*max_seq_len=*/512,
         /*n_kv_heads=*/N_KV_HEADS,
         /*head_dim=*/HEAD_DIM,

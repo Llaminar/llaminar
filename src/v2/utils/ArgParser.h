@@ -83,7 +83,8 @@ namespace llaminar2
         bool benchmark_mode = false; // Run benchmark (prefill + decode timing)
 
         // Fused attention kernel
-        bool use_fused_attention = false; // Use fused attention+Wo kernel (experimental)
+        bool use_fused_attention = false;        // Use fused attention+Wo kernel
+        std::string fused_attention_backend_str; // Backend: "jit" (default), "reference", "tiled"
     };
 
     /**

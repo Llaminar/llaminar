@@ -257,7 +257,13 @@ namespace llaminar2
             const char *quant_thresh_env = std::getenv("LLAMINAR_GEMM_QUANT_PARALLEL_THRESHOLD");
             if (quant_thresh_env)
                 gemm_quant_parallel_threshold = std::atoi(quant_thresh_env);
+
+            const char *trace_q8_env = std::getenv("LLAMINAR_TRACE_Q8_1_DIRECT");
+            if (trace_q8_env)
+                trace_q8_1_direct = (std::atoi(trace_q8_env) != 0);
         }
+
+        bool trace_q8_1_direct = false; ///< Enable detailed Q8_1 JIT kernel tracing
     };
 
     /**
