@@ -536,6 +536,527 @@ namespace llaminar::v2::kernels::jit::test
             "Qwen2 0.5B - Prefill 64 tokens");
     }
 
+    // Debug test for causal with single tile
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_SingleTile_Causal)
+    {
+        run_prefill_decode_parity_test(
+            /*seq_len_q=*/2,
+            /*seq_len_kv=*/2,
+            /*num_heads=*/4,
+            /*num_kv_heads=*/2,
+            /*head_dim=*/64,
+            /*causal=*/true,
+            "Debug: Single Tile (seq_q=2), Causal");
+    }
+
+    // Debug test for causal with partial second tile (3 queries = 1 full + 1 partial)
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_PartialSecondTile_Causal)
+    {
+        run_prefill_decode_parity_test(
+            /*seq_len_q=*/3,
+            /*seq_len_kv=*/3,
+            /*num_heads=*/4,
+            /*num_kv_heads=*/2,
+            /*head_dim=*/64,
+            /*causal=*/true,
+            "Debug: Partial Second Tile (seq_q=3), Causal");
+    }
+
+    // Debug test: 4 queries, but seq_len_kv=3 (no K3)
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_FullSecondTile_ShortKV_Causal)
+    {
+        run_prefill_decode_parity_test(
+            /*seq_len_q=*/4,
+            /*seq_len_kv=*/3,
+            /*num_heads=*/4,
+            /*num_kv_heads=*/2,
+            /*head_dim=*/64,
+            /*causal=*/true,
+            "Debug: Full Second Tile with Short KV (seq_q=4, seq_kv=3), Causal");
+    }
+
+    // Debug test: 4 queries, seq_len_kv=5 (more KV positions than queries)
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_FullSecondTile_LongKV_Causal)
+    {
+        run_prefill_decode_parity_test(
+            /*seq_len_q=*/4,
+            /*seq_len_kv=*/5,
+            /*num_heads=*/4,
+            /*num_kv_heads=*/2,
+            /*head_dim=*/64,
+            /*causal=*/true,
+            "Debug: Full Second Tile with Long KV (seq_q=4, seq_kv=5), Causal");
+    }
+
+    // Debug test: Print intermediate attention values to trace the bug
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_DeepTrace_Causal)
+    {
+        // Same configuration as failing test
+        const int seq_len_q = 4;
+        const int seq_len_kv = 4;
+        const int num_heads = 4;
+        const int num_kv_heads = 2;
+        const int head_dim = 64;
+        const bool causal = true;
+
+        const int d_model = num_heads * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int blocks_per_head = head_dim / 32;
+
+        std::cout << "\n=== DEEP TRACE: Causal Bug Analysis ===" << std::endl;
+        std::cout << "  q_tile_size = " << (4 / (head_dim / 32)) << " (for head_dim=64)" << std::endl;
+        std::cout << "  Tile 0: Q0, Q1 (tile_start=0)" << std::endl;
+        std::cout << "  Tile 1: Q2, Q3 (tile_start=2)" << std::endl;
+
+        // Use deterministic data to make analysis easier
+        // Q = identity-like pattern, K = orthogonal pattern
+        std::vector<float> Q_fp32(seq_len_q * num_heads * head_dim);
+        std::vector<float> K_fp32(seq_len_kv * num_kv_heads * head_dim);
+        std::vector<float> V_fp32(seq_len_kv * num_kv_heads * head_dim);
+
+        // Initialize with deterministic pattern
+        for (int q = 0; q < seq_len_q; ++q)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    // Q[q,h,d] = (q+1) * 0.1 if d == (q + h * 16) % head_dim, else 0.01
+                    int idx = q * num_heads * head_dim + h * head_dim + d;
+                    if (d == (q + h * 16) % head_dim)
+                    {
+                        Q_fp32[idx] = (q + 1) * 0.1f;
+                    }
+                    else
+                    {
+                        Q_fp32[idx] = 0.01f * ((idx % 7) - 3) * 0.1f;
+                    }
+                }
+            }
+        }
+
+        for (int k = 0; k < seq_len_kv; ++k)
+        {
+            for (int h = 0; h < num_kv_heads; ++h)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    int idx = k * num_kv_heads * head_dim + h * head_dim + d;
+                    // K[k,h,d] has peak at different position than Q
+                    if (d == (k + h * 8 + 32) % head_dim)
+                    {
+                        K_fp32[idx] = (k + 1) * 0.15f;
+                    }
+                    else
+                    {
+                        K_fp32[idx] = 0.01f * ((idx % 11) - 5) * 0.1f;
+                    }
+                }
+            }
+        }
+
+        for (int v = 0; v < seq_len_kv; ++v)
+        {
+            for (int h = 0; h < num_kv_heads; ++h)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    int idx = v * num_kv_heads * head_dim + h * head_dim + d;
+                    // V[k,h,d] = k + d*0.001 (distinct pattern per KV position)
+                    V_fp32[idx] = (v + 1) * 0.5f + d * 0.001f;
+                }
+            }
+        }
+
+        // Quantize
+        std::vector<Q8_1Block> Q_q8(seq_len_q * num_heads * blocks_per_head);
+        std::vector<Q8_1Block> K_q8(seq_len_kv * num_kv_heads * blocks_per_head);
+        std::vector<Q8_1Block> V_q8(seq_len_kv * num_kv_heads * blocks_per_head);
+
+        quantize_fp32_to_q8_1(Q_fp32.data(), seq_len_q * num_heads, head_dim, Q_q8.data());
+        quantize_fp32_to_q8_1(K_fp32.data(), seq_len_kv * num_kv_heads, head_dim, K_q8.data());
+        quantize_fp32_to_q8_1(V_fp32.data(), seq_len_kv * num_kv_heads, head_dim, V_q8.data());
+
+        // Identity Wo
+        std::vector<float> Wo_fp32(d_model * d_model, 0.0f);
+        for (int i = 0; i < d_model; ++i)
+        {
+            Wo_fp32[i * d_model + i] = 1.0f;
+        }
+
+        std::vector<float> output_prefill(seq_len_q * d_model, 0.0f);
+        std::vector<float> output_decode(seq_len_q * d_model, 0.0f);
+
+        // Run prefill
+        {
+            JitAttentionConfig config;
+            config.head_dim = head_dim;
+            config.num_heads = num_heads;
+            config.num_kv_heads = num_kv_heads;
+            config.batch_size = seq_len_q;
+            config.wo_format = WoFormat::FP32;
+            config.causal = causal;
+            config.mode = AttentionMode::PREFILL;
+
+            JitFusedAttentionWo kernel(config);
+            kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                           output_prefill.data(), seq_len_q, seq_len_kv, scale, 0);
+        }
+
+        // Run decode
+        {
+            JitAttentionConfig config;
+            config.head_dim = head_dim;
+            config.num_heads = num_heads;
+            config.num_kv_heads = num_kv_heads;
+            config.batch_size = 1;
+            config.wo_format = WoFormat::FP32;
+            config.causal = causal;
+            config.mode = AttentionMode::DECODE;
+
+            JitFusedAttentionWo kernel(config);
+            for (int q = 0; q < seq_len_q; ++q)
+            {
+                const Q8_1Block *Q_slice = Q_q8.data() + q * num_heads * blocks_per_head;
+                float *out_slice = output_decode.data() + q * d_model;
+                int effective_kv_len = causal ? std::min(q + 1, seq_len_kv) : seq_len_kv;
+                kernel.compute(Q_slice, K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                               out_slice, 1, effective_kv_len, scale, q);
+            }
+        }
+
+        // Detailed comparison
+        std::cout << "\n  Query-by-query comparison (head 0 only, first 4 elements):" << std::endl;
+        std::cout << "  NOTE: V pattern: V[k] ~ (k+1)*0.5 + d*0.001" << std::endl;
+        std::cout << "  For causal: Q2 attends to K0,K1,K2; Q3 attends to K0,K1,K2,K3" << std::endl;
+        std::cout << std::endl;
+
+        for (int q = 0; q < seq_len_q; ++q)
+        {
+            std::cout << "  Q" << q << ":" << std::endl;
+            std::cout << "    Prefill: ";
+            for (int i = 0; i < 4; ++i)
+            {
+                std::cout << std::fixed << std::setprecision(4) << output_prefill[q * d_model + i] << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "    Decode:  ";
+            for (int i = 0; i < 4; ++i)
+            {
+                std::cout << std::fixed << std::setprecision(4) << output_decode[q * d_model + i] << " ";
+            }
+            std::cout << std::endl;
+
+            // Check per-query match
+            double q_cos = cosine_similarity(
+                output_prefill.data() + q * d_model,
+                output_decode.data() + q * d_model,
+                d_model);
+            double q_max_err = max_abs_error(
+                output_prefill.data() + q * d_model,
+                output_decode.data() + q * d_model,
+                d_model);
+            std::cout << "    Cosine: " << q_cos << ", MaxErr: " << q_max_err;
+            if (q_cos < 0.995)
+                std::cout << " *** MISMATCH ***";
+            std::cout << std::endl;
+        }
+
+        // Detailed comparison by head
+        std::cout << "\n  Per-head comparison for Q2:" << std::endl;
+        for (int h = 0; h < num_heads; ++h)
+        {
+            int head_start = 2 * d_model + h * head_dim;
+            std::cout << "    Head " << h << ": Prefill=" << output_prefill[head_start]
+                      << " Decode=" << output_decode[head_start]
+                      << " Diff=" << std::fabs(output_prefill[head_start] - output_decode[head_start]) << std::endl;
+        }
+
+        // Cross-query similarity (to detect if Q2 prefill looks like Q3)
+        std::cout << "\n  Cross-query cosine similarity (prefill outputs):" << std::endl;
+        for (int i = 0; i < seq_len_q; ++i)
+        {
+            for (int j = i + 1; j < seq_len_q; ++j)
+            {
+                double sim = cosine_similarity(
+                    output_prefill.data() + i * d_model,
+                    output_prefill.data() + j * d_model,
+                    d_model);
+                std::cout << "    Q" << i << " vs Q" << j << ": " << std::fixed << std::setprecision(4) << sim << std::endl;
+            }
+        }
+
+        // Also show Q2 prefill vs Q3 decode (should differ if bug exists)
+        double q2_prefill_vs_q3_decode = cosine_similarity(
+            output_prefill.data() + 2 * d_model,
+            output_decode.data() + 3 * d_model,
+            d_model);
+        std::cout << "\n  Q2 prefill vs Q3 decode: " << q2_prefill_vs_q3_decode << std::endl;
+        std::cout << "  (If bug exists, this should be high ~0.99+, should be lower ~0.9 if correct)" << std::endl;
+
+        // Overall parity check
+        double cos_sim = cosine_similarity(output_prefill.data(), output_decode.data(), seq_len_q * d_model);
+        EXPECT_GE(cos_sim, MIN_COSINE_SIM) << "Prefill vs decode parity failed";
+    }
+
+    // Single-head test to isolate the causal bug from GQA complexity
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_SingleHead_Causal)
+    {
+        const int seq_len_q = 4;
+        const int seq_len_kv = 4;
+        const int num_heads = 1;
+        const int num_kv_heads = 1;
+        const int head_dim = 64;
+        const bool causal = true;
+
+        const int d_model = num_heads * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int blocks_per_head = head_dim / 32;
+
+        std::cout << "\n=== Single Head Causal Test (DETAILED DEBUG) ===" << std::endl;
+        std::cout << "  q_tile_size = 4 / (64/32) = 2" << std::endl;
+        std::cout << "  Tile 0: Q0, Q1; Tile 1: Q2, Q3" << std::endl;
+
+        // V values that make it easy to trace which KV positions were attended
+        // V[k] = 2^k: V0=1, V1=2, V2=4, V3=8
+        // This way we can see exactly which positions were attended by the binary pattern
+        std::vector<float> Q_fp32(seq_len_q * num_heads * head_dim, 1.0f / std::sqrt(64.0f));
+        std::vector<float> K_fp32(seq_len_kv * num_kv_heads * head_dim, 1.0f / std::sqrt(64.0f));
+        std::vector<float> V_fp32(seq_len_kv * num_kv_heads * head_dim);
+
+        // V values: powers of 2 for easy identification
+        for (int k = 0; k < seq_len_kv; ++k)
+        {
+            float v_val = static_cast<float>(1 << k); // 1, 2, 4, 8
+            for (int d = 0; d < head_dim; ++d)
+            {
+                V_fp32[k * head_dim + d] = v_val;
+            }
+        }
+
+        std::cout << "  V values: V0=1, V1=2, V2=4, V3=8" << std::endl;
+        std::cout << "  With uniform Q*K scores, output = avg of attended V values" << std::endl;
+        std::cout << "  Expected:" << std::endl;
+        std::cout << "    Q0: (1)/1 = 1.0" << std::endl;
+        std::cout << "    Q1: (1+2)/2 = 1.5" << std::endl;
+        std::cout << "    Q2: (1+2+4)/3 = 2.333" << std::endl;
+        std::cout << "    Q3: (1+2+4+8)/4 = 3.75" << std::endl;
+
+        std::vector<Q8_1Block> Q_q8(seq_len_q * num_heads * blocks_per_head);
+        std::vector<Q8_1Block> K_q8(seq_len_kv * num_kv_heads * blocks_per_head);
+        std::vector<Q8_1Block> V_q8(seq_len_kv * num_kv_heads * blocks_per_head);
+
+        quantize_fp32_to_q8_1(Q_fp32.data(), seq_len_q * num_heads, head_dim, Q_q8.data());
+        quantize_fp32_to_q8_1(K_fp32.data(), seq_len_kv * num_kv_heads, head_dim, K_q8.data());
+        quantize_fp32_to_q8_1(V_fp32.data(), seq_len_kv * num_kv_heads, head_dim, V_q8.data());
+
+        // Identity Wo
+        std::vector<float> Wo_fp32(d_model * d_model, 0.0f);
+        for (int i = 0; i < d_model; ++i)
+        {
+            Wo_fp32[i * d_model + i] = 1.0f;
+        }
+
+        std::vector<float> output_prefill(seq_len_q * d_model, 0.0f);
+        std::vector<float> output_decode(seq_len_q * d_model, 0.0f);
+
+        // Run prefill
+        {
+            JitAttentionConfig config;
+            config.head_dim = head_dim;
+            config.num_heads = num_heads;
+            config.num_kv_heads = num_kv_heads;
+            config.batch_size = seq_len_q;
+            config.wo_format = WoFormat::FP32;
+            config.causal = causal;
+            config.mode = AttentionMode::PREFILL;
+
+            JitFusedAttentionWo kernel(config);
+            kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                           output_prefill.data(), seq_len_q, seq_len_kv, scale, 0);
+        }
+
+        // Run decode
+        {
+            JitAttentionConfig config;
+            config.head_dim = head_dim;
+            config.num_heads = num_heads;
+            config.num_kv_heads = num_kv_heads;
+            config.batch_size = 1;
+            config.wo_format = WoFormat::FP32;
+            config.causal = causal;
+            config.mode = AttentionMode::DECODE;
+
+            JitFusedAttentionWo kernel(config);
+            for (int q = 0; q < seq_len_q; ++q)
+            {
+                const Q8_1Block *Q_slice = Q_q8.data() + q * num_heads * blocks_per_head;
+                float *out_slice = output_decode.data() + q * d_model;
+                int effective_kv_len = causal ? std::min(q + 1, seq_len_kv) : seq_len_kv;
+                kernel.compute(Q_slice, K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                               out_slice, 1, effective_kv_len, scale, q);
+            }
+        }
+
+        std::cout << "\n  Results (first element of each query):" << std::endl;
+        for (int q = 0; q < seq_len_q; ++q)
+        {
+            std::cout << "    Q" << q << ": Prefill=" << output_prefill[q * d_model]
+                      << " Decode=" << output_decode[q * d_model] << std::endl;
+        }
+
+        double cos_sim = cosine_similarity(output_prefill.data(), output_decode.data(), seq_len_q * d_model);
+        std::cout << "  Cosine sim: " << cos_sim << std::endl;
+
+        // Compute reference using FP32 attention
+        std::cout << "\n  Reference FP32 attention (for comparison):" << std::endl;
+        for (int q_idx = 0; q_idx < seq_len_q; ++q_idx)
+        {
+            // For causal: attend to [0, q_idx]
+            int kv_end = causal ? std::min(q_idx + 1, seq_len_kv) : seq_len_kv;
+
+            // Compute scores
+            std::vector<float> scores(kv_end);
+            for (int k_idx = 0; k_idx < kv_end; ++k_idx)
+            {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    dot += Q_fp32[q_idx * head_dim + d] * K_fp32[k_idx * head_dim + d];
+                }
+                scores[k_idx] = dot * scale;
+            }
+
+            // Softmax
+            float max_score = *std::max_element(scores.begin(), scores.end());
+            float sum_exp = 0.0f;
+            for (int k = 0; k < kv_end; ++k)
+            {
+                scores[k] = std::exp(scores[k] - max_score);
+                sum_exp += scores[k];
+            }
+            for (int k = 0; k < kv_end; ++k)
+            {
+                scores[k] /= sum_exp;
+            }
+
+            // Weighted sum of V
+            float result = 0.0f;
+            for (int k = 0; k < kv_end; ++k)
+            {
+                result += scores[k] * V_fp32[k * head_dim]; // Just first element
+            }
+
+            std::cout << "    Q" << q_idx << " (attends to K[0.." << kv_end - 1 << "]): "
+                      << result << " (weights: ";
+            for (int k = 0; k < kv_end; ++k)
+            {
+                std::cout << scores[k] << " ";
+            }
+            std::cout << ")" << std::endl;
+        }
+
+        EXPECT_GE(cos_sim, MIN_COSINE_SIM);
+    }
+
+    // Test with head_dim=32 (q_tile_size=4) to see if bug is tile-size specific
+    TEST_F(Test__JitFusedAttentionWo_Prefill, Debug_SingleHead_HeadDim32_Causal)
+    {
+        const int seq_len_q = 4;
+        const int seq_len_kv = 4;
+        const int num_heads = 1;
+        const int num_kv_heads = 1;
+        const int head_dim = 32; // Different from 64!
+        const bool causal = true;
+
+        // With head_dim=32, q_tile_size = 4 / (32/32) = 4 / 1 = 4
+        // So ALL 4 queries fit in ONE tile!
+        std::cout << "\n=== Single Head, head_dim=32 (q_tile_size=4) Causal Test ===" << std::endl;
+        std::cout << "  q_tile_size = 4 / (32/32) = 4" << std::endl;
+        std::cout << "  Tile 0: Q0, Q1, Q2, Q3 (all in one tile!)" << std::endl;
+
+        const int d_model = num_heads * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int blocks_per_head = head_dim / 32;
+
+        std::vector<float> Q_fp32(seq_len_q * num_heads * head_dim, 1.0f / std::sqrt(32.0f));
+        std::vector<float> K_fp32(seq_len_kv * num_kv_heads * head_dim, 1.0f / std::sqrt(32.0f));
+        std::vector<float> V_fp32(seq_len_kv * num_kv_heads * head_dim);
+
+        for (int k = 0; k < seq_len_kv; ++k)
+        {
+            float v_val = static_cast<float>(k + 1);
+            for (int d = 0; d < head_dim; ++d)
+            {
+                V_fp32[k * head_dim + d] = v_val;
+            }
+        }
+
+        std::vector<Q8_1Block> Q_q8(seq_len_q * num_heads * blocks_per_head);
+        std::vector<Q8_1Block> K_q8(seq_len_kv * num_kv_heads * blocks_per_head);
+        std::vector<Q8_1Block> V_q8(seq_len_kv * num_kv_heads * blocks_per_head);
+
+        quantize_fp32_to_q8_1(Q_fp32.data(), seq_len_q * num_heads, head_dim, Q_q8.data());
+        quantize_fp32_to_q8_1(K_fp32.data(), seq_len_kv * num_kv_heads, head_dim, K_q8.data());
+        quantize_fp32_to_q8_1(V_fp32.data(), seq_len_kv * num_kv_heads, head_dim, V_q8.data());
+
+        std::vector<float> Wo_fp32(d_model * d_model, 0.0f);
+        for (int i = 0; i < d_model; ++i)
+        {
+            Wo_fp32[i * d_model + i] = 1.0f;
+        }
+
+        std::vector<float> output_prefill(seq_len_q * d_model, 0.0f);
+        std::vector<float> output_decode(seq_len_q * d_model, 0.0f);
+
+        {
+            JitAttentionConfig config;
+            config.head_dim = head_dim;
+            config.num_heads = num_heads;
+            config.num_kv_heads = num_kv_heads;
+            config.batch_size = seq_len_q;
+            config.wo_format = WoFormat::FP32;
+            config.causal = causal;
+            config.mode = AttentionMode::PREFILL;
+
+            JitFusedAttentionWo kernel(config);
+            kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                           output_prefill.data(), seq_len_q, seq_len_kv, scale, 0);
+        }
+
+        {
+            JitAttentionConfig config;
+            config.head_dim = head_dim;
+            config.num_heads = num_heads;
+            config.num_kv_heads = num_kv_heads;
+            config.batch_size = 1;
+            config.wo_format = WoFormat::FP32;
+            config.causal = causal;
+            config.mode = AttentionMode::DECODE;
+
+            JitFusedAttentionWo kernel(config);
+            for (int q = 0; q < seq_len_q; ++q)
+            {
+                const Q8_1Block *Q_slice = Q_q8.data() + q * num_heads * blocks_per_head;
+                float *out_slice = output_decode.data() + q * d_model;
+                int effective_kv_len = causal ? std::min(q + 1, seq_len_kv) : seq_len_kv;
+                kernel.compute(Q_slice, K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                               out_slice, 1, effective_kv_len, scale, q);
+            }
+        }
+
+        std::cout << "\n  Results (first element):" << std::endl;
+        for (int q = 0; q < seq_len_q; ++q)
+        {
+            std::cout << "    Q" << q << ": Prefill=" << output_prefill[q * d_model]
+                      << " Decode=" << output_decode[q * d_model] << std::endl;
+        }
+
+        double cos_sim = cosine_similarity(output_prefill.data(), output_decode.data(), seq_len_q * d_model);
+        std::cout << "  Cosine sim: " << cos_sim << std::endl;
+        EXPECT_GE(cos_sim, MIN_COSINE_SIM);
+    }
+
     // NOTE: Qwen7B prefill test removed due to JIT code size limitation.
     // The prefill kernel with 28 heads exceeds the 512KB code buffer.
     // Future work: Use runtime head loop or larger buffer.

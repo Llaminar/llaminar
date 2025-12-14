@@ -65,12 +65,17 @@ namespace llaminar::v2::kernels::jit
      *
      * These registers hold constants used across multiple microkernels.
      * Once initialized, they should not be modified.
+     *
+     * Note: ZMM_NEG_INF (zmm28) is dual-purposed:
+     *   - Decode mode: -infinity for softmax initialization
+     *   - Prefill mode: 16.0f for Q8_1 correction factor
      */
     struct ConstRegs
     {
         static constexpr int ZMM_128 = 26;     ///< 0x80808080 for unsigned conversion
         static constexpr int ZMM_SCALE = 27;   ///< Attention scale (1/sqrt(d))
-        static constexpr int ZMM_NEG_INF = 28; ///< -infinity for softmax init
+        static constexpr int ZMM_NEG_INF = 28; ///< -infinity for softmax init (decode)
+        static constexpr int ZMM_16 = 28;      ///< 16.0f for Q8_1 correction (prefill) - shares zmm28
         static constexpr int ZMM_ONE = 29;     ///< 1.0f
         static constexpr int ZMM_LOG2E = 30;   ///< log2(e) for fast exp
         static constexpr int ZMM_EXP_MIN = 31; ///< -87.0f (exp underflow clamp)
@@ -136,6 +141,7 @@ namespace llaminar::v2::kernels::jit
         Xbyak::Zmm zmm_128() const { return Xbyak::Zmm(ConstRegs::ZMM_128); }
         Xbyak::Zmm zmm_scale() const { return Xbyak::Zmm(ConstRegs::ZMM_SCALE); }
         Xbyak::Zmm zmm_neg_inf() const { return Xbyak::Zmm(ConstRegs::ZMM_NEG_INF); }
+        Xbyak::Zmm zmm_16() const { return Xbyak::Zmm(ConstRegs::ZMM_16); }  ///< 16.0f for Q8_1 correction
         Xbyak::Zmm zmm_one() const { return Xbyak::Zmm(ConstRegs::ZMM_ONE); }
         Xbyak::Zmm zmm_log2e() const { return Xbyak::Zmm(ConstRegs::ZMM_LOG2E); }
         Xbyak::Zmm zmm_exp_min() const { return Xbyak::Zmm(ConstRegs::ZMM_EXP_MIN); }

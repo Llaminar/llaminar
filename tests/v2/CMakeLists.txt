@@ -2873,6 +2873,19 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Prefill
     MPI_PROCS 1
 )
 
+# Debug test for prefill alternating zeros issue
+add_executable(v2_test_jit_fused_attention_wo_debug unit/attention/Test__JitFusedAttentionWo_Debug.cpp)
+target_link_libraries(v2_test_jit_fused_attention_wo_debug 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttentionWo_Debug 
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_debug>
+    LABELS "V2;Unit;JIT;FusedAttention;Debug"
+    MPI_PROCS 1
+)
+
 # Test: JIT Wo Projection - Tests the Wo projection implementation in JIT kernel
 # Validates FP32, FP16, BF16, Q8_1 Wo formats against REFERENCE backend
 add_executable(v2_test_jit_wo_projection unit/attention/Test__JitWoProjection.cpp)
