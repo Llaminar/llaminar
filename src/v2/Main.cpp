@@ -911,39 +911,6 @@ int main(int argc, char *argv[])
             LOG_DEBUG("[Rank 0] Sampling token...");
             std::vector<float> logits_vec(logits, logits + vocab_size);
 
-            // DEBUG: Print first 10 logit values and some specific positions
-            {
-                LOG_TRACE("[Rank 0] First 10 logit values:");
-                for (int k = 0; k < 10; ++k)
-                {
-                    LOG_TRACE("  logits[" << k << "] = " << logits_vec[k]);
-                }
-                LOG_TRACE("[Rank 0] Logits at key positions (PyTorch expected):");
-                LOG_TRACE("  logits[341] = " << logits_vec[341] << " (expected ~13.0 for ' {\\n')");
-                LOG_TRACE("  logits[11] = " << logits_vec[11] << " (expected ~12.9 for ',')");
-                LOG_TRACE("  logits[31792] = " << logits_vec[31792] << " (expected ~12.9 for '_world')");
-                LOG_TRACE("  logits[89012] = " << logits_vec[89012] << " (position 0 top: '给')");
-            }
-
-            // DEBUG: Print top-5 logits to help diagnose sampling issues
-            {
-                std::vector<std::pair<int, float>> indexed_logits;
-                indexed_logits.reserve(vocab_size);
-                for (size_t j = 0; j < vocab_size; ++j)
-                {
-                    indexed_logits.emplace_back(static_cast<int>(j), logits_vec[j]);
-                }
-                std::partial_sort(indexed_logits.begin(), indexed_logits.begin() + 5, indexed_logits.end(),
-                                  [](const auto &a, const auto &b)
-                                  { return a.second > b.second; });
-                LOG_TRACE("[Rank 0] Top-5 logits at decode iteration " << i << ":");
-                for (int k = 0; k < 5; ++k)
-                {
-                    LOG_TRACE("  " << (k + 1) << ". Token " << indexed_logits[k].first
-                                   << " score=" << indexed_logits[k].second);
-                }
-            }
-
             // Sample next token
             try
             {

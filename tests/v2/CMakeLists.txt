@@ -2844,6 +2844,20 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness
     MPI_PROCS 1
 )
 
+# Test: JIT Wo Projection Isolated
+# Tests the Wo projection logic in isolation to debug 1.0 output issue
+add_executable(v2_test_jit_wo_projection_isolated unit/attention/Test__JitWoProjectionIsolated.cpp)
+target_link_libraries(v2_test_jit_wo_projection_isolated 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitWoProjectionIsolated
+    COMMAND $<TARGET_FILE:v2_test_jit_wo_projection_isolated>
+    LABELS "V2;Unit;JIT;WoProjection;Isolated"
+    MPI_PROCS 1
+)
+
 # Test: JIT Fused Attention + Wo - Prefill Mode Tests
 # Tests the prefill kernel (H→KV→Q loop order) for K/V cache reuse optimization
 # Validates prefill vs decode parity, tile boundary handling, causal masking

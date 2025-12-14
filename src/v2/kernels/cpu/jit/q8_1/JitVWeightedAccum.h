@@ -69,9 +69,9 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_v_weighted_accum (" + std::to_string(num_blocks) + " blocks)");
 
             // Register aliases
-            Zmm zmm_v_lo = gen.zmm_input(0); // zmm8: V values 0-15 (dequantized)
-            Zmm zmm_v_hi = gen.zmm_input(1); // zmm9: V values 16-31 (dequantized)
-            Zmm zmm_d_v = gen.zmm_input(7);  // zmm15: V scale
+            Zmm zmm_v_lo = gen.zmm_input(0);  // zmm8: V values 0-15 (dequantized)
+            Zmm zmm_v_hi = gen.zmm_input(1);  // zmm9: V values 16-31 (dequantized)
+            Zmm zmm_d_v = gen.zmm_scratch(5); // zmm25: V scale
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -302,9 +302,9 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_v_weighted_accum_from_cache (" + std::to_string(num_blocks) + " blocks)");
 
             // Register aliases
-            Zmm zmm_v_lo = gen.zmm_input(0); // zmm8: V values 0-15 (dequantized)
-            Zmm zmm_v_hi = gen.zmm_input(1); // zmm9: V values 16-31 (dequantized)
-            Zmm zmm_d_v = gen.zmm_input(7);  // zmm15: V scale
+            Zmm zmm_v_lo = gen.zmm_input(0);  // zmm8: V values 0-15 (dequantized)
+            Zmm zmm_v_hi = gen.zmm_input(1);  // zmm9: V values 16-31 (dequantized)
+            Zmm zmm_d_v = gen.zmm_scratch(5); // zmm25: V scale
 
             for (int b = 0; b < num_blocks; ++b)
             {

@@ -33,7 +33,7 @@ namespace llaminar2
         }
 
         creators_[architecture] = creator;
-        LOG_INFO("[PipelineFactory] Registered pipeline for architecture '" << architecture << "'");
+        LOG_DEBUG("[PipelineFactory] Registered pipeline for architecture '" << architecture << "'");
     }
 
     std::unique_ptr<PipelineBase> PipelineFactory::create(

@@ -582,7 +582,7 @@ namespace llaminar2
             return "";
         }
 
-        LOG_INFO("runSingleShotChat: Encoded " << token_ids.size() << " tokens");
+        LOG_DEBUG("runSingleShotChat: Encoded " << token_ids.size() << " tokens");
 
         // Run prefill
         if (!pipeline->forward(token_ids.data(), static_cast<int>(token_ids.size())))

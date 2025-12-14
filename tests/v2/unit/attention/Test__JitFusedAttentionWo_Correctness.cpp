@@ -677,12 +677,12 @@ namespace llaminar::v2::kernels::jit::test
     }
 
     // ============================================================================
-    // Stress Tests (Optional - can be slow)
+    // Stress Tests
     // ============================================================================
 
-    TEST_F(Test__JitFusedAttentionWo_Correctness, DISABLED_Stress_VeryLongSequence)
+    TEST_F(Test__JitFusedAttentionWo_Correctness, Stress_VeryLongSequence)
     {
-        // Very long sequence - disabled by default
+        // Very long sequence stress test
         run_parity_test(
             /*seq_len=*/256,
             /*kv_seq_len=*/1024,
@@ -692,9 +692,9 @@ namespace llaminar::v2::kernels::jit::test
             "Stress - Very long sequence (seq=256, kv=1024)");
     }
 
-    TEST_F(Test__JitFusedAttentionWo_Correctness, DISABLED_Stress_ManyHeads)
+    TEST_F(Test__JitFusedAttentionWo_Correctness, Stress_ManyHeads)
     {
-        // Many heads - disabled by default
+        // Many heads stress test (64 Q heads, 8 KV heads)
         run_parity_test(
             /*seq_len=*/16,
             /*kv_seq_len=*/64,

@@ -424,7 +424,7 @@ namespace llaminar2
         {
             if (rank == 0)
             {
-                LOG_INFO("[MPI Strategy] Selected TensorParallel (n_heads=" << n_heads_
+                LOG_DEBUG("[MPI Strategy] Selected TensorParallel (n_heads=" << n_heads_
                                                                             << " divisible by world_size=" << world_size << ")");
             }
             return MPIStrategy::TensorParallel;
@@ -435,7 +435,7 @@ namespace llaminar2
         {
             if (rank == 0)
             {
-                LOG_INFO("[MPI Strategy] Selected PipelineParallel (n_layers=" << n_layers_
+                LOG_DEBUG("[MPI Strategy] Selected PipelineParallel (n_layers=" << n_layers_
                                                                                << " divisible by world_size=" << world_size << ")");
             }
             return MPIStrategy::PipelineParallel;
@@ -994,7 +994,7 @@ namespace llaminar2
                 {
                     fp32_file.write(reinterpret_cast<const char *>(fp32_data),
                                     effective_elements * sizeof(float));
-                    LOG_INFO("[TensorDump] Wrote " << key << " FP32 data (" << rows << "x" << cols
+                    LOG_DEBUG("[TensorDump] Wrote " << key << " FP32 data (" << rows << "x" << cols
                                                    << " = " << effective_elements << " elements) to " << base_path << "_fp32.bin");
                 }
             }
@@ -1013,7 +1013,7 @@ namespace llaminar2
             {
                 blocks_file.write(reinterpret_cast<const char *>(blocks),
                                   total_blocks * sizeof(Q8_1Block));
-                LOG_INFO("[TensorDump] Wrote " << key << " Q8_1 blocks (" << total_blocks << " blocks) to "
+                LOG_DEBUG("[TensorDump] Wrote " << key << " Q8_1 blocks (" << total_blocks << " blocks) to "
                                                << base_path << "_q8_1_blocks.bin");
             }
         }

@@ -108,8 +108,9 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_softmax_update");
 
-            // Scratch ZMM for score broadcast
-            Zmm zmm_score = gen.zmm_scratch(0);
+            // Use zmm_scratch(5) for score - scratch(0-2) are clobbered by emit_fast_exp
+            // zmm_scratch(0-2) = zmm20-22, zmm_scratch(5) = zmm25
+            Zmm zmm_score = gen.zmm_scratch(5);
 
             // Broadcast score to all lanes (needed for comparison and subtraction)
             gen.vbroadcastss(zmm_score, score_xmm);

@@ -370,28 +370,6 @@ namespace llaminar2
                     {
                         LOG_TRACE("[MPI TP Q8_1] Creating causal mask for " << total_tokens << " tokens");
                         attention_utils::create_causal_mask(mask_data, total_tokens, config.window_size);
-                        // Debug: print mask contents for 3x3
-                        if (total_tokens <= 5 && rank == 0)
-                        {
-                            std::ostringstream oss;
-                            oss << "[MPI TP Q8_1] Causal mask contents (first " << total_tokens << " rows):" << std::endl;
-                            for (int i = 0; i < total_tokens; ++i)
-                            {
-                                oss << "  row " << i << ": [";
-                                for (int j = 0; j < total_tokens; ++j)
-                                {
-                                    float val = mask_data[i * total_tokens + j];
-                                    if (std::isinf(val))
-                                        oss << "-inf";
-                                    else
-                                        oss << val;
-                                    if (j < total_tokens - 1)
-                                        oss << ", ";
-                                }
-                                oss << "]" << std::endl;
-                            }
-                            LOG_INFO(oss.str());
-                        }
                     }
                     else
                     {

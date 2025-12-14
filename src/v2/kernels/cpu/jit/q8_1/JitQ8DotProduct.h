@@ -84,17 +84,23 @@ namespace llaminar::v2::kernels::jit
             gen.vxorps(dst_xmm, dst_xmm, dst_xmm);
 
             // YMM registers for Q8_1 dot product (explicit construction)
-            Ymm ymm_q(4);
-            Ymm ymm_k(5);
-            Ymm ymm_dot(6);
+            // Use registers that avoid:
+            // - zmm0-7 (Accumulators in fused kernel)
+            // - zmm10-13 (Q data in fused kernel)
+            // - zmm16-19 (Softmax state)
+            // - zmm21-22 (Passed as args: dst_xmm, scale_xmm)
+            // - zmm26-31 (Constants)
+            Ymm ymm_q(14);   // Safe input zone
+            Ymm ymm_k(15);   // Safe input zone
+            Ymm ymm_dot(20); // Scratch zone
 
             // XMM registers for scales and correction (explicit construction)
-            Xmm xmm_d_q(8);
-            Xmm xmm_d_k(9);
-            Xmm xmm_sum_qs_k(15);
-            Xmm xmm_correction(14);
-            Xmm xmm_block_result(6);
-            Xmm xmm_tmp(7);
+            Xmm xmm_d_q(8);           // Safe input zone
+            Xmm xmm_d_k(9);           // Safe input zone
+            Xmm xmm_sum_qs_k(23);     // Scratch zone
+            Xmm xmm_correction(24);   // Scratch zone
+            Xmm xmm_block_result(20); // Alias of ymm_dot
+            Xmm xmm_tmp(25);          // Scratch zone
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -135,7 +141,7 @@ namespace llaminar::v2::kernels::jit
                 gen.vpdpbusd(ymm_dot, ymm_q, ymm_k);
 
                 // Horizontal sum of dot product (8×int32 → scalar int32)
-                gen.vextracti128(xmm_tmp, ymm_dot, 1);
+                gen.vextracti32x4(xmm_tmp, ymm_dot, 1);
                 gen.vpaddd(xmm_block_result, Xmm(ymm_dot.getIdx()), xmm_tmp);
                 gen.vpshufd(xmm_tmp, xmm_block_result, 0x4E);
                 gen.vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
@@ -165,6 +171,216 @@ namespace llaminar::v2::kernels::jit
             }
 
             // Apply global scale (attention scale = 1/sqrt(d))
+            gen.vmulss(dst_xmm, dst_xmm, scale_xmm);
+        }
+
+        /**
+         * @brief Emit Q8_1 dot product using pre-loaded Q registers and d_Q from memory
+         *
+         * Optimized for Decode mode where Q data is in registers, but d_Q is loaded from memory
+         * to save registers.
+         *
+         * @param gen Code generator
+         * @param dst_xmm XMM register to receive scalar score result
+         * @param reg_K_ptr GP register pointing to K blocks
+         * @param reg_Q_ptr GP register pointing to Q blocks (for d_Q)
+         * @param num_blocks Number of Q8_1 blocks
+         * @param scale_xmm XMM containing global scale
+         * @param q_reg_base_idx Base index of ZMM registers holding Q data (unsigned)
+         */
+        void emit_dot_product_register_q_mem_dq(
+            JitMicrokernelBase &gen,
+            const Xbyak::Xmm &dst_xmm,
+            const Xbyak::Reg64 &reg_K_ptr,
+            const Xbyak::Reg64 &reg_Q_ptr,
+            int q_head_offset,
+            int num_blocks,
+            const Xbyak::Xmm &scale_xmm,
+            int q_reg_base_idx)
+        {
+            using namespace Xbyak;
+
+            // Zero accumulator
+            gen.vxorps(dst_xmm, dst_xmm, dst_xmm);
+
+            // Registers for K and computation
+            // Use registers that avoid:
+            // - zmm0-7 (Accumulators in fused kernel)
+            // - zmm10-13 (Q data in fused kernel)
+            // - zmm16-19 (Softmax state)
+            // - zmm21-22 (Passed as args: dst_xmm, scale_xmm)
+            // - zmm26-31 (Constants)
+            Ymm ymm_k(15);   // Safe input zone
+            Ymm ymm_dot(20); // Scratch zone
+
+            // XMM registers for scales and correction
+            Xmm xmm_d_q(8); // Scratch for d_Q
+            Xmm xmm_d_k(9);
+            Xmm xmm_sum_qs_k(23);     // Scratch zone
+            Xmm xmm_correction(24);   // Scratch zone
+            Xmm xmm_block_result(20); // Alias of ymm_dot
+            Xmm xmm_tmp(25);          // Scratch zone
+
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                // Use pre-loaded Q registers
+                Ymm ymm_q(q_reg_base_idx + b);
+
+                int k_offset = b * 36;
+                int q_offset = q_head_offset + b * 36;
+
+                // Load Q scale: d_Q (FP16) from memory
+                gen.vpbroadcastw(xmm_d_q, gen.ptr[reg_Q_ptr + q_offset]);
+                gen.vcvtph2ps(xmm_d_q, xmm_d_q);
+
+                // Load K scale: d_K (FP16)
+                gen.vpbroadcastw(xmm_d_k, gen.ptr[reg_K_ptr + k_offset]);
+                gen.vcvtph2ps(xmm_d_k, xmm_d_k);
+
+                // Load K sum_qs (INT16 at offset 2)
+                gen.vpbroadcastw(xmm_sum_qs_k, gen.ptr[reg_K_ptr + k_offset + 2]);
+                gen.vpmovsxwd(xmm_sum_qs_k, xmm_sum_qs_k); // Sign-extend to int32
+                gen.vcvtdq2ps(xmm_sum_qs_k, xmm_sum_qs_k); // Convert to float
+
+                // Load K data (32 int8 values at offset 4)
+                gen.vmovdqu8(ymm_k, gen.ptr[reg_K_ptr + k_offset + 4]);
+
+                // vpdpbusd: unsigned(Q+128) × signed(K)
+                gen.vxorps(ymm_dot, ymm_dot, ymm_dot);
+                gen.vpdpbusd(ymm_dot, ymm_q, ymm_k);
+
+                // Horizontal sum of dot product
+                gen.vextracti32x4(xmm_tmp, ymm_dot, 1);
+                gen.vpaddd(xmm_block_result, Xmm(ymm_dot.getIdx()), xmm_tmp);
+                gen.vpshufd(xmm_tmp, xmm_block_result, 0x4E);
+                gen.vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+                gen.vpshufd(xmm_tmp, xmm_block_result, 0xB1);
+                gen.vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+
+                // Convert to float
+                gen.vcvtdq2ps(xmm_block_result, xmm_block_result);
+
+                // Compute correction: 128.0f * sum_qs_K
+                gen.mov(gen.eax, 0x43000000); // 128.0f
+                gen.vmovd(xmm_correction, gen.eax);
+                gen.vbroadcastss(xmm_correction, xmm_correction);
+                gen.vmulps(xmm_correction, xmm_correction, xmm_sum_qs_k);
+
+                // Subtract correction: raw_dot - 128*sum_qs_K
+                gen.vsubps(xmm_block_result, xmm_block_result, xmm_correction);
+
+                // Compute combined scale: d_Q * d_K
+                gen.vmulps(xmm_d_q, xmm_d_q, xmm_d_k);
+
+                // Apply block scale
+                gen.vmulps(xmm_block_result, xmm_block_result, xmm_d_q);
+
+                // Accumulate
+                gen.vaddps(dst_xmm, dst_xmm, xmm_block_result);
+            }
+
+            // Apply global scale (attention scale = 1/sqrt(d))
+            gen.vmulss(dst_xmm, dst_xmm, scale_xmm);
+        }
+
+        /**
+         * @brief Emit Q8_1 dot product using pre-loaded Q registers
+         *
+         * Optimized for Decode mode where Q is constant across KV loop.
+         * Q data and d_Q scales must be pre-loaded into registers.
+         *
+         * @param gen Code generator
+         * @param dst_xmm XMM register to receive scalar score result
+         * @param reg_K_ptr GP register pointing to K blocks
+         * @param num_blocks Number of Q8_1 blocks
+         * @param scale_xmm XMM containing global scale
+         * @param q_reg_base_idx Base index of ZMM registers holding Q data (unsigned)
+         * @param dq_reg_base_idx Base index of XMM registers holding d_Q scales
+         */
+        void emit_dot_product_register_q(
+            JitMicrokernelBase &gen,
+            const Xbyak::Xmm &dst_xmm,
+            const Xbyak::Reg64 &reg_K_ptr,
+            int num_blocks,
+            const Xbyak::Xmm &scale_xmm,
+            int q_reg_base_idx,
+            int dq_reg_base_idx)
+        {
+            using namespace Xbyak;
+
+            // Zero accumulator
+            gen.vxorps(dst_xmm, dst_xmm, dst_xmm);
+
+            // Registers for K and computation
+            // Use registers that avoid:
+            // - zmm0-7 (Accumulators in fused kernel)
+            // - zmm10-13 (Q data in fused kernel)
+            // - zmm16-19 (Softmax state)
+            // - zmm21-22 (Passed as args: dst_xmm, scale_xmm)
+            // - zmm26-31 (Constants)
+            Ymm ymm_k(15);   // Safe input zone
+            Ymm ymm_dot(20); // Scratch zone
+
+            // XMM registers for K scales and correction
+            Xmm xmm_d_k(9);
+            Xmm xmm_sum_qs_k(23);     // Scratch zone
+            Xmm xmm_correction(24);   // Scratch zone
+            Xmm xmm_block_result(20); // Alias of ymm_dot
+            Xmm xmm_tmp(25);          // Scratch zone
+
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                // Use pre-loaded Q registers
+                Ymm ymm_q(q_reg_base_idx + b);
+                Xmm xmm_d_q(dq_reg_base_idx + b);
+
+                int k_offset = b * 36;
+
+                // Load K scale: d_K (FP16)
+                gen.vpbroadcastw(xmm_d_k, gen.ptr[reg_K_ptr + k_offset]);
+                gen.vcvtph2ps(xmm_d_k, xmm_d_k);
+
+                // Load K sum_qs (INT16 at offset 2)
+                gen.vpbroadcastw(xmm_sum_qs_k, gen.ptr[reg_K_ptr + k_offset + 2]);
+                gen.vpmovsxwd(xmm_sum_qs_k, xmm_sum_qs_k); // Sign-extend to int32
+                gen.vcvtdq2ps(xmm_sum_qs_k, xmm_sum_qs_k); // Convert to float
+
+                // Load K data (32 int8 values at offset 4)
+                gen.vmovdqu8(ymm_k, gen.ptr[reg_K_ptr + k_offset + 4]);
+
+                // vpdpbusd: unsigned(Q+128) × signed(K)
+                gen.vxorps(ymm_dot, ymm_dot, ymm_dot);
+                gen.vpdpbusd(ymm_dot, ymm_q, ymm_k);
+
+                // Horizontal sum of dot product
+                gen.vextracti32x4(xmm_tmp, ymm_dot, 1);
+                gen.vpaddd(xmm_block_result, Xmm(ymm_dot.getIdx()), xmm_tmp);
+                gen.vpshufd(xmm_tmp, xmm_block_result, 0x4E);
+                gen.vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+                gen.vpshufd(xmm_tmp, xmm_block_result, 0xB1);
+                gen.vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+
+                // Convert to float
+                gen.vcvtdq2ps(xmm_block_result, xmm_block_result);
+
+                // Compute correction: 128.0f * sum_qs_K
+                gen.mov(gen.eax, 0x43000000); // 128.0f
+                gen.vmovd(xmm_correction, gen.eax);
+                gen.vbroadcastss(xmm_correction, xmm_correction);
+                gen.vmulps(xmm_correction, xmm_correction, xmm_sum_qs_k);
+
+                // Apply correction
+                gen.vsubps(xmm_block_result, xmm_block_result, xmm_correction);
+
+                // Apply scales: result * d_Q * d_K
+                gen.vmulps(xmm_block_result, xmm_block_result, xmm_d_q);
+                gen.vmulps(xmm_block_result, xmm_block_result, xmm_d_k);
+
+                // Accumulate
+                gen.vaddps(dst_xmm, dst_xmm, xmm_block_result);
+            }
+
+            // Apply global scale
             gen.vmulss(dst_xmm, dst_xmm, scale_xmm);
         }
     };

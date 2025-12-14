@@ -156,7 +156,7 @@ namespace llaminar2
                 chat_template_ = ChatTemplate::create(chat_template_string_);
                 if (chat_template_)
                 {
-                    LOG_INFO("[BPETokenizer] Loaded chat template: "
+                    LOG_DEBUG("[BPETokenizer] Loaded chat template: "
                              << chatTemplateTypeName(chat_template_->type()));
                 }
                 else

@@ -169,6 +169,30 @@ namespace llaminar::v2::kernels::jit
               ,
               config_(config)
         {
+            // Calculate optimal Q_TILE_SIZE for register blocking
+            // We reserve zmm20-zmm31 for constants and scratch (zmm20-25 scratch, zmm26-31 consts).
+            // We have 4 ZMM registers (zmm16-zmm19) available for Q data.
+            // Each query requires num_blocks registers.
+            // num_blocks = head_dim / 32.
+            // Constraint: q_tile_size * num_blocks <= 4.
+            int num_blocks = config_.head_dim / 32;
+            int available_q_regs = 4;
+
+            if (num_blocks > 0)
+            {
+                q_tile_size_ = available_q_regs / num_blocks;
+            }
+            else
+            {
+                q_tile_size_ = 8;
+            }
+
+            // Clamp to reasonable limits
+            if (q_tile_size_ > 8)
+                q_tile_size_ = 8;
+            if (q_tile_size_ < 1)
+                q_tile_size_ = 1;
+
             generate();
         }
 
@@ -182,6 +206,7 @@ namespace llaminar::v2::kernels::jit
 
     private:
         JitAttentionConfig config_;
+        int q_tile_size_ = 8;
 
         // Microkernel emitters
         JitQ8DotProductEmitter dot_emitter_;
@@ -252,6 +277,10 @@ namespace llaminar::v2::kernels::jit
             // Initialize constants for exp
             load_constant_f32(zmm_log2e(), 1.44269504089f);
             load_constant_f32(zmm_exp_min(), -87.0f);
+            load_constant_f32(zmm_one(), 1.0f);
+
+            // Initialize constant for Q8_1 unsigned conversion (0x80808080)
+            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
 
             // Calculate working space needed on stack:
             // 1. Q blocks for one head: num_blocks * 64 bytes (padded)
@@ -354,8 +383,6 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            constexpr int Q_TILE_SIZE = 8;
-
             // Function prologue
             push_callee_saved();
 
@@ -380,6 +407,7 @@ namespace llaminar::v2::kernels::jit
             // Initialize constants for exp
             load_constant_f32(zmm_log2e(), 1.44269504089f);
             load_constant_f32(zmm_one(), 1.0f);
+            load_constant_f32(zmm_exp_min(), -87.0f);
 
             // Initialize constant for unsigned Q conversion
             emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
@@ -391,9 +419,9 @@ namespace llaminar::v2::kernels::jit
             int heads_per_kv = config_.num_heads / config_.num_kv_heads;
 
             // Stack layout calculation
-            int q_blocks_size = Q_TILE_SIZE * num_blocks * 64;
-            int softmax_state_size = Q_TILE_SIZE * config_.num_heads * 8; // (max, sum) per query per head
-            int context_size = Q_TILE_SIZE * d_model * 4;                 // FP32 context per query
+            int q_blocks_size = q_tile_size_ * num_blocks * 64;
+            int softmax_state_size = q_tile_size_ * config_.num_heads * 8; // (max, sum) per query per head
+            int context_size = q_tile_size_ * d_model * 4;                 // FP32 context per query
 
             int q_blocks_offset = 0;
             int softmax_offset = q_blocks_size;
@@ -410,7 +438,13 @@ namespace llaminar::v2::kernels::jit
             int k_ptr_spill = q_local_spill + 8;
             int v_ptr_spill = k_ptr_spill + 8;
 
-            int stack_size = v_ptr_spill + 8 + 64;
+            // New spill slots for assembly head loop
+            int head_idx_spill = v_ptr_spill + 8;
+            int head_offset_spill = head_idx_spill + 8;
+            int softmax_head_offset_spill = head_offset_spill + 8;
+            int context_head_offset_spill = softmax_head_offset_spill + 8;
+
+            int stack_size = context_head_offset_spill + 8 + 64;
             stack_size = (stack_size + 63) & ~63;
 
             sub(rsp, stack_size);
@@ -436,133 +470,165 @@ namespace llaminar::v2::kernels::jit
             cmp(rax, reg_seq_len_q);
             jge("prefill_tile_end", T_NEAR);
 
-            // Calculate tile_size = min(Q_TILE_SIZE, seq_len_q - tile_start)
+            // Calculate tile_size = min(q_tile_size_, seq_len_q - tile_start)
             mov(rcx, reg_seq_len_q);
             sub(rcx, rax);
-            cmp(rcx, Q_TILE_SIZE);
+            cmp(rcx, q_tile_size_);
             jle("prefill_tile_size_ok", T_NEAR);
-            mov(rcx, Q_TILE_SIZE);
+            mov(rcx, q_tile_size_);
             L("prefill_tile_size_ok");
             mov(ptr[rsp + tile_size_spill], rcx);
 
             // Initialize softmax state: max=-inf, sum=0
             // Initialize for ALL heads in the tile
-            emit_prefill_init_softmax(Q_TILE_SIZE * config_.num_heads, softmax_offset);
+            emit_prefill_init_softmax(q_tile_size_ * config_.num_heads, softmax_offset);
 
             // Initialize context buffer to zeros
-            emit_prefill_init_context(Q_TILE_SIZE, d_model, context_offset);
+            emit_prefill_init_context(q_tile_size_, d_model, context_offset);
 
             // ===============================================================
-            // HEAD LOOP: Process each attention head (compile-time unrolled)
+            // HEAD LOOP: Process each attention head (Assembly Loop)
             // ===============================================================
-            for (int h = 0; h < config_.num_heads; ++h)
+
+            // Initialize loop variables
+            mov(qword[rsp + head_idx_spill], 0);
+            mov(qword[rsp + head_offset_spill], 0);
+            mov(rax, softmax_offset);
+            mov(ptr[rsp + softmax_head_offset_spill], rax);
+            mov(rax, context_offset);
+            mov(ptr[rsp + context_head_offset_spill], rax);
+
+            L("prefill_head_loop");
+            mov(rax, ptr[rsp + head_idx_spill]);
+            cmp(rax, config_.num_heads);
+            jge("prefill_head_end", T_NEAR);
+
+            // Copy Q blocks for all queries in tile for this head
+            mov(r11, ptr[rsp + head_offset_spill]);
+            emit_prefill_copy_q_tile(reg_Q, r11, num_blocks, q_blocks_offset,
+                                     tile_start_spill, tile_size_spill);
+
+            // ===============================================================
+            // KV LOOP: Iterate over K/V cache positions (runtime)
+            // ===============================================================
+            mov(qword[rsp + kv_idx_spill], 0);
+
+            L(".kv_loop");
+            mov(r8, ptr[rsp + kv_idx_spill]);
+            mov(r9, ptr[rsp + seq_len_kv_spill]);
+            cmp(r8, r9);
+            jge(".kv_end", T_NEAR);
+
+            // Calculate kv_head = head_idx / heads_per_kv
+            xor_(rdx, rdx);
+            mov(rax, ptr[rsp + head_idx_spill]);
+            mov(rcx, heads_per_kv);
+            div(rcx); // rax = kv_head
+
+            // Calculate K/V pointers
+            int kv_stride = config_.num_kv_heads * num_blocks * 36;
+            int kv_head_stride = num_blocks * 36;
+
+            // K_ptr = reg_K + kv_idx * kv_stride + kv_head * kv_head_stride
+            mov(rdi, ptr[rsp + kv_idx_spill]);
+            imul(rdi, rdi, kv_stride);
+
+            mov(rsi, rax); // kv_head
+            imul(rsi, rsi, kv_head_stride);
+            add(rdi, rsi);
+
+            mov(rsi, rdi); // Copy offset for V
+
+            add(rdi, reg_K);
+            mov(ptr[rsp + k_ptr_spill], rdi);
+
+            add(rsi, reg_V);
+            mov(ptr[rsp + v_ptr_spill], rsi);
+
+            // ===============================================================
+            // Q INNER LOOP: Process queries within tile that pass causal mask
+            // ===============================================================
+            // For causal: q_start = max(0, kv_idx - position_offset)
+            mov(r10, ptr[rsp + kv_idx_spill]);
+            if (config_.causal)
             {
-                int kv_head = h / heads_per_kv;
-                std::string h_prefix = "prefill_h" + std::to_string(h);
-
-                // Copy Q blocks for all queries in tile for this head
-                emit_prefill_copy_q_tile(reg_Q, h, num_blocks, q_blocks_offset,
-                                         tile_start_spill, tile_size_spill);
-
-                // ===============================================================
-                // KV LOOP: Iterate over K/V cache positions (runtime)
-                // ===============================================================
-                mov(qword[rsp + kv_idx_spill], 0);
-
-                L((h_prefix + "_kv_loop").c_str());
-                mov(r8, ptr[rsp + kv_idx_spill]);
-                mov(r9, ptr[rsp + seq_len_kv_spill]);
-                cmp(r8, r9);
-                jge((h_prefix + "_kv_end").c_str(), T_NEAR);
-
-                // Calculate and spill K/V pointers
-                int kv_stride = config_.num_kv_heads * num_blocks * 36;
-
-                mov(rdi, r8);
-                imul(rdi, rdi, kv_stride);
-                add(rdi, kv_head * num_blocks * 36);
-                add(rdi, reg_K);
-                mov(ptr[rsp + k_ptr_spill], rdi);
-
-                mov(rsi, r8);
-                imul(rsi, rsi, kv_stride);
-                add(rsi, kv_head * num_blocks * 36);
-                add(rsi, reg_V);
-                mov(ptr[rsp + v_ptr_spill], rsi);
-
-                // ===============================================================
-                // Q INNER LOOP: Process queries within tile that pass causal mask
-                // ===============================================================
-                // For causal: q_start = max(0, kv_idx - position_offset)
-                mov(r10, ptr[rsp + kv_idx_spill]);
-                if (config_.causal)
-                {
-                    sub(r10, ptr[rsp + position_offset_spill]);
-                    xor_(r11, r11);
-                    cmp(r10, 0);
-                    cmovl(r10, r11);
-                }
-                else
-                {
-                    xor_(r10, r10);
-                }
-
-                // q_local_start = max(0, q_start - tile_start)
-                mov(rax, ptr[rsp + tile_start_spill]);
-                sub(r10, rax);
+                sub(r10, ptr[rsp + position_offset_spill]);
                 xor_(r11, r11);
                 cmp(r10, 0);
                 cmovl(r10, r11);
-                mov(ptr[rsp + q_local_spill], r10);
+            }
+            else
+            {
+                xor_(r10, r10);
+            }
 
-                L((h_prefix + "_q_loop").c_str());
-                mov(r10, ptr[rsp + q_local_spill]);
-                mov(rcx, ptr[rsp + tile_size_spill]);
-                cmp(r10, rcx);
-                jge((h_prefix + "_q_end").c_str(), T_NEAR);
+            // q_local_start = max(0, q_start - tile_start)
+            mov(rax, ptr[rsp + tile_start_spill]);
+            sub(r10, rax);
+            xor_(r11, r11);
+            cmp(r10, 0);
+            cmovl(r10, r11);
+            mov(ptr[rsp + q_local_spill], r10);
 
-                // Process attention for this query
-                // Reload K/V pointers from spill (emitters may clobber registers)
-                mov(rdi, ptr[rsp + k_ptr_spill]);
-                mov(rsi, ptr[rsp + v_ptr_spill]);
+            // Process attention for all valid queries in tile
+            // Reload K/V pointers from spill (emitters may clobber registers)
+            mov(rdi, ptr[rsp + k_ptr_spill]);
+            mov(rsi, ptr[rsp + v_ptr_spill]);
 
-                emit_prefill_query_attention(
-                    rdi, rsi, r10, // K_ptr, V_ptr, q_local
-                    h, num_blocks,
-                    q_blocks_offset,
-                    softmax_offset + h * Q_TILE_SIZE * 8, // Per-head softmax state
-                    context_offset, d_model);
+            // Load dynamic offsets
+            mov(rdx, ptr[rsp + softmax_head_offset_spill]);
+            mov(rcx, ptr[rsp + context_head_offset_spill]);
 
-                // Increment q_local (reload from spill since emitter may have clobbered r10)
-                mov(r10, ptr[rsp + q_local_spill]);
-                inc(r10);
-                mov(ptr[rsp + q_local_spill], r10);
-                jmp((h_prefix + "_q_loop").c_str(), T_NEAR);
+            emit_prefill_tile_attention(
+                rdi, rsi, r10,              // K_ptr, V_ptr, q_local_start
+                ptr[rsp + tile_size_spill], // tile_size
+                num_blocks,
+                q_blocks_offset,
+                d_model,
+                rdx, rcx);
 
-                L((h_prefix + "_q_end").c_str());
+            // Increment kv_idx
+            mov(r8, ptr[rsp + kv_idx_spill]);
+            inc(r8);
+            mov(ptr[rsp + kv_idx_spill], r8);
+            jmp(".kv_loop", T_NEAR);
 
-                // Increment kv_idx
-                mov(r8, ptr[rsp + kv_idx_spill]);
-                inc(r8);
-                mov(ptr[rsp + kv_idx_spill], r8);
-                jmp((h_prefix + "_kv_loop").c_str(), T_NEAR);
+            L(".kv_end");
 
-                L((h_prefix + "_kv_end").c_str());
+            // Increment offsets
+            mov(rax, ptr[rsp + head_offset_spill]);
+            add(rax, num_blocks * 36);
+            mov(ptr[rsp + head_offset_spill], rax);
 
-            } // End head loop
+            mov(rax, ptr[rsp + softmax_head_offset_spill]);
+            add(rax, q_tile_size_ * 8);
+            mov(ptr[rsp + softmax_head_offset_spill], rax);
+
+            mov(rax, ptr[rsp + context_head_offset_spill]);
+            add(rax, head_dim * 4);
+            mov(ptr[rsp + context_head_offset_spill], rax);
+
+            // Increment head_idx
+            mov(rax, ptr[rsp + head_idx_spill]);
+            inc(rax);
+            mov(ptr[rsp + head_idx_spill], rax);
+
+            jmp("prefill_head_loop", T_NEAR);
+
+            L("prefill_head_end");
 
             // ===============================================================
             // NORMALIZE AND PROJECT: 1/sum normalization + Wo projection
             // ===============================================================
             emit_prefill_normalize_project(
                 reg_Wo, reg_output,
-                num_blocks, Q_TILE_SIZE,
+                num_blocks, q_tile_size_,
                 softmax_offset, context_offset,
                 tile_start_spill, tile_size_spill, d_model, q_local_spill);
 
             // Advance tile_start
             mov(rax, ptr[rsp + tile_start_spill]);
-            add(rax, Q_TILE_SIZE);
+            add(rax, q_tile_size_);
             mov(ptr[rsp + tile_start_spill], rax);
             jmp("prefill_tile_loop", T_NEAR);
 
@@ -620,11 +686,334 @@ namespace llaminar::v2::kernels::jit
         }
 
         /**
-         * @brief Copy Q blocks for tile for one head
+         * @brief Vectorized exponential for ZMM
+         * Computes exp(x) for each element in src
+         */
+        void emit_vec_exp(const Xbyak::Zmm &dst, const Xbyak::Zmm &src)
+        {
+            using namespace Xbyak;
+
+            // Constants
+            Xmm xmm_log2e = Xmm(zmm_log2e().getIdx());
+
+            Zmm zmm_n = zmm_scratch(0);
+            Zmm zmm_f = zmm_scratch(1);
+            Zmm zmm_p = zmm_scratch(2);
+
+            // x * log2e
+            vmulps(zmm_f, src, zmm_log2e());
+
+            // n = floor(x * log2e)
+            vrndscaleps(zmm_n, zmm_f, 0x01); // Round down
+
+            // f = x * log2e - n
+            vsubps(zmm_f, zmm_f, zmm_n);
+
+            // Polynomial p = c5 * f + c4 ...
+            // c5 = 0.0013334f (0x3aaec3b4)
+            mov(eax, 0x3aaec3b4);
+            vpbroadcastd(zmm_p, eax);
+            vmulps(zmm_p, zmm_p, zmm_f);
+
+            // c4 = 0.00961812f (0x3c1d955b)
+            mov(eax, 0x3c1d955b);
+            vpbroadcastd(dst, eax); // use dst as temp
+            vaddps(zmm_p, zmm_p, dst);
+            vmulps(zmm_p, zmm_p, zmm_f);
+
+            // c3 = 0.05550411f (0x3d6356eb)
+            mov(eax, 0x3d6356eb);
+            vpbroadcastd(dst, eax);
+            vaddps(zmm_p, zmm_p, dst);
+            vmulps(zmm_p, zmm_p, zmm_f);
+
+            // c2 = 0.24022650f (0x3e75fdf0)
+            mov(eax, 0x3e75fdf0);
+            vpbroadcastd(dst, eax);
+            vaddps(zmm_p, zmm_p, dst);
+            vmulps(zmm_p, zmm_p, zmm_f);
+
+            // c1 = 0.69314718f (0x3f317218)
+            mov(eax, 0x3f317218);
+            vpbroadcastd(dst, eax);
+            vaddps(zmm_p, zmm_p, dst);
+            vmulps(zmm_p, zmm_p, zmm_f);
+
+            // c0 = 1.0f (0x3f800000)
+            mov(eax, 0x3f800000);
+            vpbroadcastd(dst, eax);
+            vaddps(zmm_p, zmm_p, dst);
+
+            // Final scaling: p * 2^n
+            vscalefps(dst, zmm_p, zmm_n);
+        }
+
+        /**
+         * @brief Process attention for all valid queries in prefill tile
+         *
+         * Optimized to load K/V once and reuse across all queries in the tile.
+         * Uses register blocking for Q data if it fits (num_blocks <= 2).
+         */
+        void emit_prefill_tile_attention(
+            const Xbyak::Reg64 &reg_K_ptr,
+            const Xbyak::Reg64 &reg_V_ptr,
+            const Xbyak::Reg64 &reg_q_local_start,
+            const Xbyak::Operand &op_tile_size,
+            int num_blocks,
+            int q_blocks_offset,
+            int d_model,
+            const Xbyak::Reg64 &reg_softmax_head_offset,
+            const Xbyak::Reg64 &reg_context_head_offset)
+        {
+            using namespace Xbyak;
+
+            // 1. Compute Scores (Q * K^T)
+            // Accumulators: zmm0..zmm(q_tile_size_-1)
+            // Initialize accumulators to 0
+            for (int q = 0; q < q_tile_size_; ++q)
+            {
+                vxorps(Zmm(q), Zmm(q), Zmm(q));
+            }
+
+            // Optimization: Pre-load Q data into registers if it fits
+            // We have zmm16-31 available (16 registers).
+            // Each query needs num_blocks registers for data.
+            // bool use_q_registers = (q_tile_size_ * num_blocks <= 16);
+            bool use_q_registers = false; // Disabled due to conflict with JitMicrokernelBase register allocation
+
+            if (use_q_registers)
+            {
+                for (int b = 0; b < num_blocks; ++b)
+                {
+                    int q_off_base = q_blocks_offset + b * 64;
+                    for (int q = 0; q < q_tile_size_; ++q)
+                    {
+                        int q_off = q_off_base + q * num_blocks * 64;
+                        int reg_idx = 16 + b * q_tile_size_ + q;
+                        vmovdqu8(Ymm(reg_idx), ptr[rsp + q_off + 4]);
+                        vpxord(Ymm(reg_idx), Ymm(reg_idx), Ymm(zmm_128().getIdx())); // unsigned to signed
+                    }
+                }
+            }
+
+            // Loop over blocks
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                int k_off = b * 36;
+                int q_off_base = q_blocks_offset + b * 64; // Base offset for block b of Q0
+
+                // Use scratch registers to avoid clobbering accumulators (zmm0-15)
+                // K scale: zmm20
+                // K sum_qs: zmm21
+                // K data: zmm22
+                Xmm xmm_d_k(20);
+                Ymm ymm_sum_qs_k(21);     // Use YMM for 8 copies
+                Xmm xmm_sum_qs_k_low(21); // Access low 128 bits
+                Ymm ymm_k(22);
+
+                vpbroadcastw(xmm_d_k, ptr[reg_K_ptr + k_off]);
+                vcvtph2ps(xmm_d_k, xmm_d_k); // d_k
+
+                vpbroadcastw(xmm_sum_qs_k_low, ptr[reg_K_ptr + k_off + 2]);
+                vpmovsxwd(ymm_sum_qs_k, xmm_sum_qs_k_low); // Convert 8 words to 8 dwords
+                vcvtdq2ps(ymm_sum_qs_k, ymm_sum_qs_k);     // sum_qs_k (8 floats)
+
+                vmovdqu8(ymm_k, ptr[reg_K_ptr + k_off + 4]); // K data
+
+                // Loop over queries in tile (unrolled)
+                for (int q = 0; q < q_tile_size_; ++q)
+                {
+                    int q_off = q_off_base + q * num_blocks * 64;
+
+                    // d_q: zmm23
+                    Xmm xmm_d_q(23);
+                    vpbroadcastw(xmm_d_q, ptr[rsp + q_off]);
+                    vcvtph2ps(xmm_d_q, xmm_d_q); // d_q
+
+                    // Dot product: zmm25
+                    Ymm ymm_dot(25);
+                    vxorps(ymm_dot, ymm_dot, ymm_dot);
+
+                    if (use_q_registers)
+                    {
+                        int reg_idx = 16 + b * q_tile_size_ + q;
+                        vpdpbusd(ymm_dot, Ymm(reg_idx), ymm_k);
+                    }
+                    else
+                    {
+                        // Q data: zmm24
+                        Ymm ymm_q(24);
+                        vmovdqu8(ymm_q, ptr[rsp + q_off + 4]);
+                        vpxord(ymm_q, ymm_q, Ymm(zmm_128().getIdx())); // unsigned to signed
+                        vpdpbusd(ymm_dot, ymm_q, ymm_k);
+                    }
+
+                    vcvtdq2ps(ymm_dot, ymm_dot);
+
+                    // Scale: d_q * d_k -> zmm23 (reuse d_q)
+                    Xmm xmm_scale(23);
+                    Ymm ymm_scale(23);
+                    vmulps(xmm_scale, xmm_d_q, xmm_d_k);
+                    vbroadcastss(ymm_scale, xmm_scale); // Broadcast to YMM
+                    vmulps(ymm_dot, ymm_dot, ymm_scale);
+
+                    // Correction: 16 * sum_qs_k * scale -> zmm24 (reuse Q data)
+                    // 16.0f = 0x41800000 (distributed correction for 8 lanes)
+                    Xmm xmm_corr_low(24);
+                    Ymm ymm_corr(24);
+                    mov(eax, 0x41800000); // 16.0f
+                    vmovd(xmm_corr_low, eax);
+                    vbroadcastss(ymm_corr, xmm_corr_low); // Broadcast to YMM
+                    vmulps(ymm_corr, ymm_corr, ymm_sum_qs_k);
+                    vmulps(ymm_corr, ymm_corr, ymm_scale);
+
+                    vsubps(ymm_dot, ymm_dot, ymm_corr);
+
+                    // Accumulate
+                    vaddps(Zmm(q), Zmm(q), Zmm(ymm_dot.getIdx()));
+                }
+            }
+
+            // Horizontal sum and scale scores
+            vmovss(xmm8, Xmm(zmm_scale().getIdx())); // scale
+            for (int q = 0; q < q_tile_size_; ++q)
+            {
+                emit_horizontal_sum_to_scalar(Zmm(q));
+                vmulss(Xmm(Zmm(q).getIdx()), Xmm(Zmm(q).getIdx()), xmm8);
+            }
+
+            // 2. Update Softmax (Scalar Loop - Optimized for sparsity)
+            mov(r8, op_tile_size);
+
+            for (int q = 0; q < q_tile_size_; ++q)
+            {
+                std::string skip_label = ".skip_softmax_" + std::to_string(q);
+
+                cmp(reg_q_local_start, q);
+                jg(skip_label, T_NEAR); // q_local_start > q
+
+                cmp(r8, q);
+                jle(skip_label, T_NEAR); // tile_size <= q
+
+                // Valid query
+                mov(r9, q);
+                shl(r9, 3);
+                add(r9, reg_softmax_head_offset);
+                add(r9, rsp);
+
+                Xmm xmm_score = Xmm(Zmm(q).getIdx());
+                Xmm xmm_max = xmm16;
+                Xmm xmm_sum = xmm17;
+
+                vmovss(xmm_max, ptr[r9]);
+                vmovss(xmm_sum, ptr[r9 + 4]);
+
+                Xmm xmm_new_max = xmm18;
+                vmaxss(xmm_new_max, xmm_score, xmm_max);
+
+                // corr = exp(old_max - new_max)
+                Xmm xmm_corr = xmm19;
+                vsubss(xmm_corr, xmm_max, xmm_new_max);
+                emit_prefill_exp_scalar(xmm_corr, xmm_corr);
+
+                // weight = exp(score - new_max)
+                Xmm xmm_weight = xmm20;
+                vsubss(xmm_weight, xmm_score, xmm_new_max);
+                emit_prefill_exp_scalar(xmm_weight, xmm_weight);
+
+                // new_sum = old_sum * corr + weight
+                vmulss(xmm_sum, xmm_sum, xmm_corr);
+                vaddss(xmm_sum, xmm_sum, xmm_weight);
+
+                // Store updated state
+                vmovss(ptr[r9], xmm_new_max);
+                vmovss(ptr[r9 + 4], xmm_sum);
+
+                // Save corr/weight for V accumulation
+                vbroadcastss(Zmm(q), xmm_corr);                  // zmm0..7 = corr
+                vbroadcastss(Zmm(q + q_tile_size_), xmm_weight); // zmm8..15 = weight
+
+                jmp(".done_softmax_" + std::to_string(q), T_NEAR);
+
+                L(skip_label);
+                // Zero out corr/weight for invalid queries (safety)
+                vxorps(Zmm(q), Zmm(q), Zmm(q));
+                vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
+
+                L(".done_softmax_" + std::to_string(q));
+            }
+
+            // 3. Accumulate V
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                int v_off = b * 36;
+                int ctx_off_base = b * 32 * 4;
+
+                // Load V block
+                vpbroadcastw(xmm16, ptr[reg_V_ptr + v_off]);
+                vcvtph2ps(xmm16, xmm16);
+                vbroadcastss(zmm16, xmm16); // V scale
+
+                vpmovsxbd(zmm17, ptr[reg_V_ptr + v_off + 4]);
+                vpmovsxbd(zmm18, ptr[reg_V_ptr + v_off + 4 + 16]);
+                vcvtdq2ps(zmm17, zmm17);
+                vcvtdq2ps(zmm18, zmm18);
+
+                // Loop over queries
+                for (int q = 0; q < q_tile_size_; ++q)
+                {
+                    std::string skip_v = ".skip_v_" + std::to_string(b) + "_" + std::to_string(q);
+
+                    cmp(reg_q_local_start, q);
+                    jg(skip_v, T_NEAR);
+                    cmp(r8, q);
+                    jle(skip_v, T_NEAR);
+
+                    // Valid query
+                    mov(r9, q);
+                    imul(r9, r9, d_model * 4);
+                    add(r9, reg_context_head_offset);
+                    add(r9, rsp);
+
+                    // Load Context
+                    Zmm zmm_ctx_lo = zmm19;
+                    Zmm zmm_ctx_hi = zmm20;
+
+                    vmovups(zmm_ctx_lo, ptr[r9 + ctx_off_base]);
+                    vmovups(zmm_ctx_hi, ptr[r9 + ctx_off_base + 64]);
+
+                    // weighted_v = V * scale * weight[q]
+                    Zmm zmm_wv_lo = zmm21;
+                    Zmm zmm_wv_hi = zmm22;
+
+                    vmulps(zmm_wv_lo, zmm17, zmm16);                     // V_lo * scale
+                    vmulps(zmm_wv_lo, zmm_wv_lo, Zmm(q + q_tile_size_)); // * weight[q]
+
+                    vmulps(zmm_wv_hi, zmm18, zmm16);                     // V_hi * scale
+                    vmulps(zmm_wv_hi, zmm_wv_hi, Zmm(q + q_tile_size_)); // * weight[q]
+
+                    // Update context
+                    vmulps(zmm_ctx_lo, zmm_ctx_lo, Zmm(q)); // * corr[q]
+                    vaddps(zmm_ctx_lo, zmm_ctx_lo, zmm_wv_lo);
+
+                    vmulps(zmm_ctx_hi, zmm_ctx_hi, Zmm(q)); // * corr[q]
+                    vaddps(zmm_ctx_hi, zmm_ctx_hi, zmm_wv_hi);
+
+                    // Store
+                    vmovups(ptr[r9 + ctx_off_base], zmm_ctx_lo);
+                    vmovups(ptr[r9 + ctx_off_base + 64], zmm_ctx_hi);
+
+                    L(skip_v);
+                }
+            }
+        }
+
+        /**
+         * @brief Copy Q blocks for tile for one head (dynamic head offset)
          */
         void emit_prefill_copy_q_tile(
             const Xbyak::Reg64 &reg_Q,
-            int head_idx,
+            const Xbyak::Reg64 &reg_head_offset,
             int num_blocks,
             int q_blocks_offset,
             int tile_start_spill,
@@ -633,7 +1022,7 @@ namespace llaminar::v2::kernels::jit
             using namespace Xbyak;
 
             int q_stride = config_.num_heads * num_blocks * 36;
-            int head_offset = head_idx * num_blocks * 36;
+            // head_offset is passed in register
 
             inLocalLabel();
 
@@ -647,7 +1036,7 @@ namespace llaminar::v2::kernels::jit
             mov(r9, ptr[rsp + tile_start_spill]);
             add(r9, r8);
             imul(r9, r9, q_stride);
-            add(r9, head_offset);
+            add(r9, reg_head_offset); // Add dynamic head offset
             add(r9, reg_Q);
 
             // Q dest on stack: q_blocks_offset + q_local * num_blocks * 64
@@ -668,6 +1057,7 @@ namespace llaminar::v2::kernels::jit
                 // Copy data (32 bytes)
                 Ymm ymm_tmp = Ymm(zmm_scratch(0).getIdx());
                 vmovdqu8(ymm_tmp, ptr[r9 + src_b + 4]);
+
                 vmovdqu8(ptr[rsp + r10 + dst_b + 4], ymm_tmp);
             }
 
@@ -680,7 +1070,7 @@ namespace llaminar::v2::kernels::jit
         }
 
         /**
-         * @brief Process attention for one query in prefill tile
+         * @brief Process attention for one query in prefill tile (dynamic offsets)
          *
          * K/V pointers are passed in registers, q_local indicates which query.
          */
@@ -688,17 +1078,16 @@ namespace llaminar::v2::kernels::jit
             const Xbyak::Reg64 &reg_K_ptr,
             const Xbyak::Reg64 &reg_V_ptr,
             const Xbyak::Reg64 &reg_q_local,
-            int head_idx,
             int num_blocks,
             int q_blocks_offset,
-            int softmax_offset,
-            int context_offset,
-            int d_model)
+            int d_model,
+            const Xbyak::Reg64 &reg_softmax_head_offset,
+            const Xbyak::Reg64 &reg_context_head_offset)
         {
             using namespace Xbyak;
 
             int head_dim = num_blocks * 32;
-            int head_ctx_offset = head_idx * head_dim * 4;
+            // head_ctx_offset is passed in reg_context_head_offset
 
             // Calculate Q base on stack: rsp + q_blocks_offset + q_local * num_blocks * 64
             Reg64 reg_q_base = r11;
@@ -715,10 +1104,10 @@ namespace llaminar::v2::kernels::jit
             emit_prefill_dot_product(xmm_score, reg_K_ptr, reg_q_base, num_blocks, xmm_scale_tmp);
 
             // Load softmax state
-            Reg64 reg_sm = rcx;
+            Reg64 reg_sm = r11; // Use r11 (reused later for reg_ctx)
             mov(reg_sm, reg_q_local);
             shl(reg_sm, 3);
-            add(reg_sm, softmax_offset);
+            add(reg_sm, reg_softmax_head_offset); // Use dynamic offset
             add(reg_sm, rsp);
 
             // Use StateRegs for max/sum to avoid clobbering constants
@@ -758,7 +1147,7 @@ namespace llaminar::v2::kernels::jit
             Reg64 reg_ctx = r11;
             mov(reg_ctx, reg_q_local);
             imul(reg_ctx, reg_ctx, d_model * 4);
-            add(reg_ctx, context_offset + head_ctx_offset);
+            add(reg_ctx, reg_context_head_offset); // Use dynamic offset
             add(reg_ctx, rsp);
 
             // Accumulate weighted V
@@ -767,6 +1156,7 @@ namespace llaminar::v2::kernels::jit
 
         /**
          * @brief Q8_1 dot product for prefill (inline version)
+         * Optimized to accumulate across blocks before horizontal sum.
          */
         void emit_prefill_dot_product(
             const Xbyak::Xmm &dst,
@@ -777,7 +1167,9 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            vxorps(dst, dst, dst);
+            // Use ymm7 as accumulator for scaled floats
+            Ymm ymm_acc(7);
+            vxorps(ymm_acc, ymm_acc, ymm_acc);
 
             Ymm ymm_q(4);
             Ymm ymm_k(5);
@@ -786,12 +1178,11 @@ namespace llaminar::v2::kernels::jit
             Xmm xmm_d_k(9);
             Xmm xmm_sum_qs_k(15);
             Xmm xmm_correction(14);
-            Xmm xmm_block_result(6);
-            Xmm xmm_tmp(7);
+            Xmm xmm_scale_block(10); // d_q * d_k
 
             for (int b = 0; b < num_blocks; ++b)
             {
-                int q_off = b * 64;
+                int q_off = b * 36;
                 int k_off = b * 36;
 
                 // Load Q scale
@@ -814,37 +1205,49 @@ namespace llaminar::v2::kernels::jit
                 // Load K data
                 vmovdqu8(ymm_k, ptr[reg_K + k_off + 4]);
 
-                // vpdpbusd
+                // vpdpbusd -> 8 int32 sums
                 vxorps(ymm_dot, ymm_dot, ymm_dot);
                 vpdpbusd(ymm_dot, ymm_q, ymm_k);
 
-                // Horizontal sum
-                vextracti128(xmm_tmp, ymm_dot, 1);
-                vpaddd(xmm_block_result, Xmm(ymm_dot.getIdx()), xmm_tmp);
-                vpshufd(xmm_tmp, xmm_block_result, 0x4E);
-                vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
-                vpshufd(xmm_tmp, xmm_block_result, 0xB1);
-                vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+                // Convert to float
+                vcvtdq2ps(ymm_dot, ymm_dot);
 
-                vcvtdq2ps(xmm_block_result, xmm_block_result);
+                // Scale factor: d_q * d_k
+                vmulps(xmm_scale_block, xmm_d_q, xmm_d_k);
+                vbroadcastss(Ymm(xmm_scale_block.getIdx()), xmm_scale_block);
 
-                // Scale: d_q * d_k
-                vmulps(xmm_d_q, xmm_d_q, xmm_d_k);
-                vmulps(xmm_block_result, xmm_block_result, xmm_d_q);
+                // Scale the dot product
+                vmulps(ymm_dot, ymm_dot, Ymm(xmm_scale_block.getIdx()));
 
-                // Correction: 128 * sum_qs * (d_q * d_k)
-                mov(eax, 0x43000000);
+                // Calculate correction: 16 * sum_qs * (d_q * d_k)
+                // 16.0f = 0x41800000 (distributed correction for 8 lanes)
+                mov(eax, 0x41800000);
                 vmovd(xmm_correction, eax);
-                vbroadcastss(xmm_correction, xmm_correction);
-                vmulps(xmm_correction, xmm_correction, xmm_sum_qs_k);
-                vmulps(xmm_correction, xmm_correction, xmm_d_q);
+                vbroadcastss(Ymm(xmm_correction.getIdx()), xmm_correction);
+
+                // Broadcast sum_qs to YMM
+                vbroadcastss(Ymm(xmm_sum_qs_k.getIdx()), xmm_sum_qs_k);
+
+                vmulps(Ymm(xmm_correction.getIdx()), Ymm(xmm_correction.getIdx()), Ymm(xmm_sum_qs_k.getIdx()));
+                vmulps(Ymm(xmm_correction.getIdx()), Ymm(xmm_correction.getIdx()), Ymm(xmm_scale_block.getIdx()));
 
                 // Subtract correction
-                vsubps(xmm_block_result, xmm_block_result, xmm_correction);
+                vsubps(ymm_dot, ymm_dot, Ymm(xmm_correction.getIdx()));
 
-                vaddps(dst, dst, xmm_block_result);
+                // Accumulate
+                vaddps(ymm_acc, ymm_acc, ymm_dot);
             }
 
+            // Horizontal sum of ymm_acc (8 floats) -> dst (scalar)
+            Xmm xmm_tmp = Xmm(ymm_dot.getIdx()); // Reuse ymm_dot register as temp
+            vextractf128(xmm_tmp, ymm_acc, 1);
+            vaddps(dst, Xmm(ymm_acc.getIdx()), xmm_tmp); // dst = low + high (FLOAT add)
+            vshufps(xmm_tmp, dst, dst, 0x4E);
+            vaddps(dst, dst, xmm_tmp);
+            vshufps(xmm_tmp, dst, dst, 0xB1);
+            vaddps(dst, dst, xmm_tmp);
+
+            // Final scale
             vmulss(dst, dst, scale);
         }
 
@@ -989,9 +1392,15 @@ namespace llaminar::v2::kernels::jit
             mov(ptr[rsp + q_local_spill], r8); // Save q_local (clobbered by emit_prefill_wo_projection)
 
             // Normalize all heads for this query
+            // r10 = context_ptr_offset = context_offset + q_local * d_model * 4
             mov(r10, r8);
             imul(r10, r10, d_model * 4);
             add(r10, context_offset);
+
+            // r11 = softmax_ptr_offset = softmax_offset + q_local * 8
+            mov(r11, r8);
+            shl(r11, 3);
+            add(r11, softmax_offset);
 
             Zmm zmm_inv_sum = zmm_scratch(0);
             Zmm zmm_one = zmm_scratch(1);
@@ -999,52 +1408,42 @@ namespace llaminar::v2::kernels::jit
             Zmm zmm_epsilon = zmm_scratch(2);
             load_constant_f32(zmm_epsilon, 1e-20f);
 
-            for (int h = 0; h < config_.num_heads; ++h)
+            // Head Loop (Assembly)
+            xor_(r9, r9); // head_idx (Use r9 instead of r12)
+
+            L(".head_loop");
+            cmp(r9, config_.num_heads);
+            jge(".head_end", T_NEAR);
+
+            // Load 1/sum for this head
+            // r11 is offset from rsp
+            vbroadcastss(zmm_inv_sum, ptr[rsp + r11 + 4]);
+            vmaxps(zmm_inv_sum, zmm_inv_sum, zmm_epsilon);
+            vdivps(zmm_inv_sum, zmm_one, zmm_inv_sum);
+
+            for (int b = 0; b < num_blocks; ++b)
             {
-                // Load 1/sum for this head
-                // Offset: softmax_offset + h * tile_size * 8 + q_local * 8
-                int sm_off = softmax_offset + h * tile_size * 8;
+                int b_off = b * 32 * 4;
+                Zmm zmm_lo_safe = zmm_scratch(4);
+                Zmm zmm_hi_safe = zmm_scratch(3);
 
-                mov(r9, r8); // q_local
-                shl(r9, 3);  // * 8
-                add(r9, sm_off);
-
-                vbroadcastss(zmm_inv_sum, ptr[rsp + r9 + 4]);
-                vmaxps(zmm_inv_sum, zmm_inv_sum, zmm_epsilon);
-                vdivps(zmm_inv_sum, zmm_one, zmm_inv_sum);
-
-                int h_off = h * head_dim * 4;
-                for (int b = 0; b < num_blocks; ++b)
-                {
-                    int b_off = b * 32 * 4;
-                    Zmm zmm_lo = zmm_scratch(2); // Reuse zmm_epsilon as scratch (reloaded next iter if needed? No, zmm_epsilon is constant)
-                    // Wait, zmm_epsilon is zmm_scratch(2). zmm_lo is zmm_scratch(2).
-                    // This clobbers zmm_epsilon!
-                    // I need to use different scratch registers.
-
-                    // zmm_scratch(0) = zmm_inv_sum (live)
-                    // zmm_scratch(1) = zmm_one (live)
-                    // zmm_scratch(2) = zmm_epsilon (live)
-                    // zmm_scratch(3) = zmm_hi
-                    // zmm_scratch(4) = zmm_lo
-
-                    Zmm zmm_lo_safe = zmm_scratch(4);
-                    Zmm zmm_hi_safe = zmm_scratch(3);
-
-                    vmovups(zmm_lo_safe, ptr[rsp + r10 + h_off + b_off]);
-                    vmovups(zmm_hi_safe, ptr[rsp + r10 + h_off + b_off + 64]);
-                    vmulps(zmm_lo_safe, zmm_lo_safe, zmm_inv_sum);
-                    vmulps(zmm_hi_safe, zmm_hi_safe, zmm_inv_sum);
-                    vmovups(ptr[rsp + r10 + h_off + b_off], zmm_lo_safe);
-                    vmovups(ptr[rsp + r10 + h_off + b_off + 64], zmm_hi_safe);
-                }
+                // r10 is offset from rsp
+                vmovups(zmm_lo_safe, ptr[rsp + r10 + b_off]);
+                vmovups(zmm_hi_safe, ptr[rsp + r10 + b_off + 64]);
+                vmulps(zmm_lo_safe, zmm_lo_safe, zmm_inv_sum);
+                vmulps(zmm_hi_safe, zmm_hi_safe, zmm_inv_sum);
+                vmovups(ptr[rsp + r10 + b_off], zmm_lo_safe);
+                vmovups(ptr[rsp + r10 + b_off + 64], zmm_hi_safe);
             }
 
-            // Wo projection: output[q_global] = context[q_local] @ Wo
-            mov(r11, ptr[rsp + tile_start_spill]);
-            add(r11, r8); // q_global = tile_start + q_local
+            // Advance pointers
+            add(r11, tile_size * 8); // Next head's softmax
+            add(r10, head_dim * 4);  // Next head's context
 
-            emit_prefill_wo_projection(reg_Wo, reg_output, r11, r10, d_model);
+            inc(r9);
+            jmp(".head_loop", T_NEAR);
+
+            L(".head_end");
 
             mov(r8, ptr[rsp + q_local_spill]); // Restore q_local
             inc(r8);
@@ -1052,6 +1451,333 @@ namespace llaminar::v2::kernels::jit
 
             L(".proj_end");
 
+            // Tile-wide projection
+            emit_prefill_wo_projection_tile(
+                reg_Wo, reg_output, tile_size, context_offset,
+                tile_start_spill, tile_size_spill, d_model);
+
+            outLocalLabel();
+        }
+
+        /**
+         * @brief Wo projection for a whole tile in prefill
+         */
+        void emit_prefill_wo_projection_tile(
+            const Xbyak::Reg64 &reg_Wo,
+            const Xbyak::Reg64 &reg_output,
+            int tile_size,
+            int context_offset,
+            int tile_start_spill,
+            int tile_size_spill,
+            int d_model)
+        {
+            using namespace Xbyak;
+            inLocalLabel();
+
+            // Dispatch by format
+            switch (config_.wo_format)
+            {
+            case WoFormat::Q8_1:
+                emit_prefill_wo_q8_1_tile(reg_Wo, reg_output, tile_size, context_offset, tile_start_spill, tile_size_spill, d_model);
+                break;
+            default:
+                // Fallback to sequential for other formats (or implement them later)
+                // For now, just loop and call single projection
+                xor_(r8, r8);
+                L(".fallback_loop");
+                cmp(r8, ptr[rsp + tile_size_spill]);
+                jge(".fallback_end", T_NEAR);
+
+                mov(r11, ptr[rsp + tile_start_spill]);
+                add(r11, r8); // q_global
+
+                // r10 = context_ptr_offset
+                mov(r10, r8);
+                imul(r10, r10, d_model * 4);
+                add(r10, context_offset);
+
+                emit_prefill_wo_projection(reg_Wo, reg_output, r11, r10, d_model);
+
+                inc(r8);
+                jmp(".fallback_loop", T_NEAR);
+                L(".fallback_end");
+                break;
+            }
+            outLocalLabel();
+        }
+
+        void emit_prefill_wo_q8_1_tile(
+            const Xbyak::Reg64 &reg_Wo,
+            const Xbyak::Reg64 &reg_output,
+            int tile_size,
+            int context_offset,
+            int tile_start_spill,
+            int tile_size_spill,
+            int d_model)
+        {
+            using namespace Xbyak;
+            inLocalLabel();
+
+            int num_blocks = d_model / 32;
+
+            // We unroll i (output rows) by 2
+            // We unroll q (tile queries) by tile_size (up to 8)
+            // Registers:
+            // acc[q] for i: zmm0..zmm7
+            // acc[q] for i+1: zmm8..zmm15
+            // W[i]: zmm16, zmm17, zmm18 (scale, lo, hi)
+            // W[i+1]: zmm19, zmm20, zmm21
+            // C[q]: zmm22, zmm23 (lo, hi)
+
+            // Outer loop over i (output rows)
+            xor_(r8, r8); // i
+
+            L(".row_loop");
+            cmp(r8, d_model);
+            jge(".row_end", T_NEAR);
+
+            // Check if we can do 2 rows
+            mov(r9, d_model);
+            sub(r9, r8);
+            cmp(r9, 2);
+            jl(".single_row", T_NEAR);
+
+            // --- Double row processing ---
+
+            // Clear accumulators
+            for (int q = 0; q < tile_size; ++q)
+            {
+                vxorps(Zmm(q), Zmm(q), Zmm(q));             // acc[q] for i
+                vxorps(Zmm(q + 8), Zmm(q + 8), Zmm(q + 8)); // acc[q] for i+1
+            }
+
+            // Pointers to W rows
+            // r12 = W + i * row_size
+            // r13 = W + (i+1) * row_size
+            mov(r12, r8);
+            imul(r12, r12, num_blocks * 36);
+            add(r12, reg_Wo);
+
+            mov(r13, r12);
+            add(r13, num_blocks * 36);
+
+            // Inner loop over blocks
+            xor_(rcx, rcx); // k_blk
+
+            L(".blk_loop_2");
+            cmp(rcx, num_blocks);
+            jge(".blk_end_2", T_NEAR);
+
+            // Load W[i] block
+            // Offset = rcx * 36
+            mov(rax, rcx);
+            imul(rax, rax, 36);
+
+            // Load W[i]
+            {
+                Zmm d0 = Zmm(16);
+                Zmm w0_lo = Zmm(17);
+                Zmm w0_hi = Zmm(18);
+
+                vpbroadcastw(Xmm(d0.getIdx()), ptr[r12 + rax]);
+                vcvtph2ps(Xmm(d0.getIdx()), Xmm(d0.getIdx()));
+                vbroadcastss(d0, Xmm(d0.getIdx()));
+
+                vpmovsxbd(w0_lo, ptr[r12 + rax + 4]);
+                vpmovsxbd(w0_hi, ptr[r12 + rax + 4 + 16]);
+                vcvtdq2ps(w0_lo, w0_lo);
+                vcvtdq2ps(w0_hi, w0_hi);
+                vmulps(w0_lo, w0_lo, d0);
+                vmulps(w0_hi, w0_hi, d0);
+
+                // Load W[i+1]
+                Zmm d1 = Zmm(19);
+                Zmm w1_lo = Zmm(20);
+                Zmm w1_hi = Zmm(21);
+
+                vpbroadcastw(Xmm(d1.getIdx()), ptr[r13 + rax]);
+                vcvtph2ps(Xmm(d1.getIdx()), Xmm(d1.getIdx()));
+                vbroadcastss(d1, Xmm(d1.getIdx()));
+
+                vpmovsxbd(w1_lo, ptr[r13 + rax + 4]);
+                vpmovsxbd(w1_hi, ptr[r13 + rax + 4 + 16]);
+                vcvtdq2ps(w1_lo, w1_lo);
+                vcvtdq2ps(w1_hi, w1_hi);
+                vmulps(w1_lo, w1_lo, d1);
+                vmulps(w1_hi, w1_hi, d1);
+
+                // Loop over q
+                // Context offset: context_offset + q * d_model * 4 + k_blk * 128
+                // We can compute base pointer for k_blk once
+                // base = rsp + context_offset + k_blk * 128
+                mov(rdx, rcx);
+                shl(rdx, 7); // * 128
+                add(rdx, context_offset);
+                add(rdx, rsp);
+
+                for (int q = 0; q < tile_size; ++q)
+                {
+                    // Load C[q]
+                    // Offset = q * d_model * 4
+                    // But d_model is variable.
+                    // We can precompute offsets? Or just compute on fly.
+                    // q * d_model * 4
+                    // Since tile_size is small (8), we can just do it.
+
+                    Zmm c_lo = Zmm(22);
+                    Zmm c_hi = Zmm(23);
+
+                    // r14 = q * d_model * 4
+                    // We can use a scratch reg. r14 is callee-save? Xbyak handles it?
+                    // No, we should use caller-save. r14 is callee-save.
+                    // r10, r11 are scratch.
+
+                    mov(r10, q);
+                    imul(r10, r10, d_model * 4);
+
+                    vmovups(c_lo, ptr[rdx + r10]);
+                    vmovups(c_hi, ptr[rdx + r10 + 64]);
+
+                    // Accumulate i
+                    vfmadd231ps(Zmm(q), c_lo, w0_lo);
+                    vfmadd231ps(Zmm(q), c_hi, w0_hi);
+
+                    // Accumulate i+1
+                    vfmadd231ps(Zmm(q + 8), c_lo, w1_lo);
+                    vfmadd231ps(Zmm(q + 8), c_hi, w1_hi);
+                }
+            }
+
+            inc(rcx);
+            jmp(".blk_loop_2", T_NEAR);
+            L(".blk_end_2");
+
+            // Horizontal sum and store
+            // We need to check actual_tile_size
+            mov(rax, ptr[rsp + tile_size_spill]); // actual size (use rax instead of r14/reg_output)
+
+            // Output ptr base
+            mov(r11, ptr[rsp + tile_start_spill]); // tile_start
+            // output[q_global][i]
+            // ptr = reg_output + (tile_start + q) * d_model * 4 + i * 4
+
+            for (int q = 0; q < tile_size; ++q)
+            {
+                // Check if q < actual_tile_size
+                cmp(rax, q);
+                jle(".skip_store_2_" + std::to_string(q), T_NEAR);
+
+                // Sum i
+                emit_horizontal_sum_to_scalar(Zmm(q));
+
+                // Sum i+1
+                emit_horizontal_sum_to_scalar(Zmm(q + 8));
+
+                // Store
+                // ptr = reg_output + (tile_start + q) * d_model * 4 + r8 * 4
+                mov(r10, ptr[rsp + tile_start_spill]);
+                add(r10, q);
+                imul(r10, r10, d_model * 4);
+                add(r10, reg_output);
+
+                vmovss(ptr[r10 + r8 * 4], Xmm(Zmm(q).getIdx()));
+                vmovss(ptr[r10 + r8 * 4 + 4], Xmm(Zmm(q + 8).getIdx()));
+
+                L(".skip_store_2_" + std::to_string(q));
+            }
+
+            add(r8, 2);
+            jmp(".row_loop", T_NEAR);
+
+            L(".single_row");
+            // --- Single row processing (fallback for odd d_model) ---
+            // (Simplified version of above, only 1 row)
+
+            // Clear accumulators
+            for (int q = 0; q < tile_size; ++q)
+            {
+                vxorps(Zmm(q), Zmm(q), Zmm(q));
+            }
+
+            mov(r12, r8);
+            imul(r12, r12, num_blocks * 36);
+            add(r12, reg_Wo);
+
+            xor_(rcx, rcx);
+            L(".blk_loop_1");
+            cmp(rcx, num_blocks);
+            jge(".blk_end_1", T_NEAR);
+
+            // Load W[i]
+            mov(rax, rcx);
+            imul(rax, rax, 36);
+
+            // Load W[i]
+            {
+                Zmm d0 = Zmm(16);
+                Zmm w0_lo = Zmm(17);
+                Zmm w0_hi = Zmm(18);
+
+                vpbroadcastw(Xmm(d0.getIdx()), ptr[r12 + rax]);
+                vcvtph2ps(Xmm(d0.getIdx()), Xmm(d0.getIdx()));
+                vbroadcastss(d0, Xmm(d0.getIdx()));
+
+                vpmovsxbd(w0_lo, ptr[r12 + rax + 4]);
+                vpmovsxbd(w0_hi, ptr[r12 + rax + 4 + 16]);
+                vcvtdq2ps(w0_lo, w0_lo);
+                vcvtdq2ps(w0_hi, w0_hi);
+                vmulps(w0_lo, w0_lo, d0);
+                vmulps(w0_hi, w0_hi, d0);
+
+                mov(rdx, rcx);
+                shl(rdx, 7);
+                add(rdx, context_offset);
+                add(rdx, rsp);
+
+                for (int q = 0; q < tile_size; ++q)
+                {
+                    Zmm c_lo = Zmm(22);
+                    Zmm c_hi = Zmm(23);
+
+                    mov(r10, q);
+                    imul(r10, r10, d_model * 4);
+
+                    vmovups(c_lo, ptr[rdx + r10]);
+                    vmovups(c_hi, ptr[rdx + r10 + 64]);
+
+                    vfmadd231ps(Zmm(q), c_lo, w0_lo);
+                    vfmadd231ps(Zmm(q), c_hi, w0_hi);
+                }
+            }
+
+            inc(rcx);
+            jmp(".blk_loop_1", T_NEAR);
+            L(".blk_end_1");
+
+            mov(rax, ptr[rsp + tile_size_spill]); // use rax instead of r14
+            mov(r11, ptr[rsp + tile_start_spill]);
+
+            for (int q = 0; q < tile_size; ++q)
+            {
+                cmp(rax, q);
+                jle(".skip_store_1_" + std::to_string(q), T_NEAR);
+
+                emit_horizontal_sum_to_scalar(Zmm(q));
+
+                mov(r10, ptr[rsp + tile_start_spill]);
+                add(r10, q);
+                imul(r10, r10, d_model * 4);
+                add(r10, reg_output);
+
+                vmovss(ptr[r10 + r8 * 4], Xmm(Zmm(q).getIdx()));
+
+                L(".skip_store_1_" + std::to_string(q));
+            }
+
+            inc(r8);
+            jmp(".row_loop", T_NEAR);
+
+            L(".row_end");
             outLocalLabel();
         }
 
@@ -1383,13 +2109,15 @@ namespace llaminar::v2::kernels::jit
                 // NOTE: Must be computed inside head loop because rdi gets clobbered
                 //       by emit_single_head_attention (used for K/V pointers)
                 // NOTE: Load q_idx from spill slot since rax is clobbered by emitters
-                Reg64 reg_Q_base = rdi;
+                // Use rsi for Q base (rdi is used for K/V pointers in single_head_attention)
+                Reg64 reg_Q_base = rsi;
                 mov(reg_Q_base, ptr[rsp + q_idx_spill_offset]); // Load saved q_idx
                 imul(reg_Q_base, reg_Q_base, q_stride);
                 add(reg_Q_base, reg_Q); // reg_Q = r12, preserved callee-saved
 
-                // Copy Q[q,h] blocks to stack for this head
-                emit_copy_q_head_to_stack(reg_Q_base, h, num_blocks, q_stack_offset);
+                // Load Q[q,h] blocks to registers for this head
+                // Optimized for Decode: Keep Q in ZMM registers across KV loop
+                emit_load_q_head_to_registers(reg_Q_base, h, num_blocks);
 
                 // Loop over KV positions (up to max_kv_pos for causal, seq_len_kv for non-causal)
                 // Use unique labels for each head to avoid conflicts
@@ -1466,12 +2194,38 @@ namespace llaminar::v2::kernels::jit
                 // Copy 32 bytes (data portion) using AVX-512 load/store (256-bit)
                 // vmovdqu32 is the AVX-512 32-bit version
                 vmovdqu32(Ymm(zmm_tmp.getIdx()), ptr[reg_Q_base + src_offset + 4]); // Data at offset 4
+
                 vmovdqu32(ptr[rsp + dst_offset + 4], Ymm(zmm_tmp.getIdx()));
 
                 // Copy 4 bytes (scale + sum_qs) using esi as scratch
                 // NOTE: Use esi (not edi) since rdi might be reg_Q_base
                 mov(esi, ptr[reg_Q_base + src_offset]);
                 mov(ptr[rsp + dst_offset], esi);
+            }
+        }
+
+        void emit_load_q_head_to_registers(
+            const Xbyak::Reg64 &reg_Q_base,
+            int head_idx,
+            int num_blocks)
+        {
+            using namespace Xbyak;
+
+            debug_emit("emit_load_q_head_to_registers (head " + std::to_string(head_idx) + ")");
+
+            int q_head_offset = head_idx * num_blocks * 36;
+
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                int src_offset = q_head_offset + b * 36;
+
+                // Load Q data (32 int8) -> ZMM (10 + b)
+                // Use zmm10-13 to avoid conflict with StateRegs (16-19) and ConstRegs (26-31)
+                Ymm ymm_q(10 + b);
+                vmovdqu8(ymm_q, ptr[reg_Q_base + src_offset + 4]);
+
+                // Convert to unsigned (XOR 0x80)
+                vpxord(ymm_q, ymm_q, Ymm(zmm_128().getIdx()));
             }
         }
 
@@ -1581,6 +2335,7 @@ namespace llaminar::v2::kernels::jit
                     int out_lo = ctx_ptr + b * 64 * 2; // offset for this block's low half
                     int out_hi = out_lo + 64;
 
+                    // Load from spill slot and store to context buffer
                     vmovups(zmm_scratch(0), ptr[rsp + spill_lo]);
                     vmovups(ptr[rsp + out_lo], zmm_scratch(0));
 
@@ -1971,9 +2726,10 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            // Use zmm_accum(4) as temporary - it's zmm4, which is VEX-compatible
-            // This avoids the EVEX-only issue with high-numbered registers
-            Zmm zmm_tmp = zmm_accum(4);
+            // Use zmm25 (scratch) as temporary to avoid clobbering zmm16 (StateRegs::ZMM_MAX)
+            // and to avoid aliasing with zmm20 (which is often the accumulator passed as zmm)
+            // Also avoid zmm21 which is used as scratch in some contexts
+            Zmm zmm_tmp = Zmm(25);
             Ymm ymm_tmp = Ymm(zmm_tmp.getIdx());
             Xmm xmm_tmp = Xmm(zmm_tmp.getIdx());
 
@@ -1982,19 +2738,15 @@ namespace llaminar::v2::kernels::jit
             vaddps(Ymm(zmm.getIdx()), Ymm(zmm.getIdx()), ymm_tmp);
 
             // ymm -> xmm: add upper 128 to lower
-            // vextractf128 needs VEX encoding, so operands must be < 16
-            // Move result to ymm_tmp first, then extract
-            vmovaps(ymm_tmp, Ymm(zmm.getIdx()));
-            vextractf128(xmm_tmp, ymm_tmp, 1);
+            // Use vextractf32x4 which supports EVEX (all registers)
+            vextractf32x4(xmm_tmp, Zmm(zmm.getIdx()), 1);
             vaddps(Xmm(zmm.getIdx()), Xmm(zmm.getIdx()), xmm_tmp);
 
-            // xmm: horizontal add (4 floats -> 1)
-            // haddps also requires VEX encoding for xmm operands
-            vmovaps(xmm_tmp, Xmm(zmm.getIdx()));
-            vhaddps(xmm_tmp, xmm_tmp, xmm_tmp);
-            vhaddps(xmm_tmp, xmm_tmp, xmm_tmp);
-            vmovss(Xmm(zmm.getIdx()), xmm_tmp);
-            vmovaps(Xmm(zmm.getIdx()), xmm_tmp);
+            // xmm -> scalar: horizontal sum
+            vshufps(xmm_tmp, Xmm(zmm.getIdx()), Xmm(zmm.getIdx()), 0x4E); // Swap high/low 64 bits
+            vaddps(Xmm(zmm.getIdx()), Xmm(zmm.getIdx()), xmm_tmp);
+            vshufps(xmm_tmp, Xmm(zmm.getIdx()), Xmm(zmm.getIdx()), 0xB1); // Swap high/low 32 bits
+            vaddss(Xmm(zmm.getIdx()), Xmm(zmm.getIdx()), xmm_tmp);
         }
 
         /**
@@ -2032,17 +2784,21 @@ namespace llaminar::v2::kernels::jit
 
             // Q[q, h] dot K[kv, kv_h]
             // Use Q8 dot product microkernel
-            // Q head blocks should already be on stack at q_stack_offset
+            // Q head blocks are pre-loaded in ZMM registers (16+) and XMM scales (24+)
             Xmm xmm_score_result(zmm_scratch(1).getIdx()); // Use xmm21 for score result (avoids accumulators)
             Xmm xmm_scale_local(zmm_scratch(2).getIdx());  // Use xmm22 for scale (avoids accumulators)
 
             // Load scale from zmm_scale() element 0
             vmovss(xmm_scale_local, Xmm(zmm_scale().getIdx()));
 
-            dot_emitter_.emit_dot_product(*this, xmm_score_result, reg_K_ptr, rsp,
-                                          q_stack_offset, num_blocks, xmm_scale_local);
+            // Use register-based dot product for Decode mode
+            // Q data in ZMM 10+, d_Q in memory (loaded via reg_Q_ptr)
+            int q_head_offset = head_idx * num_blocks * 36;
+            dot_emitter_.emit_dot_product_register_q_mem_dq(*this, xmm_score_result, reg_K_ptr, reg_Q_ptr,
+                                                            q_head_offset, num_blocks, xmm_scale_local, 10);
 
             // Score is now in xmm_score_result element 0
+
             // Online softmax update needs a label prefix for internal jumps
             std::string softmax_label = label_prefix + "_h" + std::to_string(head_idx) + "_softmax";
             softmax_emitter_.emit_update(*this, xmm_score_result, softmax_label);
@@ -2064,6 +2820,7 @@ namespace llaminar::v2::kernels::jit
 
             // Weighted V accumulation
             // weight is in zmm_weight() after softmax update
+
             v_accum_emitter_.emit_weighted_accum(*this, reg_V_ptr, num_blocks, spill_base_offset);
         }
     };

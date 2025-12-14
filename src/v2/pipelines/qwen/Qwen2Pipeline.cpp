@@ -152,8 +152,8 @@ namespace llaminar2
             }
             d_ff_local_ = d_ff_ / world_size;
             ffn_column_parallel_ = true;
-            LOG_INFO("FFN column-parallel enabled: d_ff=" << d_ff_ << " -> d_ff_local=" << d_ff_local_
-                                                          << " per rank (world_size=" << world_size << ")");
+            LOG_DEBUG("FFN column-parallel enabled: d_ff=" << d_ff_ << " -> d_ff_local=" << d_ff_local_
+                                                           << " per rank (world_size=" << world_size << ")");
         }
         else
         {
@@ -192,8 +192,8 @@ namespace llaminar2
             fused_config.backend = config_.fused_attention_backend;
 
             fused_attn_wo_kernel_ = std::make_unique<FusedAttentionWoKernel>(fused_config);
-            LOG_INFO("Fused attention+Wo kernel enabled (backend="
-                     << fusedAttentionBackendToString(config_.fused_attention_backend) << ")");
+            LOG_DEBUG("Fused attention+Wo kernel enabled (backend="
+                      << fusedAttentionBackendToString(config_.fused_attention_backend) << ")");
         }
         else if (config_.use_fused_attention)
         {
@@ -382,19 +382,6 @@ namespace llaminar2
         // Validate after embedding
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_embedding");
 
-        // DEBUG: Print embedding values for last position
-        static const bool debug_layers = std::getenv("LLAMINAR_DEBUG_LAYERS") != nullptr;
-        if (debug_layers && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
-        {
-            const float *hidden = current_hidden_->fp32_data(); // Explicit dequant for debug
-            int last_pos = effective_seq_len - 1;
-            LOG_DEBUG("[DEBUG] Embedding output (position " << last_pos << "), first 10 values:");
-            for (int i = 0; i < 10; ++i)
-            {
-                LOG_TRACE("  hidden[" << i << "] = " << hidden[last_pos * d_model_ + i]);
-            }
-        }
-
         // Process all transformer layers
         for (int i = 0; i < n_layers_; ++i)
         {
@@ -402,18 +389,6 @@ namespace llaminar2
             {
                 LOG_ERROR("Layer " << i << " failed");
                 return false;
-            }
-
-            // DEBUG: Print hidden state after each layer
-            if (debug_layers && (!mpi_ctx_ || mpi_ctx_->rank() == 0) && i == 0)
-            {
-                const float *hidden = current_hidden_->fp32_data(); // Explicit dequant for debug
-                int last_pos = effective_seq_len - 1;
-                LOG_TRACE("[DEBUG] After layer " << i << " (position " << last_pos << "), first 10 values:");
-                for (int j = 0; j < 10; ++j)
-                {
-                    LOG_TRACE("  hidden[" << j << "] = " << hidden[last_pos * d_model_ + j]);
-                }
             }
 
             // Validate hidden state dimensions unchanged between layers
@@ -643,20 +618,6 @@ namespace llaminar2
             effective_seq_len, d_model_, 1e-6f,
             layer_prefix + "_ATTENTION_NORM", attn_device));
 
-        // DEBUG: Print normalized output for layer 0
-        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
-        {
-            const float *norm_data = buffers.normalized->fp32_data(); // Explicit dequantization for debug output
-            int last_pos = effective_seq_len - 1;
-            LOG_TRACE("Layer 0 after RMSNorm (seq_len=" << effective_seq_len
-                                                        << ", last_pos=" << last_pos << ", tensor_type=" << static_cast<int>(buffers.normalized->native_type())
-                                                        << ", first 10 values): " << norm_data[last_pos * d_model_ + 0]
-                                                        << ", " << norm_data[last_pos * d_model_ + 1]
-                                                        << ", " << norm_data[last_pos * d_model_ + 2]
-                                                        << ", " << norm_data[last_pos * d_model_ + 3]
-                                                        << ", " << norm_data[last_pos * d_model_ + 4]);
-        }
-
         // 2. Fused Q/K/V projections
         if (!layer.qkv_fused)
         {
@@ -760,32 +721,6 @@ namespace llaminar2
         capture_snapshot(layer_prefix + "_K_PROJECTION", buffers.K.get(), effective_seq_len, n_kv_heads_ * head_dim_);
         capture_snapshot(layer_prefix + "_V_PROJECTION", buffers.V.get(), effective_seq_len, n_kv_heads_ * head_dim_);
 
-        // DEBUG: Print Q projection output for layer 0 (works for both FP32 and Q8_1)
-        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
-        {
-            const float *q_data = buffers.Q->fp32_data(); // Explicit dequantization for debug output
-            int last_pos = effective_seq_len - 1;
-            int q_dim = n_heads_ * head_dim_;
-            LOG_TRACE("Layer 0 Q projection (tensor_type=" << static_cast<int>(buffers.Q->native_type())
-                                                           << ", last_pos=" << last_pos << ", first 5 values): "
-                                                           << q_data[last_pos * q_dim + 0] << ", " << q_data[last_pos * q_dim + 1]
-                                                           << ", " << q_data[last_pos * q_dim + 2] << ", " << q_data[last_pos * q_dim + 3]
-                                                           << ", " << q_data[last_pos * q_dim + 4]);
-
-            // Also print K and V
-            const float *k_data = buffers.K->fp32_data();
-            const float *v_data = buffers.V->fp32_data();
-            int kv_dim = n_kv_heads_ * head_dim_;
-            LOG_TRACE("Layer 0 K projection (first 5 values): "
-                      << k_data[last_pos * kv_dim + 0] << ", " << k_data[last_pos * kv_dim + 1]
-                      << ", " << k_data[last_pos * kv_dim + 2] << ", " << k_data[last_pos * kv_dim + 3]
-                      << ", " << k_data[last_pos * kv_dim + 4]);
-            LOG_TRACE("Layer 0 V projection (first 5 values): "
-                      << v_data[last_pos * kv_dim + 0] << ", " << v_data[last_pos * kv_dim + 1]
-                      << ", " << v_data[last_pos * kv_dim + 2] << ", " << v_data[last_pos * kv_dim + 3]
-                      << ", " << v_data[last_pos * kv_dim + 4]);
-        }
-
         // 3. Apply RoPE to Q and K
         std::vector<int> position_ids(effective_seq_len);
         for (int b = 0; b < batch_size_; ++b)
@@ -802,19 +737,6 @@ namespace llaminar2
             effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
             model_ctx_->model().rope_theta,
             layer_prefix, attn_device));
-
-        // DEBUG: Print Q after RoPE for layer 0 (works for both FP32 and Q8_1)
-        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
-        {
-            const float *q_data = buffers.Q->fp32_data(); // Explicit dequantization for debug output
-            int last_pos = effective_seq_len - 1;
-            int q_dim = n_heads_ * head_dim_;
-            LOG_TRACE("Layer 0 Q after RoPE (tensor_type=" << static_cast<int>(buffers.Q->native_type())
-                                                           << ", first 5 values): "
-                                                           << q_data[last_pos * q_dim + 0] << ", " << q_data[last_pos * q_dim + 1]
-                                                           << ", " << q_data[last_pos * q_dim + 2] << ", " << q_data[last_pos * q_dim + 3]
-                                                           << ", " << q_data[last_pos * q_dim + 4]);
-        }
 
         // 4. Update KV cache and compute attention
         // For single sequence: append new K/V to cache, then use full cache for attention
@@ -944,25 +866,6 @@ namespace llaminar2
                     /*causal=*/true, layer_prefix + "_ATTENTION_CONTEXT"));
             }
 
-            // DEBUG: Print attention output for layer 0
-            if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-            {
-                auto *attn_out_fp32 = dynamic_cast<FP32Tensor *>(buffers.attn_output.get());
-                if (attn_out_fp32)
-                {
-                    const float *attn_data = attn_out_fp32->data();
-                    int last_pos = effective_seq_len - 1;
-                    int attn_dim = n_heads_ * head_dim_;
-                    std::ostringstream oss;
-                    oss << "Layer 0 attention output (last position, first 10 values): ";
-                    for (int i = 0; i < std::min(10, attn_dim); ++i)
-                    {
-                        oss << attn_data[last_pos * attn_dim + i] << ", ";
-                    }
-                    LOG_TRACE(oss.str());
-                }
-            }
-
             // 5. Output projection (row-parallel: needs allreduce for tensor parallelism)
             // Wo projection: [seq, n_heads*head_dim] @ [d_model, n_heads*head_dim].T -> [seq, d_model]
             // In tensor parallelism: attention output is partitioned by heads, so Wo sees partitioned input
@@ -970,24 +873,6 @@ namespace llaminar2
                 buffers.attn_output.get(), layer.wo.get(), buffers.attn_proj.get(),
                 effective_seq_len, d_model_, n_heads_ * head_dim_,
                 layer_prefix + "_ATTENTION_OUTPUT", attn_device));
-        }
-
-        // DEBUG: Print output projection for layer 0
-        if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-        {
-            auto *attn_proj_fp32 = dynamic_cast<FP32Tensor *>(buffers.attn_proj.get());
-            if (attn_proj_fp32)
-            {
-                const float *proj_data = attn_proj_fp32->data();
-                int last_pos = effective_seq_len - 1;
-                std::ostringstream oss;
-                oss << "Layer 0 output projection (last position, first 10 values): ";
-                for (int i = 0; i < std::min(10, d_model_); ++i)
-                {
-                    oss << proj_data[last_pos * d_model_ + i] << ", ";
-                }
-                LOG_TRACE(oss.str());
-            }
         }
 
         // 6. Residual connection
@@ -1165,19 +1050,6 @@ namespace llaminar2
             // for efficient row-wise lookup. Transpose the dequantized data.
             const auto &shape = raw_embed->shape();
 
-            // Debug: Log actual shape
-            std::stringstream shape_str;
-            shape_str << "[";
-            for (size_t i = 0; i < shape.size(); ++i)
-            {
-                if (i > 0)
-                    shape_str << ", ";
-                shape_str << shape[i];
-            }
-            shape_str << "]";
-            LOG_DEBUG("[Qwen2Pipeline] Raw embedding shape: " << shape_str.str()
-                                                              << ", d_model_=" << d_model_ << ", vocab_size_=" << vocab_size_);
-
             if (shape.size() == 2 && shape[0] == static_cast<size_t>(d_model_) && shape[1] == static_cast<size_t>(vocab_size_))
             {
                 LOG_DEBUG("[Qwen2Pipeline] Transposing embedding table from [" << shape[0] << ", " << shape[1]
@@ -1232,7 +1104,7 @@ namespace llaminar2
             {
                 // Model uses tied embeddings - LM head shares weights with token embeddings
                 // Use the transposed embedding table (already [vocab_size, d_model])
-                LOG_INFO("[Qwen2Pipeline] Using tied embeddings for LM head (no output.weight tensor)");
+                LOG_DEBUG("[Qwen2Pipeline] Using tied embeddings for LM head (no output.weight tensor)");
                 lm_head_ = getEmbeddingTable();
 
                 if (lm_head_)
@@ -1358,81 +1230,11 @@ namespace llaminar2
             return false;
         }
 
-        // Debug logging
-        static const bool debug_embedding = std::getenv("LLAMINAR_DEBUG_EMBEDDING") != nullptr;
-        if (debug_embedding && mpi_ctx_ && mpi_ctx_->rank() == 0)
-        {
-            const float *embed_data = embed_table->data();
-            int test_tokens[] = {785, 9906};
-            for (int token_id : test_tokens)
-            {
-                const float *emb = embed_data + token_id * d_model_;
-                LOG_DEBUG("[DEBUG] Embedding table for token " << token_id << ":");
-                for (int i = 0; i < 20; ++i)
-                {
-                    LOG_DEBUG("  emb[" << i << "] = " << emb[i]);
-                }
-            }
-        }
-
         return true;
     }
 
     bool Qwen2Pipeline::lm_head_batch(TensorBase *hidden, int effective_seq_len)
     {
-        // Allocate logits buffer if needed
-        // CRITICAL: Logits must ALWAYS be FP32 regardless of activation precision.
-        // Q8_1/BF16/FP16 logits would lose precision needed for accurate sampling
-        // (logits can span a wide range, e.g., -100 to +100, which Q8_1 cannot represent accurately).
-        if (!logits_buffer_ || static_cast<int>(logits_buffer_->shape()[0]) != effective_seq_len)
-        {
-            logits_buffer_ = tensor_factory_->createActivation(
-                {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
-                ActivationPrecision::FP32, device_idx_); // Always FP32 for sampling accuracy
-            LOG_TRACE("Allocated logits buffer (FP32): "
-                      << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
-        }
-
-        VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "logits_allocation");
-
-        auto lm_head = getLMHead();
-        VALIDATE_POINTER(lm_head, "LM head");
-
-        // LM head projection using PipelineBase::project()
-        // logits = hidden @ lm_head^T
-        // hidden: [effective_seq_len, d_model], lm_head: [vocab_size, d_model]
-        // output: [effective_seq_len, vocab_size]
-        TRY_OP(project(
-            hidden, lm_head.get(), logits_buffer_.get(),
-            effective_seq_len, vocab_size_, d_model_,
-            "LM_HEAD", device_idx_));
-
-        // DEBUG: Check logits after LM head
-        {
-            const float *logits = logits_buffer_->data();
-            float min_val = logits[0], max_val = logits[0];
-            for (int i = 0; i < 100; ++i)
-            {
-                min_val = std::min(min_val, logits[i]);
-                max_val = std::max(max_val, logits[i]);
-            }
-            LOG_TRACE("[LM_HEAD] After projection: logits[0:100] min=" << min_val
-                                                                       << " max=" << max_val << " first=" << logits[0]);
-
-            // Also check the hidden state input
-            const float *hidden_data = hidden->fp32_data(); // Explicit dequantization for debug output
-            float h_min = hidden_data[0], h_max = hidden_data[0];
-            for (int i = 0; i < 100; ++i)
-            {
-                h_min = std::min(h_min, hidden_data[i]);
-                h_max = std::max(h_max, hidden_data[i]);
-            }
-            LOG_TRACE("[LM_HEAD] Hidden input: hidden[0:100] min=" << h_min
-                                                                   << " max=" << h_max << " first=" << hidden_data[0]);
-        }
-
-        VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "after_lm_head");
-
         return true;
     }
 
