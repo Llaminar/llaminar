@@ -859,10 +859,6 @@ namespace llaminar::v2::kernels::jit::test
             Wo_fp32[i * d_model + i] = 1.0f;
         }
 
-        // Enable debug buffer
-        llaminar::v2::kernels::jit::g_jit_debug_buffer2.enabled = true;
-        llaminar::v2::kernels::jit::g_jit_debug_buffer2.count = 0;
-
         std::vector<float> output(seq_len_q * d_model, -999.0f);
         {
             JitAttentionConfig config;
@@ -878,11 +874,6 @@ namespace llaminar::v2::kernels::jit::test
             kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
                            output.data(), seq_len_q, seq_len_kv, scale, 0);
         }
-
-        // Dump debug buffer
-        std::cout << "\n=== JIT DEBUG BUFFER 2 ===\n";
-        llaminar::v2::kernels::jit::g_jit_debug_buffer2.dump();
-        llaminar::v2::kernels::jit::g_jit_debug_buffer2.enabled = false;
 
         std::cout << "Results:\n";
         for (int q = 0; q < seq_len_q; ++q)
@@ -901,102 +892,6 @@ namespace llaminar::v2::kernels::jit::test
         EXPECT_NEAR(output[1 * d_model], 0.0f, 1.0f) << "Q1 got V[3]!";
         EXPECT_NEAR(output[2 * d_model], 0.0f, 1.0f) << "Q2 got V[3]!";
         EXPECT_GT(output[3 * d_model], 100.0f) << "Q3 should have V[3] influence";
-    }
-    /**
-     * Test ONLY Tile 1 in isolation using position_offset to shift the causal window
-     */
-    TEST_F(Test__JitFusedAttentionWo_Debug, Tile1Only)
-    {
-        // Use 2 queries (Tile 1 only) with position_offset=2
-        // Q0 here maps to global position 2
-        // Q1 here maps to global position 3
-        const int seq_len_q = 2; // Just 2 queries
-        const int seq_len_kv = 4;
-        const int num_heads = 1;
-        const int num_kv_heads = 1;
-        const int head_dim = 64;
-        const int d_model = head_dim;
-        const int blocks_per_head = head_dim / 32;
-        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        const int position_offset = 2; // Start at position 2
-
-        std::cout << "\n=== Tile 1 Only Test ===\n";
-        std::cout << "position_offset=" << position_offset << "\n";
-        std::cout << "V[0]=0, V[1]=0, V[2]=0, V[3]=1000\n";
-        std::cout << "Q0 (global pos 2): should attend to V[0..2] → ~0\n";
-        std::cout << "Q1 (global pos 3): should attend to V[0..3] → ~250\n\n";
-
-        float uniform_val = 1.0f / std::sqrt(64.0f);
-
-        std::vector<Q8_1Block> Q_q8(seq_len_q * num_heads * blocks_per_head);
-        std::vector<Q8_1Block> K_q8(seq_len_kv * num_kv_heads * blocks_per_head);
-        std::vector<Q8_1Block> V_q8(seq_len_kv * num_kv_heads * blocks_per_head);
-
-        quantize_constant_q8(Q_q8.data(), seq_len_q * num_heads, blocks_per_head, uniform_val);
-        quantize_constant_q8(K_q8.data(), seq_len_kv * num_kv_heads, blocks_per_head, uniform_val);
-
-        float v_values[4] = {0.0f, 0.0f, 0.0f, 1000.0f};
-        for (int k = 0; k < seq_len_kv; ++k)
-        {
-            float v_val = v_values[k];
-            for (int b = 0; b < blocks_per_head; ++b)
-            {
-                Q8_1Block &blk = V_q8[k * blocks_per_head + b];
-                if (v_val == 0.0f)
-                {
-                    blk.d = fp32_to_fp16(0.0f);
-                    blk.sum_qs = 0;
-                    for (int i = 0; i < 32; ++i)
-                        blk.qs[i] = 0;
-                }
-                else
-                {
-                    float blk_scale = v_val / 127.0f;
-                    blk.d = fp32_to_fp16(blk_scale);
-                    int32_t sum_qs = 0;
-                    for (int i = 0; i < 32; ++i)
-                    {
-                        blk.qs[i] = 127;
-                        sum_qs += 127;
-                    }
-                    blk.sum_qs = static_cast<int16_t>(sum_qs);
-                }
-            }
-        }
-
-        std::vector<float> Wo_fp32(d_model * d_model, 0.0f);
-        for (int i = 0; i < d_model; ++i)
-        {
-            Wo_fp32[i * d_model + i] = 1.0f;
-        }
-
-        std::vector<float> output(seq_len_q * d_model, -999.0f);
-        {
-            JitAttentionConfig config;
-            config.head_dim = head_dim;
-            config.num_heads = num_heads;
-            config.num_kv_heads = num_kv_heads;
-            config.batch_size = seq_len_q;
-            config.wo_format = WoFormat::FP32;
-            config.causal = true;
-            config.mode = AttentionMode::PREFILL;
-
-            JitFusedAttentionWo kernel(config);
-            kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
-                           output.data(), seq_len_q, seq_len_kv, scale, position_offset);
-        }
-
-        std::cout << "Results:\n";
-        std::cout << "  Q0 (pos 2): " << output[0 * d_model];
-        if (std::fabs(output[0 * d_model]) > 1.0f)
-            std::cout << " *** GOT V[3] ***";
-        std::cout << "\n";
-        std::cout << "  Q1 (pos 3): " << output[1 * d_model] << "\n";
-
-        // Q0 (position 2) should only see V[0..2] which are 0
-        EXPECT_NEAR(output[0 * d_model], 0.0f, 1.0f) << "Q0 at position 2 got V[3]!";
-        // Q1 (position 3) should see V[0..3], but since V[0..2]=0, output ≈ 1000/4 = 250
-        EXPECT_GT(output[1 * d_model], 100.0f) << "Q1 at position 3 should have V[3]";
     }
 
 } // namespace

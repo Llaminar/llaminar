@@ -131,94 +131,7 @@ namespace std
 
 namespace llaminar::v2::kernels::jit
 {
-    // Debug tracing for causal mask investigation
-    struct JitDebugTrace
-    {
-        static constexpr int MAX_ENTRIES = 256;
-        struct Entry
-        {
-            int64_t tile_start;
-            int64_t kv_idx;
-            int64_t q_local_start;
-            int q;
-            int skipped; // 1 if skipped, 0 if processed
-        };
-        Entry entries[MAX_ENTRIES];
-        int count = 0;
-        bool enabled = false;
-
-        void reset() { count = 0; }
-        void add(int64_t ts, int64_t kv, int64_t qls, int q, int skip)
-        {
-            if (enabled && count < MAX_ENTRIES)
-            {
-                entries[count++] = {ts, kv, qls, q, skip};
-            }
-        }
-
-        void dump() const
-        {
-            printf("\n=== JIT Debug Trace (%d entries) ===\n", count);
-            for (int i = 0; i < count; ++i)
-            {
-                printf("  tile_start=%ld, kv_idx=%ld, q_local_start=%ld, q=%d, %s\n",
-                       entries[i].tile_start, entries[i].kv_idx,
-                       entries[i].q_local_start, entries[i].q,
-                       entries[i].skipped ? "SKIP" : "PROC");
-            }
-        }
-    };
-    inline JitDebugTrace g_jit_debug_trace;
-
-    // C function that JIT code can call for debugging
-    extern "C" inline void jit_debug_log(int64_t tile_start, int64_t kv_idx, int64_t q_local_start, int q, int skip)
-    {
-        g_jit_debug_trace.add(tile_start, kv_idx, q_local_start, q, skip);
-    }
-
     // Global debug buffer that JIT can write to
-    struct JitDebugBuffer
-    {
-        static constexpr int MAX_ENTRIES = 256;
-        int64_t data[MAX_ENTRIES * 5]; // tile_start, kv_idx, q_local_start, q, skipped
-        int count = 0;
-        bool enabled = false;
-
-        void reset() { count = 0; }
-        void dump() const
-        {
-            printf("\n=== JIT Debug Buffer (%d entries) ===\n", count);
-            for (int i = 0; i < count; ++i)
-            {
-                printf("  tile_start=%ld, kv_idx=%ld, q_local_start=%ld, q=%ld, %s\n",
-                       data[i * 5 + 0], data[i * 5 + 1], data[i * 5 + 2], data[i * 5 + 3],
-                       data[i * 5 + 4] ? "SKIP" : "PROC");
-            }
-        }
-    };
-    inline JitDebugBuffer g_jit_debug_buffer;
-
-    // Extended debug buffer for intermediate values
-    struct JitDebugBuffer2
-    {
-        static constexpr int MAX_ENTRIES = 256;
-        int64_t data[MAX_ENTRIES * 6]; // tile_start, kv_idx, q_start, q_local_start, position_offset, head_idx
-        int count = 0;
-        bool enabled = false;
-
-        void reset() { count = 0; }
-        void dump() const
-        {
-            printf("\n=== JIT Debug Buffer 2 (%d entries) ===\n", count);
-            for (int i = 0; i < count; ++i)
-            {
-                printf("  tile=%ld, kv=%ld, q_start=%ld, q_local=%ld, pos_off=%ld, head=%ld\n",
-                       data[i * 6 + 0], data[i * 6 + 1], data[i * 6 + 2], data[i * 6 + 3], data[i * 6 + 4], data[i * 6 + 5]);
-            }
-        }
-    };
-    inline JitDebugBuffer2 g_jit_debug_buffer2;
-
     /**
      * @brief Function signature for generated attention kernel
      *
@@ -534,8 +447,9 @@ namespace llaminar::v2::kernels::jit
             int head_offset_spill = head_idx_spill + 8;
             int softmax_head_offset_spill = head_offset_spill + 8;
             int context_head_offset_spill = softmax_head_offset_spill + 8;
+            int q_loop_spill = context_head_offset_spill + 8;
 
-            int stack_size = context_head_offset_spill + 8 + 64;
+            int stack_size = q_loop_spill + 8 + 64;
             stack_size = (stack_size + 63) & ~63;
 
             sub(rsp, stack_size);
@@ -557,6 +471,7 @@ namespace llaminar::v2::kernels::jit
             mov(qword[rsp + tile_start_spill], 0);
 
             L("prefill_tile_loop");
+
             mov(rax, ptr[rsp + tile_start_spill]);
             cmp(rax, reg_seq_len_q);
             jge("prefill_tile_end", T_NEAR);
@@ -656,63 +571,6 @@ namespace llaminar::v2::kernels::jit
             // r10 now holds q_start - save it for debug
             mov(ptr[rsp + q_local_spill], r10); // Temporarily save q_start
 
-            // DEBUG: Capture intermediate values BEFORE q_local_start calculation
-            {
-                push(rax);
-                push(r10);
-                push(r11);
-                push(rcx);
-
-                mov(rax, reinterpret_cast<uintptr_t>(&g_jit_debug_buffer2));
-                mov(r11d, ptr[rax + offsetof(JitDebugBuffer2, enabled)]);
-                test(r11d, r11d);
-                jz(".skip_debug2a", T_NEAR);
-
-                mov(r11d, ptr[rax + offsetof(JitDebugBuffer2, count)]);
-                cmp(r11d, JitDebugBuffer2::MAX_ENTRIES);
-                jge(".skip_debug2a", T_NEAR);
-
-                // Calculate write offset: data + count * 48 (6 * 8 bytes)
-                lea(rcx, ptr[rax + offsetof(JitDebugBuffer2, data)]);
-                mov(rax, r11);
-                imul(rax, rax, 48);
-                add(rcx, rax);
-
-                // Write tile_start
-                mov(rax, ptr[rsp + 32 + tile_start_spill]);
-                mov(ptr[rcx], rax);
-
-                // Write kv_idx
-                mov(rax, ptr[rsp + 32 + kv_idx_spill]);
-                mov(ptr[rcx + 8], rax);
-
-                // Write q_start (saved in q_local_spill temporarily)
-                mov(rax, ptr[rsp + 32 + q_local_spill]);
-                mov(ptr[rcx + 16], rax);
-
-                // q_local_start will be filled next (placeholder)
-                mov(qword[rcx + 24], -999);
-
-                // Write position_offset
-                mov(rax, ptr[rsp + 32 + position_offset_spill]);
-                mov(ptr[rcx + 32], rax);
-
-                // Write head_idx
-                mov(rax, ptr[rsp + 32 + head_idx_spill]);
-                mov(ptr[rcx + 40], rax);
-
-                // Increment count
-                mov(rax, reinterpret_cast<uintptr_t>(&g_jit_debug_buffer2));
-                inc(dword[rax + offsetof(JitDebugBuffer2, count)]);
-
-                L(".skip_debug2a");
-
-                pop(rcx);
-                pop(r11);
-                pop(r10);
-                pop(rax);
-            }
-
             // Now calculate q_local_start = max(0, q_start - tile_start)
             mov(r10, ptr[rsp + q_local_spill]); // Reload q_start
             mov(rax, ptr[rsp + tile_start_spill]);
@@ -721,40 +579,6 @@ namespace llaminar::v2::kernels::jit
             cmp(r10, 0);
             cmovl(r10, r11);
             mov(ptr[rsp + q_local_spill], r10); // Now store final q_local_start
-
-            // DEBUG: Update q_local_start in buffer2 (entry count-1)
-            {
-                push(rax);
-                push(r10);
-                push(rcx);
-
-                mov(rax, reinterpret_cast<uintptr_t>(&g_jit_debug_buffer2));
-                mov(rcx, ptr[rax + offsetof(JitDebugBuffer2, enabled)]);
-                test(ecx, ecx);
-                jz(".skip_debug2b", T_NEAR);
-
-                // Get count-1 to find the entry we just wrote
-                mov(ecx, ptr[rax + offsetof(JitDebugBuffer2, count)]);
-                test(ecx, ecx);
-                jz(".skip_debug2b", T_NEAR);
-                dec(ecx);
-
-                // Calculate offset to entry
-                lea(rax, ptr[rax + offsetof(JitDebugBuffer2, data)]);
-                mov(r10, rcx);
-                imul(r10, r10, 48);
-                add(rax, r10);
-
-                // Update q_local_start (offset 24)
-                mov(r10, ptr[rsp + 24 + q_local_spill]); // +24 for pushed regs
-                mov(ptr[rax + 24], r10);
-
-                L(".skip_debug2b");
-
-                pop(rcx);
-                pop(r10);
-                pop(rax);
-            }
 
             // Process attention for all valid queries in tile
             // Reload K/V pointers from spill (emitters may clobber registers)
@@ -810,7 +634,7 @@ namespace llaminar::v2::kernels::jit
                 reg_Wo, reg_output,
                 num_blocks, q_tile_size_,
                 softmax_offset, context_offset,
-                tile_start_spill, tile_size_spill, d_model, q_local_spill);
+                tile_start_spill, tile_size_spill, d_model, q_local_spill, q_loop_spill);
 
             // Advance tile_start
             mov(rax, ptr[rsp + tile_start_spill]);
@@ -865,7 +689,8 @@ namespace llaminar::v2::kernels::jit
             vxorps(zmm_zero, zmm_zero, zmm_zero);
 
             int total_floats = tile_size * d_model;
-            for (int i = 0; i < total_floats; i += 16)
+            // DEBUG: Reduce loop limit to check for overflow
+            for (int i = 0; i < total_floats - 16; i += 16)
             {
                 vmovups(ptr[rsp + context_offset + i * 4], zmm_zero);
             }
@@ -1127,7 +952,8 @@ namespace llaminar::v2::kernels::jit
 
                 L(skip_label);
                 // Zero out corr/weight for invalid queries (safety)
-                vxorps(Zmm(q), Zmm(q), Zmm(q));
+                // corr = 1.0 (preserve existing context), weight = 0.0 (no new contribution)
+                vmovups(Zmm(q), zmm_one());
                 vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
 
                 L(".done_softmax_" + std::to_string(q));
@@ -1567,7 +1393,8 @@ namespace llaminar::v2::kernels::jit
             int tile_start_spill,
             int tile_size_spill,
             int d_model,
-            int q_local_spill)
+            int q_local_spill,
+            int q_loop_spill)
         {
             using namespace Xbyak;
 
@@ -1646,7 +1473,7 @@ namespace llaminar::v2::kernels::jit
             // Tile-wide projection
             emit_prefill_wo_projection_tile(
                 reg_Wo, reg_output, tile_size, context_offset,
-                tile_start_spill, tile_size_spill, d_model);
+                tile_start_spill, tile_size_spill, d_model, q_loop_spill);
 
             outLocalLabel();
         }
@@ -1661,7 +1488,8 @@ namespace llaminar::v2::kernels::jit
             int context_offset,
             int tile_start_spill,
             int tile_size_spill,
-            int d_model)
+            int d_model,
+            int q_loop_spill)
         {
             using namespace Xbyak;
             inLocalLabel();
@@ -1678,7 +1506,7 @@ namespace llaminar::v2::kernels::jit
                 // NOTE: emit_prefill_wo_projection uses r8 as row counter, so save/restore it
                 // Use a stack spill for the query loop counter to avoid register conflicts
                 {
-                    int q_loop_spill = tile_size_spill + 16; // After other spills
+                    // q_loop_spill is defined in the prologue
                     mov(qword[rsp + q_loop_spill], 0);
                     L(".fallback_loop");
                     mov(r8, ptr[rsp + q_loop_spill]);
