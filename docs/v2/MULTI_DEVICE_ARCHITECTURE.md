@@ -508,9 +508,13 @@ The `WorkDistributor` supports MoE via:
 
 ### Phase 6: Multi-GPU (Week 5+)
 
-1. ☐ Enable multiple GPUs per rank in DeviceManager
-2. ☐ Implement layer-wise GPU assignment
-3. ☐ Add GPU-aware MPI (NCCL for NVIDIA, RCCL for AMD)
+1. ✅ Enable CUDA + ROCm in same binary (heterogeneous multi-GPU)
+   - Created separate GPU enumeration compilation units (CUDAEnumeration.cu, ROCmEnumeration.cpp)
+   - Fixed header conflicts between cuda_runtime.h and hip_runtime.h
+   - All 3 GPUs (RTX 3090 + 2× MI50) enumerated in single process
+2. ☐ Enable multiple GPUs per rank in DeviceManager
+3. ☐ Implement layer-wise GPU assignment
+4. ☐ Add GPU-aware MPI (NCCL for NVIDIA, RCCL for AMD)
 
 ## File Structure
 
@@ -528,6 +532,9 @@ src/v2/execution/
 src/v2/backends/
 ├── IBackend.h              # Abstract GPU backend interface (272 lines)
 ├── ComputeBackend.{h,cpp}  # DeviceManager, device enumeration (~1000 lines)
+├── GPUEnumeration.h        # Extern declarations for GPU enumeration
+├── CUDAEnumeration.cu      # CUDA device enumeration (isolated TU to avoid header conflicts)
+├── ROCmEnumeration.cpp     # ROCm device enumeration (compiled with HIP)
 ├── cuda/
 │   ├── CUDABackend.h       # CUDA implementation of IBackend
 │   └── CUDABackend.cu      # CUDA kernels and runtime calls

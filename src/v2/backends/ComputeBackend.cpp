@@ -8,10 +8,17 @@
  * - AMD ROCm
  * - Vulkan (cross-vendor)
  *
+ * Phase 6: Multi-GPU (heterogeneous)
+ * GPU enumeration is now in separate compilation units to avoid header conflicts:
+ *   - CUDAEnumeration.cu (CUDA only)
+ *   - ROCmEnumeration.cpp (ROCm only, compiled with hipcc)
+ * This allows CUDA and ROCm to coexist in the same binary.
+ *
  * @author David Sanftenberg
  */
 
 #include "ComputeBackend.h"
+#include "GPUEnumeration.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
@@ -26,33 +33,18 @@
 #include <numa.h>
 
 // ============================================================================
-// GPU Backend Includes (DEPRECATED - Phase 3)
+// GPU Header Includes REMOVED (Phase 6)
 // ============================================================================
-// These GPU includes are DEPRECATED as of Phase 3. GPU backends now use
-// the IBackend interface (IBackend.h) with separate compilation units:
-//   - CUDABackend (backends/cuda/CUDABackend.cu)
-//   - ROCmBackend (backends/rocm/ROCmBackend.cpp)
-//
-// GPU code in this file is disabled to prevent header conflicts.
-// See backends/IBackend.h for the new GPU abstraction interface.
+// GPU enumeration moved to separate compilation units to enable heterogeneous
+// multi-GPU (CUDA + ROCm in same binary). See:
+//   - backends/CUDAEnumeration.cu
+//   - backends/ROCmEnumeration.cpp
+//   - backends/GPUEnumeration.h (declarations)
 // ============================================================================
-
-#if 1 // GPU includes enabled for Phase 1 testing
-// Conditional includes based on backend availability
-#ifdef HAVE_CUDA
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#endif
-
-#ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
-#endif
 
 #ifdef HAVE_VULKAN
 #include <vulkan/vulkan.h>
 #endif
-#endif // #if 1 - GPU includes enabled for Phase 1 testing
 
 namespace llaminar2
 {
@@ -181,148 +173,32 @@ namespace llaminar2
     // ============================================================================
     // CUDA Device Enumeration (DEPRECATED - Phase 3)
     // ============================================================================
-    // GPU device enumeration is now handled by IBackend interface.
-    // See backends/cuda/CUDABackend.cu for new CUDA implementation.
+    // GPU Device Enumeration (Phase 6: Separate compilation units)
+    // ============================================================================
+    // CUDA and ROCm enumeration moved to separate files to avoid header conflicts:
+    //   - CUDAEnumeration.cu (CUDA runtime headers only)
+    //   - ROCmEnumeration.cpp (HIP runtime headers only, compiled with hipcc)
+    // This enables heterogeneous multi-GPU (NVIDIA + AMD in same binary).
     // ============================================================================
 
-#if 1 // CUDA enumeration enabled for Phase 1 testing
+    // Wrapper functions that call into separate compilation units
+    static std::vector<ComputeDevice> enumerate_cuda_devices()
+    {
 #ifdef HAVE_CUDA
-    static std::vector<ComputeDevice> enumerate_cuda_devices()
-    {
-        std::vector<ComputeDevice> devices;
-
-        int device_count = 0;
-        cudaError_t err = cudaGetDeviceCount(&device_count);
-
-        if (err != cudaSuccess || device_count == 0)
-        {
-            return devices; // No CUDA devices
-        }
-
-        for (int i = 0; i < device_count; ++i)
-        {
-            cudaDeviceProp prop;
-            if (cudaGetDeviceProperties(&prop, i) != cudaSuccess)
-            {
-                continue; // Skip failed device
-            }
-
-            ComputeDevice dev;
-            dev.type = ComputeBackendType::GPU_CUDA;
-            dev.name = std::string(prop.name);
-            dev.device_id = i;
-            dev.compute_capability = prop.major * 10 + prop.minor; // e.g., 80 for SM 8.0
-            dev.total_memory_bytes = prop.totalGlobalMem;
-
-            // Get free memory
-            size_t free_bytes = 0, total_bytes = 0;
-            if (cudaSetDevice(i) == cudaSuccess)
-            {
-                cudaMemGetInfo(&free_bytes, &total_bytes);
-                dev.free_memory_bytes = free_bytes;
-            }
-            else
-            {
-                dev.free_memory_bytes = dev.total_memory_bytes; // Assume free
-            }
-
-            // Feature detection based on compute capability
-            dev.supports_fp16 = (prop.major >= 6); // Pascal (SM 6.0+)
-            dev.supports_bf16 = (prop.major >= 8); // Ampere (SM 8.0+)
-            dev.supports_int8 = (prop.major >= 6); // DP4A on Pascal+, Tensor Cores on Volta+
-
-            devices.push_back(dev);
-        }
-
-        return devices;
-    }
+        return cuda_enumeration::enumerate_cuda_devices();
 #else
-    static std::vector<ComputeDevice> enumerate_cuda_devices()
-    {
-        return {}; // CUDA not available
-    }
+        return {};
 #endif
-#endif // #if 1 - CUDA enumeration enabled for Phase 1 testing
+    }
 
-    // Replacement stub disabled (using real CUDA enumeration above)
-    // static std::vector<ComputeDevice> enumerate_cuda_devices()
-    // {
-    //     return {}; // GPU enumeration moved to IBackend (Phase 3)
-    // }
-
-    // ============================================================================
-    // ROCm Device Enumeration
-    // ============================================================================
-
+    static std::vector<ComputeDevice> enumerate_rocm_devices()
+    {
 #ifdef HAVE_ROCM
-    static std::vector<ComputeDevice> enumerate_rocm_devices()
-    {
-        std::vector<ComputeDevice> devices;
-
-        LOG_DEBUG("[DeviceManager] enumerate_rocm_devices() called");
-
-        int device_count = 0;
-        hipError_t err = hipGetDeviceCount(&device_count);
-
-        LOG_DEBUG("[DeviceManager] hipGetDeviceCount returned " << device_count << " devices (err=" << static_cast<int>(err) << ")");
-
-        if (err != hipSuccess || device_count == 0)
-        {
-            LOG_DEBUG("[DeviceManager] No ROCm devices found or error");
-            return devices; // No ROCm devices
-        }
-
-        for (int i = 0; i < device_count; ++i)
-        {
-            hipDeviceProp_t prop;
-            if (hipGetDeviceProperties(&prop, i) != hipSuccess)
-            {
-                continue; // Skip failed device
-            }
-
-            ComputeDevice dev;
-            dev.type = ComputeBackendType::GPU_ROCM;
-            dev.name = std::string(prop.name);
-            dev.device_id = i;
-
-            // Parse GCN arch from gcnArchName string (e.g., "gfx906" -> 906)
-            std::string arch_name(prop.gcnArchName);
-            int gcn_arch = 0;
-            if (arch_name.substr(0, 3) == "gfx")
-            {
-                gcn_arch = std::stoi(arch_name.substr(3));
-            }
-            dev.compute_capability = gcn_arch;
-            dev.total_memory_bytes = prop.totalGlobalMem;
-
-            // Get free memory
-            size_t free_bytes = 0, total_bytes = 0;
-            if (hipSetDevice(i) == hipSuccess)
-            {
-                (void)hipMemGetInfo(&free_bytes, &total_bytes);
-                dev.free_memory_bytes = free_bytes;
-            }
-            else
-            {
-                dev.free_memory_bytes = dev.total_memory_bytes;
-            }
-
-            // AMD feature support (based on GCN arch)
-            dev.supports_fp16 = true;              // All modern AMD GPUs support FP16
-            dev.supports_bf16 = (gcn_arch >= 908); // MI100+ (gfx908+)
-            dev.supports_int8 = true;              // CDNA/RDNA support
-
-            devices.push_back(dev);
-        }
-
-        return devices;
-    }
+        return rocm_enumeration::enumerate_rocm_devices();
 #else
-    static std::vector<ComputeDevice> enumerate_rocm_devices()
-    {
-        return {}; // ROCm not available
-    }
+        return {};
 #endif
+    }
 
     // ============================================================================
     // Vulkan Device Enumeration (DEPRECATED - Phase 3)

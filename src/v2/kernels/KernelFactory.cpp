@@ -490,7 +490,7 @@ namespace llaminar
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
-                    return llaminar::v2::kernels::cuda::createCudaGemmRaw(tensor);
+                    return llaminar::v2::kernels::cuda::createCudaGemm(tensor).release();
 #endif
 
                 case DeviceType::ROCm:

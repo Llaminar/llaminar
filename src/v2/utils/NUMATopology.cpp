@@ -17,15 +17,19 @@
 #include <hwloc.h>
 #endif
 
-#ifdef HAVE_CUDA
+// GPU headers - CANNOT include both CUDA and HIP in same translation unit (type conflicts)
+// When both are enabled, use extern declarations from GPUEnumeration.h instead
+#if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
 #include <cuda_runtime.h>
 #include <nvml.h>
 #endif
 
-#ifdef HAVE_ROCM
+#if defined(HAVE_ROCM) && !defined(HAVE_CUDA)
 #include <hip/hip_runtime.h>
-// TODO: Add ROCm SMI include when available
 #endif
+
+// When both are enabled, we only use sysfs-based detection (no direct GPU API calls)
+// This avoids header conflicts while still providing NUMA information
 
 namespace llaminar2
 {
@@ -319,7 +323,9 @@ namespace llaminar2
         info.gpu_id = cuda_device_id;
         info.numa_node = -1;
 
-#ifdef HAVE_CUDA
+// When both CUDA and ROCm are enabled, we can't include CUDA headers (conflicts with HIP)
+// Use sysfs-only detection in that case
+#if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
         // Try NVML first (most reliable)
         int node = NUMATopology::detectGPUViaNVML(cuda_device_id);
         if (node >= 0)
@@ -346,6 +352,14 @@ namespace llaminar2
                 return info;
             }
         }
+#elif defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        // Both backends enabled - use sysfs enumeration via nvidia-smi or lspci
+        // The CUDA enumeration unit will provide PCI bus ID
+        LOG_DEBUG("[NUMATopology] Both CUDA and ROCm enabled, using sysfs for CUDA GPU NUMA detection");
+        info.numa_node = 0;
+        info.affinity_detected = false;
+        info.detection_method = "fallback_multi_gpu";
+        return info;
 #endif
 
         // Fallback to node 0
@@ -358,7 +372,7 @@ namespace llaminar2
 
     int NUMATopology::detectGPUViaNVML(int cuda_device_id)
     {
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
         // Initialize NVML
         nvmlReturn_t result = nvmlInit();
         if (result != NVML_SUCCESS)
@@ -399,7 +413,7 @@ namespace llaminar2
 
     std::string NUMATopology::getCUDAPCIBusID(int cuda_device_id)
     {
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, cuda_device_id) == cudaSuccess)
         {

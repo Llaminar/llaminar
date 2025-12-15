@@ -24,9 +24,9 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease" CACHE STRING "" FORCE)
 # Enable native CPU optimizations (AVX512/AVX2/FMA)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 
-# Backend options (Phase 3: Separate compilation units)
-# CUDA and ROCm cannot be linked together due to type conflicts in headers
-# Mutually exclusive: choose one GPU backend or none (CPU-only)
+# Backend options (Phase 6: Heterogeneous Multi-GPU)
+# CUDA and ROCm CAN coexist - compiled in separate translation units
+# Enable both for mixed NVIDIA + AMD GPU systems
 option(HAVE_CUDA "Enable CUDA backend" OFF)
 option(HAVE_ROCM "Enable ROCm backend" OFF)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
@@ -48,13 +48,17 @@ option(USE_ONEDNN "Enable OneDNN for INT8 GEMM acceleration" ON)
 option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging" OFF)
 
 # =============================================================================
-# GPU Backend Mutual Exclusion Check (Phase 3)
+# GPU Backend Configuration (Phase 6: Multi-GPU)
 # =============================================================================
+# CUDA and ROCm CAN coexist in the same binary when:
+#   1. CUDA code is in separate .cu files (compiled by nvcc)
+#   2. ROCm code is in separate .cpp files (compiled by hipcc)
+#   3. Common code uses abstract IBackend interface (no GPU headers)
+#
+# This enables heterogeneous multi-GPU: NVIDIA + AMD in the same system
 if(HAVE_CUDA AND HAVE_ROCM)
-    message(FATAL_ERROR "Cannot enable both CUDA and ROCm backends. Choose one:\n"
-                        "  cmake -DHAVE_CUDA=ON -DHAVE_ROCM=OFF   (NVIDIA GPUs)\n"
-                        "  cmake -DHAVE_CUDA=OFF -DHAVE_ROCM=ON   (AMD GPUs)\n"
-                        "  cmake -DHAVE_CUDA=OFF -DHAVE_ROCM=OFF  (CPU-only)")
+    message(STATUS "V2: Both CUDA and ROCm enabled (heterogeneous multi-GPU)")
+    message(STATUS "V2: NVIDIA GPUs via CUDA, AMD GPUs via ROCm")
 endif()
 
 # =============================================================================
@@ -91,13 +95,14 @@ if(HAVE_CUDA)
         endif()
     endif()
     
-    # CUDA compile flags
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_70 -gencode=arch=compute_70,code=sm_70")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_75,code=sm_75")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_80,code=sm_80")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_86,code=sm_86")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_89,code=sm_89")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90,code=sm_90")
+    # CUDA compile flags (CUDA 13.0+ dropped sm_70 Volta support)
+    # RTX 3090 = sm_86 (Ampere)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_75")  # Base: Turing
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_75,code=sm_75")  # Turing (RTX 20xx)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_80,code=sm_80")  # Ampere (A100)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_86,code=sm_86")  # Ampere (RTX 30xx)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_89,code=sm_89")  # Ada (RTX 40xx)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90,code=sm_90")  # Hopper (H100)
     
     # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
@@ -115,6 +120,9 @@ if(HAVE_ROCM)
         set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation path")
     endif()
     
+    # Enable HIP language for ROCm compilation
+    enable_language(HIP)
+    
     # Find HIP
     list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH})
     find_package(hip REQUIRED)
@@ -126,13 +134,8 @@ if(HAVE_ROCM)
     message(STATUS "V2: hipcc: ${HIP_HIPCC_EXECUTABLE}")
     
     # ROCm compile flags (support common AMD architectures)
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx900")  # Vega 10
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx906")  # Vega 20
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx908")  # MI100
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx90a")  # MI200
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx940")  # MI300
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx1030") # Navi 21
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx1100") # Navi 31
+    # MI50 = gfx906
+    set(CMAKE_HIP_ARCHITECTURES "gfx900;gfx906;gfx908;gfx90a;gfx940;gfx1030;gfx1100")
 endif()
 
 # =============================================================================
@@ -177,9 +180,10 @@ if(HAVE_CUDA)
         message(STATUS "V2: Neural network source added to CUDA backend")
     endif()
     
-    # CUDA backend library includes backend + kernels
+    # CUDA backend library includes backend + kernels + enumeration
     add_library(cuda_backend STATIC 
         backends/cuda/CUDABackend.cu
+        backends/CUDAEnumeration.cu
         ${CUDA_KERNEL_SOURCES}
     )
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -260,9 +264,20 @@ endif()
 
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
-    add_library(rocm_backend STATIC backends/rocm/ROCmBackend.cpp)
+    # ROCm enumeration must be compiled with hipcc to use HIP runtime
+    add_library(rocm_backend STATIC 
+        backends/rocm/ROCmBackend.cpp
+        backends/ROCmEnumeration.cpp
+    )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(rocm_backend PUBLIC hip::host)
+    target_link_libraries(rocm_backend PUBLIC hip::host roc::hipblas)
+    
+    # Set HIP compiler for ROCm source files
+    set_source_files_properties(
+        backends/rocm/ROCmBackend.cpp
+        backends/ROCmEnumeration.cpp
+        PROPERTIES LANGUAGE HIP
+    )
     
     # Define HAVE_ROCM for MPIStager and other consumers
     add_compile_definitions(HAVE_ROCM)
@@ -617,7 +632,7 @@ target_compile_features(llaminar2_core PUBLIC cxx_std_17)
 
 # Dependencies
 find_package(MPI REQUIRED)
-find_package(OpenMP REQUIRED)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
 
 # Generate microkernel instantiations (auto-run Python script at configure time)
