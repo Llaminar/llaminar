@@ -16,6 +16,8 @@
 #include <omp.h>
 #endif
 
+#include "../../../utils/OpenMPUtils.h"
+
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #elif defined(__AVX2__)
@@ -217,10 +219,9 @@ namespace llaminar2::primitives
                 return cols >= 8192;
             }
 
-#ifdef _OPENMP
-            if (omp_in_parallel())
-                return false;
-#endif
+            // NOTE: With OMP_WORKSHARE_REGION, we don't need to check omp_in_parallel()
+            // here because the macro handles nested parallelism correctly - it will use
+            // worksharing constructs when inside an existing parallel region.
 
             return elems >= opts.parallel_threshold_elems;
         }
@@ -452,17 +453,39 @@ namespace llaminar2::primitives
         if (opts.t5_compat_mode)
         {
             bool parallel = want_parallel(rows, cols, opts);
-#pragma omp parallel for if (parallel)
-            for (long long r = 0; r < (long long)rows; ++r)
+            if (parallel)
             {
-                const float *row = src + (std::size_t)r * cols;
-                float sum_sq = 0.0f;
-                for (std::size_t c = 0; c < cols; ++c)
+                auto do_work = [&]()
                 {
-                    float val = row[c];
-                    sum_sq += val * val;
+#pragma omp for schedule(static)
+                    for (long long r = 0; r < (long long)rows; ++r)
+                    {
+                        const float *row = src + (std::size_t)r * cols;
+                        float sum_sq = 0.0f;
+                        for (std::size_t c = 0; c < cols; ++c)
+                        {
+                            float val = row[c];
+                            sum_sq += val * val;
+                        }
+                        row_sumsq[r] = (double)sum_sq;
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_work);
+            }
+            else
+            {
+                // Serial path
+                for (long long r = 0; r < (long long)rows; ++r)
+                {
+                    const float *row = src + (std::size_t)r * cols;
+                    float sum_sq = 0.0f;
+                    for (std::size_t c = 0; c < cols; ++c)
+                    {
+                        float val = row[c];
+                        sum_sq += val * val;
+                    }
+                    row_sumsq[r] = (double)sum_sq;
                 }
-                row_sumsq[r] = (double)sum_sq;
             }
             return;
         }
@@ -475,7 +498,9 @@ namespace llaminar2::primitives
         {
             double total_sum_sq = 0.0;
 
-#pragma omp parallel reduction(+ : total_sum_sq)
+            // Note: For reduction in nested context, we use OMP_WORKSHARE_REGION
+            // but need manual chunking since omp for reduction can be tricky
+            auto do_reduction = [&]()
             {
                 int tid = omp_get_thread_num();
                 int nthreads = omp_get_num_threads();
@@ -484,20 +509,42 @@ namespace llaminar2::primitives
                 long long start = tid * chunk_size;
                 long long end = std::min((long long)cols, start + chunk_size);
 
+                double local_sum = 0.0;
                 if (start < end)
                 {
-                    total_sum_sq += compute_sumsq_dispatch(src + start, end - start);
+                    local_sum = compute_sumsq_dispatch(src + start, end - start);
                 }
-            }
+
+// Thread-safe accumulation
+#pragma omp atomic
+                total_sum_sq += local_sum;
+            };
+            OMP_WORKSHARE_REGION(do_reduction);
             row_sumsq[0] = total_sum_sq;
             return;
         }
 
-#pragma omp parallel for if (parallel)
-        for (long long r = 0; r < (long long)rows; ++r)
+        if (parallel)
         {
-            const float *row = src + (std::size_t)r * cols;
-            row_sumsq[r] = compute_sumsq_dispatch(row, cols);
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (long long r = 0; r < (long long)rows; ++r)
+                {
+                    const float *row = src + (std::size_t)r * cols;
+                    row_sumsq[r] = compute_sumsq_dispatch(row, cols);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            // Serial path
+            for (long long r = 0; r < (long long)rows; ++r)
+            {
+                const float *row = src + (std::size_t)r * cols;
+                row_sumsq[r] = compute_sumsq_dispatch(row, cols);
+            }
         }
     }
 
@@ -550,50 +597,96 @@ namespace llaminar2::primitives
 
             if (has_gamma)
             {
-#pragma omp parallel for schedule(static)
-                for (long long c = 0; c < (long long)cols; ++c)
+                auto do_work = [&]()
                 {
-                    dst[c] = src[c] * scale * gamma[c];
-                }
+#pragma omp for schedule(static)
+                    for (long long c = 0; c < (long long)cols; ++c)
+                    {
+                        dst[c] = src[c] * scale * gamma[c];
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_work);
             }
             else
             {
-#pragma omp parallel for schedule(static)
-                for (long long c = 0; c < (long long)cols; ++c)
+                auto do_work = [&]()
                 {
-                    dst[c] = src[c] * scale;
-                }
+#pragma omp for schedule(static)
+                    for (long long c = 0; c < (long long)cols; ++c)
+                    {
+                        dst[c] = src[c] * scale;
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_work);
             }
             return;
         }
 
-#pragma omp parallel for if (parallel)
-        for (long long r = 0; r < (long long)rows; ++r)
+        if (parallel)
         {
-            const float *row_in = src + (std::size_t)r * cols;
-            float *row_out = dst + (std::size_t)r * cols;
-            float scale = inv[(std::size_t)r];
-
-            if (scale == 0.0f)
+            auto do_work = [&]()
             {
-                std::fill(row_out, row_out + cols, 0.0f);
-                continue;
-            }
-
-            if (!has_gamma)
-            {
-#pragma omp simd
-                for (long long c = 0; c < (long long)cols; ++c)
+#pragma omp for schedule(static)
+                for (long long r = 0; r < (long long)rows; ++r)
                 {
-                    row_out[c] = row_in[c] * scale;
+                    const float *row_in = src + (std::size_t)r * cols;
+                    float *row_out = dst + (std::size_t)r * cols;
+                    float scale = inv[(std::size_t)r];
+
+                    if (scale == 0.0f)
+                    {
+                        std::fill(row_out, row_out + cols, 0.0f);
+                        continue;
+                    }
+
+                    if (!has_gamma)
+                    {
+#pragma omp simd
+                        for (long long c = 0; c < (long long)cols; ++c)
+                        {
+                            row_out[c] = row_in[c] * scale;
+                        }
+                    }
+                    else
+                    {
+#pragma omp simd
+                        for (long long c = 0; c < (long long)cols; ++c)
+                        {
+                            row_out[c] = row_in[c] * scale * gamma[c];
+                        }
+                    }
                 }
-            }
-            else
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            // Serial path
+            for (long long r = 0; r < (long long)rows; ++r)
             {
-#pragma omp simd
-                for (long long c = 0; c < (long long)cols; ++c)
+                const float *row_in = src + (std::size_t)r * cols;
+                float *row_out = dst + (std::size_t)r * cols;
+                float scale = inv[(std::size_t)r];
+
+                if (scale == 0.0f)
                 {
-                    row_out[c] = row_in[c] * scale * gamma[c];
+                    std::fill(row_out, row_out + cols, 0.0f);
+                    continue;
+                }
+
+                if (!has_gamma)
+                {
+                    for (long long c = 0; c < (long long)cols; ++c)
+                    {
+                        row_out[c] = row_in[c] * scale;
+                    }
+                }
+                else
+                {
+                    for (long long c = 0; c < (long long)cols; ++c)
+                    {
+                        row_out[c] = row_in[c] * scale * gamma[c];
+                    }
                 }
             }
         }
@@ -648,8 +741,7 @@ namespace llaminar2::primitives
 
         bool parallel = want_parallel(rows, cols, opts);
 
-#pragma omp parallel for if (parallel)
-        for (long long r = 0; r < (long long)rows; ++r)
+        auto do_row_work = [&](long long r)
         {
             const int32_t *row = src + (std::size_t)r * cols;
             double acc = 0.0;
@@ -774,6 +866,27 @@ namespace llaminar2::primitives
 #endif
 
             row_sumsq[r] = acc;
+        };
+
+        if (parallel)
+        {
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (long long r = 0; r < (long long)rows; ++r)
+                {
+                    do_row_work(r);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            // Serial path
+            for (long long r = 0; r < (long long)rows; ++r)
+            {
+                do_row_work(r);
+            }
         }
     }
 
@@ -1042,8 +1155,7 @@ namespace llaminar2::primitives
 
         bool parallel = want_parallel(rows, cols, opts);
 
-#pragma omp parallel for if (parallel)
-        for (long long r = 0; r < (long long)rows; ++r)
+        auto do_row_work = [&](long long r)
         {
             const int32_t *row_in = src + (std::size_t)r * cols;
             int8_t *row_out = dst_int8 + (std::size_t)r * cols;
@@ -1053,7 +1165,7 @@ namespace llaminar2::primitives
             {
                 std::fill(row_out, row_out + cols, (int8_t)0);
                 dst_row_scales[r] = 1.0f;
-                continue;
+                return;
             }
 
             // Step 1: Normalize INT32 to FP32 and apply gamma (vectorized)
@@ -1101,6 +1213,27 @@ namespace llaminar2::primitives
                 row_out[c] = static_cast<int8_t>(std::round(scaled));
             }
 #endif
+        };
+
+        if (parallel)
+        {
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (long long r = 0; r < (long long)rows; ++r)
+                {
+                    do_row_work(r);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            // Serial path
+            for (long long r = 0; r < (long long)rows; ++r)
+            {
+                do_row_work(r);
+            }
         }
     }
 
@@ -1719,8 +1852,7 @@ namespace llaminar2::primitives
     {
         bool parallel = want_parallel(rows, cols, opts);
 
-#pragma omp parallel for if (parallel)
-        for (std::size_t r = 0; r < rows; ++r)
+        auto do_row_work = [&](std::size_t r)
         {
             const uint16_t *src_row = src + r * cols;
             uint16_t *dst_row = dst + r * cols;
@@ -1734,6 +1866,26 @@ namespace llaminar2::primitives
 #endif
             {
                 bf16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+            }
+        };
+
+        if (parallel)
+        {
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (std::size_t r = 0; r < rows; ++r)
+                {
+                    do_row_work(r);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            for (std::size_t r = 0; r < rows; ++r)
+            {
+                do_row_work(r);
             }
         }
     }
@@ -1749,8 +1901,7 @@ namespace llaminar2::primitives
     {
         bool parallel = want_parallel(rows, cols, opts);
 
-#pragma omp parallel for if (parallel)
-        for (std::size_t r = 0; r < rows; ++r)
+        auto do_row_work = [&](std::size_t r)
         {
             const uint16_t *src_row = src + r * cols;
             uint16_t *dst_row = dst + r * cols;
@@ -1770,6 +1921,26 @@ namespace llaminar2::primitives
 #endif
             {
                 fp16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+            }
+        };
+
+        if (parallel)
+        {
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (std::size_t r = 0; r < rows; ++r)
+                {
+                    do_row_work(r);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            for (std::size_t r = 0; r < rows; ++r)
+            {
+                do_row_work(r);
             }
         }
     }
@@ -3091,42 +3262,29 @@ namespace llaminar2::primitives
         // No hard cutoffs - the math handles it smoothly.
         // ================================================================
 #ifdef _OPENMP
-        int num_threads = 1;
-        bool in_parallel = omp_in_parallel();
+        bool should_parallelize = opts.allow_parallel;
 
-        if (opts.allow_parallel && !in_parallel)
+        if (should_parallelize)
         {
-            size_t total_bytes = (rows * cols * 36) / 32; // Q8_1: 36 bytes per 32 elements
-            num_threads = std::max(1, static_cast<int>(total_bytes / cfg.q8_bytes_per_thread));
-
-            // Cap at available threads
-            int max_threads = omp_get_max_threads();
-            if (cfg.max_threads > 0 && cfg.max_threads < max_threads)
+            // Use OMP_WORKSHARE_REGION for nested-safe execution
+            auto do_work = [&]()
             {
-                max_threads = cfg.max_threads;
-            }
-            num_threads = std::min(num_threads, max_threads);
-
-            // Ensure at least 1 row per thread
-            num_threads = std::min(num_threads, static_cast<int>(rows));
-        }
-
-        if (num_threads > 1)
-        {
-#pragma omp parallel for num_threads(num_threads) schedule(static)
-            for (long long r = 0; r < static_cast<long long>(rows); ++r)
-            {
-                rmsnorm_q8_1_pure_integer_row_unrolled(
-                    input + r * blocks_per_row,
-                    gamma_q12,
-                    output + r * blocks_per_row,
-                    blocks_per_row,
-                    epsilon_scaled);
-            }
+#pragma omp for schedule(static)
+                for (long long r = 0; r < static_cast<long long>(rows); ++r)
+                {
+                    rmsnorm_q8_1_pure_integer_row_unrolled(
+                        input + r * blocks_per_row,
+                        gamma_q12,
+                        output + r * blocks_per_row,
+                        blocks_per_row,
+                        epsilon_scaled);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
             return;
         }
 #endif
-        // Sequential path (num_threads == 1)
+        // Sequential path
         for (size_t r = 0; r < rows; ++r)
         {
             rmsnorm_q8_1_pure_integer_row_unrolled(

@@ -315,7 +315,7 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for if (parallel)
+#pragma omp parallel for schedule(static) if (parallel)
         for (int r = 0; r < rows; ++r)
         {
             softmax_row_fp32(scores + r * cols, cols, causal, scale, r);
@@ -333,7 +333,7 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for if (parallel)
+#pragma omp parallel for schedule(static) if (parallel)
         for (int r = 0; r < rows; ++r)
         {
             softmax_row_bf16(scores + r * cols, cols, causal, scale, r);
@@ -351,7 +351,7 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for if (parallel)
+#pragma omp parallel for schedule(static) if (parallel)
         for (int r = 0; r < rows; ++r)
         {
             softmax_row_fp16(scores + r * cols, cols, causal, scale, r);
@@ -376,7 +376,7 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for if (parallel)
+#pragma omp parallel for schedule(static) if (parallel)
         for (int r = 0; r < rows; ++r)
         {
             softmax_row_q8_1(scores + r * n_blocks_per_row, n_blocks_per_row, causal, scale, r);

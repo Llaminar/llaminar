@@ -26,6 +26,7 @@
 #include "../tensors/UnifiedKVCache.h" // Unified KV cache for single-sequence and batched decode
 #include "PipelineConfig.h"            // Runtime configuration
 #include "MPIStrategy.h"               // MPI parallelization strategies
+#include "PipelineExecutor.h"          // Multi-device executor framework
 #include "ops/Ops.h"                   // Self-validating operations
 #include <vector>
 #include <memory>
@@ -1271,6 +1272,16 @@ namespace llaminar2
         std::unique_ptr<ISwiGLUOp> typed_swiglu_op_;
         std::unique_ptr<IRoPEOp> typed_rope_op_;
 
+        // ===== Multi-Device Execution Framework =====
+        /**
+         * @brief Optional PipelineExecutor for multi-device work distribution
+         *
+         * When config_.executor_* flags are enabled, operations use this
+         * executor for hierarchical work distribution across devices.
+         * Nullptr when all executor flags are disabled (default).
+         */
+        std::unique_ptr<PipelineExecutor> pipeline_executor_;
+
     protected:
         /**
          * @brief Initialize typed ops based on activation precision
@@ -1288,7 +1299,64 @@ namespace llaminar2
 
             LOG_DEBUG("[PipelineBase] Initialized typed ops for precision: "
                       << static_cast<int>(config_.activation_precision));
+
+            // Initialize PipelineExecutor if any executor feature flag is enabled
+            initializePipelineExecutor();
         }
+
+        /**
+         * @brief Initialize PipelineExecutor if any feature flags are enabled
+         *
+         * Creates PipelineExecutor only when needed (at least one executor_* flag set).
+         * This lazy approach avoids overhead when using traditional execution path.
+         */
+        void initializePipelineExecutor()
+        {
+            // Check if any executor feature is enabled
+            bool any_executor_enabled =
+                config_.executor_ffn_norm ||
+                config_.executor_ffn_swiglu ||
+                config_.executor_ffn_residual ||
+                config_.executor_attn_norm ||
+                config_.executor_attn_residual ||
+                config_.executor_rope;
+
+            if (!any_executor_enabled)
+            {
+                LOG_DEBUG("[PipelineBase] No executor features enabled, skipping PipelineExecutor init");
+                return;
+            }
+
+            // Create PipelineExecutor configuration mirroring pipeline flags
+            PipelineExecutorConfig exec_config;
+            exec_config.executor_ffn_norm = config_.executor_ffn_norm;
+            exec_config.executor_ffn_swiglu = config_.executor_ffn_swiglu;
+            exec_config.executor_ffn_residual = config_.executor_ffn_residual;
+            exec_config.executor_attn_norm = config_.executor_attn_norm;
+            exec_config.executor_attn_residual = config_.executor_attn_residual;
+            exec_config.executor_rope = config_.executor_rope;
+
+            // Create executor with MPI context
+            // Use the raw pointer constructor when we have unique_ptr
+            MPIContext *mpi_raw = mpi_ctx_ ? mpi_ctx_.get() : (default_mpi_ctx_ ? default_mpi_ctx_.get() : nullptr);
+            pipeline_executor_ = std::make_unique<PipelineExecutor>(exec_config, mpi_raw);
+
+            // Add primary device context
+            pipeline_executor_->setDeviceContext(device_idx_);
+
+            LOG_INFO("[PipelineBase] Initialized PipelineExecutor with device " << device_idx_);
+            LOG_DEBUG("  executor_ffn_norm=" << config_.executor_ffn_norm);
+            LOG_DEBUG("  executor_ffn_swiglu=" << config_.executor_ffn_swiglu);
+            LOG_DEBUG("  executor_ffn_residual=" << config_.executor_ffn_residual);
+            LOG_DEBUG("  executor_attn_norm=" << config_.executor_attn_norm);
+            LOG_DEBUG("  executor_attn_residual=" << config_.executor_attn_residual);
+            LOG_DEBUG("  executor_rope=" << config_.executor_rope);
+        }
+
+        /**
+         * @brief Get PipelineExecutor (may be nullptr if no flags enabled)
+         */
+        PipelineExecutor *pipelineExecutor() const { return pipeline_executor_.get(); }
     };
 
 } // namespace llaminar2

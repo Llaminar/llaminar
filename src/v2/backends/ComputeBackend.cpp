@@ -251,23 +251,24 @@ namespace llaminar2
     // }
 
     // ============================================================================
-    // ROCm Device Enumeration (DEPRECATED - Phase 3)
-    // ============================================================================
-    // GPU device enumeration is now handled by IBackend interface.
-    // See backends/rocm/ROCmBackend.cpp for new ROCm implementation.
+    // ROCm Device Enumeration
     // ============================================================================
 
-#if 0 // ROCm enumeration disabled (Phase 3)
 #ifdef HAVE_ROCM
     static std::vector<ComputeDevice> enumerate_rocm_devices()
     {
         std::vector<ComputeDevice> devices;
 
+        LOG_DEBUG("[DeviceManager] enumerate_rocm_devices() called");
+
         int device_count = 0;
         hipError_t err = hipGetDeviceCount(&device_count);
 
+        LOG_DEBUG("[DeviceManager] hipGetDeviceCount returned " << device_count << " devices (err=" << static_cast<int>(err) << ")");
+
         if (err != hipSuccess || device_count == 0)
         {
+            LOG_DEBUG("[DeviceManager] No ROCm devices found or error");
             return devices; // No ROCm devices
         }
 
@@ -283,14 +284,22 @@ namespace llaminar2
             dev.type = ComputeBackendType::GPU_ROCM;
             dev.name = std::string(prop.name);
             dev.device_id = i;
-            dev.compute_capability = prop.gcnArch; // GCN architecture version
+
+            // Parse GCN arch from gcnArchName string (e.g., "gfx906" -> 906)
+            std::string arch_name(prop.gcnArchName);
+            int gcn_arch = 0;
+            if (arch_name.substr(0, 3) == "gfx")
+            {
+                gcn_arch = std::stoi(arch_name.substr(3));
+            }
+            dev.compute_capability = gcn_arch;
             dev.total_memory_bytes = prop.totalGlobalMem;
 
             // Get free memory
             size_t free_bytes = 0, total_bytes = 0;
             if (hipSetDevice(i) == hipSuccess)
             {
-                hipMemGetInfo(&free_bytes, &total_bytes);
+                (void)hipMemGetInfo(&free_bytes, &total_bytes);
                 dev.free_memory_bytes = free_bytes;
             }
             else
@@ -298,10 +307,10 @@ namespace llaminar2
                 dev.free_memory_bytes = dev.total_memory_bytes;
             }
 
-            // AMD feature support
-            dev.supports_fp16 = true;                  // All modern AMD GPUs support FP16
-            dev.supports_bf16 = (prop.gcnArch >= 908); // MI100+ (gfx908+)
-            dev.supports_int8 = true;                  // CDNA/RDNA support
+            // AMD feature support (based on GCN arch)
+            dev.supports_fp16 = true;              // All modern AMD GPUs support FP16
+            dev.supports_bf16 = (gcn_arch >= 908); // MI100+ (gfx908+)
+            dev.supports_int8 = true;              // CDNA/RDNA support
 
             devices.push_back(dev);
         }
@@ -314,13 +323,6 @@ namespace llaminar2
         return {}; // ROCm not available
     }
 #endif
-#endif // #if 0 - ROCm enumeration disabled (Phase 3)
-
-    // Replacement stub (always returns empty)
-    static std::vector<ComputeDevice> enumerate_rocm_devices()
-    {
-        return {}; // GPU enumeration moved to IBackend (Phase 3)
-    }
 
     // ============================================================================
     // Vulkan Device Enumeration (DEPRECATED - Phase 3)

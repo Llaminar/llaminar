@@ -9,6 +9,7 @@
 #include <omp.h>
 #include <algorithm>
 #include "../../../tensors/SIMDHelpers.h"
+#include "../../../utils/OpenMPUtils.h"
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -205,8 +206,8 @@ namespace llaminar2::primitives
         // Use a chunk size that fits in L1/L2 cache and provides enough work
         const int chunk_size = 1024;
 
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < size; i += chunk_size)
+        // Lambda for loop body - used by both parallel and worksharing paths
+        auto process_chunk = [&](int i)
         {
             int current_chunk = std::min(chunk_size, size - i);
             const float *g_ptr = gate + i;
@@ -223,31 +224,50 @@ namespace llaminar2::primitives
                 o_ptr[j] = silu_scalar(g_ptr[j]) * u_ptr[j];
             }
 #endif
-        }
+        };
+
+        // Layer-fusion support: avoid nested parallel region if already parallel
+        auto do_work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int i = 0; i < size; i += chunk_size)
+            {
+                process_chunk(i);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
     }
 
     void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
     {
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < size; ++i)
+        // Layer-fusion support: avoid nested parallel region if already parallel
+        auto do_work = [&]()
         {
-            float g = simd::bf16_to_fp32(gate[i]);
-            float u = simd::bf16_to_fp32(up[i]);
-            float res = silu_scalar(g) * u; // silu on gate, per HuggingFace
-            output[i] = simd::fp32_to_bf16(res);
-        }
+#pragma omp for schedule(static)
+            for (int i = 0; i < size; ++i)
+            {
+                float g = simd::bf16_to_fp32(gate[i]);
+                float u = simd::bf16_to_fp32(up[i]);
+                output[i] = simd::fp32_to_bf16(silu_scalar(g) * u);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
     }
 
     void compute_swiglu_fp16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
     {
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < size; ++i)
+        // Layer-fusion support: avoid nested parallel region if already parallel
+        auto do_work = [&]()
         {
-            float g = simd::fp16_to_fp32(gate[i]);
-            float u = simd::fp16_to_fp32(up[i]);
-            float res = silu_scalar(g) * u; // silu on gate, per HuggingFace
-            output[i] = simd::fp32_to_fp16(res);
-        }
+#pragma omp for schedule(static)
+            for (int i = 0; i < size; ++i)
+            {
+                float g = simd::fp16_to_fp32(gate[i]);
+                float u = simd::fp16_to_fp32(up[i]);
+                output[i] = simd::fp32_to_fp16(silu_scalar(g) * u);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
     }
 
 #if defined(__AVX2__)
@@ -258,6 +278,7 @@ namespace llaminar2::primitives
         Q8_1Block *o_blocks = static_cast<Q8_1Block *>(output);
         int num_blocks = size / Q8_1Block::BLOCK_SIZE;
 
+        // Constants for SIMD operations
         __m256 one = _mm256_set1_ps(1.0f);
         __m256 zero = _mm256_setzero_ps();
         __m256 two = _mm256_set1_ps(2.0f);
@@ -267,8 +288,8 @@ namespace llaminar2::primitives
         __m256i perm_idx = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
         __m256i offset_128 = _mm256_set1_epi8(-128);
 
-#pragma omp parallel for schedule(static)
-        for (int b = 0; b < num_blocks; ++b)
+        // Lambda for processing a single block - captures SIMD constants by reference
+        auto process_block = [&](int b)
         {
             const Q8_1Block &gb = g_blocks[b];
             const Q8_1Block &ub = u_blocks[b];
@@ -368,13 +389,24 @@ namespace llaminar2::primitives
             _mm256_storeu_si256((__m256i *)ob.qs, result);
 
             // Compute sum
-            __m256i u = _mm256_add_epi8(result, offset_128);
-            __m256i sums = _mm256_sad_epu8(u, _mm256_setzero_si256());
+            __m256i u_shifted = _mm256_add_epi8(result, offset_128);
+            __m256i sums = _mm256_sad_epu8(u_shifted, _mm256_setzero_si256());
 
             int64_t sum_val = _mm256_extract_epi64(sums, 0) + _mm256_extract_epi64(sums, 1) +
                               _mm256_extract_epi64(sums, 2) + _mm256_extract_epi64(sums, 3);
             ob.sum_qs = (int16_t)(sum_val - 4096);
-        }
+        };
+
+        // Layer-fusion support: use OMP_WORKSHARE_REGION for nested-safe parallelization
+        auto do_work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                process_block(b);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
     }
 #endif
 
@@ -626,8 +658,8 @@ namespace llaminar2::primitives
         // size is total elements. Q8_1Block::BLOCK_SIZE is 32.
         int num_blocks = size / Q8_1Block::BLOCK_SIZE;
 
-#pragma omp parallel for schedule(static)
-        for (int b = 0; b < num_blocks; ++b)
+        // Lambda for processing a single block
+        auto process_block = [&](int b)
         {
             const Q8_1Block &gb = g_blocks[b];
             const Q8_1Block &ub = u_blocks[b];
@@ -661,7 +693,18 @@ namespace llaminar2::primitives
                 sum += q;
             }
             ob.sum_qs = sum;
-        }
+        };
+
+        // Layer-fusion support: avoid nested parallel region if already parallel
+        auto do_work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                process_block(b);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
 #endif
     }
 

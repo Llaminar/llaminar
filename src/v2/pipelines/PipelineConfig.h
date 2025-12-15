@@ -282,6 +282,56 @@ namespace llaminar2
          */
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
+        // ===== Multi-Device Executor Feature Flags (Incremental Rollout) =====
+
+        /**
+         * @brief Enable LayerExecutor for FFN RMSNorm operations
+         *
+         * When enabled, FFN pre-normalization uses the new LayerExecutor framework
+         * for multi-device work distribution. Default disabled for safety.
+         */
+        bool executor_ffn_norm = false;
+
+        /**
+         * @brief Enable LayerExecutor for FFN SwiGLU operations
+         *
+         * When enabled, SwiGLU activation uses the new LayerExecutor framework.
+         * Default disabled for safety.
+         */
+        bool executor_ffn_swiglu = false;
+
+        /**
+         * @brief Enable LayerExecutor for FFN residual add operations
+         *
+         * When enabled, FFN residual connections use the new LayerExecutor framework.
+         * Default disabled for safety.
+         */
+        bool executor_ffn_residual = false;
+
+        /**
+         * @brief Enable LayerExecutor for attention RMSNorm operations
+         *
+         * When enabled, pre-attention RMSNorm uses the new LayerExecutor framework.
+         * Default disabled for safety.
+         */
+        bool executor_attn_norm = false;
+
+        /**
+         * @brief Enable LayerExecutor for attention residual add operations
+         *
+         * When enabled, attention residual connections use the new LayerExecutor framework.
+         * Default disabled for safety.
+         */
+        bool executor_attn_residual = false;
+
+        /**
+         * @brief Enable LayerExecutor for RoPE operations
+         *
+         * When enabled, RoPE positional encoding uses the new LayerExecutor framework.
+         * Default disabled for safety.
+         */
+        bool executor_rope = false;
+
         /**
          * @brief Default constructor with standard settings
          */

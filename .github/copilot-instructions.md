@@ -1152,6 +1152,92 @@ When writing SIMD in v2, we follow these principles:
 2. **Vectorized Tail Handling in All Loops**: AVX512 16-way, AVX2 8-way, AVX 4-way, SSE 2-way, scalar tail
 3. **Prefetch**: Prefetch upcoming sequential reads
 
+### OpenMP Nested-Safe Parallel Regions (OMP_WORKSHARE_REGION)
+
+Location: `src/v2/utils/OpenMPUtils.h`
+
+**Purpose**: Provides macros for creating OpenMP parallel regions that are safe to call from within existing parallel regions. This enables "layer-level fusion" where an outer parallel region can encompass multiple kernel calls, eliminating thread fork/join overhead between operations.
+
+**Problem**: Creating a new `#pragma omp parallel` region has ~10-50µs overhead per invocation. With 482 parallel region entries per token (24 layers × ~20 operations), this adds up to significant overhead (measured at 29% of decode time in profiling).
+
+**Solution**: Use `OMP_WORKSHARE_REGION` macro which checks `omp_in_parallel()` and only creates a new parallel region if not already inside one.
+
+#### API Reference
+
+```cpp
+#include "utils/OpenMPUtils.h"
+
+// Main macro - creates parallel region only if not already in one
+#define OMP_WORKSHARE_REGION(work_fn)
+
+// With barrier after work (when subsequent code depends on completion)
+#define OMP_WORKSHARE_REGION_SYNC(work_fn)
+
+// Helper functions
+inline bool isInParallelRegion();  // Wrapper for omp_in_parallel()
+inline int getThreadId();          // Wrapper for omp_get_thread_num()
+inline int getNumThreads();        // Wrapper for omp_get_num_threads()
+
+// RAII guard for temporary thread count changes
+class ThreadCountGuard;
+```
+
+#### Usage Pattern
+
+**ALWAYS use this pattern** when writing kernels with OpenMP parallelization:
+
+```cpp
+#include "utils/OpenMPUtils.h"
+
+void my_kernel(float* data, int n) {
+    // Define work as a lambda with worksharing constructs
+    auto do_work = [&]() {
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            data[i] = process(data[i]);
+        }
+    };
+    
+    // Execute: creates parallel region only if not already in one
+    OMP_WORKSHARE_REGION(do_work);
+}
+```
+
+**DO NOT** write verbose if/else patterns manually:
+
+```cpp
+// ❌ BAD - verbose, error-prone, hard to maintain
+if (omp_in_parallel()) {
+    #pragma omp for schedule(static)
+    for (int i = 0; i < n; ++i) { /* ... */ }
+} else {
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i) { /* ... */ }
+}
+
+// ✅ GOOD - use the macro
+auto do_work = [&]() {
+    #pragma omp for schedule(static)
+    for (int i = 0; i < n; ++i) { /* ... */ }
+};
+OMP_WORKSHARE_REGION(do_work);
+```
+
+#### When to Use
+
+| Scenario | Use |
+|----------|-----|
+| Kernel with `#pragma omp parallel for` | `OMP_WORKSHARE_REGION` |
+| Multiple independent loops in one function | Wrap each in separate `OMP_WORKSHARE_REGION` with `nowait` |
+| Work that must complete before continuing | `OMP_WORKSHARE_REGION_SYNC` |
+| Single-threaded operation inside parallel region | Just call it (no macro needed) |
+
+#### Implementation Files Using This Pattern
+
+- `src/v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h` - All GEMM functions
+- `src/v2/kernels/cpu/primitives/SwiGLUPrimitives.cpp` - All SwiGLU variants
+- Future: All new kernels should use this pattern
+
 ### KernelFactory: Centralized Kernel Dispatch and Caching
 
 Location: `src/v2/kernels/KernelFactory.h`, `src/v2/kernels/KernelFactory.cpp`

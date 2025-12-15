@@ -9,6 +9,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugAssert.h"
 #include "../../utils/MPIStager.h"
+#include "../../utils/OpenMPUtils.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/SIMDHelpers.h"
@@ -752,11 +753,16 @@ namespace llaminar2
     {
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-#pragma omp parallel for if (size > 8192)
-        for (int i = 0; i < size; ++i)
+        bool do_parallel = (size > 8192);
+        auto scale_work = [&]()
         {
-            scores[i] *= scale;
-        }
+#pragma omp for schedule(static)
+            for (int i = 0; i < size; ++i)
+            {
+                scores[i] *= scale;
+            }
+        };
+        OMP_WORKSHARE_REGION_IF(scale_work, do_parallel);
     }
 
     void GQAAttention::apply_attention_mask(

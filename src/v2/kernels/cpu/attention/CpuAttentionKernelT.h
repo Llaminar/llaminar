@@ -542,97 +542,105 @@ namespace llaminar2
                 parallelize_heads = false;
             }
 
-#pragma omp parallel for if (parallelize_heads)
-            for (int h = 0; h < n_heads; ++h)
-            {
-                float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
-
-                // Strided Q@K^T with fused scaling
-                const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
-
-                // Virtual GQA: Map head h to kv_head
-                int kv_h = h / heads_per_kv;
-                const float *K_h = K_fp32.data() + kv_h * head_dim; // K_fp32: already FP32
-
-                const int lda = n_heads * head_dim;    // Q: stride between rows (skip other heads)
-                const int ldb = n_kv_heads * head_dim; // K: stride between rows (skip other heads)
-                const int ldc = seq_len;               // scores: contiguous [seq_len, seq_len]
-
-                // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
-                gemm->multiply_activations_strided(
-                    Q_h,                        // FP32 Q head
-                    K_h,                        // FP32 K head (after broadcast if GQA)
-                    scores_h,                   // FP32 scores output
-                    seq_len, seq_len, head_dim, // m=seq_len, n=seq_len, k=head_dim
-                    lda, ldb, ldc,
-                    true,    // transpose_B=true (K^T)
-                    scale,   // alpha=1/sqrt(d_k) - FUSED SCALING!
-                    0.0f,    // beta
-                    nullptr, // mpi_ctx
-                    -1);     // device_idx (CPU)
-            }
-
-            if (mask)
-            {
-#pragma omp parallel for if (n_heads > 1)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    float *scores_h = scores + h * seq_len * seq_len;
-                    attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
-                }
-            }
-
-            // 3. Apply softmax with optional causal masking
-            // Softmax operates on FP32 workspaces (even for BF16/FP16 inputs)
-            // Softmax is lightweight, parallelize even with few heads
-
-#pragma omp parallel for if (n_heads > 1)
-            for (int h = 0; h < n_heads; ++h)
-            {
-                float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
-
-                // Apply FP32 softmax directly (workspaces are always FP32)
-                primitives::softmax_row_major_fp32(scores_h, seq_len, seq_len, causal, 1.0f, true);
-            }
-
-            // 4. Compute context: weights @ V using strided GEMM (zero-copy multi-head)
-            // Zero output once before parallel region
+            // Zero output before parallel region (single-threaded)
             std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 
-            // Reuse GEMM kernel from Q@K^T computation
-            // Reuse parallelism strategy
-
-#pragma omp parallel for if (parallelize_heads)
-            for (int h = 0; h < n_heads; ++h)
+            // FUSED PARALLEL REGION: Combines Q@K^T, mask, softmax, and Scores@V
+            // This saves 3 thread fork/join cycles (~30-150µs) per attention block
+#pragma omp parallel if (parallelize_heads)
             {
-                // NOTE: weights_h points to FP32 workspace (scores)
-                const float *weights_h = scores + h * seq_len * seq_len;
+                // Phase 1: Q @ K^T -> Scores
+#pragma omp for schedule(static) nowait
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
 
-                // Virtual GQA: Map head h to kv_head
-                int kv_h = h / heads_per_kv;
-                const float *V_h = V_fp32.data() + kv_h * head_dim; // V_fp32 is float*
+                    // Strided Q@K^T with fused scaling
+                    const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
 
-                // CRITICAL: output is float* (not ElementType*), pointer arithmetic in floats
-                float *output_h = output + h * head_dim; // First element of head h
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
+                    const float *K_h = K_fp32.data() + kv_h * head_dim; // K_fp32: already FP32
 
-                // Strided GEMM: context = weights @ V
-                const int lda = seq_len;               // weights: contiguous [seq_len, seq_len]
-                const int ldb = n_kv_heads * head_dim; // V: stride between rows (skip other heads)
-                const int ldc = n_heads * head_dim;    // output: stride between rows
+                    const int lda = n_heads * head_dim;    // Q: stride between rows (skip other heads)
+                    const int ldb = n_kv_heads * head_dim; // K: stride between rows (skip other heads)
+                    const int ldc = seq_len;               // scores: contiguous [seq_len, seq_len]
 
-                // Strided GEMM: context = weights @ V
-                gemm->multiply_activations_strided(
-                    weights_h,                  // Already float*, no cast needed
-                    V_h,                        // Already float*, no cast needed
-                    output_h,                   // Already float*, no cast needed
-                    seq_len, head_dim, seq_len, // m=seq_len, n=head_dim, k=seq_len
-                    lda, ldb, ldc,
-                    false,   // transpose_B=false (weights @ V, not V^T)
-                    1.0f,    // alpha
-                    0.0f,    // beta (output already zeroed)
-                    nullptr, // mpi_ctx
-                    -1);     // device_idx (CPU)
-            }
+                    // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
+                    gemm->multiply_activations_strided(
+                        Q_h,                        // FP32 Q head
+                        K_h,                        // FP32 K head (after broadcast if GQA)
+                        scores_h,                   // FP32 scores output
+                        seq_len, seq_len, head_dim, // m=seq_len, n=seq_len, k=head_dim
+                        lda, ldb, ldc,
+                        true,    // transpose_B=true (K^T)
+                        scale,   // alpha=1/sqrt(d_k) - FUSED SCALING!
+                        0.0f,    // beta
+                        nullptr, // mpi_ctx
+                        -1);     // device_idx (CPU)
+                }
+
+#pragma omp barrier
+
+                // Phase 2: Apply attention mask (if provided)
+                if (mask)
+                {
+#pragma omp for schedule(static) nowait
+                    for (int h = 0; h < n_heads; ++h)
+                    {
+                        float *scores_h = scores + h * seq_len * seq_len;
+                        attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
+                    }
+#pragma omp barrier
+                }
+
+                // Phase 3: Apply softmax with optional causal masking
+                // Note: call with parallel=false since we're already in parallel region
+#pragma omp for schedule(static) nowait
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
+
+                    // Apply FP32 softmax directly (workspaces are always FP32)
+                    // parallel=false: already inside parallel region, avoid nested parallelism
+                    primitives::softmax_row_major_fp32(scores_h, seq_len, seq_len, causal, 1.0f, false);
+                }
+
+#pragma omp barrier
+
+                // Phase 4: Compute context: weights @ V using strided GEMM
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    // NOTE: weights_h points to FP32 workspace (scores)
+                    const float *weights_h = scores + h * seq_len * seq_len;
+
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
+                    const float *V_h = V_fp32.data() + kv_h * head_dim; // V_fp32 is float*
+
+                    // CRITICAL: output is float* (not ElementType*), pointer arithmetic in floats
+                    float *output_h = output + h * head_dim; // First element of head h
+
+                    // Strided GEMM: context = weights @ V
+                    const int lda = seq_len;               // weights: contiguous [seq_len, seq_len]
+                    const int ldb = n_kv_heads * head_dim; // V: stride between rows (skip other heads)
+                    const int ldc = n_heads * head_dim;    // output: stride between rows
+
+                    // Strided GEMM: context = weights @ V
+                    gemm->multiply_activations_strided(
+                        weights_h,                  // Already float*, no cast needed
+                        V_h,                        // Already float*, no cast needed
+                        output_h,                   // Already float*, no cast needed
+                        seq_len, head_dim, seq_len, // m=seq_len, n=head_dim, k=seq_len
+                        lda, ldb, ldc,
+                        false,   // transpose_B=false (weights @ V, not V^T)
+                        1.0f,    // alpha
+                        0.0f,    // beta (output already zeroed)
+                        nullptr, // mpi_ctx
+                        -1);     // device_idx (CPU)
+                }
+            } // End fused parallel region
 
             return true;
         }

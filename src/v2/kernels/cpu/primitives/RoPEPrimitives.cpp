@@ -17,6 +17,8 @@
 #include <omp.h>
 #endif
 
+#include "../../../utils/OpenMPUtils.h"
+
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #elif defined(__AVX2__)
@@ -390,34 +392,38 @@ namespace llaminar2::primitives
         }
 
         // 2. Apply rotation in parallel using cached tables
-#pragma omp parallel for collapse(2) schedule(static)
-        for (int t = 0; t < seq_len; ++t)
+        auto do_rope_work = [&]()
         {
-            for (int h = 0; h < num_heads; ++h)
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < seq_len; ++t)
             {
-                float *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                const float *cos_ptr = cos_table.data() + t * half_dim;
-                const float *sin_ptr = sin_table.data() + t * half_dim;
+                for (int h = 0; h < num_heads; ++h)
+                {
+                    float *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                    const float *cos_ptr = cos_table.data() + t * half_dim;
+                    const float *sin_ptr = sin_table.data() + t * half_dim;
 
 #if defined(__AVX512F__)
-                apply_rope_to_head_cached_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+                    apply_rope_to_head_cached_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
 #elif defined(__AVX2__)
-                apply_rope_to_head_cached_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+                    apply_rope_to_head_cached_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
 #else
-                // Fallback scalar implementation
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float x_first = head_ptr[i];
-                    float x_second = head_ptr[i + half_dim];
-                    float cos_val = cos_ptr[i];
-                    float sin_val = sin_ptr[i];
+                    // Fallback scalar implementation
+                    for (int i = 0; i < half_dim; ++i)
+                    {
+                        float x_first = head_ptr[i];
+                        float x_second = head_ptr[i + half_dim];
+                        float cos_val = cos_ptr[i];
+                        float sin_val = sin_ptr[i];
 
-                    head_ptr[i] = x_first * cos_val - x_second * sin_val;
-                    head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
-                }
+                        head_ptr[i] = x_first * cos_val - x_second * sin_val;
+                        head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+                    }
 #endif
+                }
             }
-        }
+        };
+        OMP_WORKSHARE_REGION(do_rope_work);
     }
 
     void update_rope_cache(
@@ -921,37 +927,41 @@ namespace llaminar2::primitives
         }
 
         // 2. Apply rotation in parallel using cached tables
-#pragma omp parallel for collapse(2) schedule(static)
-        for (int t = 0; t < seq_len; ++t)
+        auto do_rope_bf16_work = [&]()
         {
-            for (int h = 0; h < num_heads; ++h)
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < seq_len; ++t)
             {
-                uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                const float *cos_ptr = cos_table.data() + t * half_dim;
-                const float *sin_ptr = sin_table.data() + t * half_dim;
+                for (int h = 0; h < num_heads; ++h)
+                {
+                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                    const float *cos_ptr = cos_table.data() + t * half_dim;
+                    const float *sin_ptr = sin_table.data() + t * half_dim;
 
 #if defined(__AVX512F__)
-                apply_rope_to_head_cached_bf16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+                    apply_rope_to_head_cached_bf16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
 #elif defined(__AVX2__)
-                apply_rope_to_head_cached_bf16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+                    apply_rope_to_head_cached_bf16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
 #else
-                // Fallback scalar implementation
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float x_first = simd::bf16_to_fp32(head_ptr[i]);
-                    float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
-                    float cos_val = cos_ptr[i];
-                    float sin_val = sin_ptr[i];
+                    // Fallback scalar implementation
+                    for (int i = 0; i < half_dim; ++i)
+                    {
+                        float x_first = simd::bf16_to_fp32(head_ptr[i]);
+                        float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
+                        float cos_val = cos_ptr[i];
+                        float sin_val = sin_ptr[i];
 
-                    float n1 = x_first * cos_val - x_second * sin_val;
-                    float n2 = x_first * sin_val + x_second * cos_val;
+                        float n1 = x_first * cos_val - x_second * sin_val;
+                        float n2 = x_first * sin_val + x_second * cos_val;
 
-                    head_ptr[i] = simd::fp32_to_bf16(n1);
-                    head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
-                }
+                        head_ptr[i] = simd::fp32_to_bf16(n1);
+                        head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
+                    }
 #endif
+                }
             }
-        }
+        };
+        OMP_WORKSHARE_REGION(do_rope_bf16_work);
     }
 
     static void apply_rope_bf16_from_cache(
@@ -1010,15 +1020,19 @@ namespace llaminar2::primitives
         }
         else
         {
-#pragma omp parallel for collapse(2) schedule(static)
-            for (int t = 0; t < seq_len; ++t)
+            auto do_rope_direct_work = [&]()
             {
-                for (int h = 0; h < num_heads; ++h)
+#pragma omp for collapse(2) schedule(static)
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                    apply_rope_to_head_bf16_vectorized(head_ptr, n_past + t, inv_freq, head_dim);
+                    for (int h = 0; h < num_heads; ++h)
+                    {
+                        uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                        apply_rope_to_head_bf16_vectorized(head_ptr, n_past + t, inv_freq, head_dim);
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_rope_direct_work);
         }
     }
 
@@ -1418,37 +1432,41 @@ namespace llaminar2::primitives
         }
 
         // 2. Apply rotation in parallel using cached tables
-#pragma omp parallel for collapse(2) schedule(static)
-        for (int t = 0; t < seq_len; ++t)
+        auto do_rope_fp16_work = [&]()
         {
-            for (int h = 0; h < num_heads; ++h)
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < seq_len; ++t)
             {
-                uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                const float *cos_ptr = cos_table.data() + t * half_dim;
-                const float *sin_ptr = sin_table.data() + t * half_dim;
+                for (int h = 0; h < num_heads; ++h)
+                {
+                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                    const float *cos_ptr = cos_table.data() + t * half_dim;
+                    const float *sin_ptr = sin_table.data() + t * half_dim;
 
 #if defined(__AVX512F__)
-                apply_rope_to_head_cached_fp16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+                    apply_rope_to_head_cached_fp16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
 #elif defined(__AVX2__)
-                apply_rope_to_head_cached_fp16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+                    apply_rope_to_head_cached_fp16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
 #else
-                // Fallback scalar implementation
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float x_first = simd::fp16_to_fp32(head_ptr[i]);
-                    float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
-                    float cos_val = cos_ptr[i];
-                    float sin_val = sin_ptr[i];
+                    // Fallback scalar implementation
+                    for (int i = 0; i < half_dim; ++i)
+                    {
+                        float x_first = simd::fp16_to_fp32(head_ptr[i]);
+                        float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
+                        float cos_val = cos_ptr[i];
+                        float sin_val = sin_ptr[i];
 
-                    float n1 = x_first * cos_val - x_second * sin_val;
-                    float n2 = x_first * sin_val + x_second * cos_val;
+                        float n1 = x_first * cos_val - x_second * sin_val;
+                        float n2 = x_first * sin_val + x_second * cos_val;
 
-                    head_ptr[i] = simd::fp32_to_fp16(n1);
-                    head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
-                }
+                        head_ptr[i] = simd::fp32_to_fp16(n1);
+                        head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
+                    }
 #endif
+                }
             }
-        }
+        };
+        OMP_WORKSHARE_REGION(do_rope_fp16_work);
     }
 
     static void apply_rope_fp16_from_cache(
@@ -1507,15 +1525,19 @@ namespace llaminar2::primitives
         }
         else
         {
-#pragma omp parallel for collapse(2) schedule(static)
-            for (int t = 0; t < seq_len; ++t)
+            auto do_rope_fp16_direct_work = [&]()
             {
-                for (int h = 0; h < num_heads; ++h)
+#pragma omp for collapse(2) schedule(static)
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                    apply_rope_to_head_fp16_vectorized(head_ptr, n_past + t, inv_freq, head_dim);
+                    for (int h = 0; h < num_heads; ++h)
+                    {
+                        uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                        apply_rope_to_head_fp16_vectorized(head_ptr, n_past + t, inv_freq, head_dim);
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_rope_fp16_direct_work);
         }
     }
 
@@ -1883,21 +1905,32 @@ namespace llaminar2::primitives
             }
             else
             {
-// Parallel compute for non-contiguous or single token (without persistent state)
-#pragma omp parallel for if (seq_len > 1)
-                for (int t = 0; t < seq_len; ++t)
+                // Parallel compute for non-contiguous or single token (without persistent state)
+                auto do_cos_sin_compute = [&]()
                 {
-                    int pos = position_ids ? position_ids[t] : t;
-                    int offset = t * half_dim;
-                    for (int i = 0; i < half_dim; ++i)
+#pragma omp for
+                    for (int t = 0; t < seq_len; ++t)
                     {
-                        float ang = pos * inv_freq[i];
-                        float c = std::cos(ang);
-                        float s = std::sin(ang);
+                        int pos = position_ids ? position_ids[t] : t;
+                        int offset = t * half_dim;
+                        for (int i = 0; i < half_dim; ++i)
+                        {
+                            float ang = pos * inv_freq[i];
+                            float c = std::cos(ang);
+                            float s = std::sin(ang);
 
-                        cos_table[offset + i] = (int16_t)(c * 32767.0f);
-                        sin_table[offset + i] = (int16_t)(s * 32767.0f);
+                            cos_table[offset + i] = (int16_t)(c * 32767.0f);
+                            sin_table[offset + i] = (int16_t)(s * 32767.0f);
+                        }
                     }
+                };
+                if (seq_len > 1)
+                {
+                    OMP_WORKSHARE_REGION(do_cos_sin_compute);
+                }
+                else
+                {
+                    do_cos_sin_compute();
                 }
             }
         }
@@ -1930,31 +1963,39 @@ namespace llaminar2::primitives
         }
         else
         {
-#pragma omp parallel for collapse(2)
-            for (int t = 0; t < seq_len; ++t)
+            auto do_apply_q_work = [&]()
             {
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    Q8_1Block *head_ptr = Q + t * q_stride_blocks + h * blocks_per_head;
-                    const int16_t *c_ptr = cos_table + t * half_dim;
-                    const int16_t *s_ptr = sin_table + t * half_dim;
-                    apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
-                }
-            }
-
-            if (K)
-            {
-#pragma omp parallel for collapse(2)
+#pragma omp for collapse(2)
                 for (int t = 0; t < seq_len; ++t)
                 {
-                    for (int h = 0; h < n_kv_heads; ++h)
+                    for (int h = 0; h < n_heads; ++h)
                     {
-                        Q8_1Block *head_ptr = K + t * k_stride_blocks + h * blocks_per_head;
+                        Q8_1Block *head_ptr = Q + t * q_stride_blocks + h * blocks_per_head;
                         const int16_t *c_ptr = cos_table + t * half_dim;
                         const int16_t *s_ptr = sin_table + t * half_dim;
                         apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
                     }
                 }
+            };
+            OMP_WORKSHARE_REGION(do_apply_q_work);
+
+            if (K)
+            {
+                auto do_apply_k_work = [&]()
+                {
+#pragma omp for collapse(2)
+                    for (int t = 0; t < seq_len; ++t)
+                    {
+                        for (int h = 0; h < n_kv_heads; ++h)
+                        {
+                            Q8_1Block *head_ptr = K + t * k_stride_blocks + h * blocks_per_head;
+                            const int16_t *c_ptr = cos_table + t * half_dim;
+                            const int16_t *s_ptr = sin_table + t * half_dim;
+                            apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                        }
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_apply_k_work);
             }
         }
     }

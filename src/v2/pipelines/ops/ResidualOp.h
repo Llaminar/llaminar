@@ -15,6 +15,7 @@
 #include "../../tensors/SIMDHelpers.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
+#include "../../utils/OpenMPUtils.h"
 
 #include <cmath>
 #include <memory>
@@ -190,11 +191,15 @@ namespace llaminar2
                 const float *p = proj_typed->data();
                 float *h = out_typed->mutable_data();
 
-#pragma omp parallel for schedule(static)
-                for (size_t i = 0; i < n; ++i)
+                auto residual_work = [&]()
                 {
-                    h[i] = r[i] + p[i];
-                }
+#pragma omp for schedule(static)
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        h[i] = r[i] + p[i];
+                    }
+                };
+                OMP_WORKSHARE_REGION(residual_work);
             }
             else if constexpr (P == ActivationPrecision::BF16)
             {
@@ -203,13 +208,17 @@ namespace llaminar2
                 const uint16_t *p = proj_typed->bf16_data();
                 uint16_t *h = out_typed->mutable_bf16_data();
 
-#pragma omp parallel for schedule(static)
-                for (size_t i = 0; i < n; ++i)
+                auto residual_work = [&]()
                 {
-                    float rf = simd::bf16_to_fp32(r[i]);
-                    float pf = simd::bf16_to_fp32(p[i]);
-                    h[i] = simd::fp32_to_bf16(rf + pf);
-                }
+#pragma omp for schedule(static)
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        float rf = simd::bf16_to_fp32(r[i]);
+                        float pf = simd::bf16_to_fp32(p[i]);
+                        h[i] = simd::fp32_to_bf16(rf + pf);
+                    }
+                };
+                OMP_WORKSHARE_REGION(residual_work);
             }
             else if constexpr (P == ActivationPrecision::FP16)
             {
@@ -218,13 +227,17 @@ namespace llaminar2
                 const uint16_t *p = proj_typed->fp16_data();
                 uint16_t *h = out_typed->mutable_fp16_data();
 
-#pragma omp parallel for schedule(static)
-                for (size_t i = 0; i < n; ++i)
+                auto residual_work = [&]()
                 {
-                    float rf = simd::fp16_to_fp32(r[i]);
-                    float pf = simd::fp16_to_fp32(p[i]);
-                    h[i] = simd::fp32_to_fp16(rf + pf);
-                }
+#pragma omp for schedule(static)
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        float rf = simd::fp16_to_fp32(r[i]);
+                        float pf = simd::fp16_to_fp32(p[i]);
+                        h[i] = simd::fp32_to_fp16(rf + pf);
+                    }
+                };
+                OMP_WORKSHARE_REGION(residual_work);
             }
             else if constexpr (P == ActivationPrecision::Q8_1)
             {
@@ -260,30 +273,34 @@ namespace llaminar2
                 const float *p = proj_typed->data();
                 float *h = out_typed->mutable_data();
 
-#pragma omp parallel for collapse(2) schedule(static)
-                for (int b = 0; b < batch_size; ++b)
+                auto batched_work = [&]()
                 {
-                    for (int s = 0; s < max_seq_len; ++s)
+#pragma omp for collapse(2) schedule(static)
+                    for (int b = 0; b < batch_size; ++b)
                     {
-                        const size_t row_offset = (static_cast<size_t>(b) * max_seq_len + s) * d_model;
-                        if (s < seq_lengths[b])
+                        for (int s = 0; s < max_seq_len; ++s)
                         {
-                            // Valid position: add residual + projection
-                            for (int d = 0; d < d_model; ++d)
+                            const size_t row_offset = (static_cast<size_t>(b) * max_seq_len + s) * d_model;
+                            if (s < seq_lengths[b])
                             {
-                                h[row_offset + d] = r[row_offset + d] + p[row_offset + d];
+                                // Valid position: add residual + projection
+                                for (int d = 0; d < d_model; ++d)
+                                {
+                                    h[row_offset + d] = r[row_offset + d] + p[row_offset + d];
+                                }
                             }
-                        }
-                        else
-                        {
-                            // Padding position: zero out
-                            for (int d = 0; d < d_model; ++d)
+                            else
                             {
-                                h[row_offset + d] = 0.0f;
+                                // Padding position: zero out
+                                for (int d = 0; d < d_model; ++d)
+                                {
+                                    h[row_offset + d] = 0.0f;
+                                }
                             }
                         }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(batched_work);
             }
             else if constexpr (P == ActivationPrecision::BF16)
             {
@@ -292,30 +309,34 @@ namespace llaminar2
                 const uint16_t *p = proj_typed->bf16_data();
                 uint16_t *h = out_typed->mutable_bf16_data();
 
-#pragma omp parallel for collapse(2) schedule(static)
-                for (int b = 0; b < batch_size; ++b)
+                auto batched_work = [&]()
                 {
-                    for (int s = 0; s < max_seq_len; ++s)
+#pragma omp for collapse(2) schedule(static)
+                    for (int b = 0; b < batch_size; ++b)
                     {
-                        const size_t row_offset = (static_cast<size_t>(b) * max_seq_len + s) * d_model;
-                        if (s < seq_lengths[b])
+                        for (int s = 0; s < max_seq_len; ++s)
                         {
-                            for (int d = 0; d < d_model; ++d)
+                            const size_t row_offset = (static_cast<size_t>(b) * max_seq_len + s) * d_model;
+                            if (s < seq_lengths[b])
                             {
-                                float rf = simd::bf16_to_fp32(r[row_offset + d]);
-                                float pf = simd::bf16_to_fp32(p[row_offset + d]);
-                                h[row_offset + d] = simd::fp32_to_bf16(rf + pf);
+                                for (int d = 0; d < d_model; ++d)
+                                {
+                                    float rf = simd::bf16_to_fp32(r[row_offset + d]);
+                                    float pf = simd::bf16_to_fp32(p[row_offset + d]);
+                                    h[row_offset + d] = simd::fp32_to_bf16(rf + pf);
+                                }
                             }
-                        }
-                        else
-                        {
-                            for (int d = 0; d < d_model; ++d)
+                            else
                             {
-                                h[row_offset + d] = 0;
+                                for (int d = 0; d < d_model; ++d)
+                                {
+                                    h[row_offset + d] = 0;
+                                }
                             }
                         }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(batched_work);
             }
             else if constexpr (P == ActivationPrecision::FP16)
             {
@@ -324,30 +345,34 @@ namespace llaminar2
                 const uint16_t *p = proj_typed->fp16_data();
                 uint16_t *h = out_typed->mutable_fp16_data();
 
-#pragma omp parallel for collapse(2) schedule(static)
-                for (int b = 0; b < batch_size; ++b)
+                auto batched_work = [&]()
                 {
-                    for (int s = 0; s < max_seq_len; ++s)
+#pragma omp for collapse(2) schedule(static)
+                    for (int b = 0; b < batch_size; ++b)
                     {
-                        const size_t row_offset = (static_cast<size_t>(b) * max_seq_len + s) * d_model;
-                        if (s < seq_lengths[b])
+                        for (int s = 0; s < max_seq_len; ++s)
                         {
-                            for (int d = 0; d < d_model; ++d)
+                            const size_t row_offset = (static_cast<size_t>(b) * max_seq_len + s) * d_model;
+                            if (s < seq_lengths[b])
                             {
-                                float rf = simd::fp16_to_fp32(r[row_offset + d]);
-                                float pf = simd::fp16_to_fp32(p[row_offset + d]);
-                                h[row_offset + d] = simd::fp32_to_fp16(rf + pf);
+                                for (int d = 0; d < d_model; ++d)
+                                {
+                                    float rf = simd::fp16_to_fp32(r[row_offset + d]);
+                                    float pf = simd::fp16_to_fp32(p[row_offset + d]);
+                                    h[row_offset + d] = simd::fp32_to_fp16(rf + pf);
+                                }
                             }
-                        }
-                        else
-                        {
-                            for (int d = 0; d < d_model; ++d)
+                            else
                             {
-                                h[row_offset + d] = 0;
+                                for (int d = 0; d < d_model; ++d)
+                                {
+                                    h[row_offset + d] = 0;
+                                }
                             }
                         }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(batched_work);
             }
             else if constexpr (P == ActivationPrecision::Q8_1)
             {
@@ -403,38 +428,42 @@ namespace llaminar2
             const Q8_1Block *proj_blocks = projection->q8_1_blocks();
             Q8_1Block *out_blocks = hidden->mutable_q8_1_blocks();
 
-#pragma omp parallel for collapse(2) schedule(static)
-            for (int b = 0; b < batch_size; ++b)
+            auto batched_q8_1_work = [&]()
             {
-                for (int s = 0; s < max_seq_len; ++s)
+#pragma omp for collapse(2) schedule(static)
+                for (int b = 0; b < batch_size; ++b)
                 {
-                    const size_t row_idx = static_cast<size_t>(b) * max_seq_len + s;
-                    const size_t block_row_offset = row_idx * blocks_per_row;
+                    for (int s = 0; s < max_seq_len; ++s)
+                    {
+                        const size_t row_idx = static_cast<size_t>(b) * max_seq_len + s;
+                        const size_t block_row_offset = row_idx * blocks_per_row;
 
-                    if (s < seq_lengths[b])
-                    {
-                        // Valid position: add blocks using SIMD
-                        // Process one row at a time (blocks_per_row blocks = blocks_per_row * 32 elements)
-                        simd::q8_1_add_q8_1(
-                            &res_blocks[block_row_offset],
-                            &proj_blocks[block_row_offset],
-                            &out_blocks[block_row_offset],
-                            blocks_per_row * BLOCK_SIZE // element count for this row
-                        );
-                    }
-                    else
-                    {
-                        // Padding position: zero out blocks
-                        for (size_t blk = 0; blk < blocks_per_row; ++blk)
+                        if (s < seq_lengths[b])
                         {
-                            Q8_1Block &out_blk = out_blocks[block_row_offset + blk];
-                            out_blk.d = 0;
-                            out_blk.sum_qs = 0;
-                            std::memset(out_blk.qs, 0, BLOCK_SIZE);
+                            // Valid position: add blocks using SIMD
+                            // Process one row at a time (blocks_per_row blocks = blocks_per_row * 32 elements)
+                            simd::q8_1_add_q8_1(
+                                &res_blocks[block_row_offset],
+                                &proj_blocks[block_row_offset],
+                                &out_blocks[block_row_offset],
+                                blocks_per_row * BLOCK_SIZE // element count for this row
+                            );
+                        }
+                        else
+                        {
+                            // Padding position: zero out blocks
+                            for (size_t blk = 0; blk < blocks_per_row; ++blk)
+                            {
+                                Q8_1Block &out_blk = out_blocks[block_row_offset + blk];
+                                out_blk.d = 0;
+                                out_blk.sum_qs = 0;
+                                std::memset(out_blk.qs, 0, BLOCK_SIZE);
+                            }
                         }
                     }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(batched_q8_1_work);
 
             return true;
         }

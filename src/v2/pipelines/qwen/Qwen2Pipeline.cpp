@@ -16,6 +16,7 @@
 #include "../../utils/DebugAssert.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/KernelProfiler.h"
+#include "../../utils/OpenMPUtils.h"
 #include "../PipelineFactory.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
@@ -1068,14 +1069,18 @@ namespace llaminar2
                 const float *src = raw_embed->data();
                 float *dst = embedding_table_->mutable_data();
 
-#pragma omp parallel for
-                for (int v = 0; v < vocab_size_; ++v)
+                auto transpose_work = [&]()
                 {
-                    for (int d = 0; d < d_model_; ++d)
+#pragma omp for schedule(static)
+                    for (int v = 0; v < vocab_size_; ++v)
                     {
-                        dst[v * d_model_ + d] = src[d * vocab_size_ + v];
+                        for (int d = 0; d < d_model_; ++d)
+                        {
+                            dst[v * d_model_ + d] = src[d * vocab_size_ + v];
+                        }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(transpose_work);
             }
             else
             {

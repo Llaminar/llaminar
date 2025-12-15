@@ -30,6 +30,7 @@
 #include "../../../pipelines/PipelineConfig.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/OpenMPUtils.h"
 #include <memory>
 #include <vector>
 #include <cstring>
@@ -421,158 +422,162 @@ namespace llaminar2
                 logged = true;
             }
 
-#pragma omp parallel for
-            for (int h = 0; h < n_heads; ++h)
+            auto attention_work = [&]()
             {
-                int tid = omp_get_thread_num();
-                int kv_h = h / heads_per_kv;
-
-                float *Q_fp32 = Q_fp32_threads[tid].data();
-                float *K_fp32 = K_fp32_threads[tid].data();
-                float *scores_fp32 = scores_threads[tid].data();
-                float *context_fp32 = context_threads[tid].data();
-
-                // 1. Dequantize Q for this head to FP32
-                for (int m = 0; m < seq_len; ++m)
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
                 {
-                    const Q8_1Block *Q_row = Q + m * q_blocks_per_row + h * head_dim_blocks;
-                    float *Q_fp32_row = Q_fp32 + m * head_dim;
-                    for (int b = 0; b < head_dim_blocks; ++b)
+                    int tid = omp_get_thread_num();
+                    int kv_h = h / heads_per_kv;
+
+                    float *Q_fp32 = Q_fp32_threads[tid].data();
+                    float *K_fp32 = K_fp32_threads[tid].data();
+                    float *scores_fp32 = scores_threads[tid].data();
+                    float *context_fp32 = context_threads[tid].data();
+
+                    // 1. Dequantize Q for this head to FP32
+                    for (int m = 0; m < seq_len; ++m)
                     {
-                        Q8_1Tensor::decodeBlock(Q_row[b], Q_fp32_row + b * 32);
-                    }
-                }
-
-                // 2. Dequantize K for this KV head to FP32
-                for (int n = 0; n < kv_len; ++n)
-                {
-                    const Q8_1Block *K_row = K + n * k_blocks_per_row + kv_h * head_dim_blocks;
-                    float *K_fp32_row = K_fp32 + n * head_dim;
-                    for (int b = 0; b < head_dim_blocks; ++b)
-                    {
-                        Q8_1Tensor::decodeBlock(K_row[b], K_fp32_row + b * 32);
-                    }
-                }
-
-                // 3. Compute Q @ K^T in FP32 with scaling
-                for (int m = 0; m < seq_len; ++m)
-                {
-                    const float *Q_row = Q_fp32 + m * head_dim;
-                    for (int n = 0; n < kv_len; ++n)
-                    {
-                        const float *K_row = K_fp32 + n * head_dim;
-                        float dot = 0.0f;
-                        for (int d = 0; d < head_dim; ++d)
-                        {
-                            dot += Q_row[d] * K_row[d];
-                        }
-                        float score = dot * scale;
-
-                        // Apply mask if present
-                        if (mask)
-                        {
-                            score += mask[m * kv_len + n];
-                        }
-
-                        // Apply causal mask (positions n > m are masked)
-                        if (causal && n > m)
-                        {
-                            score = -std::numeric_limits<float>::infinity();
-                        }
-
-                        scores_fp32[m * kv_len + n] = score;
-                    }
-                }
-
-                // 4. Apply softmax row-wise (in FP32 for precision)
-                for (int m = 0; m < seq_len; ++m)
-                {
-                    float *row = scores_fp32 + m * kv_len;
-
-                    // Find max for numerical stability
-                    float max_val = row[0];
-                    for (int n = 1; n < kv_len; ++n)
-                    {
-                        if (row[n] > max_val)
-                            max_val = row[n];
-                    }
-
-                    // Compute exp and sum
-                    float sum = 0.0f;
-                    for (int n = 0; n < kv_len; ++n)
-                    {
-                        row[n] = std::exp(row[n] - max_val);
-                        sum += row[n];
-                    }
-
-                    // Normalize
-                    float inv_sum = 1.0f / sum;
-                    for (int n = 0; n < kv_len; ++n)
-                    {
-                        row[n] *= inv_sum;
-                    }
-                }
-
-                // 5. Compute context = scores @ V
-                // Dequantize V on-the-fly and accumulate in FP32
-                std::memset(context_fp32, 0, seq_len * head_dim * sizeof(float));
-                for (int m = 0; m < seq_len; ++m)
-                {
-                    const float *weights = scores_fp32 + m * kv_len;
-                    float *context_row = context_fp32 + m * head_dim;
-
-                    for (int n = 0; n < kv_len; ++n)
-                    {
-                        float w = weights[n];
-                        if (w < 1e-10f)
-                            continue; // Skip negligible weights
-
-                        const Q8_1Block *V_row = V + n * k_blocks_per_row + kv_h * head_dim_blocks;
+                        const Q8_1Block *Q_row = Q + m * q_blocks_per_row + h * head_dim_blocks;
+                        float *Q_fp32_row = Q_fp32 + m * head_dim;
                         for (int b = 0; b < head_dim_blocks; ++b)
                         {
-                            float d_v = simd::fp16_to_fp32(V_row[b].d);
-                            for (int i = 0; i < 32 && b * 32 + i < head_dim; ++i)
+                            Q8_1Tensor::decodeBlock(Q_row[b], Q_fp32_row + b * 32);
+                        }
+                    }
+
+                    // 2. Dequantize K for this KV head to FP32
+                    for (int n = 0; n < kv_len; ++n)
+                    {
+                        const Q8_1Block *K_row = K + n * k_blocks_per_row + kv_h * head_dim_blocks;
+                        float *K_fp32_row = K_fp32 + n * head_dim;
+                        for (int b = 0; b < head_dim_blocks; ++b)
+                        {
+                            Q8_1Tensor::decodeBlock(K_row[b], K_fp32_row + b * 32);
+                        }
+                    }
+
+                    // 3. Compute Q @ K^T in FP32 with scaling
+                    for (int m = 0; m < seq_len; ++m)
+                    {
+                        const float *Q_row = Q_fp32 + m * head_dim;
+                        for (int n = 0; n < kv_len; ++n)
+                        {
+                            const float *K_row = K_fp32 + n * head_dim;
+                            float dot = 0.0f;
+                            for (int d = 0; d < head_dim; ++d)
                             {
-                                context_row[b * 32 + i] += w * (V_row[b].qs[i] * d_v);
+                                dot += Q_row[d] * K_row[d];
+                            }
+                            float score = dot * scale;
+
+                            // Apply mask if present
+                            if (mask)
+                            {
+                                score += mask[m * kv_len + n];
+                            }
+
+                            // Apply causal mask (positions n > m are masked)
+                            if (causal && n > m)
+                            {
+                                score = -std::numeric_limits<float>::infinity();
+                            }
+
+                            scores_fp32[m * kv_len + n] = score;
+                        }
+                    }
+
+                    // 4. Apply softmax row-wise (in FP32 for precision)
+                    for (int m = 0; m < seq_len; ++m)
+                    {
+                        float *row = scores_fp32 + m * kv_len;
+
+                        // Find max for numerical stability
+                        float max_val = row[0];
+                        for (int n = 1; n < kv_len; ++n)
+                        {
+                            if (row[n] > max_val)
+                                max_val = row[n];
+                        }
+
+                        // Compute exp and sum
+                        float sum = 0.0f;
+                        for (int n = 0; n < kv_len; ++n)
+                        {
+                            row[n] = std::exp(row[n] - max_val);
+                            sum += row[n];
+                        }
+
+                        // Normalize
+                        float inv_sum = 1.0f / sum;
+                        for (int n = 0; n < kv_len; ++n)
+                        {
+                            row[n] *= inv_sum;
+                        }
+                    }
+
+                    // 5. Compute context = scores @ V
+                    // Dequantize V on-the-fly and accumulate in FP32
+                    std::memset(context_fp32, 0, seq_len * head_dim * sizeof(float));
+                    for (int m = 0; m < seq_len; ++m)
+                    {
+                        const float *weights = scores_fp32 + m * kv_len;
+                        float *context_row = context_fp32 + m * head_dim;
+
+                        for (int n = 0; n < kv_len; ++n)
+                        {
+                            float w = weights[n];
+                            if (w < 1e-10f)
+                                continue; // Skip negligible weights
+
+                            const Q8_1Block *V_row = V + n * k_blocks_per_row + kv_h * head_dim_blocks;
+                            for (int b = 0; b < head_dim_blocks; ++b)
+                            {
+                                float d_v = simd::fp16_to_fp32(V_row[b].d);
+                                for (int i = 0; i < 32 && b * 32 + i < head_dim; ++i)
+                                {
+                                    context_row[b * 32 + i] += w * (V_row[b].qs[i] * d_v);
+                                }
                             }
                         }
                     }
-                }
 
-                // 6. Requantize context to Q8_1 output
-                for (int m = 0; m < seq_len; ++m)
-                {
-                    const float *ctx_row = context_fp32 + m * head_dim;
-                    Q8_1Block *out_row = output_q8 + m * out_blocks_per_row + h * head_dim_blocks;
-
-                    for (int b = 0; b < head_dim_blocks; ++b)
+                    // 6. Requantize context to Q8_1 output
+                    for (int m = 0; m < seq_len; ++m)
                     {
-                        const float *src = ctx_row + b * 32;
-                        Q8_1Block &blk = out_row[b];
+                        const float *ctx_row = context_fp32 + m * head_dim;
+                        Q8_1Block *out_row = output_q8 + m * out_blocks_per_row + h * head_dim_blocks;
 
-                        // Find max abs for scale
-                        float max_abs = 0.0f;
-                        for (int i = 0; i < 32; ++i)
+                        for (int b = 0; b < head_dim_blocks; ++b)
                         {
-                            max_abs = std::max(max_abs, std::abs(src[i]));
+                            const float *src = ctx_row + b * 32;
+                            Q8_1Block &blk = out_row[b];
+
+                            // Find max abs for scale
+                            float max_abs = 0.0f;
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                max_abs = std::max(max_abs, std::abs(src[i]));
+                            }
+
+                            float d = max_abs / 127.0f;
+                            float inv_d = (d > 1e-10f) ? (1.0f / d) : 0.0f;
+
+                            blk.d = simd::fp32_to_fp16(d);
+
+                            int16_t sum_qs = 0;
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                int8_t q = static_cast<int8_t>(std::round(std::clamp(src[i] * inv_d, -127.0f, 127.0f)));
+                                blk.qs[i] = q;
+                                sum_qs += q;
+                            }
+                            blk.sum_qs = sum_qs;
                         }
-
-                        float d = max_abs / 127.0f;
-                        float inv_d = (d > 1e-10f) ? (1.0f / d) : 0.0f;
-
-                        blk.d = simd::fp32_to_fp16(d);
-
-                        int16_t sum_qs = 0;
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            int8_t q = static_cast<int8_t>(std::round(std::clamp(src[i] * inv_d, -127.0f, 127.0f)));
-                            blk.qs[i] = q;
-                            sum_qs += q;
-                        }
-                        blk.sum_qs = sum_qs;
                     }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(attention_work);
 
             return true;
         }
@@ -676,22 +681,26 @@ namespace llaminar2
                 LOG_WARN("[CPUAttentionKernelTyped] head_dim=" << head_dim
                                                                << " not supported by JIT, falling back to reference implementation");
 
-                // Use reference implementation
-#pragma omp parallel for
-                for (int h = 0; h < n_heads; ++h)
+                // Use reference implementation (nested-safe)
+                auto fallback_work = [&]()
                 {
-                    int kv_h = h / heads_per_kv;
-                    const Q8_1Block *Q_h = Q + h * head_dim_blocks;
-                    const Q8_1Block *K_h = K + kv_h * head_dim_blocks;
-                    const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
-                    Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
+#pragma omp for schedule(static)
+                    for (int h = 0; h < n_heads; ++h)
+                    {
+                        int kv_h = h / heads_per_kv;
+                        const Q8_1Block *Q_h = Q + h * head_dim_blocks;
+                        const Q8_1Block *K_h = K + kv_h * head_dim_blocks;
+                        const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
+                        Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
 
-                    gemm_v4::fused_q8_1_attention_reference(
-                        Q_h, K_h, V_h, out_h,
-                        seq_len, kv_len, head_dim,
-                        q_blocks_per_row, k_blocks_per_row, k_blocks_per_row, out_blocks_per_row,
-                        scale, mask, kv_len);
-                }
+                        gemm_v4::fused_q8_1_attention_reference(
+                            Q_h, K_h, V_h, out_h,
+                            seq_len, kv_len, head_dim,
+                            q_blocks_per_row, k_blocks_per_row, k_blocks_per_row, out_blocks_per_row,
+                            scale, mask, kv_len);
+                    }
+                };
+                OMP_WORKSHARE_REGION(fallback_work);
                 return true;
             }
 
@@ -711,55 +720,60 @@ namespace llaminar2
                 debug_printed = true;
             }
 
-#pragma omp parallel for if (parallelize_heads)
-            for (int h = 0; h < n_heads; ++h)
+            // Capture all needed variables for nested-safe parallel execution
+            auto jit_attention_work = [&]()
             {
-                // Virtual GQA: Map head h to kv_head
-                int kv_h = h / heads_per_kv;
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
 
-                // Pointers to head-specific Q8_1 blocks
-                const Q8_1Block *Q_h = Q + h * head_dim_blocks;
-                const Q8_1Block *K_h = K + kv_h * head_dim_blocks;
-                const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
-                Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
+                    // Pointers to head-specific Q8_1 blocks
+                    const Q8_1Block *Q_h = Q + h * head_dim_blocks;
+                    const Q8_1Block *K_h = K + kv_h * head_dim_blocks;
+                    const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
+                    Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
 
-                // Strides in bytes
-                const int q_stride_bytes = q_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
-                const int k_stride_bytes = k_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
-                const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+                    // Strides in bytes
+                    const int q_stride_bytes = q_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+                    const int k_stride_bytes = k_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+                    const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
 
-                // Build params for fused kernel using volatile to prevent optimization issues
-                // This mirrors the fix applied to QuantisedGemmKernel for -O3 compatibility
-                volatile gemm_v4::FusedQ8_1AttentionParams params_v;
-                params_v.Q = Q_h;
-                params_v.K = K_h;
-                params_v.V = V_h;
-                params_v.output = out_h;
-                params_v.M = seq_len;
-                params_v.N = kv_len;
-                params_v.head_dim = head_dim;
-                params_v.Q_stride_bytes = q_stride_bytes;
-                params_v.K_stride_bytes = k_stride_bytes;
-                params_v.V_stride_bytes = k_stride_bytes; // V has same stride as K
-                params_v.output_stride_bytes = out_stride_bytes;
-                params_v.scale = scale;
-                params_v.mask = mask;
-                params_v.mask_stride = kv_len;
+                    // Build params for fused kernel using volatile to prevent optimization issues
+                    // This mirrors the fix applied to QuantisedGemmKernel for -O3 compatibility
+                    volatile gemm_v4::FusedQ8_1AttentionParams params_v;
+                    params_v.Q = Q_h;
+                    params_v.K = K_h;
+                    params_v.V = V_h;
+                    params_v.output = out_h;
+                    params_v.M = seq_len;
+                    params_v.N = kv_len;
+                    params_v.head_dim = head_dim;
+                    params_v.Q_stride_bytes = q_stride_bytes;
+                    params_v.K_stride_bytes = k_stride_bytes;
+                    params_v.V_stride_bytes = k_stride_bytes; // V has same stride as K
+                    params_v.output_stride_bytes = out_stride_bytes;
+                    params_v.scale = scale;
+                    params_v.mask = mask;
+                    params_v.mask_stride = kv_len;
 
-                // Copy to non-volatile for kernel call (workaround for -O3 optimization issue)
-                gemm_v4::FusedQ8_1AttentionParams params;
-                std::memcpy(&params, const_cast<gemm_v4::FusedQ8_1AttentionParams *>(&params_v), sizeof(params));
+                    // Copy to non-volatile for kernel call (workaround for -O3 optimization issue)
+                    gemm_v4::FusedQ8_1AttentionParams params;
+                    std::memcpy(&params, const_cast<gemm_v4::FusedQ8_1AttentionParams *>(&params_v), sizeof(params));
 
-                // Memory barrier to prevent reordering
-                asm volatile("" ::: "memory");
+                    // Memory barrier to prevent reordering
+                    asm volatile("" ::: "memory");
 
-                // Dump inputs for debugging (compile-time optional)
-                gemm_v4::dump_attention_inputs(params, h, -1);
+                    // Dump inputs for debugging (compile-time optional)
+                    gemm_v4::dump_attention_inputs(params, h, -1);
 
-                // Execute fused kernel
-                auto func = jit_kernel->get_kernel();
-                func(&params);
-            }
+                    // Execute fused kernel
+                    auto func = jit_kernel->get_kernel();
+                    func(&params);
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(jit_attention_work, parallelize_heads);
 
             return true;
         }
@@ -865,102 +879,107 @@ namespace llaminar2
                 // 2. Scores @ V -> Output (FP32)
                 std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 
-#pragma omp parallel for if (parallelize_heads)
-                for (int h = 0; h < n_heads; ++h)
+                // Capture variables for nested-safe parallel execution
+                auto typed_attention_work = [&]()
                 {
-                    // --- Step 1: Q @ K^T -> Scores ---
-                    float *scores_h = scores + h * seq_len * kv_len;
-                    const ElementType *Q_h = Q + h * head_dim;
-
-                    // Virtual GQA: Map head h to kv_head
-                    int kv_h = h / heads_per_kv;
-                    const ElementType *K_h = K + kv_h * head_dim;
-
-                    const int lda_k = n_heads * head_dim;
-                    const int ldb_k = n_kv_heads * head_dim; // Stride of K is based on n_kv_heads
-                    const int ldc_k = kv_len;
-
-                    // Optimized path for decoding (seq_len == 1) on FP32
-                    if (seq_len == 1 && std::is_same_v<TensorT, FP32Tensor>)
+#pragma omp for schedule(static)
+                    for (int h = 0; h < n_heads; ++h)
                     {
-                        if constexpr (std::is_same_v<TensorT, FP32Tensor>)
+                        // --- Step 1: Q @ K^T -> Scores ---
+                        float *scores_h = scores + h * seq_len * kv_len;
+                        const ElementType *Q_h = Q + h * head_dim;
+
+                        // Virtual GQA: Map head h to kv_head
+                        int kv_h = h / heads_per_kv;
+                        const ElementType *K_h = K + kv_h * head_dim;
+
+                        const int lda_k = n_heads * head_dim;
+                        const int ldb_k = n_kv_heads * head_dim; // Stride of K is based on n_kv_heads
+                        const int ldc_k = kv_len;
+
+                        // Optimized path for decoding (seq_len == 1) on FP32
+                        if (seq_len == 1 && std::is_same_v<TensorT, FP32Tensor>)
                         {
-                            // 1. Q @ K^T
-                            for (int t = 0; t < kv_len; ++t)
+                            if constexpr (std::is_same_v<TensorT, FP32Tensor>)
                             {
-                                const float *k_ptr = K_h + t * ldb_k;
-                                float dot = 0.0f;
+                                // 1. Q @ K^T
+                                for (int t = 0; t < kv_len; ++t)
+                                {
+                                    const float *k_ptr = K_h + t * ldb_k;
+                                    float dot = 0.0f;
 #pragma omp simd reduction(+ : dot)
-                                for (int d = 0; d < head_dim; ++d)
-                                {
-                                    dot += Q_h[d] * k_ptr[d];
+                                    for (int d = 0; d < head_dim; ++d)
+                                    {
+                                        dot += Q_h[d] * k_ptr[d];
+                                    }
+                                    scores_h[t] = dot * scale;
+                                    if (mask)
+                                        scores_h[t] += mask[t];
                                 }
-                                scores_h[t] = dot * scale;
-                                if (mask)
-                                    scores_h[t] += mask[t];
-                            }
 
-                            // 2. Softmax (Vectorized)
-                            // Note: scale is already applied in step 1, so we pass 1.0f here.
-                            // Causal masking is also handled in step 1 via the mask add.
-                            llaminar2::primitives::softmax_row_fp32(
-                                scores_h,
-                                kv_len,
-                                false, // causal
-                                1.0f,  // scale
-                                -1     // row_idx
-                            );
+                                // 2. Softmax (Vectorized)
+                                // Note: scale is already applied in step 1, so we pass 1.0f here.
+                                // Causal masking is also handled in step 1 via the mask add.
+                                llaminar2::primitives::softmax_row_fp32(
+                                    scores_h,
+                                    kv_len,
+                                    false, // causal
+                                    1.0f,  // scale
+                                    -1     // row_idx
+                                );
 
-                            // 3. Scores @ V
-                            const float *weights_h = scores_h;
-                            const ElementType *V_h = V + kv_h * head_dim;
-                            float *output_h = output + h * head_dim;
+                                // 3. Scores @ V
+                                const float *weights_h = scores_h;
+                                const ElementType *V_h = V + kv_h * head_dim;
+                                float *output_h = output + h * head_dim;
 
-                            const int ldb_v = n_kv_heads * head_dim;
+                                const int ldb_v = n_kv_heads * head_dim;
 
-                            // Initialize output to 0
-                            std::memset(output_h, 0, head_dim * sizeof(float));
+                                // Initialize output to 0
+                                std::memset(output_h, 0, head_dim * sizeof(float));
 
-                            for (int t = 0; t < kv_len; ++t)
-                            {
-                                float s = weights_h[t];
-                                const float *v_ptr = V_h + t * ldb_v;
+                                for (int t = 0; t < kv_len; ++t)
+                                {
+                                    float s = weights_h[t];
+                                    const float *v_ptr = V_h + t * ldb_v;
 #pragma omp simd
-                                for (int d = 0; d < head_dim; ++d)
-                                {
-                                    output_h[d] += s * v_ptr[d];
+                                    for (int d = 0; d < head_dim; ++d)
+                                    {
+                                        output_h[d] += s * v_ptr[d];
+                                    }
                                 }
+                                continue; // Skip generic path
                             }
-                            continue; // Skip generic path
                         }
+
+                        gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
+                            Q_h, K_h, scores_h,
+                            seq_len, kv_len, head_dim,
+                            lda_k, ldb_k, ldc_k,
+                            scale,
+                            true, // transpose_B
+                            1,    // softmax_axis
+                            mask,
+                            causal,
+                            nullptr, -1, format);
+
+                        // --- Step 2: Scores @ V -> Output ---
+                        const float *weights_h = scores_h; // Reuse scores_h
+                        const ElementType *V_h = V + kv_h * head_dim;
+                        float *output_h = output + h * head_dim;
+
+                        const int lda_v = kv_len;
+                        const int ldb_v = n_kv_heads * head_dim; // Stride of V is based on n_kv_heads
+                        const int ldc_v = n_heads * head_dim;
+
+                        gemm->template multiply_activations_strided_typed<float, ElementType>(
+                            weights_h, V_h, output_h,
+                            seq_len, head_dim, kv_len,
+                            lda_v, ldb_v, ldc_v,
+                            false, 1.0f, 0.0f, nullptr, -1, format);
                     }
-
-                    gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
-                        Q_h, K_h, scores_h,
-                        seq_len, kv_len, head_dim,
-                        lda_k, ldb_k, ldc_k,
-                        scale,
-                        true, // transpose_B
-                        1,    // softmax_axis
-                        mask,
-                        causal,
-                        nullptr, -1, format);
-
-                    // --- Step 2: Scores @ V -> Output ---
-                    const float *weights_h = scores_h; // Reuse scores_h
-                    const ElementType *V_h = V + kv_h * head_dim;
-                    float *output_h = output + h * head_dim;
-
-                    const int lda_v = kv_len;
-                    const int ldb_v = n_kv_heads * head_dim; // Stride of V is based on n_kv_heads
-                    const int ldc_v = n_heads * head_dim;
-
-                    gemm->template multiply_activations_strided_typed<float, ElementType>(
-                        weights_h, V_h, output_h,
-                        seq_len, head_dim, kv_len,
-                        lda_v, ldb_v, ldc_v,
-                        false, 1.0f, 0.0f, nullptr, -1, format);
-                }
+                };
+                OMP_WORKSHARE_REGION_IF(typed_attention_work, parallelize_heads);
 
                 return true;
             }
@@ -1060,97 +1079,112 @@ namespace llaminar2
                 parallelize_heads = false;
             }
 
-#pragma omp parallel for if (parallelize_heads)
-            for (int h = 0; h < n_heads; ++h)
+            // Q@K^T GEMM for each head (nested-safe)
+            auto qkt_gemm_work = [&]()
             {
-                float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
 
-                // Strided Q@K^T with fused scaling
-                const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
+                    // Strided Q@K^T with fused scaling
+                    const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
 
-                // Virtual GQA: Map head h to kv_head
-                int kv_h = h / heads_per_kv;
-                const float *K_h = K_fp32.data() + kv_h * head_dim; // K_fp32: already FP32
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
+                    const float *K_h = K_fp32.data() + kv_h * head_dim; // K_fp32: already FP32
 
-                const int lda = n_heads * head_dim;    // Q: stride between rows (skip other heads)
-                const int ldb = n_kv_heads * head_dim; // K: stride between rows (skip other heads)
-                const int ldc = seq_len;               // scores: contiguous [seq_len, seq_len]
+                    const int lda = n_heads * head_dim;    // Q: stride between rows (skip other heads)
+                    const int ldb = n_kv_heads * head_dim; // K: stride between rows (skip other heads)
+                    const int ldc = seq_len;               // scores: contiguous [seq_len, seq_len]
 
-                // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
-                gemm->multiply_activations_strided(
-                    Q_h,                        // FP32 Q head
-                    K_h,                        // FP32 K head (after broadcast if GQA)
-                    scores_h,                   // FP32 scores output
-                    seq_len, seq_len, head_dim, // m=seq_len, n=seq_len, k=head_dim
-                    lda, ldb, ldc,
-                    true,    // transpose_B=true (K^T)
-                    scale,   // alpha=1/sqrt(d_k) - FUSED SCALING!
-                    0.0f,    // beta
-                    nullptr, // mpi_ctx
-                    -1);     // device_idx (CPU)
-            }
+                    // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
+                    gemm->multiply_activations_strided(
+                        Q_h,                        // FP32 Q head
+                        K_h,                        // FP32 K head (after broadcast if GQA)
+                        scores_h,                   // FP32 scores output
+                        seq_len, seq_len, head_dim, // m=seq_len, n=seq_len, k=head_dim
+                        lda, ldb, ldc,
+                        true,    // transpose_B=true (K^T)
+                        scale,   // alpha=1/sqrt(d_k) - FUSED SCALING!
+                        0.0f,    // beta
+                        nullptr, // mpi_ctx
+                        -1);     // device_idx (CPU)
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(qkt_gemm_work, parallelize_heads);
 
             if (mask)
             {
-#pragma omp parallel for if (n_heads > 1)
-                for (int h = 0; h < n_heads; ++h)
+                auto mask_apply_work = [&]()
                 {
-                    float *scores_h = scores + h * seq_len * seq_len;
-                    attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
-                }
+#pragma omp for schedule(static)
+                    for (int h = 0; h < n_heads; ++h)
+                    {
+                        float *scores_h = scores + h * seq_len * seq_len;
+                        attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
+                    }
+                };
+                OMP_WORKSHARE_REGION_IF(mask_apply_work, n_heads > 1);
             }
 
-            // 3. Apply softmax with optional causal masking
+            // 3. Apply softmax with optional causal masking (nested-safe)
             // Softmax operates on FP32 workspaces (even for BF16/FP16 inputs)
             // Softmax is lightweight, parallelize even with few heads
-
-#pragma omp parallel for if (n_heads > 1)
-            for (int h = 0; h < n_heads; ++h)
+            auto softmax_work = [&]()
             {
-                float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len; // FP32 workspace
 
-                // Apply FP32 softmax directly (workspaces are always FP32)
-                primitives::softmax_row_major_fp32(scores_h, seq_len, seq_len, causal, 1.0f, true);
-            }
+                    // Apply FP32 softmax directly (workspaces are always FP32)
+                    primitives::softmax_row_major_fp32(scores_h, seq_len, seq_len, causal, 1.0f, true);
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(softmax_work, n_heads > 1);
 
             // 4. Compute context: weights @ V using strided GEMM (zero-copy multi-head)
             // Zero output once before parallel region
             std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 
             // Reuse GEMM kernel from Q@K^T computation
-            // Reuse parallelism strategy
-
-#pragma omp parallel for if (parallelize_heads)
-            for (int h = 0; h < n_heads; ++h)
+            // Reuse parallelism strategy (nested-safe)
+            auto weights_v_work = [&]()
             {
-                // NOTE: weights_h points to FP32 workspace (scores)
-                const float *weights_h = scores + h * seq_len * seq_len;
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    // NOTE: weights_h points to FP32 workspace (scores)
+                    const float *weights_h = scores + h * seq_len * seq_len;
 
-                // Virtual GQA: Map head h to kv_head
-                int kv_h = h / heads_per_kv;
-                const float *V_h = V_fp32.data() + kv_h * head_dim; // V_fp32 is float*
+                    // Virtual GQA: Map head h to kv_head
+                    int kv_h = h / heads_per_kv;
+                    const float *V_h = V_fp32.data() + kv_h * head_dim; // V_fp32 is float*
 
-                // CRITICAL: output is float* (not ElementType*), pointer arithmetic in floats
-                float *output_h = output + h * head_dim; // First element of head h
+                    // CRITICAL: output is float* (not ElementType*), pointer arithmetic in floats
+                    float *output_h = output + h * head_dim; // First element of head h
 
-                // Strided GEMM: context = weights @ V
-                const int lda = seq_len;               // weights: contiguous [seq_len, seq_len]
-                const int ldb = n_kv_heads * head_dim; // V: stride between rows (skip other heads)
-                const int ldc = n_heads * head_dim;    // output: stride between rows
+                    // Strided GEMM: context = weights @ V
+                    const int lda = seq_len;               // weights: contiguous [seq_len, seq_len]
+                    const int ldb = n_kv_heads * head_dim; // V: stride between rows (skip other heads)
+                    const int ldc = n_heads * head_dim;    // output: stride between rows
 
-                // Strided GEMM: context = weights @ V
-                gemm->multiply_activations_strided(
-                    weights_h,                  // Already float*, no cast needed
-                    V_h,                        // Already float*, no cast needed
-                    output_h,                   // Already float*, no cast needed
-                    seq_len, head_dim, seq_len, // m=seq_len, n=head_dim, k=seq_len
-                    lda, ldb, ldc,
-                    false,   // transpose_B=false (weights @ V, not V^T)
-                    1.0f,    // alpha
-                    0.0f,    // beta (output already zeroed)
-                    nullptr, // mpi_ctx
-                    -1);     // device_idx (CPU)
-            }
+                    // Strided GEMM: context = weights @ V
+                    gemm->multiply_activations_strided(
+                        weights_h,                  // Already float*, no cast needed
+                        V_h,                        // Already float*, no cast needed
+                        output_h,                   // Already float*, no cast needed
+                        seq_len, head_dim, seq_len, // m=seq_len, n=head_dim, k=seq_len
+                        lda, ldb, ldc,
+                        false,   // transpose_B=false (weights @ V, not V^T)
+                        1.0f,    // alpha
+                        0.0f,    // beta (output already zeroed)
+                        nullptr, // mpi_ctx
+                        -1);     // device_idx (CPU)
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(weights_v_work, parallelize_heads);
 
             return true;
         }

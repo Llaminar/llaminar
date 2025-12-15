@@ -24,6 +24,8 @@
 #include <omp.h>
 #endif
 
+#include "../../../utils/OpenMPUtils.h"
+
 namespace llaminar2
 {
 
@@ -53,6 +55,9 @@ namespace llaminar2
      * - Multiple rows (prefill) where work can be distributed, OR
      * - Single row with very large d_model where SIMD parallelism helps
      *
+     * Note: This now returns true even when already in a parallel region,
+     * because OMP_WORKSHARE_REGION will handle nested worksharing properly.
+     *
      * @param rows Number of rows (sequence length)
      * @param cols Number of columns (d_model)
      * @return true if parallelization is likely beneficial
@@ -60,10 +65,6 @@ namespace llaminar2
     inline bool want_parallel(int rows, size_t cols)
     {
 #ifdef _OPENMP
-        // Already in a parallel region - don't nest
-        if (omp_in_parallel())
-            return false;
-
         // Multiple rows: parallelize if we have enough work per thread
         if (rows >= MIN_ROWS_FOR_PARALLEL)
             return true;
@@ -147,25 +148,23 @@ namespace llaminar2
 
         if (use_parallel)
         {
-            // Parallel path: spawn threads, each with thread-local scratch
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+            // Parallel/worksharing path with thread-local scratch
+            auto do_work = [&]()
             {
+                // Thread-local scratch allocation
                 std::array<float, MAX_STACK_ROW_SIZE> stack_scratch;
                 std::vector<float> heap_scratch;
                 float *scratch = (ucols <= MAX_STACK_ROW_SIZE)
                                      ? stack_scratch.data()
                                      : (heap_scratch.resize(ucols), heap_scratch.data());
 
-#ifdef _OPENMP
-#pragma omp for
-#endif
+#pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
                 {
                     process_row(row, scratch);
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
         else
         {
@@ -226,9 +225,7 @@ namespace llaminar2
 
         if (use_parallel)
         {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+            auto do_work = [&]()
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
@@ -240,14 +237,13 @@ namespace llaminar2
                                       ? stack_fp32_out.data()
                                       : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
-#ifdef _OPENMP
-#pragma omp for
-#endif
+#pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
                 {
                     process_row(row, fp32_in, fp32_out);
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
         else
         {
@@ -310,9 +306,7 @@ namespace llaminar2
 
         if (use_parallel)
         {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+            auto do_work = [&]()
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
@@ -324,14 +318,13 @@ namespace llaminar2
                                       ? stack_fp32_out.data()
                                       : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
-#ifdef _OPENMP
-#pragma omp for
-#endif
+#pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
                 {
                     process_row(row, fused, fp32_out);
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
         else
         {
@@ -396,9 +389,7 @@ namespace llaminar2
 
         if (use_parallel)
         {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+            auto do_work = [&]()
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
@@ -410,14 +401,13 @@ namespace llaminar2
                                       ? stack_fp32_out.data()
                                       : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
-#ifdef _OPENMP
-#pragma omp for
-#endif
+#pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
                 {
                     process_row(row, fp32_in, fp32_out);
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
         else
         {
@@ -480,9 +470,7 @@ namespace llaminar2
 
         if (use_parallel)
         {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+            auto do_work = [&]()
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
@@ -494,14 +482,13 @@ namespace llaminar2
                                       ? stack_fp32_out.data()
                                       : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
-#ifdef _OPENMP
-#pragma omp for
-#endif
+#pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
                 {
                     process_row(row, fused, fp32_out);
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
         else
         {
@@ -614,9 +601,7 @@ namespace llaminar2
 
         if (use_parallel)
         {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+            auto do_work = [&]()
             {
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fused;
                 std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
@@ -628,14 +613,13 @@ namespace llaminar2
                                       ? stack_fp32_out.data()
                                       : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
 
-#ifdef _OPENMP
-#pragma omp for
-#endif
+#pragma omp for schedule(static)
                 for (int row = 0; row < rows; ++row)
                 {
                     process_row(row, fused, fp32_out);
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
         else
         {

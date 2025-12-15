@@ -1973,6 +1973,62 @@ add_v2_test(V2_Unit_PipelineDeviceDetection
     LABELS "V2;Unit;PipelineExecution;DeviceManagement;MoE;Phase3"
 )
 
+# =============================================================================
+# Execution Framework Tests (WorkDistributor, DeviceContext)
+# =============================================================================
+
+# Test: WorkDistributor (hierarchical work distribution across ranks/devices)
+# Tests rank-level slicing, device-level slicing with weights, and hierarchical distribution
+add_executable(v2_test_work_distributor unit/Test__WorkDistributor.cpp)
+target_link_libraries(v2_test_work_distributor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_WorkDistributor
+    COMMAND $<TARGET_FILE:v2_test_work_distributor>
+    LABELS "V2;Unit;Execution;WorkDistribution;MPI;DeviceManagement;HierarchicalSlicing"
+    MPI_PROCS 1  # Tests slice computation, not actual MPI communication
+)
+
+# Test: DeviceContext (abstract execution context for CPU/GPU)
+# Tests CPUDeviceContext memory allocation, parallel execution, and workspace management
+add_executable(v2_test_device_context unit/Test__DeviceContext.cpp)
+target_link_libraries(v2_test_device_context llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceContext
+    COMMAND $<TARGET_FILE:v2_test_device_context>
+    LABELS "V2;Unit;Execution;DeviceContext;OpenMP;MemoryManagement;ParallelExecution"
+    MPI_PROCS 1  # Tests CPU context locally, no MPI needed
+)
+
+# Test: ComputeStage (device-agnostic kernel dispatch abstraction)
+# Tests all compute stage types: RMSNorm, RoPE, Attention, SwiGLU, ResidualAdd, MoE stages
+add_executable(v2_test_compute_stage unit/Test__ComputeStage.cpp)
+target_link_libraries(v2_test_compute_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ComputeStage
+    COMMAND $<TARGET_FILE:v2_test_compute_stage>
+    LABELS "V2;Unit;Execution;ComputeStage;RMSNorm;RoPE;Attention;SwiGLU;MoE;KernelDispatch"
+    MPI_PROCS 1  # Tests CPU stages locally, no MPI needed
+)
+
+# Test: LayerExecutor (layer-level execution orchestration)
+# Tests compute graph construction, topological ordering, dependency tracking,
+# attention/FFN/MoE graph building, and multi-device execution
+add_executable(v2_test_layer_executor unit/Test__LayerExecutor.cpp)
+target_link_libraries(v2_test_layer_executor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LayerExecutor
+    COMMAND $<TARGET_FILE:v2_test_layer_executor>
+    LABELS "V2;Unit;Execution;LayerExecutor;ComputeGraph;Orchestration;Attention;FFN;MoE;MultiDevice"
+    MPI_PROCS 1  # Tests execution orchestration locally
+)
+
+# Test: PipelineExecutor (LayerExecutor-to-pipeline adapter)
+# Tests configuration, device context management, and individual operation execution
+# Bridges new execution framework with existing pipeline infrastructure
+add_executable(v2_test_pipeline_executor unit/Test__PipelineExecutor.cpp)
+target_link_libraries(v2_test_pipeline_executor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PipelineExecutor
+    COMMAND $<TARGET_FILE:v2_test_pipeline_executor>
+    LABELS "V2;Unit;PipelineExecution;Execution;LayerExecutor;ComputeStage;DeviceContext"
+    MPI_PROCS 1
+)
+
 # Test: PipelineBase Precision Mode
 # Tests WeightPrecision and ActivationPrecision configuration flow through PipelineBase
 add_executable(v2_test_pipeline_precision_mode unit/pipelines/Test__PipelineBase_PrecisionMode.cpp)

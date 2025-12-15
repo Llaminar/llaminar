@@ -32,6 +32,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../CPUKernelBase.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
 
@@ -1137,27 +1138,35 @@ namespace llaminar2
                 // 2. Add mask
                 if (mask)
                 {
-#pragma omp parallel for collapse(2)
-                    for (int i = 0; i < m; ++i)
+                    auto add_mask_work = [&]()
                     {
-                        for (int j = 0; j < n; ++j)
+#pragma omp for collapse(2) schedule(static)
+                        for (int i = 0; i < m; ++i)
                         {
-                            C[i * n + j] += mask[i * n + j];
+                            for (int j = 0; j < n; ++j)
+                            {
+                                C[i * n + j] += mask[i * n + j];
+                            }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_REGION(add_mask_work);
                 }
 
                 // 3. Causal mask
                 if (is_causal)
                 {
-#pragma omp parallel for
-                    for (int i = 0; i < m; ++i)
+                    auto causal_mask_work = [&]()
                     {
-                        for (int j = i + 1; j < n; ++j)
+#pragma omp for schedule(static)
+                        for (int i = 0; i < m; ++i)
                         {
-                            C[i * n + j] = -std::numeric_limits<float>::infinity();
+                            for (int j = i + 1; j < n; ++j)
+                            {
+                                C[i * n + j] = -std::numeric_limits<float>::infinity();
+                            }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_REGION(causal_mask_work);
                 }
 
                 // 4. Softmax
@@ -1272,14 +1281,18 @@ namespace llaminar2
                 // 2. Add mask if provided
                 if (mask)
                 {
-#pragma omp parallel for collapse(2)
-                    for (int i = 0; i < m; ++i)
+                    auto add_mask_work = [&]()
                     {
-                        for (int j = 0; j < n; ++j)
+#pragma omp for collapse(2) schedule(static)
+                        for (int i = 0; i < m; ++i)
                         {
-                            C[i * n + j] += mask[i * n + j];
+                            for (int j = 0; j < n; ++j)
+                            {
+                                C[i * n + j] += mask[i * n + j];
+                            }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_REGION(add_mask_work);
                 }
 
                 // 3. Softmax
@@ -1394,11 +1407,15 @@ namespace llaminar2
                 }
                 else
                 {
-#pragma omp parallel for
-                    for (int r = 0; r < m; ++r)
+                    auto softmax_row_work = [&]()
                     {
-                        primitives::softmax_row_fp32(C + r * ldc, n, false, 1.0f, -1);
-                    }
+#pragma omp for schedule(static)
+                        for (int r = 0; r < m; ++r)
+                        {
+                            primitives::softmax_row_fp32(C + r * ldc, n, false, 1.0f, -1);
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(softmax_row_work);
                 }
 
                 return true;

@@ -8,6 +8,7 @@
 #include "../utils/DebugAssert.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/KernelProfiler.h"
+#include "../utils/OpenMPUtils.h"
 #include "PipelineBase.h"
 #include "attention/MpiAttentionOrchestrator.h"
 #include "../tensors/TensorFactory.h"
@@ -1261,11 +1262,31 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        if (!typed_rmsnorm_op_ || !typed_rmsnorm_op_->execute(
-                                      input, gamma, output, rows, cols, eps,
-                                      mpi_ctx_.get(), target_device))
+        // Check if PipelineExecutor should handle this operation
+        // (based on config flags and whether this is FFN or attention norm)
+        bool is_ffn_norm = snapshot_key.find("FFN_NORM") != std::string::npos;
+        bool is_attn_norm = snapshot_key.find("ATTENTION_NORM") != std::string::npos;
+        bool use_executor = pipeline_executor_ &&
+                            ((is_ffn_norm && config_.executor_ffn_norm) ||
+                             (is_attn_norm && config_.executor_attn_norm));
+
+        if (use_executor)
         {
-            return false;
+            // Use new multi-device executor framework
+            if (!pipeline_executor_->executeRMSNorm(input, gamma, output, rows, cols, eps))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // Use existing typed op
+            if (!typed_rmsnorm_op_ || !typed_rmsnorm_op_->execute(
+                                          input, gamma, output, rows, cols, eps,
+                                          mpi_ctx_.get(), target_device))
+            {
+                return false;
+            }
         }
 
         // Capture snapshot
@@ -1404,16 +1425,19 @@ namespace llaminar2
                 }
 
                 // Gather blocks row by row (strided pattern)
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 const int local_row_bytes = static_cast<int>(blocks_per_row_local * sizeof(Q8_1Block));
 
-                for (int row = 0; row < m; ++row)
-                {
-                    const Q8_1Block *src_row = local_blocks + row * blocks_per_row_local;
-                    Q8_1Block *dst_row = output_blocks + row * blocks_per_row_full;
+                OMP_SINGLE([&]()
+                           {
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const Q8_1Block *src_row = local_blocks + row * blocks_per_row_local;
+                        Q8_1Block *dst_row = output_blocks + row * blocks_per_row_full;
 
-                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
-                                               dst_row, recv_counts.data(), displs.data());
-                }
+                        mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                                   dst_row, recv_counts.data(), displs.data());
+                    } });
 
                 LOG_TRACE("[TP GEMM] Row-parallel TensorSlice Q8_1-native completed for " << snapshot_key
                                                                                           << " (m=" << m << ", n_local=" << n_local << "/" << n
@@ -1460,16 +1484,19 @@ namespace llaminar2
                 }
 
                 // Gather elements row by row
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 const int local_row_bytes = static_cast<int>(n_local * sizeof(uint16_t));
 
-                for (int row = 0; row < m; ++row)
-                {
-                    const uint16_t *src_row = local_data + row * n_local;
-                    uint16_t *dst_row = output_data + row * n;
+                OMP_SINGLE([&]()
+                           {
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const uint16_t *src_row = local_data + row * n_local;
+                        uint16_t *dst_row = output_data + row * n;
 
-                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
-                                               dst_row, recv_counts.data(), displs.data());
-                }
+                        mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                                   dst_row, recv_counts.data(), displs.data());
+                    } });
 
                 LOG_TRACE("[TP GEMM] Row-parallel TensorSlice BF16-native completed for " << snapshot_key);
                 return true;
@@ -1514,16 +1541,19 @@ namespace llaminar2
                 }
 
                 // Gather elements row by row
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 const int local_row_bytes = static_cast<int>(n_local * sizeof(uint16_t));
 
-                for (int row = 0; row < m; ++row)
-                {
-                    const uint16_t *src_row = local_data + row * n_local;
-                    uint16_t *dst_row = output_data + row * n;
+                OMP_SINGLE([&]()
+                           {
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const uint16_t *src_row = local_data + row * n_local;
+                        uint16_t *dst_row = output_data + row * n;
 
-                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
-                                               dst_row, recv_counts.data(), displs.data());
-                }
+                        mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                                   dst_row, recv_counts.data(), displs.data());
+                    } });
 
                 LOG_TRACE("[TP GEMM] Row-parallel TensorSlice FP16-native completed for " << snapshot_key);
                 return true;
@@ -1597,16 +1627,19 @@ namespace llaminar2
             }
 
             // Gather elements row by row
+            // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
             const int local_row_bytes = static_cast<int>(n_local * sizeof(float));
 
-            for (int row = 0; row < m; ++row)
-            {
-                const float *src_row = local_data + row * n_local;
-                float *dst_row = out_data + row * n;
+            OMP_SINGLE([&]()
+                       {
+                for (int row = 0; row < m; ++row)
+                {
+                    const float *src_row = local_data + row * n_local;
+                    float *dst_row = out_data + row * n;
 
-                mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
-                                           dst_row, recv_counts.data(), displs.data());
-            }
+                    mpi_ctx_->allgatherv_bytes(src_row, local_row_bytes,
+                                               dst_row, recv_counts.data(), displs.data());
+                } });
 
             // If output is Q8_1, quantize FP32 result into Q8_1 blocks
             if (output_q8_1)
@@ -1616,27 +1649,31 @@ namespace llaminar2
 
                 const size_t blocks_per_row = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-#pragma omp parallel for
-                for (int row = 0; row < m; ++row)
+                auto quantize_work = [&]()
                 {
-                    const float *src_row = fp32_data + row * n;
-                    Q8_1Block *dst_blocks = q8_blocks + row * blocks_per_row;
-
-                    const size_t n_full_blocks = n / BLOCK_SIZE;
-                    simd::quantize_fp32_to_q8_1_blocks(src_row, dst_blocks, n_full_blocks * BLOCK_SIZE);
-
-                    // Handle tail elements if any
-                    const size_t tail_start = n_full_blocks * BLOCK_SIZE;
-                    if (tail_start < static_cast<size_t>(n))
+#pragma omp for schedule(static)
+                    for (int row = 0; row < m; ++row)
                     {
-                        const size_t tail_count = n - tail_start;
-                        Q8_1Block &tail_block = dst_blocks[n_full_blocks];
+                        const float *src_row = fp32_data + row * n;
+                        Q8_1Block *dst_blocks = q8_blocks + row * blocks_per_row;
 
-                        float tail_buf[BLOCK_SIZE] = {0};
-                        std::memcpy(tail_buf, src_row + tail_start, tail_count * sizeof(float));
-                        simd::quantize_fp32_to_q8_1_blocks(tail_buf, &tail_block, BLOCK_SIZE);
+                        const size_t n_full_blocks = n / BLOCK_SIZE;
+                        simd::quantize_fp32_to_q8_1_blocks(src_row, dst_blocks, n_full_blocks * BLOCK_SIZE);
+
+                        // Handle tail elements if any
+                        const size_t tail_start = n_full_blocks * BLOCK_SIZE;
+                        if (tail_start < static_cast<size_t>(n))
+                        {
+                            const size_t tail_count = n - tail_start;
+                            Q8_1Block &tail_block = dst_blocks[n_full_blocks];
+
+                            float tail_buf[BLOCK_SIZE] = {0};
+                            std::memcpy(tail_buf, src_row + tail_start, tail_count * sizeof(float));
+                            simd::quantize_fp32_to_q8_1_blocks(tail_buf, &tail_block, BLOCK_SIZE);
+                        }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(quantize_work);
             }
 
             LOG_TRACE("[TP GEMM] Row-parallel TensorSlice completed for " << snapshot_key
@@ -1698,10 +1735,12 @@ namespace llaminar2
                 }
 
                 // Native Q8_1 allreduce-sum (AVX512 dequant→sum→requant)
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 Q8_1Block *blocks = output_q8_1->mutable_q8_1_blocks();
                 const size_t output_size = static_cast<size_t>(m) * n;
                 const size_t n_blocks = (output_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks);
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks); });
 
                 LOG_TRACE("[TP GEMM] K-sliced Q8_1-native completed for " << snapshot_key
                                                                           << " (m=" << m << ", n=" << n
@@ -1722,13 +1761,17 @@ namespace llaminar2
                 const uint16_t *src = input_bf16->bf16_data();
                 uint16_t *dst = input_local.mutable_bf16_data();
 
-#pragma omp parallel for
-                for (int row = 0; row < m; ++row)
+                auto bf16_slice_work = [&]()
                 {
-                    const uint16_t *src_row = src + row * k + k_start;
-                    uint16_t *dst_row = dst + row * k_local;
-                    std::memcpy(dst_row, src_row, k_local * sizeof(uint16_t));
-                }
+#pragma omp for schedule(static)
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const uint16_t *src_row = src + row * k + k_start;
+                        uint16_t *dst_row = dst + row * k_local;
+                        std::memcpy(dst_row, src_row, k_local * sizeof(uint16_t));
+                    }
+                };
+                OMP_WORKSHARE_REGION(bf16_slice_work);
 
                 // GEMM: [m, k_local] (BF16) @ [n, k_local]^T → [m, n] (BF16)
                 if (!typed_gemm_op_->execute(&input_local, weight, output_bf16, m, n, k_local,
@@ -1739,9 +1782,11 @@ namespace llaminar2
                 }
 
                 // Native BF16 allreduce-sum
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 uint16_t *out_data = output_bf16->mutable_bf16_data();
                 const size_t output_size = static_cast<size_t>(m) * n;
-                mpi_ctx_->allreduce_bf16_inplace(out_data, output_size);
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_bf16_inplace(out_data, output_size); });
 
                 LOG_TRACE("[TP GEMM] K-sliced BF16-native completed for " << snapshot_key);
                 return true;
@@ -1760,13 +1805,17 @@ namespace llaminar2
                 const uint16_t *src = input_fp16->fp16_data();
                 uint16_t *dst = input_local.mutable_fp16_data();
 
-#pragma omp parallel for
-                for (int row = 0; row < m; ++row)
+                auto fp16_slice_work = [&]()
                 {
-                    const uint16_t *src_row = src + row * k + k_start;
-                    uint16_t *dst_row = dst + row * k_local;
-                    std::memcpy(dst_row, src_row, k_local * sizeof(uint16_t));
-                }
+#pragma omp for schedule(static)
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const uint16_t *src_row = src + row * k + k_start;
+                        uint16_t *dst_row = dst + row * k_local;
+                        std::memcpy(dst_row, src_row, k_local * sizeof(uint16_t));
+                    }
+                };
+                OMP_WORKSHARE_REGION(fp16_slice_work);
 
                 // GEMM: [m, k_local] (FP16) @ [n, k_local]^T → [m, n] (FP16)
                 if (!typed_gemm_op_->execute(&input_local, weight, output_fp16, m, n, k_local,
@@ -1777,9 +1826,11 @@ namespace llaminar2
                 }
 
                 // Native FP16 allreduce-sum
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 uint16_t *out_data = output_fp16->mutable_fp16_data();
                 const size_t output_size = static_cast<size_t>(m) * n;
-                mpi_ctx_->allreduce_fp16_inplace(out_data, output_size);
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_fp16_inplace(out_data, output_size); });
 
                 LOG_TRACE("[TP GEMM] K-sliced FP16-native completed for " << snapshot_key);
                 return true;
@@ -1828,15 +1879,19 @@ namespace llaminar2
                     float *dst = input_local_tensor->mutable_data();
                     const uint16_t *bf16_src = input_bf16->bf16_data();
 
-#pragma omp parallel for
-                    for (int row = 0; row < m; ++row)
+                    auto bf16_dequant_work = [&]()
                     {
-                        for (int col = 0; col < k_local; ++col)
+#pragma omp for schedule(static)
+                        for (int row = 0; row < m; ++row)
                         {
-                            uint16_t bf16_val = bf16_src[row * k + k_start + col];
-                            dst[row * k_local + col] = simd::bf16_to_fp32(bf16_val);
+                            for (int col = 0; col < k_local; ++col)
+                            {
+                                uint16_t bf16_val = bf16_src[row * k + k_start + col];
+                                dst[row * k_local + col] = simd::bf16_to_fp32(bf16_val);
+                            }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_REGION(bf16_dequant_work);
                     input_for_gemm = input_local_tensor.get();
                 }
                 else if (input_fp16)
@@ -1848,15 +1903,19 @@ namespace llaminar2
                     float *dst = input_local_tensor->mutable_data();
                     const uint16_t *fp16_src = input_fp16->fp16_data();
 
-#pragma omp parallel for
-                    for (int row = 0; row < m; ++row)
+                    auto fp16_dequant_work = [&]()
                     {
-                        for (int col = 0; col < k_local; ++col)
+#pragma omp for schedule(static)
+                        for (int row = 0; row < m; ++row)
                         {
-                            uint16_t fp16_val = fp16_src[row * k + k_start + col];
-                            dst[row * k_local + col] = simd::fp16_to_fp32(fp16_val);
+                            for (int col = 0; col < k_local; ++col)
+                            {
+                                uint16_t fp16_val = fp16_src[row * k + k_start + col];
+                                dst[row * k_local + col] = simd::fp16_to_fp32(fp16_val);
+                            }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_REGION(fp16_dequant_work);
                     input_for_gemm = input_local_tensor.get();
                 }
                 else
@@ -1870,13 +1929,17 @@ namespace llaminar2
                 {
                     std::vector<float> input_local(static_cast<size_t>(m) * k_local);
 
-#pragma omp parallel for
-                    for (int row = 0; row < m; ++row)
+                    auto fp32_slice_work = [&]()
                     {
-                        const float *src_row = src + row * k + k_start;
-                        float *dst_row = input_local.data() + row * k_local;
-                        std::memcpy(dst_row, src_row, k_local * sizeof(float));
-                    }
+#pragma omp for schedule(static)
+                        for (int row = 0; row < m; ++row)
+                        {
+                            const float *src_row = src + row * k + k_start;
+                            float *dst_row = input_local.data() + row * k_local;
+                            std::memcpy(dst_row, src_row, k_local * sizeof(float));
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(fp32_slice_work);
 
                     std::vector<size_t> local_shape = {static_cast<size_t>(m), static_cast<size_t>(k_local)};
                     input_local_tensor = std::make_unique<FP32Tensor>(local_shape);
@@ -1916,9 +1979,11 @@ namespace llaminar2
             }
 
             // FP32 allreduce-sum
+            // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
             float *out_data = output_for_allreduce->mutable_data();
             const size_t output_size = static_cast<size_t>(m) * n;
-            mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+            OMP_SINGLE([&]()
+                       { mpi_ctx_->allreduce_sum_inplace(out_data, output_size); });
 
             // Convert FP32 result to output tensor type if needed
             if (output_q8_1)
@@ -1927,48 +1992,60 @@ namespace llaminar2
                 const float *fp32_data = output_for_allreduce->data();
                 const size_t blocks_per_row = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-#pragma omp parallel for
-                for (int row = 0; row < m; ++row)
+                auto quantize_work = [&]()
                 {
-                    const float *src_row = fp32_data + row * n;
-                    Q8_1Block *dst_blocks = q8_blocks + row * blocks_per_row;
-
-                    const size_t n_full_blocks = n / BLOCK_SIZE;
-                    simd::quantize_fp32_to_q8_1_blocks(src_row, dst_blocks, n_full_blocks * BLOCK_SIZE);
-
-                    const size_t tail_start = n_full_blocks * BLOCK_SIZE;
-                    if (tail_start < static_cast<size_t>(n))
+#pragma omp for schedule(static)
+                    for (int row = 0; row < m; ++row)
                     {
-                        const size_t tail_count = n - tail_start;
-                        Q8_1Block &tail_block = dst_blocks[n_full_blocks];
+                        const float *src_row = fp32_data + row * n;
+                        Q8_1Block *dst_blocks = q8_blocks + row * blocks_per_row;
 
-                        float tail_buf[BLOCK_SIZE] = {0};
-                        std::memcpy(tail_buf, src_row + tail_start, tail_count * sizeof(float));
-                        simd::quantize_fp32_to_q8_1_blocks(tail_buf, &tail_block, BLOCK_SIZE);
+                        const size_t n_full_blocks = n / BLOCK_SIZE;
+                        simd::quantize_fp32_to_q8_1_blocks(src_row, dst_blocks, n_full_blocks * BLOCK_SIZE);
+
+                        const size_t tail_start = n_full_blocks * BLOCK_SIZE;
+                        if (tail_start < static_cast<size_t>(n))
+                        {
+                            const size_t tail_count = n - tail_start;
+                            Q8_1Block &tail_block = dst_blocks[n_full_blocks];
+
+                            float tail_buf[BLOCK_SIZE] = {0};
+                            std::memcpy(tail_buf, src_row + tail_start, tail_count * sizeof(float));
+                            simd::quantize_fp32_to_q8_1_blocks(tail_buf, &tail_block, BLOCK_SIZE);
+                        }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(quantize_work);
             }
             else if (output_bf16)
             {
                 const float *fp32_data = output_for_allreduce->data();
                 uint16_t *bf16_data = output_bf16->mutable_bf16_data();
 
-#pragma omp parallel for simd
-                for (size_t i = 0; i < output_size; ++i)
+                auto bf16_convert_work = [&]()
                 {
-                    bf16_data[i] = simd::fp32_to_bf16(fp32_data[i]);
-                }
+#pragma omp for simd schedule(static)
+                    for (size_t i = 0; i < output_size; ++i)
+                    {
+                        bf16_data[i] = simd::fp32_to_bf16(fp32_data[i]);
+                    }
+                };
+                OMP_WORKSHARE_REGION(bf16_convert_work);
             }
             else if (output_fp16)
             {
                 const float *fp32_data = output_for_allreduce->data();
                 uint16_t *fp16_data = output_fp16->mutable_fp16_data();
 
-#pragma omp parallel for simd
-                for (size_t i = 0; i < output_size; ++i)
+                auto fp16_convert_work = [&]()
                 {
-                    fp16_data[i] = simd::fp32_to_fp16(fp32_data[i]);
-                }
+#pragma omp for simd schedule(static)
+                    for (size_t i = 0; i < output_size; ++i)
+                    {
+                        fp16_data[i] = simd::fp32_to_fp16(fp32_data[i]);
+                    }
+                };
+                OMP_WORKSHARE_REGION(fp16_convert_work);
             }
 
             LOG_TRACE("[TP GEMM] K-sliced row-parallel (FP32 path) completed for " << snapshot_key
@@ -2000,13 +2077,19 @@ namespace llaminar2
                     // FP32: Scale then allreduce
                     float *out_data = output_fp32->mutable_data();
 
-#pragma omp parallel for simd
-                    for (size_t i = 0; i < output_size; ++i)
+                    auto scale_work = [&]()
                     {
-                        out_data[i] *= scale;
-                    }
+#pragma omp for simd schedule(static)
+                        for (size_t i = 0; i < output_size; ++i)
+                        {
+                            out_data[i] *= scale;
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(scale_work);
 
-                    mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+                    // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                    OMP_SINGLE([&]()
+                               { mpi_ctx_->allreduce_sum_inplace(out_data, output_size); });
 
                     LOG_TRACE("[TP GEMM] Row-parallel (replicated) FP32 allreduce for " << snapshot_key
                                                                                         << " (m=" << m << ", n=" << n << ")");
@@ -2023,14 +2106,20 @@ namespace llaminar2
 
                     // Scale Q8_1 blocks by 1/world_size (scale the 'd' field)
                     const size_t n_blocks = (output_size + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-#pragma omp parallel for
-                    for (size_t b = 0; b < n_blocks; ++b)
+                    auto block_scale_work = [&]()
                     {
-                        float d = fp16_to_fp32(blocks[b].d);
-                        blocks[b].d = fp32_to_fp16(d * scale);
-                    }
+#pragma omp for schedule(static)
+                        for (size_t b = 0; b < n_blocks; ++b)
+                        {
+                            float d = fp16_to_fp32(blocks[b].d);
+                            blocks[b].d = fp32_to_fp16(d * scale);
+                        }
+                    };
+                    OMP_WORKSHARE_REGION(block_scale_work);
 
-                    mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks);
+                    // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                    OMP_SINGLE([&]()
+                               { mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks); });
 
                     LOG_TRACE("[TP GEMM] Row-parallel (replicated) Q8_1-native allreduce for " << snapshot_key
                                                                                                << " (m=" << m << ", n=" << n << ", n_blocks=" << n_blocks << ")");
@@ -2048,7 +2137,9 @@ namespace llaminar2
                     // Scale FP16 values by 1/world_size
                     simd::fp16_scale_inplace(fp16_data, output_size, scale);
 
-                    mpi_ctx_->allreduce_fp16_inplace(fp16_data, output_size);
+                    // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                    OMP_SINGLE([&]()
+                               { mpi_ctx_->allreduce_fp16_inplace(fp16_data, output_size); });
 
                     LOG_TRACE("[TP GEMM] Row-parallel (replicated) FP16-native allreduce for " << snapshot_key
                                                                                                << " (m=" << m << ", n=" << n << ")");
@@ -2066,7 +2157,9 @@ namespace llaminar2
                     // Scale BF16 values by 1/world_size
                     simd::bf16_scale_inplace(bf16_data, output_size, scale);
 
-                    mpi_ctx_->allreduce_bf16_inplace(bf16_data, output_size);
+                    // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                    OMP_SINGLE([&]()
+                               { mpi_ctx_->allreduce_bf16_inplace(bf16_data, output_size); });
 
                     LOG_TRACE("[TP GEMM] Row-parallel (replicated) BF16-native allreduce for " << snapshot_key
                                                                                                << " (m=" << m << ", n=" << n << ")");
@@ -2118,8 +2211,10 @@ namespace llaminar2
             if (auto *output_fp32 = dynamic_cast<FP32Tensor *>(output))
             {
                 // FP32: Use native MPI_FLOAT allreduce
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
                 float *out_data = output_fp32->mutable_data();
-                mpi_ctx_->allreduce_sum_inplace(out_data, output_size);
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_sum_inplace(out_data, output_size); });
 
                 LOG_TRACE("[TP GEMM] Column-parallel FP32 allreduce completed for " << snapshot_key
                                                                                     << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
@@ -2137,7 +2232,9 @@ namespace llaminar2
 
                 // Calculate number of blocks: ceil(elements / 32)
                 const size_t n_blocks = (output_size + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks);
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_q8_1_inplace(blocks, n_blocks); });
 
                 LOG_TRACE("[TP GEMM] Column-parallel Q8_1-native allreduce completed for " << snapshot_key
                                                                                            << " (m=" << m << ", n=" << n << ", k_local=" << k_local
@@ -2153,7 +2250,9 @@ namespace llaminar2
                     return false;
                 }
 
-                mpi_ctx_->allreduce_fp16_inplace(fp16_data, output_size);
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_fp16_inplace(fp16_data, output_size); });
 
                 LOG_TRACE("[TP GEMM] Column-parallel FP16-native allreduce completed for " << snapshot_key
                                                                                            << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
@@ -2168,7 +2267,9 @@ namespace llaminar2
                     return false;
                 }
 
-                mpi_ctx_->allreduce_bf16_inplace(bf16_data, output_size);
+                // OMP_SINGLE ensures only one thread calls MPI in layer-level parallel region
+                OMP_SINGLE([&]()
+                           { mpi_ctx_->allreduce_bf16_inplace(bf16_data, output_size); });
 
                 LOG_TRACE("[TP GEMM] Column-parallel BF16-native allreduce completed for " << snapshot_key
                                                                                            << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
@@ -2192,14 +2293,35 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
 
-        // Use typed residual op (supports Q8_1/BF16/FP16 activation precision)
-        if (!typed_residual_op_->batched(
-                const_cast<TensorBase *>(residual),
-                const_cast<TensorBase *>(input),
-                output,
-                batch_size, sequence_lengths.data(), seq_len, hidden_dim))
+        // Check if PipelineExecutor should handle this operation
+        // (based on config flags and whether this is FFN or attention residual)
+        bool is_ffn_residual = snapshot_key.find("FFN_RESIDUAL") != std::string::npos;
+        bool is_attn_residual = snapshot_key.find("ATTENTION_RESIDUAL") != std::string::npos;
+        bool use_executor = pipeline_executor_ &&
+                            ((is_ffn_residual && config_.executor_ffn_residual) ||
+                             (is_attn_residual && config_.executor_attn_residual));
+
+        if (use_executor)
         {
-            return false;
+            // Use new multi-device executor framework
+            // Note: PipelineExecutor::executeResidualAdd expects simple element count
+            int total_elements = batch_size * seq_len * hidden_dim;
+            if (!pipeline_executor_->executeResidualAdd(residual, input, output, total_elements))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // Use typed residual op (supports Q8_1/BF16/FP16 activation precision)
+            if (!typed_residual_op_->batched(
+                    const_cast<TensorBase *>(residual),
+                    const_cast<TensorBase *>(input),
+                    output,
+                    batch_size, sequence_lengths.data(), seq_len, hidden_dim))
+            {
+                return false;
+            }
         }
 
         // Capture snapshot
@@ -2216,11 +2338,25 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        // Use typed_swiglu_op_ to support Q8_1 tensors
-        if (!typed_swiglu_op_->execute(gate, up, output, rows, cols,
-                                       mpi_ctx_.get(), target_device))
+        // Check if PipelineExecutor should handle this operation
+        bool use_executor = pipeline_executor_ && config_.executor_ffn_swiglu;
+
+        if (use_executor)
         {
-            return false;
+            // Use new multi-device executor framework
+            if (!pipeline_executor_->executeSwiGLU(gate, up, output, rows, cols))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // Use typed_swiglu_op_ to support Q8_1 tensors
+            if (!typed_swiglu_op_->execute(gate, up, output, rows, cols,
+                                           mpi_ctx_.get(), target_device))
+            {
+                return false;
+            }
         }
 
         // Capture snapshot
@@ -2239,11 +2375,25 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        // Use typed RoPE op (supports Q8_1/BF16/FP16 activation precision)
-        if (!typed_rope_op_->apply(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
-                                   mpi_ctx_.get(), target_device))
+        // Check if PipelineExecutor should handle this operation
+        bool use_executor = pipeline_executor_ && config_.executor_rope;
+
+        if (use_executor)
         {
-            return false;
+            // Use new multi-device executor framework
+            if (!pipeline_executor_->executeRoPE(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta, target_device))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // Use typed RoPE op (supports Q8_1/BF16/FP16 activation precision)
+            if (!typed_rope_op_->apply(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
+                                       mpi_ctx_.get(), target_device))
+            {
+                return false;
+            }
         }
 
         // Capture snapshots for Q and K after RoPE

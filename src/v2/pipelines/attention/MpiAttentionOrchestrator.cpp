@@ -10,6 +10,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugAssert.h"
 #include "../../utils/MPIStager.h"
+#include "../../utils/OpenMPUtils.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/Tensors.h"
 #include "../../kernels/cpu/primitives/SoftmaxPrimitives.h"
@@ -174,22 +175,26 @@ namespace llaminar2
             const int src_blocks_per_row = n_heads * head_dim_blocks;
             const int dst_blocks_per_row = static_cast<int>(local_n_heads) * head_dim_blocks;
 
-#pragma omp parallel for
-            for (int t = 0; t < seq_len; ++t)
+            auto slice_work = [&]()
             {
-                const Q8_1Block *src_row = src + t * src_blocks_per_row;
-                Q8_1Block *dst_row = dst + t * dst_blocks_per_row;
-
-                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+#pragma omp for schedule(static)
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    size_t global_h = start_head + local_h;
-                    const Q8_1Block *src_head = src_row + global_h * head_dim_blocks;
-                    Q8_1Block *dst_head = dst_row + local_h * head_dim_blocks;
+                    const Q8_1Block *src_row = src + t * src_blocks_per_row;
+                    Q8_1Block *dst_row = dst + t * dst_blocks_per_row;
 
-                    // Copy all blocks for this head
-                    std::memcpy(dst_head, src_head, head_dim_blocks * sizeof(Q8_1Block));
+                    for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                    {
+                        size_t global_h = start_head + local_h;
+                        const Q8_1Block *src_head = src_row + global_h * head_dim_blocks;
+                        Q8_1Block *dst_head = dst_row + local_h * head_dim_blocks;
+
+                        // Copy all blocks for this head
+                        std::memcpy(dst_head, src_head, head_dim_blocks * sizeof(Q8_1Block));
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(slice_work);
         }
 
         /**
@@ -204,17 +209,21 @@ namespace llaminar2
          */
         void dequantizeQ8_1ToFP32(const Q8_1Block *src, float *dst, size_t total_blocks)
         {
-#pragma omp parallel for
-            for (size_t b = 0; b < total_blocks; ++b)
+            auto dequant_work = [&]()
             {
-                const Q8_1Block &block = src[b];
-                float *out = dst + b * Q8_1Block::BLOCK_SIZE;
-                float d = fp16_to_fp32(block.d);
-                for (int i = 0; i < 32; ++i)
+#pragma omp for schedule(static)
+                for (size_t b = 0; b < total_blocks; ++b)
                 {
-                    out[i] = static_cast<float>(block.qs[i]) * d;
+                    const Q8_1Block &block = src[b];
+                    float *out = dst + b * Q8_1Block::BLOCK_SIZE;
+                    float d = fp16_to_fp32(block.d);
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        out[i] = static_cast<float>(block.qs[i]) * d;
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(dequant_work);
         }
 
         /**
@@ -245,29 +254,33 @@ namespace llaminar2
             const int dst_blocks_per_row = static_cast<int>(local_n_heads) * head_dim_blocks;
             const int heads_per_kv = n_heads / n_kv_heads;
 
-#pragma omp parallel for
-            for (int t = 0; t < seq_len; ++t)
+            auto broadcast_work = [&]()
             {
-                const Q8_1Block *K_row = K_src + t * kv_blocks_per_row;
-                const Q8_1Block *V_row = V_src + t * kv_blocks_per_row;
-                Q8_1Block *K_dst_row = K_dst + t * dst_blocks_per_row;
-                Q8_1Block *V_dst_row = V_dst + t * dst_blocks_per_row;
-
-                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+#pragma omp for schedule(static)
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    size_t global_h = start_head + local_h;
-                    int kv_h = static_cast<int>(global_h) / heads_per_kv; // Which KV head to use
+                    const Q8_1Block *K_row = K_src + t * kv_blocks_per_row;
+                    const Q8_1Block *V_row = V_src + t * kv_blocks_per_row;
+                    Q8_1Block *K_dst_row = K_dst + t * dst_blocks_per_row;
+                    Q8_1Block *V_dst_row = V_dst + t * dst_blocks_per_row;
 
-                    const Q8_1Block *K_head = K_row + kv_h * head_dim_blocks;
-                    const Q8_1Block *V_head = V_row + kv_h * head_dim_blocks;
-                    Q8_1Block *K_dst_head = K_dst_row + local_h * head_dim_blocks;
-                    Q8_1Block *V_dst_head = V_dst_row + local_h * head_dim_blocks;
+                    for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                    {
+                        size_t global_h = start_head + local_h;
+                        int kv_h = static_cast<int>(global_h) / heads_per_kv; // Which KV head to use
 
-                    // Copy all blocks for this head
-                    std::memcpy(K_dst_head, K_head, head_dim_blocks * sizeof(Q8_1Block));
-                    std::memcpy(V_dst_head, V_head, head_dim_blocks * sizeof(Q8_1Block));
+                        const Q8_1Block *K_head = K_row + kv_h * head_dim_blocks;
+                        const Q8_1Block *V_head = V_row + kv_h * head_dim_blocks;
+                        Q8_1Block *K_dst_head = K_dst_row + local_h * head_dim_blocks;
+                        Q8_1Block *V_dst_head = V_dst_row + local_h * head_dim_blocks;
+
+                        // Copy all blocks for this head
+                        std::memcpy(K_dst_head, K_head, head_dim_blocks * sizeof(Q8_1Block));
+                        std::memcpy(V_dst_head, V_head, head_dim_blocks * sizeof(Q8_1Block));
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION(broadcast_work);
         }
 
         /**
@@ -509,28 +522,33 @@ namespace llaminar2
                 const size_t output_head_stride = head_dim_blocks;
                 const size_t output_token_stride = config.n_heads * head_dim_blocks;
 
-#pragma omp parallel for collapse(3) if (total_tokens * world_size * local_n_heads > 64)
-                for (int t = 0; t < total_tokens; ++t)
+                bool parallelize = (total_tokens * world_size * static_cast<int>(local_n_heads) > 64);
+                auto rearrange_work = [&]()
                 {
-                    for (int r = 0; r < world_size; ++r)
+#pragma omp for collapse(3) schedule(static)
+                    for (int t = 0; t < total_tokens; ++t)
                     {
-                        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                        for (int r = 0; r < world_size; ++r)
                         {
-                            // Source: recv_buffer[r * blocks_per_rank + t * local_n_heads * head_dim_blocks + local_h * head_dim_blocks]
-                            size_t src_offset = r * blocks_per_rank +
-                                                t * local_n_heads * head_dim_blocks +
-                                                local_h * head_dim_blocks;
+                            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                            {
+                                // Source: recv_buffer[r * blocks_per_rank + t * local_n_heads * head_dim_blocks + local_h * head_dim_blocks]
+                                size_t src_offset = r * blocks_per_rank +
+                                                    t * local_n_heads * head_dim_blocks +
+                                                    local_h * head_dim_blocks;
 
-                            // Destination: output_blocks[t * n_heads * head_dim_blocks + (r * local_n_heads + local_h) * head_dim_blocks]
-                            size_t global_head = r * local_n_heads + local_h;
-                            size_t dst_offset = t * output_token_stride + global_head * output_head_stride;
+                                // Destination: output_blocks[t * n_heads * head_dim_blocks + (r * local_n_heads + local_h) * head_dim_blocks]
+                                size_t global_head = r * local_n_heads + local_h;
+                                size_t dst_offset = t * output_token_stride + global_head * output_head_stride;
 
-                            // Copy head_dim_blocks worth of Q8_1Block
-                            std::memcpy(&output_blocks[dst_offset], &recv_buffer[src_offset],
-                                        head_dim_blocks * sizeof(Q8_1Block));
+                                // Copy head_dim_blocks worth of Q8_1Block
+                                std::memcpy(&output_blocks[dst_offset], &recv_buffer[src_offset],
+                                            head_dim_blocks * sizeof(Q8_1Block));
+                            }
                         }
                     }
-                }
+                };
+                OMP_WORKSHARE_COLLAPSE3_IF(rearrange_work, parallelize);
 
                 LOG_TRACE("[MPI TP Q8_1] Rank " << rank << ": Q8_1 allgatherv complete, "
                                                 << blocks_per_rank << " blocks per rank");
@@ -563,42 +581,52 @@ namespace llaminar2
                     const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
                     const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
 
-#pragma omp parallel for collapse(3) if (effective_batch_size * seq_len * local_n_heads > 64)
-                    for (int b = 0; b < effective_batch_size; ++b)
+                    bool do_parallel = (effective_batch_size * seq_len * static_cast<int>(local_n_heads) > 64);
+                    auto batch_copy_work = [&]()
                     {
-                        for (int s = 0; s < seq_len; ++s)
+#pragma omp for collapse(3) schedule(static)
+                        for (int b = 0; b < effective_batch_size; ++b)
                         {
-                            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                            for (int s = 0; s < seq_len; ++s)
                             {
-                                size_t global_h = start_head + local_h;
-                                const float *src = local_output_fp32.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
-                                float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
-#pragma omp simd
-                                for (int d = 0; d < config.head_dim; ++d)
+                                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
                                 {
-                                    dst[d] = src[d];
+                                    size_t global_h = start_head + local_h;
+                                    const float *src = local_output_fp32.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
+                                    float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
+#pragma omp simd
+                                    for (int d = 0; d < config.head_dim; ++d)
+                                    {
+                                        dst[d] = src[d];
+                                    }
                                 }
                             }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_COLLAPSE3_IF(batch_copy_work, do_parallel);
                 }
                 else
                 {
                     // Single-sequence path
-#pragma omp parallel for collapse(2) if (total_tokens * local_n_heads > 64)
-                    for (int t = 0; t < total_tokens; ++t)
+                    bool do_parallel = (total_tokens * static_cast<int>(local_n_heads) > 64);
+                    auto single_copy_work = [&]()
                     {
-                        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+#pragma omp for collapse(2) schedule(static)
+                        for (int t = 0; t < total_tokens; ++t)
                         {
-                            size_t global_h = start_head + local_h;
-#pragma omp simd
-                            for (int d = 0; d < config.head_dim; ++d)
+                            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
                             {
-                                send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
-                                    local_output_fp32[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                                size_t global_h = start_head + local_h;
+#pragma omp simd
+                                for (int d = 0; d < config.head_dim; ++d)
+                                {
+                                    send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
+                                        local_output_fp32[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                                }
                             }
                         }
-                    }
+                    };
+                    OMP_WORKSHARE_COLLAPSE2_IF(single_copy_work, do_parallel);
                 }
 
                 // Allreduce to combine results (zeros + local values = concatenation effect)
@@ -1072,42 +1100,52 @@ namespace llaminar2
             const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
             const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
 
-#pragma omp parallel for collapse(3) if (effective_batch_size * seq_len * local_n_heads > 64)
-            for (int b = 0; b < effective_batch_size; ++b)
+            bool do_parallel = (effective_batch_size * seq_len * static_cast<int>(local_n_heads) > 64);
+            auto batch_copy_work = [&]()
             {
-                for (int s = 0; s < seq_len; ++s)
+#pragma omp for collapse(3) schedule(static)
+                for (int b = 0; b < effective_batch_size; ++b)
                 {
-                    for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                    for (int s = 0; s < seq_len; ++s)
                     {
-                        size_t global_h = start_head + local_h;
-                        const float *src = local_output.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
-                        float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
-#pragma omp simd
-                        for (int d = 0; d < config.head_dim; ++d)
+                        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
                         {
-                            dst[d] = src[d];
+                            size_t global_h = start_head + local_h;
+                            const float *src = local_output.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
+                            float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
+#pragma omp simd
+                            for (int d = 0; d < config.head_dim; ++d)
+                            {
+                                dst[d] = src[d];
+                            }
                         }
                     }
                 }
-            }
+            };
+            OMP_WORKSHARE_COLLAPSE3_IF(batch_copy_work, do_parallel);
         }
         else
         {
             // Single-sequence path: local_output is [seq_len, local_n_heads, head_dim]
-#pragma omp parallel for collapse(2) if (total_tokens * local_n_heads > 64)
-            for (int t = 0; t < total_tokens; ++t)
+            bool do_parallel = (total_tokens * static_cast<int>(local_n_heads) > 64);
+            auto single_copy_work = [&]()
             {
-                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+#pragma omp for collapse(2) schedule(static)
+                for (int t = 0; t < total_tokens; ++t)
                 {
-                    size_t global_h = start_head + local_h;
-#pragma omp simd
-                    for (int d = 0; d < config.head_dim; ++d)
+                    for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
                     {
-                        send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
-                            local_output[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                        size_t global_h = start_head + local_h;
+#pragma omp simd
+                        for (int d = 0; d < config.head_dim; ++d)
+                        {
+                            send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
+                                local_output[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                        }
                     }
                 }
-            }
+            };
+            OMP_WORKSHARE_COLLAPSE2_IF(single_copy_work, do_parallel);
         }
 
         LOG_DEBUG("[MPI TP] Rank " << rank << ": send_buffer[0]=" << send_buffer[0]
@@ -1375,11 +1413,15 @@ namespace llaminar2
     {
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-#pragma omp parallel for if (size > 8192)
-        for (int i = 0; i < size; ++i)
+        auto scale_work = [&]()
         {
-            scores[i] *= scale;
-        }
+#pragma omp for schedule(static)
+            for (int i = 0; i < size; ++i)
+            {
+                scores[i] *= scale;
+            }
+        };
+        OMP_WORKSHARE_REGION_IF(scale_work, size > 8192);
     }
 
     void MpiAttentionOrchestrator::apply_attention_mask(

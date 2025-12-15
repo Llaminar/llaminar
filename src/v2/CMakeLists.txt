@@ -487,6 +487,11 @@ message(STATUS "V2: FTXUI v5.0.0 configured for interactive chat UI")
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
     backends/BackendManager.cpp
+    # Execution framework (hierarchical work distribution)
+    execution/WorkDistributor.cpp
+    execution/DeviceContext.cpp
+    execution/ComputeStage.cpp
+    execution/LayerExecutor.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
@@ -494,6 +499,7 @@ add_library(llaminar2_core STATIC
     loaders/DeviceOrchestrator.cpp
     pipelines/PipelineBase.cpp
     pipelines/PipelineFactory.cpp
+    pipelines/PipelineExecutor.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
     pipelines/attention/GQAAttention.cpp
     pipelines/attention/MpiAttentionOrchestrator.cpp

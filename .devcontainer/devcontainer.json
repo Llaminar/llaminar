@@ -77,9 +77,6 @@
         3000,
         5000
     ],
-    "containerEnv": {
-        "VIRTUAL_ENV": "/workspaces/llaminar/.venv"
-    },
     "postCreateCommand": "bash -c 'sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && cmake --version && gcc --version'",
     "remoteUser": "vscode",
     "overrideCommand": false,
@@ -87,8 +84,18 @@
         "--privileged",
         "--cap-add=SYS_ADMIN",
         "--security-opt",
-        "apparmor=unconfined"
+        "apparmor=unconfined",
+        "--device=/dev/kfd",
+        "--device=/dev/dri",
+        "--group-add=video",
+        "--group-add=render",
+        "--ipc=host",
+        "--shm-size=32g"
     ],
+    "containerEnv": {
+        "VIRTUAL_ENV": "/workspaces/llaminar/.venv",
+        "HSA_OVERRIDE_GFX_VERSION": "9.0.6"
+    },
     "mounts": [
         "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
     ]

@@ -106,6 +106,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/OpenMPUtils.h"
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -686,7 +687,10 @@ namespace llaminar2
                 // All three phases run in the same parallel region to minimize
                 // OpenMP overhead (single parallel region entry).
                 //
-#pragma omp parallel
+                // Layer-fusion support: OMP_WORKSHARE_REGION handles nested parallelism
+                // automatically - if already in a parallel region, uses worksharing only.
+
+                auto do_multiply_work = [&]()
                 {
                     // ---------------------------------------------------------
                     // Phase 1: Initialize/scale output matrix C
@@ -1107,7 +1111,10 @@ namespace llaminar2
                             }
                         }
                     }
-                }
+                }; // end do_multiply_work lambda
+
+                // Execute using OMP_WORKSHARE_REGION for nested-safe parallelism
+                OMP_WORKSHARE_REGION(do_multiply_work);
 
                 return true;
             }
@@ -1287,12 +1294,12 @@ namespace llaminar2
                 Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
                 const bool k_aligned = (k % 32 == 0);
 
-#pragma omp parallel
+                // OMP_WORKSHARE_REGION handles nested parallelism automatically
+                auto do_quantize = [&]()
                 {
-                    // Parallelize over rows for large M, or collapse for small M
                     int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
                     if (quant_thresh == 0)
-                        quant_thresh = omp_get_num_threads();
+                        quant_thresh = omp_get_max_threads();
 
                     if (m < quant_thresh)
                     {
@@ -1303,7 +1310,6 @@ namespace llaminar2
                             {
                                 const float *a_row = A + i * k + k_blk * 32;
                                 Q8_1Block *row_blocks = all_blocks + i * k_blocks;
-
                                 int valid_elements = std::min(32, k - k_blk * 32);
                                 simd::quantize_single_block(a_row, row_blocks[k_blk], valid_elements);
                             }
@@ -1319,7 +1325,6 @@ namespace llaminar2
 
                             if (k_aligned)
                             {
-                                // Fast path: K is multiple of 32
                                 for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
                                 {
                                     simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
@@ -1327,7 +1332,6 @@ namespace llaminar2
                             }
                             else
                             {
-                                // General path: handle partial last block
                                 for (int k_blk = 0; k_blk < k_blocks - 1; ++k_blk)
                                 {
                                     simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
@@ -1341,7 +1345,9 @@ namespace llaminar2
                             }
                         }
                     }
-                }
+                };
+
+                OMP_WORKSHARE_REGION(do_quantize);
 
                 return true;
             }
@@ -1414,10 +1420,10 @@ namespace llaminar2
                 int N_padded = ((n + 63) / 64) * 64; // Stride for compensation/scales arrays
                 const Q8_1Block *all_blocks = static_cast<const Q8_1Block *>(q8_1_activations);
 
-#pragma omp parallel
+                // OMP_WORKSHARE_REGION handles nested parallelism automatically
+                auto do_gemm_work = [&]()
                 {
                     // FUSED: Zero/scale C inside the same parallel region as GEMM
-                    // This eliminates one parallel region entry per GEMM call
                     if (needs_zero)
                     {
 #pragma omp for schedule(static) nowait
@@ -1546,7 +1552,9 @@ namespace llaminar2
                             }
                         }
                     }
-                }
+                }; // end do_gemm_work lambda
+
+                OMP_WORKSHARE_REGION(do_gemm_work);
 
                 return true;
             }
@@ -1622,7 +1630,8 @@ namespace llaminar2
                 const int output_blocks_per_row = (n + 31) / 32;
                 const size_t output_stride = output_blocks_per_row * sizeof(Q8_1Block);
 
-#pragma omp parallel
+                // OMP_WORKSHARE_REGION handles nested parallelism automatically
+                auto do_gemm_q8_1_work = [&]()
                 {
                     // Cache-aware blocking
                     int num_threads = omp_get_num_threads();
@@ -1774,7 +1783,9 @@ namespace llaminar2
                             }
                         }
                     }
-                }
+                }; // end do_gemm_q8_1_work lambda
+
+                OMP_WORKSHARE_REGION(do_gemm_q8_1_work);
 
                 return true;
             }
@@ -2048,55 +2059,59 @@ namespace llaminar2
 
                 int m_blocking = 4;
 
-// Parallelize over M blocks
-#pragma omp parallel for schedule(dynamic)
-                for (int i = 0; i < m; i += m_blocking)
+                // Nested-safe parallel execution over M blocks
+                auto softmax_gemm_work = [&]()
                 {
-                    int current_m = std::min(m_blocking, m - i);
+#pragma omp for schedule(dynamic)
+                    for (int i = 0; i < m; i += m_blocking)
+                    {
+                        int current_m = std::min(m_blocking, m - i);
 
-                    OnlineSoftmaxParams params;
-                    params.Q = static_cast<const char *>(A) + i * stride_q_bytes;
-                    params.K = B;
-                    params.C = C + i * n;
-                    params.M = current_m;
-                    params.N = n;
-                    params.K_blocks = (k + 31) / 32;
-                    params.Q_stride_bytes = stride_q_bytes;
-                    params.K_stride_bytes = stride_k_bytes;
-                    params.C_stride_bytes = n * sizeof(float);
-                    params.scale = scale;
+                        OnlineSoftmaxParams params;
+                        params.Q = static_cast<const char *>(A) + i * stride_q_bytes;
+                        params.K = B;
+                        params.C = C + i * n;
+                        params.M = current_m;
+                        params.N = n;
+                        params.K_blocks = (k + 31) / 32;
+                        params.Q_stride_bytes = stride_q_bytes;
+                        params.K_stride_bytes = stride_k_bytes;
+                        params.C_stride_bytes = n * sizeof(float);
+                        params.scale = scale;
 
-                    if (mask)
-                    {
-                        params.mask = mask + i * n;
-                        params.mask_stride_bytes = n * sizeof(float);
-                    }
-                    else
-                    {
-                        params.mask = nullptr;
-                        params.mask_stride_bytes = 0;
-                    }
-
-                    if (current_m == 4)
-                    {
-                        auto func = kernel_m4.get_kernel();
-                        func(&params);
-                    }
-                    else
-                    {
-                        // Handle tail with M1 kernel loop
-                        auto func = kernel_m1.get_kernel();
-                        for (int j = 0; j < current_m; ++j)
+                        if (mask)
                         {
-                            OnlineSoftmaxParams p = params;
-                            p.Q = static_cast<const char *>(params.Q) + j * stride_q_bytes;
-                            p.C = static_cast<float *>(params.C) + j * n;
-                            if (mask)
-                                p.mask = static_cast<const float *>(params.mask) + j * n;
-                            func(&p);
+                            params.mask = mask + i * n;
+                            params.mask_stride_bytes = n * sizeof(float);
+                        }
+                        else
+                        {
+                            params.mask = nullptr;
+                            params.mask_stride_bytes = 0;
+                        }
+
+                        if (current_m == 4)
+                        {
+                            auto func = kernel_m4.get_kernel();
+                            func(&params);
+                        }
+                        else
+                        {
+                            // Handle tail with M1 kernel loop
+                            auto func = kernel_m1.get_kernel();
+                            for (int j = 0; j < current_m; ++j)
+                            {
+                                OnlineSoftmaxParams p = params;
+                                p.Q = static_cast<const char *>(params.Q) + j * stride_q_bytes;
+                                p.C = static_cast<float *>(params.C) + j * n;
+                                if (mask)
+                                    p.mask = static_cast<const float *>(params.mask) + j * n;
+                                func(&p);
+                            }
                         }
                     }
-                }
+                };
+                OMP_WORKSHARE_REGION(softmax_gemm_work);
                 return true;
             }
 
@@ -2204,18 +2219,26 @@ namespace llaminar2
                     return false;
                 }
 
-                // Handle beta scaling / zeroing
+                // Handle beta scaling / zeroing (nested-safe)
                 if (!accumulate || beta == 0.0f)
                 {
-#pragma omp parallel for
-                    for (size_t i = 0; i < (size_t)m * n; ++i)
-                        C[i] = 0.0f;
+                    auto zero_work = [&]()
+                    {
+#pragma omp for schedule(static)
+                        for (size_t i = 0; i < (size_t)m * n; ++i)
+                            C[i] = 0.0f;
+                    };
+                    OMP_WORKSHARE_REGION(zero_work);
                 }
                 else if (beta != 1.0f)
                 {
-#pragma omp parallel for
-                    for (size_t i = 0; i < (size_t)m * n; ++i)
-                        C[i] *= beta;
+                    auto scale_work = [&]()
+                    {
+#pragma omp for schedule(static)
+                        for (size_t i = 0; i < (size_t)m * n; ++i)
+                            C[i] *= beta;
+                    };
+                    OMP_WORKSHARE_REGION(scale_work);
                 }
 
                 int k_blocks = k / 32;

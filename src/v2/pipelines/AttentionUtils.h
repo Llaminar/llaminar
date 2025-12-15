@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include "../utils/OpenMPUtils.h"
 
 namespace llaminar2
 {
@@ -49,31 +50,36 @@ namespace llaminar2
             const int heads_per_kv = n_heads / n_kv_heads;
 
             // Parallelize over sequences (outer loop)
-#pragma omp parallel for if (seq_len * n_kv_heads > 512)
-            for (int s = 0; s < seq_len; ++s)
+            bool do_parallel = (seq_len * n_kv_heads > 512);
+            auto broadcast_work = [&]()
             {
-                for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+#pragma omp for schedule(static)
+                for (int s = 0; s < seq_len; ++s)
                 {
-                    // Source: kv_in[s, kv_h, :] (one KV head)
-                    const float *src = kv_in + s * n_kv_heads * head_dim + kv_h * head_dim;
-
-                    // Broadcast to multiple Q heads: kv_out[s, kv_h*heads_per_kv + i, :]
-                    for (int i = 0; i < heads_per_kv; ++i)
+                    for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
                     {
-                        const int q_h = kv_h * heads_per_kv + i;
+                        // Source: kv_in[s, kv_h, :] (one KV head)
+                        const float *src = kv_in + s * n_kv_heads * head_dim + kv_h * head_dim;
 
-                        // Safety: guard against any mismatch where
-                        // n_heads is not an exact multiple of n_kv_heads.
-                        if (q_h >= n_heads)
+                        // Broadcast to multiple Q heads: kv_out[s, kv_h*heads_per_kv + i, :]
+                        for (int i = 0; i < heads_per_kv; ++i)
                         {
-                            continue;
-                        }
+                            const int q_h = kv_h * heads_per_kv + i;
 
-                        float *dst = kv_out + s * n_heads * head_dim + q_h * head_dim;
-                        std::memcpy(dst, src, head_dim * sizeof(float));
+                            // Safety: guard against any mismatch where
+                            // n_heads is not an exact multiple of n_kv_heads.
+                            if (q_h >= n_heads)
+                            {
+                                continue;
+                            }
+
+                            float *dst = kv_out + s * n_heads * head_dim + q_h * head_dim;
+                            std::memcpy(dst, src, head_dim * sizeof(float));
+                        }
                     }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION_IF(broadcast_work, do_parallel);
         }
 
         /**
@@ -97,23 +103,28 @@ namespace llaminar2
         {
             const float neg_inf = -std::numeric_limits<float>::infinity();
 
-// Parallelize over rows (each row independent)
-#pragma omp parallel for if (seq_len * seq_len > 1024)
-            for (int i = 0; i < seq_len; ++i)
+            // Parallelize over rows (each row independent)
+            bool do_parallel = (seq_len * seq_len > 1024);
+            auto mask_work = [&]()
             {
-                for (int j = 0; j < seq_len; ++j)
+#pragma omp for schedule(static)
+                for (int i = 0; i < seq_len; ++i)
                 {
-                    bool can_attend = (i >= j); // Causal: can't attend to future
-
-                    // Sliding window: also check distance
-                    if (window_size >= 0 && can_attend)
+                    for (int j = 0; j < seq_len; ++j)
                     {
-                        can_attend = (i - j < window_size);
-                    }
+                        bool can_attend = (i >= j); // Causal: can't attend to future
 
-                    mask[i * seq_len + j] = can_attend ? 0.0f : neg_inf;
+                        // Sliding window: also check distance
+                        if (window_size >= 0 && can_attend)
+                        {
+                            can_attend = (i - j < window_size);
+                        }
+
+                        mask[i * seq_len + j] = can_attend ? 0.0f : neg_inf;
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION_IF(mask_work, do_parallel);
         }
 
         /**
@@ -149,55 +160,60 @@ namespace llaminar2
             const float neg_inf = -std::numeric_limits<float>::infinity();
             const int total_len = batch_size * padded_seq_len;
 
-// Parallelize over rows - each row's mask is independent
-// Use flattened 1D iteration for better load balancing
-#pragma omp parallel for if (total_len * total_len > 4096) schedule(static)
-            for (int i = 0; i < total_len; ++i)
+            // Parallelize over rows - each row's mask is independent
+            // Use flattened 1D iteration for better load balancing
+            bool do_parallel = (total_len * total_len > 4096);
+            auto mask_work = [&]()
             {
-                const int batch_i = i / padded_seq_len; // Which sequence does token i belong to?
-                const int pos_i = i % padded_seq_len;   // Position within that sequence
-
-                // Get actual sequence length for this sequence
-                const int actual_len_i = sequence_lengths ? sequence_lengths[batch_i] : padded_seq_len;
-
-                // If token i is a padding token, it cannot attend to anything
-                const bool i_is_padding = (pos_i >= actual_len_i);
-
-                for (int j = 0; j < total_len; ++j)
+#pragma omp for schedule(static)
+                for (int i = 0; i < total_len; ++i)
                 {
-                    const int batch_j = j / padded_seq_len;
-                    const int pos_j = j % padded_seq_len;
+                    const int batch_i = i / padded_seq_len; // Which sequence does token i belong to?
+                    const int pos_i = i % padded_seq_len;   // Position within that sequence
 
-                    bool can_attend = false;
+                    // Get actual sequence length for this sequence
+                    const int actual_len_i = sequence_lengths ? sequence_lengths[batch_i] : padded_seq_len;
 
-                    // Padding tokens cannot attend to anything
-                    if (!i_is_padding)
+                    // If token i is a padding token, it cannot attend to anything
+                    const bool i_is_padding = (pos_i >= actual_len_i);
+
+                    for (int j = 0; j < total_len; ++j)
                     {
-                        // 1. Must be in same sequence (block-diagonal structure)
-                        if (batch_i == batch_j)
-                        {
-                            // 2. Check if token j is within valid sequence (not padding)
-                            const int actual_len_j = sequence_lengths ? sequence_lengths[batch_j] : padded_seq_len;
-                            const bool j_is_padding = (pos_j >= actual_len_j);
+                        const int batch_j = j / padded_seq_len;
+                        const int pos_j = j % padded_seq_len;
 
-                            if (!j_is_padding)
+                        bool can_attend = false;
+
+                        // Padding tokens cannot attend to anything
+                        if (!i_is_padding)
+                        {
+                            // 1. Must be in same sequence (block-diagonal structure)
+                            if (batch_i == batch_j)
                             {
-                                // 3. Causal constraint: can't attend to future tokens
-                                if (pos_i >= pos_j)
+                                // 2. Check if token j is within valid sequence (not padding)
+                                const int actual_len_j = sequence_lengths ? sequence_lengths[batch_j] : padded_seq_len;
+                                const bool j_is_padding = (pos_j >= actual_len_j);
+
+                                if (!j_is_padding)
                                 {
-                                    // 4. Sliding window constraint (if enabled)
-                                    if (window_size < 0 || (pos_i - pos_j < window_size))
+                                    // 3. Causal constraint: can't attend to future tokens
+                                    if (pos_i >= pos_j)
                                     {
-                                        can_attend = true;
+                                        // 4. Sliding window constraint (if enabled)
+                                        if (window_size < 0 || (pos_i - pos_j < window_size))
+                                        {
+                                            can_attend = true;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                        mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION_IF(mask_work, do_parallel);
         }
 
         /**
@@ -227,52 +243,57 @@ namespace llaminar2
             const float neg_inf = -std::numeric_limits<float>::infinity();
             const int total_len = batch_size * padded_seq_len;
 
-// Parallelize over rows - each row's mask is independent
-// Use flattened 1D iteration for better load balancing
-#pragma omp parallel for if (total_len * total_len > 4096) schedule(static)
-            for (int i = 0; i < total_len; ++i)
+            // Parallelize over rows - each row's mask is independent
+            // Use flattened 1D iteration for better load balancing
+            bool do_parallel = (total_len * total_len > 4096);
+            auto mask_work = [&]()
             {
-                const int batch_i = i / padded_seq_len; // Which sequence does token i belong to?
-                const int pos_i = i % padded_seq_len;   // Position within that sequence
-
-                // Get actual sequence length for this sequence
-                const int actual_len_i = sequence_lengths ? sequence_lengths[batch_i] : padded_seq_len;
-
-                // If token i is a padding token, it cannot attend to anything
-                const bool i_is_padding = (pos_i >= actual_len_i);
-
-                for (int j = 0; j < total_len; ++j)
+#pragma omp for schedule(static)
+                for (int i = 0; i < total_len; ++i)
                 {
-                    const int batch_j = j / padded_seq_len;
-                    const int pos_j = j % padded_seq_len;
+                    const int batch_i = i / padded_seq_len; // Which sequence does token i belong to?
+                    const int pos_i = i % padded_seq_len;   // Position within that sequence
 
-                    bool can_attend = false;
+                    // Get actual sequence length for this sequence
+                    const int actual_len_i = sequence_lengths ? sequence_lengths[batch_i] : padded_seq_len;
 
-                    // Padding tokens cannot attend to anything
-                    if (!i_is_padding)
+                    // If token i is a padding token, it cannot attend to anything
+                    const bool i_is_padding = (pos_i >= actual_len_i);
+
+                    for (int j = 0; j < total_len; ++j)
                     {
-                        // 1. Must be in same sequence (block-diagonal structure)
-                        if (batch_i == batch_j)
-                        {
-                            // 2. Check if token j is within valid sequence (not padding)
-                            const int actual_len_j = sequence_lengths ? sequence_lengths[batch_j] : padded_seq_len;
-                            const bool j_is_padding = (pos_j >= actual_len_j);
+                        const int batch_j = j / padded_seq_len;
+                        const int pos_j = j % padded_seq_len;
 
-                            if (!j_is_padding)
+                        bool can_attend = false;
+
+                        // Padding tokens cannot attend to anything
+                        if (!i_is_padding)
+                        {
+                            // 1. Must be in same sequence (block-diagonal structure)
+                            if (batch_i == batch_j)
                             {
-                                // 3. NO CAUSAL CONSTRAINT - can attend to any valid token (past or future)
-                                // 4. Sliding window constraint (if enabled)
-                                if (window_size < 0 || (std::abs(pos_i - pos_j) < window_size))
+                                // 2. Check if token j is within valid sequence (not padding)
+                                const int actual_len_j = sequence_lengths ? sequence_lengths[batch_j] : padded_seq_len;
+                                const bool j_is_padding = (pos_j >= actual_len_j);
+
+                                if (!j_is_padding)
                                 {
-                                    can_attend = true;
+                                    // 3. NO CAUSAL CONSTRAINT - can attend to any valid token (past or future)
+                                    // 4. Sliding window constraint (if enabled)
+                                    if (window_size < 0 || (std::abs(pos_i - pos_j) < window_size))
+                                    {
+                                        can_attend = true;
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                        mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION_IF(mask_work, do_parallel);
         }
 
         /**
@@ -293,12 +314,17 @@ namespace llaminar2
         {
             const int total = rows * cols;
 
-// Parallelize mask application (vectorizable)
-#pragma omp parallel for if (total > 4096)
-            for (int i = 0; i < total; ++i)
+            // Parallelize mask application (vectorizable)
+            bool do_parallel = (total > 4096);
+            auto apply_work = [&]()
             {
-                scores[i] += mask[i];
-            }
+#pragma omp for schedule(static)
+                for (int i = 0; i < total; ++i)
+                {
+                    scores[i] += mask[i];
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(apply_work, do_parallel);
         }
 
         /**
@@ -381,54 +407,59 @@ namespace llaminar2
             const float neg_inf = -std::numeric_limits<float>::infinity();
             const int total_len = batch_size * seq_len;
 
-// Parallelize over rows - each row's mask is independent
-#pragma omp parallel for if (total_len * total_len > 4096) schedule(static)
-            for (int i = 0; i < total_len; ++i)
+            // Parallelize over rows - each row's mask is independent
+            bool do_parallel = (total_len * total_len > 4096);
+            auto mask_work = [&]()
             {
-                const int batch_i = i / seq_len; // Which batch does token i belong to?
-                const int pos_i = i % seq_len;   // Position within that batch
-
-                // Get actual sequence length for this batch
-                const int actual_len_i = actual_lengths[batch_i];
-
-                // If token i is a padding token, it cannot attend to anything
-                const bool i_is_padding = (pos_i >= actual_len_i);
-
-                for (int j = 0; j < total_len; ++j)
+#pragma omp for schedule(static)
+                for (int i = 0; i < total_len; ++i)
                 {
-                    const int batch_j = j / seq_len; // Which batch does token j belong to?
-                    const int pos_j = j % seq_len;   // Position within that batch
+                    const int batch_i = i / seq_len; // Which batch does token i belong to?
+                    const int pos_i = i % seq_len;   // Position within that batch
 
-                    bool can_attend = false;
+                    // Get actual sequence length for this batch
+                    const int actual_len_i = actual_lengths[batch_i];
 
-                    // Padding tokens cannot attend to anything
-                    if (!i_is_padding)
+                    // If token i is a padding token, it cannot attend to anything
+                    const bool i_is_padding = (pos_i >= actual_len_i);
+
+                    for (int j = 0; j < total_len; ++j)
                     {
-                        // 1. Must be in same batch (block-diagonal structure)
-                        if (batch_i == batch_j)
-                        {
-                            // 2. Check if token j is within valid sequence (not padding)
-                            const int actual_len_j = actual_lengths[batch_j];
-                            const bool j_is_padding = (pos_j >= actual_len_j);
+                        const int batch_j = j / seq_len; // Which batch does token j belong to?
+                        const int pos_j = j % seq_len;   // Position within that batch
 
-                            if (!j_is_padding)
+                        bool can_attend = false;
+
+                        // Padding tokens cannot attend to anything
+                        if (!i_is_padding)
+                        {
+                            // 1. Must be in same batch (block-diagonal structure)
+                            if (batch_i == batch_j)
                             {
-                                // 3. Causal constraint: can't attend to future tokens
-                                if (!causal || pos_j <= pos_i)
+                                // 2. Check if token j is within valid sequence (not padding)
+                                const int actual_len_j = actual_lengths[batch_j];
+                                const bool j_is_padding = (pos_j >= actual_len_j);
+
+                                if (!j_is_padding)
                                 {
-                                    // 4. Sliding window constraint (if enabled)
-                                    if (window_size < 0 || (pos_i - pos_j < window_size))
+                                    // 3. Causal constraint: can't attend to future tokens
+                                    if (!causal || pos_j <= pos_i)
                                     {
-                                        can_attend = true;
+                                        // 4. Sliding window constraint (if enabled)
+                                        if (window_size < 0 || (pos_i - pos_j < window_size))
+                                        {
+                                            can_attend = true;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                        mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
+                    }
                 }
-            }
+            };
+            OMP_WORKSHARE_REGION_IF(mask_work, do_parallel);
         }
 
     } // namespace attention_utils
