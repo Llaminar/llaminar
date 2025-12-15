@@ -990,8 +990,8 @@ namespace llaminar::v2::kernels::jit
             // Prefetch next K/V blocks while processing current ones.
             // This hides memory latency for streaming KV access.
             // prefetcht0 = L1, prefetcht1 = L2, prefetcht2 = L3
-            prefetcht0(ptr[rdi + kv_stride]);      // Next K position, block 0
-            prefetcht0(ptr[rsi + kv_stride]);      // Next V position, block 0
+            prefetcht0(ptr[rdi + kv_stride]); // Next K position, block 0
+            prefetcht0(ptr[rsi + kv_stride]); // Next V position, block 0
             if (num_blocks > 1)
             {
                 prefetcht0(ptr[rdi + kv_stride + 64]); // Next K, block 1
