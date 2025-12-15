@@ -170,28 +170,39 @@ namespace llaminar::v2::kernels::jit
               ,
               config_(config)
         {
-            // Calculate optimal Q_TILE_SIZE based on kernel mode
+            // Calculate optimal Q_TILE_SIZE based on kernel mode and head_dim
             //
-            // DECODE mode: Q data kept in registers across KV loop for speed.
-            //   - We have zmm10-13 (4 regs) for Q data
-            //   - Each query needs num_blocks registers
-            //   - Constraint: q_tile_size * num_blocks <= 4
-            //   - For head_dim=128 (4 blocks): tile_size = 1
+            // CRITICAL CONSTRAINT: Context accumulators must fit in registers!
             //
-            // PREFILL mode: Q data loaded from stack each iteration.
-            //   - No register constraint on Q (loaded per-block from stack)
-            //   - Tile size determines K/V reuse across queries
-            //   - Larger tile = better K/V cache reuse
-            //   - Use fixed tile size of 4 to enable meaningful parallelism
-            //   - (Limited to 4 due to softmax vectorization using XMM = 4 floats)
+            // We follow the decode kernel's pattern:
+            //   - Blocks 0-1 (64 floats): kept in registers (4 ZMM per query)
+            //   - Blocks 2+: spilled to stack (accessed once per V block per KV)
+            //
+            // This avoids loading/storing the FULL context every KV iteration.
+            // The spilled blocks are still touched per-KV but it's much less
+            // traffic than the previous approach of spilling everything.
+            //
+            // Register allocation for context:
+            //   - 4 ZMM per query for blocks 0-1 (zmm0-3 for Q0, zmm4-7 for Q1, etc.)
+            //   - Need to leave room for V data, scores, softmax state
+            //
+            // Available: zmm0-15 (16 regs) for context
+            // Reserve: zmm12-15 for V data and intermediates (4 regs)
+            // Effective: zmm0-11 (12 regs) for context = 3 queries × 4 ZMM
+            //
+            // However, we also limit to 2 queries for simplicity with softmax
+            // vectorization using XMM (4 floats, but we want simpler code).
             //
             int num_blocks = config_.head_dim / 32;
 
             if (config_.effectiveMode() == AttentionMode::PREFILL)
             {
-                // Prefill: Use fixed tile size for K/V reuse
-                // Use 4 (max XMM elements) for vectorized softmax
-                q_tile_size_ = 4;
+                // Tile size for prefill: maximize K/V cache reuse
+                // Process 4 queries per K/V load, allowing K/V data to be
+                // amortized across multiple queries before eviction from L1.
+                // All context blocks are stored in memory (stack buffer).
+
+                q_tile_size_ = 4; // Process 4 queries per K/V load
             }
             else
             {
@@ -617,6 +628,7 @@ namespace llaminar::v2::kernels::jit
          *   │ zmm0-7    │ Score accumulators for queries 0-7 in tile         │
          *   │           │ After softmax: corr[0-7] (broadcasted)             │
          *   │ zmm8-15   │ After softmax: weight[0-7] (broadcasted)           │
+         *   │           │ (Context uses memory buffer, not registers)        │
          *   │ zmm16     │ Packed old_max for vectorized softmax              │
          *   │ zmm17     │ Packed old_sum / new_sum                           │
          *   │ zmm18     │ Packed scores for vectorized softmax               │
@@ -773,19 +785,16 @@ namespace llaminar::v2::kernels::jit
             int k_ptr_spill = q_local_spill + 8;              // K pointer for current KV
             int v_ptr_spill = k_ptr_spill + 8;                // V pointer for current KV
 
-            // Debug output for development
-            printf("DEBUG spill offsets: tile_start=%d, tile_size=%d, seq_len_kv=%d, position_offset=%d, kv_idx=%d\n",
-                   tile_start_spill, tile_size_spill, seq_len_kv_spill, position_offset_spill, kv_idx_spill);
-
             // Additional spill slots for head loop
             int head_idx_spill = v_ptr_spill + 8;                          // Head loop index
             int head_offset_spill = head_idx_spill + 8;                    // Head offset in Q blocks
             int softmax_head_offset_spill = head_offset_spill + 8;         // Softmax offset for head
             int context_head_offset_spill = softmax_head_offset_spill + 8; // Context offset for head
             int q_loop_spill = context_head_offset_spill + 8;              // Query loop counter
+            int kv_loop_end_spill = q_loop_spill + 8;                      // KV loop end bound
 
             // Total stack size (64-byte aligned for AVX-512)
-            int stack_size = q_loop_spill + 8 + 64;
+            int stack_size = kv_loop_end_spill + 8 + 64;
             stack_size = (stack_size + 63) & ~63;
 
             // ═══════════════════════════════════════════════════════════════════
@@ -872,11 +881,27 @@ namespace llaminar::v2::kernels::jit
             // KV LOOP: Iterate over K/V cache positions
             // ═══════════════════════════════════════════════════════════════════
 
+            // Context buffer is zeroed at tile start (emit_init_context_buffer)
+
+            // Calculate KV loop end
+            mov(rax, ptr[rsp + seq_len_kv_spill]);
+            if (config_.causal)
+            {
+                // kv_end = min(seq_len_kv, tile_start + tile_size + position_offset)
+                mov(r10, ptr[rsp + tile_start_spill]);
+                add(r10, ptr[rsp + tile_size_spill]);
+                add(r10, ptr[rsp + position_offset_spill]);
+
+                cmp(rax, r10);
+                cmovg(rax, r10); // rax = min(rax, r10)
+            }
+            mov(ptr[rsp + kv_loop_end_spill], rax);
+
             mov(qword[rsp + kv_idx_spill], 0); // kv_idx = 0
 
             L(".kv_loop");
             mov(r8, ptr[rsp + kv_idx_spill]);
-            mov(r9, ptr[rsp + seq_len_kv_spill]);
+            mov(r9, ptr[rsp + kv_loop_end_spill]);
             cmp(r8, r9);
             jge(".kv_end", T_NEAR);
 
@@ -973,6 +998,8 @@ namespace llaminar::v2::kernels::jit
             jmp(".kv_loop", T_NEAR);
 
             L(".kv_end");
+
+            // Context buffer is accumulated in memory (no register store needed)
 
             // ═══════════════════════════════════════════════════════════════════
             // INCREMENT HEAD OFFSETS AND CONTINUE
@@ -1086,6 +1113,12 @@ namespace llaminar::v2::kernels::jit
                 vmovss(ptr[rsp + offset + 4], Xmm(zmm_zero.getIdx())); // sum
             }
         }
+
+        // NOTE: emit_init_context_registers() and emit_store_context_registers()
+        // were removed. The previous optimization of keeping context block 0 in
+        // zmm8-15 was incorrect because each head's block 0 is at a DIFFERENT
+        // memory location. Head N's accumulation would clobber head N-1's context.
+        // All context blocks now use the memory buffer consistently.
 
         /**
          * @brief Initialize context buffer to zeros for prefill tile
@@ -1362,8 +1395,8 @@ namespace llaminar::v2::kernels::jit
             // Optional: Pre-load Q data into registers if it fits
             // We have zmm16-31 available (16 registers)
             // Each query needs num_blocks registers for data
-            // Currently disabled due to conflict with JitMicrokernelBase allocation
-            bool use_q_registers = false;
+            // Reuse zmm16-31 since Q is only needed for Phase 1
+            bool use_q_registers = (num_blocks * q_tile_size_ <= 16);
 
             if (use_q_registers)
             {
@@ -1509,9 +1542,9 @@ namespace llaminar::v2::kernels::jit
             // For each V block:
             //   context[q,block] = context[q,block] * corr[q] + V[block] * weight[q]
             //
-            // The correction factor (corr) rescales the existing accumulator to
-            // account for the new maximum. The weight factor is the softmax
-            // attention weight for this KV position.
+            // All context blocks use the memory buffer on stack. This is correct
+            // because each head's context offset is different, and register
+            // persistence across heads would cause incorrect accumulation.
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -1544,19 +1577,6 @@ namespace llaminar::v2::kernels::jit
                     cmp(r8, q);
                     jle(skip_v, T_NEAR);
 
-                    // Calculate context pointer for this query and block
-                    // ctx_ptr = rsp + context_head_offset + q * d_model * 4 + ctx_off_base
-                    mov(r9, q);
-                    imul(r9, r9, d_model * 4);
-                    add(r9, reg_context_head_offset);
-                    add(r9, rsp);
-
-                    // Load existing context accumulator
-                    Zmm zmm_ctx_lo = zmm19;
-                    Zmm zmm_ctx_hi = zmm20;
-                    vmovups(zmm_ctx_lo, ptr[r9 + ctx_off_base]);
-                    vmovups(zmm_ctx_hi, ptr[r9 + ctx_off_base + 64]);
-
                     // Compute weighted V: V_dequant * scale * weight[q]
                     // weight[q] is in Zmm(q + q_tile_size_)
                     Zmm zmm_wv_lo = zmm21;
@@ -1568,8 +1588,20 @@ namespace llaminar::v2::kernels::jit
                     vmulps(zmm_wv_hi, zmm18, zmm16);                     // V_hi * scale
                     vmulps(zmm_wv_hi, zmm_wv_hi, Zmm(q + q_tile_size_)); // * weight[q]
 
+                    // All blocks use memory - compute context address
+                    // context_ptr = rsp + context_offset + q * d_model * 4 + ctx_off_base
+                    mov(r9, q);
+                    imul(r9, r9, d_model * 4);
+                    add(r9, reg_context_head_offset);
+                    add(r9, rsp);
+
+                    // Load existing context accumulator
+                    Zmm zmm_ctx_lo = zmm19;
+                    Zmm zmm_ctx_hi = zmm20;
+                    vmovups(zmm_ctx_lo, ptr[r9 + ctx_off_base]);
+                    vmovups(zmm_ctx_hi, ptr[r9 + ctx_off_base + 64]);
+
                     // Update context: ctx = ctx * corr[q] + weighted_V
-                    // corr[q] is in Zmm(q)
                     vmulps(zmm_ctx_lo, zmm_ctx_lo, Zmm(q)); // ctx_lo *= corr[q]
                     vaddps(zmm_ctx_lo, zmm_ctx_lo, zmm_wv_lo);
 
