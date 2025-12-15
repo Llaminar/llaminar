@@ -77,7 +77,7 @@
         3000,
         5000
     ],
-    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && cmake --version && gcc --version'",
+    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && git config --global user.name 'David Sanftenberg' && git config --global user.email 'david.sanftenberg@gmail.com' && cmake --version && gcc --version'",
     "remoteUser": "vscode",
     "overrideCommand": false,
     "runArgs": [
