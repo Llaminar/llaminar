@@ -90,7 +90,8 @@
         "--group-add=video",
         "--group-add=render",
         "--ipc=host",
-        "--shm-size=32g"
+        "--shm-size=32g",
+        "--gpus=all"
     ],
     "containerEnv": {
         "VIRTUAL_ENV": "/workspaces/llaminar/.venv",
