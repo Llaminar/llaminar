@@ -87,6 +87,14 @@ namespace llaminar2
             return "COPY";
         case ComputeStageType::DEQUANTIZE:
             return "DEQUANTIZE";
+        case ComputeStageType::QUANTIZE:
+            return "QUANTIZE";
+        case ComputeStageType::EMBEDDING:
+            return "EMBEDDING";
+        case ComputeStageType::LM_HEAD:
+            return "LM_HEAD";
+        case ComputeStageType::FINAL_NORM:
+            return "FINAL_NORM";
         default:
             return "UNKNOWN";
         }
@@ -2465,6 +2473,332 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // EmbeddingStage Implementation
+    // =============================================================================
+
+    EmbeddingStage::EmbeddingStage(Params params) : params_(std::move(params)) {}
+
+    bool EmbeddingStage::execute(IDeviceContext *ctx)
+    {
+        LOG_DEBUG("[EmbeddingStage] Execute: num_tokens=" << params_.num_tokens
+                                                          << " d_model=" << params_.d_model
+                                                          << " vocab_size=" << params_.vocab_size);
+
+        // Validate inputs
+        if (!params_.embed_table || !params_.output)
+        {
+            LOG_ERROR("[EmbeddingStage] Null tensor pointers");
+            return false;
+        }
+
+        if (!params_.token_ids && !params_.token_batches)
+        {
+            LOG_ERROR("[EmbeddingStage] No token input provided");
+            return false;
+        }
+
+        if (params_.num_tokens <= 0 || params_.d_model <= 0)
+        {
+            LOG_ERROR("[EmbeddingStage] Invalid dimensions");
+            return false;
+        }
+
+        // Use the same approach as EmbeddingOp in Qwen2Pipeline:
+        // Get the embedding kernel from the output tensor (IActivationTensor::createEmbedding)
+        // This handles automatic type dispatch for FP32, Q8_1, etc.
+        auto *activation = dynamic_cast<IActivationTensor *>(params_.output);
+        if (!activation)
+        {
+            LOG_ERROR("[EmbeddingStage] Output tensor must implement IActivationTensor");
+            return false;
+        }
+
+        auto kernel = activation->createEmbedding();
+        if (!kernel)
+        {
+            LOG_ERROR("[EmbeddingStage] Failed to create embedding kernel");
+            return false;
+        }
+
+        // Handle batched vs single sequence input
+        if (params_.token_batches)
+        {
+            // Batched input: flatten token batches with padding
+            const int batch_size = static_cast<int>(params_.token_batches->size());
+            const int padded_len = params_.padded_seq_len;
+            const int total_positions = batch_size * padded_len;
+
+            std::vector<int> flat_token_ids(total_positions, 0); // Zero-initialized for padding
+
+            int global_idx = 0;
+            for (int b = 0; b < batch_size; ++b)
+            {
+                const auto &tokens = (*params_.token_batches)[b];
+                const int seq_len = static_cast<int>(tokens.size());
+
+                // Copy actual tokens
+                for (int i = 0; i < seq_len && i < padded_len; ++i)
+                {
+                    flat_token_ids[global_idx + i] = tokens[i];
+                }
+                global_idx += padded_len;
+            }
+
+            // Delegate to kernel's apply_tensor - handles all type dispatch internally
+            if (!kernel->apply_tensor(params_.embed_table, flat_token_ids.data(), total_positions,
+                                      params_.d_model, params_.output, params_.mpi_ctx, params_.device_idx))
+            {
+                LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed (batched)");
+                return false;
+            }
+
+            // Zero out padding positions in output
+            // This matches what EmbeddingOp does in its execute_batched
+            global_idx = 0;
+            for (int b = 0; b < batch_size; ++b)
+            {
+                const auto &tokens = (*params_.token_batches)[b];
+                const int seq_len = static_cast<int>(tokens.size());
+
+                for (int i = seq_len; i < padded_len; ++i)
+                {
+                    zero_output_row(params_.output, global_idx + i, params_.d_model);
+                }
+                global_idx += padded_len;
+            }
+        }
+        else
+        {
+            // Single sequence input: delegate directly to kernel
+            if (!kernel->apply_tensor(params_.embed_table, params_.token_ids, params_.num_tokens,
+                                      params_.d_model, params_.output, params_.mpi_ctx, params_.device_idx))
+            {
+                LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Zero out a row of the output tensor (for padding)
+     *
+     * Handles both FP32 and Q8_1 output formats.
+     */
+    void EmbeddingStage::zero_output_row(TensorBase *output, int row_idx, int d_model)
+    {
+        TensorType output_type = output->native_type();
+
+        if (output_type == TensorType::FP32)
+        {
+            float *data = const_cast<float *>(output->fp32_data());
+            if (data)
+            {
+                std::memset(data + row_idx * d_model, 0, d_model * sizeof(float));
+            }
+        }
+        else if (output_type == TensorType::Q8_1)
+        {
+            // For Q8_1, zero out the blocks for this row
+            auto *q8_1_output = dynamic_cast<Q8_1Tensor *>(output);
+            if (q8_1_output)
+            {
+                // Q8_1 has 32 elements per block
+                const int block_size = 32;
+                const int blocks_per_row = (d_model + block_size - 1) / block_size;
+                Q8_1Block *blocks = q8_1_output->mutable_q8_1_blocks();
+
+                if (blocks)
+                {
+                    for (int b = 0; b < blocks_per_row; ++b)
+                    {
+                        Q8_1Block &block = blocks[row_idx * blocks_per_row + b];
+                        block.d = 0.0f;
+                        std::memset(block.qs, 0, 32);
+                    }
+                }
+            }
+        }
+    }
+
+    size_t EmbeddingStage::estimatedFlops() const
+    {
+        // Embedding is pure memory ops, no FLOPs
+        return 0;
+    }
+
+    size_t EmbeddingStage::estimatedMemoryBytes() const
+    {
+        // Read: embed_table[token_id] for each token
+        // Write: output[num_tokens, d_model]
+        return params_.num_tokens * params_.d_model * sizeof(float) * 2;
+    }
+
+    bool EmbeddingStage::supportsBackend(ComputeBackendType backend) const
+    {
+        // Embedding is currently CPU-only (memcpy-based)
+        return backend == ComputeBackendType::CPU;
+    }
+
+    StageDumpInfo EmbeddingStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        if (params_.output)
+        {
+            info.addOutput("embeddings", params_.output,
+                           params_.num_tokens, params_.d_model);
+        }
+
+        info.addScalarInt("num_tokens", params_.num_tokens);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("vocab_size", params_.vocab_size);
+        info.addScalarInt("device_idx", params_.device_idx);
+
+        return info;
+    }
+
+    // =============================================================================
+    // LMHeadStage Implementation
+    // =============================================================================
+
+    LMHeadStage::LMHeadStage(Params params) : params_(std::move(params)) {}
+
+    bool LMHeadStage::execute(IDeviceContext *ctx)
+    {
+        LOG_DEBUG("[LMHeadStage] Execute: seq_len=" << params_.seq_len
+                                                    << " d_model=" << params_.d_model
+                                                    << " vocab_size=" << params_.vocab_size);
+
+        // Validate inputs
+        if (!params_.hidden_states || !params_.lm_head_weight || !params_.logits)
+        {
+            LOG_ERROR("[LMHeadStage] Null tensor pointers");
+            return false;
+        }
+
+        if (params_.seq_len <= 0 || params_.d_model <= 0 || params_.vocab_size <= 0)
+        {
+            LOG_ERROR("[LMHeadStage] Invalid dimensions");
+            return false;
+        }
+
+        // Get or create GEMM kernel for LM head weight
+        // The kernel handles quantized weights and typed activations
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.lm_head_weight);
+        if (!lm_gemm)
+        {
+            LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
+            return false;
+        }
+
+        // LM head: logits = hidden @ lm_head^T
+        // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
+        // output: [seq_len, vocab_size]
+        bool success = lm_gemm->multiply_tensor(
+            params_.hidden_states,
+            params_.logits,
+            params_.seq_len,
+            params_.vocab_size,
+            params_.d_model,
+            true, // transpose_B (lm_head is [vocab_size, d_model])
+            1.0f, 0.0f,
+            params_.mpi_ctx,
+            params_.device_idx);
+
+        if (!success)
+        {
+            LOG_ERROR("[LMHeadStage] GEMM failed");
+            return false;
+        }
+
+        // Apply bias if present
+        if (params_.bias)
+        {
+            float *logits_data = const_cast<float *>(params_.logits->fp32_data());
+            if (!logits_data)
+            {
+                LOG_ERROR("[LMHeadStage] Failed to get logits data for bias add");
+                return false;
+            }
+
+// Add bias to each row
+#pragma omp parallel for
+            for (int s = 0; s < params_.seq_len; ++s)
+            {
+                float *row = logits_data + s * params_.vocab_size;
+                for (int v = 0; v < params_.vocab_size; ++v)
+                {
+                    row[v] += params_.bias[v];
+                }
+            }
+        }
+
+        return true;
+    }
+
+    size_t LMHeadStage::estimatedFlops() const
+    {
+        // GEMM: 2 * seq_len * vocab_size * d_model
+        return 2ULL * params_.seq_len * params_.vocab_size * params_.d_model;
+    }
+
+    size_t LMHeadStage::estimatedMemoryBytes() const
+    {
+        // Read: hidden [seq_len, d_model], lm_head [vocab_size, d_model]
+        // Write: logits [seq_len, vocab_size]
+        size_t hidden_bytes = params_.seq_len * params_.d_model * sizeof(float);
+        size_t weight_bytes = params_.vocab_size * params_.d_model * sizeof(float); // Approximation for quantized
+        size_t output_bytes = params_.seq_len * params_.vocab_size * sizeof(float);
+        return hidden_bytes + weight_bytes + output_bytes;
+    }
+
+    bool LMHeadStage::supportsBackend(ComputeBackendType backend) const
+    {
+        // LM head uses KernelFactory which supports CPU and GPU
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+        case ComputeBackendType::GPU_CUDA:
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    StageDumpInfo LMHeadStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        if (params_.hidden_states)
+        {
+            info.addInput("hidden_states", params_.hidden_states,
+                          params_.seq_len, params_.d_model);
+        }
+
+        if (params_.lm_head_weight)
+        {
+            info.addWeight("lm_head_weight", params_.lm_head_weight);
+        }
+
+        if (params_.logits)
+        {
+            info.addOutput("logits", params_.logits,
+                           params_.seq_len, params_.vocab_size);
+        }
+
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("vocab_size", params_.vocab_size);
+        info.addScalarBool("has_bias", params_.bias != nullptr);
+        info.addScalarInt("device_idx", params_.device_idx);
+
+        return info;
+    }
+
+    // =============================================================================
     // ComputeStageFactory Implementation
     // =============================================================================
 
@@ -2571,6 +2905,22 @@ namespace llaminar2
     {
         // Unified: AttentionComputeStage uses KernelFactory at execute-time
         return std::make_unique<AttentionComputeStage>(params);
+    }
+
+    // =============================================================================
+    // Model-Level Stage Factories
+    // =============================================================================
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createEmbedding(
+        const EmbeddingStage::Params &params)
+    {
+        return std::make_unique<EmbeddingStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createLMHead(
+        const LMHeadStage::Params &params)
+    {
+        return std::make_unique<LMHeadStage>(params);
     }
 
 } // namespace llaminar2

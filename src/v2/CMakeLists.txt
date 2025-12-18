@@ -508,6 +508,7 @@ add_library(llaminar2_core STATIC
     execution/DeviceContext.cpp
     execution/ComputeStage.cpp
     execution/LayerExecutor.cpp
+    execution/ModelExecutor.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
@@ -518,6 +519,7 @@ add_library(llaminar2_core STATIC
     pipelines/PipelineExecutor.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
     pipelines/qwen/Qwen2LayerExecutor.cpp
+    pipelines/qwen/Qwen2ModelExecutor.cpp
     pipelines/attention/GQAAttention.cpp
     pipelines/attention/MpiAttentionOrchestrator.cpp
     tensors/TensorBase.cpp

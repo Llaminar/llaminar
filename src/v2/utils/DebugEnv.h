@@ -423,6 +423,8 @@ namespace llaminar2
      *
      * Feature Flags:
      *   These flags enable incremental migration of pipeline operations:
+     *   LLAMINAR_EXEC_EMBEDDING            - Use ComputeStage for Embedding lookup (default: 0)
+     *   LLAMINAR_EXEC_LM_HEAD              - Use ComputeStage for LM head projection (default: 0)
      *   LLAMINAR_EXEC_RMSNORM              - Use ComputeStage for RMSNorm (default: 0)
      *   LLAMINAR_EXEC_ROPE                 - Use ComputeStage for RoPE (default: 0)
      *   LLAMINAR_EXEC_ATTENTION            - Use ComputeStage for Attention (default: 0)
@@ -446,6 +448,10 @@ namespace llaminar2
         bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
 
         // Per-operation feature flags (enable incremental migration)
+        // Model-level operations (embedding, final norm, lm head)
+        bool exec_embedding = false; ///< Use ComputeStage for Embedding lookup
+        bool exec_lm_head = false;   ///< Use ComputeStage for LM head projection
+        // Layer-level operations
         bool exec_rmsnorm = false;   ///< Use ComputeStage for RMSNorm
         bool exec_rope = false;      ///< Use ComputeStage for RoPE
         bool exec_attention = false; ///< Use ComputeStage for Attention
@@ -490,7 +496,16 @@ namespace llaminar2
                 auto_weight_transfer = (std::atoi(auto_xfer_env) != 0);
             }
 
-            // Per-operation flags
+            // Model-level operation flags (embedding, lm_head)
+            const char *embedding_env = std::getenv("LLAMINAR_EXEC_EMBEDDING");
+            if (embedding_env)
+                exec_embedding = (std::atoi(embedding_env) != 0);
+
+            const char *lm_head_env = std::getenv("LLAMINAR_EXEC_LM_HEAD");
+            if (lm_head_env)
+                exec_lm_head = (std::atoi(lm_head_env) != 0);
+
+            // Layer-level operation flags
             const char *rmsnorm_env = std::getenv("LLAMINAR_EXEC_RMSNORM");
             if (rmsnorm_env)
                 exec_rmsnorm = (std::atoi(rmsnorm_env) != 0);

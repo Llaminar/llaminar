@@ -427,11 +427,43 @@ namespace llaminar2
         // Validate hidden state dimensions
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "hidden_allocation");
 
-        // Batch embedding lookup
-        if (!embedding_batch(token_batches, current_hidden_.get()))
+        // =============================================================================
+        // Embedding lookup (executor or legacy path)
+        // =============================================================================
+        const auto &exec_env = debugEnv().execution;
+        if (exec_env.exec_embedding)
         {
-            LOG_ERROR("Embedding batch failed");
-            return false;
+            // Executor path: Use EmbeddingStage via ComputeGraph
+            LOG_TRACE("[EMBEDDING] Using EmbeddingStage executor path");
+            auto embed_table = getEmbeddingTable();
+            VALIDATE_POINTER(embed_table, "embedding table");
+
+            EmbeddingStage::Params embed_params;
+            embed_params.embed_table = embed_table.get();
+            embed_params.token_batches = &token_batches;
+            embed_params.padded_seq_len = padded_seq_len_;
+            embed_params.output = current_hidden_.get();
+            embed_params.num_tokens = effective_seq_len;
+            embed_params.d_model = d_model_;
+            embed_params.vocab_size = vocab_size_;
+            embed_params.mpi_ctx = mpi_ctx_.get();
+            embed_params.device_idx = device_idx_;
+
+            EmbeddingStage embed_stage(embed_params);
+            if (!embed_stage.execute(nullptr))
+            {
+                LOG_ERROR("EmbeddingStage execution failed");
+                return false;
+            }
+        }
+        else
+        {
+            // Legacy path: Use embedding_batch
+            if (!embedding_batch(token_batches, current_hidden_.get()))
+            {
+                LOG_ERROR("Embedding batch failed");
+                return false;
+            }
         }
 
         // Capture embedding output
@@ -470,11 +502,54 @@ namespace llaminar2
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_final_norm");
 
-        // LM head projection (batched)
-        if (!lm_head_batch(current_hidden_.get(), effective_seq_len))
+        // =============================================================================
+        // LM head projection (executor or legacy path)
+        // =============================================================================
+        if (exec_env.exec_lm_head)
         {
-            LOG_ERROR("LM head batch failed");
-            return false;
+            // Executor path: Use LMHeadStage
+            LOG_TRACE("[LM_HEAD] Using LMHeadStage executor path");
+            auto lm_head = getLMHead();
+            VALIDATE_POINTER(lm_head, "LM head");
+
+            // Allocate logits buffer if needed
+            if (!logits_buffer_ || static_cast<int>(logits_buffer_->shape()[0]) != effective_seq_len)
+            {
+                logits_buffer_ = std::shared_ptr<FP32Tensor>(
+                    tensor_factory_->createFP32(
+                                       {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
+                                       device_idx_)
+                        .release());
+                LOG_INFO("Allocated logits buffer: "
+                         << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
+            }
+
+            LMHeadStage::Params lm_params;
+            lm_params.hidden_states = current_hidden_.get();
+            lm_params.lm_head_weight = lm_head.get();
+            lm_params.logits = logits_buffer_.get();
+            lm_params.seq_len = effective_seq_len;
+            lm_params.d_model = d_model_;
+            lm_params.vocab_size = vocab_size_;
+            lm_params.bias = nullptr; // Qwen2 has no LM head bias
+            lm_params.mpi_ctx = mpi_ctx_.get();
+            lm_params.device_idx = device_idx_;
+
+            LMHeadStage lm_stage(lm_params);
+            if (!lm_stage.execute(nullptr))
+            {
+                LOG_ERROR("LMHeadStage execution failed");
+                return false;
+            }
+        }
+        else
+        {
+            // Legacy path: Use lm_head_batch
+            if (!lm_head_batch(current_hidden_.get(), effective_seq_len))
+            {
+                LOG_ERROR("LM head batch failed");
+                return false;
+            }
         }
 
         // Update per-sequence positions for next incremental decode step

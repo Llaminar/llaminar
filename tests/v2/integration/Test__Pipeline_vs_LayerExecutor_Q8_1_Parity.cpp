@@ -217,19 +217,23 @@ protected:
             mut_env.execution.use_layer_executor = true;
 
             // Enable all execution stages for full LayerExecutor path
+            setenv("LLAMINAR_EXEC_EMBEDDING", "1", 1);
             setenv("LLAMINAR_EXEC_RMSNORM", "1", 1);
             setenv("LLAMINAR_EXEC_GEMM", "1", 1);
             setenv("LLAMINAR_EXEC_ROPE", "1", 1);
             setenv("LLAMINAR_EXEC_ATTENTION", "1", 1);
             setenv("LLAMINAR_EXEC_SWIGLU", "1", 1);
             setenv("LLAMINAR_EXEC_RESIDUAL", "1", 1);
+            setenv("LLAMINAR_EXEC_LM_HEAD", "1", 1);
 
+            mut_env.execution.exec_embedding = true;
             mut_env.execution.exec_rmsnorm = true;
             mut_env.execution.exec_gemm = true;
             mut_env.execution.exec_rope = true;
             mut_env.execution.exec_attention = true;
             mut_env.execution.exec_swiglu = true;
             mut_env.execution.exec_residual = true;
+            mut_env.execution.exec_lm_head = true;
         }
         else
         {
@@ -237,19 +241,23 @@ protected:
             mut_env.execution.use_layer_executor = false;
 
             // Disable all executor stages for legacy path
+            setenv("LLAMINAR_EXEC_EMBEDDING", "0", 1);
             setenv("LLAMINAR_EXEC_RMSNORM", "0", 1);
             setenv("LLAMINAR_EXEC_GEMM", "0", 1);
             setenv("LLAMINAR_EXEC_ROPE", "0", 1);
             setenv("LLAMINAR_EXEC_ATTENTION", "0", 1);
             setenv("LLAMINAR_EXEC_SWIGLU", "0", 1);
             setenv("LLAMINAR_EXEC_RESIDUAL", "0", 1);
+            setenv("LLAMINAR_EXEC_LM_HEAD", "0", 1);
 
+            mut_env.execution.exec_embedding = false;
             mut_env.execution.exec_rmsnorm = false;
             mut_env.execution.exec_gemm = false;
             mut_env.execution.exec_rope = false;
             mut_env.execution.exec_attention = false;
             mut_env.execution.exec_swiglu = false;
             mut_env.execution.exec_residual = false;
+            mut_env.execution.exec_lm_head = false;
         }
 
         PipelineConfig config;

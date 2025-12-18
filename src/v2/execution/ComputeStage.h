@@ -203,6 +203,11 @@ namespace llaminar2
         COPY,       ///< Memory copy
         QUANTIZE,   ///< Quantization (FP32 → Q8_1, etc.)
         DEQUANTIZE, ///< Dequantization
+
+        // Model-level operations (ModelExecutor)
+        EMBEDDING,  ///< Token embedding lookup
+        LM_HEAD,    ///< Language model head projection
+        FINAL_NORM, ///< Final layer normalization
     };
 
     /**
@@ -914,6 +919,104 @@ namespace llaminar2
         bool executeQ8_1(IDeviceContext *ctx, size_t num_elements);
     };
 
+    // =============================================================================
+    // Model-Level Stages (for ModelExecutor)
+    // =============================================================================
+
+    /**
+     * @brief Embedding lookup stage
+     *
+     * Performs token → embedding lookup for transformer input processing.
+     * Supports output to various precision formats (FP32, BF16, Q8_1).
+     *
+     * The embedding table is typically FP32 (stored in model weights).
+     * Output format is determined by the output tensor's native_type().
+     */
+    class EmbeddingStage : public IComputeStage
+    {
+    public:
+        struct Params
+        {
+            // Input/output tensors
+            const TensorBase *embed_table = nullptr; ///< Embedding table [vocab_size, d_model]
+            const int *token_ids = nullptr;          ///< Token IDs to look up
+            TensorBase *output = nullptr;            ///< Output [num_tokens, d_model]
+
+            // Dimensions
+            int num_tokens = 0; ///< Number of tokens to look up
+            int d_model = 0;    ///< Embedding dimension
+            int vocab_size = 0; ///< Vocabulary size (for bounds checking)
+
+            // Batched input (alternative to token_ids)
+            const std::vector<std::vector<int>> *token_batches = nullptr;
+            int padded_seq_len = 0; ///< Padded sequence length for batched
+
+            // Device placement
+            const MPIContext *mpi_ctx = nullptr;
+            int device_idx = -1;
+        };
+
+        explicit EmbeddingStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override { return ComputeStageType::EMBEDDING; }
+        size_t estimatedFlops() const override;
+        size_t estimatedMemoryBytes() const override;
+        bool supportsBackend(ComputeBackendType backend) const override;
+        StageDumpInfo getDumpInfo() const override;
+
+    private:
+        Params params_;
+
+        /// Zero out a row of the output tensor (for padding)
+        static void zero_output_row(TensorBase *output, int row_idx, int d_model);
+    };
+
+    /**
+     * @brief Language model head projection stage
+     *
+     * Projects hidden states to vocabulary logits for token prediction.
+     * Typically the final stage in a forward pass before sampling.
+     *
+     * This stage wraps a GEMM operation but provides semantic clarity
+     * in compute graphs and enables LM head-specific optimizations.
+     */
+    class LMHeadStage : public IComputeStage
+    {
+    public:
+        struct Params
+        {
+            // Input/output tensors
+            const TensorBase *hidden_states = nullptr;  ///< Hidden states [seq_len, d_model]
+            const TensorBase *lm_head_weight = nullptr; ///< LM head weights [vocab_size, d_model]
+            TensorBase *logits = nullptr;               ///< Output logits [seq_len, vocab_size]
+
+            // Dimensions
+            int seq_len = 0;    ///< Sequence length
+            int d_model = 0;    ///< Model dimension
+            int vocab_size = 0; ///< Vocabulary size
+
+            // Optional bias (some models have LM head bias)
+            const float *bias = nullptr; ///< LM head bias [vocab_size] (nullable)
+
+            // Device placement
+            const MPIContext *mpi_ctx = nullptr;
+            int device_idx = -1;
+        };
+
+        explicit LMHeadStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override { return ComputeStageType::LM_HEAD; }
+        size_t estimatedFlops() const override;
+        size_t estimatedMemoryBytes() const override;
+        bool supportsBackend(ComputeBackendType backend) const override;
+        StageDumpInfo getDumpInfo() const override;
+
+    private:
+        Params params_;
+    };
+
     /**
      * @brief MPI Allreduce stage
      */
@@ -1166,6 +1269,32 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createAttentionCompute(
             const AttentionComputeStage::Params &params);
+
+        // =====================================================================
+        // Model-Level Stage Factories (for ModelExecutor)
+        // =====================================================================
+
+        /**
+         * @brief Create an embedding lookup stage
+         *
+         * Used at the start of forward pass to convert token IDs to embeddings.
+         *
+         * @param params Embedding parameters including token IDs and output tensor
+         * @return EmbeddingStage instance
+         */
+        static std::unique_ptr<IComputeStage> createEmbedding(
+            const EmbeddingStage::Params &params);
+
+        /**
+         * @brief Create an LM head projection stage
+         *
+         * Used at the end of forward pass to project hidden states to logits.
+         *
+         * @param params LM head parameters including hidden states and output logits
+         * @return LMHeadStage instance
+         */
+        static std::unique_ptr<IComputeStage> createLMHead(
+            const LMHeadStage::Params &params);
     };
 
 } // namespace llaminar2
