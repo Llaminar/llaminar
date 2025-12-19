@@ -2206,6 +2206,20 @@ add_v2_test(V2_Unit_Qwen2GraphBufferManagement
     MPI_PROCS 1
 )
 
+# Test: Qwen2GraphCaching (Phase 10: Graph caching optimization)
+# Tests graph caching functionality for decode mode:
+# - Caching enabled after initializeBuffers()
+# - Cached graphs reused in decode mode (seq_len=1)
+# - Dynamic parameter updates (pos_offset)
+# - Cache cleared properly on clearCache()/releaseBuffers()
+add_executable(v2_test_qwen2_graph_caching unit/Test__Qwen2GraphCaching.cpp)
+target_link_libraries(v2_test_qwen2_graph_caching llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Qwen2GraphCaching
+    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_caching>
+    LABELS "V2;Unit;Qwen2;Qwen2Graph;GraphCaching;Phase10;Optimization"
+    MPI_PROCS 1
+)
+
 # Test: ExecutionConfigAutoEnable (regression test for empty graph bug)
 # Tests that use_graph_buffer_management=true auto-enables all exec_* flags
 # to prevent empty graphs (0 nodes) when graph buffer management is enabled.

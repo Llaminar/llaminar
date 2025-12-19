@@ -334,6 +334,30 @@ namespace llaminar2
         {
             return StageBufferRequirements{}; // Default: no requirements declared
         }
+
+        // =========================================================================
+        // Dynamic Parameter Update (Phase 10: Graph Caching Optimization)
+        // =========================================================================
+
+        /**
+         * @brief Update dynamic parameters for cached graph reuse
+         *
+         * When graphs are cached and reused across executions, some parameters
+         * change between runs (e.g., position offset for RoPE, seq_len).
+         * This method allows efficient updates without rebuilding the graph.
+         *
+         * Stages that support dynamic params should override this.
+         * Default implementation does nothing (parameters are static).
+         *
+         * @param pos_offset New position offset (for RoPE stages)
+         * @param seq_len New sequence length (for dimension-dependent stages)
+         */
+        virtual void updateDynamicParams(int pos_offset, int seq_len)
+        {
+            (void)pos_offset;
+            (void)seq_len;
+            // Default: no dynamic params to update
+        }
     };
 
     // =============================================================================
@@ -531,6 +555,9 @@ namespace llaminar2
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
+        /// Get params for testing
+        const Params &getParams() const { return params_; }
+
     private:
         Params params_;
     };
@@ -571,6 +598,16 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
+
+        /// Update position offset for cached graph reuse
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            params_.pos_offset = pos_offset;
+            (void)seq_len; // RoPE doesn't need seq_len update
+        }
+
+        /// Get params for testing
+        const Params &getParams() const { return params_; }
 
     private:
         Params params_;
@@ -846,6 +883,16 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
+
+        /// Update position offset for cached graph reuse
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            params_.position_offset = pos_offset;
+            (void)seq_len; // Attention doesn't need seq_len update (kv_len queried dynamically)
+        }
+
+        /// Get params for testing
+        const Params &getParams() const { return params_; }
 
     private:
         Params params_;

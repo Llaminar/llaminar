@@ -511,6 +511,30 @@ namespace llaminar2
         void resetStats() { executor_.resetStats(); }
         void clearCache();
 
+        // =====================================================================
+        // Graph Caching Accessors (for testing)
+        // =====================================================================
+
+        /**
+         * @brief Check if graph caching is enabled
+         * @return true if caching is enabled (after initializeBuffers() with graph buffer management)
+         */
+        bool isGraphCachingEnabled() const { return graph_caching_enabled_; }
+
+        /**
+         * @brief Get the size of the layer graph cache
+         * @return Number of layers in the cache (0 if caching disabled)
+         */
+        size_t getCacheSize() const { return layer_graph_cache_.size(); }
+
+        /**
+         * @brief Check if a valid cached graph exists for a layer
+         * @param layer_idx Layer index (0-based)
+         * @param is_attention true for attention graph, false for FFN graph
+         * @return true if a valid cached graph exists
+         */
+        bool hasValidCachedGraph(int layer_idx, bool is_attention) const;
+
     private:
         // Configuration
         Qwen2GraphConfig config_;
@@ -537,6 +561,77 @@ namespace llaminar2
         int current_batch_size_ = 0;
         int current_seq_len_ = 0;
         std::vector<int> position_ids_buffer_;
+
+        // =====================================================================
+        // Graph Caching (Phase 10: Execution Optimization)
+        // =====================================================================
+        //
+        // When graph_caching_enabled_ is true, we cache pre-built graphs per layer
+        // and reuse them across executions. This avoids the overhead of:
+        // - Creating ComputeGraph objects
+        // - Allocating stage unique_ptrs
+        // - Building dependency maps
+        //
+        // Cached graphs work because:
+        // 1. Buffer pointers are stable (graph-managed buffers)
+        // 2. Weight pointers are stable (owned by ModelLoader)
+        // 3. Only dynamic params (seq_len, pos_offset) change
+        //
+        // For each layer, we cache:
+        // - Attention graph (for seq_len=1 decode mode)
+        // - FFN graph (always reusable)
+        //
+        // Dynamic params are updated via stage setters before execution.
+        // =====================================================================
+
+        /// Enable graph caching (auto-enabled when using graph-managed buffers)
+        bool graph_caching_enabled_ = false;
+
+        /// Cached attention graphs per layer [layer_idx]
+        /// Key is: (layer_idx, seq_len) for different graph variants
+        struct CachedLayerGraphs
+        {
+            std::unique_ptr<ComputeGraph> attention_decode; ///< seq_len=1
+            std::unique_ptr<ComputeGraph> ffn_decode;       ///< seq_len=1
+            int cached_seq_len = 0;                         ///< seq_len used for cached graphs
+            bool valid = false;                             ///< Whether cache is valid
+        };
+        std::vector<CachedLayerGraphs> layer_graph_cache_;
+
+        /// Last position offset used (for RoPE update detection)
+        int last_pos_offset_ = -1;
+
+        /**
+         * @brief Check if we can use cached graph for this execution
+         */
+        bool canUseCachedGraph(int layer_idx, int seq_len) const;
+
+        /**
+         * @brief Get or build attention graph (with caching)
+         */
+        ComputeGraph &getOrBuildAttentionGraph(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            IUnifiedKVCache *kv_cache,
+            const int *position_ids,
+            int device_idx);
+
+        /**
+         * @brief Get or build FFN graph (with caching)
+         */
+        ComputeGraph &getOrBuildFFNGraph(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int device_idx);
+
+        /**
+         * @brief Update dynamic parameters in cached graph
+         */
+        void updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len);
 
         // =====================================================================
         // Graph Buffer Management (Phase 5)

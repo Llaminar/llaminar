@@ -989,7 +989,64 @@ namespace llaminar2
                                                 << " input[0:4]=" << input[0] << "," << input[1] << "," << input[2] << "," << input[3]);
         }
 
-        // Build compute graph
+        // Get device context
+        IDeviceContext *ctx = getDeviceContext(device_idx);
+        if (!ctx)
+        {
+            return false;
+        }
+
+        // =============================================================================
+        // Phase 10: Graph Caching for Decode Mode
+        // =============================================================================
+        // For decode mode (seq_len=1), we can cache and reuse the attention graph.
+        // Only the position offset changes between decode steps.
+        // =============================================================================
+        int pos_offset = position_ids ? position_ids[0] : 0;
+
+        if (graph_caching_enabled_ && seq_len == 1 &&
+            layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
+        {
+            auto &cache = layer_graph_cache_[layer_idx];
+
+            // Check if we have a valid cached graph for decode mode
+            if (cache.attention_decode && cache.cached_seq_len == 1 && cache.valid)
+            {
+                LOG_DEBUG("[Qwen2Graph] Reusing cached attention graph for layer " << layer_idx << " (pos_offset=" << pos_offset << ")");
+
+                // Update dynamic parameters (position offset)
+                updateCachedGraphParams(*cache.attention_decode, pos_offset, seq_len);
+
+                // Execute cached graph
+                bool success = executor_.execute(*cache.attention_decode, ctx);
+                if (!success)
+                {
+                    LOG_ERROR("[Qwen2Graph] Cached attention graph failed at layer " << layer_idx);
+                }
+                cache.attention_decode->reset(); // Reset for next execution
+                return success;
+            }
+
+            // Build and cache the graph
+            LOG_DEBUG("[Qwen2Graph] Building and caching attention graph for layer " << layer_idx << " (decode mode)");
+            cache.attention_decode = std::make_unique<ComputeGraph>(
+                buildAttentionGraph(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device_idx));
+            cache.cached_seq_len = seq_len;
+            cache.valid = true;
+
+            // Execute the newly built graph
+            bool success = executor_.execute(*cache.attention_decode, ctx);
+            if (!success)
+            {
+                LOG_ERROR("[Qwen2Graph] Attention block failed at layer " << layer_idx);
+            }
+            cache.attention_decode->reset();
+            return success;
+        }
+
+        // =============================================================================
+        // Non-cached path (prefill or caching disabled)
+        // =============================================================================
         ComputeGraph graph = buildAttentionGraph(layer, buffers, layer_idx, seq_len,
                                                  kv_cache, position_ids, device_idx);
 
@@ -1002,12 +1059,6 @@ namespace llaminar2
             {
                 LOG_INFO("[EXEC_ATTN]   - " << name);
             }
-        }
-
-        IDeviceContext *ctx = getDeviceContext(device_idx);
-        if (!ctx)
-        {
-            return false;
         }
 
         bool success = executor_.execute(graph, ctx);
@@ -1039,13 +1090,58 @@ namespace llaminar2
         int seq_len,
         int device_idx)
     {
-        ComputeGraph graph = buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx);
-
+        // Get device context
         IDeviceContext *ctx = getDeviceContext(device_idx);
         if (!ctx)
         {
             return false;
         }
+
+        // =============================================================================
+        // Phase 10: Graph Caching for Decode Mode
+        // =============================================================================
+        // FFN graphs have no dynamic parameters (no position offset).
+        // For decode mode (seq_len=1), we can cache and reuse directly.
+        // =============================================================================
+        if (graph_caching_enabled_ && seq_len == 1 &&
+            layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
+        {
+            auto &cache = layer_graph_cache_[layer_idx];
+
+            // Check if we have a valid cached FFN graph
+            if (cache.ffn_decode && cache.valid)
+            {
+                LOG_DEBUG("[Qwen2Graph] Reusing cached FFN graph for layer " << layer_idx);
+
+                // Execute cached graph (no params to update for FFN)
+                bool success = executor_.execute(*cache.ffn_decode, ctx);
+                if (!success)
+                {
+                    LOG_ERROR("[Qwen2Graph] Cached FFN graph failed at layer " << layer_idx);
+                }
+                cache.ffn_decode->reset();
+                return success;
+            }
+
+            // Build and cache the graph
+            LOG_DEBUG("[Qwen2Graph] Building and caching FFN graph for layer " << layer_idx << " (decode mode)");
+            cache.ffn_decode = std::make_unique<ComputeGraph>(
+                buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx));
+
+            // Execute the newly built graph
+            bool success = executor_.execute(*cache.ffn_decode, ctx);
+            if (!success)
+            {
+                LOG_ERROR("[Qwen2Graph] FFN block failed at layer " << layer_idx);
+            }
+            cache.ffn_decode->reset();
+            return success;
+        }
+
+        // =============================================================================
+        // Non-cached path (prefill or caching disabled)
+        // =============================================================================
+        ComputeGraph graph = buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx);
 
         bool success = executor_.execute(graph, ctx);
 
@@ -1133,7 +1229,34 @@ namespace llaminar2
         current_seq_len_ = 0;
         position_ids_buffer_.clear();
 
-        LOG_DEBUG("[Qwen2Graph] Cache cleared");
+        // Clear cached graphs (Phase 10)
+        for (auto &cache : layer_graph_cache_)
+        {
+            cache.attention_decode.reset();
+            cache.ffn_decode.reset();
+            cache.cached_seq_len = 0;
+            cache.valid = false;
+        }
+        last_pos_offset_ = -1;
+
+        LOG_DEBUG("[Qwen2Graph] Cache cleared (including " << layer_graph_cache_.size() << " layer graph caches)");
+    }
+
+    bool Qwen2Graph::hasValidCachedGraph(int layer_idx, bool is_attention) const
+    {
+        if (!graph_caching_enabled_)
+            return false;
+        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_graph_cache_.size())
+            return false;
+
+        const auto &cache = layer_graph_cache_[layer_idx];
+        if (!cache.valid)
+            return false;
+
+        if (is_attention)
+            return cache.attention_decode != nullptr;
+        else
+            return cache.ffn_decode != nullptr;
     }
 
     // =============================================================================
@@ -1224,11 +1347,31 @@ namespace llaminar2
                  << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
                  << " (" << savings << "% reduction)");
 
+        // =============================================================================
+        // Phase 10: Enable Graph Caching
+        // =============================================================================
+        // With graph-managed buffers, buffer pointers are stable across executions.
+        // This means we can cache the built graphs and reuse them.
+        // =============================================================================
+        graph_caching_enabled_ = true;
+        layer_graph_cache_.resize(config_.n_layers);
+        LOG_INFO("[Qwen2Graph] Graph caching ENABLED for " << config_.n_layers << " layers");
+
         return true;
     }
 
     void Qwen2Graph::releaseBuffers()
     {
+        // Clear cached graphs first (they reference buffers)
+        for (auto &cache : layer_graph_cache_)
+        {
+            cache.attention_decode.reset();
+            cache.ffn_decode.reset();
+            cache.cached_seq_len = 0;
+            cache.valid = false;
+        }
+        graph_caching_enabled_ = false;
+
         if (buffer_manager_)
         {
             buffer_manager_->releaseAll();
@@ -1291,6 +1434,41 @@ namespace llaminar2
                   << " gate=" << lb.gate
                   << " current_hidden=" << buffers_.current_hidden
                   << " logits=" << buffers_.logits);
+    }
+
+    // =============================================================================
+    // Graph Caching Helper Methods (Phase 10)
+    // =============================================================================
+
+    bool Qwen2Graph::canUseCachedGraph(int layer_idx, int seq_len) const
+    {
+        if (!graph_caching_enabled_)
+            return false;
+        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_graph_cache_.size())
+            return false;
+
+        const auto &cache = layer_graph_cache_[layer_idx];
+        return cache.valid && cache.cached_seq_len == seq_len;
+    }
+
+    void Qwen2Graph::updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len)
+    {
+        // Update all stages in the graph that have dynamic parameters
+        // The graph structure allows us to iterate through all nodes
+        auto order = graph.getExecutionOrder();
+
+        for (const auto &node_name : order)
+        {
+            ComputeNode *node = graph.getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+
+            // Update dynamic params (pos_offset, seq_len)
+            // Only stages that override updateDynamicParams will actually do anything
+            node->stage->updateDynamicParams(pos_offset, seq_len);
+        }
+
+        LOG_TRACE("[Qwen2Graph] Updated cached graph params: pos_offset=" << pos_offset << " seq_len=" << seq_len);
     }
 
 } // namespace llaminar2
