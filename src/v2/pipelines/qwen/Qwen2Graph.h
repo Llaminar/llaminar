@@ -1,0 +1,486 @@
+/**
+ * @file Qwen2Graph.h
+ * @brief Qwen2 compute graph builder for declarative forward pass execution
+ * @author David Sanftenberg
+ * @date December 2025
+ *
+ * Qwen2Graph is the unified graph builder for Qwen2 architecture models,
+ * combining the functionality previously split across Qwen2LayerExecutor
+ * and Qwen2ModelExecutor.
+ *
+ * Key Design:
+ * - This class BUILDS compute graphs (it's a graph builder, not executor)
+ * - The actual execution is delegated to GraphExecutor
+ * - Supports both model-level and layer-level graph construction
+ *
+ * Graph Building Methods:
+ * - buildFullForwardGraph(): Complete embedding → layers → LM head
+ * - buildEmbeddingGraph(): Token embedding lookup
+ * - buildTransformerLayersGraph(): All transformer layers
+ * - buildLayerGraph(): Single transformer layer
+ * - buildAttentionGraph(): Attention block within a layer
+ * - buildFFNGraph(): FFN block within a layer
+ * - buildLMHeadGraph(): Final projection to vocabulary
+ *
+ * Migration Path:
+ * - Qwen2Pipeline creates Qwen2Graph
+ * - Qwen2Pipeline::forward() delegates to executeForward()
+ * - Eventually, all forward logic moves to this graph-based approach
+ */
+
+#pragma once
+
+#include "../../execution/GraphExecutor.h"
+#include "../../execution/ComputeStage.h"
+#include "../../execution/DeviceContext.h"
+#include "../../execution/ExecutionPolicy.h"
+#include "../../pipelines/PipelineConfig.h"
+#include "../../tensors/Tensors.h"
+#include "../../tensors/UnifiedKVCache.h"
+#include "../../loaders/ModelContext.h"
+#include "../../utils/MPIContext.h"
+#include <memory>
+#include <string>
+#include <vector>
+#include <functional>
+#include <unordered_map>
+
+namespace llaminar2
+{
+
+    // Forward declarations
+    class Qwen2Pipeline;
+
+    // =========================================================================
+    // Configuration
+    // =========================================================================
+
+    /**
+     * @brief Configuration for Qwen2Graph
+     *
+     * Combines architecture parameters with execution settings.
+     */
+    struct Qwen2GraphConfig
+    {
+        // Model architecture
+        int n_layers = 0;   ///< Number of transformer layers
+        int d_model = 0;    ///< Model hidden dimension
+        int n_heads = 0;    ///< Number of attention heads
+        int n_kv_heads = 0; ///< Number of KV heads (GQA)
+        int head_dim = 0;   ///< Dimension per head
+        int d_ff = 0;       ///< FFN intermediate dimension
+        int vocab_size = 0; ///< Vocabulary size
+
+        // FFN sharding (for tensor parallelism)
+        int d_ff_local = 0; ///< Local FFN dim per rank
+        bool ffn_column_parallel = false;
+
+        // Precision and execution
+        float rms_norm_eps = 1e-6f;
+        float rope_theta = 10000.0f;
+        ActivationPrecision activation_precision = ActivationPrecision::FP32;
+
+        // Execution settings
+        int default_device = 0;
+        bool enable_profiling = false;
+        bool enable_validation = false;
+
+        /// Use decomposed attention path (Phase 9): KVCacheAppendStage + AttentionComputeStage
+        bool use_decomposed_attention = false;
+
+        /// Execution policy controlling which operations run
+        ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
+
+        /// Base GraphExecutor configuration
+        GraphExecutorConfig executor_config = GraphExecutorConfig{};
+    };
+
+    // =========================================================================
+    // Weight Structures
+    // =========================================================================
+
+    /**
+     * @brief Layer weights for attention and FFN blocks
+     *
+     * Raw pointers since Qwen2Graph does NOT own these weights.
+     */
+    struct Qwen2LayerWeights
+    {
+        // Attention weights
+        TensorBase *wq = nullptr;        ///< Query projection
+        TensorBase *wk = nullptr;        ///< Key projection
+        TensorBase *wv = nullptr;        ///< Value projection
+        TensorBase *wo = nullptr;        ///< Output projection
+        TensorBase *attn_norm = nullptr; ///< Pre-attention norm gamma
+
+        // Attention biases (Qwen2 uses Q/K/V biases)
+        TensorBase *q_bias = nullptr; ///< Query bias [d_model]
+        TensorBase *k_bias = nullptr; ///< Key bias [n_kv_heads * head_dim]
+        TensorBase *v_bias = nullptr; ///< Value bias [n_kv_heads * head_dim]
+
+        // FFN weights
+        TensorBase *gate_proj = nullptr; ///< FFN gate projection
+        TensorBase *up_proj = nullptr;   ///< FFN up projection
+        TensorBase *down_proj = nullptr; ///< FFN down projection
+        TensorBase *ffn_norm = nullptr;  ///< Pre-FFN norm gamma
+    };
+
+    /**
+     * @brief Model-level weights
+     *
+     * Provides access to global weights and per-layer accessor.
+     */
+    struct Qwen2ModelWeights
+    {
+        TensorBase *embedding_table = nullptr; ///< [vocab_size, d_model]
+        TensorBase *final_norm = nullptr;      ///< [d_model]
+        TensorBase *lm_head = nullptr;         ///< [vocab_size, d_model]
+
+        /// Accessor for per-layer weights
+        std::function<Qwen2LayerWeights(int layer_idx)> get_layer_weights;
+    };
+
+    // =========================================================================
+    // Activation Buffers
+    // =========================================================================
+
+    /**
+     * @brief Activation buffers for layer execution
+     *
+     * ## Buffer Lifecycle Semantics
+     *
+     * **INOUT (Input modified in-place)**:
+     *   - `residual`: Accumulates attention/FFN outputs via +=
+     *   - `normalized`: Receives norm output, may be reused
+     *
+     * **SCRATCH (Temporary workspace)**:
+     *   - `Q`, `K`, `V`: Projection outputs, consumed by attention
+     *   - `attn_output`: Pre-Wo output, consumed by projection
+     *   - `gate`, `up`: FFN projections, consumed by SwiGLU
+     *   - `ffn_output`: SwiGLU output, consumed by down projection
+     *   - `workspace_scores`, `workspace_context`, `workspace_mask`: Attention scratch
+     *
+     * **OUTPUT (Write-only)**:
+     *   - `current_hidden`: Final hidden state output
+     *   - `attn_proj`: After Wo projection, before residual add
+     */
+    struct Qwen2ActivationBuffers
+    {
+        // === INOUT Buffers ===
+        TensorBase *residual = nullptr;
+        TensorBase *normalized = nullptr;
+
+        // === SCRATCH Buffers ===
+        TensorBase *Q = nullptr;
+        TensorBase *K = nullptr;
+        TensorBase *V = nullptr;
+        TensorBase *attn_output = nullptr;
+        TensorBase *gate = nullptr;
+        TensorBase *up = nullptr;
+        TensorBase *ffn_output = nullptr;
+        TensorBase *workspace_scores = nullptr;
+        TensorBase *workspace_context = nullptr;
+        TensorBase *workspace_mask = nullptr;
+
+        // === OUTPUT Buffers ===
+        TensorBase *attn_proj = nullptr;
+        TensorBase *current_hidden = nullptr;
+    };
+
+    /**
+     * @brief Model-level buffers for full forward pass
+     */
+    struct Qwen2ModelBuffers
+    {
+        TensorBase *current_hidden = nullptr; ///< [batch_size * seq_len, d_model]
+        TensorBase *logits = nullptr;         ///< [batch_size * seq_len, vocab_size]
+
+        /// Per-layer activation buffers
+        Qwen2ActivationBuffers layer_buffers;
+    };
+
+    // =========================================================================
+    // Forward Input/Output
+    // =========================================================================
+
+    /**
+     * @brief Input for forward pass
+     */
+    struct Qwen2ForwardInput
+    {
+        const int *token_ids = nullptr; ///< Token IDs [batch_size * seq_len]
+        int batch_size = 1;             ///< Number of sequences
+        int seq_len = 0;                ///< Sequence length
+        int position_offset = 0;        ///< KV cache position offset
+        int device_idx = 0;             ///< Target device
+
+        /// For batched input (alternative to token_ids)
+        struct Batch
+        {
+            const int *tokens;
+            int len;
+            int offset;
+        };
+        const Batch *batches = nullptr;
+        int num_batches = 0;
+    };
+
+    /**
+     * @brief Output from forward pass
+     */
+    struct Qwen2ForwardOutput
+    {
+        TensorBase *logits = nullptr; ///< Output logits [batch_size * seq_len, vocab_size]
+        TensorBase *hidden = nullptr; ///< Optional: final hidden states
+    };
+
+    // =========================================================================
+    // Qwen2Graph Class
+    // =========================================================================
+
+    /**
+     * @brief Qwen2 compute graph builder
+     *
+     * Builds ComputeGraph instances for Qwen2 architecture,
+     * delegating execution to GraphExecutor.
+     */
+    class Qwen2Graph
+    {
+    public:
+        /**
+         * @brief Construct Qwen2Graph with full context
+         *
+         * @param model_ctx Model context with GGUF metadata
+         * @param mpi_ctx MPI context (nullptr for single-rank)
+         * @param config Qwen2-specific configuration
+         */
+        Qwen2Graph(std::shared_ptr<ModelContext> model_ctx,
+                   std::shared_ptr<MPIContext> mpi_ctx,
+                   const Qwen2GraphConfig &config);
+
+        /**
+         * @brief Construct Qwen2Graph for layer-level operations only
+         *
+         * This constructor is used when only layer-level graph building is needed,
+         * without model-level operations like embedding or LM head.
+         * Backward compatible with Qwen2LayerExecutor(config, mpi_ctx).
+         *
+         * @param config Qwen2-specific configuration
+         * @param mpi_ctx MPI context (nullptr for single-rank)
+         */
+        Qwen2Graph(const Qwen2GraphConfig &config,
+                   std::shared_ptr<MPIContext> mpi_ctx = nullptr);
+
+        ~Qwen2Graph() = default;
+
+        // Non-copyable
+        Qwen2Graph(const Qwen2Graph &) = delete;
+        Qwen2Graph &operator=(const Qwen2Graph &) = delete;
+
+        // =====================================================================
+        // Configuration
+        // =====================================================================
+
+        const Qwen2GraphConfig &config() const { return config_; }
+
+        /**
+         * @brief Set weight accessors (called by pipeline)
+         */
+        void setWeights(const Qwen2ModelWeights &weights) { weights_ = weights; }
+
+        /**
+         * @brief Set activation buffers (called by pipeline)
+         */
+        void setBuffers(const Qwen2ModelBuffers &buffers) { buffers_ = buffers; }
+
+        /**
+         * @brief Set snapshot callback for debugging
+         */
+        void setSnapshotCallback(StageSnapshotCallback callback)
+        {
+            snapshot_callback_ = std::move(callback);
+            executor_.setSnapshotCallback(snapshot_callback_);
+        }
+
+        // =====================================================================
+        // Model-Level Graph Building
+        // =====================================================================
+
+        /**
+         * @brief Build complete forward graph (embedding → layers → LM head)
+         */
+        ComputeGraph buildFullForwardGraph(
+            const Qwen2ForwardInput &input,
+            Qwen2ForwardOutput &output);
+
+        /**
+         * @brief Build embedding lookup graph
+         */
+        ComputeGraph buildEmbeddingGraph(
+            const Qwen2ForwardInput &input,
+            TensorBase *output_hidden);
+
+        /**
+         * @brief Build all transformer layers graph
+         */
+        ComputeGraph buildTransformerLayersGraph(
+            TensorBase *input_hidden,
+            IUnifiedKVCache *kv_cache,
+            const int *position_ids,
+            int device_idx);
+
+        /**
+         * @brief Build single transformer layer graph
+         */
+        ComputeGraph buildLayerGraph(
+            int layer_idx,
+            TensorBase *input_hidden,
+            IUnifiedKVCache *kv_cache,
+            const int *position_ids,
+            int device_idx);
+
+        /**
+         * @brief Build LM head projection graph
+         */
+        ComputeGraph buildLMHeadGraph(
+            TensorBase *hidden_states,
+            TensorBase *output_logits,
+            int device_idx);
+
+        // =====================================================================
+        // Layer-Level Graph Building
+        // =====================================================================
+
+        /**
+         * @brief Build attention block graph
+         */
+        ComputeGraph buildAttentionGraph(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            IUnifiedKVCache *kv_cache,
+            const int *position_ids,
+            int device_idx);
+
+        /**
+         * @brief Build FFN block graph
+         */
+        ComputeGraph buildFFNGraph(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int device_idx);
+
+        // =====================================================================
+        // Execution Methods
+        // =====================================================================
+
+        /**
+         * @brief Execute full forward pass
+         *
+         * Builds and executes the complete forward graph.
+         */
+        bool executeForward(
+            const Qwen2ForwardInput &input,
+            Qwen2ForwardOutput &output);
+
+        /**
+         * @brief Execute a pre-built graph
+         */
+        bool execute(ComputeGraph &graph, IDeviceContext *ctx);
+
+        /**
+         * @brief Execute attention block
+         */
+        bool executeAttention(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            IUnifiedKVCache *kv_cache,
+            const int *position_ids,
+            int device_idx);
+
+        /**
+         * @brief Execute FFN block
+         */
+        bool executeFFN(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int device_idx);
+
+        /**
+         * @brief Execute full transformer layer (attention + FFN)
+         */
+        bool executeLayer(
+            const Qwen2LayerWeights &layer,
+            Qwen2ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            IUnifiedKVCache *kv_cache,
+            const int *position_ids,
+            int device_idx);
+
+        // =====================================================================
+        // Statistics and State
+        // =====================================================================
+
+        const GraphExecutorStats &stats() const { return executor_.stats(); }
+        void resetStats() { executor_.resetStats(); }
+        void clearCache();
+
+    private:
+        // Configuration
+        Qwen2GraphConfig config_;
+        std::shared_ptr<ModelContext> model_ctx_;
+        std::shared_ptr<MPIContext> mpi_ctx_;
+
+        // Weights and buffers (not owned)
+        Qwen2ModelWeights weights_;
+        Qwen2ModelBuffers buffers_;
+
+        // Graph executor for actual execution
+        GraphExecutor executor_;
+
+        // Device contexts (created lazily)
+        std::unordered_map<int, std::unique_ptr<IDeviceContext>> device_contexts_;
+
+        // Snapshot callback
+        StageSnapshotCallback snapshot_callback_;
+
+        // Current execution state
+        int current_batch_size_ = 0;
+        int current_seq_len_ = 0;
+        std::vector<int> position_ids_buffer_;
+
+        // =====================================================================
+        // Helper Methods
+        // =====================================================================
+
+        IDeviceContext *getDeviceContext(int device_idx);
+
+        std::vector<int> buildPositionIds(int seq_len, int batch_size, int offset);
+
+        void addFinalNormToGraph(
+            ComputeGraph &graph,
+            TensorBase *hidden,
+            const std::string &prev_node,
+            int seq_len,
+            int device_idx);
+    };
+
+    // =========================================================================
+    // Backward Compatibility Aliases
+    // =========================================================================
+
+    // NOTE: These aliases are DEPRECATED. Use Qwen2Graph directly.
+    using Qwen2LayerExecutor = Qwen2Graph;
+    using Qwen2ModelExecutor = Qwen2Graph;
+    using Qwen2ExecutorConfig = Qwen2GraphConfig;
+    using Qwen2ModelExecutorConfig = Qwen2GraphConfig;
+
+} // namespace llaminar2

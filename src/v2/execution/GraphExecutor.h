@@ -1,0 +1,300 @@
+/**
+ * @file GraphExecutor.h
+ * @brief Compute graph execution engine
+ * @author David Sanftenberg
+ * @date December 2025
+ *
+ * GraphExecutor coordinates the execution of ComputeStages within a compute graph,
+ * managing:
+ * - Device-aware stage scheduling
+ * - Asynchronous execution with dependency tracking
+ * - Multi-device work distribution via WorkDistributor
+ *
+ * Note: This was previously named LayerExecutor but renamed to better reflect
+ * its purpose - it executes graphs, not layers specifically.
+ *
+ * Architecture:
+ *   Pipeline / ModelExecutor
+ *      |
+ *      v
+ *   GraphExecutor  <-- This component
+ *      |
+ *      v
+ *   ComputeStage[] (device-specific implementations)
+ *      |
+ *      v
+ *   DeviceContext (execution environment)
+ */
+
+#pragma once
+
+#include "IGraphExecutor.h"
+#include "ComputeStage.h"
+#include "DeviceContext.h"
+#include "WorkDistributor.h"
+#include <memory>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <functional>
+
+namespace llaminar2
+{
+
+    // Forward declarations
+    class TensorBase;
+
+    /**
+     * @brief Represents a node in the compute graph
+     */
+    struct ComputeNode
+    {
+        std::string name;                      ///< Node identifier
+        std::unique_ptr<IComputeStage> stage;  ///< The compute stage
+        std::vector<std::string> dependencies; ///< Names of nodes this depends on
+        int device_idx;                        ///< Target device for execution
+        bool completed;                        ///< Execution complete flag
+
+        ComputeNode() : device_idx(-1), completed(false) {}
+        ComputeNode(std::string n, std::unique_ptr<IComputeStage> s, int dev = -1)
+            : name(std::move(n)), stage(std::move(s)), device_idx(dev), completed(false) {}
+    };
+
+    /**
+     * @brief Compute graph for execution
+     *
+     * A directed acyclic graph (DAG) of ComputeNodes with dependency tracking.
+     * Enables parallel execution of independent nodes and proper ordering of
+     * dependent operations.
+     */
+    class ComputeGraph
+    {
+    public:
+        ComputeGraph() = default;
+        ~ComputeGraph() = default;
+
+        // Non-copyable
+        ComputeGraph(const ComputeGraph &) = delete;
+        ComputeGraph &operator=(const ComputeGraph &) = delete;
+
+        // Movable
+        ComputeGraph(ComputeGraph &&) = default;
+        ComputeGraph &operator=(ComputeGraph &&) = default;
+
+        /**
+         * @brief Add a node to the graph
+         * @param name Unique node identifier
+         * @param stage The compute stage to execute
+         * @param device_idx Target device (-1 for auto)
+         * @return Reference to this graph for chaining
+         */
+        ComputeGraph &addNode(const std::string &name,
+                              std::unique_ptr<IComputeStage> stage,
+                              int device_idx = -1);
+
+        /**
+         * @brief Add a dependency between nodes
+         * @param node_name The dependent node
+         * @param depends_on The node that must complete first
+         * @return Reference to this graph for chaining
+         */
+        ComputeGraph &addDependency(const std::string &node_name,
+                                    const std::string &depends_on);
+
+        /**
+         * @brief Get execution order respecting dependencies
+         * @return Vector of node names in valid execution order
+         */
+        std::vector<std::string> getExecutionOrder() const;
+
+        /**
+         * @brief Get nodes that can execute in parallel (no unmet dependencies)
+         * @return Vector of names of ready nodes
+         */
+        std::vector<std::string> getReadyNodes() const;
+
+        /**
+         * @brief Get a node by name
+         * @param name Node identifier
+         * @return Pointer to node (nullptr if not found)
+         */
+        ComputeNode *getNode(const std::string &name);
+        const ComputeNode *getNode(const std::string &name) const;
+
+        /**
+         * @brief Mark a node as completed
+         * @param name Node identifier
+         */
+        void markCompleted(const std::string &name);
+
+        /**
+         * @brief Reset all completion flags
+         */
+        void reset();
+
+        /**
+         * @brief Check if all nodes are completed
+         */
+        bool allCompleted() const;
+
+        /**
+         * @brief Get number of nodes
+         */
+        size_t size() const { return nodes_.size(); }
+
+        /**
+         * @brief Get total estimated FLOPs for all stages
+         */
+        size_t totalEstimatedFlops() const;
+
+        /**
+         * @brief Clear the graph
+         */
+        void clear();
+
+    private:
+        std::vector<std::unique_ptr<ComputeNode>> nodes_;
+        std::unordered_map<std::string, size_t> node_index_;
+    };
+
+    /**
+     * @brief Orchestrates execution of compute stages within a graph
+     *
+     * GraphExecutor manages the execution of compute graphs by handling
+     * topological ordering, device contexts, and execution modes.
+     *
+     * Usage:
+     * @code
+     * GraphExecutor executor(config);
+     *
+     * // Build a graph
+     * ComputeGraph graph;
+     * graph.addNode("norm", createRMSNormStage(...));
+     * graph.addNode("proj", createGEMMStage(...));
+     * graph.addDependency("proj", "norm");
+     *
+     * // Execute
+     * executor.execute(graph, ctx);
+     * @endcode
+     */
+    class GraphExecutor : public IGraphExecutor
+    {
+    public:
+        /**
+         * @brief Construct with configuration
+         * @param config Executor configuration
+         */
+        explicit GraphExecutor(const GraphExecutorConfig &config = GraphExecutorConfig());
+        ~GraphExecutor() override;
+
+        // Non-copyable, movable
+        GraphExecutor(const GraphExecutor &) = delete;
+        GraphExecutor &operator=(const GraphExecutor &) = delete;
+        GraphExecutor(GraphExecutor &&) = default;
+        GraphExecutor &operator=(GraphExecutor &&) = default;
+
+        // =========================================================================
+        // Configuration (IGraphExecutor interface)
+        // =========================================================================
+
+        /**
+         * @brief Get current configuration
+         */
+        const GraphExecutorConfig &config() const override { return config_; }
+
+        /**
+         * @brief Set execution mode
+         */
+        void setExecutionMode(ExecutionMode mode) override { config_.mode = mode; }
+
+        /**
+         * @brief Get current execution mode
+         */
+        ExecutionMode executionMode() const override { return config_.mode; }
+
+        /**
+         * @brief Enable/disable profiling
+         */
+        void setProfilingEnabled(bool enabled) override { config_.enable_profiling = enabled; }
+
+        /**
+         * @brief Enable/disable output validation
+         */
+        void setValidationEnabled(bool enabled) override { config_.enable_validation = enabled; }
+
+        /**
+         * @brief Set snapshot callback for debugging
+         */
+        void setSnapshotCallback(StageSnapshotCallback callback) override { config_.snapshot_callback = std::move(callback); }
+
+        /**
+         * @brief Set the current layer context for stage dumping
+         */
+        void setCurrentLayerIdx(int layer_idx) override { config_.current_layer_idx = layer_idx; }
+
+        /**
+         * @brief Set the current iteration context for stage dumping
+         */
+        void setCurrentIteration(int iteration) override { config_.current_iteration = iteration; }
+
+        /**
+         * @brief Set the MPI rank for stage dumping
+         */
+        void setMPIRank(int rank) override { config_.mpi_rank = rank; }
+
+        // =========================================================================
+        // Execution (IGraphExecutor interface)
+        // =========================================================================
+
+        /**
+         * @brief Execute a compute graph
+         * @param graph The compute graph to execute
+         * @param ctx Device context for execution
+         * @return true on success
+         */
+        bool execute(ComputeGraph &graph, IDeviceContext *ctx) override;
+
+        /**
+         * @brief Execute a compute graph with multi-device support
+         * @param graph The compute graph to execute
+         * @param contexts Map of device_idx -> DeviceContext
+         * @return true on success
+         */
+        bool executeMultiDevice(
+            ComputeGraph &graph,
+            const std::unordered_map<int, IDeviceContext *> &contexts) override;
+
+        // =========================================================================
+        // Statistics (IGraphExecutor interface)
+        // =========================================================================
+
+        /**
+         * @brief Get execution statistics
+         */
+        const GraphExecutorStats &stats() const override { return stats_; }
+
+        /**
+         * @brief Reset statistics
+         */
+        void resetStats() override { stats_.reset(); }
+
+    private:
+        GraphExecutorConfig config_;
+        GraphExecutorStats stats_;
+
+        // Internal execution helpers
+        bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);
+        bool executeParallel(ComputeGraph &graph, IDeviceContext *ctx);
+        bool executeNode(ComputeNode &node, IDeviceContext *ctx);
+
+        // Workspace management
+        std::vector<float> temp_buffer_;
+        size_t temp_buffer_size_ = 0;
+
+        float *getTemporaryBuffer(size_t elements);
+    };
+
+    // Backwards compatibility alias
+    using LayerExecutor = GraphExecutor;
+
+} // namespace llaminar2

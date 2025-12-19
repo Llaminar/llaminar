@@ -507,6 +507,7 @@ add_library(llaminar2_core STATIC
     execution/WorkDistributor.cpp
     execution/DeviceContext.cpp
     execution/ComputeStage.cpp
+    execution/GraphExecutor.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
     loaders/ModelLoader.cpp
@@ -518,6 +519,7 @@ add_library(llaminar2_core STATIC
     pipelines/PipelineFactory.cpp
     pipelines/PipelineExecutor.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
+    pipelines/qwen/Qwen2Graph.cpp
     pipelines/qwen/Qwen2LayerExecutor.cpp
     pipelines/qwen/Qwen2ModelExecutor.cpp
     pipelines/attention/GQAAttention.cpp
