@@ -32,6 +32,7 @@
 #include "ComputeStage.h"
 #include "DeviceContext.h"
 #include "WorkDistributor.h"
+#include "GraphBufferManager.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -278,9 +279,46 @@ namespace llaminar2
          */
         void resetStats() override { stats_.reset(); }
 
+        // =========================================================================
+        // Buffer Management
+        // =========================================================================
+
+        /**
+         * @brief Set the buffer manager for managed execution
+         *
+         * When a buffer manager is set, executeWithBufferManagement() can be
+         * used to automatically allocate buffers before execution.
+         *
+         * @param manager Buffer manager (not owned, must outlive executor)
+         */
+        void setBufferManager(GraphBufferManager *manager) { buffer_manager_ = manager; }
+
+        /**
+         * @brief Get the current buffer manager
+         * @return Pointer to buffer manager (nullptr if not set)
+         */
+        GraphBufferManager *bufferManager() const { return buffer_manager_; }
+
+        /**
+         * @brief Execute a graph with automatic buffer management
+         *
+         * This method:
+         * 1. Allocates all buffers via the buffer manager
+         * 2. Executes the graph
+         * 3. Leaves buffers allocated for retrieval
+         *
+         * Requires setBufferManager() to be called first.
+         *
+         * @param graph The compute graph to execute
+         * @param ctx Device context for execution
+         * @return true on success
+         */
+        bool executeWithBufferManagement(ComputeGraph &graph, IDeviceContext *ctx);
+
     private:
         GraphExecutorConfig config_;
         GraphExecutorStats stats_;
+        GraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);

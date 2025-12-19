@@ -448,23 +448,26 @@ TEST_F(ComputeStageTest, MoERouterBasic)
     const int d_model = 4;
     const int num_experts = 3;
 
-    // Simple hidden states
-    std::vector<float> hidden = {1.0f, 0.0f, 0.0f, 0.0f,  // Token 0
-                                 0.0f, 1.0f, 0.0f, 0.0f}; // Token 1
+    // Simple hidden states using tensor helper
+    std::vector<float> hidden_data = {1.0f, 0.0f, 0.0f, 0.0f,  // Token 0
+                                      0.0f, 1.0f, 0.0f, 0.0f}; // Token 1
+    auto hidden = makeTensor(seq_len, d_model, hidden_data);
 
-    // Gate weights: each expert is a one-hot
-    std::vector<float> gate_weights = {
+    // Gate weights: each expert is a one-hot [num_experts, d_model]
+    std::vector<float> gate_data = {
         1.0f, 0.0f, 0.0f, 0.0f, // Expert 0 responds to dim 0
         0.0f, 1.0f, 0.0f, 0.0f, // Expert 1 responds to dim 1
         0.0f, 0.0f, 1.0f, 0.0f  // Expert 2 responds to dim 2
     };
+    auto gate_weights = makeTensor(num_experts, d_model, gate_data);
 
-    std::vector<float> router_logits(seq_len * num_experts, 0.0f);
+    // Output router logits
+    auto router_logits = makeTensor(seq_len, num_experts);
 
     MoERouterStage::Params params;
-    params.hidden = hidden.data();
-    params.gate_weights = gate_weights.data();
-    params.router_logits = router_logits.data();
+    params.hidden = hidden.get();
+    params.gate_weights = gate_weights.get();
+    params.router_logits = router_logits.get();
     params.seq_len = seq_len;
     params.d_model = d_model;
     params.num_experts = num_experts;
@@ -474,15 +477,18 @@ TEST_F(ComputeStageTest, MoERouterBasic)
     EXPECT_EQ(stage.type(), ComputeStageType::MOE_ROUTER);
     EXPECT_TRUE(stage.execute(ctx_.get()));
 
+    // Get output data for verification
+    const float* output = router_logits->data();
+
     // Token 0: [1,0,0,0] should have logit 1 for expert 0
-    EXPECT_NEAR(router_logits[0], 1.0f, 1e-5f); // Expert 0
-    EXPECT_NEAR(router_logits[1], 0.0f, 1e-5f); // Expert 1
-    EXPECT_NEAR(router_logits[2], 0.0f, 1e-5f); // Expert 2
+    EXPECT_NEAR(output[0], 1.0f, 1e-5f); // Expert 0
+    EXPECT_NEAR(output[1], 0.0f, 1e-5f); // Expert 1
+    EXPECT_NEAR(output[2], 0.0f, 1e-5f); // Expert 2
 
     // Token 1: [0,1,0,0] should have logit 1 for expert 1
-    EXPECT_NEAR(router_logits[3], 0.0f, 1e-5f); // Expert 0
-    EXPECT_NEAR(router_logits[4], 1.0f, 1e-5f); // Expert 1
-    EXPECT_NEAR(router_logits[5], 0.0f, 1e-5f); // Expert 2
+    EXPECT_NEAR(output[3], 0.0f, 1e-5f); // Expert 0
+    EXPECT_NEAR(output[4], 1.0f, 1e-5f); // Expert 1
+    EXPECT_NEAR(output[5], 0.0f, 1e-5f); // Expert 2
 }
 
 TEST_F(ComputeStageTest, MoEExpertNoTokens)

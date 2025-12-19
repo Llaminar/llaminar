@@ -933,67 +933,6 @@ TEST_F(ComputeStagesTest, Stages_LargeSize)
 }
 
 // =============================================================================
-// AttentionStage Basic Tests
-// =============================================================================
-
-TEST_F(ComputeStagesTest, AttentionStage_TypeAndBackend)
-{
-    AttentionStage::Params params{
-        .Q = nullptr,
-        .K = nullptr,
-        .V = nullptr,
-        .output = nullptr,
-        .seq_len = 4,
-        .n_heads = 8,
-        .head_dim = 64};
-
-    AttentionStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::ATTENTION);
-    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
-}
-
-TEST_F(ComputeStagesTest, AttentionStage_EstimatedFlops)
-{
-    const int seq_len = 16, n_heads = 8, head_dim = 64;
-
-    AttentionStage::Params params{
-        .seq_len = seq_len,
-        .n_heads = n_heads,
-        .head_dim = head_dim};
-
-    AttentionStage stage(params);
-
-    // Attention FLOPs: Q*K^T (2*s*s*d) + softmax (5*s*s) + scores*V (2*s*s*d)
-    // Per head, then multiply by n_heads
-    // Note: Implementation may return 0 if not computing FLOP estimates
-    size_t flops = stage.estimatedFlops();
-    // Just verify it doesn't crash and returns non-negative
-    EXPECT_GE(flops, 0);
-}
-
-TEST_F(ComputeStagesTest, AttentionStage_SnapshotInfo)
-{
-    const int seq_len = 4, n_heads = 2, head_dim = 32;
-    std::vector<float> output(seq_len * n_heads * head_dim);
-
-    AttentionStage::Params params{
-        .output = output.data(),
-        .seq_len = seq_len,
-        .n_heads = n_heads,
-        .head_dim = head_dim};
-
-    AttentionStage stage(params);
-
-    auto dump_info = stage.getDumpInfo();
-    ASSERT_EQ(dump_info.outputs.size(), 1);
-    EXPECT_EQ(dump_info.outputs[0].data, output.data());
-    EXPECT_EQ(dump_info.outputs[0].rows, seq_len);
-    EXPECT_EQ(dump_info.outputs[0].cols, n_heads * head_dim);
-    EXPECT_STREQ(dump_info.outputs[0].name, "output");
-}
-
-// =============================================================================
 // AllreduceStage Tests
 // =============================================================================
 
@@ -1001,7 +940,6 @@ TEST_F(ComputeStagesTest, AllreduceStage_TypeAndBackend)
 {
     AllreduceStage::Params params{
         .buffer = nullptr,
-        .count = 256,
         .mpi_comm = nullptr};
 
     AllreduceStage stage(params);
@@ -1013,9 +951,7 @@ TEST_F(ComputeStagesTest, AllreduceStage_TypeAndBackend)
 
 TEST_F(ComputeStagesTest, AllreduceStage_EstimatedFlops)
 {
-    const size_t count = 1024;
-
-    AllreduceStage::Params params{.count = count};
+    AllreduceStage::Params params{.buffer = nullptr};
     AllreduceStage stage(params);
 
     // Allreduce is communication, not compute, but may have some overhead

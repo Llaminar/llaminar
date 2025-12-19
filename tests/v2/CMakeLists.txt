@@ -1202,6 +1202,19 @@ add_v2_test(V2_Unit_AttentionParity
     MPI_PROCS 1  # Single rank for unit testing
 )
 
+# Test: AttentionComputeStage dynamic kv_len from KV cache
+add_executable(v2_test_attention_dynamic_kvlen unit/Test__AttentionComputeStage_DynamicKVLen.cpp)
+target_link_libraries(v2_test_attention_dynamic_kvlen 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionComputeStage_DynamicKVLen 
+    COMMAND $<TARGET_FILE:v2_test_attention_dynamic_kvlen>
+    LABELS "V2;Unit;Attention;ComputeStage;DynamicKVLen;GraphBufferManagement;Phase9;CPU"
+    MPI_PROCS 1  # Single rank for unit testing
+)
+
 # Test: SwiGLU parity regression tests (locks in correct formula: gate * silu(up))
 add_executable(v2_test_swiglu_parity unit/Test__SwiGLUParity.cpp)
 target_link_libraries(v2_test_swiglu_parity 
@@ -2125,6 +2138,109 @@ add_v2_test(V2_Unit_LayerExecutor
     MPI_PROCS 1  # Tests execution orchestration locally
 )
 
+# Test: BufferRole (buffer role classification and descriptor types)
+# Tests BufferRole enum, BufferDescriptor, StageBufferRequirements, and real-world usage patterns
+# Part of Phase 1: GraphExecutor buffer management infrastructure
+add_executable(v2_test_buffer_role unit/Test__BufferRole.cpp)
+target_link_libraries(v2_test_buffer_role llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_BufferRole
+    COMMAND $<TARGET_FILE:v2_test_buffer_role>
+    LABELS "V2;Unit;Execution;BufferRole;BufferDescriptor;BufferManagement"
+    MPI_PROCS 1
+)
+
+# Test: GraphBufferManager (centralized buffer allocation and management)
+# Tests buffer allocation, retrieval, statistics, graph allocation, and executor integration
+# Part of Phase 2: GraphExecutor buffer management infrastructure
+add_executable(v2_test_graph_buffer_manager unit/Test__GraphBufferManager.cpp)
+target_link_libraries(v2_test_graph_buffer_manager llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphBufferManager
+    COMMAND $<TARGET_FILE:v2_test_graph_buffer_manager>
+    LABELS "V2;Unit;Execution;GraphBufferManager;BufferManagement;TensorAllocation"
+    MPI_PROCS 1
+)
+
+# Test: StageBufferRequirements (IComputeStage::getBufferRequirements())
+# Tests buffer requirement declarations for all compute stages (SwiGLU, ResidualAdd,
+# RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for GraphBufferManager integration
+# Part of Phase 3: Stage Migration for buffer management infrastructure
+add_executable(v2_test_stage_buffer_requirements unit/Test__StageBufferRequirements.cpp)
+target_link_libraries(v2_test_stage_buffer_requirements llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageBufferRequirements
+    COMMAND $<TARGET_FILE:v2_test_stage_buffer_requirements>
+    LABELS "V2;Unit;Execution;ComputeStage;BufferRequirements;BufferRole"
+    MPI_PROCS 1
+)
+
+# Test: LivenessAnalyzer (buffer lifetime analysis for memory optimization)
+# Tests buffer liveness tracking, aliasing group computation, memory savings calculation.
+# Part of Phase 4: Liveness Analysis for buffer management infrastructure
+add_executable(v2_test_liveness_analyzer unit/Test__LivenessAnalyzer.cpp)
+target_link_libraries(v2_test_liveness_analyzer llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LivenessAnalyzer
+    COMMAND $<TARGET_FILE:v2_test_liveness_analyzer>
+    LABELS "V2;Unit;Execution;LivenessAnalyzer;BufferAliasing;MemoryOptimization"
+    MPI_PROCS 1
+)
+
+# Test: Qwen2BufferSpec (formal buffer specification for Qwen2 pipeline)
+# Tests buffer specification builder, memory estimation, and aliasing group suggestions.
+# Part of Phase 5: Qwen2Graph Integration
+add_executable(v2_test_qwen2_buffer_spec unit/Test__Qwen2BufferSpec.cpp)
+target_link_libraries(v2_test_qwen2_buffer_spec llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Qwen2BufferSpec
+    COMMAND $<TARGET_FILE:v2_test_qwen2_buffer_spec>
+    LABELS "V2;Unit;Qwen2;BufferSpec;BufferManagement;MemoryOptimization"
+    MPI_PROCS 1
+)
+
+# Test: Qwen2GraphBufferManagement (GraphBufferManager integration with Qwen2Graph)
+# Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
+# statistics tracking, and release cleanup.
+# Part of Phase 5: Qwen2Graph Integration
+add_executable(v2_test_qwen2_graph_buffer_mgmt unit/Test__Qwen2GraphBufferManagement.cpp)
+target_link_libraries(v2_test_qwen2_graph_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Qwen2GraphBufferManagement
+    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_buffer_mgmt>
+    LABELS "V2;Unit;Qwen2;Qwen2Graph;BufferManagement;GraphBufferManager"
+    MPI_PROCS 1
+)
+
+# Test: ExecutionConfigAutoEnable (regression test for empty graph bug)
+# Tests that use_graph_buffer_management=true auto-enables all exec_* flags
+# to prevent empty graphs (0 nodes) when graph buffer management is enabled.
+# Covers the "repeating tokens" bug caused by graph having no computation nodes.
+add_executable(v2_test_execution_config_auto_enable unit/Test__ExecutionConfigAutoEnable.cpp)
+target_link_libraries(v2_test_execution_config_auto_enable llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ExecutionConfigAutoEnable
+    COMMAND $<TARGET_FILE:v2_test_execution_config_auto_enable>
+    LABELS "V2;Unit;Execution;ExecutionConfig;GraphBufferManagement;Regression"
+    MPI_PROCS 1
+)
+
+# Test: CPUKernelDeviceIndex (regression test for device_idx validation bug)
+# Tests that CPU kernels accept any device_idx value (not just -1) for NUMA support.
+# Covers the bug where CPUAttentionKernelTyped rejected device_idx=0 or 1.
+add_executable(v2_test_cpu_kernel_device_index unit/Test__CPUKernelDeviceIndex.cpp)
+target_link_libraries(v2_test_cpu_kernel_device_index llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUKernelDeviceIndex
+    COMMAND $<TARGET_FILE:v2_test_cpu_kernel_device_index>
+    LABELS "V2;Unit;Kernels;Attention;DeviceIndex;NUMA;Regression"
+    MPI_PROCS 1
+)
+
+# Test: DecomposedAttentionRequirement (regression test for shared_from_this crash)
+# Tests that graph buffer management requires decomposed attention path (KVCacheAppendStage +
+# AttentionComputeStage) instead of AttentionWithKVCacheStage which uses create_view().
+# Covers the crash caused by unique_ptr buffers not supporting shared_from_this().
+add_executable(v2_test_decomposed_attention_requirement unit/Test__DecomposedAttentionRequirement.cpp)
+target_link_libraries(v2_test_decomposed_attention_requirement llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DecomposedAttentionRequirement
+    COMMAND $<TARGET_FILE:v2_test_decomposed_attention_requirement>
+    LABELS "V2;Unit;Execution;Attention;GraphBufferManagement;DecomposedAttention;Regression"
+    MPI_PROCS 1
+)
+
 # Test: LayerExecutorInterface (ILayerExecutor interface and MockLayerExecutor)
 # Tests polymorphic execution, MockLayerExecutor behavior, interface-based testing patterns,
 # configuration, statistics, and multi-device execution through interface abstraction
@@ -2439,6 +2555,21 @@ target_link_libraries(v2_integration_pipeline_vs_layer_executor_fp32
 add_v2_test(V2_Integration_Pipeline_vs_LayerExecutor_FP32_Parity
     COMMAND $<TARGET_FILE:v2_integration_pipeline_vs_layer_executor_fp32>
     LABELS "V2;Integration;Pipeline;LayerExecutor;FP32;Parity;ExecutionFramework;Migration"
+    MPI_PROCS 1
+)
+
+# Test: GraphBufferManagement Parity
+# Validates that graph-managed buffer allocation produces equivalent results
+# to pipeline-managed buffer allocation. Part of Phase 5: Qwen2Graph Integration.
+# Both modes use LayerExecutor path, comparing LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=0 vs =1.
+add_executable(v2_integration_graph_buffer_parity integration/Test__GraphBufferManagement_Parity.cpp)
+target_link_libraries(v2_integration_graph_buffer_parity
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_GraphBufferManagement_Parity
+    COMMAND $<TARGET_FILE:v2_integration_graph_buffer_parity>
+    LABELS "V2;Integration;GraphBufferManager;BufferManagement;Parity;ExecutionFramework;Phase5"
     MPI_PROCS 1
 )
 

@@ -6,6 +6,7 @@
  */
 
 #include "ComputeStage.h"
+#include "BufferRole.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/OpenMPUtils.h"
@@ -380,6 +381,43 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements GEMMStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.A || !params_.B || !params_.C)
+            return reqs; // Empty if tensors not set
+
+        // Convert tensor type to buffer tensor type
+        BufferTensorType a_type = toBufferTensorType(params_.A->native_type());
+        BufferTensorType b_type = toBufferTensorType(params_.B->native_type());
+        BufferTensorType c_type = toBufferTensorType(params_.C->native_type());
+
+        // INPUT buffer (activations)
+        reqs.addInput("A", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)}, a_type);
+
+        // WEIGHT buffer (read-only, may be quantized)
+        reqs.addWeight("B", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n)}, b_type);
+
+        // OUTPUT buffer
+        reqs.addOutput("C", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, c_type);
+
+        // Optional bias
+        if (params_.bias)
+        {
+            reqs.addWeight("bias", {static_cast<size_t>(params_.n)}, BufferTensorType::FP32);
+        }
+
+        // Optional gate_input for SwiGLU fusion
+        if (params_.gate_input)
+        {
+            BufferTensorType gate_type = toBufferTensorType(params_.gate_input->native_type());
+            reqs.addInput("gate_input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, gate_type);
+        }
+
+        return reqs;
+    }
+
     // =============================================================================
     // FusedQKVGEMMStage Implementation
     // =============================================================================
@@ -615,6 +653,54 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements FusedQKVGEMMStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.input || !params_.wq || !params_.wk || !params_.wv)
+            return reqs; // Empty if tensors not set
+
+        // Convert tensor types
+        BufferTensorType input_type = params_.input
+                                          ? toBufferTensorType(params_.input->native_type())
+                                          : BufferTensorType::FP32;
+        BufferTensorType wq_type = toBufferTensorType(params_.wq->native_type());
+        BufferTensorType wk_type = toBufferTensorType(params_.wk->native_type());
+        BufferTensorType wv_type = toBufferTensorType(params_.wv->native_type());
+
+        // INPUT buffer (shared activation)
+        reqs.addInput("input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)}, input_type);
+
+        // WEIGHT buffers
+        reqs.addWeight("wq", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_q)}, wq_type);
+        reqs.addWeight("wk", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_k)}, wk_type);
+        reqs.addWeight("wv", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_v)}, wv_type);
+
+        // OUTPUT buffers
+        BufferTensorType out_type = params_.output_q
+                                        ? toBufferTensorType(params_.output_q->native_type())
+                                        : BufferTensorType::FP32;
+        reqs.addOutput("output_q", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_q)}, out_type);
+        reqs.addOutput("output_k", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_k)}, out_type);
+        reqs.addOutput("output_v", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_v)}, out_type);
+
+        // Optional biases
+        if (params_.bias_q)
+        {
+            reqs.addWeight("bias_q", {static_cast<size_t>(params_.n_q)}, BufferTensorType::FP32);
+        }
+        if (params_.bias_k)
+        {
+            reqs.addWeight("bias_k", {static_cast<size_t>(params_.n_k)}, BufferTensorType::FP32);
+        }
+        if (params_.bias_v)
+        {
+            reqs.addWeight("bias_v", {static_cast<size_t>(params_.n_v)}, BufferTensorType::FP32);
+        }
+
+        return reqs;
+    }
+
     // =============================================================================
     // FusedGateUpGEMMStage Implementation
     // =============================================================================
@@ -815,6 +901,45 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements FusedGateUpGEMMStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.input || !params_.w_gate || !params_.w_up)
+            return reqs; // Empty if tensors not set
+
+        // Convert tensor types
+        BufferTensorType input_type = toBufferTensorType(params_.input->native_type());
+        BufferTensorType gate_type = toBufferTensorType(params_.w_gate->native_type());
+        BufferTensorType up_type = toBufferTensorType(params_.w_up->native_type());
+
+        // INPUT buffer (shared activation)
+        reqs.addInput("input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)}, input_type);
+
+        // WEIGHT buffers
+        reqs.addWeight("w_gate", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_gate)}, gate_type);
+        reqs.addWeight("w_up", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_up)}, up_type);
+
+        // OUTPUT buffers
+        BufferTensorType out_type = params_.output_gate
+                                        ? toBufferTensorType(params_.output_gate->native_type())
+                                        : BufferTensorType::FP32;
+        reqs.addOutput("output_gate", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_gate)}, out_type);
+        reqs.addOutput("output_up", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_up)}, out_type);
+
+        // Optional biases
+        if (params_.bias_gate)
+        {
+            reqs.addWeight("bias_gate", {static_cast<size_t>(params_.n_gate)}, BufferTensorType::FP32);
+        }
+        if (params_.bias_up)
+        {
+            reqs.addWeight("bias_up", {static_cast<size_t>(params_.n_up)}, BufferTensorType::FP32);
+        }
+
+        return reqs;
+    }
+
     // =============================================================================
     // RMSNormStage Implementation (Type-Safe via IActivationTensor)
     // =============================================================================
@@ -935,6 +1060,40 @@ namespace llaminar2
         info.addScalar("eps", params_.eps);
 
         return info;
+    }
+
+    StageBufferRequirements RMSNormStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.input)
+            return reqs; // Empty if tensors not set
+
+        // Get dimensions from tensors
+        const size_t seq_len = params_.seq_len > 0
+                                   ? static_cast<size_t>(params_.seq_len)
+                                   : params_.input->rows();
+        const size_t hidden_dim = params_.input->cols();
+
+        // Convert tensor type to buffer tensor type
+        BufferTensorType buf_type = toBufferTensorType(params_.input->native_type());
+
+        // INPUT buffer (may be in-place with output)
+        reqs.addInput("input", {seq_len, hidden_dim}, buf_type);
+
+        // OUTPUT buffer
+        if (params_.output)
+        {
+            reqs.addOutput("output", {seq_len, hidden_dim}, buf_type);
+        }
+
+        // WEIGHT buffer (gamma - always FP32)
+        if (params_.gamma)
+        {
+            reqs.addWeight("gamma", {hidden_dim}, BufferTensorType::FP32);
+        }
+
+        return reqs;
     }
 
     // =============================================================================
@@ -1088,182 +1247,32 @@ namespace llaminar2
         return info;
     }
 
-    // =============================================================================
-    // AttentionStage Implementation
-    // =============================================================================
-
-    AttentionStage::AttentionStage(Params params) : params_(std::move(params)) {}
-
-    bool AttentionStage::execute(IDeviceContext *ctx)
+    StageBufferRequirements RoPEStage::getBufferRequirements() const
     {
-        LOG_DEBUG("[AttentionStage] Execute: seq_len=" << params_.seq_len << " kv_len=" << params_.kv_len
-                                                       << " n_heads=" << params_.n_heads << " n_kv_heads=" << params_.n_kv_heads
-                                                       << " head_dim=" << params_.head_dim << " causal=" << params_.causal);
+        StageBufferRequirements reqs;
 
-        if (!ctx)
+        if (!params_.Q)
+            return reqs; // Empty if tensors not set
+
+        // Get dimensions from tensors
+        const size_t seq_len = params_.Q->rows();
+        const size_t q_dim = static_cast<size_t>(params_.n_heads * params_.head_dim);
+
+        // Convert tensor type to buffer tensor type
+        BufferTensorType buf_type = toBufferTensorType(params_.Q->native_type());
+
+        // Q is INOUT (in-place operation)
+        reqs.addInout("Q", {seq_len, q_dim}, buf_type);
+
+        // K is optional INOUT (in-place operation)
+        if (params_.K)
         {
-            LOG_ERROR("[AttentionStage] Null device context");
-            return false;
+            const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+            const size_t k_dim = static_cast<size_t>(n_kv_heads * params_.head_dim);
+            reqs.addInout("K", {seq_len, k_dim}, buf_type);
         }
 
-        // This is a simplified implementation - production would use optimized kernels
-        const float *Q = static_cast<const float *>(params_.Q);
-        const float *K = static_cast<const float *>(params_.K);
-        const float *V = static_cast<const float *>(params_.V);
-        float *output = static_cast<float *>(params_.output);
-
-        // Debug: dump first few values of Q/K/V
-        LOG_DEBUG("[AttentionStage] Q[0:4] = " << Q[0] << ", " << Q[1] << ", " << Q[2] << ", " << Q[3]);
-        LOG_DEBUG("[AttentionStage] K[0:4] = " << K[0] << ", " << K[1] << ", " << K[2] << ", " << K[3]);
-        LOG_DEBUG("[AttentionStage] V[0:4] = " << V[0] << ", " << V[1] << ", " << V[2] << ", " << V[3]);
-
-        const int seq_len = params_.seq_len;
-        const int kv_len = params_.kv_len;
-        const int n_heads = params_.n_heads;
-        const int n_kv_heads = params_.n_kv_heads;
-        const int head_dim = params_.head_dim;
-        const int heads_per_kv = n_heads / n_kv_heads;
-        const float scale = params_.scale;
-
-        // Get workspace from context for attention scores
-        size_t scores_size = static_cast<size_t>(seq_len) * kv_len * sizeof(float);
-        void *workspace = ctx->getWorkspace(scores_size * n_heads);
-        float *scores_buf = static_cast<float *>(workspace);
-
-        // Process each query head
-        ctx->runFor(0, static_cast<size_t>(n_heads), [=](size_t h_)
-                    {
-        int h = static_cast<int>(h_);
-        int kv_h = h / heads_per_kv;  // GQA: map query head to KV head
-        float* scores = scores_buf + h * seq_len * kv_len;
-        
-        // Q * K^T
-        for (int q_pos = 0; q_pos < seq_len; ++q_pos) {
-            const float* q_vec = Q + q_pos * n_heads * head_dim + h * head_dim;
-            
-            for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
-                // Apply causal mask
-                if (params_.causal && k_pos > q_pos) {
-                    scores[q_pos * kv_len + k_pos] = -INFINITY;
-                    continue;
-                }
-                
-                const float* k_vec = K + k_pos * n_kv_heads * head_dim + kv_h * head_dim;
-                
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    dot += q_vec[d] * k_vec[d];
-                }
-                scores[q_pos * kv_len + k_pos] = dot * scale;
-            }
-        }
-        
-        // Softmax
-        for (int q_pos = 0; q_pos < seq_len; ++q_pos) {
-            float* row = scores + q_pos * kv_len;
-            
-            // Find max
-            float max_val = row[0];
-            for (int k_pos = 1; k_pos < kv_len; ++k_pos) {
-                if (row[k_pos] > max_val) max_val = row[k_pos];
-            }
-            
-            // Exp and sum
-            float sum = 0.0f;
-            for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
-                row[k_pos] = std::exp(row[k_pos] - max_val);
-                sum += row[k_pos];
-            }
-            
-            // Normalize
-            float inv_sum = 1.0f / sum;
-            for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
-                row[k_pos] *= inv_sum;
-            }
-        }
-        
-        // Scores * V
-        for (int q_pos = 0; q_pos < seq_len; ++q_pos) {
-            float* out_vec = output + q_pos * n_heads * head_dim + h * head_dim;
-            const float* score_row = scores + q_pos * kv_len;
-            
-            std::memset(out_vec, 0, head_dim * sizeof(float));
-            
-            for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
-                const float* v_vec = V + k_pos * n_kv_heads * head_dim + kv_h * head_dim;
-                float s = score_row[k_pos];
-                
-                for (int d = 0; d < head_dim; ++d) {
-                    out_vec[d] += s * v_vec[d];
-                }
-            }
-        } });
-
-        // Debug: dump first few values of output
-        LOG_DEBUG("[AttentionStage] output[0:4] = " << output[0] << ", " << output[1] << ", " << output[2] << ", " << output[3]);
-
-        return true;
-    }
-
-    size_t AttentionStage::estimatedFlops() const
-    {
-        // QK: 2 * seq_len * kv_len * head_dim (per head)
-        // Softmax: ~5 * seq_len * kv_len (per head)
-        // V: 2 * seq_len * kv_len * head_dim (per head)
-        size_t qk_flops = 2ULL * params_.seq_len * params_.kv_len * params_.head_dim;
-        size_t softmax_flops = 5ULL * params_.seq_len * params_.kv_len;
-        size_t v_flops = 2ULL * params_.seq_len * params_.kv_len * params_.head_dim;
-        return (qk_flops + softmax_flops + v_flops) * params_.n_heads;
-    }
-
-    size_t AttentionStage::estimatedMemoryBytes() const
-    {
-        size_t q_bytes = static_cast<size_t>(params_.seq_len) * params_.n_heads *
-                         params_.head_dim * sizeof(float);
-        size_t kv_bytes = static_cast<size_t>(params_.kv_len) * params_.n_kv_heads *
-                          params_.head_dim * sizeof(float);
-        size_t out_bytes = q_bytes;
-        return q_bytes + 2 * kv_bytes + out_bytes; // Q + K + V + output
-    }
-
-    bool AttentionStage::supportsBackend(ComputeBackendType backend) const
-    {
-        switch (backend)
-        {
-        case ComputeBackendType::CPU:
-
-            return true;
-        default:
-            return false;
-        }
-    }
-
-    StageDumpInfo AttentionStage::getDumpInfo() const
-    {
-        StageDumpInfo info;
-
-        // Input tensors
-        info.addInput("Q", static_cast<const float *>(params_.Q),
-                      params_.seq_len, params_.n_heads * params_.head_dim);
-        info.addInput("K", static_cast<const float *>(params_.K),
-                      params_.kv_len, params_.n_kv_heads * params_.head_dim);
-        info.addInput("V", static_cast<const float *>(params_.V),
-                      params_.kv_len, params_.n_kv_heads * params_.head_dim);
-
-        // Output
-        info.addOutput("output", static_cast<const float *>(params_.output),
-                       params_.seq_len, params_.n_heads * params_.head_dim);
-
-        // Scalar params
-        info.addScalarInt("seq_len", params_.seq_len);
-        info.addScalarInt("kv_len", params_.kv_len);
-        info.addScalarInt("n_heads", params_.n_heads);
-        info.addScalarInt("n_kv_heads", params_.n_kv_heads);
-        info.addScalarInt("head_dim", params_.head_dim);
-        info.addScalarBool("causal", params_.causal);
-        info.addScalar("scale", params_.scale);
-
-        return info;
+        return reqs;
     }
 
     // =============================================================================
@@ -1374,6 +1383,30 @@ namespace llaminar2
         info.addScalarInt("intermediate_dim", intermediate_dim);
 
         return info;
+    }
+
+    StageBufferRequirements SwiGLUStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.gate || !params_.up || !params_.output)
+            return reqs; // Empty if tensors not set
+
+        // Get dimensions from tensors
+        const size_t rows = params_.gate->rows();
+        const size_t cols = params_.gate->cols();
+
+        // Convert tensor type to buffer tensor type
+        BufferTensorType buf_type = toBufferTensorType(params_.gate->native_type());
+
+        // INPUT buffers (read-only)
+        reqs.addInput("gate", {rows, cols}, buf_type);
+        reqs.addInput("up", {rows, cols}, buf_type);
+
+        // OUTPUT buffer
+        reqs.addOutput("output", {rows, cols}, buf_type);
+
+        return reqs;
     }
 
     // =============================================================================
@@ -1628,6 +1661,30 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements ResidualAddStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.input || !params_.residual || !params_.output)
+            return reqs; // Empty if tensors not set
+
+        // Get dimensions from tensors
+        const size_t rows = params_.input->rows();
+        const size_t cols = params_.input->cols();
+
+        // Convert tensor type to buffer tensor type
+        BufferTensorType buf_type = toBufferTensorType(params_.input->native_type());
+
+        // INPUT buffers (read-only)
+        reqs.addInput("input", {rows, cols}, buf_type);
+        reqs.addInput("residual", {rows, cols}, buf_type);
+
+        // OUTPUT buffer (may alias residual for in-place operation)
+        reqs.addOutput("output", {rows, cols}, buf_type);
+
+        return reqs;
+    }
+
     // =============================================================================
     // AllreduceStage Implementation
     // =============================================================================
@@ -1637,8 +1694,16 @@ namespace llaminar2
     bool AllreduceStage::execute(IDeviceContext *ctx)
     {
         (void)ctx;
+
+        if (!params_.buffer)
+        {
+            LOG_ERROR("[AllreduceStage] Null buffer");
+            return false;
+        }
+
+        size_t count = params_.buffer->numel();
         LOG_DEBUG("[AllreduceStage] Execute: buffer=" << params_.buffer
-                                                      << " count=" << params_.count << " has_comm=" << (params_.mpi_comm != nullptr));
+                                                      << " count=" << count << " has_comm=" << (params_.mpi_comm != nullptr));
         if (!params_.mpi_comm)
         {
             LOG_ERROR("[AllreduceStage] Null MPI communicator");
@@ -1647,12 +1712,33 @@ namespace llaminar2
 
         MPI_Comm comm = static_cast<MPI_Comm>(params_.mpi_comm);
 
-        LOG_DEBUG("[AllreduceStage] Calling MPI_Allreduce with count=" << params_.count);
+        // Get mutable data pointer based on tensor type
+        void *data_ptr = nullptr;
+        MPI_Datatype mpi_type = MPI_FLOAT;
+
+        if (params_.buffer->native_type() == TensorType::FP32)
+        {
+            auto *fp32_tensor = dynamic_cast<FP32Tensor *>(params_.buffer);
+            if (fp32_tensor)
+            {
+                data_ptr = fp32_tensor->mutable_data();
+                mpi_type = MPI_FLOAT;
+            }
+        }
+        // Add other types as needed (BF16, FP16, etc.)
+
+        if (!data_ptr)
+        {
+            LOG_ERROR("[AllreduceStage] Unsupported tensor type for allreduce");
+            return false;
+        }
+
+        LOG_DEBUG("[AllreduceStage] Calling MPI_Allreduce with count=" << count);
         int result = MPI_Allreduce(
             MPI_IN_PLACE,
-            params_.buffer,
-            static_cast<int>(params_.count),
-            MPI_FLOAT,
+            data_ptr,
+            static_cast<int>(count),
+            mpi_type,
             MPI_SUM,
             comm);
 
@@ -1665,6 +1751,20 @@ namespace llaminar2
         // Allreduce is backend-agnostic (works with any device that has MPI support)
         (void)backend;
         return true;
+    }
+
+    StageBufferRequirements AllreduceStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Allreduce operates in-place on a single buffer
+        if (params_.buffer)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.buffer->native_type());
+            reqs.addInout("buffer", params_.buffer->shape(), buf_type);
+        }
+
+        return reqs;
     }
 
     // =============================================================================
@@ -1681,11 +1781,24 @@ namespace llaminar2
             return false;
         }
 
-        // Router is a simple matmul: hidden @ gate_weights
-        // This computes logits for each expert
-        const float *hidden = static_cast<const float *>(params_.hidden);
-        const float *gate_weights = static_cast<const float *>(params_.gate_weights);
-        float *logits = params_.router_logits;
+        if (!params_.hidden || !params_.gate_weights || !params_.router_logits)
+        {
+            LOG_ERROR("[MoERouterStage] Null tensor parameters");
+            return false;
+        }
+
+        // Get data pointers from tensors
+        const float *hidden = params_.hidden->data();
+        const float *gate_weights = params_.gate_weights->data();
+
+        // Router logits is output, need mutable access
+        auto *logits_tensor = dynamic_cast<FP32Tensor *>(params_.router_logits);
+        if (!logits_tensor)
+        {
+            LOG_ERROR("[MoERouterStage] router_logits must be FP32Tensor");
+            return false;
+        }
+        float *logits = logits_tensor->mutable_data();
 
         const int seq_len = params_.seq_len;
         const int d_model = params_.d_model;
@@ -1726,6 +1839,31 @@ namespace llaminar2
         }
     }
 
+    StageBufferRequirements MoERouterStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (params_.hidden)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.hidden->native_type());
+            reqs.addInput("hidden", params_.hidden->shape(), buf_type);
+        }
+
+        if (params_.gate_weights)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.gate_weights->native_type());
+            reqs.addWeight("gate_weights", params_.gate_weights->shape(), buf_type);
+        }
+
+        if (params_.router_logits)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.router_logits->native_type());
+            reqs.addOutput("router_logits", params_.router_logits->shape(), buf_type);
+        }
+
+        return reqs;
+    }
+
     // -----------------------------------------------------------------------------
 
     MoEExpertStage::MoEExpertStage(Params params) : params_(std::move(params)) {}
@@ -1742,6 +1880,12 @@ namespace llaminar2
         {
             // No tokens routed to this expert - nothing to do
             return true;
+        }
+
+        if (!params_.input || !params_.output)
+        {
+            LOG_ERROR("[MoEExpertStage] Null input or output tensor");
+            return false;
         }
 
         // This is a placeholder - real implementation would use the actual expert weights
@@ -1791,6 +1935,28 @@ namespace llaminar2
         }
     }
 
+    StageBufferRequirements MoEExpertStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (params_.input)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.input->native_type());
+            reqs.addInput("input", params_.input->shape(), buf_type);
+        }
+
+        if (params_.output)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.output->native_type());
+            reqs.addOutput("output", params_.output->shape(), buf_type);
+        }
+
+        // Note: Expert weights (gate, up, down) would be added here when we have
+        // proper weight tensor references in the Params struct
+
+        return reqs;
+    }
+
     // -----------------------------------------------------------------------------
 
     MoECombineStage::MoECombineStage(Params params) : params_(std::move(params)) {}
@@ -1825,6 +1991,34 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    StageBufferRequirements MoECombineStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Add expert outputs as inputs
+        if (params_.expert_outputs)
+        {
+            for (size_t i = 0; i < params_.expert_outputs->size(); ++i)
+            {
+                const TensorBase *expert_out = (*params_.expert_outputs)[i];
+                if (expert_out)
+                {
+                    BufferTensorType buf_type = toBufferTensorType(expert_out->native_type());
+                    std::string name = "expert_output_" + std::to_string(i);
+                    reqs.addInput(name, expert_out->shape(), buf_type);
+                }
+            }
+        }
+
+        if (params_.output)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.output->native_type());
+            reqs.addOutput("output", params_.output->shape(), buf_type);
+        }
+
+        return reqs;
     }
 
     // =============================================================================
@@ -2252,6 +2446,61 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements AttentionWithKVCacheStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Input: Q (query)
+        if (params_.Q)
+        {
+            const size_t seq_dim = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t q_dim = static_cast<size_t>(params_.n_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.Q->native_type());
+            reqs.addInput("Q", {seq_dim, q_dim}, buf_type);
+        }
+
+        // Input: K (key)
+        if (params_.K)
+        {
+            const size_t seq_dim = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t k_dim = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.K->native_type());
+            reqs.addInput("K", {seq_dim, k_dim}, buf_type);
+        }
+
+        // Input: V (value)
+        if (params_.V)
+        {
+            const size_t seq_dim = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t v_dim = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.V->native_type());
+            reqs.addInput("V", {seq_dim, v_dim}, buf_type);
+        }
+
+        // Output: attention output
+        if (params_.output)
+        {
+            const size_t seq_dim = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t out_dim = static_cast<size_t>(params_.n_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.output->native_type());
+            reqs.addOutput("output", {seq_dim, out_dim}, buf_type);
+        }
+
+        // Scratch: workspace buffers (if pre-allocated)
+        if (params_.workspace_scores)
+        {
+            reqs.addScratch("workspace_scores", params_.workspace_scores->shape(),
+                            toBufferTensorType(params_.workspace_scores->native_type()));
+        }
+        if (params_.workspace_context)
+        {
+            reqs.addScratch("workspace_context", params_.workspace_context->shape(),
+                            toBufferTensorType(params_.workspace_context->native_type()));
+        }
+
+        return reqs;
+    }
+
     // =============================================================================
     // KVCacheAppendStage Implementation
     // =============================================================================
@@ -2298,6 +2547,29 @@ namespace llaminar2
         return true;
     }
 
+    StageBufferRequirements KVCacheAppendStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Input: K (to be appended to cache)
+        if (params_.K)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.K->native_type());
+            reqs.addInput("K", params_.K->shape(), buf_type);
+        }
+
+        // Input: V (to be appended to cache)
+        if (params_.V)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.V->native_type());
+            reqs.addInput("V", params_.V->shape(), buf_type);
+        }
+
+        // Note: KV cache itself is external state, not a buffer managed by this stage
+
+        return reqs;
+    }
+
     // =============================================================================
     // AttentionComputeStage Implementation
     // =============================================================================
@@ -2307,19 +2579,35 @@ namespace llaminar2
 
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
     {
+        // Dynamic kv_len: query from KV cache at execution time if available
+        // This enables declarative graph construction where the stage runs after
+        // KVCacheAppendStage has already appended tokens
+        int effective_kv_len = params_.kv_len;
+        if (params_.kv_cache && params_.layer_idx >= 0)
+        {
+            effective_kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+            if (effective_kv_len == 0)
+            {
+                effective_kv_len = params_.seq_len; // Prefill case
+            }
+            LOG_TRACE("[AttentionComputeStage] Dynamic kv_len from cache: " << effective_kv_len
+                                                                            << " (static was: " << params_.kv_len << ")");
+        }
+
         // Detect attention mode if auto-detection enabled
         AttentionMode mode = params_.attention_mode;
         if (params_.auto_detect_mode)
         {
-            mode = detect_attention_mode(params_.batch_size, params_.seq_len, params_.kv_len);
+            mode = detect_attention_mode(params_.batch_size, params_.seq_len, effective_kv_len);
         }
 
         LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size
                                                             << " seq_len=" << params_.seq_len
-                                                            << " kv_len=" << params_.kv_len
+                                                            << " kv_len=" << effective_kv_len
                                                             << " n_heads=" << params_.n_heads
                                                             << " n_kv_heads=" << params_.n_kv_heads
                                                             << " head_dim=" << params_.head_dim
+                                                            << " position_offset=" << params_.position_offset
                                                             << " mode=" << attention_mode_name(mode));
 
         // Validate inputs
@@ -2329,7 +2617,7 @@ namespace llaminar2
             return false;
         }
 
-        if (params_.seq_len <= 0 || params_.kv_len <= 0 ||
+        if (params_.seq_len <= 0 || effective_kv_len <= 0 ||
             params_.n_heads <= 0 || params_.n_kv_heads <= 0 || params_.head_dim <= 0)
         {
             LOG_ERROR("[AttentionComputeStage] Invalid dimensions");
@@ -2376,20 +2664,68 @@ namespace llaminar2
             device_idx = ctx->deviceIndex();
         }
 
+        // Build proper causal mask for decode mode
+        // In decode mode (seq_len < kv_len), we need to account for position offset
+        // The kernel's internal causal mask assumes m=0 for decode (query position 0),
+        // but decode tokens should be able to attend to all cached positions [0, kv_len-1]
+        //
+        // Key insight: For decode with seq_len=1, the query is at position (kv_len-1),
+        // so it should attend to ALL kv_len positions. The kernel's "n > m" check would
+        // only allow attending to position 0, which is wrong.
+        std::unique_ptr<FP32Tensor> decode_mask;
+        TensorBase *mask_to_use = params_.workspace_mask;
+
+        const bool is_decode_mode = (mode == AttentionMode::DECODE ||
+                                     (params_.seq_len < effective_kv_len && params_.batch_size == 1));
+
+        if (params_.causal && is_decode_mode)
+        {
+            // Build decode-specific causal mask
+            // For decode: seq_len=1 (or small), kv_len = full cache length
+            // Query at position i (within seq_len) corresponds to global position (base_pos + i)
+            // where base_pos = position_offset if provided, else (kv_len - seq_len)
+            const int base_pos = (params_.position_offset > 0)
+                                     ? params_.position_offset
+                                     : (effective_kv_len - params_.seq_len);
+
+            decode_mask = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(params_.seq_len * effective_kv_len)});
+            float *mask_data = decode_mask->mutable_data();
+
+            for (int q = 0; q < params_.seq_len; ++q)
+            {
+                const int q_pos = base_pos + q; // Global position of this query
+                for (int k = 0; k < effective_kv_len; ++k)
+                {
+                    // Causal: Query at position q_pos can attend to K positions [0, q_pos]
+                    mask_data[q * effective_kv_len + k] = (k <= q_pos)
+                                                              ? 0.0f
+                                                              : -std::numeric_limits<float>::infinity();
+                }
+            }
+
+            mask_to_use = decode_mask.get();
+            LOG_DEBUG("[AttentionComputeStage] Built decode causal mask: base_pos=" << base_pos
+                                                                                    << " seq_len=" << params_.seq_len << " kv_len=" << effective_kv_len);
+        }
+
         // Dispatch to kernel's compute_tensor() method with detected mode
-        // The kernel uses mode internally for optimized dispatch (decode vs prefill path)
+        // IMPORTANT: For decode with explicit mask, we pass causal=false to avoid
+        // double-masking (kernel would apply "n > m" on top of our mask)
+        const bool kernel_causal = params_.causal && !is_decode_mode;
+
         bool success = kernel->compute_tensor(
             params_.Q, params_.K, params_.V, params_.output,
             params_.batch_size,
             params_.seq_len,
-            params_.kv_len,
+            effective_kv_len,
             params_.n_heads,
             params_.n_kv_heads,
             params_.head_dim,
-            params_.causal,
+            kernel_causal, // Pass false for decode (we built the mask explicitly)
             params_.window_size,
             params_.workspace_scores,
-            params_.workspace_mask,
+            mask_to_use, // Use our decode mask if we built one
             params_.mpi_ctx,
             device_idx);
 
@@ -2470,6 +2806,61 @@ namespace llaminar2
         info.addScalarBool("auto_detect_mode", params_.auto_detect_mode);
 
         return info;
+    }
+
+    StageBufferRequirements AttentionComputeStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Input: Q (query)
+        if (params_.Q)
+        {
+            const size_t q_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t q_cols = static_cast<size_t>(params_.n_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.Q->native_type());
+            reqs.addInput("Q", {q_rows, q_cols}, buf_type);
+        }
+
+        // Input: K (key - may have different kv_len than Q's seq_len)
+        if (params_.K)
+        {
+            const size_t k_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
+            const size_t k_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.K->native_type());
+            reqs.addInput("K", {k_rows, k_cols}, buf_type);
+        }
+
+        // Input: V (value)
+        if (params_.V)
+        {
+            const size_t v_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
+            const size_t v_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.V->native_type());
+            reqs.addInput("V", {v_rows, v_cols}, buf_type);
+        }
+
+        // Output: attention output
+        if (params_.output)
+        {
+            const size_t out_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t out_cols = static_cast<size_t>(params_.n_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.output->native_type());
+            reqs.addOutput("output", {out_rows, out_cols}, buf_type);
+        }
+
+        // Scratch: workspace buffers (if pre-allocated)
+        if (params_.workspace_scores)
+        {
+            reqs.addScratch("workspace_scores", params_.workspace_scores->shape(),
+                            toBufferTensorType(params_.workspace_scores->native_type()));
+        }
+        if (params_.workspace_context)
+        {
+            reqs.addScratch("workspace_context", params_.workspace_context->shape(),
+                            toBufferTensorType(params_.workspace_context->native_type()));
+        }
+
+        return reqs;
     }
 
     // =============================================================================
@@ -2659,6 +3050,31 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements EmbeddingStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.embed_table || !params_.output)
+            return reqs; // Empty if tensors not set
+
+        // WEIGHT buffer (embedding table - read-only)
+        BufferTensorType embed_type = toBufferTensorType(params_.embed_table->native_type());
+        reqs.addWeight("embed_table",
+                       {static_cast<size_t>(params_.vocab_size), static_cast<size_t>(params_.d_model)},
+                       embed_type);
+
+        // OUTPUT buffer (embeddings)
+        BufferTensorType out_type = toBufferTensorType(params_.output->native_type());
+        reqs.addOutput("output",
+                       {static_cast<size_t>(params_.num_tokens), static_cast<size_t>(params_.d_model)},
+                       out_type);
+
+        // Note: token_ids is a raw int* pointer, not a TensorBase, so we don't
+        // declare it as a buffer (it's typically a small CPU array)
+
+        return reqs;
+    }
+
     // =============================================================================
     // LMHeadStage Implementation
     // =============================================================================
@@ -2798,6 +3214,40 @@ namespace llaminar2
         return info;
     }
 
+    StageBufferRequirements LMHeadStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        if (!params_.hidden_states || !params_.lm_head_weight || !params_.logits)
+            return reqs; // Empty if tensors not set
+
+        // INPUT buffer (hidden states)
+        BufferTensorType hidden_type = toBufferTensorType(params_.hidden_states->native_type());
+        reqs.addInput("hidden_states",
+                      {static_cast<size_t>(params_.seq_len), static_cast<size_t>(params_.d_model)},
+                      hidden_type);
+
+        // WEIGHT buffer (LM head weights - may be quantized)
+        BufferTensorType weight_type = toBufferTensorType(params_.lm_head_weight->native_type());
+        reqs.addWeight("lm_head_weight",
+                       {static_cast<size_t>(params_.vocab_size), static_cast<size_t>(params_.d_model)},
+                       weight_type);
+
+        // OUTPUT buffer (logits)
+        BufferTensorType logits_type = toBufferTensorType(params_.logits->native_type());
+        reqs.addOutput("logits",
+                       {static_cast<size_t>(params_.seq_len), static_cast<size_t>(params_.vocab_size)},
+                       logits_type);
+
+        // Optional bias
+        if (params_.bias)
+        {
+            reqs.addWeight("bias", {static_cast<size_t>(params_.vocab_size)}, BufferTensorType::FP32);
+        }
+
+        return reqs;
+    }
+
     // =============================================================================
     // ComputeStageFactory Implementation
     // =============================================================================
@@ -2835,13 +3285,6 @@ namespace llaminar2
     {
         // Unified: RoPEStage uses KernelFactory at execute-time for device dispatch
         return std::make_unique<RoPEStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createAttention(
-        const AttentionStage::Params &params)
-    {
-        // Unified: AttentionStage uses KernelFactory at execute-time for device dispatch
-        return std::make_unique<AttentionStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSwiGLU(

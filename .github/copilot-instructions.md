@@ -1629,11 +1629,29 @@ For a full list of environment variables available, check `src/v2/utils/DebugEnv
 | `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing breakdown in benchmark mode. | Disabled unless set to non-zero. | Performance profiling |
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
 | `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
+| `LLAMINAR_USE_LAYER_EXECUTOR` | Enable LayerExecutor (Qwen2Graph) for declarative compute graphs. | Disabled (0) | Execution framework |
+| `LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT` | When LayerExecutor is enabled, use GraphBufferManager for automatic buffer allocation with aliasing optimization. | Disabled (0) | Buffer management |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk for debugging. | Disabled (0) | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps. | `/tmp/llaminar_tensor_dumps` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_LAYERS` | Comma-separated layer indices to dump. | `all` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_STAGES` | Comma-separated stage names to dump. | `all` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_RANK` | Only dump from this MPI rank (-1=all). | `0` | Snapshot framework |
+
+### Graph Buffer Management
+
+When both `LLAMINAR_USE_LAYER_EXECUTOR=1` and `LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=1` are set, the GraphExecutor takes over buffer responsibilities from the pipeline. This enables automatic aliasing optimization for SCRATCH buffers that don't have overlapping lifetimes.
+
+```bash
+# Enable graph-managed buffers with LayerExecutor
+LLAMINAR_USE_LAYER_EXECUTOR=1 \
+LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=1 \
+./run_llaminar.sh -m model.gguf -p "Hello world"
+```
+
+Benefits of graph-managed buffers:
+- **Memory savings**: Non-overlapping SCRATCH buffers can share physical memory
+- **Automatic aliasing**: Q↔gate, K↔up, V↔ffn_output aliasing
+- **Centralized allocation**: All buffers managed by GraphBufferManager with NUMA awareness
 
 ### Tensor Dump Feature
 

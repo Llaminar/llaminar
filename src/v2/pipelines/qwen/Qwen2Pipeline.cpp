@@ -211,6 +211,7 @@ namespace llaminar2
         // 1. Automatic device-aware weight transfer
         // 2. Parallel/pipelined execution modes
         // 3. Cleaner separation of graph construction vs execution
+        // 4. Graph-managed buffer allocation with aliasing optimization
         // =============================================================================
         const auto &exec_env = debugEnv().execution;
         if (exec_env.use_layer_executor)
@@ -227,8 +228,45 @@ namespace llaminar2
             exec_config.default_device = device_idx_;
             exec_config.enable_profiling = exec_env.executor_profiling;
             exec_config.enable_validation = exec_env.executor_validation;
+            exec_config.activation_precision = config_.activation_precision;
+            exec_config.vocab_size = vocab_size_;
+            exec_config.n_layers = n_layers_;
+
+            // Graph buffer management: when enabled, executor manages its own buffers
+            exec_config.use_graph_buffer_management = exec_env.use_graph_buffer_management;
+            exec_config.max_seq_len = config_.max_seq_len;
+
+            // Decomposed attention (KVCacheAppendStage + AttentionComputeStage) is REQUIRED
+            // when graph buffer management is enabled, because AttentionWithKVCacheStage
+            // uses create_view() which requires shared_ptr, but GraphBufferManager uses
+            // unique_ptr for buffer storage.
+            //
+            // When graph buffer management is DISABLED, we use the legacy
+            // AttentionWithKVCacheStage which is known to be numerically correct.
+            //
+            // TODO: Fix decomposed attention to match legacy attention numerically,
+            // then we can use decomposed attention everywhere.
+            exec_config.use_decomposed_attention = exec_env.use_graph_buffer_management;
 
             layer_executor_ = std::make_unique<Qwen2LayerExecutor>(exec_config, mpi_ctx_);
+
+            // If graph buffer management is enabled, set up the executor's buffers
+            if (exec_env.use_graph_buffer_management)
+            {
+                layer_executor_->setTensorFactory(tensor_factory_.get());
+                if (!layer_executor_->initializeBuffers(config_.max_seq_len))
+                {
+                    LOG_ERROR("Failed to initialize graph-managed buffers");
+                    // Fall back to manual buffer management
+                }
+                else
+                {
+                    const auto *stats = layer_executor_->bufferStats();
+                    LOG_INFO("Graph-managed buffers initialized: "
+                             << (stats->total_bytes / (1024.0 * 1024.0)) << " MB total, "
+                             << stats->total_buffers << " buffers");
+                }
+            }
 
             // Wire snapshot callback for debugging LayerExecutor vs legacy path
             // Callback captures stage outputs using PipelineBase::captureSnapshot
@@ -592,27 +630,44 @@ namespace llaminar2
                 position_ids[i] = current_positions_[seq_idx] + i;
             }
 
-            // Map activation buffers to executor format
-            // IMPORTANT: residual must be a SEPARATE buffer from current_hidden
-            // because residual needs to be preserved while current_hidden is modified
-            Qwen2ActivationBuffers exec_buffers;
-            exec_buffers.residual = buffers.residual.get(); // Separate residual buffer
-            exec_buffers.normalized = buffers.normalized.get();
-            exec_buffers.Q = buffers.Q.get();
-            exec_buffers.K = buffers.K.get();
-            exec_buffers.V = buffers.V.get();
-            exec_buffers.attn_output = buffers.attn_output.get();
-            exec_buffers.attn_proj = buffers.attn_proj.get();
-            exec_buffers.gate = buffers.gate.get();
-            exec_buffers.up = buffers.up.get();
-            exec_buffers.ffn_output = buffers.ffn_output.get();
-            exec_buffers.current_hidden = current_hidden_.get();
+            // Get activation buffers - either from graph-managed or from pipeline
+            Qwen2ActivationBuffers *exec_buffers_ptr;
+            Qwen2ActivationBuffers manual_exec_buffers;
 
-            // Attention workspace buffers (pre-allocated by PipelineBase)
-            // Required for MPI tensor-parallel attention with causal masking
-            exec_buffers.workspace_scores = attention_workspace_scores_.get();
-            exec_buffers.workspace_context = attention_workspace_context_.get();
-            exec_buffers.workspace_mask = attention_workspace_mask_.get();
+            if (layer_executor_->hasGraphManagedBuffers())
+            {
+                // Graph-managed buffers: use executor's internal buffers
+                exec_buffers_ptr = &layer_executor_->getInternalBuffers();
+                // Set current_hidden to pipeline's (shared between pipeline and executor)
+                exec_buffers_ptr->current_hidden = current_hidden_.get();
+
+                LOG_DEBUG("[LAYER_PROCESSING] Using graph-managed buffers");
+            }
+            else
+            {
+                // Manual buffer mapping (legacy path)
+                // IMPORTANT: residual must be a SEPARATE buffer from current_hidden
+                // because residual needs to be preserved while current_hidden is modified
+                manual_exec_buffers.residual = buffers.residual.get();
+                manual_exec_buffers.normalized = buffers.normalized.get();
+                manual_exec_buffers.Q = buffers.Q.get();
+                manual_exec_buffers.K = buffers.K.get();
+                manual_exec_buffers.V = buffers.V.get();
+                manual_exec_buffers.attn_output = buffers.attn_output.get();
+                manual_exec_buffers.attn_proj = buffers.attn_proj.get();
+                manual_exec_buffers.gate = buffers.gate.get();
+                manual_exec_buffers.up = buffers.up.get();
+                manual_exec_buffers.ffn_output = buffers.ffn_output.get();
+                manual_exec_buffers.current_hidden = current_hidden_.get();
+
+                // Attention workspace buffers (pre-allocated by PipelineBase)
+                // Required for MPI tensor-parallel attention with causal masking
+                manual_exec_buffers.workspace_scores = attention_workspace_scores_.get();
+                manual_exec_buffers.workspace_context = attention_workspace_context_.get();
+                manual_exec_buffers.workspace_mask = attention_workspace_mask_.get();
+
+                exec_buffers_ptr = &manual_exec_buffers;
+            }
 
             // NOTE: No copy needed - LayerExecutor reads from current_hidden directly
             // and uses in-place residual adds (output[i] = input[i] + output[i])
@@ -641,7 +696,7 @@ namespace llaminar2
 
             // Execute layer via compute graphs
             bool success = layer_executor_->executeLayer(
-                exec_weights, exec_buffers, layer_idx, effective_seq_len,
+                exec_weights, *exec_buffers_ptr, layer_idx, effective_seq_len,
                 kv_cache_.get(), position_ids.data(), target_device);
 
             if (!success)

@@ -23,6 +23,7 @@
 #include <vector>
 #include <functional>
 #include "DeviceContext.h"
+#include "BufferRole.h"                  // For buffer requirements
 #include "../pipelines/PipelineConfig.h" // For ActivationPrecision
 #include "../tensors/BlockStructures.h"  // For Q8_1Block in StageDumpInfo
 #include "../tensors/TensorKernels.h"    // For AttentionMode enum
@@ -299,6 +300,40 @@ namespace llaminar2
         {
             return StageDumpInfo{}; // Default: empty info
         }
+
+        // =========================================================================
+        // Buffer Management (Phase 1: GraphExecutor buffer management)
+        // =========================================================================
+
+        /**
+         * @brief Get buffer requirements for this stage
+         *
+         * Returns descriptors for all buffers this stage needs:
+         * - INPUT: Read-only data consumed by the stage
+         * - OUTPUT: Data produced by the stage
+         * - INOUT: Read-modify-write buffers (e.g., residual accumulation)
+         * - SCRATCH: Temporary workspace (eligible for aliasing)
+         * - WEIGHT: Read-only model parameters
+         *
+         * GraphBufferManager uses this for:
+         * - Pre-allocating all buffers before graph execution
+         * - Liveness analysis for SCRATCH buffer reuse
+         * - Memory budget estimation
+         *
+         * CRITICAL: Stages MUST NOT allocate buffers internally in execute().
+         * All buffers should come from GraphExecutor's managed pool.
+         *
+         * Default implementation returns empty requirements (for backward compat).
+         * Stages should override to declare their actual requirements.
+         *
+         * @return Buffer requirements for this stage
+         * @see BufferRole for role semantics
+         * @see GraphBufferManager for buffer allocation
+         */
+        virtual StageBufferRequirements getBufferRequirements() const
+        {
+            return StageBufferRequirements{}; // Default: no requirements declared
+        }
     };
 
     // =============================================================================
@@ -344,6 +379,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -396,6 +432,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -448,6 +485,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -491,6 +529,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -531,44 +570,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
-
-    private:
-        Params params_;
-    };
-
-    /**
-     * @brief Full attention stage (Q*K^T, softmax, *V)
-     *
-     * @deprecated Use AttentionWithKVCacheStage for production. This naive
-     * implementation is kept for testing and simple use cases. Production
-     * attention should use KernelFactory::createAttention() via GQAAttention.
-     */
-    class [[deprecated("Use AttentionWithKVCacheStage + KernelFactory for production")]] AttentionStage : public IComputeStage
-    {
-    public:
-        struct Params
-        {
-            const void *Q;  ///< Query tensor [seq_len, n_heads * head_dim]
-            const void *K;  ///< Key tensor [kv_len, n_kv_heads * head_dim]
-            const void *V;  ///< Value tensor [kv_len, n_kv_heads * head_dim]
-            void *output;   ///< Output tensor [seq_len, n_heads * head_dim]
-            int seq_len;    ///< Query sequence length
-            int kv_len;     ///< Key/value sequence length
-            int n_heads;    ///< Number of query heads
-            int n_kv_heads; ///< Number of KV heads (GQA)
-            int head_dim;   ///< Dimension per head
-            bool causal;    ///< Apply causal mask
-            float scale;    ///< Attention scale (1/sqrt(head_dim))
-        };
-
-        explicit AttentionStage(Params params);
-
-        bool execute(IDeviceContext *ctx) override;
-        ComputeStageType type() const override { return ComputeStageType::ATTENTION; }
-        size_t estimatedFlops() const override;
-        size_t estimatedMemoryBytes() const override;
-        bool supportsBackend(ComputeBackendType backend) const override;
-        StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -690,6 +692,7 @@ namespace llaminar2
          * If mode is AUTO, this detects based on seq_len and cache state.
          */
         Mode effectiveMode() const;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -739,6 +742,7 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::COPY; } // Cache ops are data movement
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -815,6 +819,19 @@ namespace llaminar2
             TensorBase *workspace_context = nullptr; ///< [seq_len, head_dim]
             TensorBase *workspace_mask = nullptr;    ///< [seq_len, kv_len] or nullptr
 
+            // KV cache for dynamic length query at execution time
+            // When set, kv_len is queried from cache instead of using the static value
+            // This enables declarative graph construction where the actual kv_len
+            // depends on prior KVCacheAppendStage execution
+            IUnifiedKVCache *kv_cache = nullptr;
+            int layer_idx = -1; ///< Layer index for KV cache query
+
+            // Position offset for decode mode causal masking
+            // In decode mode (seq_len < kv_len), this indicates the query's global position
+            // For proper causal masking, query at position_offset can attend to [0, position_offset]
+            // If 0 (default), will be auto-computed as (kv_len - seq_len) for decode mode
+            int position_offset = 0;
+
             // Optional MPI context (for distributed logging, not tensor-parallel here)
             const MPIContext *mpi_ctx = nullptr;
             int device_idx = -1; ///< Target device (-1 = CPU, ≥0 = GPU)
@@ -828,6 +845,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -863,6 +881,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -907,6 +926,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -964,6 +984,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -1012,6 +1033,7 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -1025,9 +1047,8 @@ namespace llaminar2
     public:
         struct Params
         {
-            void *buffer;   ///< Buffer to allreduce (in-place)
-            size_t count;   ///< Number of elements
-            void *mpi_comm; ///< MPI communicator (cast to MPI_Comm)
+            TensorBase *buffer = nullptr; ///< Buffer to allreduce (in-place)
+            void *mpi_comm = nullptr;     ///< MPI communicator (cast to MPI_Comm)
         };
 
         explicit AllreduceStage(Params params);
@@ -1036,6 +1057,7 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::ALLREDUCE; }
         bool requiresAllreduce() const override { return true; }
         bool supportsBackend(ComputeBackendType backend) const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -1053,12 +1075,12 @@ namespace llaminar2
     public:
         struct Params
         {
-            const void *hidden;       ///< Hidden states [seq_len, d_model]
-            const void *gate_weights; ///< Router weights [d_model, num_experts]
-            float *router_logits;     ///< Output: router logits [seq_len, num_experts]
-            int seq_len;
-            int d_model;
-            int num_experts;
+            const TensorBase *hidden = nullptr;       ///< Hidden states [seq_len, d_model]
+            const TensorBase *gate_weights = nullptr; ///< Router weights [d_model, num_experts]
+            TensorBase *router_logits = nullptr;      ///< Output: router logits [seq_len, num_experts]
+            int seq_len = 0;
+            int d_model = 0;
+            int num_experts = 0;
         };
 
         explicit MoERouterStage(Params params);
@@ -1067,6 +1089,7 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::MOE_ROUTER; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -1083,15 +1106,15 @@ namespace llaminar2
     public:
         struct Params
         {
-            int expert_id;                         ///< Which expert this is
-            const void *input;                     ///< Input tokens for this expert
-            void *output;                          ///< Output buffer
-            const TensorBase *gate_w;              ///< Expert gate weights
-            const TensorBase *up_w;                ///< Expert up weights
-            const TensorBase *down_w;              ///< Expert down weights
-            const std::vector<int> *token_indices; ///< Which tokens to process
-            int d_model;
-            int intermediate_dim;
+            int expert_id = 0;                               ///< Which expert this is
+            const TensorBase *input = nullptr;               ///< Input tokens for this expert
+            TensorBase *output = nullptr;                    ///< Output buffer
+            const TensorBase *gate_w = nullptr;              ///< Expert gate weights
+            const TensorBase *up_w = nullptr;                ///< Expert up weights
+            const TensorBase *down_w = nullptr;              ///< Expert down weights
+            const std::vector<int> *token_indices = nullptr; ///< Which tokens to process
+            int d_model = 0;
+            int intermediate_dim = 0;
         };
 
         explicit MoEExpertStage(Params params);
@@ -1101,6 +1124,7 @@ namespace llaminar2
         std::string name() const override;
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -1114,13 +1138,13 @@ namespace llaminar2
     public:
         struct Params
         {
-            const std::vector<const void *> *expert_outputs; ///< Outputs from each expert
-            const std::vector<float> *expert_weights;        ///< Router weights per token-expert
-            const std::vector<int> *token_expert_map;        ///< Which experts each token used
-            void *output;                                    ///< Combined output [seq_len, d_model]
-            int seq_len;
-            int d_model;
-            int top_k; ///< Experts per token
+            const std::vector<const TensorBase *> *expert_outputs = nullptr; ///< Outputs from each expert
+            const std::vector<float> *expert_weights = nullptr;              ///< Router weights per token-expert
+            const std::vector<int> *token_expert_map = nullptr;              ///< Which experts each token used
+            TensorBase *output = nullptr;                                    ///< Combined output [seq_len, d_model]
+            int seq_len = 0;
+            int d_model = 0;
+            int top_k = 0; ///< Experts per token
         };
 
         explicit MoECombineStage(Params params);
@@ -1128,6 +1152,7 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_COMBINE; }
         bool supportsBackend(ComputeBackendType backend) const override;
+        StageBufferRequirements getBufferRequirements() const override;
 
     private:
         Params params_;
@@ -1182,17 +1207,6 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createRoPE(
             const RoPEStage::Params &params);
-
-        /**
-         * @brief Create an attention stage
-         * @deprecated Use createAttentionWithKVCache() for production. This factory
-         * creates the deprecated AttentionStage which uses void* pointers.
-         * Production attention should use KernelFactory::createAttention() via
-         * AttentionWithKVCacheStage -> MpiAttentionOrchestrator -> GQAAttention.
-         */
-        [[deprecated("Use createAttentionWithKVCache() for production")]]
-        static std::unique_ptr<IComputeStage> createAttention(
-            const AttentionStage::Params &params);
 
         /**
          * @brief Create a SwiGLU stage

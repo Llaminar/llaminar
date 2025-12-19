@@ -561,15 +561,16 @@ namespace llaminar2
 
                 TensorBase *K_for_attn = buffers.K;
                 TensorBase *V_for_attn = buffers.V;
-                int kv_len = seq_len;
+                int kv_len = seq_len; // Static hint for mode detection (actual queried at runtime)
 
                 if (kv_cache)
                 {
                     K_for_attn = kv_cache->get_k_base(layer_idx, 0);
                     V_for_attn = kv_cache->get_v_base(layer_idx, 0);
-                    kv_len = kv_cache->get_cached_tokens(layer_idx, 0);
-                    if (kv_len == 0)
-                        kv_len = seq_len;
+                    int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
+                    // Use static cached_tokens for initial mode hint
+                    // Actual kv_len will be queried dynamically at execution time
+                    kv_len = (cached_tokens > 0) ? cached_tokens : seq_len;
                 }
 
                 AttentionMode mode = detect_attention_mode(1, seq_len, kv_len);
@@ -584,17 +585,20 @@ namespace llaminar2
                 attn_params.output = buffers.attn_output;
                 attn_params.batch_size = 1;
                 attn_params.seq_len = seq_len;
-                attn_params.kv_len = kv_len;
+                attn_params.kv_len = kv_len; // Static hint, actual queried from kv_cache at runtime
                 attn_params.n_heads = config_.n_heads;
                 attn_params.n_kv_heads = config_.n_kv_heads;
                 attn_params.head_dim = config_.head_dim;
                 attn_params.causal = true;
                 attn_params.window_size = -1;
                 attn_params.attention_mode = mode;
-                attn_params.auto_detect_mode = false;
+                attn_params.auto_detect_mode = true; // Re-detect at runtime with actual kv_len
                 attn_params.workspace_scores = buffers.workspace_scores;
                 attn_params.workspace_context = buffers.workspace_context;
                 attn_params.workspace_mask = buffers.workspace_mask;
+                attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
+                attn_params.layer_idx = layer_idx;
+                attn_params.position_offset = position_ids ? position_ids[0] : 0;
                 attn_params.mpi_ctx = mpi_ctx_.get();
                 attn_params.device_idx = device_idx;
 
@@ -693,8 +697,7 @@ namespace llaminar2
                 graph.addNode(prefix + "wo_allreduce",
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
-                                      buffers.attn_proj->mutable_data(),
-                                      static_cast<size_t>(seq_len) * config_.d_model,
+                                      buffers.attn_proj,
                                       getMPIComm(mpi_ctx_.get())}),
                               device_idx);
 
@@ -867,8 +870,7 @@ namespace llaminar2
                 graph.addNode(prefix + "down_allreduce",
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
-                                      buffers.attn_proj->mutable_data(),
-                                      allreduce_count,
+                                      buffers.attn_proj,
                                       comm}),
                               device_idx);
 
@@ -1132,6 +1134,163 @@ namespace llaminar2
         position_ids_buffer_.clear();
 
         LOG_DEBUG("[Qwen2Graph] Cache cleared");
+    }
+
+    // =============================================================================
+    // Graph Buffer Management (Phase 5)
+    // =============================================================================
+
+    bool Qwen2Graph::initializeBuffers(int seq_len)
+    {
+        if (!config_.use_graph_buffer_management)
+        {
+            LOG_WARN("[Qwen2Graph] initializeBuffers called but use_graph_buffer_management=false");
+            return false;
+        }
+
+        LOG_INFO("[Qwen2Graph] Initializing buffers with graph management, seq_len=" << seq_len);
+
+        // Create buffer spec builder if not already created
+        if (!buffer_spec_builder_)
+        {
+            // Determine activation tensor type
+            BufferTensorType activation_type =
+                (config_.activation_precision == ActivationPrecision::Q8_1)
+                    ? BufferTensorType::Q8_1
+                    : BufferTensorType::FP32;
+
+            buffer_spec_builder_ = std::make_unique<Qwen2BufferSpecBuilder>(
+                config_.d_model,
+                config_.n_heads,
+                config_.n_kv_heads,
+                config_.head_dim,
+                config_.d_ff,
+                config_.vocab_size,
+                activation_type,
+                config_.default_device);
+        }
+
+        // Verify TensorFactory is set
+        if (!tensor_factory_)
+        {
+            LOG_ERROR("[Qwen2Graph] TensorFactory not set. Call setTensorFactory() before initializeBuffers()");
+            return false;
+        }
+
+        // Create buffer manager with TensorFactory
+        buffer_manager_ = std::make_unique<GraphBufferManager>(
+            tensor_factory_, mpi_ctx_.get());
+
+        // Build layer buffer specifications
+        auto layer_specs = buffer_spec_builder_->buildLayerSpecs(seq_len);
+        auto layer_reqs = toBufferRequirements(layer_specs);
+
+        // Allocate layer buffers (iterate over vector)
+        for (const auto &desc : layer_reqs.buffers)
+        {
+            if (!buffer_manager_->allocateBuffer("layer", desc))
+            {
+                LOG_ERROR("[Qwen2Graph] Failed to allocate layer buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Build model-level buffer specifications (current_hidden, logits)
+        auto model_specs = buffer_spec_builder_->buildModelSpecs(1, seq_len);
+        auto model_reqs = toBufferRequirements(model_specs);
+
+        for (const auto &desc : model_reqs.buffers)
+        {
+            if (!buffer_manager_->allocateBuffer("model", desc))
+            {
+                LOG_ERROR("[Qwen2Graph] Failed to allocate model buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Bind allocated buffers to buffers_ struct
+        bindGraphManagedBuffers(seq_len);
+
+        auto &stats = buffer_manager_->stats();
+        LOG_INFO("[Qwen2Graph] Buffer initialization complete: "
+                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
+                 << "scratch=" << (stats.scratch_bytes / (1024.0 * 1024.0)) << " MB, "
+                 << "output=" << (stats.output_bytes / (1024.0 * 1024.0)) << " MB");
+
+        // Log theoretical aliasing savings
+        auto [original, optimized] = buffer_spec_builder_->estimateMemorySavings(seq_len);
+        double savings = (original > 0) ? 100.0 * (original - optimized) / original : 0.0;
+        LOG_INFO("[Qwen2Graph] Theoretical aliasing savings: "
+                 << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
+                 << " (" << savings << "% reduction)");
+
+        return true;
+    }
+
+    void Qwen2Graph::releaseBuffers()
+    {
+        if (buffer_manager_)
+        {
+            buffer_manager_->releaseAll();
+            buffer_manager_.reset();
+            LOG_INFO("[Qwen2Graph] Buffers released");
+        }
+
+        owned_buffers_.clear();
+        buffer_spec_builder_.reset();
+
+        // Clear buffer pointers
+        buffers_ = Qwen2ModelBuffers{};
+    }
+
+    const BufferAllocationStats *Qwen2Graph::bufferStats() const
+    {
+        if (!buffer_manager_)
+        {
+            return nullptr;
+        }
+        return &buffer_manager_->stats();
+    }
+
+    void Qwen2Graph::bindGraphManagedBuffers(int seq_len)
+    {
+        if (!buffer_manager_)
+        {
+            LOG_ERROR("[Qwen2Graph] bindGraphManagedBuffers: buffer_manager_ is null");
+            return;
+        }
+
+        // Bind layer buffers
+        auto &lb = buffers_.layer_buffers;
+
+        lb.residual = buffer_manager_->getBuffer("layer", BufferNames::RESIDUAL);
+        lb.normalized = buffer_manager_->getBuffer("layer", BufferNames::NORMALIZED);
+
+        // Attention buffers
+        lb.Q = buffer_manager_->getBuffer("layer", BufferNames::Q);
+        lb.K = buffer_manager_->getBuffer("layer", BufferNames::K);
+        lb.V = buffer_manager_->getBuffer("layer", BufferNames::V);
+        lb.attn_output = buffer_manager_->getBuffer("layer", BufferNames::ATTN_OUTPUT);
+        lb.attn_proj = buffer_manager_->getBuffer("layer", BufferNames::ATTN_PROJ);
+        lb.workspace_scores = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_SCORES);
+        lb.workspace_context = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_CONTEXT);
+        lb.workspace_mask = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_MASK);
+
+        // FFN buffers
+        lb.gate = buffer_manager_->getBuffer("layer", BufferNames::GATE);
+        lb.up = buffer_manager_->getBuffer("layer", BufferNames::UP);
+        lb.ffn_output = buffer_manager_->getBuffer("layer", BufferNames::FFN_OUTPUT);
+
+        // Model-level buffers
+        buffers_.current_hidden = buffer_manager_->getBuffer("model", BufferNames::CURRENT_HIDDEN);
+        buffers_.logits = buffer_manager_->getBuffer("model", BufferNames::LOGITS);
+
+        LOG_DEBUG("[Qwen2Graph] Bound graph-managed buffers: "
+                  << "residual=" << lb.residual
+                  << " Q=" << lb.Q
+                  << " gate=" << lb.gate
+                  << " current_hidden=" << buffers_.current_hidden
+                  << " logits=" << buffers_.logits);
     }
 
 } // namespace llaminar2

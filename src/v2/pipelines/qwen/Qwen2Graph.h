@@ -31,14 +31,17 @@
 #pragma once
 
 #include "../../execution/GraphExecutor.h"
+#include "../../execution/GraphBufferManager.h"
 #include "../../execution/ComputeStage.h"
 #include "../../execution/DeviceContext.h"
 #include "../../execution/ExecutionPolicy.h"
 #include "../../pipelines/PipelineConfig.h"
 #include "../../tensors/Tensors.h"
+#include "../../tensors/TensorFactory.h"
 #include "../../tensors/UnifiedKVCache.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
+#include "Qwen2BufferSpec.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,6 +90,16 @@ namespace llaminar2
 
         /// Use decomposed attention path (Phase 9): KVCacheAppendStage + AttentionComputeStage
         bool use_decomposed_attention = false;
+
+        /// Use graph-managed buffer allocation with aliasing optimization.
+        /// When true, Qwen2Graph will use GraphBufferManager to allocate activation
+        /// buffers with automatic aliasing of non-overlapping SCRATCH buffers.
+        /// When false (default), uses external setBuffers() pattern.
+        /// Part of Phase 5: Qwen2Graph Integration.
+        bool use_graph_buffer_management = false;
+
+        /// Maximum sequence length for buffer allocation (when use_graph_buffer_management=true)
+        int max_seq_len = 2048;
 
         /// Execution policy controlling which operations run
         ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
@@ -290,8 +303,73 @@ namespace llaminar2
 
         /**
          * @brief Set activation buffers (called by pipeline)
+         *
+         * Use this for manual buffer management (default behavior).
+         * Alternative: Use initializeBuffers() for graph-managed allocation.
          */
         void setBuffers(const Qwen2ModelBuffers &buffers) { buffers_ = buffers; }
+
+        /**
+         * @brief Set TensorFactory for graph-managed buffer allocation
+         * @param factory TensorFactory pointer (not owned)
+         */
+        void setTensorFactory(TensorFactory *factory) { tensor_factory_ = factory; }
+
+        // =====================================================================
+        // Graph-Managed Buffer Allocation (Phase 5)
+        // =====================================================================
+
+        /**
+         * @brief Initialize activation buffers using GraphBufferManager
+         *
+         * Allocates all activation buffers with automatic aliasing optimization
+         * for SCRATCH buffers. This is an alternative to setBuffers().
+         *
+         * Requires config.use_graph_buffer_management = true.
+         *
+         * @param seq_len Maximum sequence length for buffer allocation
+         * @return true if allocation successful
+         */
+        bool initializeBuffers(int seq_len);
+
+        /**
+         * @brief Release all graph-managed buffers
+         *
+         * Call this when buffers are no longer needed to free memory.
+         */
+        void releaseBuffers();
+
+        /**
+         * @brief Check if graph buffer management is enabled
+         */
+        bool hasGraphManagedBuffers() const { return buffer_manager_ != nullptr; }
+
+        /**
+         * @brief Get internal activation buffers (for graph-managed mode)
+         *
+         * When using graph-managed buffers, the pipeline should use these
+         * instead of creating its own buffer mappings.
+         *
+         * @return Reference to internal activation buffers
+         */
+        Qwen2ActivationBuffers &getInternalBuffers() { return buffers_.layer_buffers; }
+        const Qwen2ActivationBuffers &getInternalBuffers() const { return buffers_.layer_buffers; }
+
+        /**
+         * @brief Get model-level buffers (current_hidden, logits)
+         *
+         * When using graph-managed buffers, these are allocated by the graph.
+         *
+         * @return Reference to model buffers
+         */
+        const Qwen2ModelBuffers &getModelBuffers() const { return buffers_; }
+
+        /**
+         * @brief Get buffer manager statistics
+         *
+         * @return BufferAllocationStats or nullptr if not using graph buffer management
+         */
+        const BufferAllocationStats *bufferStats() const;
 
         /**
          * @brief Set snapshot callback for debugging
@@ -439,6 +517,9 @@ namespace llaminar2
         std::shared_ptr<ModelContext> model_ctx_;
         std::shared_ptr<MPIContext> mpi_ctx_;
 
+        // TensorFactory for buffer allocation (not owned)
+        TensorFactory *tensor_factory_ = nullptr;
+
         // Weights and buffers (not owned)
         Qwen2ModelWeights weights_;
         Qwen2ModelBuffers buffers_;
@@ -458,6 +539,19 @@ namespace llaminar2
         std::vector<int> position_ids_buffer_;
 
         // =====================================================================
+        // Graph Buffer Management (Phase 5)
+        // =====================================================================
+
+        /// Buffer manager for graph-managed allocation (nullptr if using setBuffers())
+        std::unique_ptr<GraphBufferManager> buffer_manager_;
+
+        /// Owned tensors when using graph-managed allocation
+        std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
+
+        /// Buffer spec builder for generating buffer specifications
+        std::unique_ptr<Qwen2BufferSpecBuilder> buffer_spec_builder_;
+
+        // =====================================================================
         // Helper Methods
         // =====================================================================
 
@@ -471,6 +565,11 @@ namespace llaminar2
             const std::string &prev_node,
             int seq_len,
             int device_idx);
+
+        /**
+         * @brief Populate buffers_ from graph-managed allocations
+         */
+        void bindGraphManagedBuffers(int seq_len);
     };
 
     // =========================================================================

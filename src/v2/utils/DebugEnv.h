@@ -446,6 +446,7 @@ namespace llaminar2
         bool executor_profiling = false;           ///< Enable stage profiling
         bool executor_validation = false;          ///< Validate outputs after each stage
         bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
+        bool use_graph_buffer_management = false;  ///< Use GraphBufferManager for buffer allocation
 
         // Per-operation feature flags (enable incremental migration)
         // Model-level operations (embedding, final norm, lm head)
@@ -496,6 +497,12 @@ namespace llaminar2
                 auto_weight_transfer = (std::atoi(auto_xfer_env) != 0);
             }
 
+            const char *graph_buf_env = std::getenv("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT");
+            if (graph_buf_env)
+            {
+                use_graph_buffer_management = (std::atoi(graph_buf_env) != 0);
+            }
+
             // Model-level operation flags (embedding, lm_head)
             const char *embedding_env = std::getenv("LLAMINAR_EXEC_EMBEDDING");
             if (embedding_env)
@@ -537,6 +544,18 @@ namespace llaminar2
                 exec_rmsnorm = true;
                 exec_rope = true;
                 exec_attention = true;
+                exec_swiglu = true;
+                exec_residual = true;
+            }
+
+            // Graph buffer management implies full graph execution
+            // (buffers are managed by GraphBufferManager, so all ops must use ComputeStage)
+            if (use_graph_buffer_management)
+            {
+                exec_rmsnorm = true;
+                exec_rope = true;
+                exec_attention = true;
+                exec_gemm = true;
                 exec_swiglu = true;
                 exec_residual = true;
             }

@@ -801,12 +801,10 @@ namespace llaminar2
             int device_idx,
             int kv_len) const
         {
-            // Validate device
-            if (device_idx != -1)
-            {
-                LOG_ERROR("[CPUAttentionKernelTyped] compute: device_idx must be -1 (CPU), got " << device_idx);
-                return false;
-            }
+            // Note: device_idx is informational only for CPU kernels.
+            // With multi-socket systems, device_idx can be 0, 1, etc. for different NUMA nodes.
+            // We accept any device_idx since CPU kernels don't need GPU context.
+            (void)device_idx;
 
             // Validate inputs
             if (!Q || !K || !V || !output)

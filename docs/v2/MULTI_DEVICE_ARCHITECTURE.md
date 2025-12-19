@@ -1044,9 +1044,8 @@ if (mpi_ctx && mpi_ctx->world_size() > 1) {
     
     // Allreduce to combine outputs
     AllreduceStage::Params allreduce_params{
-        buffers.attn_output.get(),
-        seq_len * n_heads * head_dim,
-        MPI_SUM
+        buffers.attn_output.get(),  // TensorBase* for type-safe buffer introspection
+        MPI_COMM  // MPI communicator
     };
     graph.addNode("attention_allreduce", createAllreduce(allreduce_params), device);
     graph.addDependency("attention_local", "attention_allreduce");

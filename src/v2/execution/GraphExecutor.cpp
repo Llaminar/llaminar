@@ -460,6 +460,41 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // Buffer Management
+    // =============================================================================
+
+    bool GraphExecutor::executeWithBufferManagement(ComputeGraph &graph, IDeviceContext *ctx)
+    {
+        if (!buffer_manager_)
+        {
+            LOG_ERROR("[GraphExecutor] executeWithBufferManagement called without buffer manager set");
+            return false;
+        }
+
+        LOG_DEBUG("[GraphExecutor] Allocating buffers for graph...");
+
+        // Allocate all buffers based on stage requirements
+        if (!buffer_manager_->allocateForGraph(graph))
+        {
+            LOG_ERROR("[GraphExecutor] Failed to allocate buffers for graph");
+            return false;
+        }
+
+        LOG_DEBUG("[GraphExecutor] Allocated " << buffer_manager_->bufferCount()
+                                               << " buffers (" << (buffer_manager_->totalAllocatedBytes() / 1024.0 / 1024.0)
+                                               << " MB)");
+
+        // Execute the graph with normal execution path
+        bool success = execute(graph, ctx);
+
+        // Note: Buffers are intentionally NOT released here
+        // Caller can retrieve them via buffer_manager_->getBuffer()
+        // Caller is responsible for releasing via buffer_manager_->releaseAll()
+
+        return success;
+    }
+
+    // =============================================================================
     // Workspace Management
     // =============================================================================
 
