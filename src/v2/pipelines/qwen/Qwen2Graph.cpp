@@ -649,6 +649,26 @@ namespace llaminar2
             }
         }
 
+        // =================================================================
+        // Resolve local head counts for tensor-parallel attention
+        // =================================================================
+        // When qkv_column_parallel is enabled, each rank processes a subset of heads.
+        // The weight shapes from QKV projection already reflect local dimensions,
+        // and RoPE/Attention stages must use matching local head counts.
+        // =================================================================
+        int local_n_heads = config_.qkv_column_parallel
+                                ? config_.local_n_heads
+                                : config_.n_heads;
+        int local_n_kv_heads = config_.qkv_column_parallel
+                                   ? config_.local_n_kv_heads
+                                   : config_.n_kv_heads;
+
+        // Validate local head counts (safety check)
+        if (local_n_heads <= 0)
+            local_n_heads = config_.n_heads;
+        if (local_n_kv_heads <= 0)
+            local_n_kv_heads = config_.n_kv_heads;
+
         // Stage 3: RoPE on Q and K
         if (env.execution.exec_rope)
         {
@@ -657,8 +677,8 @@ namespace llaminar2
             RoPEStage::Params rope_params;
             rope_params.Q = buffers.Q;
             rope_params.K = buffers.K;
-            rope_params.n_heads = config_.n_heads;
-            rope_params.n_kv_heads = config_.n_kv_heads;
+            rope_params.n_heads = local_n_heads;       // Use local head count for TP
+            rope_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
             rope_params.head_dim = config_.head_dim;
             rope_params.pos_offset = pos_offset;
             rope_params.theta_base = config_.rope_theta;
@@ -789,9 +809,9 @@ namespace llaminar2
                 attn_params.output = buffers.attn_output;
                 attn_params.batch_size = batch_size;
                 attn_params.seq_len = seq_len;
-                attn_params.kv_len = kv_len; // Static hint, actual queried from kv_cache at runtime
-                attn_params.n_heads = config_.n_heads;
-                attn_params.n_kv_heads = config_.n_kv_heads;
+                attn_params.kv_len = kv_len;               // Static hint, actual queried from kv_cache at runtime
+                attn_params.n_heads = local_n_heads;       // Use local head count for TP
+                attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
                 attn_params.head_dim = config_.head_dim;
                 attn_params.causal = true;
                 attn_params.window_size = -1;
@@ -843,8 +863,8 @@ namespace llaminar2
                 attn_params.mode = AttentionWithKVCacheStage::Mode::AUTO;
                 attn_params.batch_size = batch_size;
                 attn_params.seq_len = seq_len;
-                attn_params.n_heads = config_.n_heads;
-                attn_params.n_kv_heads = config_.n_kv_heads;
+                attn_params.n_heads = local_n_heads;       // Use local head count for TP
+                attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
                 attn_params.head_dim = config_.head_dim;
                 attn_params.causal = true;
                 attn_params.window_size = -1;
@@ -1495,15 +1515,41 @@ namespace llaminar2
                     ? BufferTensorType::Q8_1
                     : BufferTensorType::FP32;
 
+            // =================================================================
+            // Phase 3: Use local head counts for buffer allocation when TP is enabled
+            // =================================================================
+            // When qkv_column_parallel is enabled:
+            // - Q buffer: [seq_len, local_n_heads * head_dim]
+            // - K/V buffers: [seq_len, local_n_kv_heads * head_dim]
+            // - Attention output: [seq_len, local_n_heads * head_dim]
+            // =================================================================
+            int buf_n_heads = config_.qkv_column_parallel
+                                  ? config_.local_n_heads
+                                  : config_.n_heads;
+            int buf_n_kv_heads = config_.qkv_column_parallel
+                                     ? config_.local_n_kv_heads
+                                     : config_.n_kv_heads;
+
+            // Validate (safety check for uninitialized config)
+            if (buf_n_heads <= 0)
+                buf_n_heads = config_.n_heads;
+            if (buf_n_kv_heads <= 0)
+                buf_n_kv_heads = config_.n_kv_heads;
+
             buffer_spec_builder_ = std::make_unique<Qwen2BufferSpecBuilder>(
                 config_.d_model,
-                config_.n_heads,
-                config_.n_kv_heads,
+                buf_n_heads,    // Use local head count for TP
+                buf_n_kv_heads, // Use local KV head count for TP
                 config_.head_dim,
                 config_.d_ff,
                 config_.vocab_size,
                 activation_type,
                 config_.default_device);
+
+            LOG_DEBUG("[Qwen2Graph] Buffer spec builder: "
+                      << "n_heads=" << buf_n_heads << " (config_.n_heads=" << config_.n_heads << "), "
+                      << "n_kv_heads=" << buf_n_kv_heads << " (config_.n_kv_heads=" << config_.n_kv_heads << "), "
+                      << "qkv_column_parallel=" << config_.qkv_column_parallel);
         }
 
         // Verify TensorFactory is set

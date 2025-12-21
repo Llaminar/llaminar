@@ -79,15 +79,24 @@ TEST_F(WeightManagerShardingTest, DeterminesInputParallelForFFNDown)
               ShardingMode::INPUT_PARALLEL);
 }
 
-TEST_F(WeightManagerShardingTest, DeterminesReplicateForQKV)
+TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForQKV)
 {
-    // In Phase 1, QKV weights are replicated (column-parallel disabled)
+    // Phase 3: QKV weights are column-parallel (split output dimension by head)
+    // Q: [n_heads * head_dim, d_model] -> [local_n_heads * head_dim, d_model]
+    // K/V: [n_kv_heads * head_dim, d_model] -> [local_n_kv_heads * head_dim, d_model]
     EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_q.weight"),
-              ShardingMode::REPLICATE);
+              ShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_k.weight"),
-              ShardingMode::REPLICATE);
+              ShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_v.weight"),
-              ShardingMode::REPLICATE);
+              ShardingMode::COLUMN_PARALLEL);
+    // Biases are also column-parallel
+    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_q.bias"),
+              ShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_k.bias"),
+              ShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_v.bias"),
+              ShardingMode::COLUMN_PARALLEL);
 }
 
 TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForGateUp)

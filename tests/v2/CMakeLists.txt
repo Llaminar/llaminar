@@ -2751,6 +2751,23 @@ add_v2_test(V2_Integration_MPI_RowParallelMultiPrecision
     LABELS "V2;Integration;MPI;RowParallel;TensorSlice;KSliced;Allgatherv;Allreduce;FP32;BF16;FP16;Q8_1;TensorParallel"
 )
 
+# Test: Column-Parallel QKV MPI Integration Tests (Phase 3)
+# Tests column-parallel weight sharding for Q/K/V projections:
+# - ShardingMode detection for attn_q/k/v weights and biases
+# - Local head distribution calculation
+# - Column-sliced Q/K/V weight GEMM correctness
+# - Buffer dimension validation for local heads
+add_executable(v2_integration_mpi_column_parallel_qkv integration/Test__MPI_ColumnParallelQKV.cpp)
+target_link_libraries(v2_integration_mpi_column_parallel_qkv
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_ColumnParallelQKV
+    COMMAND $<TARGET_FILE:v2_integration_mpi_column_parallel_qkv>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;ColumnParallel;QKV;TensorParallel;Attention;Phase3"
+)
+
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
 # Large matrices, mixed precision, strided layouts, fused softmax, causal masking
 add_executable(v2_integration_fp_gemm integration/Test__FloatingPointGemmKernel.cpp)

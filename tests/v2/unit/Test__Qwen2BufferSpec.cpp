@@ -304,5 +304,189 @@ namespace llaminar2
             }
         }
 
+        // =========================================================================
+        // Phase 3: Local Head Tests (Column-Parallel QKV)
+        // =========================================================================
+
+        TEST_F(Qwen2BufferSpecTest, LocalHeadsQBufferShape)
+        {
+            // Simulate 2-rank tensor parallelism: local_n_heads = 7 (out of 14)
+            int local_n_heads = 7;
+            int local_n_kv_heads = 1;
+            Qwen2BufferSpecBuilder local_builder(
+                896,              // d_model
+                local_n_heads,    // n_heads (local)
+                local_n_kv_heads, // n_kv_heads (local)
+                64,               // head_dim
+                4864,             // d_ff
+                151936            // vocab_size
+            );
+
+            int seq_len = 32;
+            auto specs = local_builder.buildLayerSpecs(seq_len);
+
+            // Find Q buffer
+            const Qwen2BufferSpec *q_spec = nullptr;
+            for (const auto &spec : specs)
+            {
+                if (spec.name == BufferNames::Q)
+                {
+                    q_spec = &spec;
+                    break;
+                }
+            }
+
+            ASSERT_NE(q_spec, nullptr);
+            EXPECT_EQ(q_spec->shape.size(), 2u);
+            EXPECT_EQ(q_spec->shape[0], static_cast<size_t>(seq_len));
+            // Q should be [seq_len, local_n_heads * head_dim] = [32, 7*64] = [32, 448]
+            EXPECT_EQ(q_spec->shape[1], static_cast<size_t>(local_n_heads * 64));
+        }
+
+        TEST_F(Qwen2BufferSpecTest, LocalHeadsKVBufferShapes)
+        {
+            // Simulate 2-rank tensor parallelism: local_n_kv_heads = 1 (out of 2)
+            int local_n_heads = 7;
+            int local_n_kv_heads = 1;
+            Qwen2BufferSpecBuilder local_builder(
+                896, local_n_heads, local_n_kv_heads, 64, 4864, 151936);
+
+            int seq_len = 32;
+            auto specs = local_builder.buildLayerSpecs(seq_len);
+
+            // Find K and V buffers
+            const Qwen2BufferSpec *k_spec = nullptr;
+            const Qwen2BufferSpec *v_spec = nullptr;
+            for (const auto &spec : specs)
+            {
+                if (spec.name == BufferNames::K)
+                    k_spec = &spec;
+                if (spec.name == BufferNames::V)
+                    v_spec = &spec;
+            }
+
+            ASSERT_NE(k_spec, nullptr);
+            ASSERT_NE(v_spec, nullptr);
+
+            // K/V should be [seq_len, local_n_kv_heads * head_dim] = [32, 1*64] = [32, 64]
+            EXPECT_EQ(k_spec->shape[0], static_cast<size_t>(seq_len));
+            EXPECT_EQ(k_spec->shape[1], static_cast<size_t>(local_n_kv_heads * 64));
+            EXPECT_EQ(v_spec->shape[0], static_cast<size_t>(seq_len));
+            EXPECT_EQ(v_spec->shape[1], static_cast<size_t>(local_n_kv_heads * 64));
+        }
+
+        TEST_F(Qwen2BufferSpecTest, LocalHeadsAttentionOutputShape)
+        {
+            // With local heads, attention output should also be local
+            int local_n_heads = 7;
+            int local_n_kv_heads = 1;
+            Qwen2BufferSpecBuilder local_builder(
+                896, local_n_heads, local_n_kv_heads, 64, 4864, 151936);
+
+            int seq_len = 32;
+            auto specs = local_builder.buildAttentionSpecs(seq_len);
+
+            // Find attention output buffer
+            const Qwen2BufferSpec *attn_output_spec = nullptr;
+            for (const auto &spec : specs)
+            {
+                if (spec.name == BufferNames::ATTN_OUTPUT)
+                {
+                    attn_output_spec = &spec;
+                    break;
+                }
+            }
+
+            ASSERT_NE(attn_output_spec, nullptr);
+            // ATTN_OUTPUT should be [seq_len, local_n_heads * head_dim] = [32, 448]
+            EXPECT_EQ(attn_output_spec->shape[0], static_cast<size_t>(seq_len));
+            EXPECT_EQ(attn_output_spec->shape[1], static_cast<size_t>(local_n_heads * 64));
+        }
+
+        TEST_F(Qwen2BufferSpecTest, LocalHeadsWorkspaceScoresShape)
+        {
+            // Workspace scores shape depends on local heads for attention computation
+            int local_n_heads = 7;
+            int local_n_kv_heads = 1;
+            Qwen2BufferSpecBuilder local_builder(
+                896, local_n_heads, local_n_kv_heads, 64, 4864, 151936);
+
+            int seq_len = 32;
+            auto specs = local_builder.buildAttentionSpecs(seq_len);
+
+            // Find workspace scores buffer
+            const Qwen2BufferSpec *scores_spec = nullptr;
+            for (const auto &spec : specs)
+            {
+                if (spec.name == BufferNames::WORKSPACE_SCORES)
+                {
+                    scores_spec = &spec;
+                    break;
+                }
+            }
+
+            ASSERT_NE(scores_spec, nullptr);
+            // WORKSPACE_SCORES should be [local_n_heads, seq_len, seq_len] = [7, 32, 32]
+            EXPECT_EQ(scores_spec->shape.size(), 3u);
+            EXPECT_EQ(scores_spec->shape[0], static_cast<size_t>(local_n_heads));
+            EXPECT_EQ(scores_spec->shape[1], static_cast<size_t>(seq_len));
+            EXPECT_EQ(scores_spec->shape[2], static_cast<size_t>(seq_len));
+        }
+
+        TEST_F(Qwen2BufferSpecTest, LocalHeadsFFNUnchanged)
+        {
+            // FFN buffers should NOT depend on local heads (d_ff is independent)
+            int local_n_heads = 7;
+            int local_n_kv_heads = 1;
+            Qwen2BufferSpecBuilder local_builder(
+                896, local_n_heads, local_n_kv_heads, 64, 4864, 151936);
+
+            int seq_len = 32;
+            auto specs = local_builder.buildFFNSpecs(seq_len);
+
+            const Qwen2BufferSpec *gate_spec = nullptr;
+            for (const auto &spec : specs)
+            {
+                if (spec.name == BufferNames::GATE)
+                {
+                    gate_spec = &spec;
+                    break;
+                }
+            }
+
+            ASSERT_NE(gate_spec, nullptr);
+            // FFN gate should still be [seq_len, d_ff] = [32, 4864]
+            EXPECT_EQ(gate_spec->shape[0], static_cast<size_t>(seq_len));
+            EXPECT_EQ(gate_spec->shape[1], 4864u);
+        }
+
+        TEST_F(Qwen2BufferSpecTest, LocalHeadsResidualUnchanged)
+        {
+            // Residual/normalized buffers should NOT depend on local heads
+            int local_n_heads = 7;
+            int local_n_kv_heads = 1;
+            Qwen2BufferSpecBuilder local_builder(
+                896, local_n_heads, local_n_kv_heads, 64, 4864, 151936);
+
+            int seq_len = 32;
+            auto specs = local_builder.buildLayerSpecs(seq_len);
+
+            const Qwen2BufferSpec *residual_spec = nullptr;
+            const Qwen2BufferSpec *normalized_spec = nullptr;
+            for (const auto &spec : specs)
+            {
+                if (spec.name == BufferNames::RESIDUAL)
+                    residual_spec = &spec;
+                if (spec.name == BufferNames::NORMALIZED)
+                    normalized_spec = &spec;
+            }
+
+            ASSERT_NE(residual_spec, nullptr);
+            ASSERT_NE(normalized_spec, nullptr);
+            // Both should be [seq_len, d_model] = [32, 896]
+            EXPECT_EQ(residual_spec->shape[1], 896u);
+            EXPECT_EQ(normalized_spec->shape[1], 896u);
+        }
+
     } // namespace test
 } // namespace llaminar2

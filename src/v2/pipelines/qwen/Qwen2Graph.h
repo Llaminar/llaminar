@@ -79,6 +79,22 @@ namespace llaminar2
         int d_ff_local = 0; ///< Local FFN dim per rank
         bool ffn_column_parallel = false;
 
+        // =================================================================
+        // Attention TP Parameters (Phase 3: Column-Parallel QKV)
+        // =================================================================
+        /// First query head for this rank (0-indexed, default 0 = no sharding)
+        int head_start = 0;
+
+        /// Number of query heads for this rank (default -1 = use full n_heads)
+        int local_n_heads = -1;
+
+        /// Number of KV heads for this rank (default -1 = use full n_kv_heads)
+        /// For GQA: may equal local_n_heads / gqa_ratio
+        int local_n_kv_heads = -1;
+
+        /// Enable column-parallel QKV projection (weights sharded by head)
+        bool qkv_column_parallel = false;
+
         // Precision and execution
         float rms_norm_eps = 1e-6f;
         float rope_theta = 10000.0f;

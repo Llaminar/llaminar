@@ -212,6 +212,46 @@ namespace llaminar2
             LOG_WARN("[InferenceRunner] Could not find feed_forward_length, using estimate: " << graph_config.d_ff);
         }
 
+        // =====================================================================
+        // Phase 3: Tensor-Parallel Configuration for Column-Parallel QKV
+        // =====================================================================
+        // When running with multiple MPI ranks, compute head distribution:
+        // - Each rank handles local_n_heads = n_heads / world_size
+        // - Each rank handles local_n_kv_heads = n_kv_heads / world_size (for GQA)
+        // - head_start identifies which head range this rank owns
+        //
+        // Weight sharding in WeightManager uses COLUMN_PARALLEL for Q/K/V:
+        // - Q: [n_heads * head_dim, d_model] → [local_n_heads * head_dim, d_model]
+        // - K/V: [n_kv_heads * head_dim, d_model] → [local_n_kv_heads * head_dim, d_model]
+        // =====================================================================
+        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        {
+            // Compute local head distribution
+            auto [q_head_start, local_n_q_heads] = mpi_ctx->get_local_slice(
+                static_cast<size_t>(graph_config.n_heads));
+            auto [kv_head_start, local_n_kv_h] = mpi_ctx->get_local_slice(
+                static_cast<size_t>(graph_config.n_kv_heads));
+
+            graph_config.head_start = static_cast<int>(q_head_start);
+            graph_config.local_n_heads = static_cast<int>(local_n_q_heads);
+            graph_config.local_n_kv_heads = static_cast<int>(local_n_kv_h);
+            graph_config.qkv_column_parallel = true;
+
+            LOG_INFO("[InferenceRunner] QKV Column-Parallel enabled: "
+                     << "head_start=" << graph_config.head_start
+                     << ", local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
+                     << ", local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads
+                     << " (rank " << mpi_ctx->rank() << "/" << mpi_ctx->world_size() << ")");
+        }
+        else
+        {
+            // Single rank: use full head counts (no sharding)
+            graph_config.head_start = 0;
+            graph_config.local_n_heads = graph_config.n_heads;
+            graph_config.local_n_kv_heads = graph_config.n_kv_heads;
+            graph_config.qkv_column_parallel = false;
+        }
+
         LOG_DEBUG("[InferenceRunner] GraphConfig: "
                   << "vocab=" << graph_config.vocab_size
                   << ", d_model=" << graph_config.d_model
