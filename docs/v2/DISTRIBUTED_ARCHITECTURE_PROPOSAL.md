@@ -75,7 +75,7 @@ The graph execution system has a well-defined device abstraction layer:
 | Kernel Type | CPU | CUDA | ROCm | Notes |
 |-------------|-----|------|------|-------|
 | **GEMM (Quantized)** | ✅ AVX512-VNNI | ✅ JIT + CUTLASS | ❌ Stub | `CudaGemmFactory.cu` |
-| **GEMM (FP32/BF16)** | ✅ OpenBLAS/MKL | ⚠️ cuBLAS | ⚠️ rocBLAS | Fallback to CPU |
+| **GEMM (FP32/BF16)** | ✅ OneDNN | ⚠️ cuBLAS | ⚠️ rocBLAS | Fallback to CPU |
 | **Attention** | ✅ Typed kernels | ❌ CPU fallback | ❌ CPU fallback | Flash Attention TODO |
 | **RMSNorm** | ✅ SIMD | ❌ CPU fallback | ❌ CPU fallback | |
 | **RoPE** | ✅ SIMD | ❌ CPU fallback | ❌ CPU fallback | |
