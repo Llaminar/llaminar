@@ -1,0 +1,1365 @@
+# Distributed Architecture Implementation Plan
+
+**Author**: David Sanftenberg  
+**Date**: December 2025  
+**Reference**: [DISTRIBUTED_ARCHITECTURE_PROPOSAL.md](./DISTRIBUTED_ARCHITECTURE_PROPOSAL.md)
+
+---
+
+## Master Todo List
+
+### Phase 1: MPITopology Foundation ✅ COMPLETE
+- [x] Create `MPITopology` class (`src/v2/utils/MPITopology.h`)
+- [x] Implement `WorkRange` struct with equal/weighted distribution
+- [x] Implement `DeviceCapability` struct
+- [x] Implement `RankPlacement` struct
+- [x] Add work distribution methods (`get_head_range`, `get_column_range`, etc.)
+- [x] Device capability exchange via AllGather
+
+### Phase 2: Stage-Level TP Integration
+- [ ] **2.1** Add `KernelFactory::getOrCreateGemmSliced()`
+- [ ] **2.2** Extend `GEMMStage::Params` with `WorkRange output_range`
+- [ ] **2.3** Modify `GEMMStage::execute()` to use sliced kernel
+- [ ] **2.4** Add `head_start/local_n_heads` to `AttentionComputeStage::Params`
+- [ ] **2.5** Modify `ITensorAttention::compute_tensor()` interface
+- [ ] **2.6** Update `CPUAttentionKernelTyped` loop bounds
+- [ ] **2.7** Unit tests for sliced GEMM and attention stages
+
+### Phase 3: Column-Parallel QKV
+- [ ] **3.1** Add column-parallel weight loading to `WeightManager`
+- [ ] **3.2** Update `Qwen2Graph::buildAttentionGraph()` to pass head ranges
+- [ ] **3.3** Modify Q/K/V buffer allocation for local dimensions
+- [ ] **3.4** Integration test: 2-rank QKV sharding
+
+### Phase 4: Column-Parallel FFN
+- [ ] **4.1** Add column-parallel Gate/Up weight loading
+- [ ] **4.2** Update `Qwen2Graph::buildFFNGraph()` for local FFN dim
+- [ ] **4.3** Add `AllreduceStage` after Down projection
+- [ ] **4.4** Integration test: 2-rank FFN sharding
+
+### Phase 5: Column-Parallel LM Head
+- [ ] **5.1** Shard `lm_head` by vocab dimension
+- [ ] **5.2** Add `AllGatherStage` before sampling
+- [ ] **5.3** (Optional) Efficient distributed argmax
+
+### Phase 6: Sharded KV Cache
+- [ ] **6.1** Modify `UnifiedKVCache` for local head storage
+- [ ] **6.2** Update cache append stages
+
+### Phase 7: Cleanup
+- [ ] **7.1** Remove `MpiAttentionOrchestrator`
+- [ ] **7.2** Remove `GQAAttention`
+- [ ] **7.3** Deprecate `PipelineBase` TP methods
+- [ ] **7.4** Update all tests to graph-based execution
+
+### GPU Integration Phases
+- [ ] **G1** Single-GPU per rank (NUMA-filtered)
+- [ ] **G2** GPU attention kernels (FlashAttention)
+- [ ] **G3** Cross-device data transfer
+- [ ] **G4** Heterogeneous work distribution
+- [ ] **G5** Multi-GPU per rank (future)
+
+---
+
+## Phase 2: Stage-Level TP Integration
+
+**Proposal Reference**: Section "Migration Path → Phase 2"
+
+**Goal**: Extend existing `ComputeStage` classes to accept tensor parallelism parameters from `MPITopology`, enabling work division without changing the graph structure.
+
+### 2.1 Add KernelFactory Sliced GEMM API
+
+**Files to Modify**:
+- `src/v2/kernels/KernelFactory.h`
+- `src/v2/kernels/KernelFactory.cpp`
+
+**Rationale**: The `QuantisedGemmKernel` already has a row-sliced constructor `QuantisedGemmKernel(weights, row_start, row_end)`. We need to expose this through `KernelFactory` with caching support.
+
+**Code Changes**:
+
+```cpp
+// src/v2/kernels/KernelFactory.h - Add to KernelFactory class
+
+/**
+ * @brief Get or create a row-sliced GEMM kernel for tensor parallelism
+ *
+ * Creates a kernel that only packs weights for rows [row_start, row_end).
+ * Used for row-parallel GEMM where output dimension is partitioned.
+ *
+ * @param tensor Weight tensor (quantized)
+ * @param row_start First row to include (0-indexed)
+ * @param row_end One past the last row
+ * @return Cached GEMM kernel pointer (owned by factory)
+ *
+ * @note Cache key includes row range, so different slices get different kernels
+ */
+static ITensorGemm* getOrCreateGemmSliced(
+    const TensorBase* tensor, 
+    size_t row_start, 
+    size_t row_end);
+```
+
+```cpp
+// src/v2/kernels/KernelFactory.cpp - Implementation
+
+ITensorGemm* KernelFactory::getOrCreateGemmSliced(
+    const TensorBase* tensor, size_t row_start, size_t row_end)
+{
+    if (!tensor) return nullptr;
+    
+    // Create cache key that includes slice range
+    // Format: tensor_ptr | row_start | row_end
+    struct SlicedCacheKey {
+        const TensorBase* tensor;
+        size_t row_start;
+        size_t row_end;
+        
+        bool operator==(const SlicedCacheKey& other) const {
+            return tensor == other.tensor && 
+                   row_start == other.row_start && 
+                   row_end == other.row_end;
+        }
+    };
+    
+    // Hash function for SlicedCacheKey
+    struct SlicedKeyHash {
+        size_t operator()(const SlicedCacheKey& k) const {
+            return std::hash<const void*>()(k.tensor) ^ 
+                   (std::hash<size_t>()(k.row_start) << 1) ^
+                   (std::hash<size_t>()(k.row_end) << 2);
+        }
+    };
+    
+    static std::unordered_map<SlicedCacheKey, std::unique_ptr<ITensorGemm>, SlicedKeyHash> sliced_cache_;
+    static std::mutex sliced_cache_mutex_;
+    
+    SlicedCacheKey key{tensor, row_start, row_end};
+    
+    std::lock_guard<std::mutex> lock(sliced_cache_mutex_);
+    auto it = sliced_cache_.find(key);
+    if (it != sliced_cache_.end()) {
+        return it->second.get();
+    }
+    
+    // Create sliced kernel using row-range constructor
+    auto kernel = std::make_unique<gemm_v4::QuantisedGemmKernel>(
+        tensor, static_cast<int>(row_start), static_cast<int>(row_end));
+    
+    ITensorGemm* raw_ptr = kernel.get();
+    sliced_cache_[key] = std::move(kernel);
+    
+    LOG_DEBUG("[KernelFactory] Created sliced GEMM kernel for rows [" 
+              << row_start << ", " << row_end << ")");
+    return raw_ptr;
+}
+```
+
+**Testing**:
+```cpp
+// tests/v2/unit/Test__KernelFactorySliced.cpp
+TEST(KernelFactorySliced, CreatesSlicedKernel) {
+    // Load a weight tensor
+    auto weights = loadTestWeights();  // [1024, 896]
+    
+    // Create sliced kernel for first half of rows
+    auto* kernel = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
+    ASSERT_NE(kernel, nullptr);
+    EXPECT_EQ(kernel->get_n(), 512);  // Output dim is sliced
+    EXPECT_EQ(kernel->get_k(), 896);  // Input dim unchanged
+}
+
+TEST(KernelFactorySliced, CachesSlicedKernels) {
+    auto weights = loadTestWeights();
+    auto* k1 = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
+    auto* k2 = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
+    EXPECT_EQ(k1, k2);  // Same slice = same kernel
+    
+    auto* k3 = KernelFactory::getOrCreateGemmSliced(weights.get(), 512, 1024);
+    EXPECT_NE(k1, k3);  // Different slice = different kernel
+}
+```
+
+---
+
+### 2.2-2.3 Extend GEMMStage for TP
+
+**Files to Modify**:
+- `src/v2/execution/ComputeStage.h`
+- `src/v2/execution/ComputeStage.cpp`
+
+**Rationale**: `GEMMStage` currently has `mpi_ctx` but doesn't use it for sharding. We add optional `WorkRange` parameters that, when set, trigger sliced kernel usage.
+
+**Code Changes**:
+
+```cpp
+// src/v2/execution/ComputeStage.h - Extend GEMMStage::Params
+
+struct Params {
+    // ... existing fields ...
+    TensorBase* A = nullptr;      // Input activation [m, k]
+    TensorBase* B = nullptr;      // Weight tensor [n, k] or [k, n]
+    TensorBase* C = nullptr;      // Output [m, n]
+    int m = 0, n = 0, k = 0;
+    float alpha = 1.0f, beta = 0.0f;
+    bool transpose_B = true;
+    
+    // Existing MPI context (for collective ops)
+    std::shared_ptr<MPIContext> mpi_ctx;
+    int device_idx = 0;
+    
+    // === NEW: Tensor Parallelism Parameters ===
+    
+    /**
+     * @brief Output dimension range for row-parallel GEMM
+     * 
+     * When set, the kernel only computes output columns [start, end).
+     * Requires weight tensor to be full (not pre-sliced) OR TensorSlice.
+     * 
+     * After local GEMM: output has shape [m, range.size()]
+     * Set needs_allgather=true to reconstruct full output.
+     */
+    std::optional<WorkRange> output_range;
+    
+    /**
+     * @brief Input dimension range for column-parallel GEMM
+     * 
+     * When set, input is already sliced to [m, range.size()].
+     * Weight should be sliced to [n, range.size()].
+     * 
+     * After local GEMM: output is partial sum, needs allreduce.
+     * Set needs_allreduce=true.
+     */
+    std::optional<WorkRange> input_range;
+    
+    /**
+     * @brief Whether to AllReduce output after GEMM
+     * 
+     * Used for column-parallel GEMM where each rank computes
+     * partial products that sum to the final result.
+     */
+    bool needs_allreduce = false;
+    
+    /**
+     * @brief Whether to AllGather output after GEMM
+     * 
+     * Used for row-parallel GEMM where each rank computes
+     * a slice of the output that needs concatenation.
+     */
+    bool needs_allgather = false;
+};
+```
+
+```cpp
+// src/v2/execution/ComputeStage.cpp - Modify GEMMStage::execute()
+
+bool GEMMStage::execute(IDeviceContext* ctx) {
+    // ... existing validation ...
+    
+    ITensorGemm* gemm = nullptr;
+    int local_n = params_.n;
+    
+    // Check for row-parallel (output dimension sharded)
+    if (params_.output_range && params_.mpi_ctx && params_.mpi_ctx->world_size() > 1) {
+        const auto& range = *params_.output_range;
+        local_n = static_cast<int>(range.size());
+        
+        // Use sliced kernel
+        gemm = KernelFactory::getOrCreateGemmSliced(
+            params_.B, range.start, range.end);
+        
+        LOG_DEBUG("[GEMMStage] Row-parallel: output_range=[" << range.start 
+                  << ", " << range.end << "), local_n=" << local_n);
+    } else {
+        // Full kernel (existing path)
+        gemm = KernelFactory::getOrCreateGemm(params_.B);
+    }
+    
+    if (!gemm) {
+        LOG_ERROR("[GEMMStage] Failed to get GEMM kernel");
+        return false;
+    }
+    
+    // Execute local GEMM
+    // For row-parallel: A[m,k] @ B_slice[local_n,k]^T = C_local[m,local_n]
+    bool success = gemm->multiply_tensor(
+        params_.A, params_.C,
+        params_.m, local_n, params_.k,
+        params_.transpose_B,
+        params_.alpha, params_.beta,
+        params_.mpi_ctx.get(), params_.device_idx);
+    
+    if (!success) {
+        LOG_ERROR("[GEMMStage] GEMM execution failed");
+        return false;
+    }
+    
+    // Post-GEMM collective operations
+    if (params_.needs_allreduce && params_.mpi_ctx) {
+        // Column-parallel: sum partial products
+        float* data = params_.C->mutable_data();
+        size_t count = static_cast<size_t>(params_.m) * params_.n;
+        params_.mpi_ctx->allreduce_sum(data, count);
+        LOG_DEBUG("[GEMMStage] AllReduce completed");
+    }
+    
+    if (params_.needs_allgather && params_.mpi_ctx) {
+        // Row-parallel: gather output slices
+        // Note: This requires output buffer to be full size
+        // The local result is in the first local_n columns
+        // AllGatherv to assemble full output
+        
+        // Implementation depends on output tensor layout
+        // For now, assume separate AllGatherStage handles this
+        LOG_WARN("[GEMMStage] needs_allgather=true but inline gather not implemented. "
+                 "Use AllGatherStage after this stage.");
+    }
+    
+    return true;
+}
+```
+
+**Testing**:
+```cpp
+// tests/v2/unit/Test__GEMMStageTP.cpp
+TEST(GEMMStageTP, RowParallelExecutesSlicedKernel) {
+    // Simulate 2-rank environment
+    int world_size = 2, rank = 0;
+    auto mpi_ctx = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+    
+    // Create tensors
+    FP32Tensor input({32, 896});   // [m, k]
+    Q8_0Tensor weights({1024, 896}); // [n, k]
+    FP32Tensor output({32, 512});  // [m, local_n] - only half the output
+    
+    // Fill with test data
+    fillRandom(&input);
+    fillRandom(&weights);
+    
+    GEMMStage::Params params;
+    params.A = &input;
+    params.B = &weights;
+    params.C = &output;
+    params.m = 32;
+    params.n = 1024;  // Full N
+    params.k = 896;
+    params.mpi_ctx = mpi_ctx;
+    params.output_range = WorkRange{0, 512};  // Rank 0 gets first half
+    
+    GEMMStage stage(params);
+    auto* ctx = getCPUContext();
+    
+    ASSERT_TRUE(stage.execute(ctx));
+    
+    // Verify output dimensions
+    EXPECT_EQ(output.shape()[0], 32);
+    EXPECT_EQ(output.shape()[1], 512);
+    
+    // Verify output is not all zeros (actual values depend on weights)
+    float sum = 0;
+    for (size_t i = 0; i < output.numel(); ++i) {
+        sum += std::abs(output.data()[i]);
+    }
+    EXPECT_GT(sum, 0.0f);
+}
+```
+
+---
+
+### 2.4-2.6 Extend AttentionComputeStage for TP
+
+**Files to Modify**:
+- `src/v2/execution/ComputeStage.h`
+- `src/v2/execution/ComputeStage.cpp`
+- `src/v2/tensors/TensorKernels.h` (ITensorAttention interface)
+- `src/v2/kernels/cpu/attention/CPUAttentionKernelTyped.h`
+
+**Rationale**: Attention is embarrassingly parallel across heads. Each rank should only compute attention for its assigned heads.
+
+**Code Changes**:
+
+```cpp
+// src/v2/execution/ComputeStage.h - Extend AttentionComputeStage::Params
+
+struct Params {
+    // ... existing fields ...
+    TensorBase* Q = nullptr;
+    TensorBase* K = nullptr;
+    TensorBase* V = nullptr;
+    TensorBase* output = nullptr;
+    int batch_size = 1;
+    int seq_len = 0;
+    int kv_len = 0;
+    int n_heads = 0;
+    int n_kv_heads = 0;
+    int head_dim = 0;
+    bool causal = true;
+    
+    // Existing
+    std::shared_ptr<MPIContext> mpi_ctx;
+    int device_idx = 0;
+    
+    // === NEW: Tensor Parallelism Parameters ===
+    
+    /**
+     * @brief First query head for this rank (0-indexed)
+     * 
+     * Default 0 means start from head 0.
+     * With TP: each rank gets a contiguous range of heads.
+     */
+    int head_start = 0;
+    
+    /**
+     * @brief Number of query heads for this rank
+     * 
+     * Default -1 means use full n_heads.
+     * With TP: set to n_heads / world_size (approximately).
+     */
+    int local_n_heads = -1;
+    
+    /**
+     * @brief Number of KV heads for this rank
+     * 
+     * Default -1 means use full n_kv_heads.
+     * For GQA: may equal local_n_heads / gqa_ratio.
+     * 
+     * Note: If n_kv_heads < world_size, some ranks may have 0 KV heads
+     * and must skip attention entirely or participate in collective only.
+     */
+    int local_n_kv_heads = -1;
+};
+```
+
+```cpp
+// src/v2/tensors/TensorKernels.h - Update ITensorAttention interface
+
+class ITensorAttention {
+public:
+    virtual ~ITensorAttention() = default;
+    
+    /**
+     * @brief Compute attention with tensor inputs
+     *
+     * @param Q Query tensor [batch, seq_len, n_heads, head_dim]
+     * @param K Key tensor [batch, kv_len, n_kv_heads, head_dim]
+     * @param V Value tensor [batch, kv_len, n_kv_heads, head_dim]
+     * @param output Output tensor [batch, seq_len, n_heads, head_dim]
+     * @param batch_size Batch size
+     * @param seq_len Query sequence length
+     * @param kv_len Key/Value sequence length
+     * @param n_heads Total number of query heads (for stride calculation)
+     * @param n_kv_heads Total number of KV heads
+     * @param head_dim Head dimension
+     * @param causal Apply causal masking
+     * @param window_size Sliding window size (-1 for full attention)
+     * @param workspace_scores Workspace for attention scores
+     * @param mask Optional attention mask
+     * @param mpi_ctx MPI context (optional)
+     * @param device_idx Target device
+     * @param head_start First head to compute (default 0)
+     * @param local_n_heads Number of heads to compute (-1 = all)
+     * @param local_n_kv_heads Number of KV heads for this slice (-1 = all)
+     */
+    virtual bool compute_tensor(
+        const TensorBase* Q, const TensorBase* K, const TensorBase* V,
+        TensorBase* output,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size,
+        TensorBase* workspace_scores,
+        TensorBase* mask,
+        const MPIContext* mpi_ctx,
+        int device_idx,
+        int head_start = 0,          // NEW
+        int local_n_heads = -1,      // NEW
+        int local_n_kv_heads = -1    // NEW
+    ) = 0;
+};
+```
+
+```cpp
+// src/v2/kernels/cpu/attention/CPUAttentionKernelTyped.h
+// Modify the compute loop to use head range
+
+template<ActivationPrecision PREC>
+bool CPUAttentionKernelTyped<PREC>::compute_tensor(
+    const TensorBase* Q, const TensorBase* K, const TensorBase* V,
+    TensorBase* output,
+    int batch_size, int seq_len, int kv_len,
+    int n_heads, int n_kv_heads, int head_dim,
+    bool causal, int window_size,
+    TensorBase* workspace_scores,
+    TensorBase* mask,
+    const MPIContext* mpi_ctx,
+    int device_idx,
+    int head_start,
+    int local_n_heads,
+    int local_n_kv_heads)
+{
+    // Resolve defaults
+    const int actual_local_n_heads = (local_n_heads < 0) ? n_heads : local_n_heads;
+    const int actual_local_n_kv_heads = (local_n_kv_heads < 0) ? n_kv_heads : local_n_kv_heads;
+    const int head_end = head_start + actual_local_n_heads;
+    
+    // GQA ratio (how many Q heads per KV head)
+    const int gqa_ratio = n_heads / n_kv_heads;
+    
+    LOG_DEBUG("[CPUAttention] head_range=[" << head_start << ", " << head_end 
+              << "), local_n_kv_heads=" << actual_local_n_kv_heads);
+    
+    // Get typed data pointers
+    const DataT* q_data = getTypedData<DataT>(Q);
+    const DataT* k_data = getTypedData<DataT>(K);
+    const DataT* v_data = getTypedData<DataT>(V);
+    DataT* out_data = getMutableTypedData<DataT>(output);
+    
+    // === MODIFIED: Loop only over local heads ===
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < batch_size; ++b) {
+        for (int h = head_start; h < head_end; ++h) {
+            // Map query head to KV head (GQA)
+            // KV head index relative to this rank's slice
+            int global_kv_head = h / gqa_ratio;
+            int local_kv_head = global_kv_head - (head_start / gqa_ratio);
+            
+            // Bounds check for edge cases
+            if (local_kv_head < 0 || local_kv_head >= actual_local_n_kv_heads) {
+                LOG_ERROR("[CPUAttention] KV head out of range: local_kv_head=" 
+                          << local_kv_head << " for query head " << h);
+                continue;
+            }
+            
+            // Compute attention for this head
+            compute_single_head(
+                q_data, k_data, v_data, out_data,
+                b, h, local_kv_head,
+                seq_len, kv_len, head_dim,
+                n_heads, actual_local_n_kv_heads,  // Strides based on local dims
+                causal, window_size,
+                workspace_scores, mask);
+        }
+    }
+    
+    return true;
+}
+```
+
+**Testing**:
+```cpp
+// tests/v2/unit/Test__AttentionStageTP.cpp
+TEST(AttentionStageTP, ComputesLocalHeadsOnly) {
+    // 14 heads, 2 ranks -> 7 heads each
+    int n_heads = 14, n_kv_heads = 2;
+    int head_start = 0, local_n_heads = 7;
+    
+    // Create Q/K/V with full dimensions (data for all heads)
+    FP32Tensor Q({1, 32, n_heads, 64});
+    FP32Tensor K({1, 32, n_kv_heads, 64});
+    FP32Tensor V({1, 32, n_kv_heads, 64});
+    FP32Tensor output({1, 32, local_n_heads, 64});  // Only local heads
+    
+    fillRandom(&Q);
+    fillRandom(&K);
+    fillRandom(&V);
+    
+    AttentionComputeStage::Params params;
+    params.Q = &Q;
+    params.K = &K;
+    params.V = &V;
+    params.output = &output;
+    params.batch_size = 1;
+    params.seq_len = 32;
+    params.kv_len = 32;
+    params.n_heads = n_heads;
+    params.n_kv_heads = n_kv_heads;
+    params.head_dim = 64;
+    params.causal = true;
+    params.head_start = head_start;
+    params.local_n_heads = local_n_heads;
+    params.local_n_kv_heads = 1;  // GQA: 7 Q heads share 1 KV head
+    
+    AttentionComputeStage stage(params);
+    ASSERT_TRUE(stage.execute(getCPUContext()));
+    
+    // Verify output shape
+    EXPECT_EQ(output.shape()[2], local_n_heads);
+}
+```
+
+---
+
+## Phase 3: Column-Parallel QKV
+
+**Proposal Reference**: Section "Migration Path → Phase 3"
+
+**Goal**: Each rank computes Q/K/V only for its assigned heads, reducing redundant computation by `world_size`.
+
+### 3.1 Column-Parallel Weight Loading
+
+**Files to Modify**:
+- `src/v2/loaders/WeightManager.h`
+- `src/v2/loaders/WeightManager.cpp`
+
+**Approach**: When loading attention weights (Wq, Wk, Wv), slice by output dimension based on rank's head range.
+
+```cpp
+// src/v2/loaders/WeightManager.h - Add method
+
+/**
+ * @brief Load attention weight with column-parallel sharding
+ *
+ * @param layer_idx Layer index
+ * @param weight_name "wq", "wk", or "wv"
+ * @param head_range Range of heads for this rank
+ * @param head_dim Dimension per head
+ * @return Sliced weight tensor [d_model, local_heads * head_dim]
+ */
+std::unique_ptr<TensorBase> getColumnShardedAttentionWeight(
+    int layer_idx,
+    const std::string& weight_name,
+    const WorkRange& head_range,
+    int head_dim);
+```
+
+```cpp
+// src/v2/loaders/WeightManager.cpp
+
+std::unique_ptr<TensorBase> WeightManager::getColumnShardedAttentionWeight(
+    int layer_idx, const std::string& weight_name,
+    const WorkRange& head_range, int head_dim)
+{
+    // Load full weight
+    auto full_weight = getLayerWeight(layer_idx, weight_name);
+    if (!full_weight) return nullptr;
+    
+    // Full shape: [n_heads * head_dim, d_model] for Wq/Wk/Wv
+    // We want columns [head_range.start * head_dim, head_range.end * head_dim)
+    size_t col_start = head_range.start * head_dim;
+    size_t col_end = head_range.end * head_dim;
+    
+    // Create TensorSlice with column-parallel metadata
+    auto meta = SliceMetadata::forColumnParallel(
+        full_weight->shape()[0],  // rows (d_model)
+        full_weight->shape()[1],  // cols (n_heads * head_dim)
+        col_start, col_end,
+        mpi_ctx_->rank(), mpi_ctx_->world_size());
+    
+    return std::make_unique<TensorSlice>(std::move(full_weight), meta);
+}
+```
+
+### 3.2 Update Qwen2Graph for Head Sharding
+
+**Files to Modify**:
+- `src/v2/pipelines/qwen/Qwen2Graph.cpp`
+
+```cpp
+// src/v2/pipelines/qwen/Qwen2Graph.cpp - In buildAttentionGraph()
+
+void Qwen2Graph::buildAttentionGraph(int layer_idx, ComputeGraph& graph) {
+    // Get work range for this rank
+    WorkRange head_range = mpi_topology_->get_head_range(config_.n_heads);
+    WorkRange kv_head_range = mpi_topology_->get_kv_head_range(config_.n_kv_heads);
+    
+    int local_n_heads = static_cast<int>(head_range.size());
+    int local_n_kv_heads = static_cast<int>(kv_head_range.size());
+    
+    // Q projection: [m, d_model] @ [d_model, local_n_heads * head_dim]
+    auto q_params = GEMMStage::Params{};
+    q_params.A = buffers_.hidden;
+    q_params.B = weights_.layers[layer_idx].wq;  // Should be column-sharded
+    q_params.C = buffers_.q_local;               // [m, local_n_heads * head_dim]
+    q_params.m = seq_len_;
+    q_params.n = local_n_heads * config_.head_dim;
+    q_params.k = config_.d_model;
+    q_params.mpi_ctx = mpi_ctx_;
+    // No output_range needed - weight is already column-sliced
+    
+    graph.addStage(std::make_unique<GEMMStage>(q_params), "q_proj");
+    
+    // K/V projections similar...
+    
+    // Attention with local heads
+    auto attn_params = AttentionComputeStage::Params{};
+    attn_params.Q = buffers_.q_local;
+    attn_params.K = buffers_.k_local;
+    attn_params.V = buffers_.v_local;
+    attn_params.output = buffers_.attn_output_local;
+    attn_params.n_heads = config_.n_heads;      // Global for stride calculation
+    attn_params.n_kv_heads = config_.n_kv_heads;
+    attn_params.head_start = static_cast<int>(head_range.start);
+    attn_params.local_n_heads = local_n_heads;
+    attn_params.local_n_kv_heads = local_n_kv_heads;
+    // ...
+    
+    graph.addStage(std::make_unique<AttentionComputeStage>(attn_params), "attention");
+    
+    // Wo projection: [m, local_n_heads * head_dim] @ [d_model, n_heads * head_dim]^T
+    // This is row-parallel on Wo (input is sharded)
+    auto wo_params = GEMMStage::Params{};
+    wo_params.A = buffers_.attn_output_local;
+    wo_params.B = weights_.layers[layer_idx].wo;  // Full Wo, row-sliced access
+    wo_params.C = buffers_.attn_proj;
+    wo_params.m = seq_len_;
+    wo_params.n = config_.d_model;
+    wo_params.k = local_n_heads * config_.head_dim;  // Local K
+    wo_params.input_range = WorkRange{
+        head_range.start * config_.head_dim,
+        head_range.end * config_.head_dim
+    };
+    wo_params.needs_allreduce = true;  // Sum partial products
+    
+    graph.addStage(std::make_unique<GEMMStage>(wo_params), "wo_proj");
+}
+```
+
+---
+
+## Phase 4: Column-Parallel FFN
+
+**Proposal Reference**: Section "Migration Path → Phase 4"
+
+**Goal**: Shard Gate/Up weights by output dimension (d_ff), reducing per-rank memory.
+
+### 4.1-4.3 FFN Graph with TP
+
+```cpp
+// src/v2/pipelines/qwen/Qwen2Graph.cpp - In buildFFNGraph()
+
+void Qwen2Graph::buildFFNGraph(int layer_idx, ComputeGraph& graph) {
+    // Get FFN dimension range
+    WorkRange ffn_range = mpi_topology_->get_column_range(config_.d_ff);
+    int local_d_ff = static_cast<int>(ffn_range.size());
+    
+    // Gate: [m, d_model] @ [d_model, local_d_ff]
+    auto gate_params = GEMMStage::Params{};
+    gate_params.A = buffers_.ffn_norm_output;
+    gate_params.B = weights_.layers[layer_idx].gate;  // Column-sharded
+    gate_params.C = buffers_.gate_local;              // [m, local_d_ff]
+    gate_params.m = seq_len_;
+    gate_params.n = local_d_ff;
+    gate_params.k = config_.d_model;
+    gate_params.mpi_ctx = mpi_ctx_;
+    
+    graph.addStage(std::make_unique<GEMMStage>(gate_params), "ffn_gate");
+    
+    // Up: [m, d_model] @ [d_model, local_d_ff]
+    auto up_params = GEMMStage::Params{};
+    up_params.A = buffers_.ffn_norm_output;
+    up_params.B = weights_.layers[layer_idx].up;
+    up_params.C = buffers_.up_local;
+    up_params.m = seq_len_;
+    up_params.n = local_d_ff;
+    up_params.k = config_.d_model;
+    up_params.mpi_ctx = mpi_ctx_;
+    
+    graph.addStage(std::make_unique<GEMMStage>(up_params), "ffn_up");
+    
+    // SwiGLU: local computation, no communication
+    auto swiglu_params = SwiGLUStage::Params{};
+    swiglu_params.gate = buffers_.gate_local;
+    swiglu_params.up = buffers_.up_local;
+    swiglu_params.output = buffers_.swiglu_local;
+    swiglu_params.rows = seq_len_;
+    swiglu_params.cols = local_d_ff;
+    
+    graph.addStage(std::make_unique<SwiGLUStage>(swiglu_params), "swiglu");
+    
+    // Down: [m, local_d_ff] @ [d_model, d_ff]^T with input_range
+    // This is column-parallel: each rank has partial input, needs allreduce
+    auto down_params = GEMMStage::Params{};
+    down_params.A = buffers_.swiglu_local;
+    down_params.B = weights_.layers[layer_idx].down;  // Full Down weight
+    down_params.C = buffers_.ffn_output;
+    down_params.m = seq_len_;
+    down_params.n = config_.d_model;
+    down_params.k = local_d_ff;
+    down_params.input_range = ffn_range;
+    down_params.needs_allreduce = true;  // Sum partial products across ranks
+    down_params.mpi_ctx = mpi_ctx_;
+    
+    graph.addStage(std::make_unique<GEMMStage>(down_params), "ffn_down");
+}
+```
+
+---
+
+## Phase 5: Column-Parallel LM Head
+
+**Proposal Reference**: Section "Migration Path → Phase 5"
+
+**Goal**: Avoid computing full 151K vocab logits on every rank.
+
+```cpp
+// src/v2/pipelines/qwen/Qwen2Graph.cpp - In buildLMHeadGraph()
+
+void Qwen2Graph::buildLMHeadGraph(ComputeGraph& graph) {
+    // Get vocab range for this rank
+    WorkRange vocab_range = mpi_topology_->get_vocab_range(config_.vocab_size);
+    int local_vocab = static_cast<int>(vocab_range.size());
+    
+    // LM Head: [m, d_model] @ [d_model, local_vocab]
+    auto lm_params = GEMMStage::Params{};
+    lm_params.A = buffers_.final_norm_output;
+    lm_params.B = weights_.lm_head;  // Column-sharded by vocab
+    lm_params.C = buffers_.logits_local;
+    lm_params.m = seq_len_;
+    lm_params.n = local_vocab;
+    lm_params.k = config_.d_model;
+    lm_params.mpi_ctx = mpi_ctx_;
+    
+    graph.addStage(std::make_unique<GEMMStage>(lm_params), "lm_head");
+    
+    // AllGather logits for sampling
+    auto gather_params = AllGatherStage::Params{};
+    gather_params.input = buffers_.logits_local;
+    gather_params.output = buffers_.logits_full;
+    gather_params.local_size = seq_len_ * local_vocab;
+    gather_params.mpi_ctx = mpi_ctx_;
+    
+    graph.addStage(std::make_unique<AllGatherStage>(gather_params), "gather_logits");
+}
+```
+
+---
+
+## GPU Integration Phases
+
+### Phase G1: Single-GPU Per Rank
+
+**Proposal Reference**: Section "GPU Integration Phases → Phase G1"
+
+**Goal**: Each MPI rank uses its NUMA-local GPU for GEMM.
+
+**Files to Modify**:
+- `src/v2/pipelines/qwen/GraphOrchestrator.cpp`
+
+```cpp
+// GraphOrchestrator initialization - select GPU device
+
+void GraphOrchestrator::initializeDevices() {
+    auto& dm = DeviceManager::instance();
+    
+    // Find GPU device for this rank (NUMA-filtered)
+    int gpu_idx = dm.find_device(ComputeBackendType::GPU_CUDA, 0);  // First CUDA
+    if (gpu_idx < 0) {
+        gpu_idx = dm.find_device(ComputeBackendType::GPU_ROCM, 0);  // Try ROCm
+    }
+    
+    if (gpu_idx >= 0) {
+        device_idx_ = gpu_idx;
+        LOG_INFO("[GraphOrchestrator] Using GPU device " << gpu_idx 
+                 << " (" << dm.devices()[gpu_idx].name << ")");
+    } else {
+        device_idx_ = DeviceManager::cpuDeviceIndex();
+        LOG_INFO("[GraphOrchestrator] No GPU found, using CPU");
+    }
+}
+```
+
+### Phase G2: GPU Attention Kernels
+
+**Files to Create**:
+- `src/v2/kernels/cuda/CudaFlashAttentionKernel.h`
+- `src/v2/kernels/cuda/CudaFlashAttentionKernel.cu`
+
+```cpp
+// src/v2/kernels/cuda/CudaFlashAttentionKernel.h
+
+#pragma once
+
+#ifdef HAVE_CUDA
+
+#include "../../tensors/TensorKernels.h"
+
+namespace llaminar::v2::kernels::cuda {
+
+/**
+ * @brief FlashAttention-2 based CUDA attention kernel
+ *
+ * Implements efficient attention using tiled computation
+ * to minimize HBM reads/writes.
+ */
+class CudaFlashAttentionKernel : public llaminar2::ITensorAttention {
+public:
+    bool compute_tensor(
+        const TensorBase* Q, const TensorBase* K, const TensorBase* V,
+        TensorBase* output,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size,
+        TensorBase* workspace_scores,
+        TensorBase* mask,
+        const MPIContext* mpi_ctx,
+        int device_idx,
+        int head_start = 0,
+        int local_n_heads = -1,
+        int local_n_kv_heads = -1) override;
+        
+private:
+    // FlashAttention parameters
+    float softmax_scale_ = 0.0f;  // Computed from head_dim
+};
+
+} // namespace llaminar::v2::kernels::cuda
+
+#endif // HAVE_CUDA
+```
+
+**Update KernelFactory**:
+```cpp
+// src/v2/kernels/KernelFactory.cpp
+
+#ifdef HAVE_CUDA
+#include "cuda/CudaFlashAttentionKernel.h"
+#endif
+
+std::unique_ptr<ITensorAttention> KernelFactory::createAttention(
+    const FP32Tensor* tensor, DeviceType dev_type)
+{
+    switch (dev_type) {
+    case DeviceType::CPU:
+        return std::make_unique<CPUAttentionKernelTyped<FP32>>();
+        
+#ifdef HAVE_CUDA
+    case DeviceType::CUDA:
+        return std::make_unique<cuda::CudaFlashAttentionKernel>();
+#endif
+
+    default:
+        return std::make_unique<CPUAttentionKernelTyped<FP32>>();
+    }
+}
+```
+
+---
+
+## Collective Operation Stages
+
+These new stages wrap MPI collectives for use in the compute graph.
+
+### AllReduceStage
+
+**Location**: `src/v2/execution/CollectiveStages.h`
+
+```cpp
+// src/v2/execution/CollectiveStages.h
+
+#pragma once
+
+#include "ComputeStage.h"
+#include "../utils/MPIContext.h"
+
+namespace llaminar::v2::execution {
+
+/**
+ * @brief Stage that performs MPI AllReduce (sum) on a tensor
+ *
+ * Used after column-parallel GEMM where each rank has a partial sum
+ * that must be combined to produce the final result.
+ *
+ * Input: Partial tensor [m, n] (local partial product)
+ * Output: Same tensor, in-place reduced across all ranks
+ */
+class AllReduceStage : public ComputeStage {
+public:
+    struct Params {
+        TensorBase* tensor = nullptr;   // In-place reduce
+        size_t count = 0;               // Number of elements (0 = infer from tensor)
+        std::shared_ptr<MPIContext> mpi_ctx;
+    };
+    
+    explicit AllReduceStage(Params params) : params_(std::move(params)) {}
+    
+    bool execute(IDeviceContext* ctx) override {
+        if (!params_.tensor || !params_.mpi_ctx) {
+            LOG_ERROR("[AllReduceStage] Missing tensor or MPI context");
+            return false;
+        }
+        
+        float* data = params_.tensor->mutable_data();
+        size_t count = params_.count > 0 ? params_.count : params_.tensor->numel();
+        
+        LOG_DEBUG("[AllReduceStage] AllReduce sum on " << count << " elements");
+        params_.mpi_ctx->allreduce_sum(data, count);
+        
+        return true;
+    }
+    
+    const char* name() const override { return "AllReduceStage"; }
+    
+private:
+    Params params_;
+};
+
+/**
+ * @brief Stage that performs MPI AllGather to reconstruct sharded tensor
+ *
+ * Used after row-parallel GEMM or vocab-sharded LM head where each rank
+ * has a slice of the output dimension that must be concatenated.
+ *
+ * Input: Local tensor slice [m, local_n]
+ * Output: Full tensor [m, n] with all slices gathered
+ */
+class AllGatherStage : public ComputeStage {
+public:
+    struct Params {
+        TensorBase* input = nullptr;    // Local slice [m, local_n]
+        TensorBase* output = nullptr;   // Full output [m, n]
+        size_t local_count = 0;         // Elements per rank (0 = infer)
+        std::shared_ptr<MPIContext> mpi_ctx;
+        
+        // Optional: slice info for variable-size gathers
+        std::vector<int> recv_counts;   // Per-rank element counts
+        std::vector<int> displacements; // Per-rank offsets
+    };
+    
+    explicit AllGatherStage(Params params) : params_(std::move(params)) {}
+    
+    bool execute(IDeviceContext* ctx) override {
+        if (!params_.input || !params_.output || !params_.mpi_ctx) {
+            LOG_ERROR("[AllGatherStage] Missing tensor(s) or MPI context");
+            return false;
+        }
+        
+        const float* send = params_.input->data();
+        float* recv = params_.output->mutable_data();
+        size_t local_count = params_.local_count > 0 
+                           ? params_.local_count 
+                           : params_.input->numel();
+        
+        if (params_.recv_counts.empty()) {
+            // Equal-size gather
+            LOG_DEBUG("[AllGatherStage] AllGather " << local_count 
+                      << " elements from each of " << params_.mpi_ctx->world_size() << " ranks");
+            
+            MPI_Allgather(
+                send, static_cast<int>(local_count), MPI_FLOAT,
+                recv, static_cast<int>(local_count), MPI_FLOAT,
+                params_.mpi_ctx->comm());
+        } else {
+            // Variable-size gather
+            LOG_DEBUG("[AllGatherStage] AllGatherv with variable sizes");
+            
+            MPI_Allgatherv(
+                send, static_cast<int>(local_count), MPI_FLOAT,
+                recv, params_.recv_counts.data(), params_.displacements.data(), MPI_FLOAT,
+                params_.mpi_ctx->comm());
+        }
+        
+        return true;
+    }
+    
+    const char* name() const override { return "AllGatherStage"; }
+    
+private:
+    Params params_;
+};
+
+/**
+ * @brief Stage that broadcasts a tensor from rank 0 to all ranks
+ *
+ * Used for token IDs at the start of inference.
+ */
+class BroadcastStage : public ComputeStage {
+public:
+    struct Params {
+        TensorBase* tensor = nullptr;
+        size_t count = 0;
+        int root_rank = 0;
+        std::shared_ptr<MPIContext> mpi_ctx;
+    };
+    
+    explicit BroadcastStage(Params params) : params_(std::move(params)) {}
+    
+    bool execute(IDeviceContext* ctx) override {
+        if (!params_.tensor || !params_.mpi_ctx) {
+            return false;
+        }
+        
+        float* data = params_.tensor->mutable_data();
+        size_t count = params_.count > 0 ? params_.count : params_.tensor->numel();
+        
+        MPI_Bcast(data, static_cast<int>(count), MPI_FLOAT, 
+                  params_.root_rank, params_.mpi_ctx->comm());
+        
+        return true;
+    }
+    
+    const char* name() const override { return "BroadcastStage"; }
+    
+private:
+    Params params_;
+};
+
+} // namespace llaminar::v2::execution
+```
+
+### Usage in Graph Construction
+
+```cpp
+// Example: Adding AllReduce after column-parallel Down projection
+
+void Qwen2Graph::buildFFNGraph(int layer_idx, ComputeGraph& graph) {
+    // ... Gate/Up/SwiGLU stages ...
+    
+    // Down projection (column-parallel: partial input)
+    auto down_params = GEMMStage::Params{};
+    down_params.A = buffers_.swiglu_local;
+    down_params.B = weights_.layers[layer_idx].down;
+    down_params.C = buffers_.ffn_output;
+    down_params.m = seq_len_;
+    down_params.n = config_.d_model;
+    down_params.k = local_d_ff;  // Local input dimension
+    down_params.mpi_ctx = mpi_ctx_;
+    // Note: Set needs_allreduce=false, use separate stage instead
+    
+    graph.addStage(std::make_unique<GEMMStage>(down_params), "ffn_down");
+    
+    // AllReduce to sum partial products
+    auto reduce_params = AllReduceStage::Params{};
+    reduce_params.tensor = buffers_.ffn_output;
+    reduce_params.mpi_ctx = mpi_ctx_;
+    
+    graph.addStage(std::make_unique<AllReduceStage>(reduce_params), "ffn_allreduce");
+}
+```
+
+---
+
+## Data Transfer Stage (CPU ↔ GPU)
+
+For heterogeneous execution, data must move between devices.
+
+```cpp
+// src/v2/execution/DataTransferStage.h
+
+#pragma once
+
+#include "ComputeStage.h"
+
+namespace llaminar::v2::execution {
+
+/**
+ * @brief Stage that copies tensor data between devices
+ *
+ * Handles:
+ * - CPU → GPU (upload before GPU kernel)
+ * - GPU → CPU (download for CPU kernel or collective)
+ * - GPU → GPU (future: peer-to-peer or via CPU staging)
+ */
+class DataTransferStage : public ComputeStage {
+public:
+    enum class Direction {
+        HOST_TO_DEVICE,
+        DEVICE_TO_HOST,
+        DEVICE_TO_DEVICE
+    };
+    
+    struct Params {
+        TensorBase* src = nullptr;
+        TensorBase* dst = nullptr;
+        Direction direction = Direction::HOST_TO_DEVICE;
+        int src_device = 0;
+        int dst_device = 0;
+        bool async = false;  // Future: async copy with events
+    };
+    
+    explicit DataTransferStage(Params params) : params_(std::move(params)) {}
+    
+    bool execute(IDeviceContext* ctx) override {
+        if (!params_.src || !params_.dst) {
+            LOG_ERROR("[DataTransferStage] Missing source or destination tensor");
+            return false;
+        }
+        
+        size_t bytes = params_.src->numel() * sizeof(float);
+        
+        switch (params_.direction) {
+        case Direction::HOST_TO_DEVICE:
+            LOG_DEBUG("[DataTransferStage] Upload " << bytes << " bytes to GPU");
+#ifdef HAVE_CUDA
+            cudaMemcpy(params_.dst->mutable_data(), params_.src->data(), 
+                       bytes, cudaMemcpyHostToDevice);
+#endif
+            break;
+            
+        case Direction::DEVICE_TO_HOST:
+            LOG_DEBUG("[DataTransferStage] Download " << bytes << " bytes from GPU");
+#ifdef HAVE_CUDA
+            cudaMemcpy(params_.dst->mutable_data(), params_.src->data(),
+                       bytes, cudaMemcpyDeviceToHost);
+#endif
+            break;
+            
+        case Direction::DEVICE_TO_DEVICE:
+            LOG_WARN("[DataTransferStage] D2D not yet implemented");
+            return false;
+        }
+        
+        return true;
+    }
+    
+    const char* name() const override { return "DataTransferStage"; }
+    
+private:
+    Params params_;
+};
+
+} // namespace llaminar::v2::execution
+```
+
+---
+
+## Testing Strategy
+
+### Unit Tests (Per Phase)
+
+| Phase | Test File | Coverage |
+|-------|-----------|----------|
+| 2.1 | `Test__KernelFactorySliced.cpp` | Sliced kernel creation/caching |
+| 2.2-2.3 | `Test__GEMMStageTP.cpp` | Row-parallel GEMM execution |
+| 2.4-2.6 | `Test__AttentionStageTP.cpp` | Head-sharded attention |
+| 3 | `Test__Qwen2GraphColumnParallelQKV.cpp` | QKV weight sharding |
+| 4 | `Test__Qwen2GraphColumnParallelFFN.cpp` | FFN sharding + allreduce |
+| 5 | `Test__Qwen2GraphColumnParallelLMHead.cpp` | Vocab sharding + allgather |
+
+### Integration Tests
+
+```cpp
+// tests/v2/integration/Test__DistributedInference.cpp
+
+TEST(DistributedInference, TwoRankTPProducesSameOutputAsFullCompute) {
+    // Run with mpirun -np 2
+    auto mpi_ctx = std::make_shared<MPIContext>();
+    
+    // Load model with TP enabled
+    ModelContext model_ctx = ModelContext::create(
+        "models/qwen2.5-0.5b-instruct-q4_0.gguf",
+        mpi_ctx);
+    
+    // Create TP-enabled orchestrator
+    GraphOrchestrator orchestrator(model_ctx, mpi_ctx);
+    
+    // Run inference
+    std::vector<int> tokens = {785, 3974, 13876};  // "The quick brown"
+    auto output = orchestrator.forward(tokens.data(), tokens.size());
+    
+    // Rank 0 gathers and validates
+    if (mpi_ctx->rank() == 0) {
+        // Compare logits against single-rank baseline
+        auto baseline = loadBaselineLogits("baseline_logits.bin");
+        float cosine_sim = computeCosineSimilarity(output, baseline);
+        EXPECT_GT(cosine_sim, 0.999f);
+    }
+    
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+```
+
+---
+
+## Success Criteria
+
+### Phase 2 Complete When:
+- [ ] `GEMMStage` with `output_range` produces correct sliced output
+- [ ] `AttentionComputeStage` with head range computes only local heads
+- [ ] Unit tests pass for sliced operations
+- [ ] Memory usage per rank reduced for tested operations
+
+### Phase 3-4 Complete When:
+- [ ] QKV projection uses column-parallel weights
+- [ ] FFN uses column-parallel Gate/Up + allreduce for Down
+- [ ] 2-rank inference produces same logits as 1-rank (cosine sim > 0.999)
+- [ ] Per-rank memory reduced by ~50% for sharded weights
+
+### Phase 5 Complete When:
+- [ ] LM head sharded by vocab
+- [ ] AllGather reconstructs full logits
+- [ ] Sampling produces identical tokens as single-rank
+
+### Full TP Complete When:
+- [ ] All deprecated components removed
+- [ ] All tests migrated to graph-based execution
+- [ ] Documentation updated
+- [ ] Performance benchmarks show scaling benefit (>1.5x for 2 ranks)
+
+---
+
+## Appendix A: Proposal Cross-Reference
+
+| Implementation Phase | Proposal Section |
+|----------------------|------------------|
+| Phase 1 (MPITopology) | "Phase 1: MPITopology Class", "Decision 1: Work Division" |
+| Phase 2 (Stage TP) | "Migration Path → Phase 2", "Kernel Support Analysis" |
+| Phase 3 (QKV) | "Decision 2: QKV Parallelism Strategy" |
+| Phase 4 (FFN) | "Decision 3: Collective Operations Placement" |
+| Phase 5 (LM Head) | "Migration Path → Phase 5" |
+| Phase 6 (KV Cache) | "Migration Path → Phase 6" |
+| Phase 7 (Cleanup) | "Decision 4: Deprecated Components" |
+| GPU Phases G1-G5 | "Device Support Status", "GPU Integration Phases" |
+
+---
+
+## Appendix B: File Inventory
+
+### Files to Create
+
+| File | Phase | Purpose |
+|------|-------|---------|
+| `src/v2/execution/CollectiveStages.h` | 2-4 | AllReduce, AllGather, Broadcast stages |
+| `src/v2/execution/DataTransferStage.h` | G3 | CPU↔GPU data movement |
+| `src/v2/kernels/cuda/CudaFlashAttentionKernel.h` | G2 | CUDA attention implementation |
+| `src/v2/kernels/cuda/CudaFlashAttentionKernel.cu` | G2 | CUDA attention kernels |
+| `tests/v2/unit/Test__KernelFactorySliced.cpp` | 2.1 | Sliced kernel tests |
+| `tests/v2/unit/Test__GEMMStageTP.cpp` | 2.2-2.3 | TP GEMM tests |
+| `tests/v2/unit/Test__AttentionStageTP.cpp` | 2.4-2.6 | TP attention tests |
+| `tests/v2/integration/Test__DistributedInference.cpp` | 3-5 | End-to-end TP tests |
+
+### Files to Modify
+
+| File | Phase | Changes |
+|------|-------|---------|
+| `src/v2/kernels/KernelFactory.h` | 2.1 | Add `getOrCreateGemmSliced()` |
+| `src/v2/kernels/KernelFactory.cpp` | 2.1, G2 | Implement sliced cache, add CUDA attention |
+| `src/v2/execution/ComputeStage.h` | 2.2, 2.4 | Add TP params to GEMM/Attention stages |
+| `src/v2/execution/ComputeStage.cpp` | 2.3, 2.5 | Implement TP logic in execute() |
+| `src/v2/tensors/TensorKernels.h` | 2.5 | Add head_start/local_n_heads to ITensorAttention |
+| `src/v2/kernels/cpu/attention/CPUAttentionKernelTyped.h` | 2.6 | Use head range in loop |
+| `src/v2/loaders/WeightManager.h` | 3.1, 4.1, 5.1 | Add column-shard methods |
+| `src/v2/pipelines/qwen/Qwen2Graph.cpp` | 3-5 | Pass TP params to stages |
+| `src/v2/pipelines/qwen/GraphOrchestrator.cpp` | G1 | GPU device selection |
+
+### Files to Delete (Phase 7)
+
+| File | Reason |
+|------|--------|
+| `src/v2/orchestrators/MpiAttentionOrchestrator.h` | Replaced by TP attention stages |
+| `src/v2/orchestrators/MpiAttentionOrchestrator.cpp` | " |
+| `src/v2/kernels/cpu/attention/GQAAttention.h` | Replaced by CPUAttentionKernelTyped |
+| `src/v2/kernels/cpu/attention/GQAAttention.cpp` | " |
+
+---
+
+## Appendix C: Risk Assessment
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Head count not divisible by world_size | Incorrect output | WorkRange already handles uneven division |
+| KV cache sync across ranks | Divergent decode | Phase 6 ensures local KV storage per rank |
+| GPU memory fragmentation | OOM on large models | Phase G1 uses pre-allocated buffers |
+| MPI deadlocks in collective stages | Hang | Barrier before AllReduce/AllGather, timeout tests |
+| Quantized weight slicing | Alignment issues | Slice at block boundaries (32-element granularity) |
+
+---
+
+## Appendix D: Performance Targets
+
+| Configuration | Metric | Target |
+|---------------|--------|--------|
+| 2-rank TP (CPU) | Speedup | >1.5x vs 1-rank |
+| 2-rank TP (CPU) | Memory/rank | <55% of 1-rank |
+| 1-rank GPU | Speedup | >3x vs 1-rank CPU |
+| 2-rank GPU | Speedup | >5x vs 1-rank CPU |
+| LM head gather | Overhead | <5% of forward pass |
+| AllReduce (1KB) | Latency | <100μs |
+| AllReduce (1MB) | Latency | <10ms |

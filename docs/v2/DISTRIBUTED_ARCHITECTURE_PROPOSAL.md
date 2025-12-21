@@ -39,6 +39,128 @@ At construction, `MPITopology`:
 3. Stores in `all_placements_` vector
 4. Enables future weighted work distribution
 
+### Decision 4: Deprecated Components (Do NOT Use)
+
+The following components are **DEPRECATED** and must NOT be used for new development:
+
+| Component | Status | Replacement |
+|-----------|--------|-------------|
+| `PipelineBase` / `Qwen2Pipeline` | ⛔ DEPRECATED | `GraphOrchestrator` + `ComputeStage` |
+| `MpiAttentionOrchestrator` | ⛔ DEPRECATED | `AttentionComputeStage` with TP params |
+| `GQAAttention` | ⛔ DEPRECATED | `AttentionComputeStage` |
+| `project_row_parallel()` | ⛔ DEPRECATED | `GEMMStage` with `WorkRange` |
+| `project_column_parallel()` | ⛔ DEPRECATED | `GEMMStage` with `WorkRange` + `AllreduceStage` |
+
+**Rationale**: The legacy Pipeline system (~3000 lines) duplicates graph execution logic and hides MPI communication. The graph-based approach makes tensor parallelism explicit and composable.
+
+**Note**: The Pipeline implementations contain working TP code that serves as **reference implementations** for migrating functionality to the Stage API. The kernel-level TP support (row-sliced constructors, head ranges) was developed for the Pipeline and can be reused.
+
+## Device Support Status
+
+### Current Infrastructure
+
+The graph execution system has a well-defined device abstraction layer:
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `IDeviceContext` | ✅ Complete | Abstract interface for CPU/GPU execution contexts |
+| `CPUDeviceContext` | ✅ Complete | OpenMP-based parallel execution, NUMA-aware allocation |
+| `CUDADeviceContext` | ✅ Complete | CUDA stream/memory management (when `HAVE_CUDA`) |
+| `ROCmDeviceContext` | ✅ Complete | HIP stream/memory management (when `HAVE_ROCM`) |
+| `DeviceManager` | ✅ Complete | Enumerate all devices, NUMA filtering for MPI ranks |
+| `KernelFactory` | ⚠️ Partial | CPU kernels complete, GPU kernels partial |
+
+### Kernel Device Support Matrix
+
+| Kernel Type | CPU | CUDA | ROCm | Notes |
+|-------------|-----|------|------|-------|
+| **GEMM (Quantized)** | ✅ AVX512-VNNI | ✅ JIT + CUTLASS | ❌ Stub | `CudaGemmFactory.cu` |
+| **GEMM (FP32/BF16)** | ✅ OpenBLAS/MKL | ⚠️ cuBLAS | ⚠️ rocBLAS | Fallback to CPU |
+| **Attention** | ✅ Typed kernels | ❌ CPU fallback | ❌ CPU fallback | Flash Attention TODO |
+| **RMSNorm** | ✅ SIMD | ❌ CPU fallback | ❌ CPU fallback | |
+| **RoPE** | ✅ SIMD | ❌ CPU fallback | ❌ CPU fallback | |
+| **SwiGLU** | ✅ SIMD | ❌ CPU fallback | ❌ CPU fallback | |
+| **Softmax** | ✅ Typed | ❌ CPU fallback | ❌ CPU fallback | |
+| **Embedding** | ✅ Complete | ❌ CPU fallback | ❌ CPU fallback | |
+
+**Legend**: ✅ = Implemented, ⚠️ = Partial/External, ❌ = Not implemented (uses CPU fallback)
+
+### Heterogeneous Execution Stumbling Blocks
+
+#### Block 1: Attention Kernels GPU-Only Incomplete
+
+**Problem**: `KernelFactory::createAttention()` falls back to CPU for all GPU requests:
+```cpp
+case DeviceType::CUDA:
+    LOG_DEBUG("CUDA Attention not implemented, using CPU fallback");
+    return std::make_unique<CPUAttentionKernelTyped<FP32>>();
+```
+
+**Impact**: Attention is compute-bound on large models. Without GPU attention, heterogeneous execution loses most benefit.
+
+**Solution Path**:
+1. Integrate FlashAttention-2 for CUDA
+2. Add hipFlashAttention for ROCm
+3. Alternative: Use cuDNN/MIOpen attention APIs
+
+#### Block 2: Cross-Device Data Transfer
+
+**Problem**: When tensor parallelism splits work across CPU and GPU, intermediate results must transfer:
+- Q/K/V computed on GPU → Attention on CPU (if GPU attention missing)
+- Attention output on CPU → Wo projection on GPU
+
+**Current State**: `IDeviceContext::copyFromDevice()` exists but isn't integrated into stage execution flow.
+
+**Solution Path**:
+1. Add `DataTransferStage` to compute graph for explicit cross-device copies
+2. Or: Automatic transfer detection in `GraphExecutor` when stage device differs from input device
+
+#### Block 3: MPI + GPU Work Division
+
+**Problem**: `MPITopology::WorkRange::for_rank_weighted()` supports heterogeneous work distribution, but:
+- GPU compute power estimation is heuristic (`relative_compute = 10.0` for GPU vs `1.0` for CPU)
+- No runtime calibration of actual throughput
+- Work granularity may not match GPU tile sizes efficiently
+
+**Current State**: `DeviceCapability` struct exists with `relative_compute` field, but not calibrated.
+
+**Solution Path**:
+1. Add benchmark-based calibration at startup (run small GEMM, measure throughput)
+2. Align work ranges to GPU-friendly boundaries (multiple of 32/64 for warps)
+3. Consider dynamic work stealing for load balancing
+
+#### Block 4: Graph Stage Device Affinity
+
+**Problem**: Current `ComputeStage` params have `device_idx` but:
+- No mechanism to specify "prefer GPU" vs "require GPU"
+- No automatic fallback to CPU if GPU unavailable
+- No multi-device stage support (e.g., data-parallel across 2 GPUs)
+
+**Solution Path**:
+1. Add `DevicePreference` enum: `REQUIRE_GPU`, `PREFER_GPU`, `CPU_ONLY`, `ANY`
+2. `GraphExecutor` selects device based on preference + availability
+3. Support device lists for data-parallel stages
+
+### Recommended Device Integration Order
+
+**Phase A (Current)**: CPU-only tensor parallelism via MPI
+- All ranks use `device_idx = 0` (CPU)
+- Focus on getting TP correct with `WorkRange` in stages
+
+**Phase B**: Single-GPU per rank
+- Each MPI rank owns one GPU
+- `DeviceManager` filters GPUs by NUMA affinity (already implemented)
+- GEMM runs on GPU, other ops on CPU (hybrid)
+
+**Phase C**: Heterogeneous CPU+GPU per rank
+- Single rank uses both CPU and GPU
+- Work split by `relative_compute` weights
+- Requires cross-device transfers and GPU attention kernels
+
+**Phase D**: Multi-GPU per rank
+- Single rank drives multiple GPUs
+- Data parallelism within rank, tensor parallelism across ranks
+
 ## Current State Problems
 
 ### Problem 1: Redundant Computation
@@ -515,24 +637,85 @@ private:
 
 ## Migration Path
 
-### Phase 1: MPITopology (Foundation)
-1. Create `MPITopology` class with topology detection
-2. Update `MPIContext` to use `MPITopology` internally
-3. Add work distribution methods (`get_head_slice`, `get_column_slice`, etc.)
+### Phase 1: MPITopology (Foundation) ✅ COMPLETE
+1. ✅ Create `MPITopology` class with topology detection
+2. ✅ Add `WorkRange` struct for simple index ranges
+3. ✅ Add work distribution methods (`get_head_range`, `get_column_range`, etc.)
+4. ✅ Device capability exchange via AllGather at startup
 
-### Phase 2: Distributed Stages
-1. Implement `SliceStage`, `GatherStage`, `AllGatherStage`, `ScatterStage`
-2. Add `ComputeStageType` enum values
-3. Create `ComputeStageFactory::create*` methods
+### Phase 2: Stage-Level TP Integration (Current Focus)
+
+Extend existing `ComputeStage` classes to accept TP parameters from `MPITopology`.
+
+#### 2.1 GEMMStage TP Support
+
+**Current State**: `GEMMStage` has `mpi_ctx` parameter but does NOT use it for sharding.
+
+**Kernel Support Available**:
+- ✅ `QuantisedGemmKernel(weights, row_start, row_end)` - Row-sliced constructor exists
+- ✅ `KernelFactory::getOrCreateGemm()` - Caches packed weights
+- ❌ `KernelFactory::getOrCreateGemmSliced()` - Needs implementation
+
+**Changes Required**:
+```cpp
+struct GEMMStage::Params {
+    // ... existing fields ...
+    
+    // TP parameters (optional, defaults to full computation)
+    std::optional<WorkRange> output_range;  // For row-parallel (N dimension)
+    std::optional<WorkRange> input_range;   // For column-parallel (K dimension)
+    bool needs_allreduce = false;           // After column-parallel GEMM
+    bool needs_allgather = false;           // After row-parallel GEMM
+};
+```
+
+**Implementation**:
+1. Add `KernelFactory::getOrCreateGemmSliced(tensor, row_start, row_end)`
+2. Modify `GEMMStage::execute()` to use sliced kernel when `output_range` set
+3. Integrate allreduce/allgather post-GEMM (or chain with separate stage)
+
+#### 2.2 AttentionComputeStage TP Support
+
+**Current State**: Passes full `n_heads` to kernel. Comment explicitly says:
+> "mpi_ctx for distributed logging, not tensor-parallel here"
+
+**Kernel Support Available**:
+- ✅ `CPUAttentionKernelTyped` loops `for h in 0..n_heads` - easy to modify
+- ✅ Per-head computation is independent (embarrassingly parallel)
+- ❌ No `head_start/head_end` parameters currently
+
+**Changes Required**:
+```cpp
+struct AttentionComputeStage::Params {
+    // ... existing fields ...
+    
+    // TP parameters (optional)
+    int head_start = 0;          // First head for this rank
+    int local_n_heads = -1;      // -1 = use n_heads (full computation)
+    int local_n_kv_heads = -1;   // -1 = use n_kv_heads (full computation)
+};
+```
+
+**Implementation**:
+1. Add head range params to `ITensorAttention::compute_tensor()`
+2. Modify `CPUAttentionKernelTyped` loop bounds: `for (h = head_start; h < head_end; ++h)`
+3. GPU kernels: Adjust thread block grid to only cover local heads
+
+#### 2.3 LMHeadStage TP Support (Future)
+
+**Current State**: Computes full `[m, vocab_size]` logits on every rank.
+
+**Changes Required**: Column-parallel with AllGather or efficient argmax reduction.
 
 ### Phase 3: Column-Parallel QKV
-1. Update `WeightManager` to shard Wq/Wk/Wv by columns
-2. Modify `Qwen2Graph::buildAttentionGraph` to use local heads
-3. Remove head extraction from `MpiAttentionOrchestrator`
+1. Update `WeightManager` to shard Wq/Wk/Wv by columns (output dim)
+2. Modify `Qwen2Graph::buildAttentionGraph` to pass `WorkRange` to stages
+3. Each rank computes Q/K/V for its assigned heads only
 
 ### Phase 4: Column-Parallel FFN
 1. Update `WeightManager` to shard Gate/Up by columns
 2. Modify `Qwen2Graph::buildFFNGraph` for local FFN dim
+3. Add `AllreduceStage` after Down projection
 
 ### Phase 5: Column-Parallel LM Head
 1. Shard `lm_head` by vocab dimension
@@ -541,12 +724,104 @@ private:
 
 ### Phase 6: Sharded KV Cache
 1. Modify `UnifiedKVCache` to only store local heads
-2. Update cache append/gather stages
+2. Update cache append stages for local head indices
 
 ### Phase 7: Cleanup
-1. Deprecate `MpiAttentionOrchestrator`
-2. Remove legacy `use_decomposed_attention` flag
-3. Update tests
+1. ⛔ Remove `MpiAttentionOrchestrator` (after TP migrated to stages)
+2. ⛔ Remove `GQAAttention` class
+3. ⛔ Deprecate `PipelineBase` TP methods (`project_row_parallel`, etc.)
+4. Update tests to use graph-based execution only
+
+---
+
+## GPU Integration Phases
+
+The following phases run in parallel with or after the CPU tensor parallelism phases above.
+
+### Phase G1: Single-GPU Per Rank (NUMA-Filtered)
+
+**Goal**: Each MPI rank uses one GPU for GEMM, CPU for other ops.
+
+**Prerequisites**: Phase 2 (Stage-Level TP) complete
+
+**Tasks**:
+1. ✅ `DeviceManager` already filters GPUs by NUMA affinity
+2. Configure `GraphOrchestrator` to use `device_idx` from DeviceManager (not hardcoded 0)
+3. Update `GEMMStage` to select GPU kernel when `device_idx` points to GPU
+4. Validate CUDA quantized GEMM (JIT + CUTLASS) works with TP sliced weights
+5. Add integration test: 2-rank MPI with each rank on separate GPU
+
+**Expected Outcome**: GEMM runs on GPU, attention/norms run on CPU with automatic fallback
+
+### Phase G2: GPU Attention Kernels
+
+**Goal**: Run attention computation on GPU (eliminates biggest CPU bottleneck)
+
+**Prerequisites**: Phase G1 complete
+
+**Tasks**:
+1. Integrate FlashAttention-2 for CUDA:
+   - Add `CudaFlashAttentionKernel` implementing `ITensorAttention`
+   - Wire into `KernelFactory::createAttention()` for `DeviceType::CUDA`
+2. Add hipFlashAttention for ROCm (or MIOpen attention)
+3. Update `AttentionComputeStage` to pass device context to kernel
+4. Add head-range support to GPU attention (for TP)
+
+**Implementation Note**:
+```cpp
+// KernelFactory.cpp - Phase G2 target
+case DeviceType::CUDA:
+    return std::make_unique<CudaFlashAttentionKernel>(/* head_start, head_end */);
+```
+
+### Phase G3: Cross-Device Data Transfer
+
+**Goal**: Enable stages to run on different devices within same rank
+
+**Prerequisites**: Phase G2 complete
+
+**Tasks**:
+1. Add `DataTransferStage` to compute graph:
+   ```cpp
+   class DataTransferStage : public IComputeStage {
+       Params: src_device, dst_device, tensor, async
+   };
+   ```
+2. Or: Automatic transfer detection in `GraphExecutor`:
+   - Track each tensor's current device
+   - Insert implicit copies when stage device differs from input device
+3. Profile and optimize: Prefer keeping data on one device when possible
+
+### Phase G4: Heterogeneous Work Distribution
+
+**Goal**: Split work between CPU and GPU based on compute power
+
+**Prerequisites**: Phase G3 complete
+
+**Tasks**:
+1. Add startup calibration routine:
+   - Run small GEMM on each device
+   - Measure GFLOPS, store in `DeviceCapability::relative_compute`
+2. Update `MPITopology::get_*_range()` to use calibrated weights
+3. Align GPU work ranges to warp-friendly boundaries (multiple of 32)
+4. Add `DevicePreference` to stage params:
+   ```cpp
+   enum class DevicePreference { REQUIRE_GPU, PREFER_GPU, CPU_ONLY, ANY };
+   ```
+
+### Phase G5: Multi-GPU Per Rank (Future)
+
+**Goal**: Single MPI rank drives multiple GPUs with data parallelism
+
+**Prerequisites**: Phase G4 complete, multi-GPU hardware available
+
+**Tasks**:
+1. Extend `RankPlacement::devices` to track multiple GPUs per rank
+2. Add `DataParallelStage` that replicates computation across devices
+3. Implement gradient-style reduction for data-parallel outputs
+4. Consider NCCL for intra-rank GPU-GPU communication
+
+---
 
 ## Memory Savings Analysis
 
