@@ -15,6 +15,7 @@
 #include "NUMATopology.h"
 #include "Logger.h"
 #include "../tensors/TensorSlice.h"
+#include "../execution/PlacementStrategy.h"
 
 #include <sstream>
 #include <algorithm>
@@ -626,6 +627,95 @@ namespace llaminar2
             }
             MPI_Barrier(world_comm_);
         }
+    }
+
+    // =========================================================================
+    // Placement Strategy
+    // =========================================================================
+
+    PlacementPlan MPITopology::computePlacement(
+        const std::string &architecture,
+        int n_layers,
+        size_t d_model,
+        size_t d_ff,
+        size_t vocab_size,
+        size_t n_heads,
+        size_t n_kv_heads,
+        const std::string &quant_type,
+        size_t estimated_memory,
+        const std::string &strategy_name) const
+    {
+        PlacementInput input;
+        input.architecture = architecture;
+        input.n_layers = n_layers;
+        input.d_model = d_model;
+        input.d_ff = d_ff;
+        input.vocab_size = vocab_size;
+        input.n_heads = n_heads;
+        input.n_kv_heads = n_kv_heads;
+        input.quant_type = quant_type;
+        input.estimated_memory_bytes = estimated_memory;
+        input.preferred_strategy = strategy_name;
+
+        return computePlacement(std::move(input));
+    }
+
+    PlacementPlan MPITopology::computePlacement(PlacementInput input) const
+    {
+        // Fill in topology fields from our gathered data
+        input.world_size = world_size_;
+        input.ranks_per_node = ranks_per_node_;
+        input.node_count = node_count_;
+
+        // Compute aggregated device info from all_placements_
+        input.rank_compute_weights.resize(world_size_);
+        input.any_rank_has_gpu = false;
+        input.total_gpu_memory = 0;
+        input.total_cpu_memory = 0;
+
+        for (int r = 0; r < world_size_; ++r)
+        {
+            const auto &rp = (r < static_cast<int>(all_placements_.size()))
+                                 ? all_placements_[r]
+                                 : placement_;
+            input.rank_compute_weights[r] = rp.total_compute_power();
+
+            for (const auto &dev : rp.devices)
+            {
+                if (dev.type == DeviceCapability::Type::CUDA ||
+                    dev.type == DeviceCapability::Type::ROCm)
+                {
+                    input.any_rank_has_gpu = true;
+                    input.total_gpu_memory += dev.memory_bytes;
+                }
+                else if (dev.type == DeviceCapability::Type::CPU)
+                {
+                    input.total_cpu_memory += dev.memory_bytes;
+                }
+            }
+        }
+
+        // Auto-select and run strategy
+        auto strategy = PlacementStrategyFactory::autoSelect(input);
+        if (!strategy)
+        {
+            LOG_ERROR("[MPITopology] Failed to select placement strategy");
+            // Return empty plan
+            PlacementPlan empty;
+            empty.strategy_name = "ERROR";
+            return empty;
+        }
+
+        LOG_DEBUG("[MPITopology] Computing placement with strategy: " << strategy->name());
+        PlacementPlan plan = strategy->compute(input);
+
+        if (rank_ == 0)
+        {
+            LOG_INFO("[MPITopology] Placement plan computed:\n"
+                     << plan.toString());
+        }
+
+        return plan;
     }
 
 } // namespace llaminar2

@@ -52,12 +52,203 @@
 - [ ] **7.3** Deprecate `PipelineBase` TP methods
 - [ ] **7.4** Update all tests to graph-based execution
 
+---
+
 ### GPU Integration Phases
-- [ ] **G1** Single-GPU per rank (NUMA-filtered)
-- [ ] **G2** GPU attention kernels (FlashAttention)
-- [ ] **G3** Cross-device data transfer
-- [ ] **G4** Heterogeneous work distribution
-- [ ] **G5** Multi-GPU per rank (future)
+
+> **Note**: Phases 2-7 above are for **CPU-only tensor parallelism** (MPI across nodes/sockets).
+> The GPU phases below add **heterogeneous execution** (CPU + GPU within a rank).
+> Phase G0 is a prerequisite for all other GPU phases.
+
+#### Phase G0: Placement Infrastructure (Foundation for GPU) ✅ COMPLETE
+> **Depends on**: Phase 1 (MPITopology)  
+> **Enables**: G1-G6 (all GPU phases need placement decisions)
+
+- [x] **G0.1** Create `PlacementStrategy` base class (`src/v2/execution/PlacementStrategy.h`)
+- [x] **G0.2** Implement `CPUOnlyStrategy` (default) + `GPUFirstStrategy` placeholder
+- [x] **G0.3** Create `PlacementPlan` struct (`src/v2/execution/PlacementPlan.h`)
+- [x] **G0.4** Integrate with `MPITopology::all_placements()` for capability input
+- [x] **G0.5** Add `WeightPlacementMap::applyPlan()` to populate from plan
+- [x] **G0.6** Add `MPITopology::computePlacement()` integration
+- [x] **G0.7** Unit tests for placement strategy (34 tests in `Test__PlacementStrategy.cpp`)
+
+#### Phase G1: Single-GPU per Rank
+> **Depends on**: G0 (placement decisions)
+
+- [ ] **G1.1** `DeviceManager` filters GPUs by NUMA affinity (already implemented)
+- [ ] **G1.2** Default placement strategy: all layers → GPU (if fits in memory)
+- [ ] **G1.3** Integration test: single-GPU inference matches CPU
+
+#### Phase G2: GPU Attention Kernels
+> **Depends on**: G1
+
+- [ ] **G2.1** Integrate FlashAttention-2 for CUDA
+- [ ] **G2.2** Add hipFlashAttention for ROCm
+- [ ] **G2.3** `KernelFactory::createAttention()` dispatches to GPU kernel
+
+#### Phase G3: Cross-Device Data Transfer
+> **Depends on**: G1
+
+- [ ] **G3.1** Add `DataTransferStage` for explicit GPU↔CPU copies
+- [ ] **G3.2** Automatic transfer detection in `GraphExecutor`
+- [ ] **G3.3** Async transfers with CUDA streams / HIP streams
+
+#### Phase G4: Heterogeneous Work Distribution
+> **Depends on**: G0, G2, G3
+
+- [ ] **G4.1** `LayerBalancedStrategy` (equal layers per device)
+- [ ] **G4.2** `ComputeWeightedStrategy` (by `relative_compute` from capabilities)
+- [ ] **G4.3** Block-level placement: Attention→GPU, FFN→CPU
+- [ ] **G4.4** Benchmark-based calibration of `relative_compute`
+
+#### Phase G5: Device-Specific Weight Packing
+> **Depends on**: G1
+
+- [ ] **G5.1** CUDA packed weights (COL32 / COL32_2R_4R4 layout)
+- [ ] **G5.2** ROCm packed weights (Matrix Core layout)
+- [ ] **G5.3** `KernelFactory` dispatches to device-specific packing
+
+#### Phase G6: Multi-GPU per Rank (Future)
+> **Depends on**: G4
+
+- [ ] **G6.1** Extend `RankPlacement::devices` for multiple GPUs
+- [ ] **G6.2** Data parallelism within rank
+- [ ] **G6.3** NVLink/xGMI-aware placement
+
+---
+
+## Key Architecture Concepts
+
+### Work Distribution Decision Flow (Phase G0) ✅ IMPLEMENTED
+
+**Summary**: How the placement decision flows to all ranks:
+
+```
+1. MPITopology::exchangeCapabilities()    ← AllGather device info (Phase 1)
+         ↓
+2. MPITopology::computePlacement(input)   ← Auto-selects strategy, computes plan
+         ↓
+3. PlacementStrategy::compute()           ← Algorithm (runs on ALL ranks, deterministic)
+         ↓
+4. PlacementPlan                          ← Struct with layer→device mappings
+         ↓
+5. WeightPlacementMap::applyPlan()        ← Populate local map from plan
+         ↓
+6. WeightManager uses placement_map       ← Loads weights to correct devices
+```
+
+**Key Design Choice**: All ranks compute the same plan locally (no broadcast needed) because:
+- `PlacementStrategy::compute()` is deterministic
+- All ranks have identical `all_placements_` after AllGather
+- Avoids serialization/broadcast complexity
+
+**Implemented Files**:
+- `src/v2/execution/PlacementPlan.h/.cpp` - `PlacementDevice` enum, `LayerPlacement`, `GlobalPlacement`, `PlacementPlan`
+- `src/v2/execution/PlacementStrategy.h/.cpp` - `PlacementInput`, `PlacementStrategy` base, `CPUOnlyStrategy`, `GPUFirstStrategy`, `PlacementStrategyFactory`
+
+**Available Strategies**:
+| Strategy | Description | Status |
+|----------|-------------|--------|
+| `CPUOnlyStrategy` | All layers → CPU (default for CPU-only TP) | ✅ Working |
+| `GPUFirstStrategy` | Fill GPU memory first, overflow to CPU | Placeholder (falls back to CPU) |
+
+**Example API**:
+```cpp
+// In main() or pipeline construction
+auto topology = std::make_shared<MPITopology>(...);
+topology->exchangeCapabilities();  // AllGather device info
+
+// Each rank computes the same plan (deterministic)
+PlacementInput input;
+input.architecture = "Qwen2";
+input.n_layers = model_loader.getBlockCount();
+input.d_model = model_loader.getEmbeddingDim();
+input.n_heads = model_loader.getHeadCount();
+input.vocab_size = model_loader.getVocabSize();
+input.quant_type = model_loader.getGGMLType();
+
+PlacementPlan plan = topology->computePlacement(input);
+
+// Apply plan to local WeightPlacementMap
+auto placement_map = std::make_shared<WeightPlacementMap>();
+placement_map->applyPlan(plan);
+
+// Pass to WeightManager
+WeightManager wm(loader, mpi_ctx, placement_map, WeightDistributionStrategy::SHARDED);
+```
+
+### Device-Specific Weight Packing (Phase G5)
+
+**Principle**: GPU kernels pack weights into their own optimal formats, just as CPU kernels do for VNNI.
+
+**Current CPU Packing** (`KernelFactory::getOrCreateGemm()`):
+- VNNI layout: `[N/64][K/4][64][4]` for AVX512-VNNI instructions
+- Packed weights stored in `tensor->cache_` (type: `TensorPackedWeightsCache*`)
+- Pack once on first kernel creation, reuse thereafter
+
+**GPU Packing Strategy** (Phase G5):
+- CUDA: COL32 or COL32_2R_4R4 layout for INT8 Tensor Cores
+- ROCm: Custom layout for Matrix Cores
+- Each backend packs into `tensor->cache_` on first kernel creation
+
+**Why This Works** (enabled by Phase G0):
+1. `WeightPlacementMap` assigns each tensor to a **single device** (layer/block granularity)
+2. Only one device type's kernel will ever be created for a given tensor
+3. No cross-device packing conflict because tensor is device-bound
+
+**Implementation Pattern**:
+```cpp
+// In KernelFactory::getOrCreateGemm()
+auto dev_type = getDeviceType(tensor->device_index());
+
+if (dev_type == DeviceType::CPU) {
+    // Pack into VNNI format (existing code)
+    packWeightsInto(tensor, new_cache->packed, VNNI_LAYOUT);
+    return std::make_unique<QuantisedGemmKernel>(&new_cache->packed);
+}
+#ifdef HAVE_CUDA
+else if (dev_type == DeviceType::CUDA) {
+    // Pack into CUDA-optimal format
+    auto* cuda_packed = new CudaPackedWeights();
+    packForCuda(tensor, cuda_packed);
+    tensor->cache_ = cuda_packed;
+    return std::make_unique<CudaQuantisedGemmKernel>(cuda_packed);
+}
+#endif
+```
+
+### Intra-Node Work Division (CPU vs GPU)
+
+**Problem**: How does a single MPI rank divide work between its CPU and GPU devices?
+
+**Answer**: Through `WeightPlacementMap` + `GraphOrchestrator` cooperation:
+
+| Component | Role | Scope |
+|-----------|------|-------|
+| `DeviceManager` | Enumerate CPU sockets and GPUs, NUMA filtering | Startup |
+| `WeightPlacementMap` | Assign layers/blocks to device indices | Model load |
+| `KernelFactory` | Create device-specific kernels with proper packing | First execution |
+| `GraphOrchestrator` | Execute stages on their assigned devices | Forward pass |
+| `IDeviceContext` | Actual parallel execution (OpenMP/CUDA/HIP) | Kernel execution |
+
+**Assignment Granularity**:
+```cpp
+// Layer-level (simple)
+placement_map->setLayerDevice(0, GPU_0);   // Layer 0 → GPU
+placement_map->setLayerDevice(1, CPU_0);   // Layer 1 → CPU
+
+// Block-level (fine-grained)
+placement_map->setAttentionDevice(layer, GPU_0);  // Attention → GPU
+placement_map->setFFNDevice(layer, CPU_0);        // FFN → CPU (AVX512 efficient)
+
+// MoE expert-level (future)
+placement_map->setLocalExpertDevice(layer, expert_id, device_idx);
+```
+
+**Relationship to MPI**:
+- **Inter-node**: MPI handles tensor parallelism (AllReduce, AllGather)
+- **Intra-node**: WeightPlacementMap handles heterogeneous device execution
+- These are orthogonal and composable
 
 ---
 
@@ -157,9 +348,13 @@ ITensorGemm* KernelFactory::getOrCreateGemmSliced(
 **Testing**:
 ```cpp
 // tests/v2/unit/Test__KernelFactorySliced.cpp
+#include "utils/TestTensorFactory.h"
+
+using namespace llaminar2::test;
+
 TEST(KernelFactorySliced, CreatesSlicedKernel) {
-    // Load a weight tensor
-    auto weights = loadTestWeights();  // [1024, 896]
+    // Create Q8_0 weight tensor with random data [1024, 896]
+    auto weights = TestTensorFactory::createQ8_0Random({1024, 896});
     
     // Create sliced kernel for first half of rows
     auto* kernel = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
@@ -169,7 +364,7 @@ TEST(KernelFactorySliced, CreatesSlicedKernel) {
 }
 
 TEST(KernelFactorySliced, CachesSlicedKernels) {
-    auto weights = loadTestWeights();
+    auto weights = TestTensorFactory::createQ8_0Random({1024, 896});
     auto* k1 = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
     auto* k2 = KernelFactory::getOrCreateGemmSliced(weights.get(), 0, 512);
     EXPECT_EQ(k1, k2);  // Same slice = same kernel
@@ -321,24 +516,24 @@ bool GEMMStage::execute(IDeviceContext* ctx) {
 **Testing**:
 ```cpp
 // tests/v2/unit/Test__GEMMStageTP.cpp
+#include "utils/TestTensorFactory.h"
+
+using namespace llaminar2::test;
+
 TEST(GEMMStageTP, RowParallelExecutesSlicedKernel) {
     // Simulate 2-rank environment
     int world_size = 2, rank = 0;
     auto mpi_ctx = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
     
-    // Create tensors
-    FP32Tensor input({32, 896});   // [m, k]
-    Q8_0Tensor weights({1024, 896}); // [n, k]
-    FP32Tensor output({32, 512});  // [m, local_n] - only half the output
-    
-    // Fill with test data
-    fillRandom(&input);
-    fillRandom(&weights);
+    // Create tensors using TestTensorFactory
+    auto input = TestTensorFactory::createFP32Random({32, 896});    // [m, k]
+    auto weights = TestTensorFactory::createQ8_0Random({1024, 896}); // [n, k]
+    auto output = TestTensorFactory::createFP32Zeros({32, 512});     // [m, local_n]
     
     GEMMStage::Params params;
-    params.A = &input;
-    params.B = &weights;
-    params.C = &output;
+    params.A = input.get();
+    params.B = weights.get();
+    params.C = output.get();
     params.m = 32;
     params.n = 1024;  // Full N
     params.k = 896;
@@ -351,13 +546,16 @@ TEST(GEMMStageTP, RowParallelExecutesSlicedKernel) {
     ASSERT_TRUE(stage.execute(ctx));
     
     // Verify output dimensions
-    EXPECT_EQ(output.shape()[0], 32);
-    EXPECT_EQ(output.shape()[1], 512);
+    EXPECT_EQ(output->shape()[0], 32);
+    EXPECT_EQ(output->shape()[1], 512);
     
-    // Verify output is not all zeros (actual values depend on weights)
+    // Verify output has values and no NaN/Inf
+    EXPECT_FALSE(TestTensorFactory::hasNaNOrInf(output.get()));
+    
+    // Verify output is not all zeros
     float sum = 0;
-    for (size_t i = 0; i < output.numel(); ++i) {
-        sum += std::abs(output.data()[i]);
+    for (size_t i = 0; i < output->numel(); ++i) {
+        sum += std::abs(output->data()[i]);
     }
     EXPECT_GT(sum, 0.0f);
 }
@@ -546,32 +744,36 @@ bool CPUAttentionKernelTyped<PREC>::compute_tensor(
 **Testing**:
 ```cpp
 // tests/v2/unit/Test__AttentionStageTP.cpp
+#include "utils/TestTensorFactory.h"
+
+using namespace llaminar2::test;
+
 TEST(AttentionStageTP, ComputesLocalHeadsOnly) {
     // 14 heads, 2 ranks -> 7 heads each
-    int n_heads = 14, n_kv_heads = 2;
-    int head_start = 0, local_n_heads = 7;
+    constexpr int N_HEADS = 14, N_KV_HEADS = 2, HEAD_DIM = 64, SEQ_LEN = 32;
+    constexpr int head_start = 0, local_n_heads = 7;
     
-    // Create Q/K/V with full dimensions (data for all heads)
-    FP32Tensor Q({1, 32, n_heads, 64});
-    FP32Tensor K({1, 32, n_kv_heads, 64});
-    FP32Tensor V({1, 32, n_kv_heads, 64});
-    FP32Tensor output({1, 32, local_n_heads, 64});  // Only local heads
+    int q_dim = N_HEADS * HEAD_DIM;
+    int kv_dim = N_KV_HEADS * HEAD_DIM;
+    int local_out_dim = local_n_heads * HEAD_DIM;
     
-    fillRandom(&Q);
-    fillRandom(&K);
-    fillRandom(&V);
+    // Create tensors - Q/K/V with full dimensions, output only for local heads
+    auto Q = TestTensorFactory::createFP32Random({1, SEQ_LEN, static_cast<size_t>(q_dim)});
+    auto K = TestTensorFactory::createFP32Random({1, SEQ_LEN, static_cast<size_t>(kv_dim)});
+    auto V = TestTensorFactory::createFP32Random({1, SEQ_LEN, static_cast<size_t>(kv_dim)});
+    auto output = TestTensorFactory::createFP32Zeros({1, SEQ_LEN, static_cast<size_t>(local_out_dim)});
     
     AttentionComputeStage::Params params;
-    params.Q = &Q;
-    params.K = &K;
-    params.V = &V;
-    params.output = &output;
+    params.Q = Q.get();
+    params.K = K.get();
+    params.V = V.get();
+    params.output = output.get();
     params.batch_size = 1;
-    params.seq_len = 32;
-    params.kv_len = 32;
-    params.n_heads = n_heads;
-    params.n_kv_heads = n_kv_heads;
-    params.head_dim = 64;
+    params.seq_len = SEQ_LEN;
+    params.kv_len = SEQ_LEN;
+    params.n_heads = N_HEADS;
+    params.n_kv_heads = N_KV_HEADS;
+    params.head_dim = HEAD_DIM;
     params.causal = true;
     params.head_start = head_start;
     params.local_n_heads = local_n_heads;
@@ -580,8 +782,9 @@ TEST(AttentionStageTP, ComputesLocalHeadsOnly) {
     AttentionComputeStage stage(params);
     ASSERT_TRUE(stage.execute(getCPUContext()));
     
-    // Verify output shape
-    EXPECT_EQ(output.shape()[2], local_n_heads);
+    // Verify output shape and validity
+    EXPECT_EQ(output->shape()[2], local_out_dim);
+    EXPECT_FALSE(TestTensorFactory::hasNaNOrInf(output.get()));
 }
 ```
 
@@ -910,25 +1113,334 @@ private:
 // src/v2/kernels/KernelFactory.cpp
 
 #ifdef HAVE_CUDA
-#include "cuda/CudaFlashAttentionKernel.h"
+#include "cuda/CudaAttentionKernelTyped.h"
 #endif
 
+#ifdef HAVE_ROCM
+#include "rocm/RocmAttentionKernelTyped.h"
+#endif
+
+/**
+ * @brief Create attention kernel with automatic type dispatch
+ *
+ * All backends use the same ActivationPrecision enum pattern:
+ * - CPU: CPUAttentionKernelTyped<ActivationPrecision::XXX>
+ * - CUDA: CudaAttentionKernelTyped<ActivationPrecision::XXX>
+ * - ROCm: RocmAttentionKernelTyped<ActivationPrecision::XXX>
+ *
+ * This ensures consistent type handling across all devices.
+ *
+ * @param tensor The activation tensor (Q/K/V) - used to determine precision
+ * @param dev_type Target device (CPU, CUDA, ROCm)
+ */
 std::unique_ptr<ITensorAttention> KernelFactory::createAttention(
-    const FP32Tensor* tensor, DeviceType dev_type)
+    const TensorBase* tensor, DeviceType dev_type)
 {
+    // Map TensorType → ActivationPrecision
+    ActivationPrecision prec = tensorTypeToActivationPrecision(tensor->dtype());
+    
     switch (dev_type) {
-    case DeviceType::CPU:
-        return std::make_unique<CPUAttentionKernelTyped<FP32>>();
-        
 #ifdef HAVE_CUDA
     case DeviceType::CUDA:
-        return std::make_unique<cuda::CudaFlashAttentionKernel>();
+        return createCudaAttention(prec);
 #endif
 
+#ifdef HAVE_ROCM
+    case DeviceType::ROCm:
+        return createRocmAttention(prec);
+#endif
+
+    case DeviceType::CPU:
     default:
-        return std::make_unique<CPUAttentionKernelTyped<FP32>>();
+        return createCpuAttention(prec);
     }
 }
+
+// Helper: TensorType enum → ActivationPrecision enum
+static ActivationPrecision tensorTypeToActivationPrecision(TensorType dtype) {
+    switch (dtype) {
+    case TensorType::FP32: return ActivationPrecision::FP32;
+    case TensorType::FP16: return ActivationPrecision::FP16;
+    case TensorType::BF16: return ActivationPrecision::BF16;
+    case TensorType::Q8_1: return ActivationPrecision::Q8_1;
+    default:
+        LOG_WARN("Unsupported dtype, falling back to FP32");
+        return ActivationPrecision::FP32;
+    }
+}
+
+// CPU dispatch
+static std::unique_ptr<ITensorAttention> createCpuAttention(ActivationPrecision prec) {
+    switch (prec) {
+    case ActivationPrecision::FP32: return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP32>>();
+    case ActivationPrecision::FP16: return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP16>>();
+    case ActivationPrecision::BF16: return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::BF16>>();
+    case ActivationPrecision::Q8_1: return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+    default: return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP32>>();
+    }
+}
+
+#ifdef HAVE_CUDA
+// CUDA dispatch - same ActivationPrecision pattern
+static std::unique_ptr<ITensorAttention> createCudaAttention(ActivationPrecision prec) {
+    switch (prec) {
+    case ActivationPrecision::FP32: return std::make_unique<cuda::CudaAttentionKernelTyped<ActivationPrecision::FP32>>();
+    case ActivationPrecision::FP16: return std::make_unique<cuda::CudaAttentionKernelTyped<ActivationPrecision::FP16>>();
+    case ActivationPrecision::BF16: return std::make_unique<cuda::CudaAttentionKernelTyped<ActivationPrecision::BF16>>();
+    case ActivationPrecision::Q8_1: return std::make_unique<cuda::CudaAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+    default: return std::make_unique<cuda::CudaAttentionKernelTyped<ActivationPrecision::FP16>>();  // FP16 default for GPU
+    }
+}
+#endif
+
+#ifdef HAVE_ROCM
+// ROCm dispatch - same ActivationPrecision pattern
+static std::unique_ptr<ITensorAttention> createRocmAttention(ActivationPrecision prec) {
+    switch (prec) {
+    case ActivationPrecision::FP32: return std::make_unique<rocm::RocmAttentionKernelTyped<ActivationPrecision::FP32>>();
+    case ActivationPrecision::FP16: return std::make_unique<rocm::RocmAttentionKernelTyped<ActivationPrecision::FP16>>();
+    case ActivationPrecision::BF16: return std::make_unique<rocm::RocmAttentionKernelTyped<ActivationPrecision::BF16>>();
+    case ActivationPrecision::Q8_1: return std::make_unique<rocm::RocmAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+    default: return std::make_unique<rocm::RocmAttentionKernelTyped<ActivationPrecision::FP16>>();  // FP16 default for GPU
+    }
+}
+#endif
+```
+
+**CUDA Kernel Template** (mirrors CPU pattern):
+```cpp
+// src/v2/kernels/cuda/CudaAttentionKernelTyped.h
+
+#pragma once
+
+#ifdef HAVE_CUDA
+
+#include "../../tensors/TensorKernels.h"
+#include "../../pipelines/PipelineConfig.h"  // ActivationPrecision
+
+namespace llaminar::v2::kernels::cuda {
+
+namespace detail {
+    // CUDA type mapping (similar to CPU but uses CUDA types)
+    template <ActivationPrecision P> struct CudaPrecisionTraits;
+    
+    template <> struct CudaPrecisionTraits<ActivationPrecision::FP32> {
+        using ComputeType = float;
+        using StorageType = float;
+        static constexpr bool use_tensor_cores = false;
+    };
+    
+    template <> struct CudaPrecisionTraits<ActivationPrecision::FP16> {
+        using ComputeType = half;
+        using StorageType = half;
+        static constexpr bool use_tensor_cores = true;  // FP16 Tensor Cores
+    };
+    
+    template <> struct CudaPrecisionTraits<ActivationPrecision::BF16> {
+        using ComputeType = nv_bfloat16;
+        using StorageType = nv_bfloat16;
+        static constexpr bool use_tensor_cores = true;  // BF16 Tensor Cores (Ampere+)
+    };
+    
+    template <> struct CudaPrecisionTraits<ActivationPrecision::Q8_1> {
+        using ComputeType = float;      // Accumulate in FP32
+        using StorageType = int8_t;     // INT8 storage
+        static constexpr bool use_tensor_cores = true;  // INT8 Tensor Cores
+    };
+}
+
+/**
+ * @brief CUDA attention kernel with precision template
+ *
+ * Uses same ActivationPrecision enum as CPU for consistent factory dispatch.
+ * Internally uses CudaPrecisionTraits for CUDA-specific type mappings.
+ */
+template <ActivationPrecision Precision>
+class CudaAttentionKernelTyped : public llaminar2::ITensorAttention {
+public:
+    using Traits = detail::CudaPrecisionTraits<Precision>;
+    using ComputeType = typename Traits::ComputeType;
+    using StorageType = typename Traits::StorageType;
+    
+    bool compute_tensor(
+        const TensorBase* Q, const TensorBase* K, const TensorBase* V,
+        TensorBase* output,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size,
+        TensorBase* workspace_scores,
+        TensorBase* mask,
+        const MPIContext* mpi_ctx,
+        int device_idx,
+        int head_start = 0,
+        int local_n_heads = -1,
+        int local_n_kv_heads = -1) override
+    {
+        // Launch precision-specific CUDA kernel
+        if constexpr (Traits::use_tensor_cores) {
+            return launch_flash_attention_tc<ComputeType, StorageType>(
+                Q, K, V, output, batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim, causal, device_idx,
+                head_start, local_n_heads);
+        } else {
+            return launch_flash_attention_cuda<ComputeType>(
+                Q, K, V, output, batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim, causal, device_idx,
+                head_start, local_n_heads);
+        }
+    }
+    
+private:
+    // FlashAttention with Tensor Cores
+    template <typename Compute, typename Storage>
+    bool launch_flash_attention_tc(...);
+    
+    // FlashAttention without Tensor Cores (FP32 fallback)
+    template <typename Compute>
+    bool launch_flash_attention_cuda(...);
+};
+
+} // namespace llaminar::v2::kernels::cuda
+
+#endif // HAVE_CUDA
+```
+
+**ROCm Kernel Template** (same pattern for AMD):
+```cpp
+// src/v2/kernels/rocm/RocmAttentionKernelTyped.h
+
+#pragma once
+
+#ifdef HAVE_ROCM
+
+#include "../../tensors/TensorKernels.h"
+#include "../../pipelines/PipelineConfig.h"
+
+namespace llaminar::v2::kernels::rocm {
+
+namespace detail {
+    template <ActivationPrecision P> struct RocmPrecisionTraits;
+    
+    template <> struct RocmPrecisionTraits<ActivationPrecision::FP32> {
+        using ComputeType = float;
+        using StorageType = float;
+        static constexpr bool use_matrix_cores = false;
+    };
+    
+    template <> struct RocmPrecisionTraits<ActivationPrecision::FP16> {
+        using ComputeType = _Float16;
+        using StorageType = _Float16;
+        static constexpr bool use_matrix_cores = true;  // CDNA Matrix Cores
+    };
+    
+    template <> struct RocmPrecisionTraits<ActivationPrecision::BF16> {
+        using ComputeType = hip_bfloat16;
+        using StorageType = hip_bfloat16;
+        static constexpr bool use_matrix_cores = true;  // MI200+ Matrix Cores
+    };
+    
+    template <> struct RocmPrecisionTraits<ActivationPrecision::Q8_1> {
+        using ComputeType = float;
+        using StorageType = int8_t;
+        static constexpr bool use_matrix_cores = true;  // INT8 Matrix Cores
+    };
+}
+
+template <ActivationPrecision Precision>
+class RocmAttentionKernelTyped : public llaminar2::ITensorAttention {
+    // Same structure as CUDA, uses RocmPrecisionTraits
+    // ...
+};
+
+} // namespace llaminar::v2::kernels::rocm
+
+#endif // HAVE_ROCM
+```
+```
+
+**Template Design** (from `CPUAttentionKernelTyped.h`):
+
+```cpp
+// ActivationPrecision enum (from PipelineConfig.h)
+enum class ActivationPrecision { FP32, BF16, FP16, Q8_1 };
+
+// Template is on the ENUM, not primitive types
+template <ActivationPrecision Precision>
+class CPUAttentionKernelTyped : public ITensorAttention {
+public:
+    // Two-level type resolution:
+    // 1. Enum → Tensor type
+    using TensorT = typename detail::PrecisionToTensor<Precision>::Type;
+    // 2. Tensor type → Element type (via ActivationTraits)
+    using ElementType = typename primitives::ActivationTraits<TensorT>::ElementType;
+    using Traits = primitives::ActivationTraits<TensorT>;
+    
+    // ...
+};
+
+// Mapping specializations:
+template<> struct PrecisionToTensor<ActivationPrecision::FP32> { using Type = FP32Tensor; };
+template<> struct PrecisionToTensor<ActivationPrecision::BF16> { using Type = BF16Tensor; };
+template<> struct PrecisionToTensor<ActivationPrecision::FP16> { using Type = FP16Tensor; };
+template<> struct PrecisionToTensor<ActivationPrecision::Q8_1> { using Type = Q8_1Tensor; };
+
+// ActivationTraits then provides ElementType:
+// - FP32Tensor → float
+// - BF16Tensor → uint16_t (bf16 storage)
+// - FP16Tensor → uint16_t (fp16 storage)
+// - Q8_1Tensor → int8_t (quantized storage)
+```
+
+**GEMM Kernel Factory** (similar pattern):
+```cpp
+std::unique_ptr<ITensorGemm> KernelFactory::createGemm(
+    const TensorBase* weight_tensor, DeviceType dev_type)
+{
+#ifdef HAVE_CUDA
+    if (dev_type == DeviceType::CUDA) {
+        return std::make_unique<cuda::CudaGemmKernel>();
+    }
+#endif
+
+    // CPU quantized kernels - dispatch based on weight tensor type
+    switch (weight_tensor->dtype()) {
+    case TensorType::Q8_0:
+        return std::make_unique<QuantizedGemmKernel<Q8_0Tensor>>(
+            static_cast<const Q8_0Tensor*>(weight_tensor));
+            
+    case TensorType::Q4_0:
+        return std::make_unique<QuantizedGemmKernel<Q4_0Tensor>>(
+            static_cast<const Q4_0Tensor*>(weight_tensor));
+            
+    case TensorType::IQ4_NL:
+        return std::make_unique<QuantizedGemmKernel<IQ4_NLTensor>>(
+            static_cast<const IQ4_NLTensor*>(weight_tensor));
+            
+    case TensorType::FP32:
+        return std::make_unique<FP32GemmKernel>();
+        
+    default:
+        throw std::runtime_error("Unsupported weight tensor type for GEMM");
+    }
+}
+```
+
+**Key Design Pattern**: Runtime dtype dispatch → compile-time template instantiation
+
+```cpp
+// The bridge pattern: polymorphic input -> templated output
+//
+// TensorBase* tensor (runtime)  →  tensor->dtype() (runtime enum)
+//                                         ↓
+//                               switch (dtype) { ... }
+//                                         ↓
+//           CPUAttentionKernelTyped<ActivationPrecision::XXX>() (compile-time)
+//                                         ↓
+//                      detail::PrecisionToTensor<P>::Type (tensor type)
+//                                         ↓
+//                      ActivationTraits<TensorT>::ElementType (primitive type)
+//
+// This is idiomatic C++ for mixing polymorphism with templates.
 ```
 
 ---

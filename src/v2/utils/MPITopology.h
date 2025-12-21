@@ -34,6 +34,10 @@ namespace llaminar2
     struct SliceMetadata;
     enum class SliceMode;
 
+    // Forward declarations - placement types in execution/PlacementPlan.h
+    struct PlacementPlan;
+    struct PlacementInput;
+
     /**
      * @brief Compute capability descriptor for a single device
      */
@@ -409,6 +413,54 @@ namespace llaminar2
 
         /// Get compute weights for all ranks (for weighted work distribution)
         std::vector<float> get_compute_weights() const;
+
+        // =========================================================================
+        // Placement Strategy
+        // =========================================================================
+
+        /**
+         * @brief Compute a PlacementPlan for weight/compute distribution
+         *
+         * Uses the gathered device capabilities (from exchangeCapabilities())
+         * along with model metadata to compute optimal placement.
+         *
+         * IMPORTANT: This is deterministic - all ranks compute the same plan.
+         * No broadcast needed; each rank runs the same algorithm.
+         *
+         * @param architecture Model architecture name (e.g., "qwen2")
+         * @param n_layers Number of transformer layers
+         * @param d_model Hidden dimension
+         * @param d_ff FFN intermediate dimension
+         * @param vocab_size Vocabulary size
+         * @param n_heads Attention heads
+         * @param n_kv_heads KV heads (for GQA)
+         * @param quant_type Quantization type (e.g., "Q4_0")
+         * @param estimated_memory Total model memory estimate
+         * @param strategy_name Strategy to use (empty = auto-select)
+         * @return Computed PlacementPlan
+         */
+        PlacementPlan computePlacement(
+            const std::string &architecture,
+            int n_layers,
+            size_t d_model,
+            size_t d_ff,
+            size_t vocab_size,
+            size_t n_heads,
+            size_t n_kv_heads,
+            const std::string &quant_type,
+            size_t estimated_memory,
+            const std::string &strategy_name = "") const;
+
+        /**
+         * @brief Compute a PlacementPlan from a PlacementInput struct
+         *
+         * Alternative interface that takes a pre-populated PlacementInput.
+         * The topology fields will be filled in automatically.
+         *
+         * @param input Placement input with model info (topology fields will be overwritten)
+         * @return Computed PlacementPlan
+         */
+        PlacementPlan computePlacement(PlacementInput input) const;
 
         // =========================================================================
         // Device Mapping

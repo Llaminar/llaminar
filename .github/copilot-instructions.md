@@ -329,6 +329,44 @@ cd /workspaces/llaminar && ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-
 cd /workspaces/llaminar && GTEST_FILTER=The.Specific.GTest.Name ctest --test-dir build_v2 -R V2_My_Test_File -V
 ```
 
+### TestTensorFactory (Test Utilities)
+
+**Location**: `tests/v2/utils/TestTensorFactory.h`
+
+A header-only test utility for creating tensors without MPI dependencies. Provides convenient methods for unit tests.
+
+**Usage**:
+```cpp
+#include "utils/TestTensorFactory.h"
+using namespace llaminar2::test;
+
+// Create activation tensors
+auto input = TestTensorFactory::createFP32({32, 896});           // Uninitialized
+auto random = TestTensorFactory::createFP32Random({32, 896});    // Random [-1, 1]
+auto zeros = TestTensorFactory::createFP32Zeros({32, 896});      // All zeros
+auto ones = TestTensorFactory::createFP32Ones({32, 896});        // All ones
+
+// Create quantized weight tensors with realistic random data
+auto weights_q8 = TestTensorFactory::createQ8_0Random({1024, 896});
+auto weights_q4 = TestTensorFactory::createQ4_0Random({1024, 896});
+
+// Fill existing tensors
+TestTensorFactory::fillRandom(tensor.get(), -0.5f, 0.5f, /*seed=*/42);
+TestTensorFactory::fillNormal(tensor.get(), /*mean=*/0.0f, /*stddev=*/0.1f);
+TestTensorFactory::fillPattern(tensor.get());  // Deterministic pattern
+
+// Comparison utilities
+float mse = TestTensorFactory::computeMSE(a->data(), b->data(), count);
+float cosine = TestTensorFactory::computeCosineSimilarity(a->data(), b->data(), count);
+bool valid = !TestTensorFactory::hasNaNOrInf(tensor.get());
+```
+
+**Key Features**:
+- No `MPIContext` required (all tensors use `device_idx=-1` for CPU)
+- Deterministic random seeds for reproducible tests
+- Quantized tensor creation with proper block formatting (Q8_0, Q4_0)
+- Built-in comparison utilities (MSE, cosine similarity, NaN/Inf detection)
+
 ### Snapshot Framework and E2E Testing
 
 **Overview**: Llaminar V2 includes a comprehensive snapshot framework for capturing and comparing intermediate activations during inference. This is essential for E2E (end-to-end) correctness validation and debugging divergences. The snapshot API is unified across both execution paths (`PipelineBase` and `GraphOrchestrator`) via the `IInferenceRunner` interface.

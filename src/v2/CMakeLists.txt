@@ -512,6 +512,9 @@ add_library(llaminar2_core STATIC
     execution/LivenessAnalyzer.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
+    # Placement strategy (weight/compute distribution)
+    execution/PlacementPlan.cpp
+    execution/PlacementStrategy.cpp
     # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
     inference/InferenceRunner.cpp
     loaders/ModelLoader.cpp

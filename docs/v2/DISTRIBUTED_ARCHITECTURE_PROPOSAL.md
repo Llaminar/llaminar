@@ -141,6 +141,272 @@ case DeviceType::CUDA:
 2. `GraphExecutor` selects device based on preference + availability
 3. Support device lists for data-parallel stages
 
+### Device-Specific Weight Packing
+
+**Key Insight**: CPU and GPU backends require different weight packing formats for optimal GEMM performance:
+- **CPU (AVX512-VNNI)**: `[N/64][K/4][64][4]` layout with interleaved scales/mins
+- **CUDA (INT8)**: COL32 or COL32_2R_4R4 layout for Tensor Cores
+- **ROCm (INT8)**: Custom layout for Matrix Cores
+
+**Design Decision**: Because `WeightPlacementMap` assigns each weight tensor to a **single device** for its lifetime (layer-level or block-level granularity), we can pack weights in device-specific formats without conflict.
+
+**How It Works**:
+
+```
+WeightPlacementMap                    KernelFactory::getOrCreateGemm()
+┌─────────────────┐                   ┌───────────────────────────────┐
+│ Layer 0: GPU 0  │───tensor W_q──────►│ dev_type = CUDA              │
+│ Layer 1: GPU 0  │                   │ → packForCuda(W_q)           │
+│ Layer 2: CPU    │                   │ → tensor->cache_ = gpu_packed│
+│ ...             │                   └───────────────────────────────┘
+│ Layer 23: CPU   │───tensor W_k──────►┌───────────────────────────────┐
+└─────────────────┘                   │ dev_type = CPU               │
+                                      │ → packForVNNI(W_k)           │
+                                      │ → tensor->cache_ = cpu_packed│
+                                      └───────────────────────────────┘
+```
+
+**Implementation Pattern**:
+
+1. **At model load time**: `WeightPlacementMap` assigns tensors to devices (via `setLayerDevice()`, `setAttentionDevice()`, `setFFNDevice()`)
+
+2. **At first kernel creation**: `KernelFactory::getOrCreateGemm()` checks `tensor->device_index()` and dispatches to device-specific packing:
+   ```cpp
+   auto dev_type = getDeviceType(tensor->device_index());
+   
+   if (dev_type == DeviceType::CPU) {
+       // Pack into VNNI format, store in tensor->cache_
+       packWeightsInto(tensor, new_cache->packed, VNNI_LAYOUT);
+   }
+   #ifdef HAVE_CUDA
+   else if (dev_type == DeviceType::CUDA) {
+       // Pack into CUDA-optimal format (e.g., COL32)
+       packForCuda(tensor, new_cache->packed);
+   }
+   #endif
+   ```
+
+3. **At kernel execution**: The kernel uses the cached packed weights without re-packing.
+
+**Benefits**:
+- No cross-device packing conflicts (tensor is device-bound)
+- Pack once, use many times (cached in `tensor->cache_`)
+- Each backend uses its optimal layout
+- GPU kernels can pack directly to device memory if desired
+
+### Intra-Node Work Division: CPU vs GPU
+
+**Problem**: On a node with both CPUs and GPUs, how do we decide which layers/operations run where?
+
+**Current Architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              NODE (1 MPI Rank)                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────┐          ┌─────────────────────────────────┐   │
+│  │  WeightPlacementMap │──────────►│        GraphOrchestrator       │   │
+│  │  (Layer → Device)   │          │                                 │   │
+│  └─────────────────────┘          │  ┌───────────┐ ┌───────────┐   │   │
+│           │                       │  │ GEMMStage │ │ Attention │   │   │
+│           │                       │  │ device=0  │ │ device=1  │   │   │
+│           ▼                       │  └─────┬─────┘ └─────┬─────┘   │   │
+│  ┌─────────────────────┐          └────────┼─────────────┼─────────┘   │
+│  │    DeviceManager    │                   │             │             │
+│  │  Enumerate devices  │                   ▼             ▼             │
+│  │  NUMA filtering     │          ┌─────────────┐ ┌─────────────┐      │
+│  └─────────────────────┘          │ CPU Context │ │ GPU Context │      │
+│           │                       │ (OpenBLAS)  │ │ (CUDA/HIP)  │      │
+│           ▼                       └─────────────┘ └─────────────┘      │
+│  device_idx=0: CPU Socket 0                                            │
+│  device_idx=1: CUDA GPU 0 (NUMA-filtered)                              │
+│  device_idx=2: CUDA GPU 1 (if available)                               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Responsibility Breakdown**:
+
+| Component | Role | When |
+|-----------|------|------|
+| `DeviceManager` | Enumerate available devices (CPU sockets, GPUs) | Startup |
+| `DeviceManager` | NUMA-filter GPUs for this MPI rank | Startup |
+| `WeightPlacementMap` | Policy: Assign weights to devices by layer/block | Model load |
+| `KernelFactory` | Create device-specific kernels, pack weights | First execution |
+| `GraphOrchestrator` | Execute stages on assigned devices | Forward pass |
+| `IDeviceContext` | Actual computation (OpenMP/CUDA/HIP) | Kernel execution |
+
+**Work Division Strategies**:
+
+1. **Layer-Level** (Simple): Entire layers on one device
+   ```cpp
+   placement_map->setLayerDevice(0, GPU_0);  // Layer 0 → GPU
+   placement_map->setLayerDevice(1, GPU_0);  // Layer 1 → GPU
+   placement_map->setLayerDevice(2, CPU_0);  // Layer 2 → CPU (offload)
+   ```
+
+2. **Block-Level** (Fine-grained): Attention vs FFN on different devices
+   ```cpp
+   placement_map->setAttentionDevice(layer, GPU_0);  // Attention → GPU (memory-bound)
+   placement_map->setFFNDevice(layer, CPU_0);        // FFN → CPU (compute-bound, AVX512)
+   ```
+
+3. **MoE Expert-Level** (Future): Individual experts on different devices
+   ```cpp
+   placement_map->setLocalExpertDevice(layer, expert_0, GPU_0);
+   placement_map->setLocalExpertDevice(layer, expert_1, CPU_0);
+   ```
+
+**Where This Fits in the MPI Framework**:
+
+```
+INTER-NODE (MPI)                    INTRA-NODE (Device)
+┌──────────────┐                    ┌──────────────────────────────────┐
+│   Rank 0     │◄───AllReduce──────►│   Rank 0 Node                    │
+│   Node 0     │                    │   ┌────────┐  ┌────────────────┐ │
+│              │                    │   │ GPU 0  │  │ CPU (2 sockets)│ │
+└──────────────┘                    │   │Layer 0 │  │ Layer 2-23     │ │
+       │                            │   │Layer 1 │  │                │ │
+   Allreduce                        │   └────────┘  └────────────────┘ │
+   AllGather                        └──────────────────────────────────┘
+       │                            
+┌──────────────┐                    ┌──────────────────────────────────┐
+│   Rank 1     │◄───AllReduce──────►│   Rank 1 Node                    │
+│   Node 1     │                    │   ┌────────┐  ┌────────────────┐ │
+│              │                    │   │ GPU 0  │  │ CPU (2 sockets)│ │
+└──────────────┘                    │   │Layer 0 │  │ Layer 2-23     │ │
+                                    │   │Layer 1 │  │                │ │
+                                    │   └────────┘  └────────────────┘ │
+                                    └──────────────────────────────────┘
+```
+
+**Key Points**:
+- **MPI ranks** handle **inter-node** tensor parallelism (weight sharding, AllReduce)
+- **DeviceManager + WeightPlacementMap** handle **intra-node** heterogeneous execution
+- These are orthogonal: a rank can shard weights across nodes AND offload layers to GPU
+- Cross-device transfers (GPU↔CPU) use `DataTransferStage` or automatic transfers in `GraphExecutor`
+
+### Work Distribution Decision Flow
+
+**Problem**: How does the coordinator's (rank 0) work distribution decision propagate to all ranks and into `WeightPlacementMap`?
+
+**Current State**: `MPITopology::exchangeCapabilities()` does an `MPI_Allgather` of compute weights, but there's no centralized decision-making or broadcast of placement decisions.
+
+**Proposed Flow** (to be implemented):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    WORK DISTRIBUTION DECISION FLOW                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  PHASE 1: Capability Discovery (All Ranks)                                      │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                           │  │
+│  │  Rank 0                  Rank 1                  Rank N                   │  │
+│  │  ┌────────────────┐      ┌────────────────┐      ┌────────────────┐      │  │
+│  │  │ Detect local   │      │ Detect local   │      │ Detect local   │      │  │
+│  │  │ devices (CPU,  │      │ devices (CPU,  │      │ devices (CPU,  │      │  │
+│  │  │ GPU, memory)   │      │ GPU, memory)   │      │ GPU, memory)   │      │  │
+│  │  └───────┬────────┘      └───────┬────────┘      └───────┬────────┘      │  │
+│  │          │                       │                       │               │  │
+│  │          └───────────────────────┴───────────────────────┘               │  │
+│  │                                  │                                        │  │
+│  │                          MPI_Allgather                                    │  │
+│  │                     (DeviceCapability structs)                            │  │
+│  │                                  │                                        │  │
+│  │                                  ▼                                        │  │
+│  │          ┌───────────────────────────────────────────────┐               │  │
+│  │          │  all_placements_[] populated on ALL ranks     │               │  │
+│  │          │  (each rank knows everyone's capabilities)    │               │  │
+│  │          └───────────────────────────────────────────────┘               │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  PHASE 2: Coordinator Decision (Rank 0 Only)                                    │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                           │  │
+│  │  Rank 0 (Coordinator)                                                     │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  PlacementStrategy::compute(                                        │  │  │
+│  │  │      model_config,          // n_layers, n_heads, d_model, etc.     │  │  │
+│  │  │      all_placements_,       // Device capabilities from AllGather   │  │  │
+│  │  │      memory_budget          // Optional: max memory per device      │  │  │
+│  │  │  ) → PlacementPlan {                                                │  │  │
+│  │  │      layer_to_rank: [0,0,0,1,1,1,...],   // TP across ranks         │  │  │
+│  │  │      layer_to_device: [GPU,GPU,CPU,...], // Per-rank device         │  │  │
+│  │  │      attention_devices: [...],           // Block-level overrides   │  │  │
+│  │  │      ffn_devices: [...],                                            │  │  │
+│  │  │  }                                                                  │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                           │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  PHASE 3: Plan Broadcast (Rank 0 → All)                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                           │  │
+│  │          Rank 0 ────────── MPI_Bcast(PlacementPlan) ──────────► All      │  │
+│  │                              (serialized plan)                            │  │
+│  │                                                                           │  │
+│  │  Alternative: Each rank computes same plan locally (deterministic algo)   │  │
+│  │               This avoids broadcast but requires identical logic          │  │
+│  │                                                                           │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  PHASE 4: Local Application (All Ranks)                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                           │  │
+│  │  Each Rank                                                                │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  // Extract this rank's portion of the plan                         │  │  │
+│  │  │  auto my_layers = plan.getLayersForRank(my_rank);                   │  │  │
+│  │  │  auto placement_map = std::make_shared<WeightPlacementMap>();       │  │  │
+│  │  │                                                                     │  │  │
+│  │  │  for (int layer : my_layers) {                                      │  │  │
+│  │  │      int device = plan.getDeviceForLayer(layer);                    │  │  │
+│  │  │      placement_map->setLayerDevice(layer, device);                  │  │  │
+│  │  │                                                                     │  │  │
+│  │  │      // Optional block-level overrides                              │  │  │
+│  │  │      if (plan.hasAttentionOverride(layer)) {                        │  │  │
+│  │  │          placement_map->setAttentionDevice(layer, ...);             │  │  │
+│  │  │      }                                                              │  │  │
+│  │  │  }                                                                  │  │  │
+│  │  │                                                                     │  │  │
+│  │  │  // Pass to WeightManager for loading                               │  │  │
+│  │  │  WeightManager wm(loader, mpi_ctx, placement_map, strategy);        │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                           │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Components to Implement**:
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `MPITopology::exchangeCapabilities()` | ✅ Exists | AllGather of device capabilities |
+| `PlacementStrategy` | ❌ TODO | Algorithm to compute optimal placement from capabilities |
+| `PlacementPlan` | ❌ TODO | Serializable struct with full placement decisions |
+| `PlacementPlan::broadcast()` | ❌ TODO | MPI_Bcast of serialized plan |
+| `WeightPlacementMap::applyPlan()` | ❌ TODO | Populate map from plan for this rank |
+
+**Strategy Variants** (future):
+
+1. **Greedy Memory-First**: Fill GPU memory, overflow to CPU
+2. **Layer-Balanced**: Equal layers per device, respecting memory
+3. **Compute-Weighted**: Distribute by `relative_compute` from capabilities
+4. **Latency-Optimized**: Minimize cross-device transfers
+
+**Decision: Broadcast vs Local Computation**:
+
+We recommend **local computation** (each rank computes the same plan) because:
+- Simpler (no serialization/deserialization)
+- Deterministic algorithms guarantee identical results
+- Lower latency (no broadcast wait)
+- Easier debugging (all ranks have same code path)
+
+This requires `PlacementStrategy::compute()` to be pure and deterministic.
+
 ### Recommended Device Integration Order
 
 **Phase A (Current)**: CPU-only tensor parallelism via MPI

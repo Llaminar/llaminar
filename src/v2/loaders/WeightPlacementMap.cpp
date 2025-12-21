@@ -6,6 +6,7 @@
  */
 
 #include "WeightPlacementMap.h"
+#include "../execution/PlacementPlan.h"
 #include <regex>
 #include <sstream>
 
@@ -222,6 +223,58 @@ namespace llaminar2
         {
             // Invalid regex, no match
             return false;
+        }
+    }
+
+    // ========== PlacementPlan Integration ==========
+
+    void WeightPlacementMap::applyPlan(const PlacementPlan &plan)
+    {
+        // Clear existing mappings
+        clear();
+
+        // Track that we've applied a plan
+        plan_applied_ = true;
+        applied_strategy_name_ = plan.strategy_name;
+
+        // Apply global tensor placements
+        // Embedding tensor
+        int embed_device = toDeviceIndex(plan.global.embedding_device);
+        setPatternDevice("token_embd*", embed_device);
+        setPatternDevice("embed*", embed_device);
+
+        // LM head tensor
+        int lm_head_device = toDeviceIndex(plan.global.lm_head_device);
+        setPatternDevice("output*", lm_head_device);
+        setPatternDevice("lm_head*", lm_head_device);
+
+        // Final norm
+        int final_norm_device = toDeviceIndex(plan.global.final_norm_device);
+        setPatternDevice("output_norm*", final_norm_device);
+        setPatternDevice("final_norm*", final_norm_device);
+        setPatternDevice("norm*", final_norm_device); // Some models use just "norm"
+
+        // Apply per-layer placements
+        for (const auto &layer : plan.layers)
+        {
+            int layer_idx = layer.layer_idx;
+            if (layer_idx < 0)
+            {
+                continue;
+            }
+
+            if (layer.split_attention_ffn)
+            {
+                // Separate devices for attention and FFN
+                setAttentionDevice(layer_idx, layer.getAttentionDeviceIdx());
+                setFFNDevice(layer_idx, layer.getFFNDeviceIdx());
+            }
+            else
+            {
+                // Same device for entire layer
+                int device = toDeviceIndex(layer.device);
+                setLayerDevice(layer_idx, device);
+            }
         }
     }
 

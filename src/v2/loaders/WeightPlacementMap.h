@@ -15,6 +15,9 @@
 namespace llaminar2
 {
 
+    // Forward declaration
+    struct PlacementPlan;
+
     /**
      * @brief Encodes fine-grained decisions about which device should hold each weight tensor.
      *
@@ -198,6 +201,34 @@ namespace llaminar2
          */
         void clear();
 
+        // ========== PlacementPlan Integration ==========
+
+        /**
+         * @brief Apply a PlacementPlan to populate all mappings
+         *
+         * This is the primary entry point for setting up weight placement.
+         * It reads the plan (computed by PlacementStrategy) and populates
+         * all the layer/tensor/pattern mappings accordingly.
+         *
+         * After calling applyPlan(), getDeviceForWeight() will return
+         * the correct device for any weight tensor based on the plan.
+         *
+         * @param plan PlacementPlan computed by PlacementStrategy
+         */
+        void applyPlan(const PlacementPlan &plan);
+
+        /**
+         * @brief Check if a plan has been applied
+         * @return true if applyPlan() has been called
+         */
+        bool hasPlan() const { return plan_applied_; }
+
+        /**
+         * @brief Get the strategy name from the applied plan (for logging)
+         * @return Strategy name, or empty string if no plan applied
+         */
+        const std::string &appliedStrategyName() const { return applied_strategy_name_; }
+
     private:
         /**
          * @brief Try to extract layer index from tensor name
@@ -222,6 +253,10 @@ namespace llaminar2
         // MoE-specific mappings (Phase 2)
         std::unordered_map<int, int> shared_expert_to_device_;        ///< Shared expert index → device
         std::unordered_map<std::string, int> local_expert_to_device_; ///< "layer_X:expert_Y" → device
+
+        // PlacementPlan tracking
+        bool plan_applied_ = false;         ///< Whether applyPlan() has been called
+        std::string applied_strategy_name_; ///< Strategy name from applied plan
     };
 
 } // namespace llaminar2

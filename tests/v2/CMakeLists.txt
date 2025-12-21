@@ -2424,6 +2424,19 @@ add_v2_test(V2_Integration_WeightManagerMemoryEfficient
     LABELS "V2;Integration;WeightManager;TensorSlice;MemoryEfficient;Sharding"
 )
 
+# Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
+add_executable(v2_test_placement_strategy unit/Test__PlacementStrategy.cpp)
+target_link_libraries(v2_test_placement_strategy 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PlacementStrategy 
+    COMMAND $<TARGET_FILE:v2_test_placement_strategy>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Placement;Strategy;WeightDistribution;DeviceMapping"
+)
+
 # Test: Quantised GEMM Sliced Parity (verifies sliced GEMM across MPI ranks matches unsliced)
 add_executable(v2_test_quantised_gemm_sliced_parity integration/Test__QuantisedGemmSlicedParity.cpp)
 target_link_libraries(v2_test_quantised_gemm_sliced_parity 
