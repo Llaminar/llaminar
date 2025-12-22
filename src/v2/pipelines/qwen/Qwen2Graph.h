@@ -4,9 +4,7 @@
  * @author David Sanftenberg
  * @date December 2025
  *
- * Qwen2Graph is the unified graph builder for Qwen2 architecture models,
- * combining the functionality previously split across Qwen2LayerExecutor
- * and Qwen2ModelExecutor.
+ * Qwen2Graph is the graph builder for Qwen2 architecture models.
  *
  * Key Design:
  * - This class BUILDS compute graphs (it's a graph builder, not executor)
@@ -21,11 +19,6 @@
  * - buildAttentionGraph(): Attention block within a layer
  * - buildFFNGraph(): FFN block within a layer
  * - buildLMHeadGraph(): Final projection to vocabulary
- *
- * Migration Path:
- * - Qwen2Pipeline creates Qwen2Graph
- * - Qwen2Pipeline::forward() delegates to executeForward()
- * - Eventually, all forward logic moves to this graph-based approach
  */
 
 #pragma once
@@ -36,7 +29,7 @@
 #include "../../execution/DeviceContext.h"
 #include "../../execution/ExecutionPolicy.h"
 #include "../../execution/IGraphBuilder.h"
-#include "../../pipelines/RuntimeConfig.h"
+#include "../../execution/RuntimeConfig.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/UnifiedKVCache.h"
@@ -798,15 +791,5 @@ namespace llaminar2
          */
         void bindGraphManagedBuffers(int seq_len);
     };
-
-    // =========================================================================
-    // Backward Compatibility Aliases
-    // =========================================================================
-
-    // NOTE: These aliases are DEPRECATED. Use Qwen2Graph directly.
-    using Qwen2LayerExecutor = Qwen2Graph;
-    using Qwen2ModelExecutor = Qwen2Graph;
-    using Qwen2ExecutorConfig = Qwen2GraphConfig;
-    using Qwen2ModelExecutorConfig = Qwen2GraphConfig;
 
 } // namespace llaminar2

@@ -9,7 +9,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "pipelines/qwen/GraphOrchestrator.h"
+#include "execution/GraphOrchestrator.h"
 #include <vector>
 #include <string>
 #include <algorithm>

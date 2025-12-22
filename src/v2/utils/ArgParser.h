@@ -89,6 +89,14 @@ namespace llaminar2
         // Fused attention kernel
         bool use_fused_attention = false;        // Use fused attention+Wo kernel
         std::string fused_attention_backend_str; // Backend: "jit" (default), "reference", "tiled"
+
+        // MPI Bootstrap Options
+        int mpi_procs = 0;              // Number of MPI processes (0 = auto: one per socket)
+        std::string hostfile = "";      // Path to hostfile for multi-machine MPI
+        bool mpi_dry_run = false;       // Print MPI configuration and exit (without launching)
+        bool mpi_verbose = false;       // Verbose MPI output (report bindings)
+        bool mpi_no_bootstrap = false;  // Disable auto-bootstrap (assume already under MPI)
+        bool mpi_oversubscribe = false; // Allow more MPI ranks than available slots
     };
 
     /**

@@ -36,7 +36,7 @@
 #include "kernels/cpu/attention/FusedAttentionWoKernel.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "kernels/cpu/jit/q8_1/JitFusedAttentionWo.h"
-#include "pipelines/RuntimeConfig.h"
+#include "execution/RuntimeConfig.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

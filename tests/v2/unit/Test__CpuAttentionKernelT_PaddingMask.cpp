@@ -20,7 +20,7 @@
 
 #include "v2/kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
-#include "v2/pipelines/AttentionUtils.h"
+#include "v2/kernels/cpu/attention/AttentionUtils.h"
 
 using namespace llaminar2;
 

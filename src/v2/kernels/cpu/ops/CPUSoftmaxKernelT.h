@@ -19,7 +19,7 @@
 #pragma once
 
 #include "../CPUKernelBase.h"
-#include "../../../pipelines/RuntimeConfig.h"
+#include "../../../execution/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
 
 #include <cstdint>

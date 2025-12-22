@@ -17,7 +17,7 @@
 #include "../tensors/SIMDHelpers.h"
 #include "../tensors/Tensors.h" // For TensorBase::rows(), cols(), dtype_name()
 #include "../tensors/TensorSlice.h"
-#include "../pipelines/MPIStrategy.h"
+#include "../utils/MPIStrategy.h"
 #include "../utils/MPIContext.h"
 
 #include <cstring>

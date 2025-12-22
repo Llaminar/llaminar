@@ -1,13 +1,13 @@
 /**
- * @file InferenceRunner.cpp
+ * @file InferenceRunnerFactory.cpp
  * @brief Factory implementation for creating IInferenceRunner instances
  * @author David Sanftenberg
  * @date December 2025
  */
 
-#include "InferenceRunner.h"
+#include "InferenceRunnerFactory.h"
 #include "../pipelines/qwen/Qwen2Graph.h"
-#include "../pipelines/qwen/GraphOrchestrator.h"
+#include "GraphOrchestrator.h"
 #include "../loaders/ModelContext.h"
 #include "../loaders/ModelLoader.h"
 #include "../loaders/WeightManager.h"

@@ -512,20 +512,18 @@ add_library(llaminar2_core STATIC
     execution/LivenessAnalyzer.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
+    execution/GraphOrchestrator.cpp
     # Placement strategy (weight/compute distribution)
     execution/PlacementPlan.cpp
     execution/PlacementStrategy.cpp
     # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
-    inference/InferenceRunner.cpp
+    execution/InferenceRunnerFactory.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
     pipelines/qwen/Qwen2Graph.cpp
-    pipelines/qwen/GraphOrchestrator.cpp
-    pipelines/qwen/Qwen2LayerExecutor.cpp
-    pipelines/qwen/Qwen2ModelExecutor.cpp
     pipelines/qwen/Qwen2BufferSpec.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
@@ -592,6 +590,7 @@ add_library(llaminar2_core STATIC
     testing/PerfHarness.cpp
     utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp
+    utils/MPIBootstrap.cpp
     utils/NUMATopology.cpp
     utils/MPITopology.cpp
     utils/MPIStager.cpp

@@ -7,7 +7,7 @@
  * - Causal and sliding window mask generation
  * - Head reshaping utilities
  *
- * Used by PipelineBase::attention_gqa() default orchestration.
+ * Used by attention stages in GraphOrchestrator.
  *
  * @author David Sanftenberg
  */
@@ -18,7 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include "../utils/OpenMPUtils.h"
+#include "../../../utils/OpenMPUtils.h"
 
 namespace llaminar2
 {

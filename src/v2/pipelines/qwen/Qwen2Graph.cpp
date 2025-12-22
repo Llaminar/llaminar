@@ -16,7 +16,7 @@
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
-#include "../MPIStrategy.h"
+#include "../../utils/MPIStrategy.h"
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>

@@ -40,9 +40,9 @@
 #include <map>
 #include <algorithm>
 
-#include "inference/InferenceRunner.h"
-#include "inference/IInferenceRunner.h"
-#include "pipelines/RuntimeConfig.h"
+#include "execution/InferenceRunnerFactory.h"
+#include "execution/IInferenceRunner.h"
+#include "execution/RuntimeConfig.h"
 #include "loaders/ModelContext.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"

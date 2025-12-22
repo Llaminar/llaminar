@@ -1,17 +1,17 @@
 /**
- * @file InferenceRunner.h
+ * @file InferenceRunnerFactory.h
  * @brief Factory for creating IInferenceRunner implementations
  * @author David Sanftenberg
  * @date December 2025
  *
  * This file provides a factory function for creating inference runners.
+ * The factory handles:
+ * - Building Qwen2GraphConfig from GGUF model metadata
+ * - Configuring tensor parallelism (head/FFN/vocab sharding) based on MPI world size
+ * - Loading and wiring up model weights
+ * - Initializing GraphOrchestrator with proper state
+ *
  * The actual interface (IInferenceRunner) is defined in IInferenceRunner.h.
- *
- * GraphOrchestrator directly implements IInferenceRunner.
- *
- * Design Goals:
- * - GraphOrchestrator is the sole execution path
- * - Main.cpp and ChatUI use IInferenceRunner exclusively
  *
  * @code
  * // Create runner
@@ -27,7 +27,7 @@
 
 #include "IInferenceRunner.h"
 #include "../loaders/ModelContext.h"
-#include "../pipelines/RuntimeConfig.h"
+#include "RuntimeConfig.h"
 #include "../utils/MPIContext.h"
 #include <memory>
 

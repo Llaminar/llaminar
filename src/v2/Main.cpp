@@ -7,12 +7,14 @@
  * - Multi-GPU heterogeneous support
  * - Direct kernel orchestration
  * - Architecture-agnostic pipeline creation via InferenceRunner factory
+ * - Self-bootstrap MPI support (auto-launches mpirun if not in MPI context)
  *
  * @author David Sanftenberg
  */
 
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
+#include "utils/MPIBootstrap.h"
 #include "utils/ArgParser.h"
 #include "utils/NUMATopology.h"
 #include "utils/Tokenizer.h"
@@ -21,9 +23,9 @@
 #include "utils/ChatTemplate.h"
 #include "utils/BenchmarkRunner.h"
 #include "backends/ComputeBackend.h"
-#include "inference/InferenceRunner.h"
-#include "inference/IInferenceRunner.h"
-#include "pipelines/RuntimeConfig.h"
+#include "execution/InferenceRunnerFactory.h"
+#include "execution/IInferenceRunner.h"
+#include "execution/RuntimeConfig.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "loaders/DeviceOrchestrator.h"
@@ -111,28 +113,106 @@ int parse_device(const std::string &device_str, DeviceManager &dm)
     return -1;
 }
 
+/**
+ * @brief Main entry point with MPI self-bootstrap support
+ *
+ * Execution flow:
+ * 1. Parse arguments (lightweight, before MPI)
+ * 2. Detect if running under MPI environment
+ * 3. If not under MPI: self-launch via mpirun (replaces process)
+ * 4. If under MPI: initialize MPI and proceed with inference
+ */
 int main(int argc, char *argv[])
 {
+    // Initialize logging from environment (LLAMINAR_LOG_LEVEL)
+    // This happens before MPI so we can log bootstrap info
+    initializeLogging();
+
+    // Parse command-line arguments (before MPI init for bootstrap decisions)
+    ArgContext args = ArgParser::parse(argc, argv);
+
+    // Handle help early (no MPI needed)
+    if (args.show_help)
+    {
+        ArgParser::printUsage(argv[0]);
+        return 0;
+    }
+
+    // Handle list-devices early (no MPI needed)
+    if (args.list_devices)
+    {
+        list_devices();
+        return 0;
+    }
+
+    // ========================================================================
+    // MPI Bootstrap Detection and Self-Launch
+    // ========================================================================
+
+    // Detect CPU topology (needed for both bootstrap and runtime config)
+    CPUTopology cpu_topology = MPIBootstrap::detectCPUTopology();
+
+    // Detect if we're already running under MPI
+    MPIEnvironmentInfo mpi_env = MPIBootstrap::detectMPIEnvironment();
+
+    // If NOT running under MPI and bootstrap is not disabled, self-launch via mpirun
+    if (!mpi_env.is_mpi_process && !args.mpi_no_bootstrap)
+    {
+        // Build launch configuration from args and topology
+        MPILaunchConfig launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
+
+        // Override with user-specified values
+        if (args.mpi_procs > 0)
+        {
+            launch_config.num_procs = args.mpi_procs;
+        }
+        if (!args.hostfile.empty())
+        {
+            launch_config.hostfile = args.hostfile;
+        }
+        launch_config.report_bindings = args.mpi_verbose || args.verbose;
+        launch_config.verbose = args.mpi_verbose;
+        launch_config.oversubscribe = args.mpi_oversubscribe;
+
+        // Handle dry-run: print config and exit
+        if (args.mpi_dry_run)
+        {
+            MPIBootstrap::printConfigurationSummary(cpu_topology, launch_config, mpi_env);
+            std::cout << "Dry run requested - exiting without launching MPI.\n";
+            return 0;
+        }
+
+        // Print config summary before launch
+        MPIBootstrap::printConfigurationSummary(cpu_topology, launch_config, mpi_env);
+
+        // Self-launch via mpirun (this replaces the current process)
+        // If successful, this function does not return
+        int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch_config, cpu_topology);
+
+        // If we get here, exec failed
+        LOG_ERROR("Failed to self-launch via mpirun");
+        return result;
+    }
+
+    // ========================================================================
+    // MPI Runtime - We are running under mpirun
+    // ========================================================================
+
     // Initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
-    // Initialize logging from environment (LLAMINAR_LOG_LEVEL)
-    initializeLogging();
+    // Re-parse arguments (MPI_Init may modify argc/argv)
+    args = ArgParser::parse(argc, argv);
 
-    // Parse command-line arguments using centralized ArgParser
-    ArgContext args = ArgParser::parse(argc, argv);
-
-    // Handle help
-    if (args.show_help)
+    // Configure OpenMP environment for this rank
+    // (In self-launch case, this was done before exec; here we do it post-MPI init)
+    MPILaunchConfig mpi_launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
+    if (args.mpi_procs > 0)
     {
-        if (MPIContextFactory::global()->rank() == 0)
-        {
-            ArgParser::printUsage(argv[0]);
-        }
-        MPI_Finalize();
-        return 0;
+        mpi_launch_config.num_procs = args.mpi_procs;
     }
+    MPIBootstrap::configureOpenMPEnvironment(cpu_topology, mpi_launch_config);
 
     // Detect NUMA node for MPI rank
     auto numa_info = NUMATopology::detectLocalNUMANode();
@@ -154,17 +234,6 @@ int main(int argc, char *argv[])
     // Initialize device manager with NUMA-aware filtering
     auto &dm = DeviceManager::instance();
     dm.initialize(numa_info.local_numa_node);
-
-    // Handle list devices
-    if (args.list_devices)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            list_devices();
-        }
-        MPI_Finalize();
-        return 0;
-    }
 
     // Validate required arguments
     if (args.model_path.empty())
@@ -251,33 +320,33 @@ int main(int argc, char *argv[])
         device_mgr_shared, mpi_ctx, orch_config);
 
     // Create runtime configuration from parsed arguments
-    PipelineConfig pipeline_config;
-    pipeline_config.max_seq_len = args.max_seq_len;
-    pipeline_config.n_threads = args.n_threads;
-    pipeline_config.batch_size = args.batch_size;
-    pipeline_config.use_mmap = args.use_mmap;
-    pipeline_config.seed = args.seed;
+    RuntimeConfig runtime_config;
+    runtime_config.max_seq_len = args.max_seq_len;
+    runtime_config.n_threads = args.n_threads;
+    runtime_config.batch_size = args.batch_size;
+    runtime_config.use_mmap = args.use_mmap;
+    runtime_config.seed = args.seed;
 
     // Parse weight precision mode
     if (args.weight_precision == "native")
     {
-        pipeline_config.weight_precision = WeightPrecision::NATIVE;
+        runtime_config.weight_precision = WeightPrecision::NATIVE;
     }
     else if (args.weight_precision == "fp32")
     {
-        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_FP32;
+        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_FP32;
     }
     else if (args.weight_precision == "bf16")
     {
-        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_BF16;
+        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_BF16;
     }
     else if (args.weight_precision == "fp16")
     {
-        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_FP16;
+        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_FP16;
     }
     else if (args.weight_precision == "int8")
     {
-        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_INT8;
+        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_INT8;
     }
     else
     {
@@ -285,25 +354,25 @@ int main(int argc, char *argv[])
         {
             LOG_WARN("Unknown weight precision mode '" << args.weight_precision << "', defaulting to NATIVE");
         }
-        pipeline_config.weight_precision = WeightPrecision::NATIVE;
+        runtime_config.weight_precision = WeightPrecision::NATIVE;
     }
 
     // Parse activation precision mode
     if (args.activation_precision == "fp32")
     {
-        pipeline_config.activation_precision = ActivationPrecision::FP32;
+        runtime_config.activation_precision = ActivationPrecision::FP32;
     }
     else if (args.activation_precision == "bf16")
     {
-        pipeline_config.activation_precision = ActivationPrecision::BF16;
+        runtime_config.activation_precision = ActivationPrecision::BF16;
     }
     else if (args.activation_precision == "fp16")
     {
-        pipeline_config.activation_precision = ActivationPrecision::FP16;
+        runtime_config.activation_precision = ActivationPrecision::FP16;
     }
     else if (args.activation_precision == "q8_1")
     {
-        pipeline_config.activation_precision = ActivationPrecision::Q8_1;
+        runtime_config.activation_precision = ActivationPrecision::Q8_1;
     }
     else
     {
@@ -311,20 +380,20 @@ int main(int argc, char *argv[])
         {
             LOG_WARN("Unknown activation precision mode '" << args.activation_precision << "', defaulting to FP32");
         }
-        pipeline_config.activation_precision = ActivationPrecision::FP32;
+        runtime_config.activation_precision = ActivationPrecision::FP32;
     }
 
     // Fused attention + Wo kernel
-    pipeline_config.use_fused_attention = args.use_fused_attention;
+    runtime_config.use_fused_attention = args.use_fused_attention;
     if (!args.fused_attention_backend_str.empty())
     {
-        pipeline_config.fused_attention_backend = parseFusedAttentionBackend(args.fused_attention_backend_str);
+        runtime_config.fused_attention_backend = parseFusedAttentionBackend(args.fused_attention_backend_str);
     }
     if (args.use_fused_attention && mpi_ctx->rank() == 0)
     {
         LOG_INFO("Fused attention+Wo kernel enabled (backend="
-                 << fusedAttentionBackendToString(pipeline_config.fused_attention_backend) << ")");
-        if (pipeline_config.activation_precision != ActivationPrecision::Q8_1)
+                 << fusedAttentionBackendToString(runtime_config.fused_attention_backend) << ")");
+        if (runtime_config.activation_precision != ActivationPrecision::Q8_1)
         {
             LOG_WARN("Fused attention requires Q8_1 activation precision, current: "
                      << args.activation_precision << ". Will use unfused path.");
@@ -368,7 +437,7 @@ int main(int argc, char *argv[])
     // Create model context (loads metadata but not weights yet)
     auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr, nullptr,
                                           weight_strategy,
-                                          pipeline_config.weight_precision);
+                                          runtime_config.weight_precision);
     if (!model_ctx)
     {
         if (mpi_ctx->rank() == 0)
@@ -385,7 +454,7 @@ int main(int argc, char *argv[])
     // Re-create model context with placement map (this creates WeightManager)
     model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map, nullptr,
                                      weight_strategy,
-                                     pipeline_config.weight_precision);
+                                     runtime_config.weight_precision);
     if (!model_ctx)
     {
         if (mpi_ctx->rank() == 0)
@@ -402,20 +471,20 @@ int main(int argc, char *argv[])
     // Validate max_seq_len against model's context length
     if (model.context_length > 0)
     {
-        if (pipeline_config.max_seq_len > static_cast<int>(model.context_length))
+        if (runtime_config.max_seq_len > static_cast<int>(model.context_length))
         {
             if (mpi_ctx->rank() == 0)
             {
-                LOG_WARN("Requested max_seq_len (" << pipeline_config.max_seq_len
+                LOG_WARN("Requested max_seq_len (" << runtime_config.max_seq_len
                                                    << ") exceeds model's context_length ("
                                                    << model.context_length << "). Clamping to model limit.");
             }
-            pipeline_config.max_seq_len = static_cast<int>(model.context_length);
+            runtime_config.max_seq_len = static_cast<int>(model.context_length);
         }
 
         if (mpi_ctx->rank() == 0)
         {
-            LOG_INFO("KV cache size: " << pipeline_config.max_seq_len
+            LOG_INFO("KV cache size: " << runtime_config.max_seq_len
                                        << " tokens (model max: " << model.context_length << ")");
         }
     }
@@ -424,7 +493,7 @@ int main(int argc, char *argv[])
     if (mpi_ctx->rank() == 0)
     {
         const char *weight_prec_name = "Unknown";
-        switch (pipeline_config.weight_precision)
+        switch (runtime_config.weight_precision)
         {
         case WeightPrecision::NATIVE:
             weight_prec_name = "NATIVE (keep in GGUF format)";
@@ -444,7 +513,7 @@ int main(int argc, char *argv[])
         }
 
         const char *activation_prec_name = "Unknown";
-        switch (pipeline_config.activation_precision)
+        switch (runtime_config.activation_precision)
         {
         case ActivationPrecision::FP32:
             activation_prec_name = "FP32 (32-bit float)";
@@ -466,8 +535,8 @@ int main(int argc, char *argv[])
 
     // Create inference runner using factory (auto-selects graph path by default)
     InferenceRunnerConfig runner_config;
-    runner_config.max_seq_len = pipeline_config.max_seq_len;
-    runner_config.activation_precision = pipeline_config.activation_precision;
+    runner_config.max_seq_len = runtime_config.max_seq_len;
+    runner_config.activation_precision = runtime_config.activation_precision;
 
     auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, runner_config);
     if (!runner)

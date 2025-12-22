@@ -287,6 +287,42 @@ namespace llaminar2
                 ctx.use_fused_attention = true; // Implicitly enable fused attention
             }
 
+            // MPI Bootstrap Options
+            else if (arg == "--mpi-procs")
+            {
+                std::string val = getNextArg(argv, argc, i, "mpi-procs");
+                if (!val.empty())
+                    ctx.mpi_procs = std::stoi(val);
+            }
+            else if (arg.rfind("--mpi-procs=", 0) == 0)
+            {
+                ctx.mpi_procs = std::stoi(arg.substr(12));
+            }
+            else if (arg == "--hostfile")
+            {
+                ctx.hostfile = getNextArg(argv, argc, i, "hostfile");
+            }
+            else if (arg.rfind("--hostfile=", 0) == 0)
+            {
+                ctx.hostfile = arg.substr(11);
+            }
+            else if (arg == "--dry-run")
+            {
+                ctx.mpi_dry_run = true;
+            }
+            else if (arg == "--mpi-verbose")
+            {
+                ctx.mpi_verbose = true;
+            }
+            else if (arg == "--no-mpi-bootstrap")
+            {
+                ctx.mpi_no_bootstrap = true;
+            }
+            else if (arg == "--oversubscribe")
+            {
+                ctx.mpi_oversubscribe = true;
+            }
+
             // Verbose logging levels
             else if (arg == "-vv" || arg == "--vverbose")
             {
@@ -440,6 +476,15 @@ namespace llaminar2
         std::cout << "                              reference - Pure C++ (for debugging)\n";
         std::cout << "                              tiled     - Cache-blocked (balanced)\n\n";
 
+        std::cout << "MPI Bootstrap:\n";
+        std::cout << "  --mpi-procs N             Number of MPI processes (default: auto = 1 per socket)\n";
+        std::cout << "  --hostfile PATH           Hostfile for multi-machine MPI (OpenMPI format)\n";
+        std::cout << "                              Format: hostname [slots=N]\n";
+        std::cout << "  --oversubscribe           Allow more MPI ranks than available slots\n";
+        std::cout << "  --mpi-verbose             Show MPI binding information\n";
+        std::cout << "  --no-mpi-bootstrap        Disable auto-bootstrap (assume already under mpirun)\n";
+        std::cout << "  --dry-run                 Print MPI configuration and exit (no execution)\n\n";
+
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";
         std::cout << "  -v, --verbose             Verbose logging (DEBUG level)\n";
@@ -447,8 +492,14 @@ namespace llaminar2
         std::cout << "  -h, --help                Show this help\n\n";
 
         std::cout << "Examples:\n";
-        std::cout << "  # Simple inference\n";
+        std::cout << "  # Simple inference (auto-launches with mpirun)\n";
         std::cout << "  " << prog_name << " -m model.gguf -p \"Hello\" -n 50\n\n";
+
+        std::cout << "  # Specify number of MPI processes\n";
+        std::cout << "  " << prog_name << " -m model.gguf --mpi-procs 4 -p \"Hello\"\n\n";
+
+        std::cout << "  # Multi-machine with hostfile\n";
+        std::cout << "  " << prog_name << " -m model.gguf --hostfile hosts.txt -p \"Hello\"\n\n";
 
         std::cout << "  # Layer split: 16 layers on GPU, rest on CPU\n";
         std::cout << "  " << prog_name << " -m model.gguf --strategy layer-split --offload-layers 16\n\n";

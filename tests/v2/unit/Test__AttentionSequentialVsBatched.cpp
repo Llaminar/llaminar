@@ -13,7 +13,7 @@
 #include <gtest/gtest.h>
 #include "v2/kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
-#include "v2/pipelines/AttentionUtils.h"
+#include "v2/kernels/cpu/attention/AttentionUtils.h"
 #include <vector>
 #include <cmath>
 #include <iostream>

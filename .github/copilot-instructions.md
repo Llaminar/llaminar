@@ -81,23 +81,41 @@ cmake --build build_v2_e2e_release --parallel
 
 ### Running Llaminar
 
-Always use the canonical launch script for optimal performance:
+The `llaminar2` executable automatically bootstraps MPI and configures the runtime environment:
 
 ```bash
-# RELEASE mode (default)
-./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
+# Standard inference (auto-detects topology, self-launches MPI)
+./build_v2_release/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
-# DEBUG mode (for smoke testing with debug logging)
-./run_llaminar_debug.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
+# Debug logging
+LLAMINAR_LOG_LEVEL=DEBUG ./build_v2/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
-# With tensor parallelism (2 MPI ranks)
-mpirun -np 2 ./run_llaminar.sh -m models/qwen2.5-7b-instruct-q4_0.gguf -p "Hello!" -n 50
+# Specify MPI process count (e.g., 2 ranks for tensor parallelism)
+./build_v2_release/llaminar2 --mpi-procs 2 -m models/qwen2.5-7b-instruct-q4_0.gguf -p "Hello!" -n 50
+
+# Dry-run to preview configuration without execution
+./build_v2_release/llaminar2 --dry-run -m models/qwen2.5-0.5b-instruct-q4_0.gguf
+
+# Disable MPI bootstrap (single-rank only)
+./build_v2_release/llaminar2 --no-mpi-bootstrap -m model.gguf -p "Hello"
 ```
 
-The launch script automatically configures:
-- OpenMP: `OMP_NUM_THREADS`, `OMP_PLACES=sockets`, `OMP_PROC_BIND=close`
-- MPI: `OMPI_MCA_mpi_leave_pinned=1`, etc.
-- BLAS: `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`
+The executable automatically configures:
+- **CPU Topology Detection**: Parses `/proc/cpuinfo` to detect sockets, cores, NUMA nodes
+- **OpenMP**: `OMP_NUM_THREADS` (cores/socket), `OMP_PLACES=sockets`, `OMP_PROC_BIND=close`
+- **MPI**: `OMPI_MCA_mpi_leave_pinned=1`, socket binding, process mapping
+- **BLAS**: `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`
+
+### MPI Bootstrap Options
+
+| Option | Description |
+|--------|-------------|
+| `--mpi-procs N` | Number of MPI processes (default: auto-detect from topology) |
+| `--hostfile PATH` | MPI hostfile for multi-machine setup (OpenMPI format) |
+| `--oversubscribe` | Allow more MPI ranks than available CPU slots |
+| `--dry-run` | Show configuration without executing |
+| `--mpi-verbose` | Verbose MPI launch output |
+| `--no-mpi-bootstrap` | Disable auto-bootstrap, run single-rank |
 
 ---
 
@@ -107,13 +125,13 @@ The launch script automatically configures:
 
 ```bash
 # Standard benchmark with auto-generated prompt
-./run_llaminar.sh -- --benchmark -m model.gguf
+./build_v2_release/llaminar2 --benchmark -m model.gguf
 
 # Custom prompt and decode length
-./run_llaminar.sh -- --benchmark -m model.gguf -p "Your prompt here" -n 100
+./build_v2_release/llaminar2 --benchmark -m model.gguf -p "Your prompt here" -n 100
 
 # With kernel profiling
-LLAMINAR_PROFILE_KERNELS=1 ./run_llaminar.sh -- --benchmark -m model.gguf -n 50
+LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
 ```
 
 **Features**:
@@ -143,7 +161,7 @@ LLAMINAR_PROFILE_KERNELS=1 ./run_llaminar.sh -- --benchmark -m model.gguf -n 50
 Enable per-kernel timing breakdown:
 
 ```bash
-LLAMINAR_PROFILE_KERNELS=1 ./run_llaminar.sh -- --benchmark -m model.gguf -n 50
+LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
 ```
 
 **Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`
@@ -331,7 +349,7 @@ LLAMINAR_SNAPSHOT_TENSOR_DUMP=1 \
 LLAMINAR_SNAPSHOT_DUMP_LAYERS=3,4,5 \
 LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_RESIDUAL,ATTENTION_RESIDUAL \
 LLAMINAR_SNAPSHOT_DUMP_DIR=/tmp/layer_debug \
-./run_llaminar.sh -m model.gguf -p "test prompt"
+./build_v2_release/llaminar2 -m model.gguf -p "test prompt"
 ```
 
 **Output Files**:
@@ -375,12 +393,12 @@ python python/reference/run_reference.py \
 
 **Step 1**: Use greedy sampling to eliminate randomness:
 ```bash
-./run_llaminar.sh -m model.gguf -p "prompt" -n 10 -t 0
+./build_v2_release/llaminar2 -m model.gguf -p "prompt" -n 10 -t 0
 ```
 
 **Step 2**: Compare top-5 predictions:
 ```bash
-LLAMINAR_LOG_LEVEL=TRACE ./run_llaminar.sh -m model.gguf -p "prompt" -n 1 -t 0 2>&1 | grep "Top-5"
+LLAMINAR_LOG_LEVEL=TRACE ./build_v2_release/llaminar2 -m model.gguf -p "prompt" -n 1 -t 0 2>&1 | grep "Top-5"
 ```
 
 **Step 3**: Run E2E parity tests:
@@ -391,7 +409,7 @@ ctest --test-dir build_v2_e2e_release -R Qwen2FP32Parity -V
 **Step 4**: Enable stage tracing for full visibility:
 ```bash
 LLAMINAR_STAGE_DUMP=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
-  mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "test"
+./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "test"
 ```
 
 ---
@@ -490,7 +508,7 @@ With 2 MPI ranks: ~50% reduction for sharded weights, ~25-30% overall.
 
 ```bash
 # Automatic sharding when world_size > 1
-mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "Hello"
 ```
 
 ---
@@ -518,10 +536,10 @@ MPI_Barrier(MPI_COMM_WORLD);
 ```bash
 # Log all MPI collectives with timing
 LLAMINAR_MPI_LOG_COLLECTIVES=1 LLAMINAR_MPI_LOG_TIMING=1 \
-  mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "test"
+./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "test"
 
 # Enable checksum verification (slow)
-LLAMINAR_MPI_VERIFY_CHECKSUMS=1 mpirun -np 2 ./run_llaminar.sh ...
+LLAMINAR_MPI_VERIFY_CHECKSUMS=1 ./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "test"
 ```
 
 ### Rank Comparison Testing

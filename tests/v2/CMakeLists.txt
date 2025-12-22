@@ -2277,44 +2277,6 @@ add_v2_test(V2_Unit_AllGatherStage
 )
 
 # Test: PipelineExecutor (LayerExecutor-to-pipeline adapter)
-# Tests configuration, device context management, and individual operation execution
-# Bridges new execution framework with existing pipeline infrastructure
-
-
-# Test: PipelineBase Precision Mode
-# Tests WeightPrecision and ActivationPrecision configuration flow through PipelineBase
-
-# Test: ResidualOpTyped (typed residual connections FP32/BF16/FP16/Q8_1)
-# Tests the typed residual connection operations that add projection outputs back to residual stream
-# Critical for verifying Q8_1 native residual addition (dequant-add-requant via SIMD)
-add_executable(v2_test_residual_op_typed unit/pipelines/ops/Test__ResidualOpTyped.cpp)
-target_link_libraries(v2_test_residual_op_typed llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_ResidualOpTyped
-    COMMAND $<TARGET_FILE:v2_test_residual_op_typed>
-    LABELS "V2;Unit;PipelineOps;ResidualConnection;Q8_1;FP32;TypedResiduals;Quantization;SIMD"
-    MPI_PROCS 1
-)
-
-# Test: RMSNormOpTyped (Q8_1 native RMSNorm)
-# Critical for verifying Q8_1 native RMSNorm (dequant-normalize-requant)
-add_executable(v2_test_rmsnorm_op_typed unit/pipelines/ops/Test__RMSNormOpTyped.cpp)
-target_link_libraries(v2_test_rmsnorm_op_typed llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_RMSNormOpTyped
-    COMMAND $<TARGET_FILE:v2_test_rmsnorm_op_typed>
-    LABELS "V2;Unit;PipelineOps;RMSNorm;Q8_1;FP32;TypedNorm;Quantization;SIMD"
-    MPI_PROCS 1
-)
-
-# Test: GemmOpTyped (Q8_1 native GEMM for QKV projection)
-# Critical for verifying Q8_1 native GEMM (Q8_1→Q8_1 and FP32→Q8_1 paths)
-add_executable(v2_test_gemm_op_typed unit/pipelines/ops/Test__GemmOpTyped.cpp)
-target_link_libraries(v2_test_gemm_op_typed llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GemmOpTyped
-    COMMAND $<TARGET_FILE:v2_test_gemm_op_typed>
-    LABELS "V2;Unit;PipelineOps;GEMM;Q8_1;FP32;TypedGemm;Quantization;QKVProjection"
-    MPI_PROCS 1
-)
-
 # Test: GQAAttention Second Sequence Handling
 # Tests that sequence 1 in batched attention is handled correctly
 # Validates buffer offsets, mask application, and cross-sequence isolation

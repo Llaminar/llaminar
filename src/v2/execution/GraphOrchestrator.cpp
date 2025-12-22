@@ -9,11 +9,11 @@
  */
 
 #include "GraphOrchestrator.h"
-#include "../../utils/Logger.h"
-#include "../../utils/DebugEnv.h"
-#include "../../utils/MPIContext.h"
-#include "../../tensors/TensorFactory.h"
-#include "../../tensors/UnifiedKVCache.h"
+#include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
+#include "../utils/MPIContext.h"
+#include "../tensors/TensorFactory.h"
+#include "../tensors/UnifiedKVCache.h"
 #include <chrono>
 
 namespace llaminar2

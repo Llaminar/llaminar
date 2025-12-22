@@ -26,7 +26,7 @@
 #include <memory>
 #include <fstream>
 
-#include "v2/pipelines/qwen/Qwen2LayerExecutor.h"
+#include "v2/pipelines/qwen/Qwen2Graph.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/UnifiedKVCache.h"
@@ -196,9 +196,9 @@ protected:
     /**
      * @brief Create executor with specified activation precision
      */
-    std::unique_ptr<Qwen2LayerExecutor> createExecutor(ActivationPrecision precision)
+    std::unique_ptr<Qwen2Graph> createExecutor(ActivationPrecision precision)
     {
-        Qwen2ExecutorConfig config;
+        Qwen2GraphConfig config;
         config.d_model = d_model_;
         config.n_heads = n_heads_;
         config.n_kv_heads = n_kv_heads_;
@@ -210,7 +210,7 @@ protected:
         config.activation_precision = precision;
         // NOTE: Decomposed attention is now always used (Phase 7 cleanup)
 
-        return std::make_unique<Qwen2LayerExecutor>(config, mpi_ctx_);
+        return std::make_unique<Qwen2Graph>(config, mpi_ctx_);
     }
 
     /**

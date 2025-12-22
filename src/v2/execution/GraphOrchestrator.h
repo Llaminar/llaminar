@@ -29,11 +29,11 @@
 
 #pragma once
 
-#include "Qwen2Graph.h"
-#include "../../inference/IInferenceRunner.h"
-#include "../../execution/GraphExecutor.h"
-#include "../../execution/DeviceContext.h"
-#include "../../execution/ComputeStage.h" // For StageDumpInfo
+#include "../pipelines/qwen/Qwen2Graph.h"
+#include "IInferenceRunner.h"
+#include "GraphExecutor.h"
+#include "DeviceContext.h"
+#include "ComputeStage.h" // For StageDumpInfo
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -568,8 +568,6 @@ namespace llaminar2
          * When enabled, orchestrator stores copies of intermediate tensors from
          * each stage execution. Used for parity testing against reference implementations.
          *
-         * This mirrors the PipelineBase snapshot API for easy migration of E2E tests.
-         *
          * @param output_dir Optional directory to save snapshots (currently unused)
          */
         void enableSnapshotCapture(const std::string &output_dir = "") override
@@ -933,15 +931,5 @@ namespace llaminar2
         /// Captured snapshots (key -> FP32 data)
         std::unordered_map<std::string, std::vector<float>> snapshots_;
     };
-
-    // =========================================================================
-    // Backward Compatibility Alias
-    // =========================================================================
-
-    /**
-     * @brief Alias for code that used Qwen2LayerExecutor
-     * @deprecated Use GraphOrchestrator or Qwen2Graph directly
-     */
-    // Note: Qwen2LayerExecutor alias remains in Qwen2Graph.h for now
 
 } // namespace llaminar2

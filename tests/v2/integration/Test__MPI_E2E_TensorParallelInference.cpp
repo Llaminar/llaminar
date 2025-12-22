@@ -38,9 +38,9 @@
 #include <iomanip>
 #include <sstream>
 
-#include "inference/InferenceRunner.h"
-#include "inference/IInferenceRunner.h"
-#include "pipelines/qwen/GraphOrchestrator.h"
+#include "execution/InferenceRunnerFactory.h"
+#include "execution/IInferenceRunner.h"
+#include "execution/GraphOrchestrator.h"
 #include "pipelines/qwen/Qwen2Graph.h"
 #include "loaders/ModelContext.h"
 #include "loaders/WeightManager.h"

@@ -22,14 +22,17 @@ Llaminar is a high-performance LLM inference engine designed for CPU clusters wi
 cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
 
-# Run inference (single rank)
-./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
+# Run inference (auto-detects topology, self-launches MPI if needed)
+./build_v2_release/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
-# Run with tensor parallelism (2 MPI ranks)
-mpirun -np 2 ./run_llaminar.sh -m models/qwen2.5-7b-instruct-q4_0.gguf -p "Hello!" -n 50
+# Specify MPI process count manually
+./build_v2_release/llaminar2 --mpi-procs 2 -m models/qwen2.5-7b-instruct-q4_0.gguf -p "Hello!" -n 50
 
 # Benchmark mode
-./run_llaminar.sh -- --benchmark -m models/qwen2.5-0.5b-instruct-q8_0.gguf -n 50
+./build_v2_release/llaminar2 --benchmark -m models/qwen2.5-0.5b-instruct-q8_0.gguf -n 50
+
+# Dry-run to see detected configuration
+./build_v2_release/llaminar2 --dry-run -m models/qwen2.5-0.5b-instruct-q4_0.gguf
 ```
 
 ## Architecture Overview
@@ -129,7 +132,7 @@ Llaminar implements **Megatron-style tensor parallelism** with automatic weight 
 
 ```bash
 # Automatic sharding when world_size > 1
-mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "Hello"
+./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "Hello"
 ```
 
 ## Supported Quantization Formats
@@ -199,13 +202,13 @@ ctest --test-dir build_v2_release -R "^V2_Perf_" --verbose
 
 ```bash
 # Run benchmark with default settings
-./run_llaminar.sh -- --benchmark -m model.gguf
+./build_v2_release/llaminar2 --benchmark -m model.gguf
 
 # With kernel profiling
-LLAMINAR_PROFILE_KERNELS=1 ./run_llaminar.sh -- --benchmark -m model.gguf -n 50
+LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 50
 
 # Custom prompt and decode length
-./run_llaminar.sh -- --benchmark -m model.gguf -p "Your prompt here" -n 100
+./build_v2_release/llaminar2 --benchmark -m model.gguf -p "Your prompt here" -n 100
 ```
 
 **Benchmark Output:**
@@ -233,7 +236,7 @@ LLAMINAR_PROFILE_KERNELS=1 ./run_llaminar.sh -- --benchmark -m model.gguf -n 50
 | `LLAMINAR_LOG_LEVEL` | Logging verbosity (ERROR, WARN, INFO, DEBUG, TRACE) |
 | `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing in benchmark mode |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Dump tensors to disk for debugging |
-| `OMP_NUM_THREADS` | OpenMP thread count (auto-set by run_llaminar.sh) |
+| `OMP_NUM_THREADS` | OpenMP thread count (auto-configured by llaminar2) |
 
 ## Documentation
 

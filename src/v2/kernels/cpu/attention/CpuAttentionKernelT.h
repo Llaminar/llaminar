@@ -22,7 +22,7 @@
 #include "../CPUKernelBase.h"
 #include "../primitives/ActivationTraits.h"
 #include "../primitives/SoftmaxPrimitivesImpl.h"
-#include "../../../pipelines/AttentionUtils.h"
+#include "AttentionUtils.h"
 #include "../../../utils/Logger.h"
 #include <memory>
 #include <vector>

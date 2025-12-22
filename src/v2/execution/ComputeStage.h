@@ -24,7 +24,7 @@
 #include <functional>
 #include "DeviceContext.h"
 #include "BufferRole.h"                 // For buffer requirements
-#include "../pipelines/RuntimeConfig.h" // For ActivationPrecision
+#include "RuntimeConfig.h"              // For ActivationPrecision
 #include "../tensors/BlockStructures.h" // For Q8_1Block in StageDumpInfo
 #include "../tensors/TensorKernels.h"   // For AttentionMode enum
 #include "../utils/MPITopology.h"       // For WorkRange (tensor parallelism)

@@ -10,9 +10,9 @@
 
 #pragma once
 
-#include "backends/ComputeBackend.h"
-#include "utils/CPUFeatures.h"
-#include "utils/Logger.h"
+#include "../backends/ComputeBackend.h"
+#include "../utils/CPUFeatures.h"
+#include "../utils/Logger.h"
 #include <string>
 
 namespace llaminar2
@@ -154,11 +154,11 @@ namespace llaminar2
      * Design rationale:
      * - ModelContext: Model file metadata (immutable, from GGUF)
      * - WeightPlacementMap: Device placement decisions (Phase 4)
-     * - PipelineConfig: Runtime behavior settings (this struct)
+     * - RuntimeConfig: Runtime behavior settings (this struct)
      *
      * This separation follows V2's philosophy of clear ownership and composability.
      */
-    struct PipelineConfig
+    struct RuntimeConfig
     {
         /**
          * @brief Maximum sequence length for inference
@@ -335,12 +335,12 @@ namespace llaminar2
         /**
          * @brief Default constructor with standard settings
          */
-        PipelineConfig() = default;
+        RuntimeConfig() = default;
 
         /**
          * @brief Construct with explicit max_seq_len (common case)
          */
-        explicit PipelineConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
+        explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
     };
 
     /**

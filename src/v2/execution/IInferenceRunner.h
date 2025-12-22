@@ -1,11 +1,10 @@
 /**
  * @file IInferenceRunner.h
- * @brief Interface for inference execution (Pipeline or Graph)
+ * @brief Interface for inference execution
  * @author David Sanftenberg
  * @date December 2025
  *
- * Simple interface implemented by both PipelineBase and GraphOrchestrator,
- * enabling callers to use either execution path interchangeably.
+ * Interface implemented by GraphOrchestrator for inference execution.
  */
 
 #pragma once
@@ -28,8 +27,7 @@ namespace llaminar2
     /**
      * @brief Interface for inference execution
      *
-     * Both PipelineBase and GraphOrchestrator implement this interface,
-     * enabling unified usage regardless of execution strategy.
+     * Implemented by GraphOrchestrator for transformer model inference.
      */
     class IInferenceRunner
     {

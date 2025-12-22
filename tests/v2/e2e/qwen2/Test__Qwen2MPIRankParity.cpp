@@ -33,8 +33,8 @@
 #include <cstring>
 
 #include "../../../../src/v2/loaders/ModelContext.h"
-#include "../../../../src/v2/inference/InferenceRunner.h"
-#include "../../../../src/v2/inference/IInferenceRunner.h"
+#include "../../../../src/v2/execution/InferenceRunnerFactory.h"
+#include "../../../../src/v2/execution/IInferenceRunner.h"
 #include "../../../../src/v2/backends/ComputeBackend.h"
 #include "../../../../src/v2/utils/MPIContext.h"
 #include "../../../../src/v2/utils/Logger.h"
