@@ -1685,11 +1685,126 @@ For a full list of environment variables available, check `src/v2/utils/DebugEnv
 | `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
 | `LLAMINAR_EXECUTOR_PROFILING` | Enable per-stage profiling in GraphExecutor. | Disabled (0) | Execution profiling |
 | `LLAMINAR_EXECUTOR_VALIDATION` | Enable output validation after each stage. | Disabled (0) | Debugging |
+| `LLAMINAR_STAGE_DUMP` | Dump per-stage tensor outputs for tracing. | Disabled (0) | Debugging |
+| `LLAMINAR_DETERMINISTIC` | Force deterministic execution for reproducibility. | Disabled (0) | Debugging |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk for debugging. | Disabled (0) | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps. | `/tmp/llaminar_tensor_dumps` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_LAYERS` | Comma-separated layer indices to dump. | `all` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_STAGES` | Comma-separated stage names to dump. | `all` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_RANK` | Only dump from this MPI rank (-1=all). | `0` | Snapshot framework |
+| `LLAMINAR_MPI_LOG_COLLECTIVES` | Log MPI collective operations (AllReduce, AllGather). | Disabled (0) | MPI debugging |
+| `LLAMINAR_MPI_LOG_TIMING` | Log timing of MPI operations with bandwidth. | Disabled (0) | MPI debugging |
+| `LLAMINAR_MPI_VERIFY_CHECKSUMS` | Verify checksums before/after MPI ops (slow). | Disabled (0) | MPI debugging |
+
+### MPI Debugging
+
+When debugging tensor parallelism issues, enable MPI logging:
+
+```bash
+# Log all MPI collectives with timing
+LLAMINAR_MPI_LOG_COLLECTIVES=1 LLAMINAR_MPI_LOG_TIMING=1 \
+  mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "test"
+
+# Enable checksum verification (slow, for debugging correctness)
+LLAMINAR_MPI_VERIFY_CHECKSUMS=1 mpirun -np 2 ./run_llaminar.sh ...
+```
+
+### Rank Comparison Testing
+
+Use the comparison script to verify tensor parallelism produces identical output:
+
+```bash
+# Compare 1 rank vs 2 ranks
+./scripts/compare_ranks.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello world" -n 20
+
+# Custom rank configurations with verbose output
+./scripts/compare_ranks.sh -m model.gguf -p "test" --ranks1 1 --ranks2 4 -v
+```
+
+### Stage Tracing (LLAMINAR_STAGE_DUMP)
+
+Enable per-stage output dumping to trace tensor values through the compute graph. Useful for debugging numerical divergence between ranks or identifying where outputs go wrong.
+
+```bash
+# Dump all stage outputs to /tmp/stage_dumps
+LLAMINAR_STAGE_DUMP=1 ./run_llaminar.sh -m model.gguf -p "test" -n 5
+
+# Combined with MPI logging for full visibility
+LLAMINAR_STAGE_DUMP=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
+  mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "test"
+```
+
+**What Gets Dumped:**
+- Stage name and dimensions
+- First/last few values (configurable)
+- Min/max/mean statistics
+- NaN/Inf detection warnings
+
+### Deterministic Mode (LLAMINAR_DETERMINISTIC)
+
+Force deterministic execution for reproducible debugging. This disables non-deterministic optimizations and ensures consistent results across runs.
+
+```bash
+# Enable deterministic mode
+LLAMINAR_DETERMINISTIC=1 ./run_llaminar.sh -m model.gguf -p "test" -n 10
+
+# Combine with stage dump for reproducible debugging
+LLAMINAR_DETERMINISTIC=1 LLAMINAR_STAGE_DUMP=1 \
+  ./run_llaminar.sh -m model.gguf -p "test"
+```
+
+**Effects:**
+- OpenMP scheduling becomes deterministic
+- Random number generators use fixed seeds
+- Reduction operations use consistent ordering
+- Useful for comparing outputs between code changes
+
+### Tensor Validity Assertions
+
+All tensor types implement `assertValid()` which validates tensor integrity on data access. This catches corruption early:
+
+```cpp
+// Called automatically when accessing tensor data
+const float* data = tensor->data();  // Triggers assertValid() internally
+
+// Manual validation in debug code
+tensor->assertValid();  // Throws if tensor is corrupted
+```
+
+**What Gets Validated:**
+- Non-null data pointer
+- Valid dimensions (rows > 0, cols > 0)
+- Block count matches expected (for quantized tensors)
+- No memory corruption indicators
+
+**Supported Tensor Types:**
+All 22+ tensor types have assertValid(): FP32, FP16, BF16, INT32, INT8, Q8_1, Q4_0, Q4_1, Q5_0, Q5_1, Q6_K, Q8_0, Q8_K, Q2_K, Q3_K, Q4_K, Q5_K, IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
+
+### Shape Validation in ComputeStages
+
+ComputeStage implementations can use built-in shape validation helpers:
+
+```cpp
+// In a ComputeStage::execute() implementation:
+
+// Validate single tensor shape
+validateShape(input, {batch_size, hidden_dim}, "input");
+
+// Validate multiple tensors at once
+validateShapes({
+    {input, {batch_size, hidden_dim}, "input"},
+    {output, {batch_size, vocab_size}, "output"},
+    {weights, {vocab_size, hidden_dim}, "weights"}
+});
+
+// Validate matmul compatibility: A[m,k] × B[k,n] = C[m,n]
+validateMatmulShapes(A, B, C, "linear_projection");
+```
+
+**Error Messages Include:**
+- Stage name and tensor name
+- Expected vs actual dimensions
+- Full shape mismatch details
 
 ### Graph Execution System (Default as of December 2025)
 

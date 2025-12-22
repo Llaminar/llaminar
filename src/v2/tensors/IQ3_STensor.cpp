@@ -187,8 +187,15 @@ namespace llaminar2
 
     const float *IQ3_STensor::data() const
     {
+        assertValid("IQ3_STensor::data");
         if (dequant_cache_.empty())
         {
+            // Check if raw data was released after GEMM packing
+            if (raw_data_released_)
+            {
+                LOG_DEBUG("IQ3_STensor::data() called but raw data was released after GEMM packing");
+                return nullptr;
+            }
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
 

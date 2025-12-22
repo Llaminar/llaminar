@@ -32,7 +32,7 @@
 #pragma once
 
 #include "Op.h"
-#include "../PipelineConfig.h"
+#include "../RuntimeConfig.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../tensors/Tensors.h"
 #include <memory>

@@ -23,11 +23,11 @@
 #include <vector>
 #include <functional>
 #include "DeviceContext.h"
-#include "BufferRole.h"                  // For buffer requirements
-#include "../pipelines/PipelineConfig.h" // For ActivationPrecision
-#include "../tensors/BlockStructures.h"  // For Q8_1Block in StageDumpInfo
-#include "../tensors/TensorKernels.h"    // For AttentionMode enum
-#include "../utils/MPITopology.h"        // For WorkRange (tensor parallelism)
+#include "BufferRole.h"                 // For buffer requirements
+#include "../pipelines/RuntimeConfig.h" // For ActivationPrecision
+#include "../tensors/BlockStructures.h" // For Q8_1Block in StageDumpInfo
+#include "../tensors/TensorKernels.h"   // For AttentionMode enum
+#include "../utils/MPITopology.h"       // For WorkRange (tensor parallelism)
 
 namespace llaminar2
 {
@@ -159,7 +159,6 @@ namespace llaminar2
     class IKVCache;
     class IUnifiedKVCache;
     class MPIContext;
-    struct MpiAttentionConfig;
 
     /**
      * @brief Types of compute operations
@@ -359,6 +358,127 @@ namespace llaminar2
             (void)seq_len;
             // Default: no dynamic params to update
         }
+
+    protected:
+        // =========================================================================
+        // Stage Tracing Infrastructure (Task 3: Debugging)
+        // =========================================================================
+
+        /**
+         * @brief Check if tracing is enabled for this stage.
+         *
+         * Considers both global trace_stages flag and per-stage filter.
+         */
+        bool shouldTrace() const;
+
+        /**
+         * @brief Trace input tensor values (only if tracing enabled).
+         *
+         * @param name Tensor name (e.g., "A", "hidden_states")
+         * @param tensor Tensor to trace
+         */
+        void traceInput(const std::string &name, const TensorBase *tensor) const;
+
+        /**
+         * @brief Trace output tensor values (only if tracing enabled).
+         *
+         * @param name Tensor name (e.g., "C", "output")
+         * @param tensor Tensor to trace
+         */
+        void traceOutput(const std::string &name, const TensorBase *tensor) const;
+
+        /**
+         * @brief Trace intermediate float array values.
+         *
+         * @param name Array name
+         * @param data Pointer to float data
+         * @param count Total element count
+         */
+        void traceIntermediate(const std::string &name, const float *data, size_t count) const;
+
+        /**
+         * @brief Compute checksum for tensor data (for divergence detection).
+         *
+         * @param data Float data pointer
+         * @param count Element count
+         * @return Simple float sum (not cryptographic, just for comparison)
+         */
+        static float computeChecksum(const float *data, size_t count);
+
+        /**
+         * @brief Format float array for logging (first N elements).
+         */
+        static std::string formatFloatArray(const float *data, size_t count);
+
+        // =========================================================================
+        // Shape Validation Infrastructure (Task 7: Debugging)
+        // =========================================================================
+
+        /**
+         * @brief Contract for a single tensor's expected shape.
+         *
+         * Used by validateShapes() to verify tensor dimensions match expectations.
+         */
+        struct TensorShapeContract
+        {
+            std::string name;             ///< Tensor name for error messages
+            const TensorBase *tensor;     ///< Tensor to validate
+            std::vector<size_t> expected; ///< Expected shape dimensions
+            bool allow_broadcast = false; ///< If true, trailing dims of 1 are OK
+        };
+
+        /**
+         * @brief Validate tensor shapes match expected contracts.
+         *
+         * @param contracts List of tensor/shape contracts to validate
+         * @throws std::runtime_error if any shape mismatches
+         *
+         * Example usage:
+         * @code
+         *   validateShapes({
+         *       {"input", input_, {batch_size_, d_model_}},
+         *       {"wq", wq_, {n_heads_ * head_dim_, d_model_}},
+         *   });
+         * @endcode
+         */
+        void validateShapes(std::initializer_list<TensorShapeContract> contracts) const;
+
+        /**
+         * @brief Validate a single tensor's shape.
+         *
+         * @param tensor_name Name for error messages
+         * @param tensor Tensor to validate
+         * @param expected Expected shape
+         */
+        void validateShape(const std::string &tensor_name, const TensorBase *tensor,
+                           const std::vector<size_t> &expected) const;
+
+        /**
+         * @brief Validate two tensors have compatible shapes for matmul.
+         *
+         * For A @ B where A is (m, k) and B is (k, n), validates k dimensions match.
+         *
+         * @param a_name Name of first tensor (for error messages)
+         * @param a First tensor (left operand)
+         * @param b_name Name of second tensor (for error messages)
+         * @param b Second tensor (right operand)
+         * @throws std::runtime_error if shapes incompatible for matmul
+         */
+        void validateMatmulShapes(const std::string &a_name, const TensorBase *a,
+                                  const std::string &b_name, const TensorBase *b) const;
+
+    private:
+        /**
+         * @brief Check if actual shape matches expected, with optional broadcast.
+         */
+        static bool shapesMatch(const std::vector<size_t> &actual,
+                                const std::vector<size_t> &expected,
+                                bool allow_broadcast);
+
+        /**
+         * @brief Format shape vector as string for error messages.
+         */
+        static std::string shapeToString(const std::vector<size_t> &shape);
     };
 
     // =============================================================================
@@ -392,8 +512,57 @@ namespace llaminar2
             float beta = 0.0f;             ///< Scale factor for existing C
             bool transpose_B = false;      ///< Whether B is transposed (n × k)
 
-            // Extended fields (use designated initializers)
-            const float *bias = nullptr;            ///< Fused bias [n] (nullptr if none)
+            // =================================================================
+            // Bias Configuration (Enhanced for Tensor Parallelism)
+            // =================================================================
+
+            /**
+             * @brief Raw bias pointer (legacy interface)
+             *
+             * @deprecated Use bias_tensor instead for TensorSlice/TP compatibility.
+             */
+            const float *bias = nullptr;
+
+            /**
+             * @brief Bias tensor (preferred interface)
+             *
+             * Using TensorBase* allows correct handling of TensorSlice from
+             * tensor parallelism weight sharding. The data is extracted via
+             * is_fp32_backed() + data() interface.
+             */
+            const TensorBase *bias_tensor = nullptr;
+
+            /**
+             * @brief Whether bias is required for this operation
+             *
+             * If true, validate() will fail if neither bias nor bias_tensor
+             * provides valid bias data. This enables fail-fast debugging.
+             */
+            bool bias_required = false;
+
+            /**
+             * @brief Get bias data pointer from either source
+             *
+             * Prefers bias_tensor (via is_fp32_backed() interface) over raw bias.
+             * Returns nullptr if no bias provided.
+             *
+             * @return const float* Bias data [n], or nullptr if no bias
+             */
+            const float *getBiasData() const;
+
+            /**
+             * @brief Validate params and throw on configuration error
+             *
+             * Checks:
+             * - Required tensors (A, B, C) are non-null
+             * - Dimensions (m, n, k) are positive
+             * - If bias_required, bias data is available
+             *
+             * @throws std::runtime_error on validation failure
+             */
+            void validate(const std::string &stage_name = "GEMMStage") const;
+
+            // SwiGLU fusion (extended fields)
             const TensorBase *gate_input = nullptr; ///< SwiGLU gate input tensor [m, n] (nullptr if not SwiGLU)
             bool do_swiglu = false;                 ///< Whether to apply SwiGLU fusion
 
@@ -656,14 +825,13 @@ namespace llaminar2
     // Forward declarations for attention infrastructure
     class IUnifiedKVCache;
     class MPIContext;
-    class MpiAttentionConfig;
 
     /**
      * @brief Production attention stage with KV cache and MPI support
      *
      * This is the full-featured attention implementation that integrates with:
      * - **KV Cache**: Automatic append during prefill, retrieval during decode
-     * - **MPI Parallelism**: Tensor-parallel attention via MpiAttentionOrchestrator
+     * - **MPI Parallelism**: Tensor-parallel attention via KernelFactory + compute_tensor()
      * - **Batched Execution**: Multiple sequences with padding masks
      * - **Asymmetric Lengths**: Different Q and KV lengths (prefill vs decode)
      * - **GQA/MHA/MQA**: All attention variants supported
@@ -817,9 +985,6 @@ namespace llaminar2
 
         /// Batched: Multiple sequences with padding
         bool executeBatched(IDeviceContext *ctx);
-
-        /// Build MpiAttentionConfig from params
-        MpiAttentionConfig buildAttentionConfig() const;
     };
 
     /**

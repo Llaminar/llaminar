@@ -281,8 +281,17 @@ namespace llaminar2
 
     const float *Q4_0Tensor::data() const
     {
+        assertValid("Q4_0Tensor::data");
         if (dequant_cache_.empty())
         {
+            // Check if raw data was released after GEMM packing
+            // If so, we cannot dequantize - return nullptr
+            if (raw_data_released_)
+            {
+                LOG_DEBUG("Q4_0Tensor::data() called but raw data was released after GEMM packing");
+                return nullptr;
+            }
+
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();

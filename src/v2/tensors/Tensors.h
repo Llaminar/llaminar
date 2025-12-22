@@ -803,6 +803,10 @@ namespace llaminar2
         virtual const float *data() const = 0; // Returns host pointer (syncs from device if needed)
         virtual float *mutable_data() = 0;     // Returns host pointer, marks dirty
 
+        // =========================================================================
+        // Unified FP32 Data Access Interface (Phase 1 Infrastructure)
+        // =========================================================================
+
         /**
          * @brief Explicit FP32 dequantization accessor
          *
@@ -817,6 +821,28 @@ namespace llaminar2
          * @note Default implementation calls data() - overridden by Q8_1Tensor
          */
         virtual const float *fp32_data() const { return data(); }
+
+        /**
+         * @brief Returns mutable pointer to FP32 data for activation tensors.
+         *
+         * For FP32Tensor, TensorSlice (of FP32), FP16Tensor, BF16Tensor:
+         * returns mutable pointer.
+         * For quantized weight tensors: returns nullptr (weights are read-only).
+         *
+         * @return float* Mutable pointer, or nullptr if not mutable/not FP32.
+         */
+        virtual float *mutable_fp32_data() { return nullptr; }
+
+        /**
+         * @brief Returns true if this tensor can provide fp32_data() directly without dequantization.
+         *
+         * For FP32Tensor, TensorSlice (of FP32 inner): returns true.
+         * For FP16Tensor, BF16Tensor: returns false (needs conversion).
+         * For quantized weight tensors: returns false (needs dequantization).
+         *
+         * Use this to check if fp32_data() is zero-cost or requires conversion.
+         */
+        virtual bool is_fp32_backed() const { return false; }
 
         // Device transfers (Phase 4.2)
         virtual bool copyFrom(const TensorBase *src) = 0; // Copy data from another tensor (handles device transfers)
@@ -1081,9 +1107,134 @@ namespace llaminar2
 
         ComparisonSummary compareTo(const TensorBase *other) const;
 
+        // =========================================================================
+        // Debug-Mode Validity Tracking (Task 4: Tensor Validity Assertions)
+        // =========================================================================
+        //
+        // In debug builds, tracks tensor validity state to catch use-after-move,
+        // use-after-free, and use-after-pool-release bugs. Zero cost in release builds.
+        //
+        // Usage:
+        //   tensor->invalidate("Released back to buffer pool");
+        //   tensor->data();  // Will trigger assertion with clear error message
+        //
+        // Enabled only when NDEBUG is NOT defined (debug builds).
+
+#ifndef NDEBUG
+        /**
+         * @brief Check if tensor is currently valid for use
+         * @return true if tensor data can be safely accessed
+         */
+        bool isValid() const { return valid_; }
+
+        /**
+         * @brief Mark this tensor as invalid (debug builds only)
+         *
+         * Call this when:
+         * - Tensor is returned to a buffer pool
+         * - Tensor data is moved/stolen
+         * - Tensor is aliased to another buffer
+         *
+         * @param reason Human-readable explanation (shown in assertion)
+         */
+        void invalidate(const std::string &reason)
+        {
+            valid_ = false;
+            invalidation_reason_ = reason;
+        }
+
+        /**
+         * @brief Re-validate tensor after reallocation (debug builds only)
+         *
+         * Call this when:
+         * - Buffer pool allocates this tensor for new use
+         * - Data is restored after temporary invalidation
+         */
+        void revalidate()
+        {
+            valid_ = true;
+            invalidation_reason_.clear();
+        }
+
+        /**
+         * @brief Get the reason this tensor was invalidated
+         * @return Reason string, or empty if tensor is valid
+         */
+        const std::string &invalidationReason() const { return invalidation_reason_; }
+
+#else
+        // No-op in release builds - zero overhead
+        bool isValid() const { return true; }
+        void invalidate(const std::string &) {}
+        void revalidate() {}
+        const std::string &invalidationReason() const
+        {
+            static std::string empty;
+            return empty;
+        }
+#endif
+
+        // =========================================================================
+        // Debug Name (for better error messages)
+        // =========================================================================
+
+        /**
+         * @brief Set a human-readable name for this tensor (debug builds)
+         * @param name Descriptive name like "layer0_attention_q" or "ffn_gate"
+         */
+        void setDebugName(const std::string &name) { debug_name_ = name; }
+
+        /**
+         * @brief Get the debug name for this tensor
+         * @return Debug name, or empty string if not set
+         */
+        const std::string &debugName() const { return debug_name_; }
+
     protected:
         // Default constructor for derived classes
         TensorBase() = default;
+
+#ifndef NDEBUG
+        // Debug validity tracking state
+        bool valid_ = true;
+        std::string invalidation_reason_;
+#endif
+        // Debug name for error messages (always present, minimal overhead)
+        std::string debug_name_;
+
+        // ===== Debug Validity Assertion Helper =====
+#ifndef NDEBUG
+        /**
+         * @brief Assert tensor is valid before access (debug builds only)
+         *
+         * Call at the start of data(), mutable_data(), fp32_data(), and other
+         * data access methods. Provides clear error message on invalid access.
+         *
+         * @param method_name Name of the method being called (for error message)
+         * @throws std::runtime_error if tensor is invalid
+         */
+        void assertValid(const char *method_name) const
+        {
+            if (!valid_)
+            {
+                std::string msg = "Tensor validity assertion failed in ";
+                msg += method_name;
+                msg += "(): tensor was invalidated";
+                if (!invalidation_reason_.empty())
+                {
+                    msg += " - reason: " + invalidation_reason_;
+                }
+                if (!debug_name_.empty())
+                {
+                    msg += " [tensor: " + debug_name_ + "]";
+                }
+                throw std::runtime_error(msg);
+            }
+        }
+#else
+        // No-op in release builds
+        void assertValid(const char *) const {}
+#endif
 
         // ===== Lazy Transfer State (Phase 1 GPU Device-Aware Slicing) =====
         // Maintained by TensorBase::ensureOnDevice/ensureOnHost implementations.
@@ -1217,6 +1368,10 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
+        float *mutable_fp32_data() override { return mutable_data(); }
+        bool is_fp32_backed() const override { return true; }
 
         bool copyFrom(const TensorBase *src) override;
 
@@ -1403,6 +1558,10 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
+
+        // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
+        // FP16 is NOT FP32-backed - requires FP16→FP32 conversion
+        bool is_fp32_backed() const override { return false; }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -1658,6 +1817,9 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
+        // Unified Data Access Interface - BF16 requires conversion (not FP32-backed)
+        bool is_fp32_backed() const override { return false; }
+
         // ITensorGemmTileDataProvider interface - for GEMM kernels to decode BF16→FP32 on-the-fly
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
@@ -1819,6 +1981,9 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
+        // Unified Data Access Interface - INT8 requires conversion (not FP32-backed)
+        bool is_fp32_backed() const override { return false; }
+
         // INT8-specific interface
         const int8_t *int8_data() const { return host_int8_data_.data(); }
         int8_t *mutable_int8_data() { return host_int8_data_.data(); }
@@ -1949,6 +2114,9 @@ namespace llaminar2
         std::shared_ptr<TensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
+
+        // Unified Data Access Interface - INT32 requires conversion (not FP32-backed)
+        bool is_fp32_backed() const override { return false; }
 
         // INT32-specific interface
         const int32_t *int32_data() const { return host_int32_data_.data(); }

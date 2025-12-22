@@ -135,6 +135,7 @@ namespace llaminar2
 
     const float *INT8Tensor::data() const
     {
+        assertValid("INT8Tensor::data");
         // Dequantize to cache on demand
         size_t total = 1;
         for (auto dim : shape_)

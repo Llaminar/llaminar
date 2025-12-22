@@ -191,6 +191,15 @@ namespace llaminar2
 
     const float *IQ4_NLTensor::data() const
     {
+        assertValid("IQ4_NLTensor::data");
+        // Check if raw data was released after GEMM packing
+        // If so, we cannot dequantize - return nullptr
+        if (raw_data_released_)
+        {
+            LOG_DEBUG("IQ4_NLTensor::data() called but raw data was released after GEMM packing");
+            return nullptr;
+        }
+
         // Fully decode to cache
         size_t total_elements = element_count();
         if (dequant_cache_.size() != total_elements)

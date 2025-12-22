@@ -10,7 +10,6 @@
  */
 
 #include "Qwen2Graph.h"
-#include "Qwen2Pipeline.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 #include "../../backends/ComputeBackend.h"

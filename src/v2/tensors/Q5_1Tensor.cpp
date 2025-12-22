@@ -88,6 +88,14 @@ namespace llaminar2
 
     const float *Q5_1Tensor::data() const
     {
+        assertValid("Q5_1Tensor::data");
+        // Check if raw data was released after GEMM packing
+        if (raw_data_released_)
+        {
+            LOG_DEBUG("Q5_1Tensor::data() called but raw data was released after GEMM packing");
+            return nullptr;
+        }
+
         // Dequantize to cache
         const size_t num_elements = shape_[0] * shape_[1];
         dequant_cache_.resize(num_elements);

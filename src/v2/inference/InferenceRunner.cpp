@@ -6,11 +6,11 @@
  */
 
 #include "InferenceRunner.h"
-#include "../pipelines/PipelineFactory.h"
-#include "../pipelines/PipelineBase.h"
-#include "../pipelines/qwen/Qwen2Pipeline.h"
 #include "../pipelines/qwen/Qwen2Graph.h"
 #include "../pipelines/qwen/GraphOrchestrator.h"
+#include "../loaders/ModelContext.h"
+#include "../loaders/ModelLoader.h"
+#include "../loaders/WeightManager.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 
@@ -18,13 +18,6 @@ namespace llaminar2
 {
 
     // Forward declarations of factory helpers
-    static std::unique_ptr<IInferenceRunner> createPipelineImpl(
-        std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx,
-        const InferenceRunnerConfig &config,
-        const std::string &architecture);
-
     static std::unique_ptr<IInferenceRunner> createGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
@@ -67,79 +60,15 @@ namespace llaminar2
         LOG_DEBUG("[InferenceRunner] Using device index " << device_idx
                                                           << " (type: " << static_cast<int>(dm.devices()[device_idx].type) << ")");
 
-        // Determine execution path
-        // Default: Graph path (as of December 2025 refactor)
-        const auto &exec_env = debugEnv().execution;
-        bool use_graph_path = true; // NEW DEFAULT: Graph is now the default
-
-        if (config.force_pipeline)
-        {
-            use_graph_path = false;
-            LOG_INFO("[InferenceRunner] Forced PIPELINE path");
-        }
-        else if (config.force_graph)
-        {
-            use_graph_path = true;
-            LOG_INFO("[InferenceRunner] Forced GRAPH path");
-        }
-        else if (exec_env.exec_full_forward)
-        {
-            // Still honor this flag for backward compatibility
-            use_graph_path = true;
-            LOG_DEBUG("[InferenceRunner] Using GRAPH path (LLAMINAR_EXEC_FULL_FORWARD=1)");
-        }
-        else
-        {
-            // Default to Graph path
-            LOG_INFO("[InferenceRunner] Using GRAPH path (default)");
-        }
-
+        // Graph is the only execution path (as of January 2025 cleanup)
         std::string architecture = model_ctx->architecture();
-
-        if (use_graph_path)
-        {
-            // Graph path: Create GraphOrchestrator directly
-            return createGraphOrchestratorImpl(model_ctx, mpi_ctx, device_idx, config, architecture);
-        }
-        else
-        {
-            // Pipeline path: Use PipelineFactory
-            return createPipelineImpl(model_ctx, mpi_ctx, device_idx, config, architecture);
-        }
+        LOG_INFO("[InferenceRunner] Using GRAPH path");
+        return createGraphOrchestratorImpl(model_ctx, mpi_ctx, device_idx, config, architecture);
     }
 
     // =========================================================================
     // Factory Helper Implementations
     // =========================================================================
-
-    static std::unique_ptr<IInferenceRunner> createPipelineImpl(
-        std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
-        int device_idx,
-        const InferenceRunnerConfig &config,
-        const std::string &architecture)
-    {
-        // Ensure Qwen2 pipeline is registered (static initialization may not run in static libraries)
-        ensureQwen2Registration();
-
-        // Configure pipeline
-        PipelineConfig pipeline_config;
-        pipeline_config.max_seq_len = config.max_seq_len;
-        pipeline_config.activation_precision = config.activation_precision;
-
-        // Create pipeline via factory
-        auto pipeline = PipelineFactory::instance().create(
-            architecture, model_ctx, mpi_ctx, device_idx, pipeline_config);
-
-        if (!pipeline)
-        {
-            LOG_ERROR("[InferenceRunner] Failed to create pipeline for: " << architecture);
-            return nullptr;
-        }
-
-        // PipelineBase implements IInferenceRunner directly, so just return it
-        return pipeline;
-    }
 
     static std::unique_ptr<IInferenceRunner> createGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
@@ -148,12 +77,11 @@ namespace llaminar2
         const InferenceRunnerConfig &config,
         const std::string &architecture)
     {
-        // Currently only Qwen2 is supported for graph path
+        // Currently only Qwen2 is supported
         if (architecture != "qwen2")
         {
-            LOG_ERROR("[InferenceRunner] Graph path only supports qwen2, got: " << architecture);
-            LOG_ERROR("[InferenceRunner] Falling back to pipeline path");
-            return createPipelineImpl(model_ctx, mpi_ctx, device_idx, config, architecture);
+            LOG_ERROR("[InferenceRunner] Only qwen2 architecture is supported, got: " << architecture);
+            return nullptr;
         }
 
         // Get model metadata

@@ -805,7 +805,9 @@ namespace llaminar2
          *
          * @note Delegates to MpiAttentionOrchestrator::compute() (see pipelines/attention/MpiAttentionOrchestrator.h)
          * @note For MPI parallelization, use attention_gqa_mpi()
+         * @deprecated Use AttentionWithKVCacheStage or CPUAttentionKernelTyped via KernelFactory for new code
          */
+        [[deprecated("Use AttentionWithKVCacheStage or KernelFactory::createAttention() for new code")]]
         virtual bool attention_gqa(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int n_heads, int n_kv_heads, int head_dim,
@@ -832,7 +834,9 @@ namespace llaminar2
          * @return true on success, false on error
          *
          * @note Delegates to MpiAttentionOrchestrator::compute_batch() (see pipelines/attention/MpiAttentionOrchestrator.h)
+         * @deprecated Use AttentionWithKVCacheStage or CPUAttentionKernelTyped via KernelFactory for new code
          */
+        [[deprecated("Use AttentionWithKVCacheStage or KernelFactory::createAttention() for new code")]]
         virtual bool attention_gqa_batch(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             const std::vector<int> &actual_lengths,
@@ -862,7 +866,9 @@ namespace llaminar2
          * @return true on success, false on error
          *
          * @note Delegates to MpiAttentionOrchestrator::compute_mpi() (see pipelines/attention/MpiAttentionOrchestrator.h)
+         * @deprecated Use AttentionWithKVCacheStage or CPUAttentionKernelTyped via KernelFactory for new code
          */
+        [[deprecated("Use AttentionWithKVCacheStage or KernelFactory::createAttention() for new code")]]
         bool attention_gqa_mpi(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int n_heads, int n_kv_heads, int head_dim,
@@ -888,7 +894,9 @@ namespace llaminar2
          * @return true on success, false on error
          *
          * @note Delegates to MpiAttentionOrchestrator::compute_tensor_parallel() (see pipelines/attention/MpiAttentionOrchestrator.h)
+         * @deprecated Use AttentionWithKVCacheStage or CPUAttentionKernelTyped via KernelFactory for new code
          */
+        [[deprecated("Use AttentionWithKVCacheStage or KernelFactory::createAttention() for new code")]]
         bool attention_gqa_tensor_parallel(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int n_heads, int n_kv_heads, int head_dim,

@@ -75,11 +75,13 @@
 - [x] **6.5** Unit tests: 13 tests in `Test__ShardedKVCache.cpp` ✅
 - [x] **6.6** Integration test: 7 tests in `Test__MPI_ShardedKVCache.cpp` ✅
 
-### Phase 7: Cleanup
-- [ ] **7.1** Remove `MpiAttentionOrchestrator`
-- [ ] **7.2** Remove `GQAAttention`
-- [ ] **7.3** Deprecate `PipelineBase` TP methods
-- [ ] **7.4** Update all tests to graph-based execution
+### Phase 7: Cleanup ⏳ IN PROGRESS
+- [x] **7.1** Mark `MpiAttentionOrchestrator` as deprecated ✅ (class has `[[deprecated]]` attribute)
+- [x] **7.2** Mark `GQAAttention` as deprecated ✅ (class has `[[deprecated]]` attribute)
+- [x] **7.3** Deprecate `PipelineBase` TP methods ✅ (`attention_gqa`, `attention_gqa_batch`, `attention_gqa_mpi`, `attention_gqa_tensor_parallel` all have `[[deprecated]]`)
+- [x] **7.4** Decouple `AttentionWithKVCacheStage` from deprecated infrastructure ✅ (now uses `KernelFactory::createAttention()`)
+- [ ] **7.5** Update tests to use graph-based execution (future work)
+- [ ] **7.6** Full removal of deprecated classes (future work after all callers migrated)
 
 ---
 

@@ -7,20 +7,17 @@
  * This file provides a factory function for creating inference runners.
  * The actual interface (IInferenceRunner) is defined in IInferenceRunner.h.
  *
- * Both PipelineBase and GraphOrchestrator directly implement IInferenceRunner,
- * so no wrapper classes are needed.
+ * GraphOrchestrator directly implements IInferenceRunner.
  *
  * Design Goals:
- * - Pipeline and GraphOrchestrator have NO dependencies on each other
- * - Execution path selection happens at construction time
- * - Both paths implement IInferenceRunner directly
+ * - GraphOrchestrator is the sole execution path
  * - Main.cpp and ChatUI use IInferenceRunner exclusively
  *
  * @code
- * // Create runner - automatically selects path based on environment
+ * // Create runner
  * auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, config);
  *
- * // Inference (works regardless of path)
+ * // Inference
  * runner->forward(tokens, seq_len);
  * const float* logits = runner->logits();
  * @endcode
@@ -30,14 +27,13 @@
 
 #include "IInferenceRunner.h"
 #include "../loaders/ModelContext.h"
-#include "../pipelines/PipelineConfig.h"
+#include "../pipelines/RuntimeConfig.h"
 #include "../utils/MPIContext.h"
 #include <memory>
 
 namespace llaminar2
 {
     // Forward declarations to avoid pulling in full headers
-    class PipelineBase;
     class GraphOrchestrator;
 
     /**
@@ -48,21 +44,15 @@ namespace llaminar2
         int max_seq_len = 4096;
         int batch_size = 1;
 
-        // Explicit path selection (overrides environment)
-        bool force_pipeline = false;
+        // Explicit graph path selection (only graph path is supported)
         bool force_graph = false;
 
-        // Pipeline-specific settings (passed through when creating Pipeline)
+        // Activation precision
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
     };
 
     /**
-     * @brief Factory function to create appropriate inference runner
-     *
-     * Selection logic:
-     * 1. If force_pipeline: use Pipeline path
-     * 2. If force_graph: use Graph path
-     * 3. Otherwise: use Graph path (default as of December 2025)
+     * @brief Factory function to create GraphOrchestrator inference runner
      *
      * @param model_ctx Model context with weights
      * @param mpi_ctx MPI context (nullptr for single-rank)

@@ -211,6 +211,8 @@ namespace llaminar2
 
     const float *FP32Tensor::data() const
     {
+        assertValid("FP32Tensor::data");
+
         // If on device, sync to host
         // TODO: Implement lazy sync when device support is added
 
@@ -223,6 +225,8 @@ namespace llaminar2
 
     float *FP32Tensor::mutable_data()
     {
+        assertValid("FP32Tensor::mutable_data");
+
         // Mark as dirty if on device
         // TODO: Implement dirty flag when device support is added
         host_dirty_ = true;

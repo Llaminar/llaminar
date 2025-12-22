@@ -36,7 +36,7 @@
 
 #include "Op.h"
 #include "GemmOp.h" // For detail::PrecisionTensor
-#include "../PipelineConfig.h"
+#include "../RuntimeConfig.h"
 #include "../../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../../tensors/Tensors.h"
 #include <memory>

@@ -207,6 +207,7 @@ namespace llaminar2
 
     const float *INT32Tensor::data() const
     {
+        assertValid("INT32Tensor::data");
         // Dequantize to cache on demand
         size_t total_elements = 1;
         for (auto dim : shape_)

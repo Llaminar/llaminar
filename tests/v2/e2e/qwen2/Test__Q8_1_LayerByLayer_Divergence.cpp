@@ -42,7 +42,7 @@
 
 #include "inference/InferenceRunner.h"
 #include "inference/IInferenceRunner.h"
-#include "pipelines/PipelineConfig.h"
+#include "pipelines/RuntimeConfig.h"
 #include "loaders/ModelContext.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
@@ -310,7 +310,6 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
     // ===== FP32 Runner with snapshots =====
     InferenceRunnerConfig config_fp32;
     config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.force_pipeline = true; // Use Pipeline for this comparison test
 
     auto runner_fp32 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_fp32);
     ASSERT_NE(runner_fp32, nullptr) << "FP32 runner creation failed";
@@ -322,7 +321,6 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
     // ===== Q8_1 Runner with snapshots =====
     InferenceRunnerConfig config_q8_1;
     config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.force_pipeline = true; // Use Pipeline for this comparison test
 
     std::unique_ptr<IInferenceRunner> runner_q8_1;
     try
@@ -653,7 +651,6 @@ TEST_F(Test__Q8_1_LayerByLayer, SingleLayerDetailed)
     // ===== FP32 Runner =====
     InferenceRunnerConfig config_fp32;
     config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.force_pipeline = true; // Use Pipeline for this comparison test
 
     auto runner_fp32 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_fp32);
     ASSERT_NE(runner_fp32, nullptr) << "FP32 runner creation failed";
@@ -665,7 +662,6 @@ TEST_F(Test__Q8_1_LayerByLayer, SingleLayerDetailed)
     // ===== Q8_1 Runner =====
     InferenceRunnerConfig config_q8_1;
     config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.force_pipeline = true; // Use Pipeline for this comparison test
 
     std::unique_ptr<IInferenceRunner> runner_q8_1;
     try
@@ -777,7 +773,6 @@ TEST_F(Test__Q8_1_LayerByLayer, EmbeddingComparison)
     // Create FP32 runner
     InferenceRunnerConfig config_fp32;
     config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.force_pipeline = true; // Use Pipeline for this comparison test
 
     auto runner_fp32 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_fp32);
     ASSERT_NE(runner_fp32, nullptr) << "FP32 runner creation failed";
@@ -785,7 +780,6 @@ TEST_F(Test__Q8_1_LayerByLayer, EmbeddingComparison)
     // Create Q8_1 runner
     InferenceRunnerConfig config_q8_1;
     config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.force_pipeline = true; // Use Pipeline for this comparison test
 
     std::unique_ptr<IInferenceRunner> runner_q8_1;
     try

@@ -19,7 +19,7 @@
 
 #include "../../../../src/v2/pipelines/ops/RMSNormOp.h"
 #include "../../../../src/v2/tensors/Tensors.h"
-#include "../../../../src/v2/pipelines/PipelineConfig.h"
+#include "../../../../src/v2/pipelines/RuntimeConfig.h"
 
 #include <cmath>
 #include <random>

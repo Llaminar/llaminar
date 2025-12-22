@@ -23,8 +23,7 @@
 #include "backends/ComputeBackend.h"
 #include "inference/InferenceRunner.h"
 #include "inference/IInferenceRunner.h"
-#include "pipelines/PipelineConfig.h"
-#include "pipelines/qwen/Qwen2Pipeline.h"
+#include "pipelines/RuntimeConfig.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "loaders/DeviceOrchestrator.h"
@@ -120,9 +119,6 @@ int main(int argc, char *argv[])
 
     // Initialize logging from environment (LLAMINAR_LOG_LEVEL)
     initializeLogging();
-
-    // Ensure pipeline registrations (static constructors may not run in executables)
-    ensureQwen2Registration();
 
     // Parse command-line arguments using centralized ArgParser
     ArgContext args = ArgParser::parse(argc, argv);

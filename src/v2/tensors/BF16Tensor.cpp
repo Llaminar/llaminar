@@ -98,6 +98,8 @@ namespace llaminar2
 
     const float *BF16Tensor::data() const
     {
+        assertValid("BF16Tensor::data");
+
         // Lazy dequantization to FP32 cache
         if (dequant_cache_.empty())
         {
@@ -121,6 +123,7 @@ namespace llaminar2
 
     float *BF16Tensor::mutable_data()
     {
+        assertValid("BF16Tensor::mutable_data");
         throw std::runtime_error("BF16Tensor::mutable_data: BF16 tensors are immutable (use from_fp32 to update)");
     }
 

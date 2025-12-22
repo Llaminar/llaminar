@@ -17,13 +17,13 @@
 #include "../tensors/SIMDHelpers.h"
 #include "../tensors/Tensors.h" // For TensorBase::rows(), cols(), dtype_name()
 #include "../tensors/TensorSlice.h"
-#include "../pipelines/attention/MpiAttentionOrchestrator.h"
 #include "../pipelines/MPIStrategy.h"
 #include "../utils/MPIContext.h"
 
 #include <cstring>
 #include <cmath>
 #include <sstream>
+#include <iomanip>
 #include <limits>
 #include <omp.h>
 
@@ -124,6 +124,350 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // IComputeStage Tracing Implementation (Task 3: Stage Tracing Infrastructure)
+    // Controlled by LLAMINAR_TRACE_STAGES and related env vars
+    // =============================================================================
+
+    bool IComputeStage::shouldTrace() const
+    {
+        const auto &cfg = debugEnv().execution;
+        if (!cfg.trace_stages)
+        {
+            return false;
+        }
+
+        // Check filter if specified
+        if (!cfg.trace_filter.empty())
+        {
+            // Simple substring match on stage name
+            return name().find(cfg.trace_filter) != std::string::npos;
+        }
+
+        return true;
+    }
+
+    std::string IComputeStage::formatFloatArray(const float *data, size_t count)
+    {
+        const auto &cfg = debugEnv().execution;
+        const int sample_count = std::min(static_cast<size_t>(cfg.trace_sample_count), count);
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(6) << "[";
+
+        for (int i = 0; i < sample_count; ++i)
+        {
+            if (i > 0)
+                oss << ", ";
+            oss << data[i];
+        }
+
+        if (count > static_cast<size_t>(sample_count))
+        {
+            oss << ", ... (" << count << " total)";
+        }
+        oss << "]";
+
+        return oss.str();
+    }
+
+    float IComputeStage::computeChecksum(const float *data, size_t count)
+    {
+        // Simple Kahan summation for numerical stability
+        float sum = 0.0f;
+        float c = 0.0f; // Compensation for lost low-order bits
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            float y = data[i] - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
+        }
+
+        return sum;
+    }
+
+    void IComputeStage::traceInput(const std::string &tensor_name, const TensorBase *tensor) const
+    {
+        if (!shouldTrace() || !tensor)
+            return;
+
+        const auto &cfg = debugEnv().execution;
+
+        // Safe data access - numel() and fp32_data() may return nullptr for released tensors
+        size_t count = 0;
+        try
+        {
+            count = tensor->numel();
+            if (count == 0)
+            {
+                LOG_INFO("[TRACE] " << name() << " INPUT '" << tensor_name
+                                    << "' [empty tensor]");
+                return;
+            }
+        }
+        catch (...)
+        {
+            LOG_WARN("[TRACE] " << name() << " INPUT '" << tensor_name
+                                << "' [numel() failed]");
+            return;
+        }
+
+        const float *data = nullptr;
+        try
+        {
+            data = tensor->fp32_data();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[TRACE] " << name() << " INPUT '" << tensor_name
+                                << "' [fp32_data() failed: " << e.what() << "]");
+            return;
+        }
+        catch (...)
+        {
+            LOG_WARN("[TRACE] " << name() << " INPUT '" << tensor_name
+                                << "' [fp32_data() failed: unknown error]");
+            return;
+        }
+
+        // Handle nullptr - tensor's raw data may have been released (e.g., after GEMM packing)
+        if (!data)
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " INPUT '" << tensor_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                    << tensor->dtype_name() << "] ";
+            }
+            oss << "[data unavailable - raw weights released after GEMM packing]";
+            LOG_INFO(oss.str());
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "[TRACE] " << name() << " INPUT '" << tensor_name << "' ";
+
+        if (cfg.trace_shapes)
+        {
+            oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                << tensor->dtype_name() << "] ";
+        }
+
+        oss << formatFloatArray(data, count);
+
+        if (cfg.trace_checksums)
+        {
+            oss << " checksum=" << computeChecksum(data, count);
+        }
+
+        LOG_INFO(oss.str());
+    }
+
+    void IComputeStage::traceOutput(const std::string &tensor_name, const TensorBase *tensor) const
+    {
+        if (!shouldTrace() || !tensor)
+            return;
+
+        const auto &cfg = debugEnv().execution;
+
+        // Safe data access - numel() and fp32_data() may crash for invalid/empty tensors
+        size_t count = 0;
+        try
+        {
+            count = tensor->numel();
+            if (count == 0)
+            {
+                LOG_INFO("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                    << "' [empty tensor]");
+                return;
+            }
+        }
+        catch (...)
+        {
+            LOG_WARN("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                << "' [numel() failed]");
+            return;
+        }
+
+        const float *data = nullptr;
+        try
+        {
+            data = tensor->fp32_data();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_WARN("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                << "' [fp32_data() failed: " << e.what() << "]");
+            return;
+        }
+        catch (...)
+        {
+            LOG_WARN("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                << "' [fp32_data() failed: unknown error]");
+            return;
+        }
+
+        if (!data)
+        {
+            LOG_INFO("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                << "' [no fp32 data available]");
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "[TRACE] " << name() << " OUTPUT '" << tensor_name << "' ";
+
+        if (cfg.trace_shapes)
+        {
+            oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                << tensor->dtype_name() << "] ";
+        }
+
+        oss << formatFloatArray(data, count);
+
+        if (cfg.trace_checksums)
+        {
+            oss << " checksum=" << computeChecksum(data, count);
+        }
+
+        LOG_INFO(oss.str());
+    }
+
+    void IComputeStage::traceIntermediate(const std::string &array_name, const float *data, size_t count) const
+    {
+        if (!shouldTrace() || !data)
+            return;
+
+        const auto &cfg = debugEnv().execution;
+
+        std::ostringstream oss;
+        oss << "[TRACE] " << name() << " INTERMEDIATE '" << array_name << "' ";
+
+        if (cfg.trace_shapes)
+        {
+            oss << "[" << count << " elems] ";
+        }
+
+        oss << formatFloatArray(data, count);
+
+        if (cfg.trace_checksums)
+        {
+            oss << " checksum=" << computeChecksum(data, count);
+        }
+
+        LOG_DEBUG(oss.str());
+    }
+
+    // =============================================================================
+    // Shape Validation Implementation (Task 7)
+    // =============================================================================
+
+    void IComputeStage::validateShapes(std::initializer_list<TensorShapeContract> contracts) const
+    {
+        for (const auto &c : contracts)
+        {
+            if (!c.tensor)
+            {
+                std::ostringstream ss;
+                ss << name() << ": null tensor '" << c.name << "'";
+                throw std::runtime_error(ss.str());
+            }
+
+            const auto &actual = c.tensor->shape();
+            if (!shapesMatch(actual, c.expected, c.allow_broadcast))
+            {
+                std::ostringstream ss;
+                ss << name() << ": shape mismatch for '" << c.name << "' - "
+                   << "expected " << shapeToString(c.expected)
+                   << " but got " << shapeToString(actual);
+                throw std::runtime_error(ss.str());
+            }
+        }
+    }
+
+    void IComputeStage::validateShape(const std::string &tensor_name, const TensorBase *tensor,
+                                      const std::vector<size_t> &expected) const
+    {
+        validateShapes({{tensor_name, tensor, expected, false}});
+    }
+
+    void IComputeStage::validateMatmulShapes(const std::string &a_name, const TensorBase *a,
+                                             const std::string &b_name, const TensorBase *b) const
+    {
+        if (!a || !b)
+        {
+            std::ostringstream ss;
+            ss << name() << ": null tensor in matmul validation - "
+               << a_name << "=" << (a ? "valid" : "null") << ", "
+               << b_name << "=" << (b ? "valid" : "null");
+            throw std::runtime_error(ss.str());
+        }
+
+        const auto &a_shape = a->shape();
+        const auto &b_shape = b->shape();
+
+        if (a_shape.size() < 2 || b_shape.size() < 2)
+        {
+            std::ostringstream ss;
+            ss << name() << ": matmul requires 2D tensors - "
+               << a_name << " has " << a_shape.size() << "D, "
+               << b_name << " has " << b_shape.size() << "D";
+            throw std::runtime_error(ss.str());
+        }
+
+        size_t a_k = a_shape[a_shape.size() - 1]; // Last dim of A
+        size_t b_k = b_shape[b_shape.size() - 2]; // Second-to-last dim of B
+
+        if (a_k != b_k)
+        {
+            std::ostringstream ss;
+            ss << name() << ": matmul K dimension mismatch - "
+               << a_name << " has K=" << a_k << " (shape " << shapeToString(a_shape) << "), "
+               << b_name << " has K=" << b_k << " (shape " << shapeToString(b_shape) << ")";
+            throw std::runtime_error(ss.str());
+        }
+    }
+
+    bool IComputeStage::shapesMatch(const std::vector<size_t> &actual,
+                                    const std::vector<size_t> &expected,
+                                    bool allow_broadcast)
+    {
+        if (actual.size() != expected.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            if (actual[i] != expected[i])
+            {
+                // With broadcast, trailing dims of 1 match anything
+                if (allow_broadcast && (actual[i] == 1 || expected[i] == 1))
+                {
+                    continue;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::string IComputeStage::shapeToString(const std::vector<size_t> &shape)
+    {
+        std::ostringstream ss;
+        ss << "(";
+        for (size_t i = 0; i < shape.size(); ++i)
+        {
+            if (i > 0)
+                ss << ", ";
+            ss << shape[i];
+        }
+        ss << ")";
+        return ss.str();
+    }
+
+    // =============================================================================
     // StageDumpInfo Implementation
     // =============================================================================
 
@@ -154,6 +498,75 @@ namespace llaminar2
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
         outputs.push_back({name, data, rows, cols, dtype, sizeof(float)});
         return *this;
+    }
+
+    // =============================================================================
+    // GEMMStage::Params Implementation
+    // =============================================================================
+
+    const float *GEMMStage::Params::getBiasData() const
+    {
+        // Prefer bias_tensor over raw bias pointer for TensorSlice compatibility
+        if (bias_tensor)
+        {
+            // Use unified data access interface - works for FP32Tensor and TensorSlice
+            if (bias_tensor->is_fp32_backed())
+            {
+                return bias_tensor->data();
+            }
+            else
+            {
+                // Non-FP32-backed bias tensor (e.g., quantized) - not supported
+                LOG_WARN("[GEMMStage::Params] bias_tensor is not FP32-backed, ignoring. "
+                         "Type: "
+                         << bias_tensor->dtype_name());
+                return nullptr;
+            }
+        }
+        // Fall back to raw bias pointer (legacy interface)
+        return bias;
+    }
+
+    void GEMMStage::Params::validate(const std::string &stage_name) const
+    {
+        std::ostringstream errors;
+
+        // Check required tensors
+        if (!A)
+        {
+            errors << "Input tensor A is null. ";
+        }
+        if (!B)
+        {
+            errors << "Weight tensor B is null. ";
+        }
+        if (!C)
+        {
+            errors << "Output tensor C is null. ";
+        }
+
+        // Check dimensions
+        if (m <= 0 || n <= 0 || k <= 0)
+        {
+            errors << "Invalid dimensions (m=" << m << ", n=" << n << ", k=" << k << "). ";
+        }
+
+        // Check bias requirement
+        if (bias_required)
+        {
+            const float *bias_data = getBiasData();
+            if (!bias_data)
+            {
+                errors << "Bias is required but not provided (neither bias nor bias_tensor set). ";
+            }
+        }
+
+        // Throw if any errors
+        std::string error_str = errors.str();
+        if (!error_str.empty())
+        {
+            throw std::runtime_error("[" + stage_name + "] Configuration error: " + error_str);
+        }
     }
 
     // =============================================================================
@@ -189,6 +602,10 @@ namespace llaminar2
                                                            << " n=" << params_.n << " k=" << params_.k);
             return false;
         }
+
+        // === Stage Tracing (Task 3) ===
+        traceInput("A", params_.A);
+        traceInput("B", params_.B);
 
         // Check if this is a sliced (tensor-parallel) GEMM
         const bool is_sliced = !params_.output_range.empty();
@@ -266,12 +683,17 @@ namespace llaminar2
             if (!gate_fp32 && params_.C->native_type() == TensorType::Q8_1)
             {
                 LOG_DEBUG("[GEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
-                return qgemm->multiply_tensor(
+                bool success = qgemm->multiply_tensor(
                     params_.A, params_.C,
                     params_.m, effective_n, params_.k,
                     params_.transpose_B,
                     params_.alpha, params_.beta,
                     params_.mpi_ctx, params_.device_idx);
+
+                // === Stage Tracing (Task 3) ===
+                if (success)
+                    traceOutput("C", params_.C);
+                return success;
             }
 
             // For SwiGLU fusion or FP32 output, use multiply_fused
@@ -285,11 +707,14 @@ namespace llaminar2
                 return false;
             }
 
-            return qgemm->multiply_fused(
+            // Use getBiasData() for TensorSlice compatibility (TP sharded bias)
+            const float *bias_data = params_.getBiasData();
+
+            bool success = qgemm->multiply_fused(
                 input_fp32,
                 output_fp32,
                 params_.m, effective_n, params_.k,
-                params_.bias,           // Fused bias
+                bias_data,              // Fused bias (via unified interface)
                 nullptr,                // No attention mask
                 false,                  // No softmax
                 nullptr, nullptr,       // No softmax buffers
@@ -298,6 +723,11 @@ namespace llaminar2
                 params_.mpi_ctx, params_.device_idx,
                 gate_fp32,
                 params_.do_swiglu);
+
+            // === Stage Tracing (Task 3) ===
+            if (success)
+                traceOutput("C", params_.C);
+            return success;
         }
 
         // FP32 GEMM fallback (for non-quantized weights)
@@ -306,6 +736,8 @@ namespace llaminar2
                                   params_.transpose_B, params_.alpha, params_.beta,
                                   params_.mpi_ctx, params_.device_idx))
         {
+            // === Stage Tracing (Task 3) ===
+            traceOutput("C", params_.C);
             return true;
         }
 
@@ -319,11 +751,16 @@ namespace llaminar2
             return false;
         }
 
-        return gemm->multiply(
+        bool success = gemm->multiply(
             input_fp32,
             output_fp32,
             params_.m, effective_n, params_.k,
             params_.alpha, params_.beta);
+
+        // === Stage Tracing (Task 3) ===
+        if (success)
+            traceOutput("C", params_.C);
+        return success;
     }
 
     size_t GEMMStage::estimatedFlops() const
@@ -392,10 +829,11 @@ namespace llaminar2
             info.addOutput("C", params_.C, params_.m, params_.n);
         }
 
-        // Optional inputs
-        if (params_.bias)
+        // Optional inputs - use unified interface for bias
+        const float *bias_data = params_.getBiasData();
+        if (bias_data)
         {
-            info.addInput("bias", params_.bias, 1, params_.n);
+            info.addInput("bias", bias_data, 1, params_.n);
         }
         if (params_.gate_input)
         {
@@ -436,8 +874,9 @@ namespace llaminar2
         // OUTPUT buffer
         reqs.addOutput("C", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, c_type);
 
-        // Optional bias
-        if (params_.bias)
+        // Optional bias (check both raw pointer and tensor)
+        const float *bias_data = params_.getBiasData();
+        if (bias_data)
         {
             reqs.addWeight("bias", {static_cast<size_t>(params_.n)}, BufferTensorType::FP32);
         }
@@ -1002,6 +1441,10 @@ namespace llaminar2
             return false;
         }
 
+        // === Stage Tracing (Task 3) ===
+        traceInput("input", params_.input);
+        traceInput("gamma", params_.gamma);
+
         // Use explicit seq_len if provided, otherwise derive from tensor dimensions
         // CRITICAL: For pre-allocated buffers, params_.seq_len must be set to avoid
         // processing garbage data beyond the actual sequence
@@ -1024,7 +1467,7 @@ namespace llaminar2
         }
 
         // apply_tensor handles input != output cases internally
-        return kernel->apply_tensor(
+        bool success = kernel->apply_tensor(
             params_.input,
             params_.gamma,
             params_.output,
@@ -1033,6 +1476,11 @@ namespace llaminar2
             params_.eps,
             params_.mpi_ctx,
             params_.device_idx);
+
+        // === Stage Tracing (Task 3) ===
+        if (success)
+            traceOutput("output", params_.output);
+        return success;
     }
 
     size_t RMSNormStage::estimatedFlops() const
@@ -1752,6 +2200,7 @@ namespace llaminar2
     bool AllreduceStage::execute(IDeviceContext *ctx)
     {
         (void)ctx;
+        const auto &mpi_env = debugEnv().mpi_logging;
 
         if (!params_.buffer)
         {
@@ -1761,6 +2210,13 @@ namespace llaminar2
 
         // Use explicit count if provided, otherwise use buffer size
         size_t count = params_.count > 0 ? params_.count : params_.buffer->numel();
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[MPI] AllReduce START: count=" << count
+                                                     << " dtype=" << params_.buffer->dtype_name());
+        }
+
         LOG_DEBUG("[AllreduceStage] Execute: buffer=" << params_.buffer
                                                       << " count=" << count << " has_comm=" << (params_.mpi_comm != nullptr));
         if (!params_.mpi_comm)
@@ -1797,7 +2253,23 @@ namespace llaminar2
             return false;
         }
 
+        // Compute checksum before if verification enabled
+        float checksum_before = 0.0f;
+        if (mpi_env.verify_checksums && mpi_type == MPI_FLOAT)
+        {
+            const float *f = static_cast<const float *>(data_ptr);
+            for (size_t i = 0; i < count; ++i)
+            {
+                checksum_before += f[i];
+            }
+            LOG_INFO("[MPI] AllReduce checksum BEFORE: " << checksum_before);
+        }
+
         LOG_DEBUG("[AllreduceStage] Calling MPI_Allreduce with count=" << count);
+
+        // Start timing if enabled
+        auto start_time = std::chrono::high_resolution_clock::now();
+
         int result = MPI_Allreduce(
             MPI_IN_PLACE,
             data_ptr,
@@ -1806,12 +2278,42 @@ namespace llaminar2
             MPI_SUM,
             comm);
 
+        // End timing
+        auto end_time = std::chrono::high_resolution_clock::now();
+
         // Debug: dump values after AllReduce
         if (mpi_type == MPI_FLOAT)
         {
             float *f = static_cast<float *>(data_ptr);
             LOG_DEBUG("[AllreduceStage] After AllReduce: data[0:4]="
                       << f[0] << "," << f[1] << "," << f[2] << "," << f[3]);
+        }
+
+        // Log timing if enabled
+        if (mpi_env.log_timing)
+        {
+            double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            double bytes = count * sizeof(float);
+            double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
+            LOG_INFO("[MPI] AllReduce timing: " << ms << " ms for " << count
+                                                << " elements (" << bandwidth_gbps << " GB/s)");
+        }
+
+        // Verify checksum after if enabled
+        if (mpi_env.verify_checksums && mpi_type == MPI_FLOAT)
+        {
+            float checksum_after = 0.0f;
+            const float *f = static_cast<const float *>(data_ptr);
+            for (size_t i = 0; i < count; ++i)
+            {
+                checksum_after += f[i];
+            }
+            LOG_INFO("[MPI] AllReduce checksum AFTER: " << checksum_after);
+        }
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[MPI] AllReduce END: result=" << (result == MPI_SUCCESS ? "SUCCESS" : "FAILED"));
         }
 
         LOG_DEBUG("[AllreduceStage] MPI_Allreduce returned " << result);
@@ -1848,6 +2350,7 @@ namespace llaminar2
     bool AllGatherStage::execute(IDeviceContext *ctx)
     {
         (void)ctx;
+        const auto &mpi_env = debugEnv().mpi_logging;
 
         if (!params_.local_input)
         {
@@ -1992,6 +2495,18 @@ namespace llaminar2
             return false;
         }
 
+        // Log MPI collective start
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[MPI] AllGather START: seq_len=" << seq_len
+                                                       << " vocab_local=" << vocab_local
+                                                       << " vocab_full=" << vocab_full
+                                                       << " world_size=" << params_.world_size);
+        }
+
+        // Start timing if enabled
+        auto start_time = std::chrono::high_resolution_clock::now();
+
         // Step 3: Use MPI_Allgather with the resized type
         // Send: seq_len * vocab_local contiguous floats
         // Recv: 1 resized_type per rank (each type covers seq_len strided blocks)
@@ -2004,6 +2519,9 @@ namespace llaminar2
             resized_type,
             comm);
 
+        // End timing
+        auto end_time = std::chrono::high_resolution_clock::now();
+
         // Clean up the derived type
         MPI_Type_free(&resized_type);
 
@@ -2011,6 +2529,22 @@ namespace llaminar2
         {
             LOG_ERROR("[AllGatherStage] MPI_Allgather (strided) failed with error " << mpi_result);
             return false;
+        }
+
+        // Log timing if enabled
+        if (mpi_env.log_timing)
+        {
+            double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            size_t total_elements = seq_len * vocab_local;
+            double bytes = total_elements * sizeof(float) * params_.world_size; // Total bytes gathered
+            double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
+            LOG_INFO("[MPI] AllGather timing: " << ms << " ms for " << total_elements
+                                                << " elements/rank (" << bandwidth_gbps << " GB/s aggregate)");
+        }
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[MPI] AllGather END: result=SUCCESS");
         }
 
         // Debug: dump gathered logits at last position
@@ -2357,50 +2891,6 @@ namespace llaminar2
         return Mode::PREFILL;
     }
 
-    MpiAttentionConfig AttentionWithKVCacheStage::buildAttentionConfig() const
-    {
-        MpiAttentionConfig config;
-        config.n_heads = params_.n_heads;
-        config.n_kv_heads = params_.n_kv_heads;
-        config.head_dim = params_.head_dim;
-        config.causal = params_.causal;
-        config.window_size = params_.window_size;
-        config.seq_len = params_.seq_len; // Pass explicit seq_len to avoid incorrect inference from Q shape
-
-        // Auto-detect precision from Q tensor type (Q is authoritative since K/V come from cache)
-        if (params_.Q && params_.Q->native_type() == TensorType::Q8_1)
-        {
-            config.precision = ActivationPrecision::Q8_1;
-        }
-        else
-        {
-            config.precision = ActivationPrecision::FP32;
-        }
-
-        config.mpi_ctx = params_.mpi_ctx;
-        config.mpi_strategy = static_cast<MPIStrategy>(params_.mpi_strategy);
-        config.verbose_logging = false;
-
-        // Wire workspace buffers if provided
-        if (params_.workspace_scores)
-        {
-            config.workspace_scores = std::shared_ptr<TensorBase>(
-                params_.workspace_scores, [](TensorBase *) {}); // Non-owning
-        }
-        if (params_.workspace_context)
-        {
-            config.workspace_context = std::shared_ptr<TensorBase>(
-                params_.workspace_context, [](TensorBase *) {});
-        }
-        if (params_.workspace_mask)
-        {
-            config.workspace_mask = std::shared_ptr<TensorBase>(
-                params_.workspace_mask, [](TensorBase *) {});
-        }
-
-        return config;
-    }
-
     bool AttentionWithKVCacheStage::execute(IDeviceContext *ctx)
     {
         if (!ctx)
@@ -2491,19 +2981,58 @@ namespace llaminar2
             return false;
         }
 
-        // Step 4: Build attention config and dispatch to MpiAttentionOrchestrator
-        MpiAttentionConfig config = buildAttentionConfig();
+        // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
+        const int device_idx = params_.device_idx;
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
+        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_view.get(), dev_type);
 
-        // Dispatch to MPI-aware attention using views
-        bool success = MpiAttentionOrchestrator::compute_mpi(
+        if (!attention_kernel)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executePrefill] Failed to create attention kernel");
+            return false;
+        }
+
+        // Step 5: Allocate workspace for attention scores [n_heads, seq_len, kv_len]
+        FP32Tensor scores_workspace({static_cast<size_t>(params_.n_heads * params_.seq_len * kv_len)});
+
+        // Step 6: Build causal mask if needed
+        std::unique_ptr<FP32Tensor> mask_tensor;
+        if (params_.causal)
+        {
+            mask_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(params_.seq_len * kv_len)});
+            float *mask_data = mask_tensor->mutable_data();
+            for (int q = 0; q < params_.seq_len; ++q)
+            {
+                for (int k = 0; k < kv_len; ++k)
+                {
+                    // Causal: Q at position q can attend to K at positions [0, q]
+                    mask_data[q * kv_len + k] = (k <= q) ? 0.0f : -std::numeric_limits<float>::infinity();
+                }
+            }
+        }
+
+        // Step 7: Dispatch via compute_tensor
+        bool success = attention_kernel->compute_tensor(
             Q_view.get(), K_view.get(), V_view.get(), out_view.get(),
-            config,
             params_.batch_size,
-            params_.sequence_lengths);
+            params_.seq_len, // Query sequence length
+            kv_len,          // Key/value sequence length
+            params_.n_heads,
+            params_.n_kv_heads,
+            params_.head_dim,
+            params_.causal,
+            params_.window_size,
+            &scores_workspace,
+            mask_tensor.get(),
+            params_.mpi_ctx.get(),
+            device_idx,
+            params_.head_start,
+            params_.local_n_heads,
+            params_.local_n_kv_heads);
 
         if (!success)
         {
-            LOG_ERROR("[AttentionWithKVCacheStage] MpiAttentionOrchestrator::compute_mpi failed");
+            LOG_ERROR("[AttentionWithKVCacheStage::executePrefill] Attention kernel compute_tensor failed");
             return false;
         }
 
@@ -2651,19 +3180,77 @@ namespace llaminar2
             }
         }
 
-        // Build attention config
-        MpiAttentionConfig config = buildAttentionConfig();
+        // Create attention kernel via KernelFactory (device-aware dispatch)
+        const int device_idx = params_.device_idx;
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
+        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
 
-        // Dispatch batched attention
-        bool success = MpiAttentionOrchestrator::compute_mpi(
+        if (!attention_kernel)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] Failed to create attention kernel");
+            return false;
+        }
+
+        // Allocate workspace for attention scores
+        // For batched: [batch_size * n_heads, seq_len, seq_len] but we compute per-batch
+        FP32Tensor scores_workspace({static_cast<size_t>(params_.n_heads * params_.seq_len * params_.seq_len)});
+
+        // Build padding-aware causal mask if needed
+        std::unique_ptr<FP32Tensor> mask_tensor;
+        if (params_.causal || params_.sequence_lengths)
+        {
+            // For batched: need full [batch*seq, batch*seq] mask for cross-batch isolation
+            const int total_tokens = params_.batch_size * params_.seq_len;
+            mask_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens * total_tokens)});
+            float *mask_data = mask_tensor->mutable_data();
+
+            // Initialize with -inf (block all)
+            std::fill(mask_data, mask_data + total_tokens * total_tokens, -std::numeric_limits<float>::infinity());
+
+            // Allow within-batch attention with causal masking
+            for (int b = 0; b < params_.batch_size; ++b)
+            {
+                int actual_len = params_.sequence_lengths ? (*params_.sequence_lengths)[b] : params_.seq_len;
+                int batch_offset = b * params_.seq_len;
+
+                for (int q = 0; q < actual_len; ++q)
+                {
+                    int q_pos = batch_offset + q;
+                    for (int k = 0; k < actual_len; ++k)
+                    {
+                        int k_pos = batch_offset + k;
+                        // Causal: Q at position q can attend to K at positions [0, q] within batch
+                        if (!params_.causal || k <= q)
+                        {
+                            mask_data[q_pos * total_tokens + k_pos] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dispatch via compute_tensor
+        bool success = attention_kernel->compute_tensor(
             params_.Q, params_.K, params_.V, params_.output,
-            config,
             params_.batch_size,
-            params_.sequence_lengths);
+            params_.seq_len, // Query sequence length
+            params_.seq_len, // KV length (same for batched prefill)
+            params_.n_heads,
+            params_.n_kv_heads,
+            params_.head_dim,
+            params_.causal,
+            params_.window_size,
+            &scores_workspace,
+            mask_tensor.get(),
+            params_.mpi_ctx.get(),
+            device_idx,
+            params_.head_start,
+            params_.local_n_heads,
+            params_.local_n_kv_heads);
 
         if (!success)
         {
-            LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] MpiAttentionOrchestrator failed");
+            LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] Attention kernel compute_tensor failed");
             return false;
         }
 

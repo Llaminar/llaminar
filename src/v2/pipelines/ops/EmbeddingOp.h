@@ -29,7 +29,7 @@
 
 #include "Op.h"
 #include "GemmOp.h" // For detail::PrecisionTensor
-#include "../PipelineConfig.h"
+#include "../RuntimeConfig.h"
 #include "../../kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "../../tensors/Tensors.h"
 #include <memory>

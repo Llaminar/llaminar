@@ -18,7 +18,7 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/utils/MPIContext.h"
-#include "v2/pipelines/PipelineConfig.h"
+#include "v2/pipelines/RuntimeConfig.h"
 
 using namespace llaminar2;
 

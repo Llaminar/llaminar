@@ -263,6 +263,12 @@ namespace llaminar2
                 ctx.chat_template = getNextArg(argv, argc, i, "chat-template");
             }
 
+            // Deterministic mode
+            else if (arg == "--deterministic")
+            {
+                ctx.deterministic = true;
+            }
+
             // Benchmark mode
             else if (arg == "--benchmark")
             {
@@ -297,6 +303,32 @@ namespace llaminar2
             {
                 std::cerr << "Warning: Unknown argument '" << arg << "'" << std::endl;
             }
+        }
+
+        // Apply deterministic mode settings
+        // This must happen AFTER all argument parsing but BEFORE returning
+        if (ctx.deterministic)
+        {
+            // Force greedy sampling
+            if (ctx.temperature != 0.0f)
+            {
+                LOG_INFO("[Deterministic] Forcing temperature=0 (was " << ctx.temperature << ")");
+                ctx.temperature = 0.0f;
+            }
+
+            // Force fixed seed
+            if (ctx.seed <= 0)
+            {
+                ctx.seed = 42;
+                LOG_INFO("[Deterministic] Setting seed=42");
+            }
+
+            // Disable stochastic sampling
+            ctx.top_p = 1.0f; // Disable nucleus sampling
+            ctx.top_k = 0;    // Disable top-k (0 = disabled)
+
+            LOG_INFO("[Deterministic] Mode enabled: temperature=0, seed=" << ctx.seed
+                                                                          << ", top_p=1.0, top_k=disabled");
         }
 
         // Apply verbose level to Logger (if specified via CLI)
@@ -394,6 +426,12 @@ namespace llaminar2
         std::cout << "  --benchmark               Run benchmark mode (separate prefill/decode timing)\n";
         std::cout << "                            Uses greedy sampling for deterministic results\n";
         std::cout << "                            Default: 128 tokens if -n not specified\n\n";
+
+        std::cout << "Reproducibility:\n";
+        std::cout << "  --deterministic           Enable deterministic mode for reproducible outputs.\n";
+        std::cout << "                            Forces: temperature=0, seed=42, top_p=1.0, top_k=disabled.\n";
+        std::cout << "                            Equivalent to: -t 0 -s 42 --top-p 1.0 --top-k 0\n";
+        std::cout << "                            Useful for debugging and comparison testing.\n\n";
 
         std::cout << "Fused Attention:\n";
         std::cout << "  --fused-attention         Enable fused attention+Wo kernel (requires Q8_1 activations)\n";

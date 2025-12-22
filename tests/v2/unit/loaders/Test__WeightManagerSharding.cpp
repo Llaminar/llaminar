@@ -58,15 +58,18 @@ protected:
 // ShardingMode Determination Tests
 // =============================================================================
 
-TEST_F(WeightManagerShardingTest, DeterminesRowParallelForAttnOutput)
+TEST_F(WeightManagerShardingTest, DeterminesInputParallelForAttnOutput)
 {
-    // attn_output.weight should be row-parallel (split input dimension)
+    // attn_output.weight (Wo) is INPUT_PARALLEL to match column-parallel QKV output
+    // Wo: [d_model, n_heads * head_dim] → [d_model, local_heads * head_dim] per rank
+    // Input: [seq, local_heads * head_dim] from local attention
+    // Output: [seq, d_model] partial sum, needs AllReduce
     EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_output.weight"),
-              ShardingMode::ROW_PARALLEL);
+              ShardingMode::INPUT_PARALLEL);
     EXPECT_EQ(WeightManager::determineShardingMode("layers.5.self_attn.o_proj.weight"),
               ShardingMode::REPLICATE); // Different naming convention
     EXPECT_EQ(WeightManager::determineShardingMode("attn_output.weight"),
-              ShardingMode::ROW_PARALLEL);
+              ShardingMode::INPUT_PARALLEL);
 }
 
 TEST_F(WeightManagerShardingTest, DeterminesInputParallelForFFNDown)

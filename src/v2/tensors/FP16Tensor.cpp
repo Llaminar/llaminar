@@ -97,6 +97,7 @@ namespace llaminar2
 
     const float *FP16Tensor::data() const
     {
+        assertValid("FP16Tensor::data");
         // Lazy dequantization to FP32 cache
         if (dequant_cache_.empty())
         {

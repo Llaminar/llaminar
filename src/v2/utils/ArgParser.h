@@ -83,6 +83,9 @@ namespace llaminar2
         // Benchmark mode
         bool benchmark_mode = false; // Run benchmark (prefill + decode timing)
 
+        // Deterministic mode (for reproducible outputs and comparison testing)
+        bool deterministic = false; // Forces temperature=0, seed=42, top_p=1.0, top_k=0
+
         // Fused attention kernel
         bool use_fused_attention = false;        // Use fused attention+Wo kernel
         std::string fused_attention_backend_str; // Backend: "jit" (default), "reference", "tiled"

@@ -24,7 +24,7 @@
 #include "../../../../src/v2/pipelines/ops/GemmOp.h"
 #include "../../../../src/v2/tensors/Tensors.h"
 #include "../../../../src/v2/kernels/KernelFactory.h"
-#include "../../../../src/v2/pipelines/PipelineConfig.h"
+#include "../../../../src/v2/pipelines/RuntimeConfig.h"
 #include "../../../../src/v2/loaders/ModelContext.h"
 
 #include <cmath>

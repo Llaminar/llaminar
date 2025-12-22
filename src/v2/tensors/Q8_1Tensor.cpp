@@ -311,6 +311,7 @@ namespace llaminar2
 
     const float *Q8_1Tensor::fp32_data() const
     {
+        assertValid("Q8_1Tensor::fp32_data");
         // Explicit FP32 dequantization - the caller acknowledges the precision conversion.
 
         // For mutable views, return data from parent's cache

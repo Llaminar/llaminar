@@ -522,17 +522,11 @@ add_library(llaminar2_core STATIC
     loaders/WeightManager.cpp
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
-    pipelines/PipelineBase.cpp
-    pipelines/PipelineFactory.cpp
-    pipelines/PipelineExecutor.cpp
-    pipelines/qwen/Qwen2Pipeline.cpp
     pipelines/qwen/Qwen2Graph.cpp
     pipelines/qwen/GraphOrchestrator.cpp
     pipelines/qwen/Qwen2LayerExecutor.cpp
     pipelines/qwen/Qwen2ModelExecutor.cpp
     pipelines/qwen/Qwen2BufferSpec.cpp
-    pipelines/attention/GQAAttention.cpp
-    pipelines/attention/MpiAttentionOrchestrator.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
@@ -594,9 +588,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
-    # Testing infrastructure (Phase 3a & 3b)
-    testing/MockPipeline.cpp
-    testing/AttentionTestHarness.cpp
+    # Testing infrastructure
     testing/PerfHarness.cpp
     utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp

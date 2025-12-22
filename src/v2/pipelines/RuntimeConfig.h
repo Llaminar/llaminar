@@ -1,10 +1,10 @@
 /**
- * @file PipelineConfig.h
- * @brief Runtime configuration for pipeline initialization
+ * @file RuntimeConfig.h
+ * @brief Runtime configuration for inference
  * @author David Sanftenberg
  * @date 2025-10-25
  *
- * Encapsulates runtime parameters that affect pipeline behavior but are not
+ * Encapsulates runtime parameters that affect inference behavior but are not
  * part of the model architecture (which comes from GGUF metadata).
  */
 

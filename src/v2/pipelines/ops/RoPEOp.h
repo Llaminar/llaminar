@@ -13,7 +13,7 @@
 #pragma once
 
 #include "Op.h"
-#include "../PipelineConfig.h"
+#include "../RuntimeConfig.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"

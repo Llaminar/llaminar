@@ -22,7 +22,7 @@
 #pragma once
 
 #include "../CPUKernelBase.h"
-#include "../../../pipelines/PipelineConfig.h"
+#include "../../../pipelines/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h" // For ITensorRoPE
 

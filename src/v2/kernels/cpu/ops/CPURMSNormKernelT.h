@@ -24,7 +24,7 @@
 
 #pragma once
 
-#include "../../../pipelines/PipelineConfig.h"
+#include "../../../pipelines/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, etc. (apply_tensor)

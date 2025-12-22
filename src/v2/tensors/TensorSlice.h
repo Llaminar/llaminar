@@ -249,6 +249,13 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override { return inner()->copyFrom(src); }
 
         // =======================================================================
+        // Unified FP32 Access Interface (Phase 1 Infrastructure - delegate to inner)
+        // =======================================================================
+        float *mutable_fp32_data() override { return inner()->mutable_fp32_data(); }
+        bool is_fp32_backed() const override { return inner()->is_fp32_backed(); }
+        bool is_view() const override { return true; } // TensorSlice is always a view/wrapper
+
+        // =======================================================================
         // Type Conversion (delegate to inner)
         // =======================================================================
 

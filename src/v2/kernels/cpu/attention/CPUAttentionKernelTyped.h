@@ -27,7 +27,7 @@
 #include "../gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
 #include "../gemm_v4/AttentionInputDumper.h"
 #include "../../../pipelines/AttentionUtils.h"
-#include "../../../pipelines/PipelineConfig.h"
+#include "../../../pipelines/RuntimeConfig.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/OpenMPUtils.h"

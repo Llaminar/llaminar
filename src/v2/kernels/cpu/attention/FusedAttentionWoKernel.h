@@ -24,7 +24,7 @@
 #include "utils/Logger.h"
 #include <memory>
 #include <cmath>
-#include "pipelines/PipelineConfig.h" // For FusedAttentionBackend enum
+#include "pipelines/RuntimeConfig.h" // For FusedAttentionBackend enum
 
 namespace llaminar2
 {

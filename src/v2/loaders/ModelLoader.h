@@ -24,7 +24,7 @@
 
 #pragma once
 
-#include "../pipelines/PipelineConfig.h" // for WeightPrecision
+#include "../pipelines/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"    // for owned_factory_
 #include <cstdint>
 #include <fstream>

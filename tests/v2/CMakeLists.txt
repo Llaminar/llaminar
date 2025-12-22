@@ -1203,17 +1203,6 @@ add_v2_test(V2_Unit_BPEByteEncoding
 )
 
 # Test: Attention parity regression tests (locks in RoPE theta, causal masking, GQA behavior)
-add_executable(v2_test_attention_parity unit/Test__AttentionParity.cpp)
-target_link_libraries(v2_test_attention_parity 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_AttentionParity 
-    COMMAND $<TARGET_FILE:v2_test_attention_parity>
-    LABELS "V2;Unit;Attention;RegressionTests;RoPE;CausalMasking;GQA;ParityTesting;CPU"
-    MPI_PROCS 1  # Single rank for unit testing
-)
 
 # Test: AttentionComputeStage dynamic kv_len from KV cache
 add_executable(v2_test_attention_dynamic_kvlen unit/Test__AttentionComputeStage_DynamicKVLen.cpp)
@@ -1242,17 +1231,6 @@ add_v2_test(V2_Unit_SwiGLUParity
 )
 
 # Test: Batch attention correctness - mask generation and batched processing
-add_executable(v2_test_batch_attention_correctness unit/Test__BatchAttentionCorrectness.cpp)
-target_link_libraries(v2_test_batch_attention_correctness 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_BatchAttentionCorrectness 
-    COMMAND $<TARGET_FILE:v2_test_batch_attention_correctness>
-    LABELS "V2;Unit;Attention;BatchProcessing;MaskGeneration;PaddingMask;CausalMask;BlockDiagonal"
-    MPI_PROCS 1  # Unit test for mask utilities, single rank
-)
 
 # Test: Attention mask application - verify masks are applied before softmax
 add_executable(v2_test_attention_mask_application unit/Test__AttentionMaskApplication.cpp)
@@ -1281,56 +1259,12 @@ add_v2_test(V2_Unit_AttentionSequentialVsBatched
 )
 
 # Test: GQAAttention batched path (comprehensive batched attention tests)
-add_executable(v2_test_gqa_attention_batched_path unit/Test__GQAAttention_BatchedPath.cpp)
-target_link_libraries(v2_test_gqa_attention_batched_path 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_GQAAttention_BatchedPath
-    COMMAND $<TARGET_FILE:v2_test_gqa_attention_batched_path>
-    LABELS "V2;Unit;Attention;GQA;Batched;Causal;Padding;HeadBroadcasting"
-    MPI_PROCS 1  # Unit test for GQAAttention compute_batch()
-)
 
 # Test: GQAAttention padding mask correctness
-add_executable(v2_test_gqa_attention_padding_mask unit/Test__GQAAttention_PaddingMask.cpp)
-target_link_libraries(v2_test_gqa_attention_padding_mask 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_GQAAttention_PaddingMask
-    COMMAND $<TARGET_FILE:v2_test_gqa_attention_padding_mask>
-    LABELS "V2;Unit;Attention;GQA;Padding;Masking;BatchProcessing;SequenceIsolation"
-    MPI_PROCS 1  # Unit test for padding mask construction and application
-)
 
 # Test: GQAAttention mask passing verification (critical bug investigation)
-add_executable(v2_test_gqa_attention_mask_passing unit/Test__GQAAttention_MaskPassing.cpp)
-target_link_libraries(v2_test_gqa_attention_mask_passing 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_GQAAttention_MaskPassing
-    COMMAND $<TARGET_FILE:v2_test_gqa_attention_mask_passing>
-    LABELS "V2;Unit;Attention;GQA;MaskPassing;BufferLayout;PaddingZeroing;SequentialVsBatch"
-    MPI_PROCS 1  # Critical tests for batch padding divergence bug
-)
 
 # Test: MpiAttentionOrchestrator mask passing verification
-add_executable(v2_test_mpi_attention_orchestrator_mask_passing unit/Test__MpiAttentionOrchestrator_MaskPassing.cpp)
-target_link_libraries(v2_test_mpi_attention_orchestrator_mask_passing 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MpiAttentionOrchestrator_MaskPassing
-    COMMAND $<TARGET_FILE:v2_test_mpi_attention_orchestrator_mask_passing>
-    LABELS "V2;Unit;Attention;MpiOrchestrator;MaskPassing;BatchProcessing;MPIDispatch;SequentialVsBatch"
-    MPI_PROCS 1  # Tests orchestrator layer mask handling (next layer up from GQA)
-)
 
 # Test: Attention mask diagnostic (basic mask construction verification)
 add_executable(v2_test_attention_mask_diagnostic unit/Test__AttentionMaskDiagnostic.cpp)
@@ -2055,16 +1989,6 @@ add_v2_test(V2_Unit_WeightManagerSharding
     LABELS "V2;Unit;TensorParallelism;WeightSharding;RowParallel"
 )
 
-# Test: PipelineBase Device Detection (Phase 3)
-add_executable(v2_test_pipeline_device_detection
-    unit/pipelines/Test__PipelineBase_DeviceDetection.cpp
-)
-target_link_libraries(v2_test_pipeline_device_detection llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_PipelineDeviceDetection
-    COMMAND $<TARGET_FILE:v2_test_pipeline_device_detection>
-    LABELS "V2;Unit;PipelineExecution;DeviceManagement;MoE;Phase3"
-)
-
 # =============================================================================
 # Execution Framework Tests (WorkDistributor, DeviceContext)
 # =============================================================================
@@ -2319,13 +2243,6 @@ add_v2_test(V2_Unit_CPUKernelDeviceIndex
 # Tests that graph buffer management requires decomposed attention path (KVCacheAppendStage +
 # AttentionComputeStage) instead of AttentionWithKVCacheStage which uses create_view().
 # Covers the crash caused by unique_ptr buffers not supporting shared_from_this().
-add_executable(v2_test_decomposed_attention_requirement unit/Test__DecomposedAttentionRequirement.cpp)
-target_link_libraries(v2_test_decomposed_attention_requirement llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_DecomposedAttentionRequirement
-    COMMAND $<TARGET_FILE:v2_test_decomposed_attention_requirement>
-    LABELS "V2;Unit;Execution;Attention;GraphBufferManagement;DecomposedAttention;Regression"
-    MPI_PROCS 1
-)
 
 # Test: LayerExecutorInterface (ILayerExecutor interface and MockLayerExecutor)
 # Tests polymorphic execution, MockLayerExecutor behavior, interface-based testing patterns,
@@ -2362,23 +2279,10 @@ add_v2_test(V2_Unit_AllGatherStage
 # Test: PipelineExecutor (LayerExecutor-to-pipeline adapter)
 # Tests configuration, device context management, and individual operation execution
 # Bridges new execution framework with existing pipeline infrastructure
-add_executable(v2_test_pipeline_executor unit/Test__PipelineExecutor.cpp)
-target_link_libraries(v2_test_pipeline_executor llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_PipelineExecutor
-    COMMAND $<TARGET_FILE:v2_test_pipeline_executor>
-    LABELS "V2;Unit;PipelineExecution;Execution;LayerExecutor;ComputeStage;DeviceContext"
-    MPI_PROCS 1
-)
 
 
 # Test: PipelineBase Precision Mode
 # Tests WeightPrecision and ActivationPrecision configuration flow through PipelineBase
-add_executable(v2_test_pipeline_precision_mode unit/pipelines/Test__PipelineBase_PrecisionMode.cpp)
-target_link_libraries(v2_test_pipeline_precision_mode llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_PipelinePrecisionMode
-    COMMAND $<TARGET_FILE:v2_test_pipeline_precision_mode>
-    LABELS "V2;Unit;PipelineExecution;PrecisionConfiguration;WeightPrecision;ActivationPrecision"
-)
 
 # Test: ResidualOpTyped (typed residual connections FP32/BF16/FP16/Q8_1)
 # Tests the typed residual connection operations that add projection outputs back to residual stream
@@ -2414,12 +2318,6 @@ add_v2_test(V2_Unit_GemmOpTyped
 # Test: GQAAttention Second Sequence Handling
 # Tests that sequence 1 in batched attention is handled correctly
 # Validates buffer offsets, mask application, and cross-sequence isolation
-add_executable(v2_test_gqa_attention_second_sequence unit/Test__GQAAttention_SecondSequence.cpp)
-target_link_libraries(v2_test_gqa_attention_second_sequence llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_GQAAttention_SecondSequence
-    COMMAND $<TARGET_FILE:v2_test_gqa_attention_second_sequence>
-    LABELS "V2;Unit;Attention;GQA;Batched;SecondSequence;BufferOffsets"
-)
 
 # Test: ModelLoader
 add_executable(v2_test_model_loader integration/Test__ModelLoader.cpp)
@@ -2529,30 +2427,10 @@ add_v2_test(V2_Integration_Q8_1_FusedAttention
 # Test: Q8_1 Isolated Attention Kernel Test
 # Captures attention inputs from pipeline, compares FP32 vs Q8_1 kernel in isolation
 # Used for debugging attention kernel divergence without full pipeline complexity
-add_executable(v2_integration_q8_1_attention_kernel integration/Test__Q8_1_AttentionKernel.cpp)
-target_link_libraries(v2_integration_q8_1_attention_kernel 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_AttentionKernel
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_attention_kernel>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;Attention;Q8_1;Parity;Debug"
-)
 
 # Test: Q8_1 Attention JIT Replay Test
 # Saves attention inputs to disk and replays them through the JIT kernel in isolation
 # Used for reproducible debugging of the JIT attention kernel
-add_executable(v2_integration_q8_1_attention_jit_replay integration/Test__Q8_1_AttentionJitReplay.cpp)
-target_link_libraries(v2_integration_q8_1_attention_jit_replay 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_AttentionJitReplay
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_attention_jit_replay>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Kernels;Attention;Q8_1;JIT;Debug;Replay"
-)
 
 # Test: Q8_1 Attention Replay from Captured Dump
 # Loads actual Q/K/V blocks captured from E2E pipeline via LLAMINAR_DUMP_ATTENTION_INPUTS
@@ -2570,28 +2448,9 @@ add_v2_test(V2_Integration_Q8_1_AttentionReplayDump
 
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
-add_executable(v2_integration_qwen2_pipeline integration/Test__Qwen2Pipeline.cpp)
-target_link_libraries(v2_integration_qwen2_pipeline
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_Qwen2Pipeline
-    COMMAND $<TARGET_FILE:v2_integration_qwen2_pipeline>
-    LABELS "V2;Integration;Pipeline;Qwen2;AutoregressiveDecode;Bias;Attention;E2E"
-)
 
 # Test: KVCache Integration Tests (KV cache behavior during autoregressive decode)
 # Validates cache accumulation, data integrity, position tracking, and attention correctness
-add_executable(v2_integration_kv_cache integration/Test__KVCacheIntegration.cpp)
-target_link_libraries(v2_integration_kv_cache
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_KVCache
-    COMMAND $<TARGET_FILE:v2_integration_kv_cache>
-    LABELS "V2;Integration;KVCache;AutoregressiveDecode;Attention;Pipeline"
-)
 
 # Test: Graph Batched KVCache Integration Tests (Phase 3 of Graph Batching Implementation)
 # Validates batched KV cache handling in Graph framework:
@@ -2613,45 +2472,14 @@ add_v2_test(V2_Integration_GraphBatchedKVCache
 # Test: Q8_1 KV Cache Integration Tests
 # Validates Q8_1 attention kernel correctly integrates with typed KV cache
 # Tests: roundtrip, attention with cache, direct vs cached K/V, GQA path, block copy semantics
-add_executable(v2_integration_q8_1_kvcache integration/Test__Q8_1_KVCache_Integration.cpp)
-target_link_libraries(v2_integration_q8_1_kvcache
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_KVCache
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_kvcache>
-    MPI_PROCS 1
-    LABELS "V2;Integration;KVCache;Q8_1;Attention;Pipeline;Correctness"
-)
 
 # Test: Decomposed Attention (Phase 9 KVCacheAppendStage + AttentionComputeStage)
 # Validates the new decomposed attention path that routes through KernelFactory
-add_executable(v2_integration_decomposed_attention integration/Test__DecomposedAttention.cpp)
-target_link_libraries(v2_integration_decomposed_attention
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_DecomposedAttention
-    COMMAND $<TARGET_FILE:v2_integration_decomposed_attention>
-    MPI_PROCS 1
-    LABELS "V2;Integration;Attention;ComputeStage;KernelFactory;KVCache;Phase9"
-)
 
 # Test: Q8_1 vs FP32 Activation Precision Parity
 # Validates Q8_1 activation precision produces equivalent results to FP32
 # Tests Top-5 token overlap, KL divergence, and greedy sampling equivalence
 # NOTE: Runs with MPI_PROCS 1 since it compares precision modes, not MPI parallelism
-add_executable(v2_integration_q8_1_vs_fp32_parity integration/Test__Q8_1_vs_FP32_Parity.cpp)
-target_link_libraries(v2_integration_q8_1_vs_fp32_parity
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_vs_FP32_Parity
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_vs_fp32_parity>
-    LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Parity;TopK;KLDivergence"
-    MPI_PROCS 1
-)
 
 # Test: LayerExecutor Q8_1 vs FP32 Activation Precision Parity
 # Validates Qwen2LayerExecutor produces equivalent results with Q8_1 vs FP32 activations
@@ -2673,61 +2501,21 @@ add_v2_test(V2_Integration_LayerExecutor_Q8_1_vs_FP32_Parity
 # Validates that the new LayerExecutor framework produces equivalent results
 # to the legacy imperative pipeline code when both use FP32 precision.
 # Tests prefill, single decode, and multi-step decode scenarios.
-add_executable(v2_integration_pipeline_vs_layer_executor_fp32 integration/Test__Pipeline_vs_LayerExecutor_FP32_Parity.cpp)
-target_link_libraries(v2_integration_pipeline_vs_layer_executor_fp32
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Pipeline_vs_LayerExecutor_FP32_Parity
-    COMMAND $<TARGET_FILE:v2_integration_pipeline_vs_layer_executor_fp32>
-    LABELS "V2;Integration;Pipeline;LayerExecutor;FP32;Parity;ExecutionFramework;Migration"
-    MPI_PROCS 1
-)
 
 # Test: GraphBufferManagement Parity
 # Validates that graph-managed buffer allocation produces equivalent results
 # to pipeline-managed buffer allocation. Part of Phase 5: Qwen2Graph Integration.
 # Both modes use LayerExecutor path, comparing LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=0 vs =1.
-add_executable(v2_integration_graph_buffer_parity integration/Test__GraphBufferManagement_Parity.cpp)
-target_link_libraries(v2_integration_graph_buffer_parity
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_GraphBufferManagement_Parity
-    COMMAND $<TARGET_FILE:v2_integration_graph_buffer_parity>
-    LABELS "V2;Integration;GraphBufferManager;BufferManagement;Parity;ExecutionFramework;Phase5"
-    MPI_PROCS 1
-)
 
 # Test: Full Graph Forward vs Legacy Parity
 # Validates that the full graph forward path (orchestrator->executeForward())
 # produces equivalent results to the legacy imperative pipeline code.
 # Part of Phase 4: Integration Testing & Parity Verification for Full Graph Inference.
-add_executable(v2_integration_full_graph_forward_parity integration/Test__FullGraphForward_vs_Legacy_Parity.cpp)
-target_link_libraries(v2_integration_full_graph_forward_parity
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_FullGraphForward_vs_Legacy_Parity
-    COMMAND $<TARGET_FILE:v2_integration_full_graph_forward_parity>
-    LABELS "V2;Integration;FullGraphForward;Pipeline;Parity;GraphOrchestrator;ExecutionFramework"
-    MPI_PROCS 1
-)
 
 # Test: Pipeline vs LayerExecutor Q8_1 Parity
 # Validates that the LayerExecutor framework produces equivalent results
 # to the legacy pipeline code when BOTH use Q8_1 activation precision.
 # Uses looser tolerances to account for quantization noise inherent to Q8_1.
-add_executable(v2_integration_pipeline_vs_layer_executor_q8_1 integration/Test__Pipeline_vs_LayerExecutor_Q8_1_Parity.cpp)
-target_link_libraries(v2_integration_pipeline_vs_layer_executor_q8_1
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Pipeline_vs_LayerExecutor_Q8_1_Parity
-    COMMAND $<TARGET_FILE:v2_integration_pipeline_vs_layer_executor_q8_1>
-    LABELS "V2;Integration;Pipeline;LayerExecutor;Q8_1;Parity;ExecutionFramework;Migration;Quantization"
-    MPI_PROCS 1
-)
 
 # Test: Q8_1 MPI Tensor-Parallel Attention
 # Tests the MPI tensor-parallel path for Q8_1 attention:
@@ -2735,16 +2523,6 @@ add_v2_test(V2_Integration_Pipeline_vs_LayerExecutor_Q8_1_Parity
 #   - K/V GQA broadcast (broadcastQ8_1KVHeads)
 #   - Fused attention kernel execution
 #   - Allgatherv result combination
-add_executable(v2_integration_q8_1_mpi_tp integration/Test__Q8_1_MPI_TensorParallel.cpp)
-target_link_libraries(v2_integration_q8_1_mpi_tp
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_Q8_1_MPI_TensorParallel
-    COMMAND $<TARGET_FILE:v2_integration_q8_1_mpi_tp>
-    MPI_PROCS 2
-    LABELS "V2;Integration;Attention;MPI;TensorParallel;Q8_1;GQA;Orchestration"
-)
 
 # Test: Precision-Aware MPI Allreduce Integration Tests
 # Tests actual MPI communication for FP32, FP16, BF16, and Q8_1 formats
@@ -2763,16 +2541,6 @@ add_v2_test(V2_Integration_MPI_PrecisionAwareAllreduce
 # Test: Row-Parallel Multi-Precision MPI Integration Tests
 # Tests TensorSlice and k-sliced row-parallel GEMM with FP32, BF16, FP16, Q8_1
 # Validates allgatherv (TensorSlice) and allreduce-sum (k-sliced) patterns
-add_executable(v2_integration_mpi_row_parallel_multiprecision integration/Test__MPI_RowParallelMultiPrecision.cpp)
-target_link_libraries(v2_integration_mpi_row_parallel_multiprecision
-    llaminar2_core
-    GTest::gtest
-)
-add_v2_test(V2_Integration_MPI_RowParallelMultiPrecision
-    COMMAND $<TARGET_FILE:v2_integration_mpi_row_parallel_multiprecision>
-    MPI_PROCS 2
-    LABELS "V2;Integration;MPI;RowParallel;TensorSlice;KSliced;Allgatherv;Allreduce;FP32;BF16;FP16;Q8_1;TensorParallel"
-)
 
 # Test: Column-Parallel QKV MPI Integration Tests (Phase 3)
 # Tests column-parallel weight sharding for Q/K/V projections:

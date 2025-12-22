@@ -36,7 +36,7 @@
 #include "../../execution/DeviceContext.h"
 #include "../../execution/ExecutionPolicy.h"
 #include "../../execution/IGraphBuilder.h"
-#include "../../pipelines/PipelineConfig.h"
+#include "../../pipelines/RuntimeConfig.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/UnifiedKVCache.h"

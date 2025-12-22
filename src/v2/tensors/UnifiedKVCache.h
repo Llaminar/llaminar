@@ -25,7 +25,7 @@
 #include "Tensors.h"
 #include "TensorFactory.h"
 #include "../utils/MPIContext.h"
-#include "../pipelines/PipelineConfig.h"
+#include "../pipelines/RuntimeConfig.h"
 #include <vector>
 #include <memory>
 

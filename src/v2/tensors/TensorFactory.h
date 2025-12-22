@@ -8,7 +8,7 @@
 
 #include "Tensors.h"
 #include "../utils/MPIContext.h"
-#include "../pipelines/PipelineConfig.h"
+#include "../pipelines/RuntimeConfig.h"
 #include <memory>
 #include <vector>
 #include <cstddef>

@@ -333,8 +333,16 @@ namespace llaminar2
 
     const float *Q2_KTensor::data() const
     {
+        assertValid("Q2_KTensor::data");
         if (dequant_cache_.empty())
         {
+            // Check if raw data was released after GEMM packing
+            if (raw_data_released_)
+            {
+                LOG_DEBUG("Q2_KTensor::data() called but raw data was released after GEMM packing");
+                return nullptr;
+            }
+
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();

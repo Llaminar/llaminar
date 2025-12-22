@@ -452,6 +452,43 @@ namespace llaminar2
         bool use_graph_buffer_management = true;   ///< Use GraphBufferManager for buffer allocation (default: ON)
         bool exec_full_forward = true;             ///< Use orchestrator->executeForward() for complete inference (default: ON)
 
+        // =================================================================
+        // Stage Tracing Configuration (Task 3: Debugging Infrastructure)
+        // =================================================================
+
+        /**
+         * @brief Enable stage execution tracing (LLAMINAR_TRACE_STAGES)
+         *
+         * When enabled, logs input/output tensor values for each compute stage.
+         * Useful for debugging divergence between configurations (e.g., 1 rank vs 2 ranks).
+         */
+        bool trace_stages = false;
+
+        /**
+         * @brief Include tensor shapes in trace output (LLAMINAR_TRACE_SHAPES)
+         */
+        bool trace_shapes = false;
+
+        /**
+         * @brief Number of tensor elements to print (LLAMINAR_TRACE_SAMPLE_COUNT)
+         */
+        int trace_sample_count = 8;
+
+        /**
+         * @brief Only trace stages matching this substring (LLAMINAR_TRACE_FILTER)
+         *
+         * Examples: "layer0", "attention", "ffn_down"
+         * Empty string = trace all stages
+         */
+        std::string trace_filter = "";
+
+        /**
+         * @brief Compute and log checksum of tensor data (LLAMINAR_TRACE_CHECKSUMS)
+         *
+         * Useful for detecting divergence without examining all values.
+         */
+        bool trace_checksums = false;
+
         // Per-operation feature flags - ALL ENABLED BY DEFAULT as of Dec 2025
         // These flags now exist only for debugging (to selectively disable operations)
         // Model-level operations (embedding, final norm, lm head)
@@ -547,6 +584,27 @@ namespace llaminar2
             const char *residual_env = std::getenv("LLAMINAR_EXEC_RESIDUAL");
             if (residual_env)
                 exec_residual = (std::atoi(residual_env) != 0);
+
+            // Stage tracing configuration
+            const char *trace_stages_env = std::getenv("LLAMINAR_TRACE_STAGES");
+            if (trace_stages_env)
+                trace_stages = (std::atoi(trace_stages_env) != 0);
+
+            const char *trace_shapes_env = std::getenv("LLAMINAR_TRACE_SHAPES");
+            if (trace_shapes_env)
+                trace_shapes = (std::atoi(trace_shapes_env) != 0);
+
+            const char *trace_count_env = std::getenv("LLAMINAR_TRACE_SAMPLE_COUNT");
+            if (trace_count_env)
+                trace_sample_count = std::atoi(trace_count_env);
+
+            const char *trace_filter_env = std::getenv("LLAMINAR_TRACE_FILTER");
+            if (trace_filter_env)
+                trace_filter = trace_filter_env;
+
+            const char *trace_checksums_env = std::getenv("LLAMINAR_TRACE_CHECKSUMS");
+            if (trace_checksums_env)
+                trace_checksums = (std::atoi(trace_checksums_env) != 0);
 
             // NOTE: Legacy cascade logic removed (Dec 2025)
             // All exec_* flags now default to true. The cascade logic below was
@@ -1033,6 +1091,60 @@ namespace llaminar2
     };
 
     /**
+     * @brief MPI collective operation logging configuration
+     *
+     * Controls diagnostic logging for MPI operations like AllReduce, AllGather, etc.
+     * Useful for debugging tensor parallelism issues.
+     *
+     * **Environment Variables**:
+     * - `LLAMINAR_MPI_LOG_COLLECTIVES`: Enable logging of MPI collective operations (0/1)
+     * - `LLAMINAR_MPI_LOG_TIMING`: Enable timing of MPI operations (0/1)
+     * - `LLAMINAR_MPI_VERIFY_CHECKSUMS`: Enable checksum verification before/after MPI ops (0/1)
+     *
+     * **Usage**:
+     * @code
+     *   # Log all MPI collectives with timing
+     *   LLAMINAR_MPI_LOG_COLLECTIVES=1 LLAMINAR_MPI_LOG_TIMING=1 \
+     *   mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "test"
+     *
+     *   # Enable checksum verification (slow, for debugging)
+     *   LLAMINAR_MPI_VERIFY_CHECKSUMS=1 mpirun -np 2 ...
+     * @endcode
+     */
+    struct MPILoggingConfig
+    {
+        bool log_collectives = false;  ///< Log MPI collective operations (start/end)
+        bool log_timing = false;       ///< Log timing of MPI operations
+        bool verify_checksums = false; ///< Verify checksums before/after MPI ops (slow)
+
+        MPILoggingConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *log_collectives_env = std::getenv("LLAMINAR_MPI_LOG_COLLECTIVES");
+            if (log_collectives_env)
+            {
+                log_collectives = (std::atoi(log_collectives_env) != 0);
+            }
+
+            const char *log_timing_env = std::getenv("LLAMINAR_MPI_LOG_TIMING");
+            if (log_timing_env)
+            {
+                log_timing = (std::atoi(log_timing_env) != 0);
+            }
+
+            const char *verify_checksums_env = std::getenv("LLAMINAR_MPI_VERIFY_CHECKSUMS");
+            if (verify_checksums_env)
+            {
+                verify_checksums = (std::atoi(verify_checksums_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -1041,14 +1153,11 @@ namespace llaminar2
         GemmConfig gemm;
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
-        AttentionConfig attention;  ///< Q8_1 attention precision configuration
-        ExecutionConfig execution;  ///< LayerExecutor framework configuration
-        SnapshotConfig snapshot;    ///< Snapshot and tensor dump configuration
-        StageDumpConfig stage_dump; ///< Compute stage input/output dumping
-
-        // Add more config groups as needed:
-        // NumaConfig numa;
-        // MPIConfig mpi;
+        AttentionConfig attention;    ///< Q8_1 attention precision configuration
+        ExecutionConfig execution;    ///< LayerExecutor framework configuration
+        SnapshotConfig snapshot;      ///< Snapshot and tensor dump configuration
+        StageDumpConfig stage_dump;   ///< Compute stage input/output dumping
+        MPILoggingConfig mpi_logging; ///< MPI collective operation logging
 
         DebugEnv() = default;
 
@@ -1061,6 +1170,7 @@ namespace llaminar2
             execution.reload();
             snapshot.reload();
             stage_dump.reload();
+            mpi_logging.reload();
         }
     };
 
