@@ -626,7 +626,7 @@ namespace llaminar2
             const float *input_data = params_.A->data();
             if (input_data)
             {
-                LOG_INFO("[GEMMStage] Wo input[0:8]=" << std::setprecision(10)
+                LOG_TRACE("[GEMMStage] Wo input[0:8]=" << std::setprecision(10)
                                                       << input_data[0] << "," << input_data[1] << "," << input_data[2] << "," << input_data[3] << ","
                                                       << input_data[4] << "," << input_data[5] << "," << input_data[6] << "," << input_data[7]
                                                       << " weight_k=" << params_.B->shape()[1]);
@@ -1015,7 +1015,7 @@ namespace llaminar2
         }
 
         // DEBUG: Log input pointer and first values for parity testing
-        LOG_INFO("[FusedQKVGEMMStage] input_fp32 ptr=" << static_cast<const void *>(input_fp32)
+        LOG_TRACE("[FusedQKVGEMMStage] input_fp32 ptr=" << static_cast<const void *>(input_fp32)
                                                        << " input[0:4]=" << std::setprecision(10)
                                                        << input_fp32[0] << "," << input_fp32[1] << ","
                                                        << input_fp32[2] << "," << input_fp32[3]);
@@ -1056,7 +1056,7 @@ namespace llaminar2
         }
 
         // Debug: Log Q output for comparison
-        LOG_INFO("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
+        LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
                                                       << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
                                                       << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
                                                       << " n_q=" << params_.n_q);

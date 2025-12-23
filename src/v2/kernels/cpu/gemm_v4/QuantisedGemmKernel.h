@@ -685,9 +685,9 @@ namespace llaminar2
                 // Debug: Dump first 32 floats to see what's being quantized
                 if (m >= 1 && k >= 32)
                 {
-                    LOG_INFO("[multiply_fused_multi] input[0:8]="
-                             << std::setprecision(6) << input[0] << "," << input[1] << "," << input[2] << "," << input[3]
-                             << "," << input[4] << "," << input[5] << "," << input[6] << "," << input[7]);
+                    LOG_TRACE("[multiply_fused_multi] input[0:8]="
+                              << std::setprecision(6) << input[0] << "," << input[1] << "," << input[2] << "," << input[3]
+                              << "," << input[4] << "," << input[5] << "," << input[6] << "," << input[7]);
                 }
 
                 // Step 2: Quantize activations once
@@ -721,18 +721,18 @@ namespace llaminar2
                     if (i == 0 && proj.n == 896 && k == 896)
                     {
                         const auto &pw = proj.kernel->packed_weights();
-                        LOG_INFO("[multiply_fused_multi] " << name << " kernel=" << static_cast<const void *>(proj.kernel)
-                                                           << " pw.packed_data.data()=" << static_cast<const void *>(pw.packed_data.data())
-                                                           << " pw.N=" << pw.N << " pw.K=" << pw.K);
+                        LOG_TRACE("[multiply_fused_multi] " << name << " kernel=" << static_cast<const void *>(proj.kernel)
+                                                            << " pw.packed_data.data()=" << static_cast<const void *>(pw.packed_data.data())
+                                                            << " pw.N=" << pw.N << " pw.K=" << pw.K);
                     }
 
                     // DEBUG: Log output buffer BEFORE GEMM to check for stale data
                     if (i == 0 && proj.n == 896 && k == 896)
                     {
-                        LOG_INFO("[multiply_fused_multi] " << proj.name << " BEFORE: output=" << static_cast<const void *>(proj.output)
-                                                           << " output[0:4]=" << std::setprecision(10)
-                                                           << proj.output[0] << "," << proj.output[1] << ","
-                                                           << proj.output[2] << "," << proj.output[3]);
+                        LOG_TRACE("[multiply_fused_multi] " << proj.name << " BEFORE: output=" << static_cast<const void *>(proj.output)
+                                                            << " output[0:4]=" << std::setprecision(10)
+                                                            << proj.output[0] << "," << proj.output[1] << ","
+                                                            << proj.output[2] << "," << proj.output[3]);
                     }
 
                     // Build fused ops configuration
@@ -1665,10 +1665,10 @@ namespace llaminar2
                 // DEBUG: Log thread state at entry point
                 if (n == 896 && k == 896)
                 {
-                    LOG_INFO("[ENTRY] tid=" << omp_get_thread_num()
-                                            << " num_threads=" << omp_get_num_threads()
-                                            << " in_parallel=" << omp_in_parallel()
-                                            << " C=" << static_cast<const void *>(C));
+                    LOG_TRACE("[ENTRY] tid=" << omp_get_thread_num()
+                                             << " num_threads=" << omp_get_num_threads()
+                                             << " in_parallel=" << omp_in_parallel()
+                                             << " C=" << static_cast<const void *>(C));
                 }
 
                 // Get reference to packed weights (either external or owned)
@@ -1705,28 +1705,28 @@ namespace llaminar2
                         pw_checksum += static_cast<uint64_t>(pw_data[i]) * (i + 1);
                     }
 
-                    LOG_INFO("[multiply_with_precomputed_q8_1] m=" << m << " n=" << n << " k=" << k
-                                                                   << " this=" << static_cast<const void *>(this)
-                                                                   << " C=" << static_cast<const void *>(C)
-                                                                   << " q8_1_act=" << static_cast<const void *>(q8_1_activations)
-                                                                   << " num_blocks=" << num_blocks
-                                                                   << " d_sum=" << d_sum
-                                                                   << " sum_qs_sum=" << sum_qs_sum
-                                                                   << " qs_checksum=" << qs_checksum
-                                                                   << " block0.d=" << blocks[0].d
-                                                                   << " block0.sum_qs=" << blocks[0].sum_qs
-                                                                   << " block0.qs[0:4]=" << (int)blocks[0].qs[0] << "," << (int)blocks[0].qs[1] << "," << (int)blocks[0].qs[2] << "," << (int)blocks[0].qs[3]
-                                                                   << " block1.d=" << (num_blocks > 1 ? blocks[1].d : 0)
-                                                                   << " block" << (blocks_per_row - 1) << ".d=" << blocks[blocks_per_row - 1].d     // Last block of row 0
-                                                                   << " block" << blocks_per_row << ".d=" << (m > 1 ? blocks[blocks_per_row].d : 0) // First block of row 1 (if exists)
-                                                                   << " pw.packed_data.data()=" << static_cast<const void *>(pw.packed_data.data())
-                                                                   << " pw_size=" << pw_size
-                                                                   << " pw_FULL_checksum=" << pw_checksum
-                                                                   << " pw.N=" << pw.N << " pw.K=" << pw.K
-                                                                   << " fused_swiglu=" << fused_ops.is_swiglu()
-                                                                   << " fused_softmax=" << fused_ops.is_softmax()
-                                                                   << " accumulate=" << accumulate
-                                                                   << " beta=" << beta);
+                    LOG_TRACE("[multiply_with_precomputed_q8_1] m=" << m << " n=" << n << " k=" << k
+                                                                    << " this=" << static_cast<const void *>(this)
+                                                                    << " C=" << static_cast<const void *>(C)
+                                                                    << " q8_1_act=" << static_cast<const void *>(q8_1_activations)
+                                                                    << " num_blocks=" << num_blocks
+                                                                    << " d_sum=" << d_sum
+                                                                    << " sum_qs_sum=" << sum_qs_sum
+                                                                    << " qs_checksum=" << qs_checksum
+                                                                    << " block0.d=" << blocks[0].d
+                                                                    << " block0.sum_qs=" << blocks[0].sum_qs
+                                                                    << " block0.qs[0:4]=" << (int)blocks[0].qs[0] << "," << (int)blocks[0].qs[1] << "," << (int)blocks[0].qs[2] << "," << (int)blocks[0].qs[3]
+                                                                    << " block1.d=" << (num_blocks > 1 ? blocks[1].d : 0)
+                                                                    << " block" << (blocks_per_row - 1) << ".d=" << blocks[blocks_per_row - 1].d     // Last block of row 0
+                                                                    << " block" << blocks_per_row << ".d=" << (m > 1 ? blocks[blocks_per_row].d : 0) // First block of row 1 (if exists)
+                                                                    << " pw.packed_data.data()=" << static_cast<const void *>(pw.packed_data.data())
+                                                                    << " pw_size=" << pw_size
+                                                                    << " pw_FULL_checksum=" << pw_checksum
+                                                                    << " pw.N=" << pw.N << " pw.K=" << pw.K
+                                                                    << " fused_swiglu=" << fused_ops.is_swiglu()
+                                                                    << " fused_softmax=" << fused_ops.is_softmax()
+                                                                    << " accumulate=" << accumulate
+                                                                    << " beta=" << beta);
                 }
 
                 // Check dimensions against packed weights
@@ -1789,10 +1789,10 @@ namespace llaminar2
                     // DEBUG: Check C[0:4] after zeroing (only thread 0 to avoid race)
                     if (n == 896 && k == 896 && omp_get_thread_num() == 0)
                     {
-                        LOG_INFO("[AFTER_ZERO] C[0:4]=" << C[0] << "," << C[1] << "," << C[2] << "," << C[3]
-                                                        << " needs_zero=" << needs_zero
-                                                        << " omp_in_parallel=" << omp_in_parallel()
-                                                        << " num_threads=" << omp_get_num_threads());
+                        LOG_TRACE("[AFTER_ZERO] C[0:4]=" << C[0] << "," << C[1] << "," << C[2] << "," << C[3]
+                                                         << " needs_zero=" << needs_zero
+                                                         << " omp_in_parallel=" << omp_in_parallel()
+                                                         << " num_threads=" << omp_get_num_threads());
                     }
 
                     // Cache-aware blocking (same logic as other paths)
@@ -1930,33 +1930,33 @@ namespace llaminar2
                                             hex_dump << " ";
                                     }
 
-                                    LOG_INFO("[JIT_PARAMS] n_blk=" << n_blk << " i=" << i
-                                                                   << " A_ptr=" << static_cast<const void *>(params_v.A)
-                                                                   << " B_ptr=" << static_cast<const void *>(params_v.B_packed)
-                                                                   << " C_ptr=" << static_cast<const void *>(params_v.C)
-                                                                   << " A_64byte_cksum=" << a_cksum
-                                                                   << " B_64byte_cksum=" << b_cksum
-                                                                   << " C_before=" << params_v.C[0] << "," << params_v.C[1]
-                                                                   << " A_hex=" << hex_dump.str()
-                                                                   << " output_format=" << static_cast<int>(params_v.output_format)
-                                                                   << " do_softmax=" << params_v.do_softmax
-                                                                   << " do_swiglu=" << params_v.do_swiglu
-                                                                   << " K_blocks=" << params_v.K_blocks
-                                                                   << " N=" << params_v.N
-                                                                   << " ldc=" << params_v.ldc
-                                                                   << " A_stride=" << params_v.A_stride
-                                                                   << " comp=" << static_cast<const void *>(params_v.comp)
-                                                                   << " comp_data_cksum=" << comp_cksum
-                                                                   << " scales=" << static_cast<const void *>(params_v.scales)
-                                                                   << " scales_data_cksum=" << scales_cksum
-                                                                   << " mins=" << static_cast<const void *>(params_v.mins)
-                                                                   << " bias=" << static_cast<const void *>(params_v.bias)
-                                                                   << " mask=" << static_cast<const void *>(params_v.mask)
-                                                                   << " local_max=" << static_cast<const void *>(params_v.local_max)
-                                                                   << " local_sum=" << static_cast<const void *>(params_v.local_sum)
-                                                                   << " gate_input=" << static_cast<const void *>(params_v.gate_input)
-                                                                   << " C_q8_1=" << static_cast<const void *>(params_v.C_q8_1)
-                                                                   << " C_q8_1_stride=" << params_v.C_q8_1_stride);
+                                    LOG_TRACE("[JIT_PARAMS] n_blk=" << n_blk << " i=" << i
+                                                                    << " A_ptr=" << static_cast<const void *>(params_v.A)
+                                                                    << " B_ptr=" << static_cast<const void *>(params_v.B_packed)
+                                                                    << " C_ptr=" << static_cast<const void *>(params_v.C)
+                                                                    << " A_64byte_cksum=" << a_cksum
+                                                                    << " B_64byte_cksum=" << b_cksum
+                                                                    << " C_before=" << params_v.C[0] << "," << params_v.C[1]
+                                                                    << " A_hex=" << hex_dump.str()
+                                                                    << " output_format=" << static_cast<int>(params_v.output_format)
+                                                                    << " do_softmax=" << params_v.do_softmax
+                                                                    << " do_swiglu=" << params_v.do_swiglu
+                                                                    << " K_blocks=" << params_v.K_blocks
+                                                                    << " N=" << params_v.N
+                                                                    << " ldc=" << params_v.ldc
+                                                                    << " A_stride=" << params_v.A_stride
+                                                                    << " comp=" << static_cast<const void *>(params_v.comp)
+                                                                    << " comp_data_cksum=" << comp_cksum
+                                                                    << " scales=" << static_cast<const void *>(params_v.scales)
+                                                                    << " scales_data_cksum=" << scales_cksum
+                                                                    << " mins=" << static_cast<const void *>(params_v.mins)
+                                                                    << " bias=" << static_cast<const void *>(params_v.bias)
+                                                                    << " mask=" << static_cast<const void *>(params_v.mask)
+                                                                    << " local_max=" << static_cast<const void *>(params_v.local_max)
+                                                                    << " local_sum=" << static_cast<const void *>(params_v.local_sum)
+                                                                    << " gate_input=" << static_cast<const void *>(params_v.gate_input)
+                                                                    << " C_q8_1=" << static_cast<const void *>(params_v.C_q8_1)
+                                                                    << " C_q8_1_stride=" << params_v.C_q8_1_stride);
                                 }
 
                                 // Copy to non-volatile for kernel call
@@ -1969,10 +1969,10 @@ namespace llaminar2
                                 // DEBUG: Log params struct address for n_blk=0 i=0
                                 if (n == 896 && k == 896 && n_blk == 0 && i == 0)
                                 {
-                                    LOG_INFO("[PARAMS_ADDR] &params=" << static_cast<const void *>(&params)
-                                                                      << " alignment=" << (reinterpret_cast<uintptr_t>(&params) % 64)
-                                                                      << " sizeof(params)=" << sizeof(params)
-                                                                      << " kernel_ptr=" << reinterpret_cast<const void *>(kernel));
+                                    LOG_TRACE("[PARAMS_ADDR] &params=" << static_cast<const void *>(&params)
+                                                                       << " alignment=" << (reinterpret_cast<uintptr_t>(&params) % 64)
+                                                                       << " sizeof(params)=" << sizeof(params)
+                                                                       << " kernel_ptr=" << reinterpret_cast<const void *>(kernel));
                                 }
 
                                 if (rows_to_process == 2)
@@ -1983,9 +1983,9 @@ namespace llaminar2
                                 // DEBUG: Immediately log output after kernel returns for n_blk=0 i=0
                                 if (n == 896 && k == 896 && n_blk == 0 && i == 0)
                                 {
-                                    LOG_INFO("[KERNEL_DONE_IMMEDIATE] C[0:4]="
-                                             << std::setprecision(10) << params.C[0] << "," << params.C[1] << "," << params.C[2] << "," << params.C[3]
-                                             << " tid=" << omp_get_thread_num());
+                                    LOG_TRACE("[KERNEL_DONE_IMMEDIATE] C[0:4]="
+                                              << std::setprecision(10) << params.C[0] << "," << params.C[1] << "," << params.C[2] << "," << params.C[3]
+                                              << " tid=" << omp_get_thread_num());
                                 }
                             }
                         }
@@ -2003,8 +2003,8 @@ namespace llaminar2
                 // Debug: log output after GEMM completes
                 if (n == 896 && k == 896)
                 {
-                    LOG_INFO("[multiply_with_precomputed_q8_1 DONE] C[0:4]="
-                             << std::setprecision(10) << C[0] << "," << C[1] << "," << C[2] << "," << C[3]);
+                    LOG_TRACE("[multiply_with_precomputed_q8_1 DONE] C[0:4]="
+                              << std::setprecision(10) << C[0] << "," << C[1] << "," << C[2] << "," << C[3]);
                 }
 
                 return true;

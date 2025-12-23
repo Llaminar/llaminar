@@ -218,6 +218,9 @@ int main(int argc, char *argv[])
     auto numa_info = NUMATopology::detectLocalNUMANode();
     auto mpi_ctx = MPIContextFactory::global();
 
+    // Set logger rank for log output
+    Logger::getInstance().setRank(mpi_ctx->rank());
+
     if (mpi_ctx->rank() == 0)
     {
         LOG_DEBUG("=== NUMA Topology Detection ===");

@@ -51,6 +51,25 @@ namespace llaminar2
             return current_level_;
         }
 
+        /**
+         * @brief Set the MPI rank for log messages
+         * @param rank The MPI rank number (0-based)
+         */
+        void setRank(int rank)
+        {
+            rank_ = rank;
+            has_rank_ = true;
+        }
+
+        /**
+         * @brief Get the current MPI rank
+         * @return The MPI rank, or -1 if not set
+         */
+        int getRank() const
+        {
+            return has_rank_ ? rank_ : -1;
+        }
+
         bool shouldLog(LogLevel level) const
         {
             return static_cast<int>(level) <= static_cast<int>(current_level_);
@@ -75,7 +94,15 @@ namespace llaminar2
                 location = " [" + filename + ":" + std::to_string(line) + "]";
             }
 
-            std::string full_line = "[" + timestamp + "] [" + level_str + "]" + location + " " + message;
+            std::string full_line = "[" + timestamp + "] [" + level_str + "]";
+
+            // Add rank if set
+            if (has_rank_)
+            {
+                full_line += " [" + std::to_string(rank_) + "]";
+            }
+
+            full_line += location + " " + message;
 
             {
                 std::lock_guard<std::mutex> lk(buffer_mutex_);
@@ -146,7 +173,7 @@ namespace llaminar2
         }
 
     private:
-        Logger() : current_level_(LogLevel::INFO)
+        Logger() : current_level_(LogLevel::INFO), rank_(0), has_rank_(false)
         {
             // Check environment variable for log level override
             const char *level_env = std::getenv("LLAMINAR_LOG_LEVEL");
@@ -166,6 +193,8 @@ namespace llaminar2
         }
 
         LogLevel current_level_;
+        int rank_;
+        bool has_rank_;
         mutable std::deque<std::string> recent_;
         mutable size_t max_buffer_ = 2048; // keep last N lines
         mutable std::mutex buffer_mutex_;

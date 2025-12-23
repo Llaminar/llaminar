@@ -309,15 +309,21 @@ public:
         }
 
         /**
-         * @brief Auto-select best device
+         * @brief Auto-select primary device (DEPRECATED - transitional)
          *
-         * Heuristics:
-         * 1. Prefer GPU over CPU
-         * 2. Among GPUs, select one with most free memory
-         * 3. Round-robin among GPUs with similar memory
+         * NOTE: This method is for legacy single-device code paths and will be
+         * deprecated in favor of heterogeneous multi-device orchestration.
          *
-         * @param estimated_memory_bytes Estimated memory needed (default: 0 = don't filter)
-         * @return Device index, or 0 (CPU) if no suitable GPU found
+         * Current behavior: Always returns CPU (index 0) since GPU kernels
+         * are not yet implemented. All devices remain enumerated and available
+         * for future heterogeneous tensor-parallel execution.
+         *
+         * Future direction: Work distribution will use all devices based on
+         * their capabilities. CPUs may get 0% prefill but significant decode
+         * work due to memory bandwidth characteristics.
+         *
+         * @param estimated_memory_bytes Ignored (kept for API compatibility)
+         * @return Device index (currently always 0 = CPU)
          */
         size_t select_device(size_t estimated_memory_bytes = 0);
 

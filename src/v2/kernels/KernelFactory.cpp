@@ -1877,7 +1877,7 @@ namespace llaminar
                 // Debug: Log cache lookup for Q weight tensors
                 if (tensor_n == 896 && tensor_k == 896)
                 {
-                    LOG_INFO("[KernelFactory::getOrCreateGemm] Looking up tensor=" << static_cast<const void *>(tensor)
+                    LOG_TRACE("[KernelFactory::getOrCreateGemm] Looking up tensor=" << static_cast<const void *>(tensor)
                                                                                    << " shape=[" << tensor_n << "," << tensor_k << "]"
                                                                                    << " cache_size=" << kernel_cache_.size());
                 }
@@ -1894,7 +1894,7 @@ namespace llaminar
                         {
                             if (tensor_n == 896 && tensor_k == 896)
                             {
-                                LOG_INFO("[KernelFactory::getOrCreateGemm] CACHE HIT: returning cached kernel=" << static_cast<const void *>(it->second.get()));
+                                LOG_TRACE("[KernelFactory::getOrCreateGemm] CACHE HIT: returning cached kernel=" << static_cast<const void *>(it->second.get()));
                             }
                             return it->second.get();
                         }
@@ -2019,7 +2019,7 @@ namespace llaminar
                         // Debug: Log cache miss for Q weight tensors
                         if (tensor_n == 896 && tensor_k == 896)
                         {
-                            LOG_INFO("[KernelFactory::getOrCreateGemm] CACHE MISS: created new kernel=" << static_cast<const void *>(raw_ptr)
+                            LOG_TRACE("[KernelFactory::getOrCreateGemm] CACHE MISS: created new kernel=" << static_cast<const void *>(raw_ptr)
                                                                                                         << " for tensor=" << static_cast<const void *>(tensor)
                                                                                                         << " pw.data=" << static_cast<const void *>(packed_cache->packed.packed_data.data()));
                         }

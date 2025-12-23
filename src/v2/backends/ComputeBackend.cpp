@@ -396,8 +396,8 @@ namespace llaminar2
         // Resize contexts_ vector to match devices
         contexts_.resize(devices_.size(), nullptr);
 
-        // Log discovered devices
-        LOG_INFO("[DeviceManager] Enumerated " << devices_.size() << " device(s):");
+        // Log discovered devices (all available for heterogeneous tensor-parallel execution)
+        LOG_INFO("[DeviceManager] Available compute backends (" << devices_.size() << " total):");
         for (size_t i = 0; i < devices_.size(); ++i)
         {
             const auto &dev = devices_[i];
@@ -413,6 +413,10 @@ namespace llaminar2
             device_info += ")";
             LOG_INFO(device_info);
         }
+
+        // Note: All devices are available for heterogeneous work distribution.
+        // CPU may get 0% prefill but significant decode work due to memory bandwidth.
+        // GPU kernels are under development; CPU backend is currently primary.
     }
 
     std::shared_ptr<ComputeContext> DeviceManager::create_context(size_t device_index)
@@ -562,74 +566,23 @@ namespace llaminar2
 
     size_t DeviceManager::select_device(size_t estimated_memory_bytes)
     {
+        // NOTE: This method selects a PRIMARY device for legacy single-device code paths.
+        // For heterogeneous tensor-parallel execution, use all devices via devices() and
+        // let the work distributor allocate work based on device capabilities.
+        //
+        // Current behavior: Returns CPU (index 0) since GPU kernels are not yet implemented.
+        // Future behavior: Will be deprecated in favor of multi-device orchestration.
+
         if (devices_.empty())
         {
             LOG_ERROR("[DeviceManager] No devices available");
             return 0;
         }
 
-        // Find GPUs with sufficient memory
-        struct DeviceScore
-        {
-            size_t index;
-            size_t free_memory;
-            int priority; // Higher = better
-        };
-
-        std::vector<DeviceScore> candidates;
-
-        for (size_t i = 0; i < devices_.size(); ++i)
-        {
-            const auto &dev = devices_[i];
-
-            // Skip if insufficient memory
-            if (estimated_memory_bytes > 0 && dev.free_memory_bytes < estimated_memory_bytes)
-            {
-                continue;
-            }
-
-            // Priority: CUDA > ROCm > Vulkan > CPU
-            int priority = 0;
-            switch (dev.type)
-            {
-            case ComputeBackendType::GPU_CUDA:
-                priority = 300;
-                break;
-            case ComputeBackendType::GPU_ROCM:
-                priority = 200;
-                break;
-            case ComputeBackendType::GPU_VULKAN:
-                priority = 100;
-                break;
-            case ComputeBackendType::CPU:
-                priority = 10;
-                break;
-            }
-
-            candidates.push_back({i, dev.free_memory_bytes, priority});
-        }
-
-        if (candidates.empty())
-        {
-            // Fall back to CPU
-            LOG_INFO("[DeviceManager] No suitable GPU found, using CPU");
-            return 0;
-        }
-
-        // Sort by priority (descending), then by free memory (descending)
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const DeviceScore &a, const DeviceScore &b)
-                  {
-                      if (a.priority != b.priority)
-                          return a.priority > b.priority;
-                      return a.free_memory > b.free_memory;
-                  });
-
-        size_t selected = candidates[0].index;
-        LOG_INFO("[DeviceManager] Auto-selected device " << selected
-                                                         << ": " << devices_[selected].name);
-
-        return selected;
+        // For now, always use CPU backend since GPU kernels are under development
+        // All devices remain available for future heterogeneous work distribution
+        LOG_INFO("[DeviceManager] Using CPU backend (GPU kernels under development)");
+        return 0; // CPU is always device 0
     }
 
     bool DeviceManager::has_gpu() const
