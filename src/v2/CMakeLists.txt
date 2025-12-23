@@ -254,8 +254,8 @@ if(HAVE_CUDA)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
         
-        # CUTLASS requires C++17 minimum
-        target_compile_features(cuda_backend PUBLIC cxx_std_17)
+        # CUTLASS requires C++17 minimum, we use C++20
+        target_compile_features(cuda_backend PUBLIC cxx_std_20)
         
         # Add CUTLASS NVCC flags for Tensor Cores
         # SM 86 = RTX 3090 (Ampere), SM 80 = A100, SM 75 = Turing
@@ -645,8 +645,8 @@ if(DUMP_ATTENTION_INPUTS)
     message(STATUS "V2: Attention input dumping ENABLED (will dump Q/K/V/mask to disk)")
 endif()
 
-# Compile features
-target_compile_features(llaminar2_core PUBLIC cxx_std_17)
+# Compile features - C++20 for concepts, ranges, and improved constexpr
+target_compile_features(llaminar2_core PUBLIC cxx_std_20)
 
 # Dependencies
 find_package(MPI REQUIRED)

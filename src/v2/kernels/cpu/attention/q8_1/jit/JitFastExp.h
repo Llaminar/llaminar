@@ -5,20 +5,44 @@
  * @date December 2025
  *
  * JIT-generated fast exp() for softmax computation.
- * Mirrors the reference FastExp.h microkernel but generates AVX-512 code at runtime.
+ * Used for computing attention weights: weight[i] = exp(score[i] - max)
  *
- * Algorithm: exp(x) = 2^(x * log2(e))
- * - Split into integer part n = floor(x * log2(e))
- * - Fractional part f = (x * log2(e)) - n
- * - Compute 2^f using 5th-order Taylor polynomial
- * - Scale by 2^n using vscalefps
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ALGORITHM
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- * Register conventions (from JitMicrokernelBase.h):
- * - Input: zmm specified by caller
- * - Output: zmm specified by caller (can be same as input)
- * - Constants: zmm_log2e(), zmm_exp_min() must be initialized
- * - Scratch: Uses InputZone (zmm8-10) - safe after dot products complete
- *            Does NOT clobber Scratch4/5 (zmm24-25) which may hold tile_max
+ * exp(x) = 2^(x * log2(e))
+ *
+ * Range reduction:
+ *   n = floor(x * log2(e))        // Integer part
+ *   f = (x * log2(e)) - n         // Fractional part, f ∈ [0, 1)
+ *
+ * 2^f approximation (5th-order Taylor polynomial in Horner form):
+ *   2^f ≈ c0 + f*(c1 + f*(c2 + f*(c3 + f*(c4 + f*c5))))
+ *
+ * Final result:
+ *   exp(x) = 2^n * 2^f           // vscalefps instruction
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGISTER USAGE (via RegisterGuard)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Borrowed registers (InputZone):
+ *   - Input0 (zmm8):  Horner temp for loading polynomial constants
+ *   - Input6 (zmm14): Integer part n = floor(x * log2e)
+ *   - Input7 (zmm15): Fractional part f = (x * log2e) - n
+ *
+ * FA2 SAFETY:
+ *   ✓ Does NOT clobber Score0-3 (xmm20-23) - may hold scores during weight compute
+ *   ✓ Does NOT clobber Scratch4-5 (zmm24-25) - may hold tile_max
+ *   ✓ Does NOT clobber State (zmm16-19) - softmax state must persist
+ *   ✓ Does NOT clobber Constants (zmm26-31)
+ *   ✓ Does NOT clobber Q data (zmm10-13) - Q persists across KV loop
+ *   ! CLOBBERS zmm8 - overlaps V accum, but exp called BEFORE V accumulation
+ *
+ * Required constants (must be initialized in zmm26-31 via JitMicrokernelBase):
+ *   - zmm_log2e():   log2(e) ≈ 1.4427
+ *   - zmm_exp_min(): -87.0f (clamp to prevent underflow)
  */
 
 #pragma once
@@ -26,9 +50,24 @@
 #include "JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
+#include "../../../jit/RegisterEnforcement.h"
 
 namespace llaminar::v2::kernels::jit
 {
+    // Import typed register types and C++20 concepts for compile-time checking
+    using namespace llaminar2::jit;
+
+    // ============================================================================
+    // FastExp Register Manifest (compile-time documentation)
+    // ============================================================================
+    // Documents the exact registers borrowed by emit_exp2_poly().
+    // The static_assert verifies no conflicts at compile time.
+
+    using FastExpManifest = KernelRegisterManifest<Input0, Input6, Input7>;
+    static_assert(!FastExpManifest::has_conflicts(),
+                  "FastExp register manifest has conflicts!");
+    static_assert(FastExpManifest::all_from_zones<QVectorZone>(),
+                  "FastExp should only use InputZone (QVector) registers");
 
     /**
      * @brief JIT code emitter for fast exp() approximation
@@ -88,14 +127,38 @@ namespace llaminar::v2::kernels::jit
 
             // Clamp input to avoid overflow/underflow
             // x_clamped = max(src, -87.0f)
-            gen.vmaxps(dst, src, gen.zmm_exp_min());
+            gen.vmaxps(dst, src, gen.const_exp_min().zmm());
 
             // x * log2(e)
-            gen.vmulps(dst, dst, gen.zmm_log2e());
+            gen.vmulps(dst, dst, gen.const_log2e().zmm());
 
             // Compute 2^(x * log2e) using polynomial
             emit_exp2_poly(gen, dst, dst);
         }
+
+#if __cplusplus >= 202002L
+        /**
+         * @brief Emit fast exp code using typed registers (C++20 concept-constrained)
+         *
+         * Preferred overload when using typed registers from RegisterAllocation.h.
+         * Provides compile-time safety via TypedZmmRegister concept.
+         *
+         * @tparam DstReg Typed ZMM register for output (must satisfy TypedZmmRegister)
+         * @tparam SrcReg Typed ZMM register for input (must satisfy TypedZmmRegister)
+         * @param gen Code generator to emit into
+         * @param dst Output register (typed)
+         * @param src Input register (typed, can be same as dst)
+         */
+        template <TypedZmmRegister DstReg, TypedZmmRegister SrcReg>
+        void emit_fast_exp(
+            JitMicrokernelBase &gen,
+            const DstReg &dst,
+            const SrcReg &src)
+        {
+            // Delegate to the raw version, extracting Xbyak::Zmm
+            emit_fast_exp(gen, dst.zmm(), src.zmm());
+        }
+#endif // C++20
 
         /**
          * @brief Emit 2^x polynomial approximation
@@ -232,8 +295,8 @@ namespace llaminar::v2::kernels::jit
 
             // Initialize constants
             debug_emit("  Init constants");
-            emit_broadcast_fp32_const(zmm_log2e(), 1.4426950408889634f, rax);
-            emit_broadcast_fp32_const(zmm_exp_min(), -87.0f, rax);
+            emit_broadcast_fp32_const(const_log2e().zmm(), 1.4426950408889634f, rax);
+            emit_broadcast_fp32_const(const_exp_min().zmm(), -87.0f, rax);
 
             // Loop: for (i = 0; i < n; i += 16)
             xor_(reg_i, reg_i);
@@ -244,13 +307,13 @@ namespace llaminar::v2::kernels::jit
             jge(loop_end, T_NEAR);
 
             // Load 16 floats
-            vmovups(zmm_input(0), ptr[reg_in + reg_i * 4]);
+            vmovups(accum0().zmm(), ptr[reg_in + reg_i * 4]);
 
             // Compute exp
-            exp_emitter_.emit_fast_exp(*this, zmm_accum(0), zmm_input(0));
+            exp_emitter_.emit_fast_exp(*this, accum0().zmm(), accum0().zmm());
 
             // Store 16 floats
-            vmovups(ptr[reg_out + reg_i * 4], zmm_accum(0));
+            vmovups(ptr[reg_out + reg_i * 4], accum0().zmm());
 
             // i += 16
             add(reg_i, 16);

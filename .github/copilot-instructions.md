@@ -529,6 +529,109 @@ auto do_attention_work = [&]() {
 OMP_WORKSHARE_REGION(do_attention_work);
 ```
 
+### JIT Register Guard System
+
+The JIT kernels (in `src/v2/kernels/cpu/attention/q8_1/jit/`) use Xbyak for runtime code generation. These kernels have **complex register allocation** across ZMM registers (zmm0-31) that are partitioned into zones.
+
+**Key Files**:
+- `RegisterAllocation.h`: Zone definitions and typed register wrappers
+- `RegisterGuard.h`: RAII tracking and conflict detection
+- `JitMicrokernelBase.h`: Base class with register accessors and tracking integration
+
+#### Register Zone Layout
+
+| Zone | Registers | Purpose |
+|------|-----------|---------|
+| **AccumulatorZone** | zmm0-7 | Context accumulators for attention output |
+| **QVectorZone** | zmm8-15 | Q vector data (also called Input zone) |
+| **StateZone** | zmm16-19 | Softmax state (max, sum, weight, corr) |
+| **ScratchZone** | zmm20-25 | Temporary computation |
+| **ReservedZone** | zmm26-31 | Preloaded constants (scale, log2e, etc.) |
+
+**Critical Aliasing**: XMM/YMM/ZMM registers share the same physical register file. `xmm20` aliases `zmm20`! The **ScoreZone** (xmm20-23) overlaps **ScratchZone** (zmm20-23).
+
+#### Typed Register Accessors
+
+Use typed accessors instead of raw register numbers:
+
+```cpp
+// Good: Typed accessors with compile-time zone information
+gen.accum0().zmm();     // zmm0
+gen.scratch4().zmm();   // zmm24 (safe during FA2 scoring)
+gen.state_max().zmm();  // zmm16
+gen.const_scale().zmm(); // zmm27
+
+// Also available: score0()-score3() for xmm20-23 (FA2 tile scores)
+```
+
+#### RAII Register Borrowing
+
+For complex code paths, use `borrow<RegType>()` to track register lifetimes:
+
+```cpp
+void emit_complex_operation(JitMicrokernelBase& gen) {
+    // Borrow registers - tracker ensures no conflicts
+    auto guard_score0 = gen.borrow<Score0>();  // xmm20
+    auto guard_score1 = gen.borrow<Score1>();  // xmm21
+    auto guard_scratch = gen.borrow<Scratch4>(); // zmm24 (safe, doesn't alias scores)
+    
+    gen.vmovss(guard_score0.xmm(), ...);
+    gen.vmovaps(guard_scratch.zmm(), ...);
+    
+    // Release score registers before reusing as scratch
+    guard_score0.release();
+    guard_score1.release();
+    
+    // Now safe to borrow Scratch0/1 (alias xmm20/21)
+    auto guard_weight0 = gen.borrow<Scratch0>(); // zmm20
+    // ... use for weights ...
+    
+    // Guards auto-release at scope end
+}
+```
+
+#### Conflict Detection with `assert_available()`
+
+When using raw accessors (e.g., in loops where borrow overhead matters), use `assert_available()` to detect conflicts:
+
+```cpp
+// Pattern: Check availability before raw accessor use
+if (gen.tracking_enabled()) {
+    gen.tracker()->assert_available<Accum6>("spilled context lo");
+    gen.tracker()->assert_available<Accum7>("spilled context hi");
+}
+zmm_ctx_lo = gen.accum6().zmm();
+zmm_ctx_hi = gen.accum7().zmm();
+```
+
+If a conflict is detected, it prints a detailed error:
+```
+╔══════════════════════════════════════════════════════════════════╗
+║              RAW ACCESSOR CONFLICT DETECTED                       ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Physical register: zmm/ymm/xmm4
+║ Currently borrowed by: 'Accumulator[4]'
+║ Raw access attempted in: emit_interleaved_v_accum_4x spilled block
+║
+║ FIX: Either:
+║   1. Use borrow<Accumulator[4]>() instead of raw accessor
+║   2. Use a different register that isn't borrowed
+║   3. Release the borrower before this access
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+#### Enabling Register Tracking
+
+Register tracking is enabled per-kernel via config:
+
+```cpp
+JitAttentionConfig config;
+config.enable_register_tracking = true;  // Enable for debugging
+JitFusedAttentionWo kernel(config);
+```
+
+**Performance Note**: Tracking adds overhead during JIT compilation only, not during execution. The generated assembly is identical.
+
 ---
 
 ## Weight Sharding and Tensor Parallelism

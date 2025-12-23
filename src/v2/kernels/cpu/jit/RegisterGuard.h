@@ -35,6 +35,7 @@
 #include "RegisterAllocation.h"
 #include <bitset>
 #include <cassert>
+#include <iostream>
 #include <string>
 #include <array>
 #include <utility>
@@ -42,8 +43,11 @@
 namespace llaminar2::jit
 {
 
-    // Forward declaration
+    // Forward declarations
     class RegisterTracker;
+
+    template <typename... RegTypes>
+    class ScopedRegisterSet;
 
     // ============================================================================
     // RegisterGuard: RAII wrapper for borrowed registers
@@ -163,6 +167,21 @@ namespace llaminar2::jit
         }
 
         /**
+         * @brief Borrow multiple registers at once as a ScopedRegisterSet
+         *
+         * @code
+         * auto regs = tracker.borrow_set<Scratch4, Scratch5>();
+         * gen.vmovaps(regs.get<0>().zmm(), ...);
+         * gen.vmovaps(regs.get<1>().zmm(), ...);
+         * @endcode
+         */
+        template <typename... RegTypes>
+        [[nodiscard]] ScopedRegisterSet<RegTypes...> borrow_set()
+        {
+            return ScopedRegisterSet<RegTypes...>(*this);
+        }
+
+        /**
          * @brief Check if a physical register is currently borrowed
          */
         bool is_borrowed(int physical_index) const
@@ -206,6 +225,77 @@ namespace llaminar2::jit
         size_t borrowed_count() const
         {
             return borrowed_.count();
+        }
+
+        /**
+         * @brief Assert that a physical register is NOT borrowed
+         *
+         * Use this to detect raw accessor usage conflicts:
+         * @code
+         * // In emit code that uses gen.accum4().zmm() directly:
+         * if (gen.tracker()) gen.tracker()->assert_available<Accum4>("emit_foo context");
+         * auto zmm = gen.accum4().zmm();
+         * @endcode
+         *
+         * @tparam RegType The typed register to check
+         * @param context Description of where this access is happening
+         * @throws Assertion failure if register is borrowed
+         */
+        template <typename RegType>
+        void assert_available(const char *context = "")
+        {
+            constexpr int idx = RegType::absolute_index;
+            if (borrowed_[idx])
+            {
+                std::cerr << "\n╔══════════════════════════════════════════════════════════════════╗\n";
+                std::cerr << "║              RAW ACCESSOR CONFLICT DETECTED                       ║\n";
+                std::cerr << "╠══════════════════════════════════════════════════════════════════╣\n";
+                std::cerr << "║ Physical register: zmm/ymm/xmm" << idx << "\n";
+                std::cerr << "║ Currently borrowed by: '" << borrower_names_[idx] << "'\n";
+                std::cerr << "║ Raw access attempted";
+                if (context && context[0])
+                {
+                    std::cerr << " in: " << context;
+                }
+                std::cerr << "\n";
+                std::cerr << "║\n";
+                std::cerr << "║ FIX: Either:\n";
+                std::cerr << "║   1. Use borrow<" << RegType::zone_type::name << "["
+                          << RegType::local_index << "]>() instead of raw accessor\n";
+                std::cerr << "║   2. Use a different register that isn't borrowed\n";
+                std::cerr << "║   3. Release the borrower before this access\n";
+                std::cerr << "╠══════════════════════════════════════════════════════════════════╣\n";
+                std::cerr << debug_string() << "\n";
+                std::cerr << "╚══════════════════════════════════════════════════════════════════╝\n";
+                std::cerr.flush();
+                assert(false && "Raw accessor used on borrowed register - see error above");
+            }
+        }
+
+        /**
+         * @brief Assert availability using physical index (for non-templated contexts)
+         */
+        void assert_available(int physical_index, const char *reg_name, const char *context = "")
+        {
+            if (borrowed_[physical_index])
+            {
+                std::cerr << "\n╔══════════════════════════════════════════════════════════════════╗\n";
+                std::cerr << "║              RAW ACCESSOR CONFLICT DETECTED                       ║\n";
+                std::cerr << "╠══════════════════════════════════════════════════════════════════╣\n";
+                std::cerr << "║ Physical register: zmm/ymm/xmm" << physical_index << " (" << reg_name << ")\n";
+                std::cerr << "║ Currently borrowed by: '" << borrower_names_[physical_index] << "'\n";
+                std::cerr << "║ Raw access attempted";
+                if (context && context[0])
+                {
+                    std::cerr << " in: " << context;
+                }
+                std::cerr << "\n";
+                std::cerr << "╠══════════════════════════════════════════════════════════════════╣\n";
+                std::cerr << debug_string() << "\n";
+                std::cerr << "╚══════════════════════════════════════════════════════════════════╝\n";
+                std::cerr.flush();
+                assert(false && "Raw accessor used on borrowed register - see error above");
+            }
         }
 
         /**

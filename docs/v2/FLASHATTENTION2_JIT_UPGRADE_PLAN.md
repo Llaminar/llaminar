@@ -2,7 +2,7 @@
 
 **Author:** David Sanftenberg  
 **Date:** December 2025  
-**Status:** In Progress (Phase 1, 2 & 3 Complete)  
+**Status:** In Progress (Phase 1, 2, 3 & 4 Complete; Phase 5 & 6 Planned)  
 **Target:** `src/v2/kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h`
 
 ---
@@ -121,6 +121,7 @@ This document outlines the modifications required to upgrade the existing JIT fu
 | Head-level parallelism | ✅ Complete | OpenMP with `OMP_WORKSHARE_REGION` (Phase 1) |
 | Tile-wise softmax batching | ✅ Complete | `process_kv_tile_batched()` (Phase 2) |
 | Vectorized score tile computation | ❌ Missing | Sequential dot products |
+| **High-performance Wo projection** | 🔴 **Bottleneck** | **6× slower than OpenBLAS (Phase 6)** |
 
 ### Performance Gap Estimate
 
@@ -131,6 +132,9 @@ Based on FlashAttention-2 paper benchmarks and our current profiling:
 | Prefill throughput | ~300 tok/s | ~450 tok/s | 1.5× |
 | Decode latency | ~18ms/tok | ~12ms/tok | 1.5× |
 | Non-matmul FLOP% | ~40% | ~15% | 2.7× reduction |
+| **Wo projection GFLOP/s** | **~8 GFLOP/s** | **~50 GFLOP/s** | **6× (Phase 6)** |
+
+> **⚠️ Critical Finding (Dec 23, 2025):** Performance analysis revealed that **93% of Qwen 7B attention FLOPs** are in the Wo projection, not attention itself. The naive JIT Wo implementation achieves only 8 GFLOP/s vs OpenBLAS's 54 GFLOP/s. See **Phase 6** for the fix.
 
 ---
 
@@ -1343,6 +1347,964 @@ ctest --test-dir build_v2_release -R "Perf__FA2" --verbose
 
 ---
 
+## Phase 5: Register Guard Enhancement (Compile-Time Enforcement)
+
+**Effort:** Low-Medium (2-3 days)  
+**Impact:** High (eliminates entire class of bugs)  
+**Risk:** Low (infrastructure change, no algorithm changes)  
+**Status:** 🔴 Not Started
+
+### 5.1 Problem Statement
+
+The current register guard system (`RegisterGuard.h` + `RegisterAllocation.h`) provides:
+- **Compile-time typed registers**: `TypedZmm<Zone, Index>`, `TypedXmm<Zone, Index>`
+- **Zone membership verification**: SFINAE helpers like `require_zone<Reg, Zone>`
+- **Runtime conflict detection**: `RegisterTracker` + `RegisterGuard<T>` RAII wrappers
+- **Overlap awareness**: Static assertions for Score/Scratch aliasing
+
+**What's missing:** The system is **opt-in**. Developers can still use raw `Xbyak::Zmm(20)` or `gen.zmm0` directly, bypassing all safeguards. This creates a gap where:
+
+1. New code may forget to use guards
+2. Legacy code may use raw registers
+3. Copy-paste from Xbyak examples uses raw registers
+4. No compiler error when guards are bypassed
+
+### 5.2 Solution: Compile-Time Enforcement
+
+Create a **sealed register system** where raw Xbyak register usage causes compilation failures in JIT code.
+
+#### 5.2.1 Sealed Register Macros
+
+```cpp
+// In RegisterAllocation.h (or new RegisterEnforcement.h)
+
+#ifdef LLAMINAR_ENFORCE_REGISTER_GUARDS
+
+// These macros poison direct Xbyak register access within JIT kernels.
+// Any code using raw zmm0, zmm1, etc. will fail to compile.
+
+// Poison individual register names (preprocessor level)
+#define zmm0 REGISTER_GUARD_REQUIRED_USE_Accum0_INSTEAD
+#define zmm1 REGISTER_GUARD_REQUIRED_USE_Accum1_INSTEAD
+// ... etc for all 32 ZMM registers ...
+#define zmm20 REGISTER_GUARD_REQUIRED_USE_Scratch0_OR_Score0_INSTEAD
+// ... etc ...
+
+// Alternative: Template specialization that produces helpful error
+namespace llaminar2::jit::internal {
+    template<int N>
+    struct RawZmmBlocked {
+        static_assert(N < 0, 
+            "Direct Xbyak::Zmm(N) usage is prohibited. "
+            "Use typed registers: Accum0-7, Input0-7, Scratch0-5, Score0-3, State*, etc. "
+            "See RegisterAllocation.h for the full type system.");
+    };
+}
+
+// Intercept Xbyak::Zmm constructor attempts
+#define Zmm(n) ::llaminar2::jit::internal::RawZmmBlocked<n>{}
+
+#endif // LLAMINAR_ENFORCE_REGISTER_GUARDS
+```
+
+#### 5.2.2 Scoped Enforcement with Pragma Push/Pop
+
+For incremental migration, allow per-file or per-function enforcement:
+
+```cpp
+// Enable enforcement in this file
+#define LLAMINAR_ENFORCE_REGISTER_GUARDS
+#include "kernels/cpu/jit/RegisterAllocation.h"
+
+// Or use pragmas for specific regions
+REGISTER_GUARDS_BEGIN  // Enables poisoning
+void emit_critical_section() {
+    // zmm0 here would cause compile error
+    auto acc = tracker.borrow<Accum0>();  // OK
+    gen.vmovaps(acc.zmm(), ...);          // OK - .zmm() accessor still works
+}
+REGISTER_GUARDS_END    // Disables poisoning
+```
+
+#### 5.2.3 Base Class Enforcement Pattern
+
+For JIT kernel classes, enforce via inheritance:
+
+```cpp
+// New file: JitKernelBase.h
+
+/**
+ * @brief Base class for JIT kernels with enforced register guarding
+ * 
+ * Inherit from this to get:
+ * 1. Built-in RegisterTracker
+ * 2. Typed register accessor methods
+ * 3. Compile-time enforcement (no raw Zmm allowed)
+ */
+class JitKernelWithGuards : public Xbyak::CodeGenerator {
+protected:
+    RegisterTracker reg_tracker_;
+    
+    // Factory methods return guards, not raw registers
+    template<typename RegType>
+    [[nodiscard]] RegisterGuard<RegType> borrow() {
+        return reg_tracker_.borrow<RegType>();
+    }
+    
+    // Convenience for common operations (return guards)
+    [[nodiscard]] auto borrow_accum0() { return borrow<Accum0>(); }
+    [[nodiscard]] auto borrow_accum1() { return borrow<Accum1>(); }
+    [[nodiscard]] auto borrow_scratch4() { return borrow<Scratch4>(); }
+    [[nodiscard]] auto borrow_scratch5() { return borrow<Scratch5>(); }
+    // ... etc ...
+    
+    // DELETED: Raw register accessors
+    // (Inheriting classes cannot accidentally use gen.zmm0, etc.)
+    
+private:
+    // Hide Xbyak's direct register access
+    using Xbyak::CodeGenerator::zmm0;   // Make private
+    using Xbyak::CodeGenerator::zmm1;
+    // ... etc for all zmm/ymm/xmm ...
+};
+```
+
+#### 5.2.4 Static Analysis Custom Check
+
+For CI integration, add a clang-tidy or grep-based check:
+
+```bash
+#!/bin/bash
+# scripts/check_register_guards.sh
+
+# Find raw Zmm/Xmm usage in JIT files (excluding RegisterAllocation.h itself)
+if grep -rn --include="*.h" --include="*.cpp" \
+    'Xbyak::Zmm([0-9]' \
+    src/v2/kernels/cpu/attention/ \
+    src/v2/kernels/cpu/jit/ \
+    | grep -v RegisterAllocation.h \
+    | grep -v RegisterGuard.h \
+    | grep -v "\.zmm()" \
+    | grep -v "// RAW_OK"; then
+    echo "ERROR: Raw Xbyak::Zmm usage detected. Use typed registers!"
+    exit 1
+fi
+
+echo "✓ All JIT register usage goes through guards"
+```
+
+### 5.3 Migration Plan
+
+#### Step 1: Audit Current Usage
+
+Current JIT files and their register guard status:
+
+| File | Guards Used | Raw Xbyak | Action |
+|------|-------------|-----------|--------|
+| `JitFusedAttentionWo.h` | ✅ Partial | ⚠️ Some | Migrate remaining |
+| `JitOnlineSoftmax.h` | ✅ Yes | ⚠️ `zmm_max`, etc. | Convert accessors |
+| `JitFastExp.h` | ✅ Yes | ✅ None | ✓ Already compliant |
+| `JitQ8DotProduct.h` | ✅ Yes | ✅ None | ✓ Already compliant |
+| `JitVWeightedAccum.h` | ✅ Yes | ✅ None | ✓ Already compliant |
+| `JitWoProjection.h` | ⚠️ Partial | ⚠️ Some | Migrate |
+| `JitMicrokernelBase.h` | ❌ None | ⚠️ Legacy | Full migration |
+
+#### Step 2: Create Typed Accessors for Common Patterns
+
+Currently `JitMicrokernelBase.h` has:
+```cpp
+Xbyak::Zmm zmm_max() const { return Xbyak::Zmm(StateRegs::ZMM_MAX); }  // BAD
+```
+
+Replace with:
+```cpp
+StateMax state_max() const { return StateMax{}; }  // GOOD - returns typed register
+```
+
+#### Step 3: Add [[nodiscard]] to All Borrow Methods
+
+Ensure guards aren't accidentally discarded:
+
+```cpp
+// BAD: Guard immediately destroyed, register not actually protected
+tracker.borrow<Scratch0>();  // Compiler warning: discarded [[nodiscard]]
+
+// GOOD: Guard lives until end of scope
+auto guard = tracker.borrow<Scratch0>();
+```
+
+#### Step 4: Enable Enforcement Incrementally
+
+1. First, enable in new code only (`#define` in new files)
+2. Then, migrate legacy files one by one
+3. Finally, enable globally in CMakeLists.txt
+
+### 5.4 Enhanced RegisterAllocation.h Additions
+
+```cpp
+// ============================================================================
+// Compile-Time Register Name Lookup (for better error messages)
+// ============================================================================
+
+template<int AbsoluteIndex>
+struct RegisterName {
+    static constexpr const char* value = 
+        (AbsoluteIndex < 8) ? "Accum" :
+        (AbsoluteIndex < 16) ? "Input" :
+        (AbsoluteIndex < 20) ? "State" :
+        (AbsoluteIndex < 26) ? "Scratch" :
+        "Reserved";
+    
+    static constexpr int local_index = 
+        (AbsoluteIndex < 8) ? AbsoluteIndex :
+        (AbsoluteIndex < 16) ? AbsoluteIndex - 8 :
+        (AbsoluteIndex < 20) ? AbsoluteIndex - 16 :
+        (AbsoluteIndex < 26) ? AbsoluteIndex - 20 :
+        AbsoluteIndex - 26;
+};
+
+// ============================================================================
+// Register Usage Manifest (for multi-kernel coordination)
+// ============================================================================
+
+/**
+ * @brief Declare a kernel's complete register footprint
+ * 
+ * Used to verify that composed kernels don't have conflicting requirements.
+ */
+template<typename... Regs>
+struct KernelRegisterManifest {
+    static constexpr size_t count = sizeof...(Regs);
+    
+    // Check compatibility with another manifest
+    template<typename... OtherRegs>
+    static constexpr bool compatible_with() {
+        // Two manifests are compatible if they can run sequentially
+        // (i.e., no register needs to persist across the boundary)
+        return true;  // Conservative default
+    }
+    
+    // Check if all registers are from allowed zones
+    template<typename... AllowedZones>
+    static constexpr bool restricted_to() {
+        return (is_any_zone_v<Regs, AllowedZones...> && ...);
+    }
+};
+
+// Example usage:
+// using FastExpManifest = KernelRegisterManifest<Scratch4, Scratch5, Input6, Input7>;
+// static_assert(FastExpManifest::restricted_to<ScratchZone, QVectorZone>());
+
+// ============================================================================
+// Guarded Register Reference (Compile-Time Safe, Zero Runtime Cost)
+// ============================================================================
+
+/**
+ * @brief A reference to a typed register that REQUIRES borrowing
+ * 
+ * Unlike TypedZmm which can be used directly, GuardedReg<T> has no
+ * .zmm() accessor. You MUST call .borrow(tracker) to get a guard.
+ */
+template<typename RegType>
+struct GuardedReg {
+    using reg_type = RegType;
+    
+    // NO direct accessor - forces borrow pattern
+    // Xbyak::Zmm zmm() = delete;
+    
+    // Only way to use: borrow first
+    [[nodiscard]] RegisterGuard<RegType> borrow(RegisterTracker& tracker) {
+        return tracker.borrow<RegType>();
+    }
+};
+
+// Pre-defined guarded registers (use these in new code)
+namespace guarded {
+    inline constexpr GuardedReg<Accum0> accum0{};
+    inline constexpr GuardedReg<Accum1> accum1{};
+    // ... etc ...
+    inline constexpr GuardedReg<Scratch4> scratch4{};
+    inline constexpr GuardedReg<Scratch5> scratch5{};
+}
+```
+
+### 5.5 Testing Strategy
+
+#### Unit Tests
+
+```cpp
+TEST(RegisterGuardEnforcement, BorrowReturnsWorkingRegister) {
+    RegisterTracker tracker;
+    auto guard = tracker.borrow<Scratch4>();
+    
+    // Can access underlying Xbyak register
+    EXPECT_EQ(guard.zmm().getIdx(), 24);
+    EXPECT_EQ(guard.xmm().getIdx(), 24);
+}
+
+TEST(RegisterGuardEnforcement, DoubleConflictDetected) {
+    RegisterTracker tracker;
+    auto g1 = tracker.borrow<Score0>();  // Physical reg 20
+    
+    EXPECT_DEATH({
+        auto g2 = tracker.borrow<Scratch0>();  // Also physical reg 20 - CONFLICT
+    }, "REGISTER CONFLICT DETECTED");
+}
+
+TEST(RegisterGuardEnforcement, NodiscardWarning) {
+    // This test verifies [[nodiscard]] is present
+    // (The actual warning is compile-time, this is a documentation test)
+    RegisterTracker tracker;
+    
+    // This should generate a compiler warning:
+    // tracker.borrow<Scratch0>();  // Warning: ignoring return value
+    
+    // Correct usage:
+    [[maybe_unused]] auto guard = tracker.borrow<Scratch0>();
+}
+
+TEST(RegisterGuardEnforcement, ManifestConflictDetected) {
+    // Verify that conflicting manifests are caught at compile time
+    using Manifest1 = KernelRegisterManifest<Scratch0, Scratch1>;
+    using Manifest2 = KernelRegisterManifest<Score0, Score1>;  // Aliases Scratch0/1
+    
+    // This should fail at compile time:
+    // static_assert(!Manifest1::conflicts_with<Manifest2::regs...>());
+}
+```
+
+#### Integration Tests
+
+```cpp
+TEST(RegisterGuardMigration, JitFastExpUsesGuards) {
+    // Verify JitFastExp uses guards (no raw Zmm)
+    // This is a documentation test - actual enforcement is compile-time
+    
+    JitFastExpEmitter emitter;
+    // If JitFastExpEmitter internally uses raw Zmm, this test file
+    // won't compile when LLAMINAR_ENFORCE_REGISTER_GUARDS is defined
+}
+```
+
+### 5.6 Implementation Order
+
+| Step | Task | Effort |
+|------|------|--------|
+| 5.0.1 | Add `[[nodiscard]]` to all borrow methods | 0.5 day |
+| 5.0.2 | Create `check_register_guards.sh` CI script | 0.5 day |
+| 5.0.3 | Add `GuardedReg<T>` template and `guarded::` namespace | 0.5 day |
+| 5.0.4 | Migrate `JitMicrokernelBase.h` raw accessors | 1 day |
+| 5.0.5 | Migrate remaining raw usage in `JitFusedAttentionWo.h` | 0.5 day |
+| 5.0.6 | Add `KernelRegisterManifest` for kernel composition | 0.5 day |
+| 5.0.7 | Enable `LLAMINAR_ENFORCE_REGISTER_GUARDS` globally | Included |
+
+**Total Effort:** ~3.5 days
+
+### 5.7 Success Criteria
+
+| Metric | Current | Target |
+|--------|---------|--------|
+| Raw `Xbyak::Zmm(N)` in JIT code | ~20 instances | 0 |
+| `[[nodiscard]]` on borrow methods | Partial | 100% |
+| CI enforcement script | None | Pass required |
+| Test coverage for guards | Basic | Full (conflict, alias, nodiscard) |
+
+---
+
+## Phase 6: High-Performance Wo Projection
+
+**Effort:** High  
+**Impact:** Very High (5-6× speedup on Qwen 7B decode)  
+**Risk:** Medium (significant JIT changes)  
+**Status:** 🔴 Not Started
+
+### 6.1 Problem Statement
+
+Performance analysis (December 23, 2025) revealed that the fused Wo projection is the **dominant bottleneck**, not attention:
+
+| Model | Attention % of FLOPs | Wo % of FLOPs |
+|-------|----------------------|---------------|
+| Qwen 0.5B decode (kv=128) | 22.6% | **77.4%** |
+| Qwen 7B decode (kv=128) | 6.7% | **93.3%** |
+| Qwen 7B prefill (seq=128) | 3.5% | **96.5%** |
+
+The current fused Wo implementation achieves only **~8-9 GFLOP/s** while standalone OpenBLAS SGEMM achieves:
+
+| Operation | Fused Kernel | OpenBLAS | Ratio |
+|-----------|-------------|----------|-------|
+| `[1 × 3584] × [3584 × 3584]` (decode) | ~8.6 GFLOP/s | **54 GFLOP/s** | **6.3× slower** |
+| `[128 × 3584] × [3584 × 3584]` (prefill) | ~8.2 GFLOP/s | **1508 GFLOP/s** | **184× slower** |
+
+### 6.2 Root Cause Analysis
+
+The current JIT Wo projection (`emit_prefill_wo_fp32`) uses a **naive row-by-row dot product**:
+
+```cpp
+// Current implementation (SLOW)
+void emit_prefill_wo_fp32(reg_Wo, reg_out, reg_ctx_off, d_model) {
+    for (row = 0; row < d_model; ++row) {         // Outer: output rows
+        acc = 0;
+        for (col = 0; col < d_model; col += 16) { // Inner: dot product
+            ctx = load(context[col:col+15]);
+            wo = load(Wo[row, col:col+15]);
+            acc += dot(ctx, wo);
+        }
+        store(output[row], reduce(acc));
+    }
+}
+```
+
+**Problems:**
+1. **No cache blocking**: Wo matrix (49 MB for Qwen 7B) constantly evicted from cache
+2. **Single accumulator**: No instruction-level parallelism (ILP)
+3. **No prefetching**: Memory latency not hidden
+4. **Row-by-row access**: Poor spatial locality for Wo reads
+5. **Sequential output**: Each output element computed independently
+
+### 6.3 Solution: BLAS-Style Microkernel
+
+High-performance GEMM implementations use:
+
+1. **Register blocking**: Compute an MR×NR output tile per inner loop iteration
+2. **Cache blocking**: Tile at L1/L2/L3 cache sizes
+3. **Packing**: Repack matrices for sequential access
+4. **Software prefetching**: Hide memory latency
+5. **Multiple accumulators**: Maximize FMA throughput
+
+For the fused kernel, we have a choice:
+
+#### Option A: Unfuse Wo (Call OpenBLAS)
+
+**Pros:** Immediate 5-6× speedup, minimal code changes  
+**Cons:** Extra memory traffic (context written then read), loses fusion benefit
+
+```cpp
+// After attention completes, call OpenBLAS
+void fused_attention_wo_with_blas(Q, K, V, Wo, output, seq_len, kv_len) {
+    // 1. Compute attention into context buffer
+    float* context = alloc_aligned(seq_len * d_model * sizeof(float));
+    compute_attention_only(Q, K, V, context, seq_len, kv_len);
+    
+    // 2. Call OpenBLAS for Wo projection
+    // output[seq_len, d_model] = context[seq_len, d_model] × Wo[d_model, d_model]
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                seq_len, d_model, d_model,
+                1.0f, context, d_model,
+                Wo, d_model,
+                0.0f, output, d_model);
+    
+    free(context);
+}
+```
+
+#### Option B: JIT BLAS-Quality Microkernel
+
+**Pros:** Maintains fusion, potentially better than BLAS for small M  
+**Cons:** Significant implementation effort, needs careful tuning
+
+We implement a **6×16 microkernel** following the BLIS/OpenBLAS approach:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    GEMM MICROKERNEL DESIGN                             │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  For C[M,N] = A[M,K] × B[K,N]:                                         │
+│                                                                        │
+│  ┌─────┐     ┌─────────────────────────────────────────────┐           │
+│  │  A  │     │                      B                      │           │
+│  │ MR  │  ×  │                      NR                     │           │
+│  │ × K │     │                   K × NR                    │           │
+│  └─────┘     └─────────────────────────────────────────────┘           │
+│      │                           │                                     │
+│      └──────────────┬────────────┘                                     │
+│                     ▼                                                  │
+│              ┌───────────┐                                             │
+│              │     C     │                                             │
+│              │  MR × NR  │  ← MR×NR accumulators in registers          │
+│              └───────────┘                                             │
+│                                                                        │
+│  For AVX-512:                                                          │
+│    NR = 16 (one ZMM register width)                                    │
+│    MR = 6  (6 output rows, 6 accumulators)                             │
+│    → 6 × 16 = 96 output elements per microkernel iteration             │
+│    → 6 ZMM accumulators (zmm0-5)                                       │
+│    → 1 ZMM for A broadcast (zmm6)                                      │
+│    → 1 ZMM for B load (zmm7)                                           │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.4 JIT Implementation: 6×16 FP32 GEMV/GEMM Microkernel
+
+**File:** `jit/JitWoProjectionOptimized.h`
+
+```cpp
+/**
+ * @brief Generate optimized 6×16 microkernel for Wo projection
+ *
+ * Computes a 6×16 tile of output:
+ *   C[6,16] = A[6,K] × B[K,16]
+ *
+ * Register allocation:
+ *   zmm0-5:  6 accumulators (one per output row)
+ *   zmm6:    Broadcast of A[row, k]
+ *   zmm7:    Load of B[k, 0:15]
+ *   zmm8-13: Prefetched B rows (for ILP)
+ *   zmm14:   Spare for unrolling
+ *
+ * K-loop is unrolled by 4 for ILP and prefetch scheduling.
+ *
+ * @param c         Xbyak code generator
+ * @param reg_A     Pointer to A matrix (row-major, context buffer)
+ * @param reg_B     Pointer to B matrix (row-major, Wo weights)
+ * @param reg_C     Pointer to C matrix (row-major, output buffer)
+ * @param K         Reduction dimension (d_model)
+ * @param lda       Leading dimension of A (d_model)
+ * @param ldb       Leading dimension of B (d_model)
+ * @param ldc       Leading dimension of C (d_model)
+ */
+void generate_wo_microkernel_6x16(
+    Xbyak::CodeGenerator& c,
+    const Xbyak::Reg64& reg_A,
+    const Xbyak::Reg64& reg_B,
+    const Xbyak::Reg64& reg_C,
+    int K, int lda, int ldb, int ldc)
+{
+    using namespace Xbyak;
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ACCUMULATOR INITIALIZATION
+    // ═══════════════════════════════════════════════════════════════════
+    
+    Zmm acc0 = zmm0, acc1 = zmm1, acc2 = zmm2;
+    Zmm acc3 = zmm3, acc4 = zmm4, acc5 = zmm5;
+    Zmm a_bcast = zmm6;
+    Zmm b_col = zmm7;
+    
+    // Zero all 6 accumulators
+    c.vxorps(acc0, acc0, acc0);
+    c.vxorps(acc1, acc1, acc1);
+    c.vxorps(acc2, acc2, acc2);
+    c.vxorps(acc3, acc3, acc3);
+    c.vxorps(acc4, acc4, acc4);
+    c.vxorps(acc5, acc5, acc5);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // MAIN K-LOOP (unrolled by 4)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    Reg64 reg_k = rcx;
+    Reg64 reg_A_ptr = r8;   // Current A column pointer
+    Reg64 reg_B_ptr = r9;   // Current B row pointer
+    
+    c.mov(reg_A_ptr, reg_A);
+    c.mov(reg_B_ptr, reg_B);
+    c.xor_(reg_k, reg_k);
+    
+    Label k_loop, k_remainder, k_done;
+    
+    // Main loop: process 4 K values per iteration
+    c.L(k_loop);
+    c.cmp(reg_k, K - 3);
+    c.jge(k_remainder, T_NEAR);
+    
+    // Prefetch next B rows (hide memory latency)
+    c.prefetcht0(ptr[reg_B_ptr + 4 * ldb * 4 + 0]);   // B[k+4, 0:15]
+    c.prefetcht0(ptr[reg_B_ptr + 4 * ldb * 4 + 64]);  // B[k+4, 16:31] if needed
+    
+    // ─────────────────────────────────────────────────────────────────
+    // K iteration 0
+    // ─────────────────────────────────────────────────────────────────
+    c.vmovups(b_col, ptr[reg_B_ptr]);                      // B[k, 0:15]
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 0 * lda * 4]); // A[0, k]
+    c.vfmadd231ps(acc0, a_bcast, b_col);                   // acc0 += A[0,k] * B[k,:]
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 1 * lda * 4]); // A[1, k]
+    c.vfmadd231ps(acc1, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 2 * lda * 4]); // A[2, k]
+    c.vfmadd231ps(acc2, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 3 * lda * 4]); // A[3, k]
+    c.vfmadd231ps(acc3, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 4 * lda * 4]); // A[4, k]
+    c.vfmadd231ps(acc4, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 5 * lda * 4]); // A[5, k]
+    c.vfmadd231ps(acc5, a_bcast, b_col);
+    
+    // ─────────────────────────────────────────────────────────────────
+    // K iteration 1
+    // ─────────────────────────────────────────────────────────────────
+    c.vmovups(b_col, ptr[reg_B_ptr + 1 * ldb * 4]);        // B[k+1, 0:15]
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 0 * lda * 4 + 4]);
+    c.vfmadd231ps(acc0, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 1 * lda * 4 + 4]);
+    c.vfmadd231ps(acc1, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 2 * lda * 4 + 4]);
+    c.vfmadd231ps(acc2, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 3 * lda * 4 + 4]);
+    c.vfmadd231ps(acc3, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 4 * lda * 4 + 4]);
+    c.vfmadd231ps(acc4, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 5 * lda * 4 + 4]);
+    c.vfmadd231ps(acc5, a_bcast, b_col);
+    
+    // ─────────────────────────────────────────────────────────────────
+    // K iterations 2 and 3 (same pattern)
+    // ─────────────────────────────────────────────────────────────────
+    // ... (repeated for k+2 and k+3)
+    
+    // Advance pointers
+    c.add(reg_A_ptr, 4 * 4);           // A_ptr += 4 (4 floats)
+    c.add(reg_B_ptr, 4 * ldb * 4);     // B_ptr += 4 * ldb (4 rows)
+    c.add(reg_k, 4);
+    c.jmp(k_loop, T_NEAR);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // K REMAINDER (K % 4 elements)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    c.L(k_remainder);
+    c.cmp(reg_k, K);
+    c.jge(k_done, T_NEAR);
+    
+    c.vmovups(b_col, ptr[reg_B_ptr]);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 0 * lda * 4]);
+    c.vfmadd231ps(acc0, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 1 * lda * 4]);
+    c.vfmadd231ps(acc1, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 2 * lda * 4]);
+    c.vfmadd231ps(acc2, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 3 * lda * 4]);
+    c.vfmadd231ps(acc3, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 4 * lda * 4]);
+    c.vfmadd231ps(acc4, a_bcast, b_col);
+    
+    c.vbroadcastss(a_bcast, ptr[reg_A_ptr + 5 * lda * 4]);
+    c.vfmadd231ps(acc5, a_bcast, b_col);
+    
+    c.add(reg_A_ptr, 4);
+    c.add(reg_B_ptr, ldb * 4);
+    c.inc(reg_k);
+    c.jmp(k_remainder, T_NEAR);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // STORE RESULTS
+    // ═══════════════════════════════════════════════════════════════════
+    
+    c.L(k_done);
+    c.vmovups(ptr[reg_C + 0 * ldc * 4], acc0);
+    c.vmovups(ptr[reg_C + 1 * ldc * 4], acc1);
+    c.vmovups(ptr[reg_C + 2 * ldc * 4], acc2);
+    c.vmovups(ptr[reg_C + 3 * ldc * 4], acc3);
+    c.vmovups(ptr[reg_C + 4 * ldc * 4], acc4);
+    c.vmovups(ptr[reg_C + 5 * ldc * 4], acc5);
+}
+```
+
+### 6.5 GEMV Specialization for Decode (M=1)
+
+For decode (single query), we optimize differently since there's only one output row:
+
+```cpp
+/**
+ * @brief Generate optimized GEMV for decode (M=1)
+ *
+ * For decode, we have: output[1, N] = context[1, K] × Wo[K, N]
+ *
+ * Strategy:
+ *   - Vectorize over N (output columns)
+ *   - Process 4×16 = 64 output columns per iteration
+ *   - Use 4 accumulators for ILP
+ *   - Unroll K-loop by 4 for prefetch scheduling
+ *
+ * Register allocation:
+ *   zmm0-3:   4 accumulators for output[0:15], [16:31], [32:47], [48:63]
+ *   zmm4:     Context broadcast
+ *   zmm5-8:   B loads (4 columns of 16)
+ *   zmm9-12:  Prefetched B
+ */
+void generate_wo_gemv_optimized(
+    Xbyak::CodeGenerator& c,
+    const Xbyak::Reg64& reg_context,  // [1, K] context vector
+    const Xbyak::Reg64& reg_Wo,       // [K, N] Wo matrix  
+    const Xbyak::Reg64& reg_output,   // [1, N] output vector
+    int K, int N)
+{
+    using namespace Xbyak;
+    
+    Zmm acc0 = zmm0, acc1 = zmm1, acc2 = zmm2, acc3 = zmm3;
+    Zmm ctx_bcast = zmm4;
+    Zmm wo0 = zmm5, wo1 = zmm6, wo2 = zmm7, wo3 = zmm8;
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // OUTER LOOP: N dimension (output columns), step by 64
+    // ═══════════════════════════════════════════════════════════════════
+    
+    Reg64 reg_n = r10;
+    Reg64 reg_out_ptr = r11;
+    Reg64 reg_Wo_col = r12;
+    
+    c.xor_(reg_n, reg_n);
+    c.mov(reg_out_ptr, reg_output);
+    c.mov(reg_Wo_col, reg_Wo);
+    
+    Label n_loop, n_loop_end;
+    
+    c.L(n_loop);
+    c.cmp(reg_n, N - 63);
+    c.jg(n_loop_end, T_NEAR);
+    
+    // Zero accumulators for this N-tile
+    c.vxorps(acc0, acc0, acc0);
+    c.vxorps(acc1, acc1, acc1);
+    c.vxorps(acc2, acc2, acc2);
+    c.vxorps(acc3, acc3, acc3);
+    
+    // ───────────────────────────────────────────────────────────────────
+    // INNER LOOP: K dimension (reduction)
+    // ───────────────────────────────────────────────────────────────────
+    
+    Reg64 reg_k = rcx;
+    Reg64 reg_ctx_ptr = r8;
+    Reg64 reg_Wo_ptr = r9;
+    
+    c.mov(reg_ctx_ptr, reg_context);
+    c.mov(reg_Wo_ptr, reg_Wo_col);
+    c.xor_(reg_k, reg_k);
+    
+    Label k_loop, k_done;
+    
+    c.L(k_loop);
+    c.cmp(reg_k, K);
+    c.jge(k_done, T_NEAR);
+    
+    // Prefetch next Wo row
+    c.prefetcht0(ptr[reg_Wo_ptr + N * 4]);
+    
+    // Broadcast context[k]
+    c.vbroadcastss(ctx_bcast, ptr[reg_ctx_ptr]);
+    
+    // Load 4 × 16 = 64 Wo elements from row k
+    c.vmovups(wo0, ptr[reg_Wo_ptr + 0 * 64]);   // Wo[k, n:n+15]
+    c.vmovups(wo1, ptr[reg_Wo_ptr + 1 * 64]);   // Wo[k, n+16:n+31]
+    c.vmovups(wo2, ptr[reg_Wo_ptr + 2 * 64]);   // Wo[k, n+32:n+47]
+    c.vmovups(wo3, ptr[reg_Wo_ptr + 3 * 64]);   // Wo[k, n+48:n+63]
+    
+    // FMA: acc += context[k] * Wo[k, :]
+    c.vfmadd231ps(acc0, ctx_bcast, wo0);
+    c.vfmadd231ps(acc1, ctx_bcast, wo1);
+    c.vfmadd231ps(acc2, ctx_bcast, wo2);
+    c.vfmadd231ps(acc3, ctx_bcast, wo3);
+    
+    c.add(reg_ctx_ptr, 4);      // Next context element
+    c.add(reg_Wo_ptr, N * 4);   // Next Wo row
+    c.inc(reg_k);
+    c.jmp(k_loop, T_NEAR);
+    
+    c.L(k_done);
+    
+    // Store 64 output elements
+    c.vmovups(ptr[reg_out_ptr + 0 * 64], acc0);
+    c.vmovups(ptr[reg_out_ptr + 1 * 64], acc1);
+    c.vmovups(ptr[reg_out_ptr + 2 * 64], acc2);
+    c.vmovups(ptr[reg_out_ptr + 3 * 64], acc3);
+    
+    // Advance to next N-tile
+    c.add(reg_out_ptr, 64 * 4);
+    c.add(reg_Wo_col, 64 * 4);
+    c.add(reg_n, 64);
+    c.jmp(n_loop, T_NEAR);
+    
+    c.L(n_loop_end);
+    
+    // Handle N remainder (N % 64 elements) - similar pattern with masking
+}
+```
+
+### 6.6 Cache Blocking Strategy
+
+For large matrices, add L2/L3 cache blocking:
+
+```cpp
+/**
+ * @brief Cache-blocked Wo projection
+ *
+ * Block sizes chosen for typical cache hierarchy:
+ *   - L1: 32 KB data → NC_L1 = 64 (64×16×4 = 4 KB per N-block)
+ *   - L2: 1 MB → KC = 256 (256 columns of Wo fit in L2)
+ *   - L3: 30+ MB → Full Wo matrix (49 MB for Qwen 7B)
+ *
+ * For Wo projection where context is tiny (1-128 rows × K columns):
+ *   - Context fits entirely in L1
+ *   - Block over K (reduction dimension) to keep Wo in L2
+ *   - Block over N (output columns) for register tiling
+ */
+void generate_wo_blocked(
+    Xbyak::CodeGenerator& c,
+    int M,      // Number of queries (1 for decode, seq_len for prefill)
+    int N,      // Output dimension (d_model)
+    int K,      // Reduction dimension (d_model)
+    int MC = 6,      // M-block size (microkernel height)
+    int NC = 64,     // N-block size (4 × 16 for decode)
+    int KC = 256)    // K-block size (L2 cache)
+{
+    // For each K-block
+    //   For each N-block
+    //     For each M-block
+    //       Call microkernel(MC, NC, KC_actual)
+    
+    // The microkernel handles partial tiles at boundaries
+}
+```
+
+### 6.7 Integration with Fused Attention
+
+Two integration strategies:
+
+#### Strategy A: Separate Attention + Optimized Wo
+
+```cpp
+void compute_fused_attention_wo_optimized(
+    const Q8_1Block* Q, const Q8_1Block* K, const Q8_1Block* V,
+    const float* Wo, float* output,
+    int seq_len_q, int seq_len_kv, float scale)
+{
+    // 1. Allocate context buffer
+    alignas(64) float context[seq_len_q * d_model];
+    
+    // 2. Compute attention into context
+    compute_attention_only_jit(Q, K, V, context, seq_len_q, seq_len_kv, scale);
+    
+    // 3. Apply optimized Wo projection
+    if (seq_len_q == 1) {
+        // Decode: use GEMV kernel
+        wo_gemv_optimized(context, Wo, output, d_model, d_model);
+    } else {
+        // Prefill: use blocked GEMM kernel
+        wo_gemm_blocked(context, Wo, output, seq_len_q, d_model, d_model);
+    }
+}
+```
+
+#### Strategy B: Fused Streaming Wo (Advanced)
+
+Process Wo projection incrementally as attention context becomes available:
+
+```cpp
+// As each query's context vector is computed, immediately project through Wo
+// This keeps context hot in L1 and enables pipelining
+for (int q = 0; q < seq_len_q; ++q) {
+    // Compute attention for query q → context[q, :]
+    compute_single_query_attention(Q[q], K, V, &context[q * d_model], ...);
+    
+    // Immediately project context[q, :] through Wo while still in cache
+    wo_gemv_optimized(&context[q * d_model], Wo, &output[q * d_model], K, N);
+}
+```
+
+### 6.8 Expected Performance Improvement
+
+| Configuration | Current | Target | Improvement |
+|--------------|---------|--------|-------------|
+| Qwen 7B decode (kv=128) | 3.18 ms | ~0.7 ms | **4.5×** |
+| Qwen 7B prefill (seq=128) | 417 ms | ~65 ms | **6.4×** |
+| Qwen 0.5B decode (kv=128) | 0.17 ms | ~0.06 ms | **2.8×** |
+
+### 6.9 Testing Strategy
+
+```cpp
+// Test__WoProjectionOptimized.cpp
+
+TEST(Test__WoProjectionOptimized, GEMV_MatchesReference) {
+    const int K = 3584, N = 3584;  // Qwen 7B dimensions
+    
+    auto context = TestTensorFactory::createFP32Random({1, K});
+    auto Wo = TestTensorFactory::createFP32Random({K, N});
+    auto ref_output = std::vector<float>(N);
+    auto opt_output = std::vector<float>(N);
+    
+    // Reference: simple GEMV
+    for (int n = 0; n < N; ++n) {
+        float sum = 0;
+        for (int k = 0; k < K; ++k) {
+            sum += context[k] * Wo[k * N + n];
+        }
+        ref_output[n] = sum;
+    }
+    
+    // Optimized: JIT GEMV
+    wo_gemv_optimized(context.data(), Wo.data(), opt_output.data(), K, N);
+    
+    float max_diff = 0;
+    for (int n = 0; n < N; ++n) {
+        max_diff = std::max(max_diff, std::abs(ref_output[n] - opt_output[n]));
+    }
+    
+    EXPECT_LT(max_diff, 1e-4f);  // FP32 accumulation tolerance
+}
+
+TEST(Perf__WoProjectionOptimized, GEMV_Throughput) {
+    const int K = 3584, N = 3584;
+    const int warmup = 10, iters = 100;
+    
+    auto context = TestTensorFactory::createFP32Random({1, K});
+    auto Wo = TestTensorFactory::createFP32Random({K, N});
+    auto output = std::vector<float>(N);
+    
+    // Warmup
+    for (int i = 0; i < warmup; ++i) {
+        wo_gemv_optimized(context.data(), Wo.data(), output.data(), K, N);
+    }
+    
+    // Benchmark
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        wo_gemv_optimized(context.data(), Wo.data(), output.data(), K, N);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    double flops = 2.0 * K * N;
+    double gflops = (flops / 1e9) / (ms / 1000.0);
+    
+    LOG_INFO("Optimized GEMV: " << ms << " ms, " << gflops << " GFLOP/s");
+    
+    // Target: at least 40 GFLOP/s (80% of OpenBLAS)
+    EXPECT_GT(gflops, 40.0);
+}
+```
+
+### 6.10 Implementation Priority
+
+Given the massive performance impact of Wo projection:
+
+| Priority | Task | Effort | Impact |
+|----------|------|--------|--------|
+| **P0** | Option A: Unfuse and call OpenBLAS | 1 day | 5-6× immediate |
+| P1 | JIT GEMV for decode (M=1) | 2 days | Maintain fusion |
+| P2 | JIT blocked GEMM for prefill | 3 days | Full optimization |
+| P3 | Streaming fused Wo | 4 days | Maximum throughput |
+
+**Recommendation:** Start with P0 (OpenBLAS unfused) to get immediate gains, then implement P1/P2 to restore fusion benefits.
+
+---
+
 ## Implementation Order
 
 | Phase | Task | Dependencies | Tests to Pass | Estimated Effort |
@@ -1361,8 +2323,20 @@ ctest --test-dir build_v2_release -R "Perf__FA2" --verbose
 | 3.6 | JIT: Full correctness validation | 3.5 | `Test__FA2RealModel` E2E parity | 1 day |
 | 4.1 | Performance benchmarks vs FA1 | 3.6 | `Perf__FA2Comparison` ≥1.2× | 0.5 day |
 | 4.2 | Integration into pipeline | 4.1 | E2E token parity test | 0.5 day |
+| **5.0.1** | **Add `[[nodiscard]]` to all borrow methods** | None | Compile-time check | **0.5 day** |
+| 5.0.2 | Create `check_register_guards.sh` CI script | None | CI integration | 0.5 day |
+| 5.0.3 | Add `GuardedReg<T>` template and `guarded::` namespace | 5.0.1 | Unit tests | 0.5 day |
+| 5.0.4 | Migrate `JitMicrokernelBase.h` raw accessors | 5.0.3 | Existing tests pass | 1 day |
+| 5.0.5 | Migrate remaining raw usage in JIT files | 5.0.4 | CI script passes | 0.5 day |
+| 5.0.6 | Add `KernelRegisterManifest` for kernel composition | 5.0.5 | Manifest unit tests | 0.5 day |
+| **6.0** | **Unfuse Wo + call OpenBLAS (quick win)** | None | Perf: 5-6× speedup | **1 day** |
+| 6.1 | JIT: `generate_wo_gemv_optimized()` for decode | 6.0 | `Test__WoGEMV` parity | 2 days |
+| 6.2 | JIT: `generate_wo_microkernel_6x16()` | 6.1 | `Test__WoMicrokernel` | 2 days |
+| 6.3 | JIT: Cache-blocked GEMM wrapper | 6.2 | `Test__WoBlockedGEMM` | 1.5 days |
+| 6.4 | Re-fuse optimized Wo into attention | 6.3 | Full E2E parity | 1.5 days |
+| 6.5 | Streaming fused Wo (advanced) | 6.4 | Perf validation | 2 days |
 
-**Total Estimated Effort:** ~12 days
+**Total Estimated Effort:** ~25.5 days (original 12 + Phase 5: 3.5 days + Phase 6: 10 days)
 
 ---
 

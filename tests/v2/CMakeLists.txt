@@ -247,6 +247,18 @@ add_v2_test(V2_Unit_RegisterGuard
     LABELS "V2;Unit;JIT;RegisterGuard;AVX512"
 )
 
+# Test: RegisterEnforcement - Compile-time register type enforcement
+add_executable(v2_test_register_enforcement unit/jit/Test__RegisterEnforcement.cpp)
+target_link_libraries(v2_test_register_enforcement 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RegisterEnforcement 
+    COMMAND $<TARGET_FILE:v2_test_register_enforcement>
+    LABELS "V2;Unit;JIT;RegisterEnforcement;TypeSafety"
+)
+
 # Test: SwiGLU formula correctness (regression test for gate/up swap bug)
 # This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
 add_executable(v2_test_swiglu_formula unit/Test__SwiGLUFormula.cpp)

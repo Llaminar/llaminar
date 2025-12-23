@@ -5,27 +5,75 @@
  * @date December 2025
  *
  * JIT-generated weighted V accumulation for attention context computation.
- * Mirrors the reference VWeightedAccum.h microkernel.
+ * Supports both single-position (FA1) and 4x batched (FA2) accumulation modes.
  *
- * Algorithm:
- *   For each block b in [0, num_blocks):
- *     d_v = fp16_to_fp32(V[b].d)
- *     v_dequant[0:31] = V[b].qs[0:31] * d_v
- *     context[b*32 : (b+1)*32] += weight * v_dequant
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ALGORITHM
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- * Register conventions:
- * - Input: V block pointer in GP reg, weight in zmm_weight()
- * - Output: Context accumulators in zmm_accum(0..N) or stack
- * - Scratch: zmm8-9 for V dequantization, zmm15 for scale
+ * For each block b in [0, num_blocks):
+ *   d_v = fp16_to_fp32(V[b].d)           // Load FP16 scale
+ *   v_dequant[0:31] = V[b].qs[0:31] * d_v // Dequantize 32 int8 values
+ *   context[b*32 : (b+1)*32] += weight * v_dequant // FMA accumulation
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CONTEXT STORAGE (head_dim dependent)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * head_dim=64 (2 blocks):
+ *   - Block 0: zmm_accum(0-1) = zmm0, zmm1 (32 floats each)
+ *   - Block 1: zmm_accum(2-3) = zmm2, zmm3
+ *
+ * head_dim=128 (4 blocks):
+ *   - Blocks 0-1: zmm_accum(0-3) = zmm0-3 (in registers)
+ *   - Blocks 2-3: Spilled to stack at [rsp + spill_base_offset]
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGISTER USAGE
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Input:
+ *   - V block pointer in GP register (varies by caller)
+ *   - zmm_weight() = zmm18: Softmax weight (broadcast)
+ *
+ * V dequantization:
+ *   - zmm_input(0-1) = zmm8-9: Dequantized V values (lo/hi halves)
+ *   - zmm_scratch(5) = zmm25: V scale (d_V broadcast)
+ *
+ * Spilled block scratch:
+ *   - emit_weighted_accum: Uses zmm_scratch(1) = zmm21 for temp
+ *   - emit_interleaved_v_accum_4x: Uses zmm_input(2-3) = zmm10-11 for context temp
+ *
+ * CRITICAL: zmm20 (Scratch0) often holds the broadcasted weight in FA2 mode.
+ *           DO NOT use zmm20 as scratch during V accumulation!
  */
 
 #pragma once
 
 #include "JitMicrokernelBase.h"
+#include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
+#include "../../../jit/RegisterEnforcement.h"
+
+// Import typed register aliases and C++20 concepts
+using namespace llaminar2::jit;
 
 namespace llaminar::v2::kernels::jit
 {
+    // ============================================================================
+    // VWeightedAccum Register Manifest (compile-time documentation)
+    // ============================================================================
+    // Documents the registers borrowed by emit_weighted_v_accum().
+    // CRITICAL: Scratch0 (zmm20) holds the broadcasted weight during V accumulation
+    // and must NOT be used for other purposes during this operation.
+
+    using VWeightedAccumManifest = KernelRegisterManifest<
+        Scratch0,       // Weight broadcast (CRITICAL - do not clobber!)
+        Accum0, Accum1, // Context blocks 0-1 low (32 floats)
+        Accum2, Accum3  // Context blocks 0-1 high (32 floats)
+        >;
+    static_assert(!VWeightedAccumManifest::has_conflicts(),
+                  "VWeightedAccum register manifest has conflicts!");
 
     /**
      * @brief JIT code emitter for weighted V accumulation
@@ -37,22 +85,22 @@ namespace llaminar::v2::kernels::jit
     {
     public:
         /**
-         * @brief Emit weighted V accumulation for one V row
+         * @brief Emit weighted V accumulation for one V row (FA1 style)
          *
-         * For each block, dequantizes V values and accumulates weighted sum
-         * into context registers/stack.
+         * Processes a single V row, dequantizing each block and accumulating
+         * the weighted sum into context registers (blocks 0-1) or stack (blocks 2+).
          *
          * Prerequisites:
-         * - zmm_weight() contains softmax weight (broadcast)
+         * - zmm_weight() = zmm18 contains softmax weight (broadcast)
          *
          * Context storage:
-         * - Blocks 0-1: zmm_accum(0-3) for 64 floats
-         * - Blocks 2+: Spilled to stack
+         * - Blocks 0-1: zmm_accum(0-3) = zmm0-3 for 64 floats
+         * - Blocks 2+: Spilled to stack at [rsp + spill_base_offset + (b-2)*128]
          *
          * Clobbers:
-         * - zmm8, zmm9 (V dequantization)
-         * - zmm15 (V scale)
-         * - zmm_scratch(0-1) for spilled block load/store
+         * - zmm8, zmm9 (Input0-1): V dequantization temporaries
+         * - zmm25 (Scratch5): V scale broadcast
+         * - zmm21 (Scratch1): Spilled block temp (NOT zmm20 which may hold weight!)
          *
          * @param gen Code generator
          * @param reg_V_ptr GP register pointing to V blocks for this position
@@ -69,10 +117,10 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_v_weighted_accum (" + std::to_string(num_blocks) + " blocks)");
 
-            // Register aliases
-            Zmm zmm_v_lo = gen.zmm_input(0);  // zmm8: V values 0-15 (dequantized)
-            Zmm zmm_v_hi = gen.zmm_input(1);  // zmm9: V values 16-31 (dequantized)
-            Zmm zmm_d_v = gen.zmm_scratch(5); // zmm25: V scale
+            // Register aliases - use typed accessors
+            Zmm zmm_v_lo = gen.accum4().zmm();  // zmm4: V values 0-15 (dequantized)
+            Zmm zmm_v_hi = gen.accum5().zmm();  // zmm5: V values 16-31 (dequantized)
+            Zmm zmm_d_v = gen.scratch5().zmm(); // zmm25: V scale
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -101,15 +149,15 @@ namespace llaminar::v2::kernels::jit
                 // Use FMA: context = context + weight * v
                 if (b == 0)
                 {
-                    // Block 0: context floats 0-31 in zmm_accum(0), zmm_accum(1)
-                    gen.vfmadd231ps(gen.zmm_accum(0), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_accum(1), zmm_v_hi, gen.zmm_weight());
+                    // Block 0: context floats 0-31 in accum0(), accum1()
+                    gen.vfmadd231ps(gen.accum0().zmm(), zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.accum1().zmm(), zmm_v_hi, gen.state_weight().zmm());
                 }
                 else if (b == 1)
                 {
-                    // Block 1: context floats 32-63 in zmm_accum(2), zmm_accum(3)
-                    gen.vfmadd231ps(gen.zmm_accum(2), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_accum(3), zmm_v_hi, gen.zmm_weight());
+                    // Block 1: context floats 32-63 in accum2(), accum3()
+                    gen.vfmadd231ps(gen.accum2().zmm(), zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.accum3().zmm(), zmm_v_hi, gen.state_weight().zmm());
                 }
                 else
                 {
@@ -117,17 +165,17 @@ namespace llaminar::v2::kernels::jit
                     int spill_lo = spill_base_offset + (b - 2) * 128;
                     int spill_hi = spill_lo + 64;
 
-                    // Use Scratch1 (zmm21) for temp, NOT Scratch0 (zmm20) which holds weight!
-                    Zmm zmm_tmp = gen.zmm_scratch(1);
+                    // Use scratch1() for temp, NOT scratch0() which holds weight!
+                    Zmm zmm_tmp = gen.scratch1().zmm();
 
                     // Low half
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_lo]);
-                    gen.vfmadd231ps(zmm_tmp, zmm_v_lo, gen.zmm_weight());
+                    gen.vfmadd231ps(zmm_tmp, zmm_v_lo, gen.state_weight().zmm());
                     gen.vmovups(gen.ptr[gen.rsp + spill_lo], zmm_tmp);
 
                     // High half
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_hi]);
-                    gen.vfmadd231ps(zmm_tmp, zmm_v_hi, gen.zmm_weight());
+                    gen.vfmadd231ps(zmm_tmp, zmm_v_hi, gen.state_weight().zmm());
                     gen.vmovups(gen.ptr[gen.rsp + spill_hi], zmm_tmp);
                 }
             }
@@ -152,26 +200,26 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_rescale_context");
 
-            // Rescale register-resident blocks
-            gen.vmulps(gen.zmm_accum(0), gen.zmm_accum(0), gen.zmm_corr());
-            gen.vmulps(gen.zmm_accum(1), gen.zmm_accum(1), gen.zmm_corr());
+            // Rescale register-resident blocks using typed accessors
+            gen.vmulps(gen.accum0().zmm(), gen.accum0().zmm(), gen.state_corr().zmm());
+            gen.vmulps(gen.accum1().zmm(), gen.accum1().zmm(), gen.state_corr().zmm());
 
             if (num_blocks >= 2)
             {
-                gen.vmulps(gen.zmm_accum(2), gen.zmm_accum(2), gen.zmm_corr());
-                gen.vmulps(gen.zmm_accum(3), gen.zmm_accum(3), gen.zmm_corr());
+                gen.vmulps(gen.accum2().zmm(), gen.accum2().zmm(), gen.state_corr().zmm());
+                gen.vmulps(gen.accum3().zmm(), gen.accum3().zmm(), gen.state_corr().zmm());
             }
 
             // Rescale spilled blocks
             if (num_blocks > 2)
             {
-                // CRITICAL: Use Scratch5 (zmm25) for temp, NOT Scratch0-3 (zmm20-23)!
+                // CRITICAL: Use scratch5() for temp, NOT scratch0-3!
                 // During FA2 tile processing, Score0-3 (xmm20-23) are still live and
                 // contain the attention scores. Using zmm20-23 would clobber them
                 // before they're used for weight computation.
                 //
-                // Scratch4 (zmm24) holds tile_max, so use Scratch5 (zmm25).
-                Zmm zmm_tmp = gen.zmm_scratch(5); // zmm25 - safe during FA2
+                // scratch4() holds tile_max, so use scratch5().
+                Zmm zmm_tmp = gen.scratch5().zmm(); // zmm25 - safe during FA2
 
                 for (int b = 2; b < num_blocks; ++b)
                 {
@@ -179,11 +227,11 @@ namespace llaminar::v2::kernels::jit
                     int spill_hi = spill_lo + 64;
 
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_lo]);
-                    gen.vmulps(zmm_tmp, zmm_tmp, gen.zmm_corr());
+                    gen.vmulps(zmm_tmp, zmm_tmp, gen.state_corr().zmm());
                     gen.vmovups(gen.ptr[gen.rsp + spill_lo], zmm_tmp);
 
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_hi]);
-                    gen.vmulps(zmm_tmp, zmm_tmp, gen.zmm_corr());
+                    gen.vmulps(zmm_tmp, zmm_tmp, gen.state_corr().zmm());
                     gen.vmovups(gen.ptr[gen.rsp + spill_hi], zmm_tmp);
                 }
             }
@@ -205,20 +253,20 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_init_context");
 
-            // Zero register-resident blocks
-            gen.vxorps(gen.zmm_accum(0), gen.zmm_accum(0), gen.zmm_accum(0));
-            gen.vxorps(gen.zmm_accum(1), gen.zmm_accum(1), gen.zmm_accum(1));
+            // Zero register-resident blocks using typed accessors
+            gen.vxorps(gen.accum0().zmm(), gen.accum0().zmm(), gen.accum0().zmm());
+            gen.vxorps(gen.accum1().zmm(), gen.accum1().zmm(), gen.accum1().zmm());
 
             if (num_blocks >= 2)
             {
-                gen.vxorps(gen.zmm_accum(2), gen.zmm_accum(2), gen.zmm_accum(2));
-                gen.vxorps(gen.zmm_accum(3), gen.zmm_accum(3), gen.zmm_accum(3));
+                gen.vxorps(gen.accum2().zmm(), gen.accum2().zmm(), gen.accum2().zmm());
+                gen.vxorps(gen.accum3().zmm(), gen.accum3().zmm(), gen.accum3().zmm());
             }
 
             // Zero spilled blocks
             if (num_blocks > 2)
             {
-                Zmm zmm_zero = gen.zmm_scratch(0);
+                Zmm zmm_zero = gen.scratch0().zmm();
                 gen.vxorps(zmm_zero, zmm_zero, zmm_zero);
 
                 for (int b = 2; b < num_blocks; ++b)
@@ -250,20 +298,20 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_normalize_context");
 
-            // Normalize register-resident blocks
-            gen.vmulps(gen.zmm_accum(0), gen.zmm_accum(0), inv_sum_zmm);
-            gen.vmulps(gen.zmm_accum(1), gen.zmm_accum(1), inv_sum_zmm);
+            // Normalize register-resident blocks using typed accessors
+            gen.vmulps(gen.accum0().zmm(), gen.accum0().zmm(), inv_sum_zmm);
+            gen.vmulps(gen.accum1().zmm(), gen.accum1().zmm(), inv_sum_zmm);
 
             if (num_blocks >= 2)
             {
-                gen.vmulps(gen.zmm_accum(2), gen.zmm_accum(2), inv_sum_zmm);
-                gen.vmulps(gen.zmm_accum(3), gen.zmm_accum(3), inv_sum_zmm);
+                gen.vmulps(gen.accum2().zmm(), gen.accum2().zmm(), inv_sum_zmm);
+                gen.vmulps(gen.accum3().zmm(), gen.accum3().zmm(), inv_sum_zmm);
             }
 
             // Normalize spilled blocks
             if (num_blocks > 2)
             {
-                Zmm zmm_tmp = gen.zmm_scratch(0);
+                Zmm zmm_tmp = gen.scratch0().zmm();
 
                 for (int b = 2; b < num_blocks; ++b)
                 {
@@ -289,12 +337,18 @@ namespace llaminar::v2::kernels::jit
          * on stack for reuse across multiple Q positions.
          *
          * Prerequisites:
-         * - zmm_weight() contains softmax weight (broadcast)
+         * - zmm_weight() = zmm18 contains softmax weight (broadcast)
          * - V blocks are cached on stack with 64-byte padding per block
          *
-         * Context storage:
-         * - For prefill, context is in zmm_accum(0-3) loaded from memory
-         * - No spilling needed since we reload from context buffer each Q iteration
+         * Context storage (head_dim dependent):
+         * - Block 0: zmm_accum(0-1) = zmm0-1
+         * - Block 1: zmm_accum(2-3) = zmm2-3
+         * - Block 2: zmm_scratch(1-2) = zmm21-22 (NOT zmm20 which may hold weight!)
+         * - Block 3: zmm_scratch(3-4) = zmm23-24
+         *
+         * Clobbers:
+         * - zmm8, zmm9 (Input0-1): V dequantization temporaries
+         * - zmm25 (Scratch5): V scale broadcast
          *
          * @param gen Code generator
          * @param reg_v_cache_ptr GP register pointing to V cache on stack
@@ -309,10 +363,10 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_v_weighted_accum_from_cache (" + std::to_string(num_blocks) + " blocks)");
 
-            // Register aliases
-            Zmm zmm_v_lo = gen.zmm_input(0);  // zmm8: V values 0-15 (dequantized)
-            Zmm zmm_v_hi = gen.zmm_input(1);  // zmm9: V values 16-31 (dequantized)
-            Zmm zmm_d_v = gen.zmm_scratch(5); // zmm25: V scale
+            // Register aliases using typed accessors
+            Zmm zmm_v_lo = gen.accum4().zmm();  // zmm4: V values 0-15 (dequantized)
+            Zmm zmm_v_hi = gen.accum5().zmm();  // zmm5: V values 16-31 (dequantized)
+            Zmm zmm_d_v = gen.scratch5().zmm(); // zmm25: V scale
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -336,32 +390,32 @@ namespace llaminar::v2::kernels::jit
                 gen.vmulps(zmm_v_hi, zmm_v_hi, zmm_d_v);
 
                 // Accumulate: context += weight * v_dequant
-                // In prefill mode, context is in zmm_accum(0-3) for blocks 0-1
+                // In prefill mode, context is in accum0-3() for blocks 0-1
                 // For head_dim > 64 (blocks > 2), we'd need more registers or spilling
                 // Current implementation supports head_dim up to 64 (num_blocks <= 2)
                 if (b == 0)
                 {
-                    gen.vfmadd231ps(gen.zmm_accum(0), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_accum(1), zmm_v_hi, gen.zmm_weight());
+                    gen.vfmadd231ps(gen.accum0().zmm(), zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.accum1().zmm(), zmm_v_hi, gen.state_weight().zmm());
                 }
                 else if (b == 1)
                 {
-                    gen.vfmadd231ps(gen.zmm_accum(2), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_accum(3), zmm_v_hi, gen.zmm_weight());
+                    gen.vfmadd231ps(gen.accum2().zmm(), zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.accum3().zmm(), zmm_v_hi, gen.state_weight().zmm());
                 }
                 else if (b == 2)
                 {
                     // For head_dim=128 (4 blocks), use additional scratch registers
-                    // Avoid zmm20 (Scratch0) which holds weight!
-                    // Use zmm21-22 (Scratch1-2) for block 2
-                    gen.vfmadd231ps(gen.zmm_scratch(1), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_scratch(2), zmm_v_hi, gen.zmm_weight());
+                    // Avoid scratch0() which holds weight!
+                    // Use scratch1-2() for block 2
+                    gen.vfmadd231ps(gen.scratch1().zmm(), zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.scratch2().zmm(), zmm_v_hi, gen.state_weight().zmm());
                 }
                 else if (b == 3)
                 {
-                    // Use zmm23-24 (Scratch3-4) for block 3
-                    gen.vfmadd231ps(gen.zmm_scratch(3), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_scratch(4), zmm_v_hi, gen.zmm_weight());
+                    // Use scratch3-4() for block 3
+                    gen.vfmadd231ps(gen.scratch3().zmm(), zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.scratch4().zmm(), zmm_v_hi, gen.state_weight().zmm());
                 }
                 // For larger head_dim, we'd need to spill to memory
             }
@@ -371,23 +425,39 @@ namespace llaminar::v2::kernels::jit
          * @brief FA2 Interleaved V Accumulation for 4 KV positions
          *
          * Processes 4 V rows simultaneously with interleaved loads and FMAs
-         * to hide memory latency. This is the FA2 optimization that pipelines
-         * V data loading with compute.
+         * to hide memory latency. This is the FlashAttention-2 optimization
+         * that pipelines V data loading with compute.
          *
-         * Pattern:
-         *   Load V[0] block
-         *   Load V[1] block | FMA V[0]
+         * ════════════════════════════════════════════════════════════════════
+         * INTERLEAVING PATTERN
+         * ════════════════════════════════════════════════════════════════════
+         *   Load V[0] block      // Start first load
+         *   Load V[1] block | FMA V[0]  // Overlap load/compute
          *   Load V[2] block | FMA V[1]
          *   Load V[3] block | FMA V[2]
-         *                   | FMA V[3]
+         *                   | FMA V[3]  // Final compute
          *
-         * This overlaps memory access with compute, reducing stalls.
+         * ════════════════════════════════════════════════════════════════════
+         * REGISTER USAGE
+         * ════════════════════════════════════════════════════════════════════
+         *
+         * Borrowed registers (via RegisterGuard):
+         *   - zmm8-9 (Input0-1): V[0] data (lo/hi halves)
+         *   - zmm4-5 (Accum4-5): V[1] data (avoids Q conflict with zmm10-13)
+         *   - zmm25 (Scratch5): V scale (d_V broadcast)
+         *
+         * Caller-owned (passed in, NOT borrowed here):
+         *   - weight_xmm0-3: Scalar weights, broadcast to zmm20-23 in-place
+         *
+         * For spilled blocks (b >= 2):
+         *   - zmm10-11 (Input2-3): Context load/store temp (safe, Q is released)
+         *   - NOT zmm20-23 which hold the broadcasted weights!
          *
          * @param gen Code generator
          * @param reg_V_ptr Pointer to first V row (V[kv_start])
          * @param v_stride Bytes between consecutive V rows
          * @param num_blocks Number of Q8_1 blocks per head
-         * @param weight_xmm0..3 Scalar weights for V[0..3]
+         * @param weight_xmm0..3 Scalar weights for V[0..3] (will be broadcast in-place)
          * @param spill_base_offset Stack offset for spilled accumulators
          */
         void emit_interleaved_v_accum_4x(
@@ -455,24 +525,44 @@ namespace llaminar::v2::kernels::jit
 
                 if (b == 0)
                 {
-                    zmm_ctx_lo = gen.zmm_accum(0);
-                    zmm_ctx_hi = gen.zmm_accum(1);
+                    // Assert that accum0-1 aren't borrowed (they shouldn't be)
+                    if (gen.tracking_enabled())
+                    {
+                        gen.tracker()->assert_available<Accum0>("emit_interleaved_v_accum_4x block 0");
+                        gen.tracker()->assert_available<Accum1>("emit_interleaved_v_accum_4x block 0");
+                    }
+                    zmm_ctx_lo = gen.accum0().zmm();
+                    zmm_ctx_hi = gen.accum1().zmm();
                 }
                 else if (b == 1)
                 {
-                    zmm_ctx_lo = gen.zmm_accum(2);
-                    zmm_ctx_hi = gen.zmm_accum(3);
+                    // Assert that accum2-3 aren't borrowed
+                    if (gen.tracking_enabled())
+                    {
+                        gen.tracker()->assert_available<Accum2>("emit_interleaved_v_accum_4x block 1");
+                        gen.tracker()->assert_available<Accum3>("emit_interleaved_v_accum_4x block 1");
+                    }
+                    zmm_ctx_lo = gen.accum2().zmm();
+                    zmm_ctx_hi = gen.accum3().zmm();
                 }
                 else
                 {
-                    // Spilled blocks
+                    // Spilled blocks: Must use accum6-7 (zmm6-7) for context!
+                    // accum4-5 (zmm4-5) are already borrowed for V data loading
+                    // (guard_v_lo_1, guard_v_hi_1), so we CANNOT use them here.
+                    //
+                    // The assert_available check will catch if we accidentally use
+                    // borrowed registers:
+                    if (gen.tracking_enabled())
+                    {
+                        gen.tracker()->assert_available<Accum6>("emit_interleaved_v_accum_4x spilled block");
+                        gen.tracker()->assert_available<Accum7>("emit_interleaved_v_accum_4x spilled block");
+                    }
                     use_spill = true;
                     spill_lo = spill_base_offset + (b - 2) * 128;
                     spill_hi = spill_lo + 64;
-                    // zmm20-23 hold weights! Cannot use them.
-                    // zmm10-13 (Input2-5) are free (Q released).
-                    zmm_ctx_lo = gen.zmm_input(2); // zmm10
-                    zmm_ctx_hi = gen.zmm_input(3); // zmm11
+                    zmm_ctx_lo = gen.accum6().zmm(); // zmm6
+                    zmm_ctx_hi = gen.accum7().zmm(); // zmm7
                 }
 
                 if (use_spill)

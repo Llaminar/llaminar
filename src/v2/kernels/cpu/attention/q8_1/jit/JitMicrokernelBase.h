@@ -10,16 +10,67 @@
  * - Debug emission support
  * - Stack management helpers
  *
- * Design Philosophy:
- * - Each JIT microkernel is independently testable
- * - Microkernels can be composed into fused kernels
- * - Register conventions ensure composability without conflicts
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DESIGN PHILOSOPHY
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- * Register Aliasing Warning:
- * - XMM, YMM, and ZMM registers with the same index share physical storage
- * - xmm0 is the lower 128 bits of ymm0 and zmm0
- * - Writing to ymm0 zeroes the upper 384 bits of zmm0
- * - Use RegisterAllocation.h typed registers to prevent aliasing bugs
+ * - Each JIT microkernel (μK1-μK5) is independently testable
+ * - Microkernels compose into fused kernels via emitters
+ * - Register conventions ensure composability without conflicts
+ * - RegisterGuard system catches conflicts at JIT compile time
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGISTER ZONES (32 ZMM registers partitioned by purpose)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * AccumZone (zmm0-7): Context accumulators - persist across KV loop
+ *   - 8 × 16 floats = 128 floats max (supports head_dim up to 128)
+ *   - For head_dim=64: zmm0-3 (64 floats)
+ *   - For head_dim=128: zmm0-7 (128 floats)
+ *
+ * InputZone (zmm8-15): Q/K/V data loading
+ *   - zmm8-9: V accum output, exp temp
+ *   - zmm10-13: Pre-loaded unsigned Q data (2-4 blocks)
+ *   - zmm14-15: exp2_poly (integer/fractional parts)
+ *
+ * StateZone (zmm16-19): Online softmax state
+ *   - zmm16: StateMax - running maximum
+ *   - zmm17: StateSum - running sum of exp weights
+ *   - zmm18: StateWeight - current weight (FA1 single mode)
+ *   - zmm19: StateCorr - correction factor for rescaling
+ *
+ * ScratchZone (zmm20-25): Temporaries + FA2 scores
+ *   - zmm20-23: Score0-3 (xmm low 128-bits) / weight broadcast (full zmm)
+ *   - zmm24: Scratch4 - safe scratch, tile_max storage
+ *   - zmm25: Scratch5 - safe scratch, correction term
+ *
+ * ConstZone (zmm26-31): Preloaded constants - never modified after init
+ *   - zmm26: 0x80808080 (Q8 unsigned bias)
+ *   - zmm27: attention scale (1/sqrt(head_dim))
+ *   - zmm28: -infinity (softmax init) or 16.0f (Q8_1 correction)
+ *   - zmm29: 1.0f
+ *   - zmm30: log2(e) for exp approximation
+ *   - zmm31: -87.0f (exp underflow clamp)
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGISTER ALIASING WARNING
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * XMM, YMM, and ZMM registers with the same index share physical storage:
+ *   - xmm0 = lower 128 bits of ymm0 = lower 128 bits of zmm0
+ *   - Writing to ymm0 zeroes the upper 384 bits of zmm0
+ *   - Writing to xmm0 zeroes the upper 384 bits of zmm0
+ *
+ * FA2 Score/Weight aliasing (intentional):
+ *   - Scores computed into Score0-3 (xmm20-23)
+ *   - After scores consumed, weights broadcast into Scratch0-3 (zmm20-23)
+ *   - This reuses the same physical registers for different phases
+ *
+ * CRITICAL: zmm20 holds broadcasted weight during V accumulation!
+ *   - Cannot use zmm20 as scratch during emit_weighted_accum
+ *   - Bug fix (Dec 2025): Changed temp registers to zmm21+ for spills
+ *
+ * Use RegisterAllocation.h typed registers to prevent aliasing bugs.
  */
 
 #pragma once
@@ -144,36 +195,89 @@ namespace llaminar::v2::kernels::jit
         }
 
         // ========================================================================
-        // Common ZMM Register Accessors (public for emitters)
+        // Legacy Raw ZMM Accessors (DEPRECATED - use typed accessors below)
         // ========================================================================
+        // These return raw Xbyak::Zmm which bypasses compile-time type checking.
+        // Prefer the typed accessors (const_128(), state_max(), etc.) for new code.
 
-        Xbyak::Zmm zmm_128() const { return Xbyak::Zmm(ConstRegs::ZMM_128); }
-        Xbyak::Zmm zmm_scale() const { return Xbyak::Zmm(ConstRegs::ZMM_SCALE); }
-        Xbyak::Zmm zmm_neg_inf() const { return Xbyak::Zmm(ConstRegs::ZMM_NEG_INF); }
-        Xbyak::Zmm zmm_16() const { return Xbyak::Zmm(ConstRegs::ZMM_16); } ///< 16.0f for Q8_1 correction
-        Xbyak::Zmm zmm_one() const { return Xbyak::Zmm(ConstRegs::ZMM_ONE); }
-        Xbyak::Zmm zmm_log2e() const { return Xbyak::Zmm(ConstRegs::ZMM_LOG2E); }
-        Xbyak::Zmm zmm_exp_min() const { return Xbyak::Zmm(ConstRegs::ZMM_EXP_MIN); }
+        [[deprecated("Use const_128() instead")]]
+        Xbyak::Zmm zmm_128() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_128);
+        }
+        [[deprecated("Use const_scale() instead")]]
+        Xbyak::Zmm zmm_scale() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_SCALE);
+        }
+        [[deprecated("Use const_neg_inf() instead")]]
+        Xbyak::Zmm zmm_neg_inf() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_NEG_INF);
+        }
+        [[deprecated("Use const_16() instead")]]
+        Xbyak::Zmm zmm_16() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_16);
+        }
+        [[deprecated("Use const_one() instead")]]
+        Xbyak::Zmm zmm_one() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_ONE);
+        }
+        [[deprecated("Use const_log2e() instead")]]
+        Xbyak::Zmm zmm_log2e() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_LOG2E);
+        }
+        [[deprecated("Use const_exp_min() instead")]]
+        Xbyak::Zmm zmm_exp_min() const
+        {
+            return Xbyak::Zmm(ConstRegs::ZMM_EXP_MIN);
+        }
 
-        Xbyak::Zmm zmm_max() const { return Xbyak::Zmm(StateRegs::ZMM_MAX); }
-        Xbyak::Zmm zmm_sum() const { return Xbyak::Zmm(StateRegs::ZMM_SUM); }
-        Xbyak::Zmm zmm_weight() const { return Xbyak::Zmm(StateRegs::ZMM_WEIGHT); }
-        Xbyak::Zmm zmm_corr() const { return Xbyak::Zmm(StateRegs::ZMM_CORR); }
-        Xbyak::Zmm zmm_score() const { return Xbyak::Zmm(StateRegs::ZMM_SCORE); }
+        [[deprecated("Use state_max() instead")]]
+        Xbyak::Zmm zmm_max() const
+        {
+            return Xbyak::Zmm(StateRegs::ZMM_MAX);
+        }
+        [[deprecated("Use state_sum() instead")]]
+        Xbyak::Zmm zmm_sum() const
+        {
+            return Xbyak::Zmm(StateRegs::ZMM_SUM);
+        }
+        [[deprecated("Use state_weight() instead")]]
+        Xbyak::Zmm zmm_weight() const
+        {
+            return Xbyak::Zmm(StateRegs::ZMM_WEIGHT);
+        }
+        [[deprecated("Use state_corr() instead")]]
+        Xbyak::Zmm zmm_corr() const
+        {
+            return Xbyak::Zmm(StateRegs::ZMM_CORR);
+        }
+        [[deprecated("Use Input7 from RegisterAllocation.h instead")]]
+        Xbyak::Zmm zmm_score() const
+        {
+            return Xbyak::Zmm(StateRegs::ZMM_SCORE);
+        }
 
-        // Scratch registers
+        // Scratch registers - use scratchN() typed accessors
+        [[deprecated("Use scratch0()-scratch5() typed accessors")]]
         Xbyak::Zmm zmm_scratch(int idx) const
         {
             return Xbyak::Zmm(ZmmZones::SCRATCH_START + idx);
         }
 
-        // Accumulator registers
+        // Accumulator registers - use accumN() typed accessors
+        [[deprecated("Use accum0()-accum7() typed accessors")]]
         Xbyak::Zmm zmm_accum(int idx) const
         {
             return Xbyak::Zmm(ZmmZones::ACCUM_START + idx);
         }
 
-        // Input registers
+        // Input registers - use InputN from RegisterAllocation.h
+        [[deprecated("Use Input0-Input7 from RegisterAllocation.h")]]
         Xbyak::Zmm zmm_input(int idx) const
         {
             return Xbyak::Zmm(ZmmZones::INPUT_START + idx);
@@ -184,6 +288,15 @@ namespace llaminar::v2::kernels::jit
         // ========================================================================
         // These return typed registers from RegisterAllocation.h, enabling
         // compile-time checking of register conflicts.
+
+        // Constant registers (zmm26-31) - preloaded at kernel init
+        static constexpr llaminar2::jit::Const128 const_128() { return {}; }
+        static constexpr llaminar2::jit::ConstScale const_scale() { return {}; }
+        static constexpr llaminar2::jit::ConstNegInf const_neg_inf() { return {}; }
+        static constexpr llaminar2::jit::Const16 const_16() { return {}; } // Note: aliases const_neg_inf()
+        static constexpr llaminar2::jit::ConstOne const_one() { return {}; }
+        static constexpr llaminar2::jit::ConstLog2e const_log2e() { return {}; }
+        static constexpr llaminar2::jit::ConstExpMin const_exp_min() { return {}; }
 
         // State registers (zmm16-19) - online softmax state
         static constexpr llaminar2::jit::StateMax state_max() { return {}; }

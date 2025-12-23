@@ -62,7 +62,7 @@ public:
         using namespace Xbyak;
         // Initialize 0x80808080 for unsigned conversion
         mov(eax, 0x80808080);
-        vpbroadcastd(zmm_128(), eax);
+        vpbroadcastd(const_128().zmm(), eax);
     }
 };
 
@@ -81,7 +81,7 @@ public:
         // Args: rdi=v_ptr, xmm0=weight, rsi=accum_ptr
 
         // Broadcast weight to ZMM_WEIGHT
-        vbroadcastss(zmm_weight(), xmm0);
+        vbroadcastss(state_weight().zmm(), xmm0);
 
         // Zero accumulators (we'll just accumulate into zeroed regs for the test)
         // In real kernel, these hold running sums.
@@ -93,10 +93,8 @@ public:
         // But emit_weighted_accum assumes accumulators are in zmm_accum(0..N) or stack.
 
         // For simplicity, we'll zero the accumulators first
-        for (int i = 0; i < 2; ++i)
-        {
-            vxorps(zmm_accum(i), zmm_accum(i), zmm_accum(i));
-        }
+        vxorps(accum0().zmm(), accum0().zmm(), accum0().zmm());
+        vxorps(accum1().zmm(), accum1().zmm(), accum1().zmm());
 
         // We need to handle spilling if num_blocks > 2 (64 elements)
         // emit_weighted_accum takes spill_base_offset.
@@ -153,7 +151,7 @@ public:
         {
             // Initialize constants for Q8_1
             mov(eax, 0x80808080);
-            vpbroadcastd(zmm_128(), eax);
+            vpbroadcastd(const_128().zmm(), eax);
 
             emitter.emit_project_q8_1(*this, rdi, rsi, rdx, head_dim);
         }

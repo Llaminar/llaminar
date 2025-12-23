@@ -6,10 +6,40 @@
  * register clobbering bugs at compile time. Instead of relying on comments and
  * conventions, register assignments are encoded in the C++ type system.
  *
- * Key concepts:
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * KEY CONCEPTS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
  * 1. **Register Zones**: Disjoint sets of registers for different purposes
- * 2. **Typed Registers**: Template wrappers that encode the register index in the type
- * 3. **Zone Membership**: Functions can use SFINAE/static_assert to verify zone membership
+ *    - AccumulatorZone (zmm0-7): Context accumulators
+ *    - QVectorZone (zmm8-15): Input data (Q, K, V, temps)
+ *    - StateZone (zmm16-19): Online softmax state
+ *    - ScratchZone (zmm20-25): Temporaries
+ *    - ScoreZone (xmm20-23): FA2 scalar scores (aliases low Scratch)
+ *    - ReservedZone (zmm26-31): Constants
+ *
+ * 2. **Typed Registers**: Template wrappers encoding register index in the type
+ *    - TypedZmm<Zone, index> → wraps specific zmm register
+ *    - TypedXmm<Zone, index> → wraps specific xmm register
+ *
+ * 3. **Zone Membership**: SFINAE/static_assert verify zone membership at compile time
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * FA2 SCORE/SCRATCH ALIASING
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * ScoreZone (xmm20-23) physically overlaps ScratchZone (zmm20-23):
+ *   - Phase 1: Scores written to Score0-3 (xmm20-23)
+ *   - Phase 2: After scores consumed, weights broadcast to Scratch0-3 (zmm20-23)
+ *
+ * CRITICAL CONSTRAINT: During V accumulation (emit_weighted_accum):
+ *   - zmm20 holds the broadcasted attention weight
+ *   - CANNOT use zmm20 as scratch (would clobber weight!)
+ *   - Use zmm21+ or Scratch4-5 (zmm24-25) for any temps needed
+ *
+ * Safe scratch during FA2: Scratch4 (zmm24), Scratch5 (zmm25)
+ *   - These do NOT alias ScoreZone
+ *   - Use require_safe_scratch_for_fa2<T> to enforce at compile time
  *
  * Example usage:
  * @code
@@ -23,6 +53,12 @@
  * void emit_something(const ScratchReg& scratch) {
  *     static_assert(std::is_same_v<typename ScratchReg::zone_type, ScratchZone>,
  *                   "Must pass a scratch register");
+ * }
+ *
+ * // FA2-safe scratch constraint
+ * template<typename T, require_safe_scratch_for_fa2<T> = true>
+ * void emit_tile_max_reduction(const T& output, ...) {
+ *     // output guaranteed to be Scratch4 or Scratch5 (zmm24/25)
  * }
  * @endcode
  */
@@ -303,6 +339,18 @@ namespace llaminar2::jit
     using Score1 = ScoreXmm<1>; // xmm21
     using Score2 = ScoreXmm<2>; // xmm22
     using Score3 = ScoreXmm<3>; // xmm23
+
+    // Reserved/Constant registers (zmm26-zmm31) - preloaded constants
+    // These are loaded once at kernel init and never modified during execution
+    template <int N>
+    using ReservedZmm = TypedZmm<ReservedZone, N>;
+    using Const128 = ReservedZmm<0>;    // zmm26: 128.0f (Q8 dequant scale) or 0x80808080
+    using ConstScale = ReservedZmm<1>;  // zmm27: attention scale (rsqrt(head_dim))
+    using ConstNegInf = ReservedZmm<2>; // zmm28: -inf (decode) OR 16.0f (prefill Q8_1 correction)
+    using Const16 = ReservedZmm<2>;     // zmm28: alias - shares with ConstNegInf (mode-dependent)
+    using ConstOne = ReservedZmm<3>;    // zmm29: 1.0f
+    using ConstLog2e = ReservedZmm<4>;  // zmm30: log2(e) for fast exp
+    using ConstExpMin = ReservedZmm<5>; // zmm31: -87.0f (exp underflow clamp)
 
     // ============================================================================
     // Register Set for Function Signatures

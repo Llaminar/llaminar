@@ -183,3 +183,87 @@ TEST_F(Test__RegisterGuard, ScopedRegisterSet)
     // All released
     EXPECT_EQ(tracker.borrowed_count(), 0);
 }
+
+// ============================================================================
+// Tests for assert_available() - detecting raw accessor conflicts
+// ============================================================================
+
+TEST_F(Test__RegisterGuard, AssertAvailable_NotBorrowed)
+{
+    // When nothing is borrowed, assert_available should pass
+    tracker.assert_available<Score0>("test context");
+    tracker.assert_available<Accum4>("test context");
+    tracker.assert_available<Scratch0>("test context");
+
+    // Also test the physical index version
+    tracker.assert_available(20, "Score0", "test context");
+    tracker.assert_available(4, "Accum4", "test context");
+}
+
+TEST_F(Test__RegisterGuard, AssertAvailable_DifferentRegister)
+{
+    // Borrow Score0, but check Accum4 - should pass
+    auto guard = tracker.borrow<Score0>();
+    tracker.assert_available<Accum4>("test context"); // Different register, OK
+
+    // Also verify Score0 IS borrowed
+    EXPECT_TRUE(tracker.is_borrowed<Score0>());
+}
+
+TEST_F(Test__RegisterGuard, AssertAvailable_AfterRelease)
+{
+    {
+        auto guard = tracker.borrow<Accum4>();
+        EXPECT_TRUE(tracker.is_borrowed<Accum4>());
+    }
+    // After guard destruction, should be available again
+    tracker.assert_available<Accum4>("after release");
+}
+
+// Death test: assert_available when register IS borrowed
+TEST_F(Test__RegisterGuard, DeathTest_AssertAvailable_WhenBorrowed)
+{
+    auto guard = tracker.borrow<Accum4>();
+
+    // This should trigger an assertion failure with helpful message
+    EXPECT_DEATH(
+        tracker.assert_available<Accum4>("trying to use raw accessor"),
+        "RAW ACCESSOR CONFLICT DETECTED");
+}
+
+// Death test: assert_available detects XMM/ZMM aliasing
+TEST_F(Test__RegisterGuard, DeathTest_AssertAvailable_AliasConflict)
+{
+    // Borrow Score0 (xmm20), then try to assert_available on Scratch0 (zmm20)
+    // These alias the same physical register!
+    auto guard = tracker.borrow<Score0>();
+
+    EXPECT_DEATH(
+        tracker.assert_available<Scratch0>("trying zmm20 while xmm20 borrowed"),
+        "RAW ACCESSOR CONFLICT DETECTED");
+}
+
+// Test that demonstrates the original bug pattern
+// This is the exact pattern that caused the FA2 parity regression:
+// 1. Borrow Accum4/5 for V loading
+// 2. Try to use Accum4/5 raw accessors for spilled context
+TEST_F(Test__RegisterGuard, DeathTest_OriginalBugPattern)
+{
+    // Simulate the bug: borrow accum4-5 for V loading
+    auto guard_v_lo = tracker.borrow<Accum4>();
+    auto guard_v_hi = tracker.borrow<Accum5>();
+
+    // Now try the pattern that was buggy: using accum4/5 raw accessors
+    // This WOULD have been detected if we had assert_available checks!
+    EXPECT_DEATH(
+        tracker.assert_available<Accum4>("spilled context lo"),
+        "RAW ACCESSOR CONFLICT DETECTED");
+
+    EXPECT_DEATH(
+        tracker.assert_available<Accum5>("spilled context hi"),
+        "RAW ACCESSOR CONFLICT DETECTED");
+
+    // But accum6-7 (the fix) should work fine
+    tracker.assert_available<Accum6>("spilled context lo (fixed)");
+    tracker.assert_available<Accum7>("spilled context hi (fixed)");
+}

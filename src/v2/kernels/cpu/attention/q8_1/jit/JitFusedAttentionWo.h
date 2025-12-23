@@ -15,19 +15,95 @@
  * computation, avoiding function call overhead while maintaining the same
  * structure as the reference implementation for testability.
  *
- * Architecture:
- *   1. For each query position q:
- *      a. For each KV position kv:
- *         - Score = Q8DotProduct(Q[q], K[kv]) * scale
- *         - OnlineSoftmax update (max, sum, correction)
- *         - Context[q] += softmax_weight * V[kv]
- *      b. Normalize context by 1/sum
- *      c. Output[q] = Context[q] * Wo
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ARCHITECTURE
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- * JIT Strategy:
- *   - Generate code at runtime based on model dimensions
- *   - Specialize for head_dim, num_heads, batch_size
- *   - Cache generated code for reuse
+ * FA1 (Single-Score) Mode:
+ *   For each query position q:
+ *     For each KV position kv:
+ *       score = Q8DotProduct(Q[q], K[kv]) * scale
+ *       weight = OnlineSoftmax.update(score)
+ *       context[q] += weight * V[kv]
+ *     context[q] *= 1/sum
+ *     output[q] = context[q] * Wo
+ *
+ * FA2 (4x Tiled) Mode:
+ *   For each query position q:
+ *     For each KV tile (kv, kv+1, kv+2, kv+3):
+ *       scores[0..3] = Q8DotProduct_4x(Q[q], K[kv..kv+3]) * scale
+ *       tile_max = max(scores[0..3])
+ *       if tile_max > running_max:
+ *         correction = exp(running_max - tile_max)
+ *         context[q] *= correction        // Rescale accumulated context
+ *         running_max = tile_max
+ *       weights[0..3] = exp(scores[0..3] - running_max)
+ *       context[q] += weights[0] * V[kv+0]
+ *       context[q] += weights[1] * V[kv+1]
+ *       context[q] += weights[2] * V[kv+2]
+ *       context[q] += weights[3] * V[kv+3]
+ *     context[q] *= 1/sum
+ *     output[q] = context[q] * Wo
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGISTER ALLOCATION ZONES (via RegisterAllocation.h)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * AccumZone (zmm0-7): Context accumulators
+ *   - zmm0-7: Up to 512 floats (128 head_dim × 4 tile, or 64 head_dim × 8)
+ *   - Layout: [context_chunk_0, context_chunk_1, ...]
+ *   - For 7B (head_dim=128): zmm0-7 = 8 chunks × 16 floats = 128 floats
+ *
+ * InputZone (zmm8-15): Q/K/V data loading
+ *   - zmm8-9: Currently free (V accum uses these for output)
+ *   - zmm10-13: Pre-loaded unsigned Q data (persists across KV loop)
+ *   - zmm14-15: Used by emit_exp2_poly (safe - exp called before V accum)
+ *
+ * StateZone (zmm16-19): Online softmax state
+ *   - StateMax (zmm16): Running max for numerical stability
+ *   - StateSum (zmm17): Running sum of exp weights
+ *   - StateWeight (zmm18): Current attention weight (FA1 only)
+ *   - StateCorr (zmm19): Correction factor for context rescaling
+ *
+ * ScratchZone (zmm20-25): Temporary registers + FA2 scores
+ *   - Score0-3 (xmm20-23): FA2 tile scores (alias Scratch0-3 low 128-bits)
+ *   - zmm20: CRITICAL - Holds broadcasted weight for V accumulation!
+ *   - zmm21-23: V weight broadcast, temp scratch
+ *   - Scratch4 (zmm24): Safe scratch - tile_max storage
+ *   - Scratch5 (zmm25): Safe scratch - correction term
+ *
+ * ConstZone (zmm26-31): Preloaded constants
+ *   - zmm26: log2(e) for exp approximation
+ *   - zmm27: -87.0f exp min clamp
+ *   - zmm28: 1.0f
+ *   - zmm29: 0x80808080 (Q8 unsigned bias)
+ *   - zmm30: -infinity
+ *   - zmm31: Reserved
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * FA2 REGISTER LIFECYCLE
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Phase 1 - Score Computation:
+ *   [Input]  Q data in zmm10-13 (persists)
+ *   [Input]  K data loaded into ymm8 (per-KV, temporary)
+ *   [Output] Scores in Score0-3 (xmm20-23)
+ *
+ * Phase 2 - Tile State Update:
+ *   [Input]  Scores in Score0-3 (xmm20-23)
+ *   [Output] tile_max in Scratch4 (zmm24)
+ *   [Output] StateCorr in zmm19 (if rescale needed)
+ *   [Clobber] Score0-3 overwritten with weights via Scratch0-3
+ *
+ * Phase 3 - Context Rescaling (if correction != 1.0):
+ *   [Input]  StateCorr in zmm19
+ *   [Modify] Accum0-7 (zmm0-7) *= StateCorr
+ *
+ * Phase 4 - V Accumulation:
+ *   [Input]  Weights in Scratch0-3 (zmm20-23) - broadcasted from xmm
+ *   [Input]  V data loaded from memory
+ *   [Modify] Accum0-7 (zmm0-7) += weight * V_chunk
+ *   [CRITICAL] zmm20 holds broadcasted weight - cannot use as scratch!
  */
 
 #pragma once
@@ -459,20 +535,20 @@ namespace llaminar::v2::kernels::jit
             // See JitMicrokernelBase.h ConstRegs for register assignments.
 
             // zmm27: Broadcast attention scale from xmm0 (1st float arg)
-            vbroadcastss(zmm_scale(), xmm0);
+            vbroadcastss(const_scale().zmm(), xmm0);
 
             // zmm30: log2(e) = 1.44269504089f for fast exp computation
-            load_constant_f32(zmm_log2e(), 1.44269504089f);
+            load_constant_f32(const_log2e().zmm(), 1.44269504089f);
 
             // zmm31: -87.0f exp underflow clamp (exp(-87) ≈ 1e-38)
-            load_constant_f32(zmm_exp_min(), -87.0f);
+            load_constant_f32(const_exp_min().zmm(), -87.0f);
 
             // zmm29: 1.0f for various computations
-            load_constant_f32(zmm_one(), 1.0f);
+            load_constant_f32(const_one().zmm(), 1.0f);
 
             // zmm26: 0x80808080 pattern for Q8_1 unsigned-to-signed conversion
             // Q8_1 stores values as unsigned [0,255], we XOR to get signed [-128,127]
-            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
+            emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rax);
 
             // ═══════════════════════════════════════════════════════════════════
             // CALCULATE STACK FRAME SIZE AND LAYOUT
@@ -753,19 +829,19 @@ namespace llaminar::v2::kernels::jit
             // ═══════════════════════════════════════════════════════════════════
 
             // zmm27: Attention scale factor (broadcasted from xmm0)
-            vbroadcastss(zmm_scale(), xmm0);
+            vbroadcastss(const_scale().zmm(), xmm0);
 
             // zmm30: log2(e) for fast exp computation
-            load_constant_f32(zmm_log2e(), 1.44269504089f);
+            load_constant_f32(const_log2e().zmm(), 1.44269504089f);
 
             // zmm29: 1.0f for various computations
-            load_constant_f32(zmm_one(), 1.0f);
+            load_constant_f32(const_one().zmm(), 1.0f);
 
             // zmm31: -87.0f exp underflow clamp
-            load_constant_f32(zmm_exp_min(), -87.0f);
+            load_constant_f32(const_exp_min().zmm(), -87.0f);
 
             // zmm26: 0x80808080 for unsigned-to-signed conversion
-            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
+            emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rax);
 
             // ═══════════════════════════════════════════════════════════════════
             // CALCULATE DIMENSIONS AND STACK LAYOUT
@@ -832,7 +908,7 @@ namespace llaminar::v2::kernels::jit
             mov(ptr[rsp + position_offset_spill], rax);
 
             // Re-initialize zmm26 (may have been clobbered)
-            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
+            emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rax);
 
             // ═══════════════════════════════════════════════════════════════════
             // TILE LOOP: Process queries in tiles of Q_TILE_SIZE
@@ -1137,11 +1213,11 @@ namespace llaminar::v2::kernels::jit
             using namespace Xbyak;
 
             // Load -FLT_MAX for max initialization (approximation of -infinity)
-            Zmm zmm_neg_inf = zmm_scratch(0);
+            Zmm zmm_neg_inf = scratch0().zmm();
             load_constant_f32(zmm_neg_inf, -3.4028235e+38f);
 
             // Zero for sum initialization
-            Zmm zmm_zero = zmm_scratch(1);
+            Zmm zmm_zero = scratch1().zmm();
             vxorps(zmm_zero, zmm_zero, zmm_zero);
 
             // Store (max, sum) pairs for each query
@@ -1190,7 +1266,7 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            Zmm zmm_zero = zmm_scratch(0);
+            Zmm zmm_zero = scratch0().zmm();
             vxorps(zmm_zero, zmm_zero, zmm_zero);
 
             // Zero-fill context buffer using 64-byte ZMM stores
@@ -1258,14 +1334,14 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            Xmm xmm_log2e = Xmm(zmm_log2e().getIdx());
+            Xmm xmm_log2e = Xmm(const_log2e().zmm().getIdx());
 
-            Zmm zmm_n = zmm_scratch(0); // Integer part
-            Zmm zmm_f = zmm_scratch(1); // Fractional part
-            Zmm zmm_p = zmm_scratch(2); // Polynomial result
+            Zmm zmm_n = scratch0().zmm(); // Integer part
+            Zmm zmm_f = scratch1().zmm(); // Fractional part
+            Zmm zmm_p = scratch2().zmm(); // Polynomial result
 
             // Step 1: t = x * log2(e)
-            vmulps(zmm_f, src, zmm_log2e());
+            vmulps(zmm_f, src, const_log2e().zmm());
 
             // Step 2: n = floor(t) using vrndscaleps with round-down mode
             vrndscaleps(zmm_n, zmm_f, 0x01);
@@ -1449,7 +1525,7 @@ namespace llaminar::v2::kernels::jit
                         int reg_idx = 16 + b * q_tile_size_ + q;
                         vmovdqu8(Ymm(reg_idx), ptr[rsp + q_off + 4]);
                         // Convert unsigned (0..255) to signed (-128..127) for vpdpbusd
-                        vpxord(Ymm(reg_idx), Ymm(reg_idx), Ymm(zmm_128().getIdx()));
+                        vpxord(Ymm(reg_idx), Ymm(reg_idx), Ymm(const_128().zmm().getIdx()));
                     }
                 }
             }
@@ -1508,7 +1584,7 @@ namespace llaminar::v2::kernels::jit
                         Ymm ymm_q(24);
                         vmovdqu8(ymm_q, ptr[rsp + q_off + 4]);
                         // Convert unsigned to signed for VNNI
-                        vpxord(ymm_q, ymm_q, Ymm(zmm_128().getIdx()));
+                        vpxord(ymm_q, ymm_q, Ymm(const_128().zmm().getIdx()));
                         // VNNI dot product: result += Q[i] * K[i] (accumulated in 8 lanes)
                         vpdpbusd(ymm_dot, ymm_q, ymm_k);
                     }
@@ -1547,7 +1623,7 @@ namespace llaminar::v2::kernels::jit
             // Each zmm0..zmm(q_tile_size-1) contains partial sums in 8 lanes
             // Reduce to scalar and apply 1/sqrt(head_dim) scaling
 
-            vmovss(xmm8, Xmm(zmm_scale().getIdx())); // Load 1/sqrt(head_dim)
+            vmovss(xmm8, Xmm(const_scale().zmm().getIdx())); // Load 1/sqrt(head_dim)
             for (int q = 0; q < q_tile_size_; ++q)
             {
                 // Reduce YMM to scalar: sum all 8 lanes
@@ -1760,7 +1836,7 @@ namespace llaminar::v2::kernels::jit
                 mov(ptr[rsp + r10 + dst_b], eax);
 
                 // Copy data (32 bytes) using YMM
-                Ymm ymm_tmp = Ymm(zmm_scratch(0).getIdx());
+                Ymm ymm_tmp = Ymm(scratch0().zmm().getIdx());
                 vmovdqu8(ymm_tmp, ptr[r9 + src_b + 4]);
                 vmovdqu8(ptr[rsp + r10 + dst_b + 4], ymm_tmp);
             }
@@ -1856,9 +1932,9 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // STEP 2: Compute Q·K dot product
             // ───────────────────────────────────────────────────────────────────
-            Xmm xmm_score = Xmm(zmm_scratch(0).getIdx());
-            Xmm xmm_scale_tmp = Xmm(zmm_scratch(1).getIdx());
-            vmovss(xmm_scale_tmp, Xmm(zmm_scale().getIdx())); // 1/sqrt(head_dim)
+            Xmm xmm_score = Xmm(scratch0().zmm().getIdx());
+            Xmm xmm_scale_tmp = Xmm(scratch1().zmm().getIdx());
+            vmovss(xmm_scale_tmp, Xmm(const_scale().zmm().getIdx())); // 1/sqrt(head_dim)
 
             emit_prefill_dot_product(xmm_score, reg_K_ptr, reg_q_base, num_blocks, xmm_scale_tmp);
 
@@ -1873,17 +1949,17 @@ namespace llaminar::v2::kernels::jit
             add(reg_sm, rsp);
 
             // Load current max and sum from state
-            Xmm xmm_max = Xmm(zmm_max().getIdx()); // zmm16
-            Xmm xmm_sum = Xmm(zmm_sum().getIdx()); // zmm17
+            Xmm xmm_max = Xmm(state_max().zmm().getIdx()); // zmm16
+            Xmm xmm_sum = Xmm(state_sum().zmm().getIdx()); // zmm17
             vmovss(xmm_max, ptr[reg_sm]);
             vmovss(xmm_sum, ptr[reg_sm + 4]);
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 4: Online softmax update
             // ───────────────────────────────────────────────────────────────────
-            Xmm xmm_new_max = Xmm(zmm_scratch(2).getIdx()); // zmm22
-            Xmm xmm_corr = Xmm(zmm_corr().getIdx());        // zmm19
-            Xmm xmm_weight = Xmm(zmm_weight().getIdx());    // zmm18
+            Xmm xmm_new_max = Xmm(scratch2().zmm().getIdx()); // zmm22
+            Xmm xmm_corr = Xmm(state_corr().zmm().getIdx());
+            Xmm xmm_weight = Xmm(state_weight().zmm().getIdx());
 
             // new_max = max(old_max, score)
             vmaxss(xmm_new_max, xmm_score, xmm_max);
@@ -1909,8 +1985,8 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // STEP 5: Broadcast weight and corr for V accumulation
             // ───────────────────────────────────────────────────────────────────
-            vbroadcastss(zmm_weight(), xmm_weight);
-            vbroadcastss(zmm_corr(), xmm_corr);
+            vbroadcastss(state_weight().zmm(), xmm_weight);
+            vbroadcastss(state_corr().zmm(), xmm_corr);
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 6: Calculate context pointer and accumulate V
@@ -2015,7 +2091,7 @@ namespace llaminar::v2::kernels::jit
 
                 // Load Q data (32 × int8, convert unsigned → signed)
                 vmovdqu8(ymm_q, ptr[reg_Q + q_off + 4]);
-                vpxord(ymm_q, ymm_q, Ymm(zmm_128().getIdx()));
+                vpxord(ymm_q, ymm_q, Ymm(const_128().zmm().getIdx()));
 
                 // Load K scale (FP16 → FP32)
                 vpbroadcastw(xmm_d_k, ptr[reg_K + k_off]);
@@ -2193,8 +2269,8 @@ namespace llaminar::v2::kernels::jit
             // And crucially: softmax state is NOT updated for masked queries.
 
             // Load -FLT_MAX for masking
-            Xmm xmm_neg_inf = Xmm(zmm_scratch(0).getIdx()); // xmm20
-            load_constant_f32(Zmm(zmm_scratch(0).getIdx()), -3.4028235e+38f);
+            Xmm xmm_neg_inf = Xmm(scratch0().zmm().getIdx()); // xmm20
+            load_constant_f32(Zmm(scratch0().zmm().getIdx()), -3.4028235e+38f);
 
             mov(r8, op_tile_size);
             for (int q = 0; q < q_tile_size_; ++q)
@@ -2412,7 +2488,7 @@ namespace llaminar::v2::kernels::jit
                 jle(valid_label, T_NEAR);
 
                 // Invalid: mask out
-                vmovups(Zmm(q), zmm_one());
+                vmovups(Zmm(q), const_one().zmm());
                 vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
                 jmp(done_label, T_NEAR);
 
@@ -2422,7 +2498,7 @@ namespace llaminar::v2::kernels::jit
                 jg(done_label, T_NEAR);
 
                 // Invalid: mask out
-                vmovups(Zmm(q), zmm_one());
+                vmovups(Zmm(q), const_one().zmm());
                 vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
 
                 L(done_label);
@@ -2441,12 +2517,12 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // Avoid zmm20 (xmm_score) and zmm22 (xmm_new_max) which are live
             // when this function is called from emit_prefill_query_attention
-            Xmm xmm_n = Xmm(zmm_scratch(3).getIdx()); // zmm23 - integer part
-            Xmm xmm_f = Xmm(zmm_scratch(4).getIdx()); // zmm24 - fractional part
-            Xmm xmm_p = Xmm(zmm_scratch(5).getIdx()); // zmm25 - polynomial result
+            Xmm xmm_n = Xmm(scratch3().zmm().getIdx()); // zmm23 - integer part
+            Xmm xmm_f = Xmm(scratch4().zmm().getIdx()); // zmm24 - fractional part
+            Xmm xmm_p = Xmm(scratch5().zmm().getIdx()); // zmm25 - polynomial result
 
             // Load log2(e) constant
-            Xmm xmm_log2e = Xmm(zmm_log2e().getIdx());
+            Xmm xmm_log2e = Xmm(const_log2e().zmm().getIdx());
 
             // ───────────────────────────────────────────────────────────────────
             // RANGE REDUCTION: Convert to base-2
@@ -2485,7 +2561,7 @@ namespace llaminar::v2::kernels::jit
             vfmadd213ss(xmm_p, xmm_f, dst); // p = p*f + c1
 
             // p = p*f + 1.0 (c0)
-            Xmm xmm_one = Xmm(zmm_one().getIdx());
+            Xmm xmm_one = Xmm(const_one().zmm().getIdx());
             vfmadd213ss(xmm_p, xmm_f, xmm_one);
 
             // ───────────────────────────────────────────────────────────────────
@@ -2545,18 +2621,18 @@ namespace llaminar::v2::kernels::jit
                 int ctx_off = b * 32 * 4; // Context offset (32 floats × 4 bytes)
 
                 // Load V scale (FP16 → FP32, broadcasted to ZMM)
-                Zmm zmm_v_scale = zmm_scratch(0);
+                Zmm zmm_v_scale = scratch0().zmm();
                 vpbroadcastw(Xmm(zmm_v_scale.getIdx()), ptr[reg_V + v_off]);
                 vcvtph2ps(Xmm(zmm_v_scale.getIdx()), Xmm(zmm_v_scale.getIdx()));
                 vbroadcastss(zmm_v_scale, Xmm(zmm_v_scale.getIdx()));
 
                 // Compute combined = V_scale * weight
-                Zmm zmm_comb = zmm_scratch(1);
-                vmulps(zmm_comb, zmm_v_scale, zmm_weight());
+                Zmm zmm_comb = scratch1().zmm();
+                vmulps(zmm_comb, zmm_v_scale, state_weight().zmm());
 
                 // Load V data (32 × int8 → 2 × 16 FP32)
-                Zmm zmm_v_lo = zmm_scratch(2);
-                Zmm zmm_v_hi = zmm_scratch(3);
+                Zmm zmm_v_lo = scratch2().zmm();
+                Zmm zmm_v_hi = scratch3().zmm();
                 vpmovsxbd(zmm_v_lo, ptr[reg_V + v_off + 4]);      // Low 16 bytes
                 vpmovsxbd(zmm_v_hi, ptr[reg_V + v_off + 4 + 16]); // High 16 bytes
                 vcvtdq2ps(zmm_v_lo, zmm_v_lo);
@@ -2567,14 +2643,14 @@ namespace llaminar::v2::kernels::jit
                 vmulps(zmm_v_hi, zmm_v_hi, zmm_comb);
 
                 // Load current context
-                Zmm zmm_ctx_lo = zmm_scratch(4);
-                Zmm zmm_ctx_hi = zmm_scratch(5);
+                Zmm zmm_ctx_lo = scratch4().zmm();
+                Zmm zmm_ctx_hi = scratch5().zmm();
                 vmovups(zmm_ctx_lo, ptr[reg_ctx + ctx_off]);
                 vmovups(zmm_ctx_hi, ptr[reg_ctx + ctx_off + 64]);
 
                 // Update context: ctx = ctx * corr + weighted_V
-                vmulps(zmm_ctx_lo, zmm_ctx_lo, zmm_corr());
-                vmulps(zmm_ctx_hi, zmm_ctx_hi, zmm_corr());
+                vmulps(zmm_ctx_lo, zmm_ctx_lo, state_corr().zmm());
+                vmulps(zmm_ctx_hi, zmm_ctx_hi, state_corr().zmm());
                 vaddps(zmm_ctx_lo, zmm_ctx_lo, zmm_v_lo);
                 vaddps(zmm_ctx_hi, zmm_ctx_hi, zmm_v_hi);
 
@@ -2677,10 +2753,10 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // NORMALIZE: Divide context by softmax sum for all heads
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_inv_sum = zmm_scratch(0);
-            Zmm zmm_one = zmm_scratch(1);
+            Zmm zmm_inv_sum = scratch0().zmm();
+            Zmm zmm_one = scratch1().zmm();
             load_constant_f32(zmm_one, 1.0f);
-            Zmm zmm_epsilon = zmm_scratch(2);
+            Zmm zmm_epsilon = scratch2().zmm();
             load_constant_f32(zmm_epsilon, 1e-20f); // Small epsilon for numerical stability
 
             // ───────────────────────────────────────────────────────────────────
@@ -2703,8 +2779,8 @@ namespace llaminar::v2::kernels::jit
             {
                 int b_off = b * 32 * 4; // 32 floats × 4 bytes
 
-                Zmm zmm_lo_safe = zmm_scratch(4);
-                Zmm zmm_hi_safe = zmm_scratch(3);
+                Zmm zmm_lo_safe = scratch4().zmm();
+                Zmm zmm_hi_safe = scratch3().zmm();
 
                 // Load context[head, block]
                 vmovups(zmm_lo_safe, ptr[rsp + r10 + b_off]);
@@ -3293,7 +3369,7 @@ namespace llaminar::v2::kernels::jit
             jge(".end", T_NEAR);
 
             // Clear accumulator
-            Zmm acc = zmm_scratch(0);
+            Zmm acc = scratch0().zmm();
             vxorps(acc, acc, acc);
 
             // Calculate Wo row pointer: Wo + row * d_model * sizeof(float)
@@ -3307,8 +3383,8 @@ namespace llaminar::v2::kernels::jit
             cmp(rcx, d_model);
             jge(".col_end", T_NEAR);
 
-            Zmm ctx = zmm_scratch(1);
-            Zmm wo = zmm_scratch(2);
+            Zmm ctx = scratch1().zmm();
+            Zmm wo = scratch2().zmm();
 
             // Load context from stack
             lea(rax, ptr[rsp + reg_ctx_off]);
@@ -3365,7 +3441,7 @@ namespace llaminar::v2::kernels::jit
             cmp(r8, d_model);
             jge(".end", T_NEAR);
 
-            Zmm acc = zmm_scratch(0);
+            Zmm acc = scratch0().zmm();
             vxorps(acc, acc, acc);
 
             // Calculate Wo row pointer: Wo + row * d_model * sizeof(FP16)
@@ -3378,8 +3454,8 @@ namespace llaminar::v2::kernels::jit
             cmp(rcx, d_model);
             jge(".col_end", T_NEAR);
 
-            Zmm ctx = zmm_scratch(1);
-            Zmm wo = zmm_scratch(2);
+            Zmm ctx = scratch1().zmm();
+            Zmm wo = scratch2().zmm();
 
             // Load context (FP32)
             lea(rax, ptr[rsp + reg_ctx_off]);
@@ -3433,7 +3509,7 @@ namespace llaminar::v2::kernels::jit
             cmp(r8, d_model);
             jge(".end", T_NEAR);
 
-            Zmm acc = zmm_scratch(0);
+            Zmm acc = scratch0().zmm();
             vxorps(acc, acc, acc);
 
             // Calculate Wo row pointer
@@ -3446,8 +3522,8 @@ namespace llaminar::v2::kernels::jit
             cmp(rcx, d_model);
             jge(".col_end", T_NEAR);
 
-            Zmm ctx = zmm_scratch(1);
-            Zmm wo = zmm_scratch(2);
+            Zmm ctx = scratch1().zmm();
+            Zmm wo = scratch2().zmm();
 
             // Load context (FP32)
             lea(rax, ptr[rsp + reg_ctx_off]);
@@ -3525,7 +3601,7 @@ namespace llaminar::v2::kernels::jit
             jge(".end", T_NEAR);
 
             // Clear accumulator
-            Zmm acc = zmm_scratch(0);
+            Zmm acc = scratch0().zmm();
             vxorps(acc, acc, acc);
 
             // Calculate Wo row pointer: Wo + row * num_blocks * 36
@@ -3546,8 +3622,8 @@ namespace llaminar::v2::kernels::jit
             add(rdx, rax);
 
             // Load context block (32 floats = 2 × ZMM)
-            Zmm ctx_lo = zmm_scratch(1);
-            Zmm ctx_hi = zmm_scratch(2);
+            Zmm ctx_lo = scratch1().zmm();
+            Zmm ctx_hi = scratch2().zmm();
             vmovups(ctx_lo, ptr[rdx]);
             vmovups(ctx_hi, ptr[rdx + 64]);
 
@@ -3557,14 +3633,14 @@ namespace llaminar::v2::kernels::jit
             add(rax, r9);
 
             // Load and broadcast FP16 scale
-            Zmm d = zmm_scratch(3);
+            Zmm d = scratch3().zmm();
             vpbroadcastw(Xmm(d.getIdx()), ptr[rax]);     // Load FP16
             vcvtph2ps(Xmm(d.getIdx()), Xmm(d.getIdx())); // FP16 → FP32
             vbroadcastss(d, Xmm(d.getIdx()));            // Broadcast to all lanes
 
             // Load and dequantize INT8 weights
-            Zmm wo_lo = zmm_scratch(4);
-            Zmm wo_hi = zmm_scratch(5);
+            Zmm wo_lo = scratch4().zmm();
+            Zmm wo_hi = scratch5().zmm();
             vpmovsxbd(wo_lo, ptr[rax + 4]);      // qs[0..15] INT8 → INT32
             vpmovsxbd(wo_hi, ptr[rax + 4 + 16]); // qs[16..31] INT8 → INT32
             vcvtdq2ps(wo_lo, wo_lo);             // INT32 → FP32
@@ -3722,12 +3798,12 @@ namespace llaminar::v2::kernels::jit
 
                 // Initialize softmax state for this head
                 // max = -FLT_MAX, sum = 0
-                load_constant_f32(zmm_max(), -3.4028235e+38f); // -FLT_MAX
-                vxorps(zmm_sum(), zmm_sum(), zmm_sum());
+                load_constant_f32(state_max().zmm(), -3.4028235e+38f); // -FLT_MAX
+                vxorps(state_sum().zmm(), state_sum().zmm(), state_sum().zmm());
 
                 // Initialize constant for unsigned Q conversion
                 // NOTE: Use rsi as scratch (rdi is used for Q_base below)
-                emit_broadcast_i32_const(zmm_128(), 0x80808080, rsi);
+                emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rsi);
 
                 // Calculate Q base pointer for this query position
                 // NOTE: Must be computed inside head loop because rdi gets clobbered
@@ -3826,9 +3902,9 @@ namespace llaminar::v2::kernels::jit
                 }
 
                 // Normalize context by 1/sum for this head
-                Zmm zmm_inv_sum = zmm_scratch(4);
-                load_constant_f32(zmm_scratch(5), 1.0f);
-                vdivps(zmm_inv_sum, zmm_scratch(5), zmm_sum());
+                Zmm zmm_inv_sum = scratch4().zmm();
+                load_constant_f32(scratch5().zmm(), 1.0f);
+                vdivps(zmm_inv_sum, scratch5().zmm(), state_sum().zmm());
                 v_accum_emitter_.emit_normalize_context(*this, zmm_inv_sum, num_blocks, spill_base_offset);
 
                 // Store this head's context to context buffer (not output)
@@ -3891,8 +3967,8 @@ namespace llaminar::v2::kernels::jit
             int q_head_offset = head_idx * num_blocks * 36;
 
             // Use scratch zone ZMM to avoid clobbering accumulators
-            // zmm_scratch(0) = zmm20, we'll use the lower 256 bits
-            Zmm zmm_tmp = zmm_scratch(0);
+            // scratch0().zmm() = zmm20, we'll use the lower 256 bits
+            Zmm zmm_tmp = scratch0().zmm();
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -3964,7 +4040,7 @@ namespace llaminar::v2::kernels::jit
 
                 // Convert signed INT8 to unsigned (XOR 0x80) for VNNI compatibility
                 // After this, values are in [0, 255] instead of [-128, 127]
-                vpxord(ymm_q, ymm_q, Ymm(zmm_128().getIdx()));
+                vpxord(ymm_q, ymm_q, Ymm(const_128().zmm().getIdx()));
             }
         }
 
@@ -4028,13 +4104,13 @@ namespace llaminar::v2::kernels::jit
             add(reg_out_ptr, reg_output);
 
             // Store register-resident accumulators
-            vmovups(ptr[reg_out_ptr], zmm_accum(0));      // floats 0-15
-            vmovups(ptr[reg_out_ptr + 64], zmm_accum(1)); // floats 16-31
+            vmovups(ptr[reg_out_ptr], accum0().zmm());      // floats 0-15
+            vmovups(ptr[reg_out_ptr + 64], accum1().zmm()); // floats 16-31
 
             if (num_blocks >= 2)
             {
-                vmovups(ptr[reg_out_ptr + 128], zmm_accum(2)); // floats 32-47
-                vmovups(ptr[reg_out_ptr + 192], zmm_accum(3)); // floats 48-63
+                vmovups(ptr[reg_out_ptr + 128], accum2().zmm()); // floats 32-47
+                vmovups(ptr[reg_out_ptr + 192], accum3().zmm()); // floats 48-63
             }
 
             // Store spilled accumulators
@@ -4047,11 +4123,11 @@ namespace llaminar::v2::kernels::jit
                     int out_lo = b * 64 * 2; // b * 32 floats * 2 halves * 4 bytes
                     int out_hi = out_lo + 64;
 
-                    vmovups(zmm_scratch(0), ptr[rsp + spill_lo]);
-                    vmovups(ptr[reg_out_ptr + out_lo], zmm_scratch(0));
+                    vmovups(scratch0().zmm(), ptr[rsp + spill_lo]);
+                    vmovups(ptr[reg_out_ptr + out_lo], scratch0().zmm());
 
-                    vmovups(zmm_scratch(0), ptr[rsp + spill_hi]);
-                    vmovups(ptr[reg_out_ptr + out_hi], zmm_scratch(0));
+                    vmovups(scratch0().zmm(), ptr[rsp + spill_hi]);
+                    vmovups(ptr[reg_out_ptr + out_hi], scratch0().zmm());
                 }
             }
         }
@@ -4099,13 +4175,13 @@ namespace llaminar::v2::kernels::jit
             int ctx_ptr = context_buffer_offset + head_offset;
 
             // Store register-resident accumulators (first 2 blocks = 64 floats in zmm0-3)
-            vmovups(ptr[rsp + ctx_ptr], zmm_accum(0));      // floats 0-15
-            vmovups(ptr[rsp + ctx_ptr + 64], zmm_accum(1)); // floats 16-31
+            vmovups(ptr[rsp + ctx_ptr], accum0().zmm());      // floats 0-15
+            vmovups(ptr[rsp + ctx_ptr + 64], accum1().zmm()); // floats 16-31
 
             if (num_blocks >= 2)
             {
-                vmovups(ptr[rsp + ctx_ptr + 128], zmm_accum(2)); // floats 32-47
-                vmovups(ptr[rsp + ctx_ptr + 192], zmm_accum(3)); // floats 48-63
+                vmovups(ptr[rsp + ctx_ptr + 128], accum2().zmm()); // floats 32-47
+                vmovups(ptr[rsp + ctx_ptr + 192], accum3().zmm()); // floats 48-63
             }
 
             // Store spilled accumulators (blocks 2+)
@@ -4119,11 +4195,11 @@ namespace llaminar::v2::kernels::jit
                     int out_hi = out_lo + 64;
 
                     // Load from spill slot and store to context buffer
-                    vmovups(zmm_scratch(0), ptr[rsp + spill_lo]);
-                    vmovups(ptr[rsp + out_lo], zmm_scratch(0));
+                    vmovups(scratch0().zmm(), ptr[rsp + spill_lo]);
+                    vmovups(ptr[rsp + out_lo], scratch0().zmm());
 
-                    vmovups(zmm_scratch(0), ptr[rsp + spill_hi]);
-                    vmovups(ptr[rsp + out_hi], zmm_scratch(0));
+                    vmovups(scratch0().zmm(), ptr[rsp + spill_hi]);
+                    vmovups(ptr[rsp + out_hi], scratch0().zmm());
                 }
             }
         }
@@ -4253,7 +4329,7 @@ namespace llaminar::v2::kernels::jit
             jge(".outer_end", T_NEAR);
 
             // Zero accumulator
-            Zmm zmm_acc = zmm_scratch(0);
+            Zmm zmm_acc = scratch0().zmm();
             vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Calculate Wo row pointer: Wo + out_idx * d_model * 4
@@ -4269,12 +4345,12 @@ namespace llaminar::v2::kernels::jit
             jge(".inner_end", T_NEAR);
 
             // Load context chunk from stack
-            Zmm zmm_ctx = zmm_scratch(1);
+            Zmm zmm_ctx = scratch1().zmm();
             lea(rdi, ptr[rsp + context_buffer_offset]);
             vmovups(zmm_ctx, ptr[rdi + reg_j * 4]);
 
             // Load Wo row chunk
-            Zmm zmm_wo = zmm_scratch(2);
+            Zmm zmm_wo = scratch2().zmm();
             vmovups(zmm_wo, ptr[reg_wo_row + reg_j * 4]);
 
             // FMA: acc += ctx * wo
@@ -4335,7 +4411,7 @@ namespace llaminar::v2::kernels::jit
             cmp(reg_out_idx, d_model);
             jge(".outer_end", T_NEAR);
 
-            Zmm zmm_acc = zmm_scratch(0);
+            Zmm zmm_acc = scratch0().zmm();
             vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Wo row pointer: Wo + out_idx * d_model * 2 (FP16)
@@ -4349,8 +4425,8 @@ namespace llaminar::v2::kernels::jit
             cmp(reg_j, d_model);
             jge(".inner_end", T_NEAR);
 
-            Zmm zmm_ctx = zmm_scratch(1);
-            Zmm zmm_wo = zmm_scratch(2);
+            Zmm zmm_ctx = scratch1().zmm();
+            Zmm zmm_wo = scratch2().zmm();
             Ymm ymm_fp16 = Ymm(zmm_wo.getIdx());
 
             // Load context (FP32)
@@ -4418,7 +4494,7 @@ namespace llaminar::v2::kernels::jit
             cmp(reg_out_idx, d_model);
             jge(".outer_end", T_NEAR);
 
-            Zmm zmm_acc = zmm_scratch(0);
+            Zmm zmm_acc = scratch0().zmm();
             vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Wo row pointer: Wo + out_idx * d_model * 2 (BF16)
@@ -4432,8 +4508,8 @@ namespace llaminar::v2::kernels::jit
             cmp(reg_j, d_model);
             jge(".inner_end", T_NEAR);
 
-            Zmm zmm_ctx = zmm_scratch(1);
-            Zmm zmm_wo = zmm_scratch(2);
+            Zmm zmm_ctx = scratch1().zmm();
+            Zmm zmm_wo = scratch2().zmm();
 
             // Load context (FP32)
             lea(rdi, ptr[rsp + context_buffer_offset]);
@@ -4525,7 +4601,7 @@ namespace llaminar::v2::kernels::jit
             jge(".outer_end", T_NEAR);
 
             // Clear accumulator
-            Zmm zmm_acc = zmm_scratch(0);
+            Zmm zmm_acc = scratch0().zmm();
             vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Wo row pointer: Wo + out_idx * num_blocks_per_row * 36
@@ -4554,8 +4630,8 @@ namespace llaminar::v2::kernels::jit
             //         ctx_lo = context[b*32 + 0..15]
             //         ctx_hi = context[b*32 + 16..31]
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_ctx_lo = zmm_scratch(1);
-            Zmm zmm_ctx_hi = zmm_scratch(2);
+            Zmm zmm_ctx_lo = scratch1().zmm();
+            Zmm zmm_ctx_hi = scratch2().zmm();
             vmovups(zmm_ctx_lo, ptr[reg_ctx_ptr]);
             vmovups(zmm_ctx_hi, ptr[reg_ctx_ptr + 64]);
 
@@ -4574,7 +4650,7 @@ namespace llaminar::v2::kernels::jit
             //         d is FP16 at offset 0 in the block
             //         Convert FP16 → FP32 → broadcast to all 16 lanes
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_d = zmm_scratch(3);
+            Zmm zmm_d = scratch3().zmm();
             vpbroadcastw(Xmm(zmm_d.getIdx()), ptr[reg_wo_block]);
             vcvtph2ps(Xmm(zmm_d.getIdx()), Xmm(zmm_d.getIdx()));
             vbroadcastss(zmm_d, Xmm(zmm_d.getIdx()));
@@ -4584,8 +4660,8 @@ namespace llaminar::v2::kernels::jit
             //         INT8 data at offset 4: 32 bytes (16 + 16)
             //         vpmovsxbd: sign-extend 16 INT8 → 16 INT32
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_wo_lo = zmm_scratch(4);
-            Zmm zmm_wo_hi = zmm_scratch(5);
+            Zmm zmm_wo_lo = scratch4().zmm();
+            Zmm zmm_wo_hi = scratch5().zmm();
             vpmovsxbd(zmm_wo_lo, ptr[reg_wo_block + 4]);
             vpmovsxbd(zmm_wo_hi, ptr[reg_wo_block + 4 + 16]);
 
@@ -4792,11 +4868,11 @@ namespace llaminar::v2::kernels::jit
             //         Q blocks are pre-loaded in ZMM 10+ by emit_load_q_head_to_registers
             //         K blocks are loaded from memory via reg_K_ptr
             // ───────────────────────────────────────────────────────────────────
-            Xmm xmm_score_result(zmm_scratch(1).getIdx()); // xmm21 for score
-            Xmm xmm_scale_local(zmm_scratch(2).getIdx());  // xmm22 for scale
+            Xmm xmm_score_result(scratch1().zmm().getIdx()); // xmm21 for score
+            Xmm xmm_scale_local(scratch2().zmm().getIdx());  // xmm22 for scale
 
-            // Load attention scale (1/sqrt(head_dim)) from zmm_scale() element 0
-            vmovss(xmm_scale_local, Xmm(zmm_scale().getIdx()));
+            // Load attention scale (1/sqrt(head_dim)) from const_scale() element 0
+            vmovss(xmm_scale_local, Xmm(const_scale().zmm().getIdx()));
 
             // Emit register-based dot product (Q in ZMM regs, K from memory)
             int q_head_offset = head_idx * num_blocks * 36;
@@ -4960,7 +5036,7 @@ namespace llaminar::v2::kernels::jit
             auto guard_q3 = borrow<Input5>(); // zmm13 - Q block 1 high (if num_blocks >= 2)
 
             // Load attention scale (1/sqrt(head_dim))
-            vmovss(xmm_scale_local, Xmm(zmm_scale().getIdx()));
+            vmovss(xmm_scale_local, Xmm(const_scale().zmm().getIdx()));
 
             // Q data is pre-loaded in zmm10+ by emit_load_q_head_to_registers
             // d_Q scales are loaded on-demand inside emit_dot_product_4x to avoid register pressure.

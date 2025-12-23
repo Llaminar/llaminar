@@ -5,19 +5,36 @@
  * @date December 2025
  *
  * JIT-generated online softmax for streaming attention computation.
- * Mirrors the reference OnlineSoftmax.h microkernel.
+ * Supports both single-score updates (FA1) and batched 4x tile updates (FA2).
  *
- * Algorithm (from "Online normalizer calculation for softmax"):
- *   State: (max, sum_exp)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ALGORITHM (from "Online normalizer calculation for softmax")
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- *   update(score):
- *     if score > max:
- *       correction = exp(max - score)
- *       sum_exp *= correction
- *       max = score
- *     weight = exp(score - max)
- *     sum_exp += weight
- *     return weight
+ * State: (max, sum_exp)
+ *
+ * FA1 Single Update:
+ *   if score > max:
+ *     correction = exp(max - score)
+ *     sum_exp *= correction
+ *     max = score
+ *   weight = exp(score - max)
+ *   sum_exp += weight
+ *   return weight
+ *
+ * FA2 Batched Tile Update (4 scores at once):
+ *   tile_max = max(score0, score1, score2, score3)
+ *   if tile_max > state_max:
+ *     correction = exp(state_max - tile_max)
+ *     state_sum *= correction
+ *     context *= correction  // Rescale accumulated context!
+ *     state_max = tile_max
+ *
+ *   For each score in [score0..score3]:
+ *     weight[i] = exp(score[i] - state_max)
+ *     state_sum += weight[i]
+ *
+ *   return weights[0..3]
  *
  * This enables single-pass attention without materializing the full NxN score matrix.
  *
@@ -28,17 +45,23 @@
  * StateZone (zmm16-19): Online softmax state
  *   - StateMax (zmm16): Running max for numerical stability
  *   - StateSum (zmm17): Running sum of exp weights
- *   - StateWeight (zmm18): Current attention weight
+ *   - StateWeight (zmm18): Current attention weight (FA1 single mode)
  *   - StateCorr (zmm19): Correction factor for context rescaling
  *
- * ScoreZone (xmm20-23): FA2 tile scores (alias Scratch0-3)
- *   - Score0 (xmm20): Q·K[kv+0]
- *   - Score1 (xmm21): Q·K[kv+1]
- *   - Score2 (xmm22): Q·K[kv+2]
- *   - Score3 (xmm23): Q·K[kv+3]
+ * ScoreZone (xmm20-23): FA2 tile scores (aliased to low Scratch)
+ *   - Score0 (xmm20): Q·K[kv+0] - aliases Scratch0
+ *   - Score1 (xmm21): Q·K[kv+1] - aliases Scratch1
+ *   - Score2 (xmm22): Q·K[kv+2] - aliases Scratch2
+ *   - Score3 (xmm23): Q·K[kv+3] - aliases Scratch3
+ *
+ * CRITICAL: Score/Scratch aliasing lifecycle:
+ *   1. Dot product emits scores into Score0-3 (xmm20-23)
+ *   2. emit_tile_state_update reads scores from Score0-3
+ *   3. emit_tile_state_update overwrites Score0-3 with weights via Scratch0-3
+ *   4. V accumulation reads weights from Scratch0-3 (zmm20-23)
  *
  * ScratchZone (zmm20-25): Temporary registers
- *   - Scratch0-3 (zmm20-23): ALIAS ScoreZone! Use for weight outputs AFTER scores consumed
+ *   - Scratch0-3 (zmm20-23): ALIAS ScoreZone! Weights after scores consumed
  *   - Scratch4 (zmm24): Safe for tile_max - does NOT clobber scores
  *   - Scratch5 (zmm25): Safe for additional scratch
  */
@@ -48,12 +71,26 @@
 #include "JitMicrokernelBase.h"
 #include "JitFastExp.h"
 #include "../../../jit/RegisterAllocation.h"
+#include "../../../jit/RegisterEnforcement.h"
 
-// Import typed register aliases for convenience
+// Import typed register aliases and C++20 concepts for convenience
 using namespace llaminar2::jit;
 
 namespace llaminar::v2::kernels::jit
 {
+    // ============================================================================
+    // OnlineSoftmax Register Manifest (compile-time documentation)
+    // ============================================================================
+    // Documents the registers borrowed by emit_tile_state_update().
+    // Note: StateZone registers (zmm16-19) are accessed but not "borrowed" since
+    // they're owned by the parent kernel and persist across all operations.
+
+    using OnlineSoftmaxTileManifest = KernelRegisterManifest<
+        Score0, Score1, Score2, Score3, // Input scores (xmm20-23)
+        Scratch4                        // tile_max storage (zmm24)
+        >;
+    static_assert(!OnlineSoftmaxTileManifest::has_conflicts(),
+                  "OnlineSoftmax tile manifest has conflicts!");
 
     /**
      * @brief JIT code emitter for online softmax update
@@ -85,10 +122,10 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_init_softmax_state");
 
             // max = -inf
-            gen.vmovaps(gen.zmm_max(), gen.zmm_neg_inf());
+            gen.vmovaps(gen.state_max().zmm(), gen.const_neg_inf().zmm());
 
             // sum = 0
-            gen.vxorps(gen.zmm_sum(), gen.zmm_sum(), gen.zmm_sum());
+            gen.vxorps(gen.state_sum().zmm(), gen.state_sum().zmm(), gen.state_sum().zmm());
         }
 
         /**
@@ -127,19 +164,19 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_softmax_update");
 
-            // Use zmm_scratch(5) for score - scratch(0-2) are clobbered by emit_fast_exp
-            // zmm_scratch(0-2) = zmm20-22, zmm_scratch(5) = zmm25
-            Zmm zmm_score = gen.zmm_scratch(5);
+            // Use scratch5 for score - scratch(0-2) are clobbered by emit_fast_exp
+            // scratch0-2 = zmm20-22, scratch5 = zmm25
+            Zmm zmm_score = gen.scratch5().zmm();
 
             // Broadcast score to all lanes (needed for comparison and subtraction)
             gen.vbroadcastss(zmm_score, score_xmm);
 
-            // Initialize zmm_corr to 1.0 (no rescale needed by default)
+            // Initialize state_corr to 1.0 (no rescale needed by default)
             // This will be overwritten if score > max
-            gen.load_constant_f32(gen.zmm_corr(), 1.0f);
+            gen.load_constant_f32(gen.state_corr().zmm(), 1.0f);
 
             // Compare score with current max
-            gen.vcomiss(score_xmm, Xmm(gen.zmm_max().getIdx()));
+            gen.vcomiss(score_xmm, Xmm(gen.state_max().zmm().getIdx()));
 
             std::string label_score_le_max = label_prefix + "_score_le_max";
             gen.jbe(label_score_le_max.c_str(), Xbyak::CodeGenerator::T_NEAR);
@@ -148,27 +185,27 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("  score > max branch");
             {
                 // correction = exp(max - score)
-                gen.vsubps(gen.zmm_corr(), gen.zmm_max(), zmm_score);
-                exp_emitter_.emit_fast_exp(gen, gen.zmm_corr(), gen.zmm_corr());
+                gen.vsubps(gen.state_corr().zmm(), gen.state_max().zmm(), zmm_score);
+                exp_emitter_.emit_fast_exp(gen, gen.state_corr().zmm(), gen.state_corr().zmm());
 
                 // sum *= correction
-                gen.vmulps(gen.zmm_sum(), gen.zmm_sum(), gen.zmm_corr());
+                gen.vmulps(gen.state_sum().zmm(), gen.state_sum().zmm(), gen.state_corr().zmm());
 
                 // max = score
-                gen.vmovaps(gen.zmm_max(), zmm_score);
+                gen.vmovaps(gen.state_max().zmm(), zmm_score);
 
-                // zmm_corr now contains exp(old_max - new_max) < 1.0
-                // Caller should rescale context accumulators by zmm_corr()
+                // state_corr() now contains exp(old_max - new_max) < 1.0
+                // Caller should rescale context accumulators by state_corr()
             }
 
             gen.L(label_score_le_max.c_str());
 
             // weight = exp(score - max)
-            gen.vsubps(gen.zmm_weight(), zmm_score, gen.zmm_max());
-            exp_emitter_.emit_fast_exp(gen, gen.zmm_weight(), gen.zmm_weight());
+            gen.vsubps(gen.state_weight().zmm(), zmm_score, gen.state_max().zmm());
+            exp_emitter_.emit_fast_exp(gen, gen.state_weight().zmm(), gen.state_weight().zmm());
 
             // sum += weight
-            gen.vaddps(gen.zmm_sum(), gen.zmm_sum(), gen.zmm_weight());
+            gen.vaddps(gen.state_sum().zmm(), gen.state_sum().zmm(), gen.state_weight().zmm());
         }
 
         /**
@@ -189,7 +226,7 @@ namespace llaminar::v2::kernels::jit
 
             // inv_sum = 1.0 / sum
             // Use precise division (not approximate vrcp14ps)
-            gen.vdivps(dst_zmm, gen.zmm_one(), gen.zmm_sum());
+            gen.vdivps(dst_zmm, gen.const_one().zmm(), gen.state_sum().zmm());
         }
 
         /**
@@ -477,10 +514,10 @@ namespace llaminar::v2::kernels::jit
 
             // Initialize constants
             debug_emit("  Init constants");
-            emit_broadcast_fp32_const(zmm_neg_inf(), -std::numeric_limits<float>::infinity(), rax);
-            emit_broadcast_fp32_const(zmm_one(), 1.0f, rax);
-            emit_broadcast_fp32_const(zmm_log2e(), 1.4426950408889634f, rax);
-            emit_broadcast_fp32_const(zmm_exp_min(), -87.0f, rax);
+            emit_broadcast_fp32_const(const_neg_inf().zmm(), -std::numeric_limits<float>::infinity(), rax);
+            emit_broadcast_fp32_const(const_one().zmm(), 1.0f, rax);
+            emit_broadcast_fp32_const(const_log2e().zmm(), 1.4426950408889634f, rax);
+            emit_broadcast_fp32_const(const_exp_min().zmm(), -87.0f, rax);
 
             // Allocate stack for temporary weight storage
             // We need to store weights during first pass, then normalize
@@ -514,33 +551,33 @@ namespace llaminar::v2::kernels::jit
             // Inline softmax update (without label issues)
             // This duplicates emit_update but avoids label collision in loop
             {
-                Zmm zmm_score = zmm_scratch(0);
+                Zmm zmm_score = scratch0().zmm();
                 vbroadcastss(zmm_score, xmm0);
 
                 // Compare score with max
-                vcomiss(xmm0, Xmm(zmm_max().getIdx()));
+                vcomiss(xmm0, Xmm(state_max().zmm().getIdx()));
 
                 Label score_le_max;
                 jbe(score_le_max, T_NEAR);
 
                 // score > max: rescale
-                vsubps(zmm_corr(), zmm_max(), zmm_score);
-                JitFastExpEmitter().emit_fast_exp(*this, zmm_corr(), zmm_corr());
-                vmulps(zmm_sum(), zmm_sum(), zmm_corr());
-                vmovaps(zmm_max(), zmm_score);
+                vsubps(state_corr().zmm(), state_max().zmm(), zmm_score);
+                JitFastExpEmitter().emit_fast_exp(*this, state_corr().zmm(), state_corr().zmm());
+                vmulps(state_sum().zmm(), state_sum().zmm(), state_corr().zmm());
+                vmovaps(state_max().zmm(), zmm_score);
 
                 L(score_le_max);
 
                 // weight = exp(score - max)
-                vsubps(zmm_weight(), zmm_score, zmm_max());
-                JitFastExpEmitter().emit_fast_exp(*this, zmm_weight(), zmm_weight());
+                vsubps(state_weight().zmm(), zmm_score, state_max().zmm());
+                JitFastExpEmitter().emit_fast_exp(*this, state_weight().zmm(), state_weight().zmm());
 
                 // sum += weight
-                vaddps(zmm_sum(), zmm_sum(), zmm_weight());
+                vaddps(state_sum().zmm(), state_sum().zmm(), state_weight().zmm());
             }
 
             // Store unnormalized weight to stack
-            vmovss(ptr[rsp + reg_i * 4], Xmm(zmm_weight().getIdx()));
+            vmovss(ptr[rsp + reg_i * 4], Xmm(state_weight().zmm().getIdx()));
 
             inc(reg_i);
             jmp(loop1_start, T_NEAR);
@@ -549,7 +586,7 @@ namespace llaminar::v2::kernels::jit
 
             // Compute 1/sum
             debug_emit("  Compute 1/sum");
-            Zmm zmm_inv_sum = zmm_scratch(3);
+            Zmm zmm_inv_sum = scratch3().zmm();
             softmax_emitter_.emit_finalize(*this, zmm_inv_sum);
 
             // Pass 2: Normalize weights

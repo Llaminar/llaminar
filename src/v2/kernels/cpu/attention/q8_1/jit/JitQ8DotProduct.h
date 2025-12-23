@@ -5,27 +5,48 @@
  * @date December 2025
  *
  * JIT-generated Q8_1 dot product using AVX-512 VNNI (vpdpbusd).
- * Mirrors the reference Q8DotProduct.h microkernel.
+ * Supports both single dot product (FA1) and 4x batched (FA2) modes.
  *
- * Algorithm:
- *   For each block b in [0, num_blocks):
- *     d_q = fp16_to_fp32(Q[b].d)
- *     d_k = fp16_to_fp32(K[b].d)
- *     sum_qs_k = K[b].sum_qs
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ALGORITHM
+ * ═══════════════════════════════════════════════════════════════════════════════
  *
- *     raw_dot = vpdpbusd(Q_unsigned, K_signed)  // (Q+128) * K
- *     corrected_dot = raw_dot - 128 * sum_qs_k   // Undo unsigned bias
- *     scaled_dot = corrected_dot * d_q * d_k
+ * For each block b in [0, num_blocks):
+ *   d_q = fp16_to_fp32(Q[b].d)
+ *   d_k = fp16_to_fp32(K[b].d)
+ *   sum_qs_k = K[b].sum_qs
  *
- *     score += scaled_dot
+ *   raw_dot = vpdpbusd(Q_unsigned, K_signed)  // (Q+128) * K
+ *   corrected_dot = raw_dot - 128 * sum_qs_k   // Undo unsigned bias
+ *   scaled_dot = corrected_dot * d_q * d_k
  *
- *   return score * global_scale
+ *   score += scaled_dot
  *
- * Register conventions (typed via RegisterAllocation.h):
- * - Input: Q/K block pointers, num_blocks, global_scale in GP regs
- * - Output: Score0-3 (xmm20-23) for 4x dot product
- * - vpdpbusd accumulators: Accum4-7 (ymm4-7) to avoid aliasing scores
- * - Scratch: Scratch4-5 (zmm24-25) safe during FA2
+ * return score * global_scale
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * REGISTER USAGE (FA2 4x Mode)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Output scores (ScoreZone - xmm20-23):
+ *   - Score0 (xmm20): Q·K[kv+0]
+ *   - Score1 (xmm21): Q·K[kv+1]
+ *   - Score2 (xmm22): Q·K[kv+2]
+ *   - Score3 (xmm23): Q·K[kv+3]
+ *
+ * vpdpbusd accumulators (borrowed via RegisterGuard):
+ *   - Accum4-7 (ymm4-7): Temporary accumulators for 4 parallel dot products
+ *
+ * K data loading:
+ *   - Input0 (zmm8): K data loading and horizontal reduction temp
+ *   - Input1 (zmm9): K scales (d_K, sum_qs_K)
+ *
+ * Correction term:
+ *   - Scratch5 (zmm25): 128.0f * sum_qs_K correction
+ *
+ * Q data (caller-owned, pre-loaded):
+ *   - zmm10-13: Unsigned Q data (persists across KV loop)
+ *   - d_Q loaded on-demand from memory to save registers
  */
 
 #pragma once
@@ -33,13 +54,27 @@
 #include "JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
+#include "../../../jit/RegisterEnforcement.h"
 #include "../microkernels/Q8DotProduct.h" // For Q8_1Block struct
 
-// Import typed register aliases
+// Import typed register aliases and C++20 concepts
 using namespace llaminar2::jit;
 
 namespace llaminar::v2::kernels::jit
 {
+    // ============================================================================
+    // Q8DotProduct Register Manifest (compile-time documentation)
+    // ============================================================================
+    // Documents the exact registers borrowed by emit_q8_dot_product().
+    // Uses Accum4-7 for vpdpbusd, Input0-1 for K data/scales, Scratch5 for correction.
+
+    using Q8DotProductManifest = KernelRegisterManifest<
+        Accum4, Accum5, Accum6, Accum7, // vpdpbusd accumulators
+        Input0, Input1,                 // K data and scales
+        Scratch5                        // Q8_1 correction term
+        >;
+    static_assert(!Q8DotProductManifest::has_conflicts(),
+                  "Q8DotProduct register manifest has conflicts!");
 
     /**
      * @brief JIT code emitter for Q8_1 dot product
@@ -125,7 +160,7 @@ namespace llaminar::v2::kernels::jit
 
                 // Convert Q from signed to unsigned by XOR with 0x80
                 // vpdpbusd: src1 (Q) must be unsigned, src2 (K) is signed
-                gen.vpxord(ymm_q, ymm_q, Ymm(gen.zmm_128().getIdx()));
+                gen.vpxord(ymm_q, ymm_q, gen.const_128().ymm());
 
                 // Load K scale: d_K (FP16)
                 gen.vpbroadcastw(xmm_d_k, gen.ptr[reg_K_ptr + k_offset]);
@@ -635,7 +670,7 @@ namespace llaminar::v2::kernels::jit
 
             // Initialize constants
             debug_emit("  Init constants");
-            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
+            emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rax);
 
             // Allocate stack for Q blocks (padded to 64 bytes each)
             // Max stack = max_blocks * 64 + alignment

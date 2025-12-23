@@ -97,8 +97,8 @@ namespace llaminar2
             void setEstimatedMemory(size_t bytes) { estimated_memory_ = bytes; }
 
             /// Set whether stage requires allreduce
-            void setRequiresAllreduce(bool requires) { requires_allreduce_ =
-                                                           requires; }
+            void setRequiresAllreduce(bool needs_allreduce) { requires_allreduce_ =
+                                                                  needs_allreduce; }
 
             /// Set supported backends (empty = all)
             void setSupportedBackends(std::vector<ComputeBackendType> backends)
