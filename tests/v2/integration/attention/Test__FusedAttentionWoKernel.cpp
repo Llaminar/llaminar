@@ -15,9 +15,9 @@
 #include <vector>
 #include <memory>
 
-#include "kernels/cpu/attention/FusedAttentionWoKernel.h"
+#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
-#include "kernels/cpu/jit/q8_1/JitFusedAttentionWo.h"
+#include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 

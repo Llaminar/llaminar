@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "kernels/cpu/microkernels/q8_1/VWeightedAccum.h"
+#include "kernels/cpu/attention/q8_1/microkernels/VWeightedAccum.h"
 #include "tensors/FP16Utils.h"
 
 #include <cmath>

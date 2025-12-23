@@ -18,7 +18,7 @@
 
 #pragma once
 
-#include "../../../../../../external/onednn/third_party/xbyak/xbyak.h"
+#include "../../../../../../../external/onednn/third_party/xbyak/xbyak.h"
 #include <array>
 #include <cstdint>
 #include <string>

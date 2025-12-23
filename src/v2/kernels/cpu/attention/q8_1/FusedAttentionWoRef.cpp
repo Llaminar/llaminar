@@ -15,11 +15,11 @@
  */
 
 #include "FusedAttentionWoRef.h"
-#include "../../microkernels/q8_1/Q8DotProduct.h"
-#include "../../microkernels/q8_1/OnlineSoftmax.h"
-#include "../../microkernels/q8_1/VWeightedAccum.h"
-#include "../../microkernels/q8_1/WoProjection.h"
-#include "../../microkernels/q8_1/FastExp.h"
+#include "microkernels/Q8DotProduct.h"
+#include "microkernels/OnlineSoftmax.h"
+#include "microkernels/VWeightedAccum.h"
+#include "microkernels/WoProjection.h"
+#include "microkernels/FastExp.h"
 #include "../../../../utils/Logger.h"
 
 #include <cstring>

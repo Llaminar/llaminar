@@ -24,10 +24,10 @@
 #include <limits>
 
 #include "../../../src/v2/kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
-#include "../../../src/v2/kernels/cpu/microkernels/q8_1/Q8DotProduct.h"
-#include "../../../src/v2/kernels/cpu/microkernels/q8_1/OnlineSoftmax.h"
-#include "../../../src/v2/kernels/cpu/microkernels/q8_1/VWeightedAccum.h"
-#include "../../../src/v2/kernels/cpu/microkernels/q8_1/FastExp.h"
+#include "../../../src/v2/kernels/cpu/attention/q8_1/microkernels/Q8DotProduct.h"
+#include "../../../src/v2/kernels/cpu/attention/q8_1/microkernels/OnlineSoftmax.h"
+#include "../../../src/v2/kernels/cpu/attention/q8_1/microkernels/VWeightedAccum.h"
+#include "../../../src/v2/kernels/cpu/attention/q8_1/microkernels/FastExp.h"
 #include "../../../src/v2/tensors/FP16Utils.h"
 
 using namespace llaminar::v2::kernels;

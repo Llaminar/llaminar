@@ -15,12 +15,12 @@
 #include <vector>
 #include <cstring>
 
-#include "kernels/cpu/jit/q8_1/JitMicrokernelBase.h"
-#include "kernels/cpu/jit/q8_1/JitQ8DotProduct.h"
-#include "kernels/cpu/jit/q8_1/JitFastExp.h"
-#include "kernels/cpu/jit/q8_1/JitOnlineSoftmax.h"
-#include "kernels/cpu/jit/q8_1/JitVWeightedAccum.h"
-#include "kernels/cpu/jit/q8_1/JitWoProjection.h"
+#include "kernels/cpu/attention/q8_1/jit/JitMicrokernelBase.h"
+#include "kernels/cpu/attention/q8_1/jit/JitQ8DotProduct.h"
+#include "kernels/cpu/attention/q8_1/jit/JitFastExp.h"
+#include "kernels/cpu/attention/q8_1/jit/JitOnlineSoftmax.h"
+#include "kernels/cpu/attention/q8_1/jit/JitVWeightedAccum.h"
+#include "kernels/cpu/attention/q8_1/jit/JitWoProjection.h"
 
 namespace llaminar::v2::kernels::jit::test
 {

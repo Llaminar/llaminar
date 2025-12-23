@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "kernels/cpu/microkernels/q8_1/WoProjection.h"
+#include "kernels/cpu/attention/q8_1/microkernels/WoProjection.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/SIMDHelpers.h"
 

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "kernels/cpu/jit/q8_1/JitMicrokernelBase.h"
+#include "kernels/cpu/attention/q8_1/jit/JitMicrokernelBase.h"
 #include <vector>
 #include <random>
 

@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "kernels/cpu/microkernels/q8_1/OnlineSoftmax.h"
+#include "kernels/cpu/attention/q8_1/microkernels/OnlineSoftmax.h"
 
 #include <cmath>
 #include <numeric>

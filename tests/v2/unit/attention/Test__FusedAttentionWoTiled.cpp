@@ -20,7 +20,7 @@
 
 #include "../../../../src/v2/kernels/cpu/attention/q8_1/FusedAttentionWoTiled.h"
 #include "../../../../src/v2/kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
-#include "../../../../src/v2/kernels/cpu/microkernels/q8_1/Q8DotProduct.h"
+#include "../../../../src/v2/kernels/cpu/attention/q8_1/microkernels/Q8DotProduct.h"
 #include "../../../../src/v2/tensors/FP16Utils.h"
 #include "../../../../src/v2/utils/CPUFeatures.h"
 

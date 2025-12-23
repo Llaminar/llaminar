@@ -22,7 +22,7 @@
 #include <random>
 #include <cstring>
 
-#include "kernels/cpu/jit/q8_1/JitFusedAttentionWo.h"
+#include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"

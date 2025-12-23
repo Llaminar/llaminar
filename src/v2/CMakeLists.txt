@@ -585,15 +585,14 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp   # Typed SwiGLU with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CPUAttentionKernelT.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
-    # Microkernels for fused attention + Wo projection (composable, testable units)
-    kernels/cpu/microkernels/q8_1/Q8DotProduct.cpp       # μK1: Q8_1 dot product with VNNI
-    kernels/cpu/microkernels/q8_1/OnlineSoftmax.cpp      # μK2: Streaming online softmax
-    kernels/cpu/microkernels/q8_1/VWeightedAccum.cpp     # μK3: Weighted V accumulation
-    kernels/cpu/microkernels/q8_1/WoProjection.cpp       # μK4: Wo output projection
-    kernels/cpu/microkernels/q8_1/FastExp.cpp            # μK5: Fast exponential approximation
-    # Fused attention + Wo kernel (composed from microkernels)
-    kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp   # Reference implementation (Phase 2)
-    kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp # Cache-blocked tiled implementation (Phase 3)
+    # Q8_1 fused attention + Wo projection (microkernels and composed kernels)
+    kernels/cpu/attention/q8_1/microkernels/Q8DotProduct.cpp       # μK1: Q8_1 dot product with VNNI
+    kernels/cpu/attention/q8_1/microkernels/OnlineSoftmax.cpp      # μK2: Streaming online softmax
+    kernels/cpu/attention/q8_1/microkernels/VWeightedAccum.cpp     # μK3: Weighted V accumulation
+    kernels/cpu/attention/q8_1/microkernels/WoProjection.cpp       # μK4: Wo output projection
+    kernels/cpu/attention/q8_1/microkernels/FastExp.cpp            # μK5: Fast exponential approximation
+    kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp             # Reference implementation
+    kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp           # Cache-blocked tiled implementation
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)

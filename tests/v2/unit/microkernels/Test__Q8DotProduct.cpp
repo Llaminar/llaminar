@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "kernels/cpu/microkernels/q8_1/Q8DotProduct.h"
+#include "kernels/cpu/attention/q8_1/microkernels/Q8DotProduct.h"
 #include "tensors/FP16Utils.h"
 
 #include <cmath>

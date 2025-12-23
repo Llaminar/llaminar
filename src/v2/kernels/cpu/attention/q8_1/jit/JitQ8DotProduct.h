@@ -31,7 +31,7 @@
 #pragma once
 
 #include "JitMicrokernelBase.h"
-#include "../../microkernels/q8_1/Q8DotProduct.h" // For Q8_1Block struct
+#include "../microkernels/Q8DotProduct.h" // For Q8_1Block struct
 
 namespace llaminar::v2::kernels::jit
 {

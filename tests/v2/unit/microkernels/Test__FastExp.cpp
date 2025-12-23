@@ -5,7 +5,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "kernels/cpu/microkernels/q8_1/FastExp.h"
+#include "kernels/cpu/attention/q8_1/microkernels/FastExp.h"
 
 #include <cmath>
 #include <random>

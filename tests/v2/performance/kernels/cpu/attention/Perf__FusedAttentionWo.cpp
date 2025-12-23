@@ -33,9 +33,9 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
-#include "kernels/cpu/attention/FusedAttentionWoKernel.h"
+#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
-#include "kernels/cpu/jit/q8_1/JitFusedAttentionWo.h"
+#include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
 #include "execution/RuntimeConfig.h"
 #include "utils/Logger.h"
 

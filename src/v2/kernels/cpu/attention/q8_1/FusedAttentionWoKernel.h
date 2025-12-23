@@ -20,7 +20,7 @@
 #include "tensors/Tensors.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoTiled.h"
-#include "kernels/cpu/jit/q8_1/JitFusedAttentionWo.h"
+#include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
 #include "utils/Logger.h"
 #include <memory>
 #include <cmath>

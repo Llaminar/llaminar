@@ -5,8 +5,8 @@
  */
 
 #include "Q8DotProduct.h"
-#include "../../../../tensors/FP16Utils.h"
-#include "../../../../utils/CPUFeatures.h"
+#include "../../../../../tensors/FP16Utils.h"
+#include "../../../../../utils/CPUFeatures.h"
 
 #include <cstdint>
 #include <cstring>

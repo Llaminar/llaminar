@@ -5,9 +5,9 @@
  */
 
 #include "WoProjection.h"
-#include "../../../../tensors/FP16Utils.h"
-#include "../../../../tensors/SIMDHelpers.h"
-#include "../../../../utils/CPUFeatures.h"
+#include "../../../../../tensors/FP16Utils.h"
+#include "../../../../../tensors/SIMDHelpers.h"
+#include "../../../../../utils/CPUFeatures.h"
 
 #include <cstring>
 #include <vector>
