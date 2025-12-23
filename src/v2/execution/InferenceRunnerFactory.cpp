@@ -6,7 +6,7 @@
  */
 
 #include "InferenceRunnerFactory.h"
-#include "../pipelines/qwen/Qwen2Graph.h"
+#include "../models/qwen/Qwen2Graph.h"
 #include "GraphOrchestrator.h"
 #include "../loaders/ModelContext.h"
 #include "../loaders/ModelLoader.h"

@@ -9,7 +9,7 @@
 #include "../../../src/v2/execution/GraphResolver.h"
 #include "../../../src/v2/execution/GraphSchema.h"
 #include "../../../src/v2/execution/GraphExecutor.h"
-#include "../../../src/v2/pipelines/qwen/Qwen2Schema.h"
+#include "../../../src/v2/models/qwen/Qwen2Schema.h"
 #include "../../../src/v2/tensors/Tensors.h"
 
 using namespace llaminar2;

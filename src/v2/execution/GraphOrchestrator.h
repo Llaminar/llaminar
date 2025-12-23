@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "../pipelines/qwen/Qwen2Graph.h"
+#include "../models/qwen/Qwen2Graph.h"
 #include "IInferenceRunner.h"
 #include "GraphExecutor.h"
 #include "GraphBufferManager.h"

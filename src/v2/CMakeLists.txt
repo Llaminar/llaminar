@@ -524,7 +524,7 @@ add_library(llaminar2_core STATIC
     loaders/WeightManager.cpp
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
-    pipelines/qwen/Qwen2Graph.cpp
+    models/qwen/Qwen2Graph.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
@@ -813,8 +813,8 @@ install(FILES
 )
 
 install(FILES
-    pipelines/QwenPipeline.h
-    DESTINATION include/llaminar2/pipelines
+    models/QwenPipeline.h
+    DESTINATION include/llaminar2/models
 )
 
 # =============================================================================

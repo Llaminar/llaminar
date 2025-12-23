@@ -26,7 +26,7 @@
 #include <memory>
 #include <fstream>
 
-#include "v2/pipelines/qwen/Qwen2Graph.h"
+#include "v2/models/qwen/Qwen2Graph.h"
 #include "v2/execution/GraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"

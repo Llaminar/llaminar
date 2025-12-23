@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/execution/GraphOrchestrator.h"
-#include "../../../src/v2/pipelines/qwen/Qwen2Graph.h"
+#include "../../../src/v2/models/qwen/Qwen2Graph.h"
 #include "../../../src/v2/backends/ComputeBackend.h"
 #include "../../../src/v2/utils/Logger.h"
 #include "../../../src/v2/utils/DebugEnv.h"

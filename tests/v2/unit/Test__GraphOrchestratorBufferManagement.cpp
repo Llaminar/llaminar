@@ -16,7 +16,7 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/execution/GraphOrchestrator.h"
-#include "../../../src/v2/pipelines/qwen/Qwen2Graph.h"
+#include "../../../src/v2/models/qwen/Qwen2Graph.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
 #include "../../../src/v2/utils/MPIContext.h"
 

@@ -41,7 +41,7 @@
 #include "execution/InferenceRunnerFactory.h"
 #include "execution/IInferenceRunner.h"
 #include "execution/GraphOrchestrator.h"
-#include "pipelines/qwen/Qwen2Graph.h"
+#include "models/qwen/Qwen2Graph.h"
 #include "loaders/ModelContext.h"
 #include "loaders/WeightManager.h"
 #include "utils/MPIContext.h"
