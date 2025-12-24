@@ -21,9 +21,14 @@
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoTiled.h"
 #include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
+#include "kernels/KernelFactory.h"
+#include "utils/DebugEnv.h"
+#include "utils/CPUFeatures.h"
 #include "utils/Logger.h"
 #include <memory>
 #include <cmath>
+#include <array>
+#include <mutex>
 #include "execution/RuntimeConfig.h" // For FusedAttentionBackend enum
 
 namespace llaminar2
@@ -96,6 +101,8 @@ namespace llaminar2
             bool causal = true,
             int position_offset = 0)
         {
+            const auto &env = debugEnv();
+
             // Validate Q8_1 input tensors
             auto *Q_q8 = dynamic_cast<Q8_1Tensor *>(Q);
             auto *K_q8 = dynamic_cast<Q8_1Tensor *>(K);
@@ -113,8 +120,18 @@ namespace llaminar2
 
             if (auto *wo_q8 = dynamic_cast<Q8_1Tensor *>(Wo))
             {
-                wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1;
-                wo_data = wo_q8->q8_1_blocks();
+                // For the JIT backend we always assume / require the packed VNNI path.
+                // Reference/Tiled backends require raw Q8_1 blocks.
+                if (config_.backend == FusedAttentionBackend::JIT)
+                {
+                    wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1_VNNI_PACKED;
+                    wo_data = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(wo_q8);
+                }
+                else
+                {
+                    wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1;
+                    wo_data = wo_q8->q8_1_blocks();
+                }
             }
             else if (auto *wo_fp32 = dynamic_cast<FP32Tensor *>(Wo))
             {
@@ -220,12 +237,55 @@ namespace llaminar2
         Config config_;
         float scale_;
 
+        struct JitKernelSlots
+        {
+            // Decode: cache per (work_size, tile_width) because the JIT config hash includes both.
+            // This lets us pick KV4 vs KV8 without recompiling or thrashing a single slot.
+            std::array<std::array<std::unique_ptr<llaminar::v2::kernels::jit::JitFusedAttentionWo>, 2>, 3> decode{};
+            std::unique_ptr<llaminar::v2::kernels::jit::JitFusedAttentionWo> prefill;
+        };
+
+        mutable std::mutex jit_slots_mutex_;
+        mutable std::array<JitKernelSlots, 5> jit_slots_{}; // indexed by static_cast<int>(WoFormat)
+
         /**
          * @brief Execute using JIT kernel
          */
         bool execute_jit(const llaminar::v2::kernels::FusedAttentionWoParams &params)
         {
             using namespace llaminar::v2::kernels::jit;
+
+            auto work_size_index = [](WorkSizeClass w) -> size_t
+            {
+                switch (w)
+                {
+                case WorkSizeClass::SMALL:
+                    return 0;
+                case WorkSizeClass::LARGE:
+                    return 1;
+                case WorkSizeClass::XL:
+                    return 2;
+                default:
+                    return 0;
+                }
+            };
+            auto tile_width_index = [](JitAttentionConfig::Fa2TileWidth t) -> size_t
+            {
+                return (t == JitAttentionConfig::Fa2TileWidth::KV8) ? 1 : 0;
+            };
+
+            // This JIT kernel relies on AVX-512 + VNNI.
+            // If unavailable, fall back to the tiled kernel.
+            if (!cpu_supports_avx512_vnni())
+            {
+                static bool logged = false;
+                if (!logged)
+                {
+                    LOG_WARN("FusedAttentionWoKernel: AVX512-VNNI not available, falling back to TILED backend");
+                    logged = true;
+                }
+                return llaminar::v2::kernels::FusedAttentionWoTiled::execute(params);
+            }
 
             // Map WoWeightType to WoFormat
             WoFormat wo_format;
@@ -243,6 +303,9 @@ namespace llaminar2
             case llaminar::v2::kernels::microkernels::WoWeightType::Q8_1:
                 wo_format = WoFormat::Q8_1;
                 break;
+            case llaminar::v2::kernels::microkernels::WoWeightType::Q8_1_VNNI_PACKED:
+                wo_format = WoFormat::Q8_1_VNNI_PACKED;
+                break;
             default:
                 LOG_ERROR("JIT kernel does not support Wo type: " << static_cast<int>(params.wo_type));
                 return false;
@@ -253,14 +316,94 @@ namespace llaminar2
             jit_config.head_dim = params.head_dim;
             jit_config.num_heads = params.num_heads;
             jit_config.num_kv_heads = params.num_kv_heads;
-            jit_config.batch_size = params.batch_size;
             jit_config.wo_format = wo_format;
+            jit_config.batch_size = params.batch_size;
+            jit_config.causal = params.causal;
+            jit_config.use_fa2_tiling = true; // Always use FA2 path
 
-            // Get or create JIT kernel from cache
-            JitFusedAttentionWo jit_kernel(jit_config);
+            // Explicitly specialize by mode (decode vs prefill) independent of batch_size.
+            // In this pipeline kernel, batch_size is typically 1 for both decode and prefill.
+            jit_config.mode = (params.seq_len <= 1)
+                                  ? llaminar::v2::kernels::jit::AttentionMode::DECODE
+                                  : llaminar::v2::kernels::jit::AttentionMode::PREFILL;
 
-            // Execute JIT kernel via compute() method (same as correctness tests)
-            jit_kernel.compute(
+            // Work-size bucketing: compile two decode kernels (SMALL vs LARGE) and swap.
+            // Prefill currently uses a single generic bucket.
+            if (jit_config.mode == llaminar::v2::kernels::jit::AttentionMode::DECODE)
+            {
+                // Thresholds tuned from microbench sweeps (Dec 2024):
+                //   kv=512:  LARGE/t8 wins
+                //   kv=2048: SMALL/t8 wins
+                //   kv=4096: LARGE/t4 wins
+                //   kv=8192: SMALL/t4 wins (slight edge)
+                // Pattern: alternates LARGE→SMALL→LARGE→SMALL as KV grows.
+                // Simplified: short contexts (≤1024) use LARGE; mid (1024-4096) use SMALL
+                // except 4096 which prefers LARGE; long (>4096) use SMALL again.
+                if (params.kv_seq_len > 8192)
+                {
+                    jit_config.work_size = WorkSizeClass::XL;
+                }
+                else if (params.kv_seq_len > 4096)
+                {
+                    // kv 4097-8192: SMALL wins at 8192
+                    jit_config.work_size = WorkSizeClass::SMALL;
+                }
+                else if (params.kv_seq_len > 2048)
+                {
+                    // kv 2049-4096: LARGE wins at 4096
+                    jit_config.work_size = WorkSizeClass::LARGE;
+                }
+                else if (params.kv_seq_len > 1024)
+                {
+                    // kv 1025-2048: SMALL wins at 2048
+                    jit_config.work_size = WorkSizeClass::SMALL;
+                }
+                else
+                {
+                    // kv <= 1024 (incl 512): LARGE wins
+                    jit_config.work_size = WorkSizeClass::LARGE;
+                }
+
+                // Decode-only lever: KV8 helps up to ~4k KV; KV4 wins at 8k+.
+                // Sweep results (Dec 2024):
+                //   kv=512:  t8 wins
+                //   kv=2048: t8 wins
+                //   kv=4096: t8 wins
+                //   kv=8192: t4 wins
+                // Use t8 for kv <= 4096, t4 for kv > 4096.
+                jit_config.fa2_tile_width =
+                    (params.kv_seq_len <= 4096)
+                        ? JitAttentionConfig::Fa2TileWidth::KV8
+                        : JitAttentionConfig::Fa2TileWidth::KV4;
+            }
+            else
+            {
+                jit_config.work_size = WorkSizeClass::SMALL;
+                jit_config.fa2_tile_width = JitAttentionConfig::Fa2TileWidth::KV4;
+            }
+
+            // Cache the constructed JitFusedAttentionWo object per (wo_format, mode, work_size)
+            // so we don't pay the global cache mutex on every token.
+            auto &slots = jit_slots_[static_cast<int>(wo_format)];
+            std::unique_ptr<JitFusedAttentionWo> *slot_ptr = nullptr;
+            if (jit_config.mode == llaminar::v2::kernels::jit::AttentionMode::PREFILL)
+            {
+                slot_ptr = &slots.prefill;
+            }
+            else
+            {
+                slot_ptr = &slots.decode[work_size_index(jit_config.work_size)][tile_width_index(jit_config.fa2_tile_width)];
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(jit_slots_mutex_);
+                if (!(*slot_ptr))
+                {
+                    *slot_ptr = std::make_unique<JitFusedAttentionWo>(jit_config);
+                }
+            }
+
+            (*slot_ptr)->compute(
                 params.Q,
                 params.K,
                 params.V,
@@ -268,7 +411,8 @@ namespace llaminar2
                 params.output,
                 params.seq_len,
                 params.kv_seq_len,
-                params.scale);
+                params.scale,
+                params.position_offset);
 
             return true;
         }

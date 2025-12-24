@@ -174,6 +174,8 @@ namespace llaminar::v2::kernels::microkernels
         case WoWeightType::Q8_1:
             wo_projection_q8_ref(params);
             break;
+        case WoWeightType::Q8_1_VNNI_PACKED:
+            throw std::runtime_error("WoProjection: Q8_1_VNNI_PACKED is only supported by JIT backend");
         default:
             // Unsupported type - fall back to FP32
             wo_projection_fp32_ref(params);

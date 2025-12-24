@@ -591,6 +591,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/attention/q8_1/microkernels/VWeightedAccum.cpp     # μK3: Weighted V accumulation
     kernels/cpu/attention/q8_1/microkernels/WoProjection.cpp       # μK4: Wo output projection
     kernels/cpu/attention/q8_1/microkernels/FastExp.cpp            # μK5: Fast exponential approximation
+    kernels/cpu/attention/q8_1/jit/WoProjectionVNNIPacked.cpp       # JIT helper thunk for VNNI-packed Wo GEMM
     kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp             # Reference implementation
     kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp           # Cache-blocked tiled implementation
     # Fused kernels (operator fusion framework)

@@ -24,11 +24,12 @@ namespace llaminar::v2::kernels::microkernels
      */
     enum class WoWeightType
     {
-        FP32, ///< Full precision float (32-bit)
-        FP16, ///< Half precision float (16-bit IEEE 754)
-        BF16, ///< Brain float (16-bit, same exponent range as FP32)
-        Q8_1, ///< Block quantized Q8_1
-        Q4_0, ///< Block quantized Q4_0
+        FP32,             ///< Full precision float (32-bit)
+        FP16,             ///< Half precision float (16-bit IEEE 754)
+        BF16,             ///< Brain float (16-bit, same exponent range as FP32)
+        Q8_1,             ///< Block quantized Q8_1
+        Q8_1_VNNI_PACKED, ///< gemm_v4::QuantisedPackedWeights (AVX-512 VNNI), JIT-only
+        Q4_0,             ///< Block quantized Q4_0
     };
 
     /**

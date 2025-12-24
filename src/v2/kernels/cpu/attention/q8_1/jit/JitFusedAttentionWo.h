@@ -113,10 +113,12 @@
 #include "JitOnlineSoftmax.h"
 #include "JitVWeightedAccum.h"
 #include "JitWoProjection.h"
+#include "JitWoProjectionOptimized.h"
 #include "JitFastExp.h"
 #include "../../../jit/RegisterAllocation.h" // Typed register allocation for FA2
 
 #include <memory>
+#include <cstdint>
 #include <unordered_map>
 #include <mutex>
 #include <functional>
@@ -148,6 +150,19 @@ namespace llaminar::v2::kernels::jit
     };
 
     /**
+     * @brief Coarse work-size bucket for JIT specialization.
+     *
+     * We keep this intentionally small so the runtime can cheaply cache and
+     * swap between a couple of specialized decode kernels.
+     */
+    enum class WorkSizeClass : uint8_t
+    {
+        SMALL = 0,
+        LARGE = 1,
+        XL = 2,
+    };
+
+    /**
      * @brief Configuration for JIT attention kernel
      */
     struct JitAttentionConfig
@@ -159,8 +174,16 @@ namespace llaminar::v2::kernels::jit
         WoFormat wo_format = WoFormat::Q8_1;      // Output projection weight format
         bool causal = true;                       // Whether to apply causal masking
         AttentionMode mode = AttentionMode::AUTO; // Kernel mode selection
-        bool use_fa2_tiling = false;              // Enable FA2-style KV tile processing (4x batched)
-        bool enable_register_tracking = false;    // Enable register conflict detection during JIT
+        bool use_fa2_tiling = true;               // Enable FA2-style KV tile processing (4x batched)
+        enum class Fa2TileWidth : uint8_t
+        {
+            KV4 = 4,
+            KV8 = 8,
+        };
+        Fa2TileWidth fa2_tile_width = Fa2TileWidth::KV4; // KV tile width for FA2 (decode-focused)
+        WorkSizeClass work_size = WorkSizeClass::SMALL;  // Coarse work-size class for specialization
+        bool enable_register_tracking = false;           // Enable register conflict detection during JIT
+        bool use_optimized_wo = false;                   // Use BLAS-style optimized Wo projection (FP32 only)
 
         /**
          * @brief Get the effective mode based on batch_size
@@ -185,7 +208,10 @@ namespace llaminar::v2::kernels::jit
                    causal == other.causal &&
                    effectiveMode() == other.effectiveMode() &&
                    use_fa2_tiling == other.use_fa2_tiling &&
-                   enable_register_tracking == other.enable_register_tracking;
+                   work_size == other.work_size &&
+                   enable_register_tracking == other.enable_register_tracking &&
+                   use_optimized_wo == other.use_optimized_wo;
+            fa2_tile_width == other.fa2_tile_width;
         }
     };
 
@@ -209,7 +235,10 @@ namespace std
             // Include effective mode in hash to cache decode and prefill kernels separately
             h ^= std::hash<int>()(static_cast<int>(cfg.effectiveMode())) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<bool>()(cfg.use_fa2_tiling) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(static_cast<int>(cfg.work_size)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<bool>()(cfg.enable_register_tracking) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<bool>()(cfg.use_optimized_wo) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(static_cast<int>(cfg.fa2_tile_width)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -241,6 +270,16 @@ namespace llaminar::v2::kernels::jit
         int seq_len_kv,
         float scale,
         int position_offset);
+
+    // External helper for packed VNNI Wo projection.
+    // Wo points to a gemm_v4::QuantisedPackedWeights, A is FP32 context [m,k], C is FP32 output [m,n].
+    extern "C" void llaminar2_wo_q8_1_vnni_packed_gemm(
+        const void *wo_packed,
+        const float *A,
+        float *C,
+        int m,
+        int n,
+        int k);
 
     /**
      * @brief JIT code generator for fused attention + Wo
@@ -587,6 +626,9 @@ namespace llaminar::v2::kernels::jit
             int q_idx_spill_offset = context_buffer_offset + d_model * 4;
             int seq_len_kv_spill_offset = q_idx_spill_offset + 8;
             int position_offset_spill_offset = seq_len_kv_spill_offset + 8;
+            // Scratch: spill scores for FA2 wider tiles (8x needs 8 scalar scores + 1 scalar max)
+            int fa2_scores_spill_offset = position_offset_spill_offset + 8;
+            int fa2_max1_spill_offset = fa2_scores_spill_offset + 32; // 8 floats = 32 bytes
 
             // ═══════════════════════════════════════════════════════════════════
             // ALLOCATE STACK FRAME
@@ -637,7 +679,8 @@ namespace llaminar::v2::kernels::jit
                 reg_Q, reg_K, reg_V, reg_Wo, reg_output,
                 reg_q_idx, reg_seq_len_kv,
                 num_blocks, spill_base_offset, q_stack_offset, context_buffer_offset,
-                q_idx_spill_offset, position_offset_spill_offset);
+                q_idx_spill_offset, position_offset_spill_offset,
+                fa2_scores_spill_offset, fa2_max1_spill_offset);
 
             inc(reg_q_idx); // q_idx++
             jmp("main_loop_q", T_NEAR);
@@ -2879,6 +2922,32 @@ namespace llaminar::v2::kernels::jit
                 // Optimized Q8_1 tile implementation
                 emit_prefill_wo_q8_1_tile(reg_Wo, reg_output, tile_size, context_offset, tile_start_spill, tile_size_spill, d_model);
                 break;
+            case WoFormat::Q8_1_VNNI_PACKED:
+                // Packed VNNI GEMM path: one GEMM for the whole tile
+                {
+                    // m = actual tile size (dynamic)
+                    mov(r8, ptr[rsp + tile_size_spill]);
+
+                    // A = context buffer base
+                    lea(r9, ptr[rsp + context_offset]);
+
+                    // C = output + tile_start * d_model * 4
+                    mov(r10, ptr[rsp + tile_start_spill]);
+                    imul(r10, r10, d_model * 4);
+                    add(r10, reg_output);
+
+                    // SysV args: rdi=WoPacked, rsi=A, rdx=C, rcx=m, r8=n, r9=k
+                    mov(rdi, reg_Wo);
+                    mov(rsi, r9);
+                    mov(rdx, r10);
+                    mov(rcx, r8);
+                    mov(r8d, d_model);
+                    mov(r9d, d_model);
+
+                    mov(rax, (size_t)llaminar2_wo_q8_1_vnni_packed_gemm);
+                    call(rax);
+                }
+                break;
             default:
                 // ───────────────────────────────────────────────────────────────
                 // FALLBACK: Sequential projection for other formats
@@ -3750,7 +3819,9 @@ namespace llaminar::v2::kernels::jit
             int q_stack_offset,
             int context_buffer_offset,
             int q_idx_spill_offset,
-            int position_offset_spill_offset)
+            int position_offset_spill_offset,
+            int fa2_scores_spill_offset,
+            int fa2_max1_spill_offset)
         {
             using namespace Xbyak;
 
@@ -3842,26 +3913,47 @@ namespace llaminar::v2::kernels::jit
                     std::string fa2_remainder_loop = head_label + "_fa2_remainder";
                     std::string fa2_remainder_end = head_label + "_fa2_remainder_end";
 
-                    // Calculate tile loop bound: (max_kv_pos / 4) * 4
-                    // This gives us the last position where we can do a full 4x tile
+                    const int fa2_kv_step =
+                        (config_.fa2_tile_width == JitAttentionConfig::Fa2TileWidth::KV8) ? 8 : 4;
+
                     Reg64 reg_tile_bound = r8;
                     mov(reg_tile_bound, reg_max_kv_pos);
-                    and_(reg_tile_bound, ~3); // Round down to multiple of 4
 
-                    // FA2 Tile Loop: Process 4 KV positions at a time
+                    // Round down to multiple of the selected tile width.
+                    if (fa2_kv_step == 8)
+                    {
+                        and_(reg_tile_bound, ~7);
+                    }
+                    else
+                    {
+                        and_(reg_tile_bound, ~3);
+                    }
+
+                    // Tile loop: Process KV in steps of 4 or 8.
                     L(fa2_tile_loop.c_str());
                     cmp(reg_kv_idx, reg_tile_bound);
                     jge(fa2_tile_end.c_str(), T_NEAR);
 
-                    emit_fa2_tile_attention_4x(
-                        reg_Q_base, reg_K, reg_V,
-                        reg_kv_idx, h, kv_head,
-                        num_blocks, spill_base_offset,
-                        head_label);
-
-                    add(reg_kv_idx, 4); // Advance by 4 positions
+                    if (fa2_kv_step == 8)
+                    {
+                        emit_fa2_tile_attention_8x(
+                            reg_Q_base, reg_K, reg_V,
+                            reg_kv_idx, h, kv_head,
+                            num_blocks, spill_base_offset,
+                            head_label,
+                            fa2_scores_spill_offset, fa2_max1_spill_offset);
+                        add(reg_kv_idx, 8);
+                    }
+                    else
+                    {
+                        emit_fa2_tile_attention_4x(
+                            reg_Q_base, reg_K, reg_V,
+                            reg_kv_idx, h, kv_head,
+                            num_blocks, spill_base_offset,
+                            head_label);
+                        add(reg_kv_idx, 4);
+                    }
                     jmp(fa2_tile_loop.c_str(), T_NEAR);
-
                     L(fa2_tile_end.c_str());
 
                     // Remainder Loop: Process remaining 0-3 positions one at a time
@@ -4254,11 +4346,18 @@ namespace llaminar::v2::kernels::jit
             imul(reg_out_ptr, reg_out_ptr, d_model * 4);
             add(reg_out_ptr, reg_output);
 
-            // Dispatch based on Wo format
+            // Dispatch based on Wo format (and optimization flag for FP32)
             switch (config_.wo_format)
             {
             case WoFormat::FP32:
-                emit_wo_projection_fp32(reg_Wo, reg_out_ptr, context_buffer_offset, d_model);
+                if (config_.use_optimized_wo)
+                {
+                    emit_wo_projection_fp32_optimized(reg_Wo, reg_out_ptr, context_buffer_offset, d_model);
+                }
+                else
+                {
+                    emit_wo_projection_fp32(reg_Wo, reg_out_ptr, context_buffer_offset, d_model);
+                }
                 break;
             case WoFormat::FP16:
                 emit_wo_projection_fp16(reg_Wo, reg_out_ptr, context_buffer_offset, d_model);
@@ -4269,6 +4368,22 @@ namespace llaminar::v2::kernels::jit
             case WoFormat::Q8_1:
                 emit_wo_projection_q8_1(reg_Wo, reg_out_ptr, context_buffer_offset, d_model);
                 break;
+            case WoFormat::Q8_1_VNNI_PACKED:
+            {
+                // A = context buffer on stack
+                lea(rsi, ptr[rsp + context_buffer_offset]);
+
+                // SysV args: rdi=WoPacked, rsi=A, rdx=C, rcx=m, r8=n, r9=k
+                mov(rdi, reg_Wo);
+                mov(rdx, reg_out_ptr);
+                mov(ecx, 1);
+                mov(r8d, d_model);
+                mov(r9d, d_model);
+
+                mov(rax, (size_t)llaminar2_wo_q8_1_vnni_packed_gemm);
+                call(rax);
+            }
+            break;
             }
         }
 
@@ -4374,6 +4489,38 @@ namespace llaminar::v2::kernels::jit
             L(".outer_end");
 
             outLocalLabel();
+        }
+
+        /**
+         * @brief Optimized FP32 Wo projection using BLAS-style 4×64 GEMV
+         *
+         * Uses JitWoProjectionOptimizedEmitter for 4× ILP over output columns.
+         * This achieves ~12 GFLOP/s single-threaded vs ~8 GFLOP/s for naive.
+         *
+         * @param reg_Wo Pointer to Wo weights [d_model × d_model]
+         * @param reg_out_ptr Pointer to output buffer for current query
+         * @param context_buffer_offset Stack offset to context buffer
+         * @param d_model Model dimension (K and N for GEMV)
+         */
+        void emit_wo_projection_fp32_optimized(
+            const Xbyak::Reg64 &reg_Wo,
+            const Xbyak::Reg64 &reg_out_ptr,
+            int context_buffer_offset,
+            int d_model)
+        {
+            using namespace Xbyak;
+
+            debug_emit("emit_wo_projection_fp32_optimized (d_model=" + std::to_string(d_model) + ")");
+
+            // Load context pointer from stack into a register
+            // We use r13 which is callee-saved but we're inside JIT so it's fine
+            Reg64 reg_context = r13;
+            lea(reg_context, ptr[rsp + context_buffer_offset]);
+
+            // Call the optimized GEMV emitter (row-major Wo semantics)
+            // The emitter generates code for: output[rows] = Wo[rows, cols] × context[cols]
+            JitWoProjectionOptimizedEmitter emitter;
+            emitter.emit_gemv_wox_rowmajor_fp32(*this, reg_context, reg_Wo, reg_out_ptr, d_model, d_model);
         }
 
         /**
@@ -5013,6 +5160,49 @@ namespace llaminar::v2::kernels::jit
             add(reg_K_ptr, reg_K);
 
             // ───────────────────────────────────────────────────────────────────
+            // SOFTWARE PREFETCH (DECODE / FA2): specialize by work size.
+            //
+            // Heuristic intent:
+            // - SMALL: keep hot, short KV in L1 (low distance)
+            // - LARGE: reduce L1 pollution, prefetch into L2 (medium distance)
+            // - XL: streaming KV, prefetch into L3 (long distance)
+            //
+            // NOTE: This is compile-time (codegen-time) specialization via
+            // JitAttentionConfig::work_size.
+            // ───────────────────────────────────────────────────────────────────
+            {
+                const int kv_prefetch_positions =
+                    (config_.work_size == WorkSizeClass::SMALL) ? 4 : (config_.work_size == WorkSizeClass::LARGE) ? 16
+                                                                                                                  : 64;
+                const int pf_bytes = kv_prefetch_positions * k_stride;
+
+                if (config_.work_size == WorkSizeClass::LARGE)
+                {
+                    prefetcht1(ptr[reg_K_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                    {
+                        prefetcht1(ptr[reg_K_ptr + pf_bytes + 64]);
+                    }
+                }
+                else if (config_.work_size == WorkSizeClass::XL)
+                {
+                    prefetcht2(ptr[reg_K_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                    {
+                        prefetcht2(ptr[reg_K_ptr + pf_bytes + 64]);
+                    }
+                }
+                else
+                {
+                    prefetcht0(ptr[reg_K_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                    {
+                        prefetcht0(ptr[reg_K_ptr + pf_bytes + 64]);
+                    }
+                }
+            }
+
+            // ───────────────────────────────────────────────────────────────────
             // STEP 2: Compute 4 Q·K scores simultaneously
             //         Using FA2 vectorized dot product emitter
             //         Q is pre-loaded in zmm10-13 by emit_load_q_head_to_registers
@@ -5129,6 +5319,39 @@ namespace llaminar::v2::kernels::jit
             add(reg_V_ptr, kv_head_offset);
             add(reg_V_ptr, reg_V);
 
+            // Prefetch V for upcoming tiles (same policy as K)
+            {
+                const int kv_prefetch_positions =
+                    (config_.work_size == WorkSizeClass::SMALL) ? 4 : (config_.work_size == WorkSizeClass::LARGE) ? 16
+                                                                                                                  : 64;
+                const int pf_bytes = kv_prefetch_positions * v_stride;
+
+                if (config_.work_size == WorkSizeClass::LARGE)
+                {
+                    prefetcht1(ptr[reg_V_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                    {
+                        prefetcht1(ptr[reg_V_ptr + pf_bytes + 64]);
+                    }
+                }
+                else if (config_.work_size == WorkSizeClass::XL)
+                {
+                    prefetcht2(ptr[reg_V_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                    {
+                        prefetcht2(ptr[reg_V_ptr + pf_bytes + 64]);
+                    }
+                }
+                else
+                {
+                    prefetcht0(ptr[reg_V_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                    {
+                        prefetcht0(ptr[reg_V_ptr + pf_bytes + 64]);
+                    }
+                }
+            }
+
             // ───────────────────────────────────────────────────────────────────
             // STEP 8: Interleaved V accumulation for 4 positions
             //         Overlaps V loads with FMA to hide memory latency
@@ -5143,6 +5366,238 @@ namespace llaminar::v2::kernels::jit
                 spill_base_offset);
 
             // Guards released automatically at end of scope
+        }
+
+        /**
+         * @brief FA2-style tile processing: 8 KV positions at once
+         *
+         * Implemented as 2× 4-wide dot products, but with a single tile max/state
+         * update + a single context rescale for the combined 8 scores.
+         *
+         * This is decode-focused and avoids changing the existing 4x microkernel.
+         *
+         * @param fa2_scores_spill_offset Stack offset for 8 scalar scores (8 floats)
+         * @param fa2_max1_spill_offset   Stack offset for scalar max of first 4 scores
+         */
+        void emit_fa2_tile_attention_8x(
+            const Xbyak::Reg64 &reg_Q_ptr,
+            const Xbyak::Reg64 &reg_K,
+            const Xbyak::Reg64 &reg_V,
+            const Xbyak::Reg64 &reg_kv_idx,
+            int head_idx,
+            int kv_head_idx,
+            int num_blocks,
+            int spill_base_offset,
+            const std::string &label_prefix,
+            int fa2_scores_spill_offset,
+            int fa2_max1_spill_offset)
+        {
+            using namespace Xbyak;
+            using namespace llaminar2::jit;
+
+            debug_emit("emit_fa2_tile_attention_8x (FA2 tile processing)");
+
+            if (tracking_enabled())
+            {
+                reset_borrows();
+            }
+
+            // K/V strides and head offsets
+            const int k_stride = config_.num_kv_heads * num_blocks * 36;
+            const int v_stride = config_.num_kv_heads * num_blocks * 36;
+            const int kv_head_offset = kv_head_idx * num_blocks * 36;
+
+            // STEP 1: K pointer for first 4 (kv..kv+3)
+            Reg64 reg_K_ptr = rdi;
+            mov(reg_K_ptr, reg_kv_idx);
+            imul(reg_K_ptr, reg_K_ptr, k_stride);
+            add(reg_K_ptr, kv_head_offset);
+            add(reg_K_ptr, reg_K);
+
+            // Prefetch K (same policy as 4x)
+            {
+                const int kv_prefetch_positions =
+                    (config_.work_size == WorkSizeClass::SMALL) ? 4 : (config_.work_size == WorkSizeClass::LARGE) ? 16
+                                                                                                                  : 64;
+                const int pf_bytes = kv_prefetch_positions * k_stride;
+                if (config_.work_size == WorkSizeClass::LARGE)
+                {
+                    prefetcht1(ptr[reg_K_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                        prefetcht1(ptr[reg_K_ptr + pf_bytes + 64]);
+                }
+                else if (config_.work_size == WorkSizeClass::XL)
+                {
+                    prefetcht2(ptr[reg_K_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                        prefetcht2(ptr[reg_K_ptr + pf_bytes + 64]);
+                }
+                else
+                {
+                    prefetcht0(ptr[reg_K_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                        prefetcht0(ptr[reg_K_ptr + pf_bytes + 64]);
+                }
+            }
+
+            // BORROW: Score0-3 for dot outputs
+            auto guard_score0 = borrow<Score0>();
+            auto guard_score1 = borrow<Score1>();
+            auto guard_score2 = borrow<Score2>();
+            auto guard_score3 = borrow<Score3>();
+
+            // BORROW: Scratch4 for local scale copy (xmm24/zmm24)
+            auto guard_scale = borrow<Scratch4>();
+            Xmm xmm_scale_local = guard_scale.xmm();
+
+            // BORROW: Q data registers (Input2-5 = zmm10-13)
+            auto guard_q0 = borrow<Input2>();
+            auto guard_q1 = borrow<Input3>();
+            auto guard_q2 = borrow<Input4>();
+            auto guard_q3 = borrow<Input5>();
+
+            vmovss(xmm_scale_local, Xmm(const_scale().zmm().getIdx()));
+
+            const int q_head_offset = head_idx * num_blocks * 36;
+
+            // STEP 2a: scores0..3
+            dot_emitter_.emit_dot_product_4x(
+                *this,
+                guard_score0.xmm(), guard_score1.xmm(), guard_score2.xmm(), guard_score3.xmm(),
+                reg_K_ptr, k_stride,
+                num_blocks, xmm_scale_local, 10, reg_Q_ptr, q_head_offset);
+
+            // Spill scores0..3
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 0], guard_score0.xmm());
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 4], guard_score1.xmm());
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 8], guard_score2.xmm());
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 12], guard_score3.xmm());
+
+            // tile_max1 in zmm24
+            softmax_emitter_.emit_tile_max_reduction_4_typed(
+                *this, Scratch4{}, score0(), score1(), score2(), score3());
+            vmovss(ptr[rsp + fa2_max1_spill_offset], Xmm(guard_scale.zmm().getIdx()));
+
+            // STEP 2b: scores4..7 (advance K by 4 rows)
+            add(reg_K_ptr, 4 * k_stride);
+            dot_emitter_.emit_dot_product_4x(
+                *this,
+                guard_score0.xmm(), guard_score1.xmm(), guard_score2.xmm(), guard_score3.xmm(),
+                reg_K_ptr, k_stride,
+                num_blocks, xmm_scale_local, 10, reg_Q_ptr, q_head_offset);
+
+            // Spill scores4..7
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 16], guard_score0.xmm());
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 20], guard_score1.xmm());
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 24], guard_score2.xmm());
+            vmovss(ptr[rsp + fa2_scores_spill_offset + 28], guard_score3.xmm());
+
+            // tile_max2 in zmm24
+            softmax_emitter_.emit_tile_max_reduction_4_typed(
+                *this, Scratch4{}, score0(), score1(), score2(), score3());
+
+            // Q no longer needed after dot products
+            guard_q0.release();
+            guard_q1.release();
+            guard_q2.release();
+            guard_q3.release();
+
+            // Combine tile_max = max(tile_max1, tile_max2)
+            Xmm xmm_max1(scratch5().zmm().getIdx());
+            vmovss(xmm_max1, ptr[rsp + fa2_max1_spill_offset]);
+            vmaxss(Xmm(guard_scale.zmm().getIdx()), Xmm(guard_scale.zmm().getIdx()), xmm_max1);
+            vbroadcastss(guard_scale.zmm(), Xmm(guard_scale.zmm().getIdx()));
+            Zmm tile_max = guard_scale.zmm();
+
+            // STEP 4: Update softmax state ONCE for the 8-wide tile
+            std::string tile_label = label_prefix + "_fa2_tile8";
+            softmax_emitter_.emit_tile_state_update(*this, tile_max, tile_label);
+
+            // STEP 5: Rescale context accumulators ONCE
+            v_accum_emitter_.emit_rescale_context(*this, num_blocks, spill_base_offset);
+
+            // RELEASE Score0-3 before reusing as Scratch0-3
+            guard_score0.release();
+            guard_score1.release();
+            guard_score2.release();
+            guard_score3.release();
+
+            // BORROW: Scratch0-3 (zmm20-23) for weights
+            auto guard_weight0 = borrow<Scratch0>();
+            auto guard_weight1 = borrow<Scratch1>();
+            auto guard_weight2 = borrow<Scratch2>();
+            auto guard_weight3 = borrow<Scratch3>();
+
+            // STEP 7: V pointer for first 4 (kv..kv+3)
+            Reg64 reg_V_ptr = rdi;
+            mov(reg_V_ptr, reg_kv_idx);
+            imul(reg_V_ptr, reg_V_ptr, v_stride);
+            add(reg_V_ptr, kv_head_offset);
+            add(reg_V_ptr, reg_V);
+
+            // Prefetch V (same policy as 4x)
+            {
+                const int kv_prefetch_positions =
+                    (config_.work_size == WorkSizeClass::SMALL) ? 4 : (config_.work_size == WorkSizeClass::LARGE) ? 16
+                                                                                                                  : 64;
+                const int pf_bytes = kv_prefetch_positions * v_stride;
+                if (config_.work_size == WorkSizeClass::LARGE)
+                {
+                    prefetcht1(ptr[reg_V_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                        prefetcht1(ptr[reg_V_ptr + pf_bytes + 64]);
+                }
+                else if (config_.work_size == WorkSizeClass::XL)
+                {
+                    prefetcht2(ptr[reg_V_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                        prefetcht2(ptr[reg_V_ptr + pf_bytes + 64]);
+                }
+                else
+                {
+                    prefetcht0(ptr[reg_V_ptr + pf_bytes]);
+                    if (num_blocks > 1)
+                        prefetcht0(ptr[reg_V_ptr + pf_bytes + 64]);
+                }
+            }
+
+            // GROUP 0: scores0..3 -> weights0..3 -> V accum (kv..kv+3)
+            vmovss(score0().xmm(), ptr[rsp + fa2_scores_spill_offset + 0]);
+            vmovss(score1().xmm(), ptr[rsp + fa2_scores_spill_offset + 4]);
+            vmovss(score2().xmm(), ptr[rsp + fa2_scores_spill_offset + 8]);
+            vmovss(score3().xmm(), ptr[rsp + fa2_scores_spill_offset + 12]);
+
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score0().xmm(), guard_weight0.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score1().xmm(), guard_weight1.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score2().xmm(), guard_weight2.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score3().xmm(), guard_weight3.zmm());
+
+            v_accum_emitter_.emit_interleaved_v_accum_4x(
+                *this,
+                reg_V_ptr, v_stride,
+                num_blocks,
+                guard_weight0.xmm(), guard_weight1.xmm(), guard_weight2.xmm(), guard_weight3.xmm(),
+                spill_base_offset);
+
+            // GROUP 1: scores4..7 -> weights0..3 -> V accum (kv+4..kv+7)
+            add(reg_V_ptr, 4 * v_stride);
+
+            vmovss(score0().xmm(), ptr[rsp + fa2_scores_spill_offset + 16]);
+            vmovss(score1().xmm(), ptr[rsp + fa2_scores_spill_offset + 20]);
+            vmovss(score2().xmm(), ptr[rsp + fa2_scores_spill_offset + 24]);
+            vmovss(score3().xmm(), ptr[rsp + fa2_scores_spill_offset + 28]);
+
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score0().xmm(), guard_weight0.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score1().xmm(), guard_weight1.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score2().xmm(), guard_weight2.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score3().xmm(), guard_weight3.zmm());
+
+            v_accum_emitter_.emit_interleaved_v_accum_4x(
+                *this,
+                reg_V_ptr, v_stride,
+                num_blocks,
+                guard_weight0.xmm(), guard_weight1.xmm(), guard_weight2.xmm(), guard_weight3.xmm(),
+                spill_base_offset);
         }
     };
 

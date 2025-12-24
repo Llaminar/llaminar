@@ -393,6 +393,11 @@ namespace llaminar2
     {
         bool fp32_scores = false; ///< Use FP32 for Q·K score computation (default: integer)
 
+        // Wo projection mode (JIT backend only)
+        // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
+        // and Wo projection is executed via gemm_v4 (AVX-512 VNNI) with on-the-fly activation quantization.
+        bool wo_vnni_packed = false;
+
         AttentionConfig()
         {
             reload();
@@ -404,6 +409,12 @@ namespace llaminar2
             if (fp32_scores_env)
             {
                 fp32_scores = (std::atoi(fp32_scores_env) != 0);
+            }
+
+            const char *wo_vnni_env = std::getenv("LLAMINAR_Q8_WO_VNNI_PACKED");
+            if (wo_vnni_env)
+            {
+                wo_vnni_packed = (std::atoi(wo_vnni_env) != 0);
             }
         }
     };

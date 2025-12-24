@@ -51,6 +51,7 @@ namespace llaminar::v2::kernels::jit
     {
         FP32,
         Q8_1,
+        Q8_1_VNNI_PACKED,
         FP16,
         BF16
     };

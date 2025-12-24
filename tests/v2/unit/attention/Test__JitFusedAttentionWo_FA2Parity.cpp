@@ -581,4 +581,134 @@ namespace llaminar::v2::kernels::jit::test
         EXPECT_FALSE(has_nan) << "FA2 output contains NaN!";
     }
 
+    // ========================================================================
+    // Optimized Wo Projection Tests
+    // ========================================================================
+
+    /**
+     * @brief Test optimized FP32 Wo projection vs naive implementation
+     *
+     * Verifies that use_optimized_wo=true produces numerically equivalent
+     * output to use_optimized_wo=false (the naive row-by-row implementation).
+     */
+    TEST_F(Test__JitFusedAttentionWo_FA2Parity, OptimizedWo_vs_Naive_896x896)
+    {
+        constexpr int seq_len = 1;
+        constexpr int kv_seq_len = 32;
+        constexpr int num_heads = 14;
+        constexpr int num_kv_heads = 2;
+        constexpr int head_dim = 64;
+        constexpr int d_model = num_heads * head_dim; // 896
+        constexpr float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        constexpr int blocks_per_head = head_dim / 32;
+
+        std::cout << "\n=== Optimized Wo vs Naive (d_model=" << d_model << ") ===" << std::endl;
+
+        // Generate random data
+        auto Q_fp32 = generate_random_fp32(seq_len * num_heads * head_dim);
+        auto K_fp32 = generate_random_fp32(kv_seq_len * num_kv_heads * head_dim);
+        auto V_fp32 = generate_random_fp32(kv_seq_len * num_kv_heads * head_dim);
+
+        // Quantize
+        std::vector<Q8_1Block> Q_q8(seq_len * num_heads * blocks_per_head);
+        std::vector<Q8_1Block> K_q8(kv_seq_len * num_kv_heads * blocks_per_head);
+        std::vector<Q8_1Block> V_q8(kv_seq_len * num_kv_heads * blocks_per_head);
+
+        quantize_fp32_to_q8_1(Q_fp32.data(), seq_len * num_heads, head_dim, Q_q8.data());
+        quantize_fp32_to_q8_1(K_fp32.data(), kv_seq_len * num_kv_heads, head_dim, K_q8.data());
+        quantize_fp32_to_q8_1(V_fp32.data(), kv_seq_len * num_kv_heads, head_dim, V_q8.data());
+
+        // Random Wo weights
+        auto Wo_fp32 = generate_random_fp32(d_model * d_model, 0.1f);
+
+        // Output buffers
+        std::vector<float> output_naive(seq_len * d_model, 0.0f);
+        std::vector<float> output_optimized(seq_len * d_model, 0.0f);
+
+        // Naive config
+        JitAttentionConfig config_naive;
+        config_naive.head_dim = head_dim;
+        config_naive.num_heads = num_heads;
+        config_naive.num_kv_heads = num_kv_heads;
+        config_naive.batch_size = 1;
+        config_naive.wo_format = WoFormat::FP32;
+        config_naive.causal = false;
+        config_naive.use_fa2_tiling = true;
+        config_naive.use_optimized_wo = false; // Naive
+
+        // Optimized config
+        JitAttentionConfig config_optimized;
+        config_optimized.head_dim = head_dim;
+        config_optimized.num_heads = num_heads;
+        config_optimized.num_kv_heads = num_kv_heads;
+        config_optimized.batch_size = 1;
+        config_optimized.wo_format = WoFormat::FP32;
+        config_optimized.causal = false;
+        config_optimized.use_fa2_tiling = true;
+        config_optimized.use_optimized_wo = true; // Optimized
+
+        // Run both kernels
+        JitFusedAttentionWo kernel_naive(config_naive);
+        kernel_naive.compute(
+            Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+            output_naive.data(), seq_len, kv_seq_len, scale, 0);
+
+        JitFusedAttentionWo kernel_optimized(config_optimized);
+        kernel_optimized.compute(
+            Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+            output_optimized.data(), seq_len, kv_seq_len, scale, 0);
+
+        // Compare outputs
+        double cos_sim = cosine_similarity(output_optimized.data(), output_naive.data(), seq_len * d_model);
+        double rel_l2 = relative_l2_error(output_optimized.data(), output_naive.data(), seq_len * d_model);
+        double max_err = max_abs_error(output_optimized.data(), output_naive.data(), seq_len * d_model);
+
+        std::cout << "  Cosine similarity (opt vs naive):  " << std::fixed << std::setprecision(6) << cos_sim << std::endl;
+        std::cout << "  Relative L2 error:                 " << std::fixed << std::setprecision(6) << rel_l2 << std::endl;
+        std::cout << "  Max absolute error:                " << std::fixed << std::setprecision(6) << max_err << std::endl;
+
+        // Optimized should be numerically identical (both use same algorithm, just different loop structure)
+        EXPECT_GT(cos_sim, 0.99999) << "Optimized Wo diverges from naive!";
+        EXPECT_LT(rel_l2, 1e-5) << "Relative L2 error too large!";
+        EXPECT_LT(max_err, 1e-5) << "Max absolute error too large!";
+
+        // Timing (informational only; no assertions to avoid flakiness)
+        // Measures end-to-end fused kernel with only Wo projection differing.
+        auto time_kernel_ms = [&](JitFusedAttentionWo &kernel, float *out)
+        {
+            constexpr int warmup_iters = 10;
+            constexpr int bench_iters = 100;
+            std::vector<double> times;
+            times.reserve(bench_iters);
+
+            for (int i = 0; i < warmup_iters; ++i)
+            {
+                kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                               out, seq_len, kv_seq_len, scale, 0);
+            }
+
+            for (int i = 0; i < bench_iters; ++i)
+            {
+                auto start = std::chrono::high_resolution_clock::now();
+                kernel.compute(Q_q8.data(), K_q8.data(), V_q8.data(), Wo_fp32.data(),
+                               out, seq_len, kv_seq_len, scale, 0);
+                auto end = std::chrono::high_resolution_clock::now();
+                times.push_back(std::chrono::duration<double, std::milli>(end - start).count());
+            }
+
+            std::sort(times.begin(), times.end());
+            return times[times.size() / 2];
+        };
+
+        // Reuse outputs as scratch to avoid allocating inside timing loops
+        double naive_ms = time_kernel_ms(kernel_naive, output_naive.data());
+        double opt_ms = time_kernel_ms(kernel_optimized, output_optimized.data());
+        double speedup = naive_ms / opt_ms;
+
+        std::cout << "\n  Timing (median of 100 iters, warmup 10):" << std::endl;
+        std::cout << "    Naive:     " << std::fixed << std::setprecision(3) << naive_ms << " ms" << std::endl;
+        std::cout << "    Optimized: " << std::fixed << std::setprecision(3) << opt_ms << " ms" << std::endl;
+        std::cout << "    Speedup (naive/opt): " << std::fixed << std::setprecision(2) << speedup << "x" << std::endl;
+    }
+
 } // namespace llaminar::v2::kernels::jit::test

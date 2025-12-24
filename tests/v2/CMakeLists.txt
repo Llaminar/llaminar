@@ -259,6 +259,18 @@ add_v2_test(V2_Unit_RegisterEnforcement
     LABELS "V2;Unit;JIT;RegisterEnforcement;TypeSafety"
 )
 
+# Test: JitWoProjectionOptimized - BLAS-style Wo projection microkernels
+add_executable(v2_test_jit_wo_projection_optimized unit/jit/Test__JitWoProjectionOptimized.cpp)
+target_link_libraries(v2_test_jit_wo_projection_optimized 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitWoProjectionOptimized 
+    COMMAND $<TARGET_FILE:v2_test_jit_wo_projection_optimized>
+    LABELS "V2;Unit;JIT;GEMM;GEMV;Wo;Attention;AVX512"
+)
+
 # Test: SwiGLU formula correctness (regression test for gate/up swap bug)
 # This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
 add_executable(v2_test_swiglu_formula unit/Test__SwiGLUFormula.cpp)
@@ -3286,6 +3298,27 @@ target_link_libraries(v2_perf_fused_attention_wo
 add_v2_test(V2_Perf_FusedAttentionWo 
     COMMAND $<TARGET_FILE:v2_perf_fused_attention_wo>
     LABELS "V2;Performance;FusedAttention;JIT;Reference;Tiled;Prefill;Decode;Throughput"
+    MPI_PROCS 1
+)
+
+# Standalone microbench (no gtest) - intended for perf stat cache profiling
+add_executable(v2_microbench_fused_attention_wo performance/kernels/cpu/attention/Microbench__FusedAttentionWo.cpp)
+target_link_libraries(v2_microbench_fused_attention_wo
+    llaminar2_core
+)
+
+# Wo transpose benchmark - compares row-major vs column-major GEMV
+add_executable(v2_perf_wo_transpose performance/Microbench__WoTranspose.cpp)
+target_link_libraries(v2_perf_wo_transpose
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_compile_options(v2_perf_wo_transpose PRIVATE -mavx512f -mavx512dq -fopenmp)
+target_link_libraries(v2_perf_wo_transpose gomp)
+add_v2_test(V2_Perf_WoTranspose
+    COMMAND $<TARGET_FILE:v2_perf_wo_transpose>
+    LABELS "V2;Performance;Wo;Transpose;GEMV"
     MPI_PROCS 1
 )
 
