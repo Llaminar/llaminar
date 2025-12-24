@@ -18,6 +18,7 @@
 #include "../../src/v2/tensors/TensorFactory.h"
 #include "../../src/v2/kernels/KernelFactory.h"
 #include "../../src/v2/utils/MPIContext.h"
+#include "../../src/v2/models/qwen/Qwen2Schema.h"
 #include <cmath>
 #include <numeric>
 
@@ -57,6 +58,11 @@ namespace llaminar2
             // Create WeightManagers with SHARDED strategy
             WeightManager wm0(loader0, mpi_ctx_rank0, nullptr, WeightDistributionStrategy::SHARDED);
             WeightManager wm1(loader1, mpi_ctx_rank1, nullptr, WeightDistributionStrategy::SHARDED);
+
+            // Set sharding config (required before accessing weights)
+            Qwen2SchemaFactory schema_factory;
+            wm0.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+            wm1.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
             // Load a row-parallel weight (attn_output.weight)
             const std::string tensor_name = "blk.0.attn_output.weight";
@@ -101,6 +107,10 @@ namespace llaminar2
 
             WeightManager wm(loader, mpi_ctx, nullptr, WeightDistributionStrategy::SHARDED);
 
+            // Set sharding config (required before accessing weights)
+            Qwen2SchemaFactory schema_factory;
+            wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
             // FFN Down is INPUT_PARALLEL (column-sliced) in Phase 4b-2
             // This means it splits the input dimension (columns) to match Gate/Up output
             const std::string tensor_name = "blk.0.ffn_down.weight";
@@ -144,6 +154,10 @@ namespace llaminar2
             }
 
             WeightManager wm(loader, mpi_ctx, nullptr, WeightDistributionStrategy::SHARDED);
+
+            // Set sharding config (required before accessing weights)
+            Qwen2SchemaFactory schema_factory;
+            wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
             // Load COLUMN_PARALLEL weight (row-sliced)
             // ffn_gate.weight is [4864, 896] -> each rank gets [2432, 896] (rows sliced, K preserved)
@@ -202,6 +216,11 @@ namespace llaminar2
             // Use ffn_gate.weight which is COLUMN_PARALLEL (row-sliced)
             // Shape: [4864, 896] -> each rank gets [2432, 896]
             WeightManager wm_full(loader_single, mpi_ctx_single, nullptr, WeightDistributionStrategy::REPLICATED);
+
+            // Configure weight sharding for all managers (needed for isGemmWeight check)
+            Qwen2SchemaFactory schema_factory;
+            wm_full.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
             const std::string tensor_name = "blk.0.ffn_gate.weight";
             auto full_weight = wm_full.getWeight(tensor_name, 0);
             ASSERT_NE(full_weight, nullptr);
@@ -224,6 +243,10 @@ namespace llaminar2
             // will be released after GEMM packing
             WeightManager wm0(loader0, mpi_ctx_rank0, nullptr, WeightDistributionStrategy::SHARDED);
             WeightManager wm1(loader1, mpi_ctx_rank1, nullptr, WeightDistributionStrategy::SHARDED);
+
+            // Configure weight sharding for both managers (reuse schema_factory)
+            wm0.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+            wm1.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
             auto weight0 = wm0.getWeight(tensor_name, 0);
             auto weight1 = wm1.getWeight(tensor_name, 0);
@@ -317,6 +340,10 @@ namespace llaminar2
             }
 
             WeightManager wm(loader, mpi_ctx, nullptr, WeightDistributionStrategy::SHARDED);
+
+            // Configure weight sharding
+            Qwen2SchemaFactory schema_factory;
+            wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
             // Load a replicated weight (attention norm)
             const std::string norm_name = "blk.0.attn_norm.weight";

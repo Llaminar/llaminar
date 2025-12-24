@@ -42,6 +42,7 @@
 #include "execution/IInferenceRunner.h"
 #include "execution/GraphOrchestrator.h"
 #include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/Qwen2Schema.h"
 #include "loaders/ModelContext.h"
 #include "loaders/WeightManager.h"
 #include "utils/MPIContext.h"
@@ -168,6 +169,10 @@ protected:
         {
             GTEST_SKIP() << "Could not load model: " << model_path_;
         }
+
+        // Configure weight sharding from Qwen2 schema
+        Qwen2SchemaFactory schema_factory;
+        model_ctx_->weightManager()->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
         // Validate model dimensions match expected
         const auto &model = model_ctx_->loader().getModel();
