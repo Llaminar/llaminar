@@ -21,6 +21,8 @@
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoTiled.h"
 #include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
+#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "tensors/SIMDHelpers.h"
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
 #include "utils/CPUFeatures.h"
@@ -115,22 +117,41 @@ namespace llaminar2
             }
 
             // Determine Wo weight type
+            // For quantized weights that implement IINT8Unpackable, we use the packed VNNI format
+            // via KernelFactory::ensurePackedWeightsInTensorCache()
             llaminar::v2::kernels::microkernels::WoWeightType wo_type;
             const void *wo_data = nullptr;
 
-            if (auto *wo_q8 = dynamic_cast<Q8_1Tensor *>(Wo))
+            // First, check if Wo implements IINT8Unpackable (all quantized formats like Q4_0, IQ4_NL, Q8_1, etc.)
+            if (auto *wo_unpackable = dynamic_cast<IINT8Unpackable *>(Wo))
             {
-                // For the JIT backend we always assume / require the packed VNNI path.
-                // Reference/Tiled backends require raw Q8_1 blocks.
+                // All quantized weight formats use the same packed VNNI path
+                // ensurePackedWeightsInTensorCache handles the conversion from any IINT8Unpackable format
                 if (config_.backend == FusedAttentionBackend::JIT)
                 {
                     wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1_VNNI_PACKED;
-                    wo_data = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(wo_q8);
+                    LOG_DEBUG("FusedAttentionWoKernel: Calling ensurePackedWeightsInTensorCache for "
+                              << Wo->dtype_name() << " Wo tensor=" << (void *)Wo);
+                    wo_data = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(Wo);
+                    LOG_DEBUG("FusedAttentionWoKernel: Got packed weights ptr=" << wo_data);
+                    LOG_TRACE("FusedAttentionWoKernel: Using packed VNNI weights from "
+                              << Wo->dtype_name() << " tensor");
                 }
                 else
                 {
-                    wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1;
-                    wo_data = wo_q8->q8_1_blocks();
+                    // For Reference/Tiled backends, we need raw Q8_1 blocks
+                    // If the tensor is already Q8_1, use it directly
+                    if (auto *wo_q8 = dynamic_cast<Q8_1Tensor *>(Wo))
+                    {
+                        wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1;
+                        wo_data = wo_q8->q8_1_blocks();
+                    }
+                    else
+                    {
+                        // Other quantized formats not yet supported in Reference/Tiled mode
+                        LOG_ERROR("FusedAttentionWoKernel: Non-Q8_1 quantized weights require JIT backend");
+                        return false;
+                    }
                 }
             }
             else if (auto *wo_fp32 = dynamic_cast<FP32Tensor *>(Wo))
@@ -248,6 +269,18 @@ namespace llaminar2
         mutable std::mutex jit_slots_mutex_;
         mutable std::array<JitKernelSlots, 5> jit_slots_{}; // indexed by static_cast<int>(WoFormat)
 
+        static void quantize_row_q8_1_helper(const float *x, void *y, int k)
+        {
+            int num_blocks = (k + 31) / 32;
+            Q8_1Block *blocks = static_cast<Q8_1Block *>(y);
+
+            for (int i = 0; i < num_blocks; ++i)
+            {
+                int valid = std::min(32, k - i * 32);
+                llaminar2::simd::quantize_single_block(x + i * 32, blocks[i], valid);
+            }
+        }
+
         /**
          * @brief Execute using JIT kernel
          */
@@ -316,6 +349,7 @@ namespace llaminar2
             jit_config.head_dim = params.head_dim;
             jit_config.num_heads = params.num_heads;
             jit_config.num_kv_heads = params.num_kv_heads;
+            jit_config.d_model = params.d_model; // For tensor parallelism: full model dim
             jit_config.wo_format = wo_format;
             jit_config.batch_size = params.batch_size;
             jit_config.causal = params.causal;
@@ -327,54 +361,52 @@ namespace llaminar2
                                   ? llaminar::v2::kernels::jit::AttentionMode::DECODE
                                   : llaminar::v2::kernels::jit::AttentionMode::PREFILL;
 
-            // Work-size bucketing: compile two decode kernels (SMALL vs LARGE) and swap.
+            // Work-size bucketing: compile decode kernels for SMALL/LARGE/XL and swap.
             // Prefill currently uses a single generic bucket.
             if (jit_config.mode == llaminar::v2::kernels::jit::AttentionMode::DECODE)
             {
-                // Thresholds tuned from microbench sweeps (Dec 2024):
-                //   kv=512:  LARGE/t8 wins
-                //   kv=2048: SMALL/t8 wins
-                //   kv=4096: LARGE/t4 wins
-                //   kv=8192: SMALL/t4 wins (slight edge)
-                // Pattern: alternates LARGE→SMALL→LARGE→SMALL as KV grows.
-                // Simplified: short contexts (≤1024) use LARGE; mid (1024-4096) use SMALL
-                // except 4096 which prefers LARGE; long (>4096) use SMALL again.
-                if (params.kv_seq_len > 8192)
+                // ═══════════════════════════════════════════════════════════════════
+                // CACHE-AWARE WORK SIZE SELECTION
+                // ═══════════════════════════════════════════════════════════════════
+                // Use detected cache sizes to determine optimal WorkSizeClass and
+                // FA2 tile width, replacing hardcoded kv_seq_len thresholds.
+                //
+                // This makes the kernel more portable across different CPUs:
+                //   - Desktop (Intel/AMD): L2=256KB-2MB, L3=8-96MB
+                //   - Server (Xeon/EPYC): L2=1-2MB, L3=32-384MB
+                //   - Laptop (efficiency cores): L2=1.25-2MB, L3=shared
+                //
+                // The AttentionCacheConfig utility computes:
+                //   - work_size: SMALL/LARGE/XL based on KV footprint vs L2/L3
+                //   - prefer_kv8_tile(): KV8 if per-head KV fits in L2
+                //   - prefetch_config(): prefetch distance and target cache level
+                // ═══════════════════════════════════════════════════════════════════
+                AttentionCacheConfig cache_cfg(params.head_dim, params.num_kv_heads, params.kv_seq_len);
+
+                // Map AttentionWorkSize → JIT WorkSizeClass
+                auto derived_work_size = cache_cfg.work_size();
+                switch (derived_work_size)
                 {
+                case AttentionWorkSize::SMALL:
+                    jit_config.work_size = WorkSizeClass::SMALL;
+                    break;
+                case AttentionWorkSize::LARGE:
+                    jit_config.work_size = WorkSizeClass::LARGE;
+                    break;
+                case AttentionWorkSize::XL:
                     jit_config.work_size = WorkSizeClass::XL;
-                }
-                else if (params.kv_seq_len > 4096)
-                {
-                    // kv 4097-8192: SMALL wins at 8192
-                    jit_config.work_size = WorkSizeClass::SMALL;
-                }
-                else if (params.kv_seq_len > 2048)
-                {
-                    // kv 2049-4096: LARGE wins at 4096
-                    jit_config.work_size = WorkSizeClass::LARGE;
-                }
-                else if (params.kv_seq_len > 1024)
-                {
-                    // kv 1025-2048: SMALL wins at 2048
-                    jit_config.work_size = WorkSizeClass::SMALL;
-                }
-                else
-                {
-                    // kv <= 1024 (incl 512): LARGE wins
-                    jit_config.work_size = WorkSizeClass::LARGE;
+                    break;
                 }
 
-                // Decode-only lever: KV8 helps up to ~4k KV; KV4 wins at 8k+.
-                // Sweep results (Dec 2024):
-                //   kv=512:  t8 wins
-                //   kv=2048: t8 wins
-                //   kv=4096: t8 wins
-                //   kv=8192: t4 wins
-                // Use t8 for kv <= 4096, t4 for kv > 4096.
-                jit_config.fa2_tile_width =
-                    (params.kv_seq_len <= 4096)
-                        ? JitAttentionConfig::Fa2TileWidth::KV8
-                        : JitAttentionConfig::Fa2TileWidth::KV4;
+                // FA2 tile width: KV8 for L2-resident KV, KV4 for streaming
+                jit_config.fa2_tile_width = cache_cfg.prefer_kv8_tile()
+                                                ? JitAttentionConfig::Fa2TileWidth::KV8
+                                                : JitAttentionConfig::Fa2TileWidth::KV4;
+
+                // Store prefetch config for JIT code generation
+                auto pf_cfg = cache_cfg.prefetch_config();
+                jit_config.prefetch_distance = pf_cfg.distance;
+                jit_config.prefetch_level = pf_cfg.cache_level;
             }
             else
             {
@@ -403,11 +435,25 @@ namespace llaminar2
                 }
             }
 
+            const void *wo_ptr = params.Wo;
+            llaminar::v2::kernels::jit::JitPackedWoParams packed_params;
+
+            if (wo_format == WoFormat::Q8_1_VNNI_PACKED)
+            {
+                const auto *packed = static_cast<const llaminar2::gemm_v4::QuantisedPackedWeights *>(params.Wo);
+                packed_params.packed_data = packed->packed_data.data();
+                packed_params.compensation = packed->compensation.data();
+                packed_params.scales = packed->scales.data();
+                packed_params.mins = packed->has_mins ? packed->mins.data() : nullptr;
+                packed_params.quantize_func = &quantize_row_q8_1_helper;
+                wo_ptr = &packed_params;
+            }
+
             (*slot_ptr)->compute(
                 params.Q,
                 params.K,
                 params.V,
-                params.Wo,
+                wo_ptr,
                 params.output,
                 params.seq_len,
                 params.kv_seq_len,

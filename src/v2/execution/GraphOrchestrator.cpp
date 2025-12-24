@@ -770,7 +770,14 @@ namespace llaminar2
         // Create tensor factory
         TensorFactory factory(*local_mpi_ctx);
 
-        // Allocate core buffers
+        // Get activation precision from config
+        ActivationPrecision act_prec = config.activation_precision;
+        const char *prec_name = (act_prec == ActivationPrecision::Q8_1) ? "Q8_1" : (act_prec == ActivationPrecision::FP16) ? "FP16"
+                                                                               : (act_prec == ActivationPrecision::BF16)   ? "BF16"
+                                                                                                                           : "FP32";
+        LOG_INFO("[GraphOrchestrator] Activation buffer precision: " << prec_name);
+
+        // Allocate core buffers (always FP32 - interface with embeddings/softmax)
         state_.hidden = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
@@ -788,7 +795,7 @@ namespace llaminar2
                       << batch_size * max_seq_len << ", " << config.vocab_local << "]");
         }
 
-        // Allocate activation buffers
+        // Allocate norm/residual buffers (always FP32 - high precision needed for residual stream)
         state_.normalized = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
@@ -796,32 +803,37 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
 
-        // QKV buffers - use local head counts for tensor parallelism
-        state_.Q = factory.createFP32(
+        // QKV buffers - use configured activation precision
+        // These are the primary activation tensors that benefit from quantization
+        state_.Q = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            device_idx);
-        state_.K = factory.createFP32(
+            act_prec, device_idx);
+        state_.K = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            device_idx);
-        state_.V = factory.createFP32(
+            act_prec, device_idx);
+        state_.V = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            device_idx);
-        state_.attn_output = factory.createFP32(
+            act_prec, device_idx);
+        state_.attn_output = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            device_idx);
+            act_prec, device_idx);
+        // attn_proj is the output of Wo projection which feeds into the residual stream
+        // Keep as FP32 for numerical stability in residual connections
         state_.attn_proj = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
 
-        // FFN buffers - use local d_ff for tensor parallelism
-        state_.gate = factory.createFP32(
+        // FFN buffers - gate and up use configured activation precision
+        state_.gate = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            device_idx);
-        state_.up = factory.createFP32(
+            act_prec, device_idx);
+        state_.up = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            device_idx);
+            act_prec, device_idx);
+        // ffn_output is the output of FFN Down projection which feeds into the residual stream
+        // Keep as FP32 for numerical stability in residual connections
         state_.ffn_output = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
 
         // Attention workspace - use local head counts for tensor parallelism
@@ -840,6 +852,7 @@ namespace llaminar2
 
         // Create KV cache - use sharded cache for tensor parallelism
         // Check if tensor parallelism is enabled (indicated by local_n_kv_heads set)
+        // KV cache uses the same activation precision as other buffers
         bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
         if (use_sharded_cache && mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
@@ -849,10 +862,11 @@ namespace llaminar2
 
             LOG_DEBUG("[GraphOrchestrator] Creating sharded KV cache: "
                       << n_kv_heads << " total KV heads, "
-                      << config.local_n_kv_heads << " local KV heads (start=" << kv_head_start << ")");
+                      << config.local_n_kv_heads << " local KV heads (start=" << kv_head_start << ")"
+                      << " precision=" << prec_name);
 
             state_.kv_cache = createShardedKVCache(
-                ActivationPrecision::FP32,
+                act_prec,
                 *local_mpi_ctx,
                 n_layers,
                 batch_size,
@@ -867,7 +881,7 @@ namespace llaminar2
         {
             // Non-sharded (replicated) KV cache for single-rank or non-tensor-parallel
             state_.kv_cache = createUnifiedKVCache(
-                ActivationPrecision::FP32,
+                act_prec,
                 *local_mpi_ctx,
                 n_layers,
                 batch_size,

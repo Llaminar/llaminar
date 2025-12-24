@@ -111,6 +111,14 @@ namespace llaminar2
         graph_config.rope_theta = model.rope_theta;
         graph_config.rms_norm_eps = model.rms_norm_eps;
 
+        // Propagate activation precision from runtime config
+        // This determines buffer types (FP32/Q8_1) and kernel selection
+        graph_config.activation_precision = config.activation_precision;
+        LOG_DEBUG("[InferenceRunner] Activation precision: "
+                  << (config.activation_precision == ActivationPrecision::Q8_1 ? "Q8_1" : config.activation_precision == ActivationPrecision::FP16 ? "FP16"
+                                                                                      : config.activation_precision == ActivationPrecision::BF16   ? "BF16"
+                                                                                                                                                   : "FP32"));
+
         // Try to get d_ff from metadata (intermediate_size)
         if (model.hasMetadata("llama.feed_forward_length"))
         {

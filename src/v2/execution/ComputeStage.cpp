@@ -13,6 +13,7 @@
 #include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "../kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // For FusedAttentionWoStage
 #include "../tensors/UnifiedKVCache.h"
 #include "../tensors/SIMDHelpers.h"
 #include "../tensors/Tensors.h" // For TensorBase::rows(), cols(), dtype_name()
@@ -71,6 +72,8 @@ namespace llaminar2
             return "ATTENTION_SOFTMAX";
         case ComputeStageType::ATTENTION_V:
             return "ATTENTION_V";
+        case ComputeStageType::FUSED_ATTENTION_WO:
+            return "FUSED_ATTENTION_WO";
         case ComputeStageType::ADD_RESIDUAL:
             return "ADD_RESIDUAL";
         case ComputeStageType::SCALE:
@@ -627,9 +630,9 @@ namespace llaminar2
             if (input_data)
             {
                 LOG_TRACE("[GEMMStage] Wo input[0:8]=" << std::setprecision(10)
-                                                      << input_data[0] << "," << input_data[1] << "," << input_data[2] << "," << input_data[3] << ","
-                                                      << input_data[4] << "," << input_data[5] << "," << input_data[6] << "," << input_data[7]
-                                                      << " weight_k=" << params_.B->shape()[1]);
+                                                       << input_data[0] << "," << input_data[1] << "," << input_data[2] << "," << input_data[3] << ","
+                                                       << input_data[4] << "," << input_data[5] << "," << input_data[6] << "," << input_data[7]
+                                                       << " weight_k=" << params_.B->shape()[1]);
             }
         }
 
@@ -1016,9 +1019,9 @@ namespace llaminar2
 
         // DEBUG: Log input pointer and first values for parity testing
         LOG_TRACE("[FusedQKVGEMMStage] input_fp32 ptr=" << static_cast<const void *>(input_fp32)
-                                                       << " input[0:4]=" << std::setprecision(10)
-                                                       << input_fp32[0] << "," << input_fp32[1] << ","
-                                                       << input_fp32[2] << "," << input_fp32[3]);
+                                                        << " input[0:4]=" << std::setprecision(10)
+                                                        << input_fp32[0] << "," << input_fp32[1] << ","
+                                                        << input_fp32[2] << "," << input_fp32[3]);
 
         LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
                                                     << " output_type=" << params_.output_q->dtype_name());
@@ -1057,9 +1060,9 @@ namespace llaminar2
 
         // Debug: Log Q output for comparison
         LOG_TRACE("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
-                                                      << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
-                                                      << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
-                                                      << " n_q=" << params_.n_q);
+                                                       << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
+                                                       << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
+                                                       << " n_q=" << params_.n_q);
 
         LOG_DEBUG("[FusedQKVGEMMStage] Complete");
         return true;
@@ -3907,6 +3910,211 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // FusedAttentionWoStage Implementation
+    // =============================================================================
+
+    FusedAttentionWoStage::FusedAttentionWoStage(Params params)
+        : params_(std::move(params))
+    {
+        // Create the kernel with configuration
+        FusedAttentionWoKernel::Config kernel_config;
+        kernel_config.num_heads = params_.n_heads;
+        kernel_config.num_kv_heads = params_.n_kv_heads;
+        kernel_config.head_dim = params_.head_dim;
+        kernel_config.d_model = params_.d_model;
+        kernel_config.backend = params_.backend;
+
+        kernel_ = std::make_unique<FusedAttentionWoKernel>(kernel_config);
+    }
+
+    bool FusedAttentionWoStage::execute(IDeviceContext *ctx)
+    {
+        // Dynamic kv_len: query from KV cache at execution time if available
+        int effective_kv_len = params_.kv_len;
+        if (params_.kv_cache && params_.layer_idx >= 0)
+        {
+            effective_kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+            if (effective_kv_len == 0)
+            {
+                effective_kv_len = params_.seq_len; // Prefill case
+            }
+            LOG_TRACE("[FusedAttentionWoStage] Dynamic kv_len from cache: " << effective_kv_len
+                                                                            << " (static was: " << params_.kv_len << ")");
+        }
+
+        LOG_DEBUG("[FusedAttentionWoStage] Execute: batch=" << params_.batch_size
+                                                            << " seq_len=" << params_.seq_len
+                                                            << " kv_len=" << effective_kv_len
+                                                            << " n_heads=" << params_.n_heads
+                                                            << " n_kv_heads=" << params_.n_kv_heads
+                                                            << " head_dim=" << params_.head_dim
+                                                            << " d_model=" << params_.d_model
+                                                            << " position_offset=" << params_.position_offset
+                                                            << " backend=" << fusedAttentionBackendToString(params_.backend));
+
+        // Validate inputs
+        if (!params_.Q || !params_.K || !params_.V || !params_.Wo || !params_.output)
+        {
+            LOG_ERROR("[FusedAttentionWoStage] Null tensor pointers");
+            return false;
+        }
+
+        if (params_.seq_len <= 0 || effective_kv_len <= 0 ||
+            params_.n_heads <= 0 || params_.n_kv_heads <= 0 ||
+            params_.head_dim <= 0 || params_.d_model <= 0)
+        {
+            LOG_ERROR("[FusedAttentionWoStage] Invalid dimensions");
+            return false;
+        }
+
+        if (params_.n_heads % params_.n_kv_heads != 0)
+        {
+            LOG_ERROR("[FusedAttentionWoStage] n_heads (" << params_.n_heads
+                                                          << ") must be divisible by n_kv_heads (" << params_.n_kv_heads << ")");
+            return false;
+        }
+
+        // Compute position offset for decode mode
+        int position_offset = params_.position_offset;
+        if (position_offset == 0 && params_.seq_len < effective_kv_len)
+        {
+            // Auto-compute for decode mode: query is at end of cached context
+            position_offset = effective_kv_len - params_.seq_len;
+        }
+
+        // Dispatch to fused kernel
+        bool success = kernel_->compute(
+            params_.Q,
+            params_.K,
+            params_.V,
+            params_.Wo,
+            params_.output,
+            params_.seq_len,
+            effective_kv_len,
+            params_.causal,
+            position_offset);
+
+        if (!success)
+        {
+            LOG_ERROR("[FusedAttentionWoStage] Kernel compute() failed");
+            return false;
+        }
+
+        LOG_DEBUG("[FusedAttentionWoStage] Execute complete");
+        return true;
+    }
+
+    size_t FusedAttentionWoStage::estimatedFlops() const
+    {
+        // Attention FLOPs + Wo projection FLOPs
+        // Attention: 2 * batch * n_heads * seq_len * kv_len * head_dim (QK^T)
+        //          + 4 * batch * n_heads * seq_len * kv_len (softmax)
+        //          + 2 * batch * n_heads * seq_len * kv_len * head_dim (scores @ V)
+        // Wo: 2 * batch * seq_len * d_model * (n_heads * head_dim)
+        const size_t qk_flops = 2ULL * params_.batch_size * params_.n_heads *
+                                params_.seq_len * params_.kv_len * params_.head_dim;
+        const size_t softmax_flops = 4ULL * params_.batch_size * params_.n_heads *
+                                     params_.seq_len * params_.kv_len;
+        const size_t sv_flops = qk_flops;
+        const size_t wo_flops = 2ULL * params_.batch_size * params_.seq_len *
+                                params_.d_model * (params_.n_heads * params_.head_dim);
+        return qk_flops + softmax_flops + sv_flops + wo_flops;
+    }
+
+    size_t FusedAttentionWoStage::estimatedMemoryBytes() const
+    {
+        // Fused kernel eliminates attention context intermediate
+        // Main memory: Q, K, V, Wo weights, output
+        // Scratch: internal scores/state (managed by kernel)
+        return static_cast<size_t>(params_.n_heads) * params_.seq_len * params_.kv_len * sizeof(float);
+    }
+
+    bool FusedAttentionWoStage::supportsBackend(ComputeBackendType backend) const
+    {
+        // Currently CPU-only (JIT backend uses AVX-512 VNNI)
+        return backend == ComputeBackendType::CPU;
+    }
+
+    StageDumpInfo FusedAttentionWoStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Output: fused attention+Wo projection result
+        if (params_.output)
+        {
+            const float *out_data = getSafeFp32Data(params_.output);
+            if (out_data)
+            {
+                info.addOutput("output",
+                               out_data,
+                               params_.seq_len,
+                               params_.d_model);
+            }
+        }
+
+        info.addScalarInt("batch_size", params_.batch_size);
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("kv_len", params_.kv_len);
+        info.addScalarInt("n_heads", params_.n_heads);
+        info.addScalarInt("n_kv_heads", params_.n_kv_heads);
+        info.addScalarInt("head_dim", params_.head_dim);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarBool("causal", params_.causal);
+        info.addScalarInt("backend", static_cast<int>(params_.backend));
+        info.addScalarInt("device_idx", params_.device_idx);
+
+        return info;
+    }
+
+    StageBufferRequirements FusedAttentionWoStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Input: Q, K, V (Q8_1)
+        if (params_.Q)
+        {
+            const size_t q_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t q_cols = static_cast<size_t>(params_.n_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.Q->native_type());
+            reqs.addInput("Q", {q_rows, q_cols}, buf_type);
+        }
+
+        if (params_.K)
+        {
+            const size_t k_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
+            const size_t k_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.K->native_type());
+            reqs.addInput("K", {k_rows, k_cols}, buf_type);
+        }
+
+        if (params_.V)
+        {
+            const size_t v_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
+            const size_t v_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            BufferTensorType buf_type = toBufferTensorType(params_.V->native_type());
+            reqs.addInput("V", {v_rows, v_cols}, buf_type);
+        }
+
+        // Input: Wo weight
+        if (params_.Wo)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.Wo->native_type());
+            reqs.addInput("Wo", params_.Wo->shape(), buf_type);
+        }
+
+        // Output: projected attention (FP32)
+        if (params_.output)
+        {
+            const size_t out_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
+            const size_t out_cols = static_cast<size_t>(params_.d_model);
+            BufferTensorType buf_type = toBufferTensorType(params_.output->native_type());
+            reqs.addOutput("output", {out_rows, out_cols}, buf_type);
+        }
+
+        return reqs;
+    }
+
+    // =============================================================================
     // EmbeddingStage Implementation
     // =============================================================================
 
@@ -4442,6 +4650,13 @@ namespace llaminar2
     {
         // Unified: AttentionComputeStage uses KernelFactory at execute-time
         return std::make_unique<AttentionComputeStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedAttentionWo(
+        const FusedAttentionWoStage::Params &params)
+    {
+        // Fused attention + Wo projection using JIT kernel
+        return std::make_unique<FusedAttentionWoStage>(params);
     }
 
     // =============================================================================

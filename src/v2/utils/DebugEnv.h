@@ -398,6 +398,11 @@ namespace llaminar2
         // and Wo projection is executed via gemm_v4 (AVX-512 VNNI) with on-the-fly activation quantization.
         bool wo_vnni_packed = false;
 
+        // Fused Attention + Wo (JIT backend only)
+        // When enabled, attention output is directly projected by Wo without intermediate memory write.
+        // Requires JIT backend and Q8_1 quantization.
+        bool fused_wo = true;
+
         AttentionConfig()
         {
             reload();
@@ -415,6 +420,12 @@ namespace llaminar2
             if (wo_vnni_env)
             {
                 wo_vnni_packed = (std::atoi(wo_vnni_env) != 0);
+            }
+
+            const char *fused_wo_env = std::getenv("LLAMINAR_FUSED_ATTENTION_WO");
+            if (fused_wo_env)
+            {
+                fused_wo = (std::atoi(fused_wo_env) != 0);
             }
         }
     };

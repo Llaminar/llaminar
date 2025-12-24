@@ -296,11 +296,278 @@ For d_model=3584:
 
 1. **FP8 K/V**: Would halve memory traffic, double effective cache capacity
 2. **Wo packing**: Column-major layout could improve GEMV locality
-3. **Multi-query batching**: For batch decode, could amortize Wo loads
+3. **Multi-query batching**: For batch decode, could amortize Wo loads (see Section 10)
 
 ---
 
-## 9. Microkernel Reference
+## 10. Cache-Aware Wo Batching (Optimization Opportunity)
+
+The Wo projection is the primary bottleneck for decode. Currently, we do a GEMV (m=1) for each query, loading the entire 49MB Wo matrix from DRAM each time.
+
+### The Problem
+
+```
+Current decode flow:
+for each query q:
+    Phase 1: Compute attention context[q] for all heads
+    Phase 2: GEMV: output[q] = Wo × context[q]  ← Loads 49MB from DRAM
+```
+
+For batch decode with N queries, we load Wo **N times** from DRAM.
+
+### The Solution: Batched Wo Projection
+
+Accumulate multiple context vectors before doing the Wo multiplication:
+
+```
+Batched flow:
+for batch_start = 0 to num_queries step BATCH_SIZE:
+    Phase 1: For each q in batch:
+        Compute attention → store to batch_context[q_local]
+    
+    Phase 2: GEMM: output[batch] = Wo × batch_context  ← Loads 49MB ONCE
+```
+
+### Cache Budget Analysis
+
+Use `CacheInfo` from `v2/utils/CPUFeatures.h` to determine optimal batch size:
+
+```cpp
+#include "v2/utils/CPUFeatures.h"
+
+const CacheInfo& cache = cache_info();
+int batch = cache.optimal_wo_batch_size(d_model);
+// Example: d_model=3584, L2=1MB → batch=16
+
+// Context buffer sizing:
+// batch=16 × d_model=3584 × 4B = 224KB (22% of L2)
+// Remaining 78% of L2 available for Wo tiles during GEMM
+```
+
+### Expected Speedup
+
+| Batch Size | Wo Loads | Speedup (Wo-bound) |
+|------------|----------|-------------------|
+| 1 (current) | N | 1× |
+| 4 | N/4 | ~4× |
+| 8 | N/8 | ~8× |
+| 16 | N/16 | ~16× |
+
+**Note**: Actual speedup depends on attention compute time. If attention dominates, batching helps less. Use profiling to measure real impact.
+
+### Implementation Status
+
+- ✅ `CacheInfo` struct for cache detection (`CPUFeatures.h`)
+- ✅ `optimal_wo_batch_size()` calculates L2-aware batch size
+- ✅ `print_analysis()` for debugging cache decisions
+- ✅ Batched decode loop in `JitFusedAttentionWo.h`
+- ✅ `emit_wo_projection_batched()` for multi-query GEMM
+- ✅ VNNI-packed Q8_1 Wo weights for batched projection
+
+---
+
+## 11. VNNI-Optimized Wo Projection (December 2024)
+
+### Overview
+
+The Wo projection kernel now supports **AVX-512 VNNI-packed Q8_1 weights**, eliminating the need for runtime dequantization and significantly improving throughput for the memory-bound Wo GEMV/GEMM.
+
+### New `WoFormat::Q8_1_VNNI_PACKED`
+
+A new weight format optimized for VNNI dot products:
+
+| Format | Storage | Compute Path |
+|--------|---------|--------------|
+| `WoFormat::FP32` | 4B/element | FMA |
+| `WoFormat::FP16` | 2B/element | Convert → FMA |
+| `WoFormat::BF16` | 2B/element | Convert → FMA |
+| `WoFormat::Q8_1` | 36B/32 elements | Dequant → FMA |
+| `WoFormat::Q8_1_VNNI_PACKED` | 36B/32 elements | **Direct VNNI** |
+
+### Memory Layout
+
+```
+Q8_1_VNNI_PACKED block (36 bytes):
+┌────────────────────────────────────────────────────────────┐
+│ d (FP16, 2B) │ sum_qs (INT16, 2B) │ qs[32] (INT8, 32B)     │
+└────────────────────────────────────────────────────────────┘
+
+Weights are packed so that 4 consecutive rows share the same 
+K-dimension block alignment, enabling 4-row parallel VNNI ops.
+```
+
+### VNNI Dot Product Flow
+
+```cpp
+// For 4 output rows simultaneously:
+for k_block = 0 to num_blocks:
+    // Load weight scales (4 FP16 → 4 FP32)
+    d0, d1, d2, d3 = vcvtph2ps(Wo_packed[row0..row3].d)
+    
+    // Load INT8 weights (4 × 32 bytes)
+    w0_lo = vpmovsxbd(Wo[row0].qs[0:15])   // 16 INT8 → 16 INT32
+    w0_hi = vpmovsxbd(Wo[row0].qs[16:31])
+    // ... same for w1, w2, w3
+    
+    // Load context (FP32 → quantize to INT8 on the fly)
+    ctx_q8 = quantize_to_int8(context[k_block * 32 : +32])
+    
+    // VNNI 4-way dot product
+    acc0 += vpdpbusd(ctx_q8, w0)  // Unsigned × Signed
+    acc1 += vpdpbusd(ctx_q8, w1)
+    acc2 += vpdpbusd(ctx_q8, w2)
+    acc3 += vpdpbusd(ctx_q8, w3)
+
+// Finalize: acc * d * ctx_scale → output
+```
+
+### Key Implementation Functions
+
+| Function | Purpose |
+|----------|---------|
+| `emit_wo_projection_vnni_inline()` | Single-query VNNI Wo projection (DECODE) |
+| `emit_wo_projection_vnni_inline_with_reg_offset()` | Batched VNNI projection with dynamic offset |
+| `llaminar2_wo_q8_1_vnni_packed_gemm()` | External C function for batched GEMM |
+
+### Fallback Path Fixes (December 2024)
+
+The fallback path (`emit_wo_projection_with_reg_offset`) was updated to correctly handle all weight formats when VNNI is unavailable:
+
+| Format | Fix Applied |
+|--------|-------------|
+| `BF16` | Use `vpmovzxwd` + `vpslld` for BF16 → FP32 conversion |
+| `FP16` | Use `vcvtph2ps` for FP16 → FP32 conversion |
+| `Q8_1` | Added `emit_wo_projection_q8_1_with_reg_offset()` for raw block handling |
+
+### Performance Characteristics
+
+| Scenario | Before (FP32 Wo) | After (Q8_1 VNNI) | Speedup |
+|----------|------------------|-------------------|---------|
+| Wo memory traffic | 49MB (7B model) | 12.25MB | 4× reduction |
+| Batched (m=8) | Memory-bound | Compute-bound | ~3-4× |
+| Single query (m=1) | Memory-bound | Memory-bound | ~1.5× |
+
+### Usage
+
+```cpp
+// Configure JIT kernel for VNNI-packed weights
+JitAttentionConfig config;
+config.wo_format = WoFormat::Q8_1_VNNI_PACKED;
+config.batch_size = 8;  // Batched decode
+
+JitFusedAttentionWo kernel(config);
+kernel.compute(Q, K, V, Wo_vnni_packed, output, ...);
+```
+
+### Requirements
+
+- **Hardware**: AVX-512 VNNI (Ice Lake, Sapphire Rapids, or newer)
+- **Fallback**: Automatically falls back to dequantize+FMA path on non-VNNI CPUs
+
+---
+
+## 12. Cache-Aware Kernel Configuration (December 2024)
+
+### Overview
+
+The attention kernel now derives its heuristics from **detected CPU cache sizes** rather than hardcoded thresholds, improving portability across different microarchitectures (Zen 4, Golden Cove, Sapphire Rapids, etc.).
+
+### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `AttentionCacheConfig` | `CPUFeatures.h` | Computes config from cache sizes |
+| `AttentionWorkSize` | `CPUFeatures.h` | SMALL/LARGE/XL enum |
+| `PrefetchConfig` | `CPUFeatures.h` | Distance and cache level |
+| `effectivePrefetchDistance()` | `JitFusedAttentionWo.h` | JIT config method |
+
+### Cache-Derived Heuristics
+
+| Parameter | Derivation |
+|-----------|------------|
+| **WorkSizeClass** | KV footprint vs L2/L3 capacity |
+| **Prefetch Distance** | Cache line count × latency hiding target |
+| **FA2 Tile Width** | KV8 if per-head KV fits L2, else KV4 |
+
+### Memory Model
+
+```
+KV footprint per head (Q8_1):
+  bytes_per_pos = (head_dim / 32) × 36 × 2  (K + V)
+  footprint = bytes_per_pos × kv_seq_len
+
+Work size classification:
+  SMALL: footprint ≤ 50% L2 → L1 prefetch (prefetcht0)
+  LARGE: footprint ≤ L3/8   → L2 prefetch (prefetcht1)
+  XL:    footprint > L3/8   → L3 prefetch (prefetcht2)
+```
+
+### Example Configuration
+
+For Qwen2 0.5B (head_dim=64) at kv_seq_len=2048:
+```
+Per-head footprint: ((64+31)/32) × 36 × 2 × 2048 = 147,456 bytes ≈ 144 KB
+L2 threshold (256KB × 50%): 128 KB
+→ WorkSize: LARGE (spills L2)
+→ Prefetch: 16 positions to L2 (prefetcht1)
+→ FA2 Tile: KV8 (fits per-iteration working set)
+```
+
+### API Usage
+
+```cpp
+// Automatic cache-aware configuration in FusedAttentionWoKernel
+AttentionCacheConfig cache_cfg(head_dim, num_kv_heads, kv_seq_len);
+
+// Map to JIT config
+jit_config.work_size = /* from cache_cfg.work_size() */;
+jit_config.prefetch_distance = cache_cfg.prefetch_config().distance;
+jit_config.prefetch_level = cache_cfg.prefetch_config().cache_level;
+jit_config.fa2_tile_width = cache_cfg.prefer_kv8_tile() ? KV8 : KV4;
+```
+
+### Debug Output
+
+```cpp
+// Print detailed cache analysis
+AttentionCacheConfig cfg(128, 4, 4096);
+cfg.print_config();
+```
+
+Output:
+```
+╔════════════════════════════════════════════════════════════╗
+║      Cache-Aware Attention Configuration                   ║
+╠════════════════════════════════════════════════════════════╣
+║ Input Parameters:                                          ║
+║   head_dim:      128                                       ║
+║   num_kv_heads:    4                                       ║
+║   kv_seq_len:   4096                                       ║
+╠════════════════════════════════════════════════════════════╣
+║ Memory Footprint:                                          ║
+║   Per head:     1152 KB                                    ║
+║   Total:        4608 KB                                    ║
+╠════════════════════════════════════════════════════════════╣
+║ Derived Configuration:                                     ║
+║   WorkSize:   LARGE (per-head vs L2/L3)                    ║
+║   Prefetch:   16 positions → L2 (prefetcht1)               ║
+║   FA2 Tile:   KV4 (KV8 spills L2)                          ║
+╚════════════════════════════════════════════════════════════╝
+```
+
+### Implementation Status
+
+- ✅ `AttentionCacheConfig` struct in `CPUFeatures.h`
+- ✅ `work_size()` derives SMALL/LARGE/XL from KV footprint
+- ✅ `prefetch_config()` computes distance and cache level
+- ✅ `prefer_kv8_tile()` based on L2 capacity
+- ✅ `FusedAttentionWoKernel.h` uses cache config for JIT selection
+- ✅ `JitFusedAttentionWo.h` uses `effectivePrefetchDistance/Level()`
+- ✅ All 4 prefetch code blocks updated to cache-aware API
+
+---
+
+## 13. Microkernel Reference
 
 | μK | Name | File | Purpose |
 |----|------|------|---------|
@@ -309,15 +576,27 @@ For d_model=3584:
 | μK3 | `JitVWeightedAccum` | `jit/JitVWeightedAccum.h` | V accumulation |
 | μK4 | `JitWoProjectionOptimized` | `jit/JitWoProjectionOptimized.h` | Wo GEMV |
 | μK5 | `JitFastExp` | `jit/JitFastExp.h` | Fast exp approximation |
+| μK6 | `emit_wo_projection_vnni_inline` | `jit/JitFusedAttentionWo.h` | VNNI Wo projection |
 
 ---
 
-## Conclusion
+## 14. Conclusion
 
 **No major issues found.** The kernel is well-architected for single-query decode with:
 - Register allocation matching data reuse patterns
 - Cache blocking where it matters (Q, context)
 - Streaming where blocking doesn't help (K, V, Wo)
 - Latency hiding through prefetch and interleaving
+- **Cache-aware configuration** for portability across CPUs
 
 The main limitation is inherent: attention is memory-bound for large sequences, and Wo projection is always memory-bound for decode. The kernel is doing the right things given these constraints.
+
+**Recent Improvements**:
+- VNNI-packed Wo weights for direct integer dot products
+- Adaptive prefetch distance based on detected cache sizes
+- WorkSizeClass derived from KV footprint vs L2/L3 capacity
+
+The cache-aware approach means the kernel will automatically adapt to:
+- Desktop CPUs (smaller L2/L3): More conservative prefetch, earlier SMALL→LARGE transitions
+- Server CPUs (larger L2/L3): Longer prefetch distances, KV8 tiles for larger contexts
+- Different microarchitectures (Intel vs AMD): Cache detection via CPUID

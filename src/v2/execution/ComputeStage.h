@@ -24,7 +24,7 @@
 #include <functional>
 #include "DeviceContext.h"
 #include "BufferRole.h"                 // For buffer requirements
-#include "RuntimeConfig.h"              // For ActivationPrecision
+#include "RuntimeConfig.h"              // For ActivationPrecision, FusedAttentionBackend
 #include "../tensors/BlockStructures.h" // For Q8_1Block in StageDumpInfo
 #include "../tensors/TensorKernels.h"   // For AttentionMode enum
 #include "../utils/MPITopology.h"       // For WorkRange (tensor parallelism)
@@ -159,6 +159,7 @@ namespace llaminar2
     class IKVCache;
     class IUnifiedKVCache;
     class MPIContext;
+    class FusedAttentionWoKernel; // Forward declaration for FusedAttentionWoStage
 
     /**
      * @brief Types of compute operations
@@ -181,11 +182,12 @@ namespace llaminar2
         SILU,   ///< SiLU activation
 
         // Attention
-        ROPE,              ///< Rotary position encoding
-        ATTENTION,         ///< Full attention (Q*K^T, softmax, *V)
-        ATTENTION_QK,      ///< Q*K^T only
-        ATTENTION_SOFTMAX, ///< Softmax only
-        ATTENTION_V,       ///< Softmax @ V only
+        ROPE,               ///< Rotary position encoding
+        ATTENTION,          ///< Full attention (Q*K^T, softmax, *V)
+        ATTENTION_QK,       ///< Q*K^T only
+        ATTENTION_SOFTMAX,  ///< Softmax only
+        ATTENTION_V,        ///< Softmax @ V only
+        FUSED_ATTENTION_WO, ///< Fused attention + Wo projection (FA2 JIT)
 
         // Element-wise
         ADD_RESIDUAL, ///< Element-wise addition (residual connection)
@@ -1219,6 +1221,105 @@ namespace llaminar2
     };
 
     /**
+     * @brief Fused attention + Wo projection stage
+     *
+     * Combines attention computation and output projection (Wo) into a single
+     * kernel for improved cache locality and reduced memory traffic.
+     *
+     * Benefits over separate AttentionComputeStage + GEMMStage:
+     * - Eliminates attention context quantization round-trip (FP32 → Q8_1 → FP32)
+     * - Context stays in registers through Wo projection
+     * - Single pass over V and Wo weights
+     *
+     * Uses FusedAttentionWoKernel internally, which supports:
+     * - JIT backend: AVX-512 VNNI optimized (default, fastest)
+     * - TILED backend: Cache-blocked for correctness/fallback
+     * - REFERENCE backend: Pure C++ for testing
+     *
+     * Output goes directly to attn_proj buffer (skip attn_output intermediate).
+     *
+     * DAG usage pattern:
+     * @code
+     * // Replace: attention → attn_output → wo_proj → attn_proj
+     * // With:    fused_attention_wo → attn_proj
+     * graph.addNode("fused_attn_wo",
+     *     ComputeStageFactory::createFusedAttentionWo({
+     *         .Q = Q, .K = K, .V = V, .Wo = layer.wo,
+     *         .output = attn_proj,  // Direct to projection output
+     *         ...
+     *     }), device);
+     * @endcode
+     *
+     * @see FusedAttentionWoKernel for kernel implementation
+     * @see AttentionComputeStage for non-fused attention
+     */
+    class FusedAttentionWoStage : public IComputeStage
+    {
+    public:
+        struct Params
+        {
+            // Input tensors (Q8_1 format)
+            TensorBase *Q = nullptr; ///< Query [batch_size * seq_len, n_heads * head_dim]
+            TensorBase *K = nullptr; ///< Key [batch_size * kv_len, n_kv_heads * head_dim]
+            TensorBase *V = nullptr; ///< Value [batch_size * kv_len, n_kv_heads * head_dim]
+
+            // Weight tensor (Q8_1 VNNI-packed or FP32)
+            TensorBase *Wo = nullptr; ///< Output projection [d_model, n_heads * head_dim]
+
+            // Output tensor (FP32)
+            TensorBase *output = nullptr; ///< Output [batch_size * seq_len, d_model]
+
+            // Dimensions
+            int batch_size = 1; ///< Number of sequences
+            int seq_len = 0;    ///< Query sequence length
+            int kv_len = 0;     ///< Key/Value length (may differ in decode mode)
+            int n_heads = 0;    ///< Number of query heads
+            int n_kv_heads = 0; ///< Number of KV heads (GQA support)
+            int head_dim = 0;   ///< Dimension per head
+            int d_model = 0;    ///< Model dimension (n_heads * head_dim)
+
+            // Attention configuration
+            bool causal = true;      ///< Apply causal mask
+            int position_offset = 0; ///< Position offset for decode mode
+
+            // Backend selection (JIT, TILED, REFERENCE)
+            FusedAttentionBackend backend = FusedAttentionBackend::JIT;
+
+            // KV cache for dynamic kv_len query at execution time
+            IUnifiedKVCache *kv_cache = nullptr;
+            int layer_idx = -1;
+
+            // Optional MPI context
+            const MPIContext *mpi_ctx = nullptr;
+            int device_idx = -1;
+        };
+
+        explicit FusedAttentionWoStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override { return ComputeStageType::FUSED_ATTENTION_WO; }
+        size_t estimatedFlops() const override;
+        size_t estimatedMemoryBytes() const override;
+        bool supportsBackend(ComputeBackendType backend) const override;
+        StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
+
+        /// Update position offset for cached graph reuse
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            params_.position_offset = pos_offset;
+            (void)seq_len;
+        }
+
+        /// Get params for testing
+        const Params &getParams() const { return params_; }
+
+    private:
+        Params params_;
+        std::unique_ptr<FusedAttentionWoKernel> kernel_;
+    };
+
+    /**
      * @brief SwiGLU activation stage
      *
      * Type-safe implementation using TensorBase* instead of void*.
@@ -1715,6 +1816,23 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createAttentionCompute(
             const AttentionComputeStage::Params &params);
+
+        /**
+         * @brief Create a fused attention + Wo projection stage
+         *
+         * Combines attention computation with output projection (Wo) for:
+         * - Better cache locality (context stays in registers)
+         * - Eliminated context quantization round-trip
+         * - Reduced memory bandwidth
+         *
+         * Replaces separate AttentionComputeStage + GEMMStage (wo_proj) in the DAG.
+         * Output goes directly to attn_proj buffer.
+         *
+         * @param params Fused attention parameters including Q, K, V, Wo, output
+         * @return FusedAttentionWoStage instance
+         */
+        static std::unique_ptr<IComputeStage> createFusedAttentionWo(
+            const FusedAttentionWoStage::Params &params);
 
         // =====================================================================
         // Model-Level Stage Factories (for ModelExecutor)

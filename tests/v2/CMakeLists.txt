@@ -222,6 +222,19 @@ add_v2_test(V2_Unit_TensorBasics
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
+# Test: CacheInfo - CPU cache detection and batch size optimization
+add_executable(v2_test_cache_info unit/Test__CacheInfo.cpp)
+target_link_libraries(v2_test_cache_info 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CacheInfo 
+    COMMAND $<TARGET_FILE:v2_test_cache_info>
+    LABELS "V2;Unit;CPUFeatures;Cache;Optimization"
+    MPI_PROCS 1
+)
+
 # Test: JIT Register Allocation Framework
 # Compile-time safe register allocation for JIT code generation
 add_executable(v2_test_register_allocation unit/Test__RegisterAllocation.cpp)
@@ -3398,3 +3411,16 @@ add_v2_test(V2_Integration_PlacementStrategy_MPI
     LABELS "V2;Integration;MPI;PlacementStrategy;Determinism;CPUOnly;GPUFirst;PhaseG0"
 )
 
+
+# Test: Qwen2Graph Fused Attention Integration
+# Verifies that the graph builder correctly switches between fused and decomposed paths
+add_executable(v2_test_qwen2_graph_fused_attention integration/Test__Qwen2Graph_FusedAttention.cpp)
+target_link_libraries(v2_test_qwen2_graph_fused_attention 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Qwen2Graph_FusedAttention 
+    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_fused_attention>
+    LABELS "V2;Integration;Graph;Attention;FusedAttention"
+)

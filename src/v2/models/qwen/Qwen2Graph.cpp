@@ -794,6 +794,7 @@ namespace llaminar2
         // Stage 4: Attention computation with KV cache integration
         // NOTE: Decomposed attention (Phase 9) is now the ONLY supported path.
         // Legacy AttentionWithKVCacheStage has been removed (Phase 7 cleanup).
+        std::string wo_producer_node;
         if (env.execution.exec_attention)
         {
             // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
@@ -894,110 +895,175 @@ namespace llaminar2
                 graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
             }
 
-            AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
-            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                            << " attention mode: " << attention_mode_name(mode)
-                                            << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
+            // Determine if we can use Fused Attention + Wo
+            // Requirements:
+            // 1. fused_wo flag enabled (env.attention.fused_wo)
+            // 2. exec_attention and exec_gemm stages enabled
+            // 3. Wo weights available
+            // 4. CPU backend (JIT kernel is CPU-only)
+            // 5. Q8_1 activation precision (JIT kernel requires Q8_1 tensors)
+            bool use_fused_wo = env.attention.fused_wo &&
+                                env.execution.exec_attention &&
+                                env.execution.exec_gemm &&
+                                layer.wo &&
+                                backend == ComputeBackendType::CPU &&
+                                config_.activation_precision == ActivationPrecision::Q8_1;
 
-            AttentionComputeStage::Params attn_params;
-            attn_params.Q = buffers.Q;
-            attn_params.K = K_for_attn;
-            attn_params.V = V_for_attn;
-            attn_params.output = buffers.attn_output;
-            attn_params.batch_size = batch_size;
-            attn_params.seq_len = seq_len;
-            attn_params.kv_len = kv_len;               // Static hint, actual queried from kv_cache at runtime
-            attn_params.n_heads = local_n_heads;       // Use local head count for TP
-            attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
-            attn_params.head_dim = config_.head_dim;
-            attn_params.causal = true;
-            attn_params.window_size = -1;
-            attn_params.attention_mode = mode;
-            attn_params.auto_detect_mode = true; // Re-detect at runtime with actual kv_len
-            attn_params.workspace_scores = buffers.workspace_scores;
-            attn_params.workspace_context = buffers.workspace_context;
-            attn_params.workspace_mask = buffers.workspace_mask;
-            attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
-            attn_params.layer_idx = layer_idx;
-            attn_params.position_offset = position_ids ? position_ids[0] : 0;
-            attn_params.mpi_ctx = mpi_ctx_.get();
-            attn_params.device_idx = device_idx;
+            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " fused_wo check: env.fused_wo=" << env.attention.fused_wo
+                      << " exec_attention=" << env.execution.exec_attention
+                      << " exec_gemm=" << env.execution.exec_gemm
+                      << " has_wo=" << (layer.wo != nullptr)
+                      << " cpu_backend=" << (backend == ComputeBackendType::CPU)
+                      << " q8_1_precision=" << (config_.activation_precision == ActivationPrecision::Q8_1)
+                      << " => use_fused_wo=" << use_fused_wo);
 
-            graph.addNode(prefix + "attention",
-                          ComputeStageFactory::createAttentionCompute(attn_params),
-                          device_idx);
-
-            if (use_gather_stage)
+            if (use_fused_wo)
             {
-                // Batched decode: attention depends on gather
-                graph.addDependency(prefix + "attention", prefix + "kv_gather");
-            }
-            else if (kv_cache)
-            {
-                graph.addDependency(prefix + "attention", prefix + "kv_append");
-            }
-            else if (env.execution.exec_rope)
-            {
-                graph.addDependency(prefix + "attention", prefix + "rope");
-            }
-            else if (env.execution.exec_gemm)
-            {
-                graph.addDependency(prefix + "attention", prefix + "qkv_proj");
-            }
+                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " using FusedAttentionWoStage");
 
-            LOG_DEBUG("[Qwen2Graph] Using decomposed attention path (Phase 9)");
-        }
+                FusedAttentionWoStage::Params fused_params;
+                fused_params.Q = buffers.Q;
+                fused_params.K = K_for_attn;
+                fused_params.V = V_for_attn;
+                fused_params.Wo = layer.wo;
+                fused_params.output = buffers.attn_proj; // Direct output to projection buffer
+                fused_params.batch_size = batch_size;
+                fused_params.seq_len = seq_len;
+                fused_params.kv_len = kv_len;
+                fused_params.n_heads = local_n_heads;
+                fused_params.n_kv_heads = local_n_kv_heads;
+                fused_params.head_dim = config_.head_dim;
+                fused_params.d_model = config_.d_model;
+                fused_params.causal = true;
+                fused_params.position_offset = position_ids ? position_ids[0] : 0;
+                fused_params.backend = FusedAttentionBackend::JIT;
+                fused_params.kv_cache = kv_cache;
+                fused_params.layer_idx = layer_idx;
+                fused_params.mpi_ctx = mpi_ctx_.get();
+                fused_params.device_idx = device_idx;
 
-        // Stage 5: Output projection (Wo)
-        if (env.execution.exec_gemm && layer.wo)
-        {
-            int wo_n = static_cast<int>(layer.wo->shape()[0]);
-            int wo_k = static_cast<int>(layer.wo->shape()[1]);
-
-            LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
-                                            << " wo_k=" << wo_k
-                                            << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
-                                            << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
-
-            graph.addNode(prefix + "wo_proj",
-                          ComputeStageFactory::createGEMM(
-                              GEMMStage::Params{
-                                  .A = buffers.attn_output,
-                                  .B = layer.wo,
-                                  .C = buffers.attn_proj,
-                                  .m = total_tokens, // Use total_tokens = batch_size * seq_len
-                                  .n = wo_n,
-                                  .k = wo_k,
-                                  .alpha = 1.0f,
-                                  .beta = 0.0f,
-                                  .transpose_B = false}),
-                          device_idx);
-
-            bool wo_is_sharded = isRowParallelSharded(layer.wo);
-            bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
-
-            if (wo_is_sharded && has_multi_rank)
-            {
-                // AllReduce the actual data, not full buffer capacity
-                size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-
-                graph.addNode(prefix + "wo_allreduce",
-                              ComputeStageFactory::createAllreduce(
-                                  AllreduceStage::Params{
-                                      buffers.attn_proj,
-                                      getMPICommPtr(mpi_ctx_.get()),
-                                      allreduce_count}),
+                wo_producer_node = prefix + "fused_attn_wo";
+                graph.addNode(wo_producer_node,
+                              ComputeStageFactory::createFusedAttentionWo(fused_params),
                               device_idx);
 
-                graph.addDependency(prefix + "wo_allreduce", prefix + "wo_proj");
+                if (use_gather_stage)
+                    graph.addDependency(wo_producer_node, prefix + "kv_gather");
+                else if (kv_cache)
+                    graph.addDependency(wo_producer_node, prefix + "kv_append");
+                else if (env.execution.exec_rope)
+                    graph.addDependency(wo_producer_node, prefix + "rope");
+                else if (env.execution.exec_gemm)
+                    graph.addDependency(wo_producer_node, prefix + "qkv_proj");
+            }
+            else
+            {
+                // Standard Decomposed Path: Attention -> Wo
+                if (env.execution.exec_attention)
+                {
+                    AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                                    << " attention mode: " << attention_mode_name(mode)
+                                                    << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
 
-                LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                << " Wo: row-parallel sharded, adding allreduce");
+                    AttentionComputeStage::Params attn_params;
+                    attn_params.Q = buffers.Q;
+                    attn_params.K = K_for_attn;
+                    attn_params.V = V_for_attn;
+                    attn_params.output = buffers.attn_output;
+                    attn_params.batch_size = batch_size;
+                    attn_params.seq_len = seq_len;
+                    attn_params.kv_len = kv_len;               // Static hint, actual queried from kv_cache at runtime
+                    attn_params.n_heads = local_n_heads;       // Use local head count for TP
+                    attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
+                    attn_params.head_dim = config_.head_dim;
+                    attn_params.causal = true;
+                    attn_params.window_size = -1;
+                    attn_params.attention_mode = mode;
+                    attn_params.auto_detect_mode = true; // Re-detect at runtime with actual kv_len
+                    attn_params.workspace_scores = buffers.workspace_scores;
+                    attn_params.workspace_context = buffers.workspace_context;
+                    attn_params.workspace_mask = buffers.workspace_mask;
+                    attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
+                    attn_params.layer_idx = layer_idx;
+                    attn_params.position_offset = position_ids ? position_ids[0] : 0;
+                    attn_params.mpi_ctx = mpi_ctx_.get();
+                    attn_params.device_idx = device_idx;
+
+                    graph.addNode(prefix + "attention",
+                                  ComputeStageFactory::createAttentionCompute(attn_params),
+                                  device_idx);
+
+                    if (use_gather_stage)
+                        graph.addDependency(prefix + "attention", prefix + "kv_gather");
+                    else if (kv_cache)
+                        graph.addDependency(prefix + "attention", prefix + "kv_append");
+                    else if (env.execution.exec_rope)
+                        graph.addDependency(prefix + "attention", prefix + "rope");
+                    else if (env.execution.exec_gemm)
+                        graph.addDependency(prefix + "attention", prefix + "qkv_proj");
+
+                    LOG_DEBUG("[Qwen2Graph] Using decomposed attention path (Phase 9)");
+                }
+
+                // Stage 5: Output projection (Wo)
+                if (env.execution.exec_gemm && layer.wo)
+                {
+                    int wo_n = static_cast<int>(layer.wo->shape()[0]);
+                    int wo_k = static_cast<int>(layer.wo->shape()[1]);
+
+                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
+                                                    << " wo_k=" << wo_k
+                                                    << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
+                                                    << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
+
+                    wo_producer_node = prefix + "wo_proj";
+                    graph.addNode(wo_producer_node,
+                                  ComputeStageFactory::createGEMM(
+                                      GEMMStage::Params{
+                                          .A = buffers.attn_output,
+                                          .B = layer.wo,
+                                          .C = buffers.attn_proj,
+                                          .m = total_tokens, // Use total_tokens = batch_size * seq_len
+                                          .n = wo_n,
+                                          .k = wo_k,
+                                          .alpha = 1.0f,
+                                          .beta = 0.0f,
+                                          .transpose_B = false}),
+                                  device_idx);
+
+                    if (env.execution.exec_attention)
+                    {
+                        graph.addDependency(wo_producer_node, prefix + "attention");
+                    }
+                }
             }
 
-            if (env.execution.exec_attention)
+            // Common AllReduce for Wo
+            if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
             {
-                graph.addDependency(prefix + "wo_proj", prefix + "attention");
+                bool wo_is_sharded = isRowParallelSharded(layer.wo);
+                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
+
+                if (wo_is_sharded && has_multi_rank)
+                {
+                    // AllReduce the actual data, not full buffer capacity
+                    size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+
+                    graph.addNode(prefix + "wo_allreduce",
+                                  ComputeStageFactory::createAllreduce(
+                                      AllreduceStage::Params{
+                                          buffers.attn_proj,
+                                          getMPICommPtr(mpi_ctx_.get()),
+                                          allreduce_count}),
+                                  device_idx);
+
+                    graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
+                    wo_producer_node = prefix + "wo_allreduce";
+
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                                    << " Wo: row-parallel sharded, adding allreduce");
+                }
             }
         }
 
@@ -1014,19 +1080,9 @@ namespace llaminar2
                           ComputeStageFactory::createResidualAdd(res_params),
                           device_idx);
 
-            if (env.execution.exec_gemm && layer.wo)
+            if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
             {
-                bool wo_is_sharded = isRowParallelSharded(layer.wo);
-                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
-
-                if (wo_is_sharded && has_multi_rank)
-                {
-                    graph.addDependency(prefix + "attn_residual", prefix + "wo_allreduce");
-                }
-                else
-                {
-                    graph.addDependency(prefix + "attn_residual", prefix + "wo_proj");
-                }
+                graph.addDependency(prefix + "attn_residual", wo_producer_node);
             }
         }
 

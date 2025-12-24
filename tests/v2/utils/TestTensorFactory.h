@@ -50,7 +50,7 @@ namespace llaminar2::test
          */
         static std::unique_ptr<FP32Tensor> createFP32(const std::vector<size_t> &shape)
         {
-            return std::make_unique<FP32Tensor>(shape, /*device_idx=*/-1);
+            return std::make_unique<FP32Tensor>(shape);
         }
 
         /**
@@ -95,7 +95,7 @@ namespace llaminar2::test
          */
         static std::unique_ptr<FP16Tensor> createFP16(const std::vector<size_t> &shape)
         {
-            return std::make_unique<FP16Tensor>(shape, /*device_idx=*/-1);
+            return std::make_unique<FP16Tensor>(shape);
         }
 
         /**
@@ -106,9 +106,20 @@ namespace llaminar2::test
             float min = -1.0f, float max = 1.0f,
             uint32_t seed = 42)
         {
-            auto tensor = createFP16(shape);
-            fillRandomFP16(tensor.get(), min, max, seed);
-            return tensor;
+            std::mt19937 rng(seed);
+            std::uniform_real_distribution<float> dist(min, max);
+
+            size_t numel = 1;
+            for (auto s : shape)
+                numel *= s;
+
+            std::vector<uint16_t> data(numel);
+            for (size_t i = 0; i < numel; ++i)
+            {
+                data[i] = fp32_to_fp16(dist(rng));
+            }
+
+            return std::make_unique<FP16Tensor>(shape, data);
         }
 
         /**
@@ -116,7 +127,7 @@ namespace llaminar2::test
          */
         static std::unique_ptr<BF16Tensor> createBF16(const std::vector<size_t> &shape)
         {
-            return std::make_unique<BF16Tensor>(shape, /*device_idx=*/-1);
+            return std::make_unique<BF16Tensor>(shape);
         }
 
         /**
@@ -127,9 +138,20 @@ namespace llaminar2::test
             float min = -1.0f, float max = 1.0f,
             uint32_t seed = 42)
         {
-            auto tensor = createBF16(shape);
-            fillRandomBF16(tensor.get(), min, max, seed);
-            return tensor;
+            std::mt19937 rng(seed);
+            std::uniform_real_distribution<float> dist(min, max);
+
+            size_t numel = 1;
+            for (auto s : shape)
+                numel *= s;
+
+            std::vector<uint16_t> data(numel);
+            for (size_t i = 0; i < numel; ++i)
+            {
+                data[i] = fp32_to_bf16(dist(rng));
+            }
+
+            return std::make_unique<BF16Tensor>(shape, data);
         }
 
         /**
@@ -137,7 +159,7 @@ namespace llaminar2::test
          */
         static std::unique_ptr<INT32Tensor> createINT32(const std::vector<size_t> &shape)
         {
-            return std::make_unique<INT32Tensor>(shape, /*device_idx=*/-1);
+            return std::make_unique<INT32Tensor>(shape);
         }
 
         /**
@@ -170,8 +192,8 @@ namespace llaminar2::test
             std::uniform_real_distribution<float> dist(min, max);
 
             // Q8_1 block: 32 int8 values + fp16 scale (d) + fp16 sum (s)
-            std::vector<uint8_t> raw_data(total_blocks * sizeof(block_q8_1));
-            auto *blocks = reinterpret_cast<block_q8_1 *>(raw_data.data());
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q8_1Block));
+            auto *blocks = reinterpret_cast<Q8_1Block *>(raw_data.data());
 
             for (size_t i = 0; i < total_blocks; ++i)
             {
@@ -188,18 +210,20 @@ namespace llaminar2::test
 
                 float scale = max_abs / 127.0f;
                 blocks[i].d = fp32_to_fp16(scale);
-                blocks[i].s = fp32_to_fp16(sum); // Q8_1 stores sum for efficient dot products
 
                 float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                int16_t sum_qs = 0;
                 for (size_t j = 0; j < BLOCK_SIZE; ++j)
                 {
                     int32_t q = static_cast<int32_t>(std::round(values[j] * inv_scale));
                     q = std::clamp(q, -128, 127);
                     blocks[i].qs[j] = static_cast<int8_t>(q);
+                    sum_qs += q;
                 }
+                blocks[i].sum_qs = sum_qs; // Q8_1 stores raw integer sum
             }
 
-            return std::make_unique<Q8_1Tensor>(shape, raw_data.data(), raw_data.size(), /*device_idx=*/-1);
+            return std::make_unique<Q8_1Tensor>(shape, reinterpret_cast<const Q8_1Block *>(raw_data.data()), total_blocks, /*device_idx=*/-1);
         }
 
         // =========================================================================
@@ -232,8 +256,8 @@ namespace llaminar2::test
             std::mt19937 rng(seed);
             std::normal_distribution<float> dist(0.0f, 0.1f); // Normal distribution typical for weights
 
-            std::vector<uint8_t> raw_data(total_blocks * sizeof(block_q8_0));
-            auto *blocks = reinterpret_cast<block_q8_0 *>(raw_data.data());
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q8_0Block));
+            auto *blocks = reinterpret_cast<Q8_0Block *>(raw_data.data());
 
             for (size_t i = 0; i < total_blocks; ++i)
             {
@@ -260,7 +284,7 @@ namespace llaminar2::test
                 }
             }
 
-            return std::make_unique<Q8_0Tensor>(shape, raw_data.data(), raw_data.size(), /*device_idx=*/-1);
+            return std::make_unique<Q8_0Tensor>(shape, raw_data);
         }
 
         /**
@@ -280,8 +304,8 @@ namespace llaminar2::test
             std::mt19937 rng(seed);
             std::normal_distribution<float> dist(0.0f, 0.1f);
 
-            std::vector<uint8_t> raw_data(total_blocks * sizeof(block_q4_0));
-            auto *blocks = reinterpret_cast<block_q4_0 *>(raw_data.data());
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q4_0Block));
+            auto *blocks = reinterpret_cast<Q4_0Block *>(raw_data.data());
 
             for (size_t i = 0; i < total_blocks; ++i)
             {
@@ -307,7 +331,7 @@ namespace llaminar2::test
                 }
             }
 
-            return std::make_unique<Q4_0Tensor>(shape, raw_data.data(), raw_data.size(), /*device_idx=*/-1);
+            return std::make_unique<Q4_0Tensor>(shape, raw_data);
         }
 
         // =========================================================================
@@ -404,38 +428,6 @@ namespace llaminar2::test
             for (size_t i = 0; i < tensor->numel(); ++i)
             {
                 data[i] = static_cast<float>(i % 256) / 256.0f - 0.5f;
-            }
-        }
-
-        /**
-         * @brief Fill FP16 tensor with random values
-         */
-        static void fillRandomFP16(FP16Tensor *tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 42)
-        {
-            if (!tensor)
-                return;
-            std::mt19937 rng(seed);
-            std::uniform_real_distribution<float> dist(min, max);
-            uint16_t *data = tensor->mutable_data();
-            for (size_t i = 0; i < tensor->numel(); ++i)
-            {
-                data[i] = fp32_to_fp16(dist(rng));
-            }
-        }
-
-        /**
-         * @brief Fill BF16 tensor with random values
-         */
-        static void fillRandomBF16(BF16Tensor *tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 42)
-        {
-            if (!tensor)
-                return;
-            std::mt19937 rng(seed);
-            std::uniform_real_distribution<float> dist(min, max);
-            uint16_t *data = tensor->mutable_data();
-            for (size_t i = 0; i < tensor->numel(); ++i)
-            {
-                data[i] = fp32_to_bf16(dist(rng));
             }
         }
 

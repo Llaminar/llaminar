@@ -937,6 +937,7 @@ namespace llaminar2
                 // Get static JIT kernel instances (compiled once, reused)
                 static QuantisedGemmJit_M1 jit;    // Single-row kernel
                 static QuantisedGemmJit_M2 jit_m2; // Two-row kernel
+
                 auto kernel = jit.get_kernel();
                 auto kernel_m2 = jit_m2.get_kernel();
 
