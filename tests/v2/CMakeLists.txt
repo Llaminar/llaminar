@@ -2429,6 +2429,23 @@ add_v2_test(V2_Integration_Q8_1_AttentionReplayDump
     LABELS "V2;Integration;Kernels;Attention;Q8_1;JIT;Debug;Replay;E2E"
 )
 
+# Test: Q8_1 Fused Attention + Wo Projection with Tensor Parallelism (Prefill Mode)
+# Validates the JIT prefill kernel with VNNI packed Wo weights under MPI tensor parallelism
+# Key validations:
+# - Context buffer uses local_dim (not d_model) for query stride
+# - Stack allocation handles TP local dimensions correctly
+# - No memory corruption from buffer overflows
+add_executable(v2_integration_q8_1_fused_attention_wo_prefill_tp integration/Test__Q8_1_FusedAttentionWo_Prefill_TP.cpp)
+target_link_libraries(v2_integration_q8_1_fused_attention_wo_prefill_tp 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_FusedAttentionWo_Prefill_TP
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_fused_attention_wo_prefill_tp>
+    MPI_PROCS 2
+    LABELS "V2;Integration;Kernels;Attention;Q8_1;VNNI;Prefill;TP;MPI"
+)
+
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
 

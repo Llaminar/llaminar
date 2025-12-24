@@ -27,6 +27,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/CPUFeatures.h"
 #include "utils/Logger.h"
+#include "utils/KernelProfiler.h"
 #include <memory>
 #include <cmath>
 #include <array>
@@ -204,6 +205,9 @@ namespace llaminar2
             params.scale = scale_;
             params.causal = causal;
             params.position_offset = position_offset;
+
+            // Profile the attention kernel
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
             // Dispatch to appropriate backend
             switch (config_.backend)
@@ -436,7 +440,7 @@ namespace llaminar2
             }
 
             const void *wo_ptr = params.Wo;
-            llaminar::v2::kernels::jit::JitPackedWoParams packed_params;
+            llaminar::v2::kernels::jit::JitPackedWoParams packed_params = {}; // Zero-initialize
 
             if (wo_format == WoFormat::Q8_1_VNNI_PACKED)
             {
@@ -446,7 +450,13 @@ namespace llaminar2
                 packed_params.scales = packed->scales.data();
                 packed_params.mins = packed->has_mins ? packed->mins.data() : nullptr;
                 packed_params.quantize_func = &quantize_row_q8_1_helper;
+                packed_params.N = packed->N;
+                packed_params.K = packed->K;
+                packed_params.original_packed = packed; // For QuantisedGemmKernel in extern C thunk
                 wo_ptr = &packed_params;
+                LOG_DEBUG("FusedAttentionWoKernel: packed_params @ " << &packed_params
+                                                                     << " wo_ptr=" << wo_ptr << " N=" << packed_params.N << " K=" << packed_params.K
+                                                                     << " original_packed=" << packed_params.original_packed);
             }
 
             (*slot_ptr)->compute(

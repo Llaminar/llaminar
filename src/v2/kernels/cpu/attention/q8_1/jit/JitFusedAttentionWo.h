@@ -419,6 +419,9 @@ namespace llaminar::v2::kernels::jit
         const void *scales;
         const void *mins;
         void (*quantize_func)(const float *, void *, int);
+        int N;                       // Output dimension (for QuantisedGemmKernel)
+        int K;                       // Input dimension (for QuantisedGemmKernel)
+        const void *original_packed; // Original QuantisedPackedWeights* for GEMM kernel
     };
 
     /**
@@ -1231,8 +1234,10 @@ namespace llaminar::v2::kernels::jit
             // ═══════════════════════════════════════════════════════════════════
             // INITIALIZE CONTEXT BUFFER TO ZEROS
             // ═══════════════════════════════════════════════════════════════════
-
-            emit_prefill_init_context(q_tile_size_, d_model, context_offset);
+            // CRITICAL: Use local_dim (not d_model) since context_size was calculated
+            // with local_dim. d_model includes the full output dimension for TP,
+            // but context stores local attention outputs (num_heads * head_dim).
+            emit_prefill_init_context(q_tile_size_, local_dim, context_offset);
 
             // ═══════════════════════════════════════════════════════════════════
             // HEAD LOOP: Process each attention head
@@ -1756,7 +1761,7 @@ namespace llaminar::v2::kernels::jit
          * @param op_tile_size Number of queries in tile (memory operand)
          * @param num_blocks head_dim / 32 (compile-time constant)
          * @param q_blocks_offset Stack offset to Q blocks buffer
-         * @param d_model Total hidden dimension (num_heads × head_dim)
+         * @param d_model Unused - kept for API compatibility (context uses config_.localDim())
          * @param reg_softmax_head_offset Dynamic offset into softmax buffer for current head
          * @param reg_context_head_offset Dynamic offset into context buffer for current head
          */
@@ -1985,8 +1990,11 @@ namespace llaminar::v2::kernels::jit
                     jle(skip_v, T_NEAR);
 
                     // Compute context address (compile-time offset optimization)
-                    // context_ptr = rsp + context_head_offset + q * d_model * 4 + ctx_off_base
-                    int q_ctx_offset = q * d_model * 4 + ctx_off_base;
+                    // context_ptr = rsp + context_head_offset + q * local_dim * 4 + ctx_off_base
+                    // NOTE: Use local_dim (not d_model) since context buffer stores
+                    // local attention outputs (num_heads * head_dim per query)
+                    int local_dim = config_.localDim();
+                    int q_ctx_offset = q * local_dim * 4 + ctx_off_base;
                     mov(r9, reg_context_head_offset);
                     add(r9, rsp);
 
@@ -2276,10 +2284,13 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // STEP 6: Calculate context pointer and accumulate V
             // ───────────────────────────────────────────────────────────────────
-            // ctx_ptr = rsp + context_head_offset + q_local * d_model * 4
+            // ctx_ptr = rsp + context_head_offset + q_local * local_dim * 4
+            // NOTE: Use local_dim (not d_model) since context buffer stores
+            // local attention outputs (num_heads * head_dim per query)
+            int local_dim = config_.localDim();
             Reg64 reg_ctx = r11;
             mov(reg_ctx, reg_q_local);
-            imul(reg_ctx, reg_ctx, d_model * 4);
+            imul(reg_ctx, reg_ctx, local_dim * 4);
             add(reg_ctx, reg_context_head_offset);
             add(reg_ctx, rsp);
 
@@ -3026,9 +3037,11 @@ namespace llaminar::v2::kernels::jit
             mov(ptr[rsp + q_local_spill], r8);
 
             // Calculate context pointer offset for this query
-            // context_ptr = rsp + context_offset + q_local * d_model * 4
+            // context_ptr = rsp + context_offset + q_local * local_dim * 4
+            // NOTE: Use local_dim (not d_model) since context buffer stores
+            // local attention outputs (num_heads * head_dim per query)
             mov(r10, r8);
-            imul(r10, r10, d_model * 4);
+            imul(r10, r10, local_dim * 4);
             add(r10, context_offset);
 
             // Calculate softmax state offset for this query

@@ -1789,11 +1789,16 @@ namespace llaminar2
             return false;
         }
 
-        // Get dimensions from tensor
-        const int seq_len = static_cast<int>(params_.gate->rows());
+        // Use explicit seq_len if provided, otherwise derive from tensor shape
+        // This is critical for decode mode where buffers are pre-allocated for max_seq_len
+        // but we're only processing 1 token.
+        const int seq_len = (params_.seq_len > 0)
+                                ? params_.seq_len
+                                : static_cast<int>(params_.gate->rows());
         const int intermediate_dim = static_cast<int>(params_.gate->cols());
 
         LOG_DEBUG("[SwiGLUStage] Execute: seq_len=" << seq_len
+                                                    << " (params_.seq_len=" << params_.seq_len << ")"
                                                     << " intermediate_dim=" << intermediate_dim
                                                     << " tensor_type=" << params_.gate->dtype_name());
 

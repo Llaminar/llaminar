@@ -39,11 +39,14 @@ namespace llaminar2
         // Configure executor from graph builder's config
         GraphExecutorConfig exec_config;
         exec_config.default_device = graph_builder_->config().default_device;
-        exec_config.enable_profiling = graph_builder_->config().enable_profiling;
+
+        // Parse execution mode and profiling from environment
+        const auto &env = debugEnv();
+
+        // Enable profiling from either graph config or env variable
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
         exec_config.enable_validation = graph_builder_->config().enable_validation;
 
-        // Parse execution mode from environment
-        const auto &env = debugEnv();
         if (env.execution.execution_mode == "parallel")
         {
             exec_config.mode = ExecutionMode::PARALLEL;
@@ -87,11 +90,13 @@ namespace llaminar2
         // Configure executor from graph builder's config
         GraphExecutorConfig exec_config;
         exec_config.default_device = graph_builder_->config().default_device;
-        exec_config.enable_profiling = graph_builder_->config().enable_profiling;
-        exec_config.enable_validation = graph_builder_->config().enable_validation;
 
-        // Parse execution mode from environment
+        // Parse execution mode and profiling from environment
         const auto &env = debugEnv();
+
+        // Enable profiling from either graph config or env variable
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
+        exec_config.enable_validation = graph_builder_->config().enable_validation;
         if (env.execution.execution_mode == "parallel")
         {
             exec_config.mode = ExecutionMode::PARALLEL;
