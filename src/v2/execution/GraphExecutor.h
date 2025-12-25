@@ -350,6 +350,20 @@ namespace llaminar2
         bool executeParallel(ComputeGraph &graph, IDeviceContext *ctx);
         bool executeNode(ComputeNode &node, IDeviceContext *ctx);
 
+        // Buffer validation (debug builds only)
+#ifndef NDEBUG
+        /**
+         * @brief Validate stage outputs for zero/NaN tensors
+         *
+         * Called after stage execution when LLAMINAR_VALIDATE_BUFFERS=1.
+         * Checks all OUTPUT buffers for uninitialized (zero) or corrupted (NaN/Inf) data.
+         *
+         * @param node The node whose outputs should be validated
+         * @return true if validation passes, false if errors detected
+         */
+        bool validateStageOutputs(const ComputeNode &node);
+#endif
+
         // Workspace management
         std::vector<float> temp_buffer_;
         size_t temp_buffer_size_ = 0;

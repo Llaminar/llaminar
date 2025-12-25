@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensors/Tensors.h"
+#include "tensors/QuantizationUtils.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoTiled.h"
 #include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
@@ -68,6 +69,18 @@ namespace llaminar2
             int head_dim = 64;    ///< Dimension per head
             int d_model = 0;      ///< Model dimension (num_heads * head_dim)
             FusedAttentionBackend backend = FusedAttentionBackend::JIT;
+
+            /**
+             * @brief Enable Hybrid mode FP32 Wo projection
+             *
+             * When true and weights are VNNI-packed, uses streaming dequantization
+             * to FP32 before projection. This avoids quantizing the FP32 context,
+             * giving highest numerical precision at the cost of performance.
+             *
+             * Flow without hybrid_wo: FP32 context → Q8_1 → VNNI GEMM → FP32
+             * Flow with hybrid_wo:    FP32 context × dequant(VNNI) → FP32
+             */
+            bool use_hybrid_wo = false;
         };
 
         explicit FusedAttentionWoKernel(const Config &config)
@@ -76,13 +89,14 @@ namespace llaminar2
             LOG_DEBUG("FusedAttentionWoKernel created: heads=" << config.num_heads
                                                                << "/" << config.num_kv_heads << ", head_dim=" << config.head_dim
                                                                << ", d_model=" << config.d_model
-                                                               << ", backend=" << static_cast<int>(config.backend));
+                                                               << ", backend=" << static_cast<int>(config.backend)
+                                                               << ", hybrid_wo=" << config.use_hybrid_wo);
         }
 
         /**
          * @brief Compute fused attention + Wo projection
          *
-         * @param Q Query tensor [seq_len_q, num_heads * head_dim] (Q8_1)
+         * @param Q Query tensor [seq_len_q, num_heads * head_dim] (Q8_1 or FP32 for Hybrid mode)
          * @param K Key tensor [seq_len_kv, num_kv_heads * head_dim] (Q8_1)
          * @param V Value tensor [seq_len_kv, num_kv_heads * head_dim] (Q8_1)
          * @param Wo Output projection weight [d_model, num_heads * head_dim]
@@ -91,6 +105,7 @@ namespace llaminar2
          * @param seq_len_kv Key/Value sequence length
          * @param causal Whether to apply causal masking
          * @param position_offset Position offset for causal mask (decode mode)
+         * @param context_snapshot Optional buffer to capture pre-Wo attention context (for debugging)
          * @return true on success
          */
         bool compute(
@@ -102,19 +117,49 @@ namespace llaminar2
             int seq_len_q,
             int seq_len_kv,
             bool causal = true,
-            int position_offset = 0)
+            int position_offset = 0,
+            TensorBase *context_snapshot = nullptr)
         {
             const auto &env = debugEnv();
 
-            // Validate Q8_1 input tensors
+            // Validate Q input - can be Q8_1 or FP32 (for Hybrid mode)
             auto *Q_q8 = dynamic_cast<Q8_1Tensor *>(Q);
+            auto *Q_fp32 = dynamic_cast<FP32Tensor *>(Q);
+
+            if (!Q_q8 && !Q_fp32)
+            {
+                LOG_ERROR("FusedAttentionWoKernel requires Q8_1 or FP32 Q tensor");
+                return false;
+            }
+
+            // Validate K/V as Q8_1 (for now - BF16 cache support in future)
             auto *K_q8 = dynamic_cast<Q8_1Tensor *>(K);
             auto *V_q8 = dynamic_cast<Q8_1Tensor *>(V);
 
-            if (!Q_q8 || !K_q8 || !V_q8)
+            if (!K_q8 || !V_q8)
             {
-                LOG_ERROR("FusedAttentionWoKernel requires Q8_1 input tensors");
+                LOG_ERROR("FusedAttentionWoKernel requires Q8_1 K/V tensors");
                 return false;
+            }
+
+            // For FP32 Q (Hybrid mode): quantize on-the-fly to Q8_1
+            std::unique_ptr<Q8_1Tensor> Q_quantized;
+            const Q8_1Block *q_blocks = nullptr;
+
+            if (Q_fp32)
+            {
+                LOG_DEBUG("FusedAttentionWoKernel: Quantizing FP32 Q to Q8_1 (Hybrid mode)");
+                Q_quantized = quantize_fp32_q_to_q8_1(Q_fp32, seq_len_q, config_.num_heads, config_.head_dim);
+                if (!Q_quantized)
+                {
+                    LOG_ERROR("FusedAttentionWoKernel: Failed to quantize FP32 Q to Q8_1");
+                    return false;
+                }
+                q_blocks = Q_quantized->q8_1_blocks();
+            }
+            else
+            {
+                q_blocks = Q_q8->q8_1_blocks();
             }
 
             // Determine Wo weight type
@@ -130,7 +175,16 @@ namespace llaminar2
                 // ensurePackedWeightsInTensorCache handles the conversion from any IINT8Unpackable format
                 if (config_.backend == FusedAttentionBackend::JIT)
                 {
-                    wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1_VNNI_PACKED;
+                    // Hybrid mode: use streaming dequantization for highest precision
+                    if (config_.use_hybrid_wo)
+                    {
+                        wo_type = llaminar::v2::kernels::microkernels::WoWeightType::FP32_STREAMING_DEQUANT;
+                        LOG_DEBUG("FusedAttentionWoKernel: Hybrid mode - using FP32 streaming dequant for Wo");
+                    }
+                    else
+                    {
+                        wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1_VNNI_PACKED;
+                    }
                     LOG_DEBUG("FusedAttentionWoKernel: Calling ensurePackedWeightsInTensorCache for "
                               << Wo->dtype_name() << " Wo tensor=" << (void *)Wo);
                     wo_data = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(Wo);
@@ -187,7 +241,7 @@ namespace llaminar2
             // Build params structure
             // Q8_1Block is now unified via microkernels::Q8_1Block = llaminar2::Q8_1Block
             llaminar::v2::kernels::FusedAttentionWoParams params;
-            params.Q = Q_q8->q8_1_blocks();
+            params.Q = q_blocks; // Use quantized Q (original or from FP32 conversion)
             params.K = K_q8->q8_1_blocks();
             params.V = V_q8->q8_1_blocks();
             params.Wo = wo_data;
@@ -205,6 +259,17 @@ namespace llaminar2
             params.scale = scale_;
             params.causal = causal;
             params.position_offset = position_offset;
+
+            // Optional context snapshot buffer for debugging
+            if (context_snapshot)
+            {
+                auto *ctx_fp32 = dynamic_cast<FP32Tensor *>(context_snapshot);
+                params.context_snapshot = ctx_fp32 ? ctx_fp32->mutable_data() : nullptr;
+            }
+            else
+            {
+                params.context_snapshot = nullptr;
+            }
 
             // Profile the attention kernel
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
@@ -271,7 +336,8 @@ namespace llaminar2
         };
 
         mutable std::mutex jit_slots_mutex_;
-        mutable std::array<JitKernelSlots, 5> jit_slots_{}; // indexed by static_cast<int>(WoFormat)
+        // Indexed by static_cast<int>(WoFormat): FP32=0, Q8_1=1, Q8_1_VNNI_PACKED=2, FP16=3, BF16=4, FP32_STREAMING_DEQUANT=5
+        mutable std::array<JitKernelSlots, 6> jit_slots_{};
 
         static void quantize_row_q8_1_helper(const float *x, void *y, int k)
         {
@@ -283,6 +349,41 @@ namespace llaminar2
                 int valid = std::min(32, k - i * 32);
                 llaminar2::simd::quantize_single_block(x + i * 32, blocks[i], valid);
             }
+        }
+
+        /**
+         * @brief Quantize FP32 Q tensor to Q8_1 for Hybrid mode
+         *
+         * This method creates a temporary Q8_1 tensor from FP32 Q data,
+         * enabling Hybrid mode to use FP32 Q (from RoPE) with the existing
+         * Q8_1 VNNI attention kernel.
+         *
+         * @param Q_fp32 Input FP32 Q tensor [seq_len, num_heads * head_dim]
+         * @param seq_len Sequence length
+         * @param num_heads Number of attention heads
+         * @param head_dim Dimension per head
+         * @return Quantized Q8_1 tensor (owned by unique_ptr)
+         */
+        std::unique_ptr<Q8_1Tensor> quantize_fp32_q_to_q8_1(
+            const FP32Tensor *Q_fp32,
+            int seq_len,
+            int num_heads,
+            int head_dim) const
+        {
+            const int row_dim = num_heads * head_dim;
+
+            // Use shared quantization utility
+            auto Q_q8 = quantization::quantize_fp32_tensor_to_q8_1(Q_fp32);
+            if (!Q_q8)
+            {
+                return nullptr;
+            }
+
+            LOG_TRACE("FusedAttentionWoKernel: Quantized FP32 Q to Q8_1: "
+                      << seq_len << "x" << row_dim << " -> "
+                      << quantization::q8_1_blocks_per_row(row_dim) * seq_len << " blocks");
+
+            return Q_q8;
         }
 
         /**
@@ -342,6 +443,9 @@ namespace llaminar2
                 break;
             case llaminar::v2::kernels::microkernels::WoWeightType::Q8_1_VNNI_PACKED:
                 wo_format = WoFormat::Q8_1_VNNI_PACKED;
+                break;
+            case llaminar::v2::kernels::microkernels::WoWeightType::FP32_STREAMING_DEQUANT:
+                wo_format = WoFormat::FP32_STREAMING_DEQUANT;
                 break;
             default:
                 LOG_ERROR("JIT kernel does not support Wo type: " << static_cast<int>(params.wo_type));
@@ -468,7 +572,8 @@ namespace llaminar2
                 params.seq_len,
                 params.kv_seq_len,
                 params.scale,
-                params.position_offset);
+                params.position_offset,
+                params.context_snapshot);
 
             return true;
         }

@@ -126,10 +126,23 @@ namespace llaminar2
         std::shared_ptr<TensorBase> up;
         std::shared_ptr<TensorBase> ffn_output;
 
+        // === Hybrid Mode Buffers ===
+        /// FP32 Q after RoPE (Hybrid mode only - avoids requantization)
+        std::shared_ptr<TensorBase> Q_rope;
+        /// FP32 K after RoPE (Hybrid mode only - avoids requantization)
+        std::shared_ptr<TensorBase> K_rope;
+        /// FP32 V dequantized (Hybrid mode only - for KV cache append when V is Q8_1)
+        std::shared_ptr<TensorBase> V_dequant;
+
         // === Attention Workspace ===
         std::shared_ptr<TensorBase> workspace_scores;
         std::shared_ptr<TensorBase> workspace_context;
         std::shared_ptr<TensorBase> workspace_mask;
+
+        // === Snapshot Buffers (for E2E debugging) ===
+        /// Optional buffer to capture attention context before Wo projection
+        /// Allocated when ENABLE_PIPELINE_SNAPSHOTS is defined
+        std::shared_ptr<TensorBase> context_snapshot;
 
         // === Configuration ===
         int batch_size = 0;
@@ -748,7 +761,49 @@ namespace llaminar2
                         return;
                     }
 
+                    // Handle fused attention+Wo stage - captures ATTENTION_CONTEXT and ATTENTION_OUTPUT
+                    // The fused stage outputs are ordered: context (pre-Wo), output (post-Wo)
+                    if (name.find("_fused_attn_wo") != std::string::npos)
+                    {
+                        size_t pos = name.find("_fused_attn_wo");
+                        std::string prefix = name.substr(0, pos);
+
+                        // FusedAttentionWoStage outputs:
+                        // [0] = context (pre-Wo attention context) - if snapshot buffer provided
+                        // [1] = output (post-Wo projection result)
+                        // OR (if no snapshot buffer):
+                        // [0] = output (post-Wo projection result)
+
+                        bool has_context = (dump.outputs.size() >= 2);
+                        size_t context_idx = has_context ? 0 : SIZE_MAX;
+                        size_t output_idx = has_context ? 1 : 0;
+
+                        // Store ATTENTION_CONTEXT (pre-Wo) if available
+                        if (has_context && dump.outputs[context_idx].data)
+                        {
+                            const auto &out = dump.outputs[context_idx];
+                            size_t count = out.rows * out.cols;
+                            std::vector<float> data(count);
+                            std::memcpy(data.data(), out.data, count * sizeof(float));
+                            snapshots_[prefix + "_ATTENTION_CONTEXT"] = std::move(data);
+                        }
+
+                        // Store ATTENTION_OUTPUT (post-Wo)
+                        if (output_idx < dump.outputs.size() && dump.outputs[output_idx].data)
+                        {
+                            const auto &out = dump.outputs[output_idx];
+                            size_t count = out.rows * out.cols;
+                            std::vector<float> data(count);
+                            std::memcpy(data.data(), out.data, count * sizeof(float));
+                            snapshots_[prefix + "_ATTENTION_OUTPUT"] = std::move(data);
+                        }
+                        return;
+                    }
+
                     // Standard single-output stages
+                    LOG_DEBUG("[Snapshot] Standard path: stage=" << name
+                                                                 << " outputs.size=" << dump.outputs.size()
+                                                                 << " out[0].data=" << (dump.outputs.empty() ? nullptr : dump.outputs[0].data));
                     if (!dump.outputs.empty() && dump.outputs[0].data)
                     {
                         const auto &out = dump.outputs[0];
@@ -758,6 +813,7 @@ namespace llaminar2
 
                         // Convert graph stage name to pipeline-style key
                         std::string key = convertStageNameToSnapshotKey(name);
+                        LOG_DEBUG("[Snapshot] Storing key=" << key << " count=" << count);
                         snapshots_[key] = std::move(data);
                     }
                 });
@@ -793,10 +849,13 @@ namespace llaminar2
             auto it = snapshots_.find(key);
             if (it == snapshots_.end())
             {
+                LOG_DEBUG("[GraphOrchestrator::getSnapshot] Key NOT FOUND: " << key
+                                                                             << " (have " << snapshots_.size() << " snapshots)");
                 out_size = 0;
                 return nullptr;
             }
             out_size = it->second.size();
+            LOG_TRACE("[GraphOrchestrator::getSnapshot] Key found: " << key << " size=" << out_size);
             return it->second.data();
         }
 

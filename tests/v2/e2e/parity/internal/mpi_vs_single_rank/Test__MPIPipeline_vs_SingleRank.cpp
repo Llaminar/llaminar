@@ -1,8 +1,13 @@
 /**
- * @file Test__Qwen2MPIRankParity.cpp
- * @brief End-to-end MPI rank parity tests using GraphOrchestrator
+ * @file Test__MPIPipeline_vs_SingleRank.cpp
+ * @brief E2E Parity: Llaminar MPI Tensor-Parallel vs Single-Rank Execution
+ *
+ * @category e2e/parity/internal/mpi_vs_single_rank
+ * @tested   MPI tensor-parallel pipeline (2+ ranks with weight sharding)
+ * @reference Single-rank pipeline (no distribution)
+ *
  * @author David Sanftenberg
- * @updated 2025-12-27 - Migrated to IInferenceRunner/GraphOrchestrator
+ * @updated 2025-12-25 - Reorganized into e2e/parity hierarchy
  *
  * Validates MPI execution parity by comparing:
  * - Single-rank execution vs multi-rank (tensor-parallel) MPI execution
@@ -12,7 +17,7 @@
  *
  * NOTE: These tests compare MPI ranks against each other, NOT against a
  * ground truth PyTorch reference. For PyTorch parity tests, see
- * Test__Qwen2FP32Parity.cpp.
+ * e2e/parity/pytorch/qwen2/Test__FP32Pipeline_vs_PyTorch.cpp
  *
  * Requirements:
  * - Real Qwen 2.5 0.5B model (models/qwen2.5-0.5b-instruct-q4_0.gguf)
@@ -22,7 +27,7 @@
 
 // CRITICAL: This test requires snapshot capture to work properly
 #ifndef ENABLE_PIPELINE_SNAPSHOTS
-#error "Test__Qwen2MPIRankParity requires ENABLE_PIPELINE_SNAPSHOTS to be defined. Build with CMAKE_BUILD_TYPE=Debug or CMAKE_BUILD_TYPE=E2ERelease"
+#error "Test__MPIPipeline_vs_SingleRank requires ENABLE_PIPELINE_SNAPSHOTS to be defined. Build with CMAKE_BUILD_TYPE=Debug or CMAKE_BUILD_TYPE=E2ERelease"
 #endif
 
 #include <gtest/gtest.h>

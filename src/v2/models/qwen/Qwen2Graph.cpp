@@ -13,11 +13,13 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 #include "../../backends/ComputeBackend.h"
+#include "../../execution/InferenceMode.h"
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/MPIStrategy.h"
 #include "../../execution/GraphBuildUtils.h"
+#include "../../execution/RuntimeConfig.h"
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -49,7 +51,7 @@ namespace llaminar2
 
         LOG_INFO("[Qwen2Graph] Initialized (full) with " << config_.n_layers
                                                          << " layers, precision="
-                                                         << (config_.activation_precision == ActivationPrecision::Q8_1 ? "Q8_1" : "FP32"));
+                                                         << activationPrecisionToString(config_.activation_precision));
     }
 
     Qwen2Graph::Qwen2Graph(const Qwen2GraphConfig &config,
@@ -766,6 +768,12 @@ namespace llaminar2
         if (local_n_kv_heads <= 0)
             local_n_kv_heads = config_.n_kv_heads;
 
+        // Create InferenceMode for centralized mode logic
+        InferenceMode inference_mode(config_.activation_precision);
+
+        // Check if we're in Hybrid mode with required buffers available
+        bool use_hybrid_mode = isHybridModeActive(inference_mode, buffers);
+
         // Stage 3: RoPE on Q and K
         if (env.execution.exec_rope)
         {
@@ -780,6 +788,14 @@ namespace llaminar2
             rope_params.pos_offset = pos_offset;
             rope_params.theta_base = config_.rope_theta;
             rope_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
+
+            // Hybrid mode: output to separate FP32 buffers to avoid requantization
+            if (use_hybrid_mode)
+            {
+                rope_params.Q_out = buffers.Q_rope;
+                rope_params.K_out = buffers.K_rope;
+                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " using Hybrid RoPE: Q8_1→FP32 output");
+            }
 
             graph.addNode(prefix + "rope",
                           ComputeStageFactory::createRoPE(rope_params),
@@ -805,7 +821,20 @@ namespace llaminar2
                 int total_tokens = batch_size * seq_len;
 
                 KVCacheAppendStage::Params kv_append_params;
-                kv_append_params.K = buffers.K;
+
+                // Hybrid mode: Use K_rope (post-RoPE FP32) instead of K (pre-RoPE Q8_1)
+                // The KV cache in Hybrid mode stores post-RoPE values
+                if (use_hybrid_mode && inference_mode.needsKRope())
+                {
+                    kv_append_params.K = buffers.K_rope;
+                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
+                                                    << " KVCacheAppend using K_rope (post-RoPE FP32)");
+                }
+                else
+                {
+                    kv_append_params.K = buffers.K;
+                }
+
                 kv_append_params.V = buffers.V;
                 kv_append_params.kv_cache = kv_cache;
                 kv_append_params.layer_idx = layer_idx;
@@ -813,6 +842,15 @@ namespace llaminar2
                 kv_append_params.num_tokens = total_tokens;
                 kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
                 kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
+
+                // Hybrid mode: populate V_dequant during KV cache append (V→FP32 conversion)
+                // This avoids a separate dequantization pass since KVCacheAppend already converts V
+                if (use_hybrid_mode && inference_mode.needsVDequant() && buffers.V_dequant)
+                {
+                    kv_append_params.V_dequant_out = buffers.V_dequant;
+                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
+                                                    << " KVCacheAppend will populate V_dequant for attention");
+                }
 
                 graph.addNode(prefix + "kv_append",
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
@@ -828,15 +866,38 @@ namespace llaminar2
                 }
             }
 
-            TensorBase *K_for_attn = buffers.K;
-            TensorBase *V_for_attn = buffers.V;
+            // For Hybrid mode attention path selection:
+            // - Decomposed attention: Use FP32 K_rope/V_dequant for best precision
+            // - Fused attention: Use Q8_1 K/V (kernel only supports Q8_1 K/V currently)
+            // KV cache always gets FP32 K_rope (stored separately from attention path)
+            //
+            // For Q8_1 mode: always use Q8_1 K/V
+            // For FP32 mode: always use FP32 K/V (but FP32 doesn't use fused attention)
+            //
+            // Note: Hybrid mode's main accuracy gain is from FP32 Q (via Q_rope) and
+            // FP32 streaming dequant for Wo projection, not from FP32 K/V.
+            TensorBase *K_for_attn = buffers.K; // Default to Q8_1
+            TensorBase *V_for_attn = buffers.V; // Default to Q8_1
+
+            // For decomposed attention path (FP32 or Hybrid without fused), use FP32 K/V if available
+            // The fused attention path check below will override this for fused attention
+            bool use_decomposed_fp32_kv = use_hybrid_mode && inference_mode.usesDecomposedFP32Attention() && buffers.V_dequant;
+            if (use_decomposed_fp32_kv)
+            {
+                // Only set FP32 K/V here - will be reset to Q8_1 if fused attention is used
+                K_for_attn = buffers.K_rope;
+                V_for_attn = buffers.V_dequant;
+            }
+
             int total_query_tokens = batch_size * seq_len;
             int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
             bool use_gather_stage = false;
 
             // For attention K/V source:
             // - Prefill (cached_tokens == 0): Use projected K/V directly [batch_size * seq_len, kv_dim]
+            //   In Hybrid mode: K_rope (FP32) and V_dequant (FP32) from above
             // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
+            //   In Hybrid mode: KV cache is FP32
             // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
             if (kv_cache)
             {
@@ -901,7 +962,12 @@ namespace llaminar2
             // 2. exec_attention and exec_gemm stages enabled
             // 3. Wo weights available
             // 4. CPU backend (JIT kernel is CPU-only)
-            // 5. Q8_1 activation precision (JIT kernel requires Q8_1 tensors)
+            // 5. Q8_1 or Hybrid activation precision (JIT kernel supports both)
+            //    - Q8_1: Uses Q8_1 Q directly
+            // Note: Hybrid mode should use decomposed attention for FP32 attention scoring.
+            // The fused path quantizes Q to Q8_1 and uses Q8_1 K/V, losing the precision benefit.
+            // Hybrid achieves its accuracy by keeping Q/K in FP32 through attention scoring,
+            // then using streaming dequant for Wo projection in the decomposed path.
             bool use_fused_wo = env.attention.fused_wo &&
                                 env.execution.exec_attention &&
                                 env.execution.exec_gemm &&
@@ -910,21 +976,44 @@ namespace llaminar2
                                 config_.activation_precision == ActivationPrecision::Q8_1;
 
             LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " fused_wo check: env.fused_wo=" << env.attention.fused_wo
-                      << " exec_attention=" << env.execution.exec_attention
-                      << " exec_gemm=" << env.execution.exec_gemm
-                      << " has_wo=" << (layer.wo != nullptr)
-                      << " cpu_backend=" << (backend == ComputeBackendType::CPU)
-                      << " q8_1_precision=" << (config_.activation_precision == ActivationPrecision::Q8_1)
-                      << " => use_fused_wo=" << use_fused_wo);
+                                            << " exec_attention=" << env.execution.exec_attention
+                                            << " exec_gemm=" << env.execution.exec_gemm
+                                            << " has_wo=" << (layer.wo != nullptr)
+                                            << " cpu_backend=" << (backend == ComputeBackendType::CPU)
+                                            << " activation_precision=" << activationPrecisionToString(config_.activation_precision)
+                                            << " => use_fused_wo=" << use_fused_wo);
 
             if (use_fused_wo)
             {
                 LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " using FusedAttentionWoStage");
 
+                // FusedAttentionWoKernel only supports Q8_1 K/V currently
+                // For Hybrid mode, we use Q8_1 K/V for attention but store FP32 to cache
+                // Reset to Q8_1 K/V for fused attention path (overriding FP32 K/V if set above)
+                TensorBase *K_for_fused = buffers.K;
+                TensorBase *V_for_fused = buffers.V;
+
+                // Check decode mode - need to get K/V from cache
+                if (kv_cache)
+                {
+                    int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
+                    if (cached_tokens > 0 && batch_size == 1)
+                    {
+                        // Decode mode: use cached K/V
+                        // Note: In Hybrid mode, KV cache stores FP32 but fused kernel needs Q8_1
+                        // This is a known limitation - Hybrid decode will fail until we add
+                        // FP32 K/V support to FusedAttentionWoKernel
+                        K_for_fused = kv_cache->get_k_base(layer_idx, 0);
+                        V_for_fused = kv_cache->get_v_base(layer_idx, 0);
+                    }
+                }
+
                 FusedAttentionWoStage::Params fused_params;
-                fused_params.Q = buffers.Q;
-                fused_params.K = K_for_attn;
-                fused_params.V = V_for_attn;
+                // For Hybrid mode: use Q_rope (FP32) instead of Q (Q8_1)
+                // The FusedAttentionWoKernel will detect FP32 Q and quantize on-the-fly
+                fused_params.Q = (use_hybrid_mode && inference_mode.needsQRope()) ? buffers.Q_rope : buffers.Q;
+                fused_params.K = K_for_fused;
+                fused_params.V = V_for_fused;
                 fused_params.Wo = layer.wo;
                 fused_params.output = buffers.attn_proj; // Direct output to projection buffer
                 fused_params.batch_size = batch_size;
@@ -941,6 +1030,17 @@ namespace llaminar2
                 fused_params.layer_idx = layer_idx;
                 fused_params.mpi_ctx = mpi_ctx_.get();
                 fused_params.device_idx = device_idx;
+
+                // Hybrid mode: enable streaming dequantization for FP32-equivalent Wo projection
+                // This gives highest numerical precision by dequantizing VNNI-packed weights to FP32
+                // row-by-row during GEMM, avoiding the precision loss of quantizing FP32 context.
+                fused_params.use_hybrid_wo = inference_mode.isHybrid();
+
+                // Optional context snapshot for debugging (enabled via buffer allocation)
+                fused_params.context_snapshot = buffers.context_snapshot;
+                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " fused_attn_wo context_snapshot="
+                                                << (buffers.context_snapshot ? "allocated" : "NULL")
+                                                << " use_hybrid_wo=" << fused_params.use_hybrid_wo);
 
                 wo_producer_node = prefix + "fused_attn_wo";
                 graph.addNode(wo_producer_node,
@@ -967,7 +1067,8 @@ namespace llaminar2
                                                     << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
 
                     AttentionComputeStage::Params attn_params;
-                    attn_params.Q = buffers.Q;
+                    // For Hybrid mode: use Q_rope (FP32) instead of Q (Q8_1)
+                    attn_params.Q = (use_hybrid_mode && inference_mode.needsQRope()) ? buffers.Q_rope : buffers.Q;
                     attn_params.K = K_for_attn;
                     attn_params.V = V_for_attn;
                     attn_params.output = buffers.attn_output;

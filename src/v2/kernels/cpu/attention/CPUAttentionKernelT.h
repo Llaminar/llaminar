@@ -812,6 +812,29 @@ namespace llaminar2
                 return false;
             }
 
+#ifndef NDEBUG
+            // Debug-only: Check for uninitialized tensors (likely allocation without population)
+            // This would have caught the V_dequant=0 bug in Hybrid mode immediately
+            // Only check FP32 path - quantized types would need different checks
+            if constexpr (std::is_same_v<ElementType, float>)
+            {
+                size_t q_elements = static_cast<size_t>(seq_len) * n_heads * head_dim;
+                size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+
+                // Sample first and last elements for quick zero check
+                bool q_zero = (Q[0] == 0.0f && Q[q_elements - 1] == 0.0f);
+                bool k_zero = (K[0] == 0.0f && K[kv_elements - 1] == 0.0f);
+                bool v_zero = (V[0] == 0.0f && V[kv_elements - 1] == 0.0f);
+
+                if (q_zero)
+                    LOG_WARN("[CPUAttentionKernelT] Q tensor appears to be all zeros (likely uninitialized)!");
+                if (k_zero)
+                    LOG_WARN("[CPUAttentionKernelT] K tensor appears to be all zeros (likely uninitialized)!");
+                if (v_zero)
+                    LOG_WARN("[CPUAttentionKernelT] V tensor appears to be all zeros (likely uninitialized)!");
+            }
+#endif
+
             if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0 || kv_len <= 0)
             {
                 LOG_ERROR("[CPUAttentionKernelT] compute: invalid dimensions");

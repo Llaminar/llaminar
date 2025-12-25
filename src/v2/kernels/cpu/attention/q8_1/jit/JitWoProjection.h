@@ -53,7 +53,10 @@ namespace llaminar::v2::kernels::jit
         Q8_1,
         Q8_1_VNNI_PACKED,
         FP16,
-        BF16
+        BF16,
+        // Hybrid mode: VNNI-packed weights with FP32 streaming dequantization
+        // This gives highest precision by avoiding activation quantization
+        FP32_STREAMING_DEQUANT
     };
 
     /**

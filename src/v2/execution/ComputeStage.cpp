@@ -624,15 +624,19 @@ namespace llaminar2
                                                << " output_type=" << params_.C->dtype_name());
 
         // Debug: Log input values for Wo projection (weight shape [896, 448] or [896, 896])
+        // Only log if input is FP32 (Q8_1 data() throws to prevent accidental dequantization)
         if (params_.B && params_.B->shape()[0] == 896 && (params_.B->shape()[1] == 448 || params_.B->shape()[1] == 896))
         {
-            const float *input_data = params_.A->data();
-            if (input_data)
+            if (std::string(params_.A->dtype_name()) == "FP32")
             {
-                LOG_TRACE("[GEMMStage] Wo input[0:8]=" << std::setprecision(10)
-                                                       << input_data[0] << "," << input_data[1] << "," << input_data[2] << "," << input_data[3] << ","
-                                                       << input_data[4] << "," << input_data[5] << "," << input_data[6] << "," << input_data[7]
-                                                       << " weight_k=" << params_.B->shape()[1]);
+                const float *input_data = params_.A->data();
+                if (input_data)
+                {
+                    LOG_TRACE("[GEMMStage] Wo input[0:8]=" << std::setprecision(10)
+                                                           << input_data[0] << "," << input_data[1] << "," << input_data[2] << "," << input_data[3] << ","
+                                                           << input_data[4] << "," << input_data[5] << "," << input_data[6] << "," << input_data[7]
+                                                           << " weight_k=" << params_.B->shape()[1]);
+                }
             }
         }
 
@@ -681,11 +685,21 @@ namespace llaminar2
             // Check if we have a gate input for SwiGLU fusion
             const float *gate_fp32 = params_.gate_input ? params_.gate_input->fp32_data() : nullptr;
 
-            // If output is Q8_1 and no fusion needed, use multiply_tensor for type-aware dispatch
-            // This handles: FP32→Q8_1, Q8_1→Q8_1, Q8_1→FP32, FP32→FP32 internally
-            if (!gate_fp32 && params_.C->native_type() == TensorType::Q8_1)
+            // If no SwiGLU fusion, use multiply_tensor for type-aware dispatch.
+            // This handles all input/output type combinations efficiently:
+            // - Q8_1→Q8_1: Direct JIT kernel (zero-copy)
+            // - Q8_1→FP32: multiply_q8_1_direct (JIT kernel, no dequant buffer)
+            // - FP32→Q8_1: multiply_to_q8_1 (quantize once, JIT kernel)
+            // - FP32→FP32: Standard GEMM
+            //
+            // IMPORTANT: Don't use multiply_fused for Q8_1 input without gate fusion!
+            // multiply_fused calls fp32_data() which dequantizes the entire Q8_1 tensor
+            // into a buffer EVERY CALL - this was causing 25x slowdown for down_proj.
+            if (!gate_fp32)
             {
-                LOG_DEBUG("[GEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
+                LOG_DEBUG("[GEMMStage] Using multiply_tensor for type-aware dispatch: "
+                          << "input_type=" << params_.A->dtype_name()
+                          << " output_type=" << params_.C->dtype_name());
                 bool success = qgemm->multiply_tensor(
                     params_.A, params_.C,
                     params_.m, effective_n, params_.k,
@@ -699,8 +713,9 @@ namespace llaminar2
                 return success;
             }
 
-            // For SwiGLU fusion or FP32 output, use multiply_fused
-            // (multiply_fused requires FP32 output for gate fusion)
+            // For SwiGLU fusion, use multiply_fused which requires FP32 pointers.
+            // Note: If gate_input is Q8_1, gate_fp32 calls fp32_data() which dequantizes.
+            // This is acceptable because gate fusion is compute-bound, not memory-bound.
             float *output_fp32 = params_.C->mutable_data();
             const float *input_fp32 = params_.A->fp32_data();
 
@@ -1607,16 +1622,24 @@ namespace llaminar2
             return false;
         }
 
-        // Get seq_len from tensor dimensions
-        // Q tensor is [seq_len, n_heads * head_dim]
-        const int seq_len = static_cast<int>(params_.Q->rows());
+        // Get seq_len: use explicit param if set (for pre-allocated buffers), else from tensor
+        // This is critical for decode where buffer is [max_seq_len, dim] but we only process 1 token
+        const int seq_len = (params_.seq_len > 0)
+                                ? params_.seq_len
+                                : static_cast<int>(params_.Q->rows());
+
+        // Detect Hybrid mode: Q8_1 input with FP32 output buffers
+        const bool hybrid_mode = (params_.Q_out != nullptr) &&
+                                 (params_.Q->native_type() == TensorType::Q8_1) &&
+                                 (params_.Q_out->native_type() == TensorType::FP32);
 
         LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
                                                   << " n_heads=" << params_.n_heads
                                                   << " n_kv_heads=" << params_.n_kv_heads
                                                   << " head_dim=" << params_.head_dim
                                                   << " pos_offset=" << params_.pos_offset
-                                                  << " tensor_type=" << params_.Q->dtype_name());
+                                                  << " tensor_type=" << params_.Q->dtype_name()
+                                                  << " hybrid_mode=" << (hybrid_mode ? "true" : "false"));
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
@@ -1637,7 +1660,25 @@ namespace llaminar2
 
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
 
-        // Apply RoPE via kernel's apply_tensor method
+        // Hybrid mode: use apply_q8_1_to_fp32() for Q8_1 → FP32 with no requantization
+        if (hybrid_mode)
+        {
+            return kernel->apply_q8_1_to_fp32(
+                params_.Q,
+                params_.K,
+                params_.Q_out,
+                params_.K_out,
+                position_ids.data(),
+                seq_len,
+                params_.n_heads,
+                n_kv_heads,
+                params_.head_dim,
+                params_.theta_base,
+                params_.mpi_ctx,
+                params_.device_idx);
+        }
+
+        // Standard path: Apply RoPE via kernel's apply_tensor method (in-place)
         return kernel->apply_tensor(
             params_.Q,
             params_.K, // May be nullptr
@@ -1704,26 +1745,61 @@ namespace llaminar2
         // Use explicit seq_len if provided, otherwise derive from tensor
         const int seq_len = (params_.seq_len > 0) ? params_.seq_len : static_cast<int>(params_.Q->rows());
 
-        // Q tensor (in-place operation) - use safe accessor for Q8_1 compatibility
-        const float *q_data = getSafeFp32Data(params_.Q);
-        if (q_data)
+        // Detect Hybrid mode: Q8_1 input with FP32 output buffers
+        const bool hybrid_mode = (params_.Q_out != nullptr) &&
+                                 (params_.Q->native_type() == TensorType::Q8_1) &&
+                                 (params_.Q_out->native_type() == TensorType::FP32);
+
+        // Q input
+        const float *q_input_data = getSafeFp32Data(params_.Q);
+        if (q_input_data)
         {
-            info.addInput("Q", q_data,
+            info.addInput("Q", q_input_data,
                           seq_len, params_.n_heads * params_.head_dim);
-            info.addOutput("Q", q_data,
+        }
+
+        // Q output - use Q_out in Hybrid mode, otherwise same as input (in-place)
+        if (hybrid_mode && params_.Q_out)
+        {
+            const float *q_out_data = getSafeFp32Data(params_.Q_out);
+            if (q_out_data)
+            {
+                info.addOutput("Q", q_out_data,
+                               seq_len, params_.n_heads * params_.head_dim);
+            }
+        }
+        else if (q_input_data)
+        {
+            info.addOutput("Q", q_input_data,
                            seq_len, params_.n_heads * params_.head_dim);
         }
 
-        // K tensor (optional, in-place)
+        // K tensor (optional)
         if (params_.K)
         {
             int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
-            const float *k_data = getSafeFp32Data(params_.K);
-            if (k_data)
+
+            // K input
+            const float *k_input_data = getSafeFp32Data(params_.K);
+            if (k_input_data)
             {
-                info.addInput("K", k_data,
+                info.addInput("K", k_input_data,
                               seq_len, n_kv_heads * params_.head_dim);
-                info.addOutput("K", k_data,
+            }
+
+            // K output - use K_out in Hybrid mode, otherwise same as input (in-place)
+            if (hybrid_mode && params_.K_out)
+            {
+                const float *k_out_data = getSafeFp32Data(params_.K_out);
+                if (k_out_data)
+                {
+                    info.addOutput("K", k_out_data,
+                                   seq_len, n_kv_heads * params_.head_dim);
+                }
+            }
+            else if (k_input_data)
+            {
+                info.addOutput("K", k_input_data,
                                seq_len, n_kv_heads * params_.head_dim);
             }
         }
@@ -3490,6 +3566,146 @@ namespace llaminar2
         LOG_DEBUG("[KVCacheAppendStage] Single-sequence append: " << total_tokens
                                                                   << " tokens to layer " << params_.layer_idx << " seq " << params_.seq_idx);
 
+        // Check if tensors match cache precision - if not, need to convert
+        // This handles Hybrid mode where K_rope is FP32 and V is Q8_1 but cache is FP32
+        bool cache_is_fp32 = (params_.kv_cache->precision() == ActivationPrecision::FP32);
+        bool k_is_fp32 = (params_.K->native_type() == TensorType::FP32);
+        bool v_is_fp32 = (params_.V->native_type() == TensorType::FP32);
+
+        // If cache is FP32 but inputs are not, convert to FP32 for cache append
+        if (cache_is_fp32 && (!k_is_fp32 || !v_is_fp32))
+        {
+            LOG_DEBUG("[KVCacheAppendStage] Converting K/V to FP32 for cache append"
+                      << " (K=" << params_.K->dtype_name()
+                      << ", V=" << params_.V->dtype_name()
+                      << ", tokens=" << total_tokens << ")");
+
+            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+
+            // Create FP32 wrapper tensors for cache append
+            auto k_slice = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+            auto v_slice = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+
+            // Optimized path for small token counts (decode phase):
+            // Use row-by-row dequantization to avoid dequantizing entire tensor.
+            // For prefill (large token counts), use fp32_data() which is more efficient
+            // due to better cache locality and parallelization.
+            constexpr int SMALL_TOKEN_THRESHOLD = 32;
+
+            if (total_tokens <= SMALL_TOKEN_THRESHOLD)
+            {
+                // Small token count - use row-by-row dequantization
+                // This avoids dequantizing the entire [max_seq_len, kv_dim] tensor
+                // when we only need [total_tokens, kv_dim] elements.
+
+                // Handle K (may be FP32 already in Hybrid mode after RoPE)
+                if (k_is_fp32)
+                {
+                    const float *k_fp32 = params_.K->fp32_data();
+                    std::memcpy(k_slice->mutable_data(), k_fp32, total_tokens * kv_dim * sizeof(float));
+                }
+                else
+                {
+                    // K is Q8_1 - dequant row by row
+                    const auto *k_q8 = dynamic_cast<const Q8_1Tensor *>(params_.K);
+                    if (k_q8)
+                    {
+                        for (int t = 0; t < total_tokens; ++t)
+                        {
+                            k_q8->to_fp32_row(t, k_slice->mutable_data() + t * kv_dim);
+                        }
+                    }
+                    else
+                    {
+                        // Fallback: use fp32_data()
+                        const float *k_fp32 = params_.K->fp32_data();
+                        if (!k_fp32)
+                        {
+                            LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for K tensor");
+                            return false;
+                        }
+                        std::memcpy(k_slice->mutable_data(), k_fp32, total_tokens * kv_dim * sizeof(float));
+                    }
+                }
+
+                // Handle V (usually Q8_1 in Hybrid mode)
+                if (v_is_fp32)
+                {
+                    const float *v_fp32 = params_.V->fp32_data();
+                    std::memcpy(v_slice->mutable_data(), v_fp32, total_tokens * kv_dim * sizeof(float));
+                }
+                else
+                {
+                    // V is Q8_1 - dequant row by row
+                    const auto *v_q8 = dynamic_cast<const Q8_1Tensor *>(params_.V);
+                    if (v_q8)
+                    {
+                        for (int t = 0; t < total_tokens; ++t)
+                        {
+                            v_q8->to_fp32_row(t, v_slice->mutable_data() + t * kv_dim);
+                        }
+                    }
+                    else
+                    {
+                        // Fallback: use fp32_data()
+                        const float *v_fp32 = params_.V->fp32_data();
+                        if (!v_fp32)
+                        {
+                            LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for V tensor");
+                            return false;
+                        }
+                        std::memcpy(v_slice->mutable_data(), v_fp32, total_tokens * kv_dim * sizeof(float));
+                    }
+                }
+
+                LOG_TRACE("[KVCacheAppendStage] Used row-by-row dequant for " << total_tokens << " tokens");
+            }
+            else
+            {
+                // Large token count (prefill) - use fp32_data() for better performance
+                const float *k_fp32 = params_.K->fp32_data();
+                const float *v_fp32 = params_.V->fp32_data();
+
+                if (!k_fp32 || !v_fp32)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for K/V tensors");
+                    return false;
+                }
+
+                std::memcpy(k_slice->mutable_data(), k_fp32, total_tokens * kv_dim * sizeof(float));
+                std::memcpy(v_slice->mutable_data(), v_fp32, total_tokens * kv_dim * sizeof(float));
+            }
+
+            // Hybrid mode: also populate V_dequant_out buffer for downstream attention
+            if (params_.V_dequant_out && !v_is_fp32)
+            {
+                auto *v_dequant_fp32 = dynamic_cast<FP32Tensor *>(params_.V_dequant_out);
+                if (v_dequant_fp32 && v_dequant_fp32->mutable_data())
+                {
+                    // Copy from the already-dequantized v_slice
+                    std::memcpy(v_dequant_fp32->mutable_data(), v_slice->data(),
+                                total_tokens * kv_dim * sizeof(float));
+                    LOG_DEBUG("[KVCacheAppendStage] Populated V_dequant_out with "
+                              << total_tokens * kv_dim << " FP32 values");
+                }
+            }
+
+            bool success = params_.kv_cache->append_kv(
+                params_.layer_idx, params_.seq_idx,
+                k_slice.get(), v_slice.get(), total_tokens);
+
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] append_kv failed (after conversion)");
+                return false;
+            }
+
+            return true;
+        }
+
+        // Direct append path - tensors already match cache precision
         bool success = params_.kv_cache->append_kv(
             params_.layer_idx, params_.seq_idx,
             params_.K, params_.V, total_tokens);
@@ -3521,9 +3737,34 @@ namespace llaminar2
             reqs.addInput("V", params_.V->shape(), buf_type);
         }
 
+        // Output: V_dequant (optional, for Hybrid mode)
+        if (params_.V_dequant_out)
+        {
+            reqs.addOutput("V_dequant", params_.V_dequant_out->shape(), BufferTensorType::FP32);
+        }
+
         // Note: KV cache itself is external state, not a buffer managed by this stage
 
         return reqs;
+    }
+
+    std::vector<BufferDescriptor> KVCacheAppendStage::getDeclaredOutputs() const
+    {
+        std::vector<BufferDescriptor> outputs;
+
+        // V_dequant: Produced when in Hybrid mode (Q8_1 activations, FP32 attention)
+        // This buffer MUST be populated by this stage when configured
+        if (params_.V_dequant_out)
+        {
+            auto desc = BufferDescriptor::output(
+                "V_dequant",
+                params_.V_dequant_out->shape(),
+                BufferTensorType::FP32);
+            desc.withProducer("kv_append").validatePopulated();
+            outputs.push_back(std::move(desc));
+        }
+
+        return outputs;
     }
 
     // =============================================================================
@@ -3649,7 +3890,10 @@ namespace llaminar2
                                                             << " n_kv_heads=" << params_.n_kv_heads
                                                             << " head_dim=" << params_.head_dim
                                                             << " position_offset=" << params_.position_offset
-                                                            << " mode=" << attention_mode_name(mode));
+                                                            << " mode=" << attention_mode_name(mode)
+                                                            << " Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null")
+                                                            << " K_type=" << (params_.K ? params_.K->dtype_name() : "null")
+                                                            << " output=" << (void *)params_.output);
 
         // Validate inputs
         if (!params_.Q || !params_.K || !params_.V || !params_.output)
@@ -3776,6 +4020,19 @@ namespace llaminar2
             return false;
         }
 
+        // Debug: dump first few output values
+        if (params_.output)
+        {
+            const float *out_data = getSafeFp32Data(params_.output);
+            if (out_data)
+            {
+                LOG_DEBUG("[AttentionComputeStage] output=" << (void *)params_.output
+                                                            << " Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null")
+                                                            << " out[0:8]=" << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3]
+                                                            << "," << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]);
+            }
+        }
+
         LOG_DEBUG("[AttentionComputeStage] Execute complete (mode=" << attention_mode_name(mode) << ")");
         return true;
     }
@@ -3829,6 +4086,11 @@ namespace llaminar2
         if (params_.output)
         {
             const float *out_data = getSafeFp32Data(params_.output);
+            LOG_DEBUG("[AttentionComputeStage::getDumpInfo] output=" << (void *)params_.output
+                                                                     << " type=" << params_.output->dtype_name()
+                                                                     << " out_data=" << (void *)out_data
+                                                                     << " seq_len=" << params_.seq_len
+                                                                     << " n_heads*head_dim=" << (params_.n_heads * params_.head_dim));
             if (out_data)
             {
                 info.addOutput("output",
@@ -3836,6 +4098,10 @@ namespace llaminar2
                                params_.seq_len,
                                params_.n_heads * params_.head_dim);
             }
+        }
+        else
+        {
+            LOG_DEBUG("[AttentionComputeStage::getDumpInfo] output is NULL");
         }
 
         // Scalars capture all necessary info for debugging
@@ -3928,6 +4194,7 @@ namespace llaminar2
         kernel_config.head_dim = params_.head_dim;
         kernel_config.d_model = params_.d_model;
         kernel_config.backend = params_.backend;
+        kernel_config.use_hybrid_wo = params_.use_hybrid_wo;
 
         kernel_ = std::make_unique<FusedAttentionWoKernel>(kernel_config);
     }
@@ -3997,7 +4264,8 @@ namespace llaminar2
             params_.seq_len,
             effective_kv_len,
             params_.causal,
-            position_offset);
+            position_offset,
+            params_.context_snapshot);
 
         if (!success)
         {
@@ -4043,6 +4311,28 @@ namespace llaminar2
     StageDumpInfo FusedAttentionWoStage::getDumpInfo() const
     {
         StageDumpInfo info;
+
+        // Context snapshot: pre-Wo attention output (for debugging/parity testing)
+        if (params_.context_snapshot)
+        {
+            const float *ctx_data = getSafeFp32Data(params_.context_snapshot);
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] context_snapshot tensor type: "
+                      << static_cast<int>(params_.context_snapshot->native_type())
+                      << " ctx_data=" << (ctx_data ? "valid" : "NULL")
+                      << " seq_len=" << params_.seq_len
+                      << " n_heads*head_dim=" << params_.n_heads * params_.head_dim);
+            if (ctx_data)
+            {
+                info.addOutput("context",
+                               ctx_data,
+                               params_.seq_len,
+                               params_.n_heads * params_.head_dim);
+            }
+        }
+        else
+        {
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] context_snapshot is NULL");
+        }
 
         // Output: fused attention+Wo projection result
         if (params_.output)

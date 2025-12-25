@@ -7,6 +7,7 @@
 #include "RoPEPrimitives.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/FP16Utils.h"
+#include "../../../utils/Logger.h"
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -1997,6 +1998,154 @@ namespace llaminar2::primitives
                 };
                 OMP_WORKSHARE_REGION(do_apply_k_work);
             }
+        }
+    }
+
+    // =========================================================================
+    // Q8_1 → FP32 RoPE (Hybrid Mode - No Requantization)
+    // =========================================================================
+
+    void apply_rope_q8_1_to_fp32(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        float *Q_out,
+        float *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta)
+    {
+        if (!Q_in || !Q_out)
+        {
+            LOG_ERROR("apply_rope_q8_1_to_fp32: Q_in and Q_out must not be null");
+            return;
+        }
+
+        if (head_dim % 32 != 0)
+        {
+            LOG_ERROR("apply_rope_q8_1_to_fp32: head_dim (" << head_dim << ") must be divisible by 32");
+            return;
+        }
+
+        const int blocks_per_head = head_dim / 32;
+        const int half_dim = head_dim / 2;
+        const int q_stride_blocks = n_heads * blocks_per_head;
+        const int k_stride_blocks = n_kv_heads * blocks_per_head;
+        const int q_stride_floats = n_heads * head_dim;
+        const int k_stride_floats = n_kv_heads * head_dim;
+
+        // Pre-compute FP32 sin/cos table for all positions
+        // Shape: [seq_len, half_dim]
+        std::vector<float> cos_table(seq_len * half_dim);
+        std::vector<float> sin_table(seq_len * half_dim);
+
+        // Compute frequency bases: inv_freq[i] = 1.0 / (theta^(2i/head_dim))
+        std::vector<float> inv_freq(half_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float exponent = static_cast<float>(2 * i) / static_cast<float>(head_dim);
+            inv_freq[i] = 1.0f / std::pow(rope_theta, exponent);
+        }
+
+        // Compute sin/cos for each position
+        for (int t = 0; t < seq_len; ++t)
+        {
+            int pos = position_ids ? position_ids[t] : t;
+            if (pos < 0)
+                pos = 0; // Handle padding
+            float *c_ptr = cos_table.data() + t * half_dim;
+            float *s_ptr = sin_table.data() + t * half_dim;
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float angle = static_cast<float>(pos) * inv_freq[i];
+                c_ptr[i] = std::cos(angle);
+                s_ptr[i] = std::sin(angle);
+            }
+        }
+
+        // Process Q tensor: dequant + rotate (no requant)
+        auto do_q_work = [&]()
+        {
+#pragma omp for collapse(2)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const Q8_1Block *head_in = Q_in + t * q_stride_blocks + h * blocks_per_head;
+                    float *head_out = Q_out + t * q_stride_floats + h * head_dim;
+                    const float *c_ptr = cos_table.data() + t * half_dim;
+                    const float *s_ptr = sin_table.data() + t * half_dim;
+
+                    // Dequantize all blocks for this head
+                    alignas(64) float dequant[256]; // Max head_dim = 256
+                    for (int b = 0; b < blocks_per_head; ++b)
+                    {
+                        const Q8_1Block &block = head_in[b];
+                        float scale = fp16_to_fp32_rope(block.d);
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            dequant[b * 32 + i] = static_cast<float>(block.qs[i]) * scale;
+                        }
+                    }
+
+                    // Apply rotation and write to FP32 output
+                    for (int i = 0; i < half_dim; ++i)
+                    {
+                        float x = dequant[i];
+                        float y = dequant[i + half_dim];
+                        float c = c_ptr[i];
+                        float s = s_ptr[i];
+                        head_out[i] = x * c - y * s;
+                        head_out[i + half_dim] = x * s + y * c;
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_q_work);
+
+        // Process K tensor if provided
+        if (K_in && K_out)
+        {
+            auto do_k_work = [&]()
+            {
+#pragma omp for collapse(2)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int h = 0; h < n_kv_heads; ++h)
+                    {
+                        const Q8_1Block *head_in = K_in + t * k_stride_blocks + h * blocks_per_head;
+                        float *head_out = K_out + t * k_stride_floats + h * head_dim;
+                        const float *c_ptr = cos_table.data() + t * half_dim;
+                        const float *s_ptr = sin_table.data() + t * half_dim;
+
+                        // Dequantize all blocks for this head
+                        alignas(64) float dequant[256];
+                        for (int b = 0; b < blocks_per_head; ++b)
+                        {
+                            const Q8_1Block &block = head_in[b];
+                            float scale = fp16_to_fp32_rope(block.d);
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                dequant[b * 32 + i] = static_cast<float>(block.qs[i]) * scale;
+                            }
+                        }
+
+                        // Apply rotation and write to FP32 output
+                        for (int i = 0; i < half_dim; ++i)
+                        {
+                            float x = dequant[i];
+                            float y = dequant[i + half_dim];
+                            float c = c_ptr[i];
+                            float s = s_ptr[i];
+                            head_out[i] = x * c - y * s;
+                            head_out[i + half_dim] = x * s + y * c;
+                        }
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_k_work);
         }
     }
 

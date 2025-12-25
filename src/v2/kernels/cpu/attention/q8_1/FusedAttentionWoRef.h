@@ -81,6 +81,14 @@ namespace llaminar::v2::kernels
          */
         float *output;
 
+        /**
+         * Optional context snapshot buffer in FP32 (for debugging/parity testing)
+         * When non-null, the kernel writes the pre-Wo attention context here.
+         * - Non-batched: [seq_len, num_heads * head_dim]
+         * - Batched: [batch_size, seq_len, num_heads * head_dim]
+         */
+        float *context_snapshot = nullptr;
+
         // ============== Batch dimensions ==============
 
         /**

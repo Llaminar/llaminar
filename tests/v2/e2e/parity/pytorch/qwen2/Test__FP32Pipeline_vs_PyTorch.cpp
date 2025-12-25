@@ -1,9 +1,14 @@
 /**
- * @file Test__Qwen2FP32Parity.cpp
- * @brief End-to-end FP32 parity tests for Qwen2 inference against PyTorch reference
+ * @file Test__FP32Pipeline_vs_PyTorch.cpp
+ * @brief E2E Parity: Llaminar FP32 Pipeline vs PyTorch Reference
+ *
+ * @category e2e/parity/pytorch
+ * @tested   FP32 inference pipeline (GraphOrchestrator)
+ * @reference PyTorch Qwen2 implementation (ground truth)
+ *
  * @author David Sanftenberg
  * @date 2025-11-06
- * @updated 2025-12-19 - Migrated to IInferenceRunner/GraphOrchestrator
+ * @updated 2025-12-25 - Reorganized into e2e/parity hierarchy
  *
  * Validates Qwen2 inference correctness by comparing against PyTorch ground truth.
  * Uses the unified IInferenceRunner interface which now defaults to GraphOrchestrator.

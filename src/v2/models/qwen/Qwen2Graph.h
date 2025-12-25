@@ -215,6 +215,17 @@ namespace llaminar2
         TensorBase *workspace_context = nullptr;
         TensorBase *workspace_mask = nullptr;
 
+        // === Hybrid Mode Buffers ===
+        /// FP32 Q after RoPE (Hybrid mode only - avoids requantization)
+        /// When set, RoPE outputs to this buffer instead of modifying Q in-place
+        TensorBase *Q_rope = nullptr;
+        /// FP32 K after RoPE (Hybrid mode only - avoids requantization)
+        /// When set, RoPE outputs to this buffer instead of modifying K in-place
+        TensorBase *K_rope = nullptr;
+        /// FP32 V dequantized (Hybrid mode only - for KV cache when V is Q8_1)
+        /// V doesn't go through RoPE but needs to match KV cache precision
+        TensorBase *V_dequant = nullptr;
+
         // === Batched Decode Buffers (for gather from multiple cache slots) ===
         TensorBase *gathered_K = nullptr; ///< [batch_size * max_kv_len, kv_dim]
         TensorBase *gathered_V = nullptr; ///< [batch_size * max_kv_len, kv_dim]
@@ -222,6 +233,11 @@ namespace llaminar2
         // === OUTPUT Buffers ===
         TensorBase *attn_proj = nullptr;
         TensorBase *current_hidden = nullptr;
+
+        // === SNAPSHOT Buffers (for debugging, enabled with ENABLE_PIPELINE_SNAPSHOTS) ===
+        /// Optional buffer to capture attention context before Wo projection
+        /// Shape: [batch_size * seq_len, n_heads * head_dim]
+        TensorBase *context_snapshot = nullptr;
     };
 
     /**

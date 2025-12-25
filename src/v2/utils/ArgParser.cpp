@@ -11,9 +11,221 @@
 #include <cstring>
 #include <cstdlib>
 #include <sstream>
+#include <algorithm>
 
 namespace llaminar2
 {
+
+    // ========================================================================
+    // Argument Registry - Single Source of Truth for CLI Validation
+    // ========================================================================
+
+    const std::vector<ArgDef> &ArgRegistry::getDefinitions()
+    {
+        // Static registry of all enum-type arguments that need validation
+        // Format: {name, {aliases}, {valid_values}, default, allow_empty, is_prefix}
+        static const std::vector<ArgDef> definitions = {
+            // Precision settings
+            {"--activation-precision",
+             {"--activation-prec", "--act-prec"},
+             {"fp32", "bf16", "fp16", "q8_1", "hybrid"},
+             "hybrid",
+             false,
+             false},
+
+            {"--weight-precision",
+             {"--weight-prec"},
+             {"native", "fp32", "bf16", "fp16", "int8"},
+             "native",
+             false,
+             false},
+
+            // Device placement
+            {"--device",
+             {"-d"},
+             {"auto", "cpu"}, // cuda:N and rocm:N handled by prefix matching
+             "auto",
+             false,
+             true}, // is_prefix_match = true for cuda:0, rocm:1, etc.
+
+            {"--strategy",
+             {},
+             {"auto", "all-gpu", "all-cpu", "layer-split", "memory-aware", "moe-optimized", "custom", "multi-gpu"},
+             "auto",
+             false,
+             false},
+
+            // Multi-GPU
+            {"--gpu-split",
+             {},
+             {"even"}, // Also allows custom ratios like "0.6,0.4" - handled specially
+             "",
+             true,  // Empty is allowed (means not specified)
+             true}, // Prefix match for ratio patterns
+
+            // Fused attention
+            {"--fused-attention-backend",
+             {},
+             {"jit", "reference", "tiled"},
+             "jit",
+             true, // Empty allowed (means use default)
+             false},
+
+            // Chat templates - common ones, but also allows custom
+            {"--chat-template",
+             {},
+             {"chatml", "llama3", "llama2", "mistral", "mistral-v7", "phi3", "gemma", "deepseek", "zephyr", "vicuna", "alpaca"},
+             "",
+             true, // Empty allowed (auto-detect from model)
+             false},
+        };
+        return definitions;
+    }
+
+    const ArgDef *ArgRegistry::findDef(const std::string &arg_name)
+    {
+        for (const auto &def : getDefinitions())
+        {
+            if (def.name == arg_name)
+            {
+                return &def;
+            }
+            for (const auto &alias : def.aliases)
+            {
+                if (alias == arg_name)
+                {
+                    return &def;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    bool ArgRegistry::validateArg(const std::string &arg_name,
+                                  const std::string &value,
+                                  std::string &error_out)
+    {
+        const ArgDef *def = findDef(arg_name);
+        if (!def)
+        {
+            // No definition found - argument is not validated by registry
+            // (might be a free-form argument like --prompt or --model)
+            return true;
+        }
+
+        // Check for empty value
+        if (value.empty())
+        {
+            if (def->allow_empty)
+            {
+                return true;
+            }
+            std::ostringstream oss;
+            oss << "Invalid " << def->name << " value: empty string not allowed. ";
+            oss << "Valid options: ";
+            for (size_t i = 0; i < def->valid_values.size(); ++i)
+            {
+                if (i > 0)
+                    oss << ", ";
+                oss << def->valid_values[i];
+            }
+            error_out = oss.str();
+            return false;
+        }
+
+        // Check valid values
+        if (!def->valid_values.empty())
+        {
+            bool is_valid = false;
+
+            if (def->is_prefix_match)
+            {
+                // For prefix matching (e.g., --device cuda:0)
+                // Check if value starts with any valid prefix or is an exact match
+                for (const auto &valid : def->valid_values)
+                {
+                    if (value == valid || value.rfind(valid + ":", 0) == 0 ||
+                        value.rfind(valid + "=", 0) == 0)
+                    {
+                        is_valid = true;
+                        break;
+                    }
+                }
+
+                // Special cases for device: allow cuda:N and rocm:N patterns
+                if (!is_valid && def->name == "--device")
+                {
+                    if (value.rfind("cuda:", 0) == 0 || value.rfind("rocm:", 0) == 0)
+                    {
+                        is_valid = true;
+                    }
+                }
+
+                // Special case for gpu-split: allow ratio patterns like "0.6,0.4"
+                if (!is_valid && def->name == "--gpu-split")
+                {
+                    // Check if it looks like a ratio pattern (contains digits and commas/dots)
+                    bool has_digit = false;
+                    bool valid_chars = true;
+                    for (char c : value)
+                    {
+                        if (std::isdigit(c))
+                            has_digit = true;
+                        else if (c != '.' && c != ',')
+                            valid_chars = false;
+                    }
+                    if (has_digit && valid_chars)
+                    {
+                        is_valid = true;
+                    }
+                }
+            }
+            else
+            {
+                // Exact match required
+                for (const auto &valid : def->valid_values)
+                {
+                    if (value == valid)
+                    {
+                        is_valid = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!is_valid)
+            {
+                std::ostringstream oss;
+                oss << "Invalid " << def->name << " value '" << value << "'. ";
+                oss << "Valid options: ";
+                for (size_t i = 0; i < def->valid_values.size(); ++i)
+                {
+                    if (i > 0)
+                        oss << ", ";
+                    oss << def->valid_values[i];
+                }
+                if (def->is_prefix_match)
+                {
+                    if (def->name == "--device")
+                    {
+                        oss << ", cuda:N, rocm:N";
+                    }
+                    else if (def->name == "--gpu-split")
+                    {
+                        oss << ", or ratio like 0.6,0.4";
+                    }
+                }
+                error_out = oss.str();
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // ========================================================================
+    // Argument Parsing
+    // ========================================================================
 
     ArgContext ArgParser::parse(int argc, char *argv[])
     {
@@ -379,6 +591,54 @@ namespace llaminar2
         }
         // else: keep default or environment-configured level
 
+        // Systematic validation of all enum-type arguments using ArgRegistry
+        // This validates all arguments that have definitions in the registry
+        std::string validation_error;
+
+        if (!ArgRegistry::validateArg("--activation-precision", ctx.activation_precision, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
+        if (!ArgRegistry::validateArg("--weight-precision", ctx.weight_precision, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
+        if (!ArgRegistry::validateArg("--device", ctx.device, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
+        if (!ArgRegistry::validateArg("--strategy", ctx.strategy, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
+        if (!ctx.gpu_split.empty() && !ArgRegistry::validateArg("--gpu-split", ctx.gpu_split, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
+        if (!ctx.fused_attention_backend_str.empty() &&
+            !ArgRegistry::validateArg("--fused-attention-backend", ctx.fused_attention_backend_str, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
+        if (!ctx.chat_template.empty() &&
+            !ArgRegistry::validateArg("--chat-template", ctx.chat_template, validation_error))
+        {
+            ctx.error = validation_error;
+            return ctx;
+        }
+
         return ctx;
     }
 
@@ -440,11 +700,12 @@ namespace llaminar2
         std::cout << "                              bf16   - Dequantize to BF16 at load\n";
         std::cout << "                              fp16   - Dequantize to FP16 at load\n";
         std::cout << "                              int8   - Dequantize to INT8 at load\n";
-        std::cout << "  --activation-precision M  Precision for activations (default: fp32)\n";
-        std::cout << "  --activation-prec M         fp32  - 32-bit float (highest accuracy)\n";
-        std::cout << "  --act-prec M                bf16  - bfloat16 (Intel AMX, 2× faster)\n";
-        std::cout << "                              fp16  - 16-bit float (ARM/GPU)\n";
-        std::cout << "                              q8_1  - 8-bit quantized with per-block scaling\n\n";
+        std::cout << "  --activation-precision M  Precision for activations (default: hybrid)\n";
+        std::cout << "  --activation-prec M         fp32   - 32-bit float (highest accuracy)\n";
+        std::cout << "  --act-prec M                bf16   - bfloat16 (Intel AMX, 2× faster)\n";
+        std::cout << "                              fp16   - 16-bit float (ARM/GPU)\n";
+        std::cout << "                              q8_1   - 8-bit quantized with per-block scaling\n";
+        std::cout << "                              hybrid - Mixed: FP32 residual, BF16 KV, Q8_1 QKV (default)\n\n";
 
         std::cout << "Tensor Parallelism:\n";
         std::cout << "  --no-shard-weights        Disable weight sharding (use replicated weights)\n";

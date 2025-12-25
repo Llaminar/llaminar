@@ -30,6 +30,9 @@ namespace llaminar::v2::kernels::microkernels
         Q8_1,             ///< Block quantized Q8_1
         Q8_1_VNNI_PACKED, ///< gemm_v4::QuantisedPackedWeights (AVX-512 VNNI), JIT-only
         Q4_0,             ///< Block quantized Q4_0
+        // Hybrid mode: VNNI-packed weights with FP32 streaming dequantization
+        // This gives highest precision by avoiding activation quantization
+        FP32_STREAMING_DEQUANT,
     };
 
     /**

@@ -1665,6 +1665,56 @@ namespace llaminar2
             float theta_base, int device_idx) { return false; }
 
         /**
+         * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)
+         *
+         * This method dequantizes Q8_1 input, applies rotation, and outputs
+         * to FP32 WITHOUT requantization. Used in Hybrid activation precision
+         * mode to eliminate the dequant→rotate→requant cycle.
+         *
+         * @param Q_in Q8_1 Q input tensor [seq_len, n_heads * head_dim]
+         * @param K_in Q8_1 K input tensor [seq_len, n_kv_heads * head_dim] or nullptr
+         * @param Q_out FP32 Q output tensor [seq_len, n_heads * head_dim]
+         * @param K_out FP32 K output tensor [seq_len, n_kv_heads * head_dim] or nullptr
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param rope_theta RoPE frequency base
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply_q8_1_to_fp32(
+            TensorBase *Q_in,
+            TensorBase *K_in,
+            TensorBase *Q_out,
+            TensorBase *K_out,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q_in;
+            (void)K_in;
+            (void)Q_out;
+            (void)K_out;
+            (void)position_ids;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)rope_theta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Default: not supported
+        }
+
+        /**
          * @brief Apply RoPE using tensor objects with automatic type dispatch
          *
          * Inspects Q/K tensor native_type() and dispatches to the appropriate

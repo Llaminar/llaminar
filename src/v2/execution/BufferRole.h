@@ -278,6 +278,18 @@ namespace llaminar2
         int device_idx = -1;
 
         // =====================================================================
+        // Producer/Consumer Contract Fields (Phase 2: Buffer Validation)
+        // =====================================================================
+
+        /// Stage name that produces this buffer (empty = external/pre-allocated)
+        /// Used by GraphValidator to verify buffer flow
+        std::string producer_stage;
+
+        /// Whether this buffer must be non-zero after producer executes
+        /// When true, GraphValidator will check tensor is populated
+        bool validate_populated = false;
+
+        // =====================================================================
         // Convenience Methods
         // =====================================================================
 
@@ -375,6 +387,47 @@ namespace llaminar2
                                        BufferTensorType type = BufferTensorType::FP32)
         {
             return BufferDescriptor{name, BufferRole::WEIGHT, std::move(shape), type, true, 64, -1};
+        }
+
+        // =====================================================================
+        // Fluent Builder Extensions (Producer/Consumer Contracts)
+        // =====================================================================
+
+        /**
+         * @brief Declare which stage produces this buffer
+         *
+         * Used by GraphValidator to verify buffer flow - ensures that
+         * every buffer with a producer_stage actually gets populated.
+         *
+         * @param stage Stage name (e.g., "kv_append", "rope")
+         * @return Reference for chaining
+         */
+        BufferDescriptor &withProducer(const std::string &stage)
+        {
+            producer_stage = stage;
+            return *this;
+        }
+
+        /**
+         * @brief Mark buffer for population validation
+         *
+         * When set, debug builds will verify the buffer is non-zero
+         * after the producer stage executes.
+         *
+         * @return Reference for chaining
+         */
+        BufferDescriptor &validatePopulated()
+        {
+            validate_populated = true;
+            return *this;
+        }
+
+        /**
+         * @brief Check if buffer has a declared producer
+         */
+        bool hasProducer() const
+        {
+            return !producer_stage.empty();
         }
     };
 

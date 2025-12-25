@@ -527,6 +527,8 @@ add_library(llaminar2_core STATIC
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
     execution/GraphOrchestrator.cpp
+    execution/HybridPrecisionConfig.cpp
+    execution/InferenceMode.cpp
     # Placement strategy (weight/compute distribution)
     execution/PlacementPlan.cpp
     execution/PlacementStrategy.cpp

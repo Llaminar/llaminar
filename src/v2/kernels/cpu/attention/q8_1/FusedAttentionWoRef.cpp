@@ -177,6 +177,14 @@ namespace llaminar::v2::kernels
         const BatchOffsets offsets = compute_batch_offsets(params);
         float *output_base = params.output + batch_idx * offsets.output_batch_stride;
 
+        // Optional context snapshot: [batch_size, seq_len, num_heads * head_dim]
+        float *context_snapshot_base = nullptr;
+        if (params.context_snapshot)
+        {
+            context_snapshot_base = params.context_snapshot +
+                                    batch_idx * seq_len * num_heads * head_dim;
+        }
+
         // Process each query position
         for (int m = 0; m < seq_len; ++m)
         {
@@ -186,6 +194,13 @@ namespace llaminar::v2::kernels
             for (int h = 0; h < num_heads; ++h)
             {
                 process_head(params, batch_idx, m, h, context_buffer);
+
+                // Copy to snapshot buffer if provided
+                if (context_snapshot_base)
+                {
+                    float *ctx_dst = context_snapshot_base + m * num_heads * head_dim + h * head_dim;
+                    std::memcpy(ctx_dst, context_buffer, head_dim * sizeof(float));
+                }
 
                 // Project context through Wo and accumulate into output
                 // μK4: WoProjection

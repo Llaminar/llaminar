@@ -1,6 +1,10 @@
 /**
- * @file Test__Q8_1_LayerByLayer_Divergence.cpp
- * @brief Layer-by-layer divergence analysis between Q8_1 and FP32 paths
+ * @file Test__Q8_1Pipeline_vs_FP32Pipeline_LayerByLayer.cpp
+ * @brief E2E Parity: Llaminar Q8_1 Pipeline vs FP32 Pipeline (Layer-by-Layer)
+ *
+ * @category e2e/parity/internal/q8_1_vs_fp32
+ * @tested   Q8_1 quantized inference pipeline (GraphOrchestrator with Q8_1)
+ * @reference FP32 inference pipeline (GraphOrchestrator with FP32)
  *
  * This test runs both FP32 and Q8_1 pipelines with snapshot capture enabled,
  * then compares intermediate activations at each stage to identify exactly
@@ -28,7 +32,7 @@
  *
  * @author David Sanftenberg
  * @date 2025-12-09
- * @updated 2025-12-19 - Migrated to IInferenceRunner interface
+ * @updated 2025-12-25 - Reorganized into e2e/parity hierarchy
  */
 
 #include <gtest/gtest.h>

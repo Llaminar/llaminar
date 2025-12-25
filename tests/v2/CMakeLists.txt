@@ -1213,6 +1213,19 @@ add_v2_test(V2_Unit_ChatTemplate
     MPI_PROCS 1  # ChatTemplate is single-rank only
 )
 
+# Test: ArgParser (command-line argument parsing and validation)
+add_executable(v2_test_arg_parser unit/Test__ArgParser.cpp)
+target_link_libraries(v2_test_arg_parser 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ArgParser 
+    COMMAND $<TARGET_FILE:v2_test_arg_parser>
+    LABELS "V2;Unit;CLI;ArgParser;Validation;Configuration"
+    MPI_PROCS 1  # ArgParser is single-rank only
+)
+
 # Test: BPETokenizer byte encoding (GPT-2 style byte-level encoding/decoding)
 add_executable(v2_test_bpe_byte_encoding unit/Test__BPETokenizerByteEncoding.cpp)
 target_link_libraries(v2_test_bpe_byte_encoding 
@@ -2165,6 +2178,17 @@ add_v2_test(V2_Unit_IGraphBuilder
     MPI_PROCS 1
 )
 
+# Test: HybridPrecisionConfig (per-buffer precision configuration for Hybrid mode)
+# Tests buffer precision resolution, default configuration, and requiresSeparateBuffer
+# Part of Hybrid Activation Precision Mode implementation
+add_executable(v2_test_hybrid_precision_config unit/Test__HybridPrecisionConfig.cpp)
+target_link_libraries(v2_test_hybrid_precision_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HybridPrecisionConfig
+    COMMAND $<TARGET_FILE:v2_test_hybrid_precision_config>
+    LABELS "V2;Unit;Execution;HybridPrecision;BufferPrecision;ActivationPrecision"
+    MPI_PROCS 1
+)
+
 # Test: StageBufferRequirements (IComputeStage::getBufferRequirements())
 # Tests buffer requirement declarations for all compute stages (SwiGLU, ResidualAdd,
 # RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for GraphBufferManager integration
@@ -2174,6 +2198,61 @@ target_link_libraries(v2_test_stage_buffer_requirements llaminar2_core GTest::gt
 add_v2_test(V2_Unit_StageBufferRequirements
     COMMAND $<TARGET_FILE:v2_test_stage_buffer_requirements>
     LABELS "V2;Unit;Execution;ComputeStage;BufferRequirements;BufferRole"
+    MPI_PROCS 1
+)
+
+# Test: TensorValidation (debug-only tensor validation utilities)
+# Tests zero detection, NaN/Inf detection, and validation assertions.
+# Part of Buffer Contract Validation System - Phase 1: Quick Wins
+add_executable(v2_test_tensor_validation unit/Test__TensorValidation.cpp)
+target_link_libraries(v2_test_tensor_validation llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TensorValidation
+    COMMAND $<TARGET_FILE:v2_test_tensor_validation>
+    LABELS "V2;Unit;TensorOperations;Validation;Debug"
+    MPI_PROCS 1
+)
+
+# Test: GraphValidator (buffer flow validation for compute graphs)
+# Tests buffer producer/consumer ordering, orphan detection, type compatibility.
+# Part of Buffer Contract Validation System - Phase 2: Buffer Contracts
+add_executable(v2_test_graph_validator unit/Test__GraphValidator.cpp)
+target_link_libraries(v2_test_graph_validator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphValidator
+    COMMAND $<TARGET_FILE:v2_test_graph_validator>
+    LABELS "V2;Unit;Execution;Validation;GraphValidator;BufferContracts"
+    MPI_PROCS 1
+)
+
+# Test: StageOutputManifest (getDeclaredOutputs for stage output contracts)
+# Tests that stages correctly declare their output buffers with producer contracts.
+# Part of Buffer Contract Validation System - Phase 3: Stage Output Manifest
+add_executable(v2_test_stage_output_manifest unit/Test__StageOutputManifest.cpp)
+target_link_libraries(v2_test_stage_output_manifest llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageOutputManifest
+    COMMAND $<TARGET_FILE:v2_test_stage_output_manifest>
+    LABELS "V2;Unit;Execution;Validation;StageOutputManifest;BufferContracts"
+    MPI_PROCS 1
+)
+
+# Test: InferenceMode (centralized mode context for activation precision)
+# Tests mode identification, buffer requirements, attention strategy, validation.
+# Part of Buffer Contract Validation System - Phase 4: InferenceMode Context
+add_executable(v2_test_inference_mode unit/Test__InferenceMode.cpp)
+target_link_libraries(v2_test_inference_mode llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_InferenceMode
+    COMMAND $<TARGET_FILE:v2_test_inference_mode>
+    LABELS "V2;Unit;Execution;Validation;InferenceMode;BufferContracts"
+    MPI_PROCS 1
+)
+
+# Test: ValidationConfig (buffer validation environment variables and GraphExecutor integration)
+# Tests LLAMINAR_VALIDATE_BUFFERS, LLAMINAR_FAIL_ON_ZERO, LLAMINAR_FAIL_ON_NAN.
+# Part of Buffer Contract Validation System - Phase 5: Debug Validation Flag
+add_executable(v2_test_validation_config unit/Test__ValidationConfig.cpp)
+target_link_libraries(v2_test_validation_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ValidationConfig
+    COMMAND $<TARGET_FILE:v2_test_validation_config>
+    LABELS "V2;Unit;Execution;Validation;ValidationConfig;BufferContracts;DebugEnv"
     MPI_PROCS 1
 )
 
@@ -2406,6 +2485,9 @@ add_v2_test(V2_Integration_Q8_1_FusedAttention
     MPI_PROCS 1
     LABELS "V2;Integration;Kernels;Attention;Q8_1;FusedOps;Correctness"
 )
+
+# NOTE: Q8_1 vs FP32 attention parity tests have been moved to e2e/parity/kernels/attention/
+# See: V2_E2E_Parity_SimpleAttentionQ8_1_vs_FP32 and V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
 
 # Test: Q8_1 Isolated Attention Kernel Test
 # Captures attention inputs from pipeline, compares FP32 vs Q8_1 kernel in isolation
@@ -2838,92 +2920,145 @@ add_v2_test(V2_Unit_IQ4_XSTensor
 )
 
 # =============================================================================
-# E2E Tests
+# E2E Parity Tests
 # =============================================================================
-# Full pipeline tests with real models and inference
-# Tests complete workflows: load -> prefill -> decode -> validate output
+# Full pipeline and kernel parity tests comparing different execution paths
+# Organized by: what is being tested vs what reference
+#
+# Structure:
+#   e2e/parity/pytorch/       - Against PyTorch ground truth
+#   e2e/parity/internal/      - Llaminar modes compared against each other
+#   e2e/parity/kernels/       - Individual kernel comparisons
 
-# Qwen2 MPI Rank Parity (single-rank vs multi-rank comparison)
-# These tests compare MPI ranks against each other, NOT against PyTorch ground truth.
-# Only build for Debug or E2ERelease configurations (requires ENABLE_PIPELINE_SNAPSHOTS)
+# -----------------------------------------------------------------------------
+# E2E Parity: MPI Tensor-Parallel vs Single-Rank
+# -----------------------------------------------------------------------------
+# Compares distributed execution against single-node to ensure TP correctness
 if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
-    add_executable(v2_test_qwen2_mpi_rank_parity 
-        e2e/qwen2/Test__Qwen2MPIRankParity.cpp
-        e2e/gtest_mpi_main.cpp
+    add_executable(v2_e2e_parity_mpi_vs_single_rank 
+        e2e/parity/internal/mpi_vs_single_rank/Test__MPIPipeline_vs_SingleRank.cpp
+        e2e/parity/gtest_mpi_main.cpp
     )
-    target_link_libraries(v2_test_qwen2_mpi_rank_parity llaminar2_core GTest::gtest MPI::MPI_CXX)
+    target_link_libraries(v2_e2e_parity_mpi_vs_single_rank llaminar2_core GTest::gtest MPI::MPI_CXX)
 
-    add_v2_test(V2_E2E_Qwen2MPIRankParity
-        COMMAND $<TARGET_FILE:v2_test_qwen2_mpi_rank_parity>
-        LABELS "V2;E2E;Qwen;MPI;RankParity;Models"
+    add_v2_test(V2_E2E_Parity_MPIPipeline_vs_SingleRank
+        COMMAND $<TARGET_FILE:v2_e2e_parity_mpi_vs_single_rank>
+        LABELS "V2;E2E;Parity;Internal;MPI;TensorParallel"
         MPI_PROCS 2
     )
 else()
-    message(STATUS "V2: E2E MPI rank parity test disabled (snapshots not available in Release build)")
+    message(STATUS "V2: E2E MPI parity test disabled (snapshots not available in Release build)")
     message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
 endif()
 
-# =============================================================================
-# PyTorch Parity Tests
-# =============================================================================
-# Ground truth validation against PyTorch reference implementation
-# Compares layer-by-layer outputs, logits, attention scores, etc.
-
-# Qwen2 FP32 Parity (PyTorch ground truth validation)
-# Requires: PyTorch snapshots generated by python/reference/generate_qwen2_pipeline_snapshots.py
-# Requires: cnpy library for NumPy .npz file loading
+# -----------------------------------------------------------------------------
+# E2E Parity: Llaminar FP32 Pipeline vs PyTorch Reference
+# -----------------------------------------------------------------------------
+# Ground truth validation against PyTorch Qwen2 implementation
 find_package(ZLIB)
 if(ZLIB_FOUND)
-    # Get the workspace root (parent of src/v2)
     get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
-    # E2E parity test requires ENABLE_PIPELINE_SNAPSHOTS (Debug or E2ERelease builds)
-    # Skip in standard Release builds to avoid linking errors
     if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
-        add_executable(v2_test_qwen2_fp32_parity 
-            e2e/qwen2/Test__Qwen2FP32Parity.cpp
+        add_executable(v2_e2e_parity_fp32_vs_pytorch 
+            e2e/parity/pytorch/qwen2/Test__FP32Pipeline_vs_PyTorch.cpp
             ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
         )
-        target_link_libraries(v2_test_qwen2_fp32_parity 
+        target_link_libraries(v2_e2e_parity_fp32_vs_pytorch 
             llaminar2_core 
             GTest::gtest 
             GTest::gtest_main
             ZLIB::ZLIB
         )
-        target_include_directories(v2_test_qwen2_fp32_parity PRIVATE 
+        target_include_directories(v2_e2e_parity_fp32_vs_pytorch PRIVATE 
             ${WORKSPACE_ROOT}/external/cnpy
         )
         
-        add_v2_test(V2_E2E_Qwen2FP32Parity
-            COMMAND $<TARGET_FILE:v2_test_qwen2_fp32_parity>
-            LABELS "V2;E2E;Qwen;Parity;PyTorch;FP32"
+        add_v2_test(V2_E2E_Parity_FP32Pipeline_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_e2e_parity_fp32_vs_pytorch>
+            LABELS "V2;E2E;Parity;PyTorch;FP32;Qwen2"
             MPI_PROCS 1
         )
-        message(STATUS "V2: E2E parity test enabled (snapshots available)")
-        
-        # E2E Test: Q8_1 vs FP32 Layer-by-Layer Divergence Analysis
-        # Compares intermediate activations at each pipeline stage between Q8_1 and FP32
-        # Uses snapshot capture to identify exactly where divergence occurs
-        add_executable(v2_test_q8_1_layer_divergence 
-            e2e/qwen2/Test__Q8_1_LayerByLayer_Divergence.cpp
+        message(STATUS "V2: E2E FP32 vs PyTorch parity test enabled")
+
+        # -----------------------------------------------------------------------------
+        # E2E Parity: Q8_1 Pipeline vs FP32 Pipeline (Layer-by-Layer)
+        # -----------------------------------------------------------------------------
+        # Identifies exactly where Q8_1 diverges from FP32 using snapshot comparison
+        add_executable(v2_e2e_parity_q8_1_vs_fp32_pipeline 
+            e2e/parity/internal/q8_1_vs_fp32/Test__Q8_1Pipeline_vs_FP32Pipeline_LayerByLayer.cpp
         )
-        target_link_libraries(v2_test_q8_1_layer_divergence 
+        target_link_libraries(v2_e2e_parity_q8_1_vs_fp32_pipeline 
             llaminar2_core 
             GTest::gtest 
         )
-        add_v2_test(V2_E2E_Q8_1_LayerByLayer_Divergence
-            COMMAND $<TARGET_FILE:v2_test_q8_1_layer_divergence>
-            LABELS "V2;E2E;Qwen;Parity;Q8_1;FP32;Divergence"
+        add_v2_test(V2_E2E_Parity_Q8_1Pipeline_vs_FP32Pipeline
+            COMMAND $<TARGET_FILE:v2_e2e_parity_q8_1_vs_fp32_pipeline>
+            LABELS "V2;E2E;Parity;Internal;Q8_1;FP32;LayerByLayer"
             MPI_PROCS 1
         )
-        message(STATUS "V2: Q8_1 layer divergence test enabled (snapshots available)")
+        message(STATUS "V2: E2E Q8_1 vs FP32 pipeline parity test enabled")
+
+        # -----------------------------------------------------------------------------
+        # E2E Parity: Hybrid Pipeline vs FP32 and Q8_1 (Layer-by-Layer)
+        # -----------------------------------------------------------------------------
+        # Validates that Hybrid precision mode achieves ≥0.995 cosine similarity
+        # with FP32, measuring improvement over full Q8_1 mode
+        add_executable(v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline 
+            e2e/parity/internal/hybrid_vs_fp32_q8_1/Test__HybridPipeline_vs_FP32_Q8_1_LayerByLayer.cpp
+        )
+        target_link_libraries(v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline 
+            llaminar2_core 
+            GTest::gtest 
+        )
+        add_v2_test(V2_E2E_Parity_HybridPipeline_vs_FP32_Q8_1
+            COMMAND $<TARGET_FILE:v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline>
+            LABELS "V2;E2E;Parity;Internal;Hybrid;FP32;Q8_1;LayerByLayer"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2: E2E Hybrid vs FP32/Q8_1 pipeline parity test enabled")
     else()
-        message(STATUS "V2: E2E parity test disabled (snapshots not available in Release build)")
+        message(STATUS "V2: E2E parity tests disabled (snapshots not available in Release build)")
         message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
     endif()
 else()
-    message(WARNING "ZLIB not found - Qwen2 FP32 parity test disabled (requires cnpy for .npz loading)")
+    message(WARNING "ZLIB not found - PyTorch parity tests disabled (requires cnpy for .npz loading)")
 endif()
+
+# -----------------------------------------------------------------------------
+# E2E Parity: Kernel-Level Tests (Attention)
+# -----------------------------------------------------------------------------
+# Compare individual kernels against FP32 reference implementations
+# These run without model loading and test kernel correctness in isolation
+
+# JitFusedAttentionWo (FA2 Q8_1 kernel) vs FP32 Decomposed Attention
+add_executable(v2_e2e_parity_jit_fused_attention_vs_fp32 
+    e2e/parity/kernels/attention/Test__JitFusedAttentionWo_vs_FP32Attention.cpp
+)
+target_link_libraries(v2_e2e_parity_jit_fused_attention_vs_fp32 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
+    COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_vs_fp32>
+    LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;FA2;JIT"
+    MPI_PROCS 1
+)
+
+# QuantisedAttentionJit_Q8_1_Fused (Simple Q8_1 kernel) vs FP32 Decomposed Attention  
+add_executable(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
+    e2e/parity/kernels/attention/Test__SimpleAttentionQ8_1_vs_FP32Attention.cpp
+)
+target_link_libraries(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_E2E_Parity_SimpleAttentionQ8_1_vs_FP32
+    COMMAND $<TARGET_FILE:v2_e2e_parity_simple_attention_q8_1_vs_fp32>
+    LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;Simple"
+    MPI_PROCS 1
+)
 
 # Performance Test: GEMM Tuning Sweep
 add_executable(v2_perf_gemm_tuning_sweep performance/kernels/cpu/gemm/Perf__GemmTuningSweep.cpp)
@@ -3221,6 +3356,21 @@ target_link_libraries(v2_test_jit_fused_attention_wo_correctness
 add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness 
     COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_correctness>
     LABELS "V2;Unit;JIT;FusedAttention;Correctness;AVX512;Q8_1;NumericalParity"
+    MPI_PROCS 1
+)
+
+# Test: JIT Fused Attention Manual Verification
+# Tests JIT kernel against MANUALLY COMPUTED ground truth (not C++ reference).
+# This catches bugs where both JIT and reference have the same error.
+add_executable(v2_test_jit_fused_attention_manual_verify unit/attention/Test__JitFusedAttentionWo_ManualVerification.cpp)
+target_link_libraries(v2_test_jit_fused_attention_manual_verify 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttention_ManualVerify
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_manual_verify>
+    LABELS "V2;Unit;JIT;FusedAttention;ManualVerification;Q8_1;GroundTruth"
     MPI_PROCS 1
 )
 

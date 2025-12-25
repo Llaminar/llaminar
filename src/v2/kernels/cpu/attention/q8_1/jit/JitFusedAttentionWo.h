@@ -390,6 +390,7 @@ namespace llaminar::v2::kernels::jit
      * @param seq_len_kv Number of KV positions
      * @param scale Attention scale factor (1/sqrt(head_dim))
      * @param position_offset Position offset for causal masking (decode mode)
+     * @param context_snapshot Optional buffer to capture pre-Wo context (for E2E testing)
      */
     using JitAttentionKernelFn = void (*)(
         const void *Q,
@@ -400,11 +401,24 @@ namespace llaminar::v2::kernels::jit
         int seq_len_q,
         int seq_len_kv,
         float scale,
-        int position_offset);
+        int position_offset,
+        float *context_snapshot);
 
     // External helper for packed VNNI Wo projection.
     // Wo points to a gemm_v4::QuantisedPackedWeights, A is FP32 context [m,k], C is FP32 output [m,n].
     extern "C" void llaminar2_wo_q8_1_vnni_packed_gemm(
+        const void *wo_packed,
+        const float *A,
+        float *C,
+        int m,
+        int n,
+        int k);
+
+    // External helper for FP32 streaming dequant Wo projection (Hybrid mode).
+    // Dequantizes VNNI-packed weights to FP32 on-the-fly for highest precision.
+    // This avoids quantizing the FP32 context, giving best numerical accuracy.
+    // Wo points to a JitPackedWoParams, A is FP32 context [m,k], C is FP32 output [m,n].
+    extern "C" void llaminar2_wo_fp32_streaming_dequant_gemm(
         const void *wo_packed,
         const float *A,
         float *C,
@@ -791,6 +805,7 @@ namespace llaminar::v2::kernels::jit
             //   │ [rsp + position_offset_spill] Saved position_offset (8)    │
             //   │ [rsp + batch_ctx_idx_spill]   Batch context index (8)      │
             //   │ [rsp + batch_start_q_spill]   First q_idx in batch (8)     │
+            //   │ [rsp + context_snapshot_spill] Snapshot buffer ptr (8)     │
             //   └─────────────────────────────────────────────────────────────┘
 
             int q_stack_offset = 0;
@@ -801,8 +816,9 @@ namespace llaminar::v2::kernels::jit
             int position_offset_spill_offset = seq_len_kv_spill_offset + 8;
             int batch_ctx_idx_spill_offset = position_offset_spill_offset + 8;
             int batch_start_q_spill_offset = batch_ctx_idx_spill_offset + 8;
+            int context_snapshot_spill_offset = batch_start_q_spill_offset + 8;
             // Scratch: spill scores for FA2 wider tiles (8x needs 8 scalar scores + 1 scalar max)
-            int fa2_scores_spill_offset = batch_start_q_spill_offset + 8;
+            int fa2_scores_spill_offset = context_snapshot_spill_offset + 8;
             int fa2_max1_spill_offset = fa2_scores_spill_offset + 32; // 8 floats = 32 bytes
 
             // ═══════════════════════════════════════════════════════════════════
@@ -827,6 +843,11 @@ namespace llaminar::v2::kernels::jit
             Reg64 reg_tmp = rdi; // Temporarily reuse rdi (will be overwritten later)
             mov(reg_tmp.cvt32(), ptr[rsp + stack_size + stack_frame_size() + 16]);
             mov(ptr[rsp + position_offset_spill_offset], reg_tmp);
+
+            // Load and save context_snapshot pointer from original stack (9th arg)
+            // Stack layout: [+8]=seq_len_kv, [+16]=position_offset, [+24]=context_snapshot
+            mov(reg_tmp, ptr[rsp + stack_size + stack_frame_size() + 24]);
+            mov(ptr[rsp + context_snapshot_spill_offset], reg_tmp);
 
             // Initialize batch context index to 0
             mov(qword[rsp + batch_ctx_idx_spill_offset], 0);
@@ -892,6 +913,19 @@ namespace llaminar::v2::kernels::jit
             jl("skip_flush", T_NEAR); // Batch not full - skip flush
 
             L("flush_batch");
+            // ═══════════════════════════════════════════════════════════════════
+            // CONTEXT SNAPSHOT (for E2E testing)
+            // ═══════════════════════════════════════════════════════════════════
+            // If context_snapshot != nullptr, copy the normalized context buffer
+            // before Wo projection for comparison with PyTorch reference.
+
+            emit_context_snapshot_copy(
+                context_buffer_offset,
+                context_snapshot_spill_offset,
+                batch_ctx_idx_spill_offset,
+                batch_start_q_spill_offset,
+                local_dim);
+
             // ═══════════════════════════════════════════════════════════════════
             // BATCHED WO PROJECTION
             // ═══════════════════════════════════════════════════════════════════
@@ -1166,9 +1200,10 @@ namespace llaminar::v2::kernels::jit
             int q_loop_spill = context_head_offset_spill + 8;              // Query loop counter
             int kv_loop_end_spill = q_loop_spill + 8;                      // KV loop end bound
             int kv_head_offset_spill = kv_loop_end_spill + 8;              // Pre-computed kv_head * kv_head_stride
+            int context_snapshot_spill = kv_head_offset_spill + 8;         // Context snapshot pointer (9th arg)
 
             // Total stack size (64-byte aligned for AVX-512)
-            int stack_size = kv_head_offset_spill + 8 + 64;
+            int stack_size = context_snapshot_spill + 8 + 64;
             stack_size = (stack_size + 63) & ~63;
 
             // ═══════════════════════════════════════════════════════════════════
@@ -1194,6 +1229,10 @@ namespace llaminar::v2::kernels::jit
             // Spill position_offset (8th arg from original stack)
             mov(rax, ptr[rsp + stack_size + stack_frame_size() + 16]);
             mov(ptr[rsp + position_offset_spill], rax);
+
+            // Spill context_snapshot (9th arg from original stack)
+            mov(rax, ptr[rsp + stack_size + stack_frame_size() + 24]);
+            mov(ptr[rsp + context_snapshot_spill], rax);
 
             // Re-initialize zmm26 (may have been clobbered)
             emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rax);
@@ -1438,7 +1477,8 @@ namespace llaminar::v2::kernels::jit
                 reg_Wo, reg_output,
                 num_blocks, q_tile_size_,
                 softmax_offset, context_offset,
-                tile_start_spill, tile_size_spill, d_model, local_dim, q_local_spill, q_loop_spill);
+                tile_start_spill, tile_size_spill, d_model, local_dim, q_local_spill, q_loop_spill,
+                context_snapshot_spill);
 
             // ═══════════════════════════════════════════════════════════════════
             // ADVANCE TO NEXT TILE
@@ -1889,11 +1929,11 @@ namespace llaminar::v2::kernels::jit
                     vbroadcastss(ymm_scale, xmm_scale);
                     vmulps(ymm_dot, ymm_dot, ymm_scale);
 
-                    // Compute correction term: 16 * sum_qs_k * d_q * d_k
-                    // The 16 factor comes from the unsigned→signed conversion offset
+                    // Compute correction term: 128 * sum_qs_k * d_q * d_k
+                    // The 128 factor comes from the unsigned→signed conversion offset (XOR 0x80)
                     Xmm xmm_corr_low(24);
                     Ymm ymm_corr(24);
-                    mov(eax, 0x41800000); // 16.0f
+                    mov(eax, 0x43000000); // 128.0f
                     vmovd(xmm_corr_low, eax);
                     vbroadcastss(ymm_corr, xmm_corr_low);
                     vmulps(ymm_corr, ymm_corr, ymm_sum_qs_k);
@@ -2378,8 +2418,8 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             for (int b = 0; b < num_blocks; ++b)
             {
-                int q_off = b * 36; // Q block is at 36-byte stride on stack
-                int k_off = b * 36; // K block is at 36-byte stride
+                int q_off = b * 64; // Q block is at 64-byte stride on stack (aligned)
+                int k_off = b * 36; // K block is at 36-byte stride (from KV cache)
 
                 // Load Q scale (FP16 → FP32)
                 vpbroadcastw(xmm_d_q, ptr[reg_Q + q_off]);
@@ -2415,9 +2455,9 @@ namespace llaminar::v2::kernels::jit
                 // Apply scale to dot product
                 vmulps(ymm_dot, ymm_dot, Ymm(xmm_scale_block.getIdx()));
 
-                // Compute correction: 16 * sum_qs_k * (d_q * d_k)
-                // The 16 factor accounts for unsigned→signed offset
-                mov(eax, 0x41800000); // 16.0f
+                // Compute correction: 128 * sum_qs_k * (d_q * d_k)
+                // The 128 factor accounts for unsigned→signed offset (XOR 0x80 adds 128)
+                mov(eax, 0x43000000); // 128.0f
                 vmovd(xmm_correction, eax);
                 vbroadcastss(Ymm(xmm_correction.getIdx()), xmm_correction);
 
@@ -3016,7 +3056,8 @@ namespace llaminar::v2::kernels::jit
             int d_model,
             int local_dim,
             int q_local_spill,
-            int q_loop_spill)
+            int q_loop_spill,
+            int context_snapshot_spill)
         {
             using namespace Xbyak;
 
@@ -3110,6 +3151,71 @@ namespace llaminar::v2::kernels::jit
             jmp(".proj_loop", T_NEAR);
 
             L(".proj_end");
+
+            // ───────────────────────────────────────────────────────────────────
+            // CONTEXT SNAPSHOT: Copy normalized context to snapshot buffer
+            // ───────────────────────────────────────────────────────────────────
+            // snapshot_ptr = context_snapshot + tile_start * local_dim * 4
+            // For each query q in [0, tile_size):
+            //   copy local_dim floats from context[q] to snapshot[tile_start + q]
+            // ───────────────────────────────────────────────────────────────────
+            mov(rax, ptr[rsp + context_snapshot_spill]);
+            test(rax, rax);
+            jz(".snapshot_skip", T_NEAR);
+
+            // Calculate base snapshot pointer: snapshot + tile_start * local_dim * 4
+            mov(r10, ptr[rsp + tile_start_spill]);
+            imul(r10, r10, local_dim * 4);
+            add(rax, r10);
+            // rax = snapshot destination for tile_start
+
+            // Loop over queries in tile
+            xor_(r8, r8); // q_idx = 0
+            L(".snapshot_loop");
+            cmp(r8, ptr[rsp + tile_size_spill]);
+            jge(".snapshot_end", T_NEAR);
+
+            // Calculate context source: rsp + context_offset + q_idx * local_dim * 4
+            mov(r10, r8);
+            imul(r10, r10, local_dim * 4);
+            lea(r11, ptr[rsp + context_offset]);
+            add(r11, r10);
+            // r11 = source context pointer for this query
+
+            // Copy local_dim floats (64 bytes at a time using AVX-512)
+            {
+                int copy_bytes = local_dim * 4;
+                int offset = 0;
+                for (int b = 0; b < copy_bytes / 64; ++b)
+                {
+                    vmovups(Xbyak::Zmm(0), ptr[r11 + offset]);
+                    vmovups(ptr[rax + offset], Xbyak::Zmm(0));
+                    offset += 64;
+                }
+                // Handle remaining bytes (< 64)
+                if (copy_bytes % 64 >= 32)
+                {
+                    vmovups(Xbyak::Ymm(0), ptr[r11 + offset]);
+                    vmovups(ptr[rax + offset], Xbyak::Ymm(0));
+                    offset += 32;
+                }
+                if (copy_bytes % 32 >= 16)
+                {
+                    vmovups(Xbyak::Xmm(0), ptr[r11 + offset]);
+                    vmovups(ptr[rax + offset], Xbyak::Xmm(0));
+                    offset += 16;
+                }
+                // Remainder handled by scalar if needed (rare for typical dims)
+            }
+
+            // Advance snapshot dest pointer by local_dim floats
+            add(rax, local_dim * 4);
+
+            inc(r8);
+            jmp(".snapshot_loop", T_NEAR);
+
+            L(".snapshot_end");
+            L(".snapshot_skip");
 
             // ───────────────────────────────────────────────────────────────────
             // WO PROJECTION: Project normalized context through Wo
@@ -4495,6 +4601,93 @@ namespace llaminar::v2::kernels::jit
         }
 
         /**
+         * @brief Emit code to copy context buffer to snapshot buffer (for E2E testing)
+         *
+         * This copies the normalized attention context to an external buffer before
+         * Wo projection, allowing comparison with PyTorch reference implementations.
+         *
+         * Layout: [batch_size, local_dim] where local_dim = num_heads * head_dim
+         *
+         * @param context_buffer_offset Stack offset for context buffer
+         * @param context_snapshot_spill_offset Stack offset for snapshot pointer spill
+         * @param batch_ctx_idx_spill_offset Stack offset for batch count
+         * @param batch_start_q_spill_offset Stack offset for first query index
+         * @param local_dim Context dimension (num_heads * head_dim)
+         */
+        void emit_context_snapshot_copy(
+            int context_buffer_offset,
+            int context_snapshot_spill_offset,
+            int batch_ctx_idx_spill_offset,
+            int batch_start_q_spill_offset,
+            int local_dim)
+        {
+            using namespace Xbyak;
+
+            debug_emit("emit_context_snapshot_copy");
+
+            // Load snapshot pointer - skip if nullptr
+            Reg64 reg_snapshot = rax;
+            mov(reg_snapshot, ptr[rsp + context_snapshot_spill_offset]);
+            test(reg_snapshot, reg_snapshot);
+            jz(".skip_snapshot", T_NEAR);
+
+            // Load batch parameters
+            Reg64 reg_batch_size = rcx;
+            Reg64 reg_batch_start = r8;
+            mov(reg_batch_size, ptr[rsp + batch_ctx_idx_spill_offset]);
+            mov(reg_batch_start, ptr[rsp + batch_start_q_spill_offset]);
+
+            // Skip if no contexts to copy
+            test(reg_batch_size, reg_batch_size);
+            jz(".skip_snapshot", T_NEAR);
+
+            // Calculate destination: snapshot + batch_start * local_dim * sizeof(float)
+            Reg64 reg_dst = r9;
+            mov(reg_dst, reg_batch_start);
+            imul(reg_dst, reg_dst, local_dim * 4);
+            add(reg_dst, reg_snapshot);
+
+            // Source: context buffer on stack
+            Reg64 reg_src = r10;
+            lea(reg_src, ptr[rsp + context_buffer_offset]);
+
+            // Copy size in bytes: batch_size * local_dim * sizeof(float)
+            Reg64 reg_bytes = r11;
+            mov(reg_bytes, reg_batch_size);
+            imul(reg_bytes, reg_bytes, local_dim * 4);
+
+            // Vectorized copy loop using AVX-512 (64 bytes per iteration)
+            // Most contexts are multiples of 64 bytes (head_dim=64 -> 256 bytes per head)
+            Zmm zmm_copy = scratch0().zmm();
+
+            L(".snapshot_copy_loop");
+            cmp(reg_bytes, 64);
+            jl(".snapshot_copy_tail", T_NEAR);
+
+            vmovups(zmm_copy, ptr[reg_src]);
+            vmovups(ptr[reg_dst], zmm_copy);
+            add(reg_src, 64);
+            add(reg_dst, 64);
+            sub(reg_bytes, 64);
+            jmp(".snapshot_copy_loop", T_NEAR);
+
+            L(".snapshot_copy_tail");
+            // Handle remaining bytes (< 64) with scalar copy
+            test(reg_bytes, reg_bytes);
+            jz(".skip_snapshot", T_NEAR);
+
+            L(".snapshot_copy_tail_loop");
+            mov(eax, ptr[reg_src]);
+            mov(ptr[reg_dst], eax);
+            add(reg_src, 4);
+            add(reg_dst, 4);
+            sub(reg_bytes, 4);
+            jnz(".snapshot_copy_tail_loop", T_NEAR);
+
+            L(".skip_snapshot");
+        }
+
+        /**
          * @brief Apply batched Wo projection to accumulated contexts
          *
          * Calls the VNNI GEMM with m = batch_size to process multiple query
@@ -5023,6 +5216,11 @@ namespace llaminar::v2::kernels::jit
             case WoFormat::Q8_1_VNNI_PACKED:
                 emit_wo_projection_vnni_inline(reg_Wo, reg_out_ptr, context_buffer_offset, d_model, local_dim);
                 break;
+            case WoFormat::FP32_STREAMING_DEQUANT:
+                // Hybrid mode: dequantize VNNI-packed weights to FP32 on-the-fly
+                // This gives highest precision but is slower than Q8_1_VNNI_PACKED
+                emit_wo_projection_streaming_dequant(reg_Wo, reg_out_ptr, context_buffer_offset, d_model, local_dim);
+                break;
             }
         }
 
@@ -5524,6 +5722,88 @@ namespace llaminar::v2::kernels::jit
             L(".outer_end");
 
             outLocalLabel();
+        }
+
+        /**
+         * @brief FP32 streaming dequant Wo projection (Hybrid mode)
+         *
+         * This path provides highest numerical precision by:
+         * 1. Dequantizing VNNI-packed weights to FP32 on-the-fly
+         * 2. Computing FP32 context × FP32 weights → FP32 output
+         *
+         * Avoids quantizing the FP32 context, which is the key source of
+         * precision loss in the standard Q8_1 VNNI path.
+         *
+         * Flow:
+         *   FP32 context × dequant(VNNI-packed weights) → FP32 output
+         * vs standard VNNI path:
+         *   quant(FP32 context) × VNNI-packed weights → FP32 output
+         *
+         * @param reg_Wo Pointer to JitPackedWoParams struct
+         * @param reg_output Output pointer for current query
+         * @param context_buffer_offset Stack offset to FP32 context buffer
+         * @param d_model Output dimension (N)
+         * @param local_dim Input dimension (K)
+         */
+        void emit_wo_projection_streaming_dequant(
+            const Xbyak::Reg64 &reg_Wo,
+            const Xbyak::Reg64 &reg_output,
+            int context_buffer_offset,
+            int d_model,
+            int local_dim)
+        {
+            using namespace Xbyak;
+            debug_emit("emit_wo_projection_streaming_dequant");
+
+            // This path calls an external C function that:
+            // 1. Dequantizes VNNI-packed weights to FP32 (streaming, per-row)
+            // 2. Computes FP32 GEMM: output = context × dequant(Wo)
+            //
+            // The extern "C" function signature matches the VNNI GEMM helper:
+            //   void llaminar2_wo_fp32_streaming_dequant_gemm(
+            //       const void* wo_packed,
+            //       const float* A,
+            //       float* C,
+            //       int m, int n, int k);
+
+            // Save caller-saved registers we'll clobber
+            push(rdi);
+            push(rsi);
+            push(rdx);
+            push(rcx);
+            push(r8);
+            push(r9);
+
+            // Set up arguments for the external call
+            // rdi: wo_packed (JitPackedWoParams*)
+            mov(rdi, reg_Wo);
+
+            // rsi: A (context buffer ptr)
+            lea(rsi, ptr[rsp + 6 * 8 + context_buffer_offset]);
+
+            // rdx: C (output ptr)
+            mov(rdx, reg_output);
+
+            // rcx: m = 1 (single row for decode)
+            mov(rcx, 1);
+
+            // r8: n = d_model (output dimension)
+            mov(r8, d_model);
+
+            // r9: k = local_dim (input dimension, same as context width)
+            mov(r9, local_dim);
+
+            // Call the external helper function
+            mov(rax, reinterpret_cast<size_t>(llaminar2_wo_fp32_streaming_dequant_gemm));
+            call(rax);
+
+            // Restore registers
+            pop(r9);
+            pop(r8);
+            pop(rcx);
+            pop(rdx);
+            pop(rsi);
+            pop(rdi);
         }
 
         void emit_wo_projection_vnni_inline(
@@ -7269,9 +7549,10 @@ namespace llaminar::v2::kernels::jit
             int seq_len_q,
             int seq_len_kv,
             float scale,
-            int position_offset = 0)
+            int position_offset = 0,
+            float *context_snapshot = nullptr)
         {
-            kernel_(Q, K, V, Wo, output, seq_len_q, seq_len_kv, scale, position_offset);
+            kernel_(Q, K, V, Wo, output, seq_len_q, seq_len_kv, scale, position_offset, context_snapshot);
         }
 
         /**

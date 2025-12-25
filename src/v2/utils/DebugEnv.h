@@ -1167,6 +1167,62 @@ namespace llaminar2
     };
 
     /**
+     * @brief Buffer validation configuration
+     *
+     * Controls runtime validation of tensor buffers to catch uninitialized
+     * or corrupted data early. Part of the Buffer Contract Validation System.
+     *
+     * **Environment Variables**:
+     * - `LLAMINAR_VALIDATE_BUFFERS`: Enable buffer validation after stage execution (0/1)
+     * - `LLAMINAR_FAIL_ON_ZERO`: Fail immediately when zero tensor detected (0/1)
+     * - `LLAMINAR_FAIL_ON_NAN`: Fail immediately when NaN/Inf detected (0/1)
+     *
+     * **Usage**:
+     * @code
+     *   # Enable buffer validation (debug builds only)
+     *   LLAMINAR_VALIDATE_BUFFERS=1 ./build_v2/llaminar2 -m model.gguf -p "test"
+     *
+     *   # Strict mode: fail on any zero or NaN tensor
+     *   LLAMINAR_VALIDATE_BUFFERS=1 LLAMINAR_FAIL_ON_ZERO=1 LLAMINAR_FAIL_ON_NAN=1 ...
+     * @endcode
+     *
+     * @note Validation only runs in debug builds (#ifndef NDEBUG)
+     * @see TensorValidation.h for validation functions
+     */
+    struct ValidationConfig
+    {
+        bool validate_buffers = false; ///< Enable buffer validation after stage execution
+        bool fail_on_zero = false;     ///< Fail immediately when zero tensor detected
+        bool fail_on_nan = false;      ///< Fail immediately when NaN/Inf detected
+
+        ValidationConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *validate_env = std::getenv("LLAMINAR_VALIDATE_BUFFERS");
+            if (validate_env)
+            {
+                validate_buffers = (std::atoi(validate_env) != 0);
+            }
+
+            const char *fail_zero_env = std::getenv("LLAMINAR_FAIL_ON_ZERO");
+            if (fail_zero_env)
+            {
+                fail_on_zero = (std::atoi(fail_zero_env) != 0);
+            }
+
+            const char *fail_nan_env = std::getenv("LLAMINAR_FAIL_ON_NAN");
+            if (fail_nan_env)
+            {
+                fail_on_nan = (std::atoi(fail_nan_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -1180,6 +1236,7 @@ namespace llaminar2
         SnapshotConfig snapshot;      ///< Snapshot and tensor dump configuration
         StageDumpConfig stage_dump;   ///< Compute stage input/output dumping
         MPILoggingConfig mpi_logging; ///< MPI collective operation logging
+        ValidationConfig validation;  ///< Buffer validation configuration
 
         DebugEnv() = default;
 
@@ -1193,6 +1250,7 @@ namespace llaminar2
             snapshot.reload();
             stage_dump.reload();
             mpi_logging.reload();
+            validation.reload();
         }
     };
 

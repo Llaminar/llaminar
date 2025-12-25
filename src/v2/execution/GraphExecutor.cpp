@@ -7,6 +7,7 @@
 
 #include "GraphExecutor.h"
 #include "StageDumper.h"
+#include "../tensors/TensorValidation.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include <algorithm>
@@ -539,6 +540,14 @@ namespace llaminar2
             StageDumper::finalizeDump(dump_ctx, ms);
         }
 
+        // Validate stage outputs if buffer validation is enabled (debug builds only)
+#ifndef NDEBUG
+        if (success && debugEnv().validation.validate_buffers)
+        {
+            success = validateStageOutputs(node);
+        }
+#endif
+
         // Invoke snapshot callback if configured (uses same dump info for efficiency)
         if (success && config_.snapshot_callback)
         {
@@ -548,6 +557,99 @@ namespace llaminar2
 
         return success;
     }
+
+    // =============================================================================
+    // Buffer Validation (Debug Builds Only)
+    // =============================================================================
+
+#ifndef NDEBUG
+    bool GraphExecutor::validateStageOutputs(const ComputeNode &node)
+    {
+        if (!node.stage)
+            return true;
+
+        const auto &validation = debugEnv().validation;
+
+        // Get stage's dump info to access output buffers
+        auto dump_info = node.stage->getDumpInfo();
+
+        bool all_valid = true;
+
+        // Validate output buffers
+        for (const auto &output : dump_info.outputs)
+        {
+            if (!output.data || output.rows == 0 || output.cols == 0)
+                continue;
+
+            // Check for zero tensor (uninitialized buffer)
+            // Only check FP32 outputs for now
+            if (std::string(output.dtype) == "FP32")
+            {
+                const float *fp32_data = static_cast<const float *>(output.data);
+                size_t numel = output.rows * output.cols;
+
+                // Quick zero check: sample first, middle, last elements
+                bool appears_zero = true;
+                if (numel > 0 && fp32_data[0] != 0.0f)
+                    appears_zero = false;
+                if (numel > 1 && fp32_data[numel / 2] != 0.0f)
+                    appears_zero = false;
+                if (numel > 2 && fp32_data[numel - 1] != 0.0f)
+                    appears_zero = false;
+
+                // Full check if samples all zero
+                if (appears_zero && numel > 3)
+                {
+                    size_t sample_stride = std::max(size_t(1), numel / 100);
+                    for (size_t i = 0; i < numel; i += sample_stride)
+                    {
+                        if (fp32_data[i] != 0.0f)
+                        {
+                            appears_zero = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (appears_zero)
+                {
+                    LOG_WARN("[GraphExecutor] Stage '" << node.name << "' output '" << output.name
+                                                       << "' appears to be all zeros (likely uninitialized)");
+
+                    if (validation.fail_on_zero)
+                    {
+                        LOG_ERROR("[GraphExecutor] Buffer validation failed: zero tensor detected");
+                        all_valid = false;
+                    }
+                }
+
+                // Check for NaN/Inf
+                bool has_nan_inf = false;
+                for (size_t i = 0; i < numel && !has_nan_inf; i += std::max(size_t(1), numel / 100))
+                {
+                    if (std::isnan(fp32_data[i]) || std::isinf(fp32_data[i]))
+                    {
+                        has_nan_inf = true;
+                    }
+                }
+
+                if (has_nan_inf)
+                {
+                    LOG_WARN("[GraphExecutor] Stage '" << node.name << "' output '" << output.name
+                                                       << "' contains NaN or Inf values");
+
+                    if (validation.fail_on_nan)
+                    {
+                        LOG_ERROR("[GraphExecutor] Buffer validation failed: NaN/Inf detected");
+                        all_valid = false;
+                    }
+                }
+            }
+        }
+
+        return all_valid;
+    }
+#endif
 
     // =============================================================================
     // Buffer Management

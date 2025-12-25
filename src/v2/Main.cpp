@@ -131,6 +131,14 @@ int main(int argc, char *argv[])
     // Parse command-line arguments (before MPI init for bootstrap decisions)
     ArgContext args = ArgParser::parse(argc, argv);
 
+    // Handle parse errors early
+    if (!args.error.empty())
+    {
+        std::cerr << "Error: " << args.error << std::endl;
+        ArgParser::printUsage(argv[0]);
+        return 1;
+    }
+
     // Handle help early (no MPI needed)
     if (args.show_help)
     {
@@ -204,6 +212,14 @@ int main(int argc, char *argv[])
 
     // Re-parse arguments (MPI_Init may modify argc/argv)
     args = ArgParser::parse(argc, argv);
+
+    // Handle parse errors (shouldn't happen if first parse succeeded, but be safe)
+    if (!args.error.empty())
+    {
+        std::cerr << "Error: " << args.error << std::endl;
+        MPI_Finalize();
+        return 1;
+    }
 
     // Configure OpenMP environment for this rank
     // (In self-launch case, this was done before exec; here we do it post-MPI init)
@@ -377,13 +393,20 @@ int main(int argc, char *argv[])
     {
         runtime_config.activation_precision = ActivationPrecision::Q8_1;
     }
+    else if (args.activation_precision == "hybrid")
+    {
+        runtime_config.activation_precision = ActivationPrecision::Hybrid;
+    }
     else
     {
+        // This branch should never be reached due to ArgParser validation,
+        // but keep as defensive fallback
         if (mpi_ctx->rank() == 0)
         {
-            LOG_WARN("Unknown activation precision mode '" << args.activation_precision << "', defaulting to FP32");
+            LOG_ERROR("Invalid activation precision mode '" << args.activation_precision
+                                                            << "' - this should have been caught by ArgParser");
         }
-        runtime_config.activation_precision = ActivationPrecision::FP32;
+        runtime_config.activation_precision = ActivationPrecision::Hybrid; // Use default
     }
 
     // Fused attention + Wo kernel

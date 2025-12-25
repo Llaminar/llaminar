@@ -139,11 +139,34 @@ namespace llaminar2
      */
     enum class ActivationPrecision
     {
-        FP32, ///< 32-bit float activations (default, highest accuracy)
-        BF16, ///< bfloat16 activations (Intel AMX, reduced bandwidth)
-        FP16, ///< 16-bit float activations (ARM/GPU optimization)
-        Q8_1  ///< Block-quantized int8 (36 bytes per 32 elements, 3.5x compression)
+        FP32,  ///< 32-bit float activations (default, highest accuracy)
+        BF16,  ///< bfloat16 activations (Intel AMX, reduced bandwidth)
+        FP16,  ///< 16-bit float activations (ARM/GPU optimization)
+        Q8_1,  ///< Block-quantized int8 (36 bytes per 32 elements, 3.5x compression)
+        Hybrid ///< Mixed precision: FP32 residual, BF16 KV cache, Q8_1 QKV activations
     };
+
+    /**
+     * @brief Convert ActivationPrecision enum to string for logging
+     */
+    inline const char *activationPrecisionToString(ActivationPrecision prec)
+    {
+        switch (prec)
+        {
+        case ActivationPrecision::FP32:
+            return "FP32";
+        case ActivationPrecision::BF16:
+            return "BF16";
+        case ActivationPrecision::FP16:
+            return "FP16";
+        case ActivationPrecision::Q8_1:
+            return "Q8_1";
+        case ActivationPrecision::Hybrid:
+            return "Hybrid";
+        default:
+            return "Unknown";
+        }
+    }
 
     /**
      * @brief Runtime configuration for pipeline initialization

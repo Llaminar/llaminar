@@ -102,6 +102,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../tensors/SIMDHelpers.h"
+#include "../../../tensors/QuantizationUtils.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
@@ -1555,78 +1556,15 @@ namespace llaminar2
              * The resulting Q8_1 blocks can be passed to multiply_with_precomputed_q8_1()
              * multiple times without redundant quantization.
              *
-             * Uses SIMD-optimized quantization (AVX-512/AVX2) via simd::quantize_single_block().
+             * Uses SIMD-optimized quantization (AVX-512/AVX2) via shared quantization utility.
              */
             bool quantize_activations(
                 const float *A,
                 void *q8_1_buffer,
                 int m, int k) override
             {
-                if (!A || !q8_1_buffer)
-                {
-                    return false;
-                }
-
-                int k_blocks = (k + 31) / 32;
-                Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
-                const bool k_aligned = (k % 32 == 0);
-
-                // OMP_WORKSHARE_REGION handles nested parallelism automatically
-                auto do_quantize = [&]()
-                {
-                    int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
-                    if (quant_thresh == 0)
-                        quant_thresh = omp_get_max_threads();
-
-                    if (m < quant_thresh)
-                    {
-#pragma omp for collapse(2) schedule(static)
-                        for (int i = 0; i < m; ++i)
-                        {
-                            for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
-                            {
-                                const float *a_row = A + i * k + k_blk * 32;
-                                Q8_1Block *row_blocks = all_blocks + i * k_blocks;
-                                int valid_elements = std::min(32, k - k_blk * 32);
-                                simd::quantize_single_block(a_row, row_blocks[k_blk], valid_elements);
-                            }
-                        }
-                    }
-                    else
-                    {
-#pragma omp for schedule(static)
-                        for (int i = 0; i < m; ++i)
-                        {
-                            const float *a_row = A + i * k;
-                            Q8_1Block *row_blocks = all_blocks + i * k_blocks;
-
-                            if (k_aligned)
-                            {
-                                for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
-                                {
-                                    simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
-                                }
-                            }
-                            else
-                            {
-                                for (int k_blk = 0; k_blk < k_blocks - 1; ++k_blk)
-                                {
-                                    simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
-                                }
-                                if (k_blocks > 0)
-                                {
-                                    int last_k_blk = k_blocks - 1;
-                                    int valid_elements = k - last_k_blk * 32;
-                                    simd::quantize_single_block(a_row + last_k_blk * 32, row_blocks[last_k_blk], valid_elements);
-                                }
-                            }
-                        }
-                    }
-                };
-
-                OMP_WORKSHARE_REGION(do_quantize);
-
-                return true;
+                // Delegate to shared quantization utility
+                return quantization::quantize_fp32_to_q8_1_buffer(A, q8_1_buffer, m, k);
             }
 
             /**

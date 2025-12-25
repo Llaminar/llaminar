@@ -429,6 +429,21 @@ namespace llaminar2
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        // Hybrid mode: Q8_1 input → FP32 output (no requantization)
+        bool apply_q8_1_to_fp32(
+            TensorBase *Q_in,
+            TensorBase *K_in,
+            TensorBase *Q_out,
+            TensorBase *K_out,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
     };
 
 } // namespace llaminar2

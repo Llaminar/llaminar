@@ -9,6 +9,7 @@
  */
 
 #include "GraphOrchestrator.h"
+#include "HybridPrecisionConfig.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
@@ -777,10 +778,7 @@ namespace llaminar2
 
         // Get activation precision from config
         ActivationPrecision act_prec = config.activation_precision;
-        const char *prec_name = (act_prec == ActivationPrecision::Q8_1) ? "Q8_1" : (act_prec == ActivationPrecision::FP16) ? "FP16"
-                                                                               : (act_prec == ActivationPrecision::BF16)   ? "BF16"
-                                                                                                                           : "FP32";
-        LOG_INFO("[GraphOrchestrator] Activation buffer precision: " << prec_name);
+        LOG_INFO("[GraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
 
         // Allocate core buffers (always FP32 - interface with embeddings/softmax)
         state_.hidden = factory.createFP32(
@@ -809,19 +807,53 @@ namespace llaminar2
             device_idx);
 
         // QKV buffers - use configured activation precision
-        // These are the primary activation tensors that benefit from quantization
+        // For Hybrid mode: Q/K are Q8_1 (from QKV GEMM), but we need separate FP32 buffers
+        // for post-RoPE to avoid the dequant→rotate→requant cycle
+        ActivationPrecision qkv_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::QKV_GEMM_Output, nullptr);
         state_.Q = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            act_prec, device_idx);
+            qkv_prec, device_idx);
         state_.K = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            act_prec, device_idx);
+            qkv_prec, device_idx);
         state_.V = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-            act_prec, device_idx);
+            qkv_prec, device_idx);
+
+        // Hybrid mode: Allocate separate FP32 buffers for Q/K after RoPE
+        // This eliminates the requantization step in RoPE
+        // Also allocate V_dequant buffer for KV cache append (V doesn't go through RoPE
+        // but needs to be converted to KV cache precision for storage)
+        if (act_prec == ActivationPrecision::Hybrid)
+        {
+            LOG_INFO("[GraphOrchestrator] Hybrid mode: allocating FP32 Q_rope/K_rope buffers");
+            state_.Q_rope = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+                device_idx);
+            state_.K_rope = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
+                device_idx);
+
+            // V_dequant: FP32 buffer for V before KV cache append
+            // V is Q8_1 from GEMM but KV cache is FP32, so we need dequantization
+            ActivationPrecision kv_cache_prec = resolveBufferPrecision(
+                act_prec, HybridBufferType::KV_Cache, nullptr);
+            state_.V_dequant = factory.createActivation(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
+                kv_cache_prec, device_idx);
+            LOG_INFO("[GraphOrchestrator] Hybrid mode: allocating V_dequant buffer ("
+                     << activationPrecisionToString(kv_cache_prec) << ")");
+        }
+
+        // Attention output buffer
+        // For Hybrid mode: attention context is FP32 (from softmax × V)
+        ActivationPrecision attn_ctx_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::Attention_Context, nullptr);
         state_.attn_output = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-            act_prec, device_idx);
+            attn_ctx_prec, device_idx);
+
         // attn_proj is the output of Wo projection which feeds into the residual stream
         // Keep as FP32 for numerical stability in residual connections
         state_.attn_proj = factory.createFP32(
@@ -829,12 +861,14 @@ namespace llaminar2
             device_idx);
 
         // FFN buffers - gate and up use configured activation precision
+        ActivationPrecision ffn_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::FFN_Gate, nullptr);
         state_.gate = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            act_prec, device_idx);
+            ffn_prec, device_idx);
         state_.up = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            act_prec, device_idx);
+            ffn_prec, device_idx);
         // ffn_output is the output of FFN Down projection which feeds into the residual stream
         // Keep as FP32 for numerical stability in residual connections
         state_.ffn_output = factory.createFP32(
@@ -855,9 +889,23 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(max_seq_len)},
             device_idx);
 
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        // Allocate context snapshot buffer for debugging attention
+        // Shape: [batch_size * max_seq_len, buffer_n_heads * head_dim]
+        state_.context_snapshot = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+            device_idx);
+        LOG_DEBUG("[GraphOrchestrator] Allocated context_snapshot buffer: ["
+                  << batch_size * max_seq_len << ", " << buffer_n_heads * head_dim << "]");
+#endif
+
         // Create KV cache - use sharded cache for tensor parallelism
         // Check if tensor parallelism is enabled (indicated by local_n_kv_heads set)
-        // KV cache uses the same activation precision as other buffers
+        // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
+        ActivationPrecision kv_cache_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::KV_Cache, nullptr);
+        LOG_DEBUG("[GraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
+
         bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
         if (use_sharded_cache && mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
@@ -868,10 +916,10 @@ namespace llaminar2
             LOG_DEBUG("[GraphOrchestrator] Creating sharded KV cache: "
                       << n_kv_heads << " total KV heads, "
                       << config.local_n_kv_heads << " local KV heads (start=" << kv_head_start << ")"
-                      << " precision=" << prec_name);
+                      << " precision=" << activationPrecisionToString(kv_cache_prec));
 
             state_.kv_cache = createShardedKVCache(
-                act_prec,
+                kv_cache_prec,
                 *local_mpi_ctx,
                 n_layers,
                 batch_size,
@@ -886,7 +934,7 @@ namespace llaminar2
         {
             // Non-sharded (replicated) KV cache for single-rank or non-tensor-parallel
             state_.kv_cache = createUnifiedKVCache(
-                act_prec,
+                kv_cache_prec,
                 *local_mpi_ctx,
                 n_layers,
                 batch_size,
@@ -982,6 +1030,16 @@ namespace llaminar2
         model_buffers.layer_buffers.workspace_scores = state_.workspace_scores.get();
         model_buffers.layer_buffers.workspace_context = state_.workspace_context.get();
         model_buffers.layer_buffers.workspace_mask = state_.workspace_mask.get();
+
+        // Hybrid mode buffers: FP32 Q/K after RoPE, V_dequant for KV cache
+        model_buffers.layer_buffers.Q_rope = state_.Q_rope.get();
+        model_buffers.layer_buffers.K_rope = state_.K_rope.get();
+        model_buffers.layer_buffers.V_dequant = state_.V_dequant.get();
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        // Pass context snapshot buffer for attention debugging
+        model_buffers.layer_buffers.context_snapshot = state_.context_snapshot.get();
+#endif
 
         setBuffers(model_buffers);
 

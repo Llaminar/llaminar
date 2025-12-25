@@ -338,6 +338,38 @@ namespace llaminar2
         }
 
         // =========================================================================
+        // Stage Output Manifest (Phase 3: Buffer Contract Validation)
+        // =========================================================================
+
+        /**
+         * @brief Get declared outputs this stage will produce
+         *
+         * Returns descriptors for outputs that this stage commits to producing.
+         * Unlike getBufferRequirements() which describes all buffers needed,
+         * this method focuses on OUTPUT buffers with producer contracts.
+         *
+         * Key difference from getBufferRequirements():
+         * - getBufferRequirements(): "What buffers do I need to run?"
+         * - getDeclaredOutputs(): "What buffers do I promise to populate?"
+         *
+         * Use cases:
+         * - GraphValidator checks that declared outputs actually get populated
+         * - Debug builds verify buffers are non-zero after stage executes
+         * - Documentation of stage contracts for downstream consumers
+         *
+         * Stages that produce outputs conditionally (e.g., V_dequant in hybrid mode)
+         * should only include those outputs when they will actually be produced.
+         *
+         * @return Vector of output buffer descriptors with producer contracts
+         * @see BufferDescriptor::withProducer() for producer declaration
+         * @see BufferDescriptor::validatePopulated() for zero-detection
+         */
+        virtual std::vector<BufferDescriptor> getDeclaredOutputs() const
+        {
+            return {}; // Default: no declared outputs (derive from getBufferRequirements)
+        }
+
+        // =========================================================================
         // Dynamic Parameter Update (Phase 10: Graph Caching Optimization)
         // =========================================================================
 
@@ -788,6 +820,10 @@ namespace llaminar2
             TensorBase *Q = nullptr; ///< Query tensor (IActivationTensor*, modified in-place)
             TensorBase *K = nullptr; ///< Key tensor (IActivationTensor*, modified in-place, optional)
 
+            // Hybrid mode output buffers (optional - when set, output goes here instead of in-place)
+            TensorBase *Q_out = nullptr; ///< FP32 output for Q after RoPE (Hybrid mode)
+            TensorBase *K_out = nullptr; ///< FP32 output for K after RoPE (Hybrid mode)
+
             // Configuration
             int n_heads = 0;             ///< Number of query heads
             int n_kv_heads = 0;          ///< Number of KV heads (for GQA)
@@ -1016,6 +1052,11 @@ namespace llaminar2
             int num_tokens = 0; ///< Total tokens to append (0 = full tensor)
             int batch_size = 1; ///< Number of sequences in batch (for per-seq append)
             int seq_len = 0;    ///< Tokens per sequence (for slicing K/V per-seq)
+
+            /// [Hybrid mode] Optional output for dequantized V (FP32)
+            /// When provided and V is Q8_1, the stage will dequantize V to this buffer
+            /// for use by downstream attention stages
+            TensorBase *V_dequant_out = nullptr;
         };
 
         explicit KVCacheAppendStage(Params params);
@@ -1024,6 +1065,10 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::COPY; } // Cache ops are data movement
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
+        std::vector<BufferDescriptor> getDeclaredOutputs() const override;
+
+        /// Check if this stage will produce V_dequant output
+        bool producesVDequant() const { return params_.V_dequant_out != nullptr; }
 
     private:
         Params params_;
@@ -1292,6 +1337,17 @@ namespace llaminar2
             // Optional MPI context
             const MPIContext *mpi_ctx = nullptr;
             int device_idx = -1;
+
+            // Optional context snapshot buffer for debugging/parity testing
+            // When provided, the kernel will write the pre-Wo attention context to this buffer
+            // Shape: [batch_size * seq_len, n_heads * head_dim] (FP32)
+            TensorBase *context_snapshot = nullptr;
+
+            // Hybrid mode: use streaming dequantization for Wo projection
+            // When true, quantized Wo weights are dequantized to FP32 row-by-row
+            // during GEMM computation, giving FP32-equivalent precision.
+            // When false, uses faster Q8_1 VNNI path with quantized activations.
+            bool use_hybrid_wo = false;
         };
 
         explicit FusedAttentionWoStage(Params params);

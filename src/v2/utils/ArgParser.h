@@ -10,9 +10,70 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <functional>
+#include <initializer_list>
 
 namespace llaminar2
 {
+
+    // ========================================================================
+    // Argument Definition Schema
+    // ========================================================================
+
+    /**
+     * @brief Defines a CLI argument with its validation rules
+     *
+     * Used to systematically validate all CLI arguments against their
+     * allowed values, types, and constraints.
+     */
+    struct ArgDef
+    {
+        std::string name;                      // Primary flag name (e.g., "--activation-precision")
+        std::vector<std::string> aliases;      // Alternative names (e.g., {"--act-prec", "--activation-prec"})
+        std::vector<std::string> valid_values; // For enum types: list of valid string values
+        std::string default_value;             // Default value (for documentation)
+        bool allow_empty = false;              // Whether empty string is valid
+        bool is_prefix_match = false;          // For args like --device=cuda:0 where value has prefix
+
+        // Convenience constructors
+        ArgDef(const std::string &n,
+               std::initializer_list<std::string> aliases_init,
+               std::initializer_list<std::string> valid_init,
+               const std::string &def = "",
+               bool empty_ok = false,
+               bool prefix = false)
+            : name(n), aliases(aliases_init), valid_values(valid_init),
+              default_value(def), allow_empty(empty_ok), is_prefix_match(prefix) {}
+    };
+
+    /**
+     * @brief Registry of all CLI arguments with validation rules
+     *
+     * This is the single source of truth for argument validation.
+     * Add new arguments here to automatically get validation.
+     */
+    class ArgRegistry
+    {
+    public:
+        static const std::vector<ArgDef> &getDefinitions();
+
+        /**
+         * @brief Validate a single argument value against its definition
+         * @param arg_name The argument name (e.g., "--activation-precision")
+         * @param value The value to validate
+         * @param error_out Output parameter for error message if validation fails
+         * @return true if valid, false otherwise
+         */
+        static bool validateArg(const std::string &arg_name,
+                                const std::string &value,
+                                std::string &error_out);
+
+        /**
+         * @brief Get the ArgDef for a given argument name or alias
+         * @return pointer to ArgDef if found, nullptr otherwise
+         */
+        static const ArgDef *findDef(const std::string &arg_name);
+    };
 
     /**
      * @brief Parsed command-line arguments context
@@ -68,7 +129,7 @@ namespace llaminar2
         std::string weight_precision = "native"; // "native", "fp32", "bf16", "fp16", "int8"
 
         // Activation/accumulation precision
-        std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "q8_1"
+        std::string activation_precision = "hybrid"; // "fp32", "bf16", "fp16", "q8_1", "hybrid"
 
         // Weight sharding for tensor parallelism
         bool shard_weights = false;           // Explicitly enable weight sharding (legacy)
@@ -97,6 +158,9 @@ namespace llaminar2
         bool mpi_verbose = false;       // Verbose MPI output (report bindings)
         bool mpi_no_bootstrap = false;  // Disable auto-bootstrap (assume already under MPI)
         bool mpi_oversubscribe = false; // Allow more MPI ranks than available slots
+
+        // Validation errors (set during parse if invalid arguments detected)
+        std::string error; // Non-empty if parse failed - caller should check and exit
     };
 
     /**

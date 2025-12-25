@@ -377,4 +377,33 @@ namespace llaminar2::primitives
         float rope_theta,
         RoPEPersistentState *persistent_state = nullptr);
 
+    /**
+     * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)
+     *
+     * This eliminates the dequant→rotate→requant cycle by outputting
+     * directly to FP32. Used in Hybrid activation precision mode.
+     *
+     * @param Q_in Q8_1 Q input tensor [seq_len * n_heads * blocks_per_head]
+     * @param K_in Q8_1 K input tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
+     * @param Q_out FP32 Q output tensor [seq_len, n_heads * head_dim]
+     * @param K_out FP32 K output tensor [seq_len, n_kv_heads * head_dim] or nullptr
+     * @param position_ids Position indices [seq_len], -1 = padding
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension (must be divisible by 32)
+     * @param rope_theta RoPE base frequency (e.g., 10000.0f)
+     */
+    void apply_rope_q8_1_to_fp32(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        float *Q_out,
+        float *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta);
+
 } // namespace llaminar2::primitives
