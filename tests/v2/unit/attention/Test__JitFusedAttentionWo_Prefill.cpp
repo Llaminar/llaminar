@@ -203,6 +203,11 @@ namespace llaminar::v2::kernels::jit::test
             std::vector<float> output_prefill(seq_len_q * d_model, 0.0f);
             std::vector<float> output_decode(seq_len_q * d_model, 0.0f);
 
+            // Snapshot buffers (local_dim = num_heads * head_dim)
+            int local_dim = num_heads * head_dim;
+            std::vector<float> snapshot_prefill(seq_len_q * local_dim, 0.0f);
+            std::vector<float> snapshot_decode(seq_len_q * local_dim, 0.0f);
+
             // === Run Prefill Mode ===
             {
                 JitAttentionConfig config;
@@ -212,7 +217,8 @@ namespace llaminar::v2::kernels::jit::test
                 config.batch_size = seq_len_q; // Triggers prefill mode
                 config.wo_format = WoFormat::FP32;
                 config.causal = causal;
-                config.mode = AttentionMode::PREFILL; // Explicit prefill
+                config.mode = AttentionMode::PREFILL;   // Explicit prefill
+                config.enable_register_tracking = true; // Enable tracking for debugging
 
                 ASSERT_EQ(config.effectiveMode(), AttentionMode::PREFILL)
                     << "Should use prefill mode";
@@ -227,7 +233,8 @@ namespace llaminar::v2::kernels::jit::test
                     seq_len_q,
                     seq_len_kv,
                     scale,
-                    0); // position_offset = 0
+                    0, // position_offset = 0
+                    snapshot_prefill.data());
             }
 
             // === Run Decode Mode (one query at a time) ===
@@ -239,7 +246,8 @@ namespace llaminar::v2::kernels::jit::test
                 config.batch_size = 1; // Triggers decode mode
                 config.wo_format = WoFormat::FP32;
                 config.causal = causal;
-                config.mode = AttentionMode::DECODE; // Explicit decode
+                config.mode = AttentionMode::DECODE;    // Explicit decode
+                config.enable_register_tracking = true; // Enable tracking for debugging
 
                 ASSERT_EQ(config.effectiveMode(), AttentionMode::DECODE)
                     << "Should use decode mode";
@@ -254,6 +262,7 @@ namespace llaminar::v2::kernels::jit::test
 
                     // Output for this query
                     float *out_slice = output_decode.data() + q * d_model;
+                    float *snap_slice = snapshot_decode.data() + q * local_dim;
 
                     // For causal attention, adjust kv_seq_len to only attend to [0, q+1)
                     int effective_kv_len = causal ? std::min(q + 1, seq_len_kv) : seq_len_kv;
@@ -267,7 +276,34 @@ namespace llaminar::v2::kernels::jit::test
                         1, // seq_len_q = 1
                         effective_kv_len,
                         scale,
-                        q); // position_offset = q for correct causal masking
+                        q, // position_offset = q for correct causal masking
+                        snap_slice);
+                }
+            }
+
+            // === Compare Snapshots (Context before Wo) ===
+            int snapshot_size = seq_len_q * local_dim;
+            double snap_cos_sim = cosine_similarity(snapshot_prefill.data(), snapshot_decode.data(), snapshot_size);
+            double snap_rel_l2 = relative_l2_error(snapshot_prefill.data(), snapshot_decode.data(), snapshot_size);
+
+            std::cout << "  Snapshot Cosine similarity: " << std::fixed << std::setprecision(6) << snap_cos_sim << std::endl;
+            std::cout << "  Snapshot Relative L2 error: " << std::fixed << std::setprecision(6) << snap_rel_l2 << std::endl;
+
+            if (snap_cos_sim < 0.999)
+            {
+                std::cout << "  Snapshot divergence detected!" << std::endl;
+                // Print first few elements of divergence
+                for (int q = 0; q < seq_len_q; ++q)
+                {
+                    std::cout << "    Query " << q << " first 8 elements:" << std::endl;
+                    std::cout << "      Prefill: ";
+                    for (int i = 0; i < 8; ++i)
+                        std::cout << std::fixed << std::setprecision(6) << snapshot_prefill[q * local_dim + i] << " ";
+                    std::cout << std::endl;
+                    std::cout << "      Decode:  ";
+                    for (int i = 0; i < 8; ++i)
+                        std::cout << std::fixed << std::setprecision(6) << snapshot_decode[q * local_dim + i] << " ";
+                    std::cout << std::endl;
                 }
             }
 

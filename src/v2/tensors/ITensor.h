@@ -233,7 +233,7 @@ namespace llaminar2
      * @brief Compile-time type IDs for tensor types
      *
      * These MUST match the TensorType enum values in Tensors.h exactly.
-     * Order: FP32=0, BF16=1, FP16=2, INT8=3, INT32=4, IQ4_NL=5, IQ4_XS=6, Q8_0=7, Q8_1=8, ...
+     * Order: FP32=0, BF16=1, FP16=2, INT8=3, INT32=4, IQ4_NL=5, IQ4_XS=6, Q8_0=7, Q8_1=8, Q16_1=9, ...
      * Defined here as constexpr to enable template specialization without circular dependency.
      */
     namespace TensorTypeId
@@ -252,23 +252,24 @@ namespace llaminar2
         constexpr int IQ4_XS = 6;
         constexpr int Q8_0 = 7;
         constexpr int Q8_1 = 8;
-        constexpr int Q4_0 = 9;
-        constexpr int Q4_1 = 10;
-        constexpr int Q5_0 = 11;
-        constexpr int Q5_1 = 12;
-        constexpr int Q6_K = 13;
-        constexpr int Q2_K = 14;
-        constexpr int Q5_K = 15;
-        constexpr int Q3_K = 16;
-        constexpr int Q4_K = 17;
-        constexpr int Q8_K = 18;
-        constexpr int IQ2_XXS = 19;
-        constexpr int IQ2_XS = 20;
-        constexpr int IQ3_XXS = 21;
-        constexpr int IQ2_S = 22;
-        constexpr int IQ3_S = 23;
-        constexpr int IQ1_S = 24;
-        constexpr int IQ1_M = 25;
+        constexpr int Q16_1 = 9; // High-precision residual format
+        constexpr int Q4_0 = 10;
+        constexpr int Q4_1 = 11;
+        constexpr int Q5_0 = 12;
+        constexpr int Q5_1 = 13;
+        constexpr int Q6_K = 14;
+        constexpr int Q2_K = 15;
+        constexpr int Q5_K = 16;
+        constexpr int Q3_K = 17;
+        constexpr int Q4_K = 18;
+        constexpr int Q8_K = 19;
+        constexpr int IQ2_XXS = 20;
+        constexpr int IQ2_XS = 21;
+        constexpr int IQ3_XXS = 22;
+        constexpr int IQ2_S = 23;
+        constexpr int IQ3_S = 24;
+        constexpr int IQ1_S = 25;
+        constexpr int IQ1_M = 26;
     }
 
 } // namespace llaminar2

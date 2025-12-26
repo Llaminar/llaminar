@@ -115,8 +115,10 @@
 #include "JitWoProjection.h"
 #include "JitWoProjectionOptimized.h"
 #include "JitFastExp.h"
-#include "../../../jit/RegisterAllocation.h" // Typed register allocation for FA2
-#include "v2/utils/CPUFeatures.h"            // Cache-aware batch size calculation
+#include "../../../jit/RegisterAllocation.h"  // Typed register allocation for FA2
+#include "../../../jit/RegisterEnforcement.h" // Enforce typed registers
+#include "../../../jit/RegisterGuard.h"       // Enforce guarded registers
+#include "v2/utils/CPUFeatures.h"             // Cache-aware batch size calculation
 
 #include <memory>
 #include <cstdint>
@@ -486,11 +488,11 @@ namespace llaminar::v2::kernels::jit
             if (config_.effectiveMode() == AttentionMode::PREFILL)
             {
                 // Tile size for prefill: maximize K/V cache reuse
-                // Process 4 queries per K/V load, allowing K/V data to be
+                // Process 8 queries per K/V load, allowing K/V data to be
                 // amortized across multiple queries before eviction from L1.
                 // All context blocks are stored in memory (stack buffer).
 
-                q_tile_size_ = 4; // Process 4 queries per K/V load
+                q_tile_size_ = 8; // Process 8 queries per K/V load
             }
             else
             {
@@ -533,6 +535,112 @@ namespace llaminar::v2::kernels::jit
         JitVWeightedAccumEmitter v_accum_emitter_;
         JitWoProjectionEmitter wo_emitter_;
         JitFastExpEmitter exp_emitter_; // Vectorized exp for prefill softmax
+
+        // ========================================================================
+        // Dynamic Register Accessors (for loop-unrolled patterns)
+        // ========================================================================
+        // These provide type-safe access to register zones using runtime indices.
+        // Use these instead of raw Zmm(q) for tile loops.
+        //
+        // Design: We could use template metaprogramming with std::integer_sequence
+        // to generate truly typed registers, but that would require restructuring
+        // the tile loops. Instead, we provide runtime-indexed accessors that
+        // document the zone intent clearly.
+        //
+        // Usage patterns:
+        //   Before: vxorps(Zmm(q), Zmm(q), Zmm(q));
+        //   After:  vxorps(tile_accum(q), tile_accum(q), tile_accum(q));
+        // ========================================================================
+
+        /**
+         * @brief Get accumulator register for tile query index
+         *
+         * Tile accumulators use zmm0-7 (AccumulatorZone).
+         * For q ∈ [0, q_tile_size_), returns zmm(q).
+         *
+         * @param q Query index within tile (0 to q_tile_size_-1)
+         * @return Xbyak::Zmm for the accumulator
+         */
+        Xbyak::Zmm tile_accum(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_accum: q must be in AccumulatorZone [0,7]");
+            return Xbyak::Zmm(llaminar2::jit::AccumulatorZone::base_index + q);
+        }
+
+        /**
+         * @brief Get XMM view of tile accumulator (for scalar operations)
+         */
+        Xbyak::Xmm tile_accum_xmm(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_accum_xmm: q must be in AccumulatorZone [0,7]");
+            return Xbyak::Xmm(llaminar2::jit::AccumulatorZone::base_index + q);
+        }
+
+        /**
+         * @brief Get weight storage register for tile query index (prefill mode)
+         *
+         * In prefill mode, we store broadcasted weights in the Input zone (zmm8-15).
+         * Layout: tile_weight(q) = zmm(8 + q) for q ∈ [0, q_tile_size_)
+         *
+         * NOTE: This overlaps with Q data registers! Only use after Q is no longer needed.
+         *
+         * @param q Query index within tile (0 to q_tile_size_-1)
+         * @return Xbyak::Zmm for the weight storage
+         */
+        Xbyak::Zmm tile_weight(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_weight: q must be in QVectorZone [0,7]");
+            return Xbyak::Zmm(llaminar2::jit::QVectorZone::base_index + q);
+        }
+
+        /**
+         * @brief Get XMM view of weight storage register (for scalar operations)
+         */
+        Xbyak::Xmm tile_weight_xmm(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_weight_xmm: q must be in QVectorZone [0,7]");
+            return Xbyak::Xmm(llaminar2::jit::QVectorZone::base_index + q);
+        }
+
+        /**
+         * @brief Get correction factor register for tile query index (prefill mode)
+         *
+         * In prefill mode, after computing new softmax state we store correction
+         * factors in the Accumulator zone (reusing the accumulators temporarily).
+         * This is used during context rescaling phase.
+         *
+         * Layout: tile_corr(q) = zmm(q) for q ∈ [0, q_tile_size_)
+         * Same physical register as tile_accum(q) - used in different phases!
+         */
+        Xbyak::Zmm tile_corr(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_corr: q must be in [0,7]");
+            return Xbyak::Zmm(q); // Same as tile_accum, different semantic
+        }
+
+        /**
+         * @brief Get second-row accumulator for Wo projection (rows i and i+1)
+         *
+         * In emit_prefill_wo_q8_1_tile, we process 2 output rows at a time.
+         * Row i uses zmm0-7, row i+1 uses zmm8-15.
+         *
+         * @param q Query index within tile (0 to tile_size-1)
+         * @return Xbyak::Zmm for the second row accumulator
+         */
+        Xbyak::Zmm tile_accum_row2(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_accum_row2: q must be in [0,7]");
+            return Xbyak::Zmm(llaminar2::jit::QVectorZone::base_index + q); // zmm8+q
+        }
+
+        /**
+         * @brief Get XMM view of second-row accumulator (for scalar store)
+         */
+        Xbyak::Xmm tile_accum_row2_xmm(int q) const
+        {
+            assert(q >= 0 && q < 8 && "tile_accum_row2_xmm: q must be in [0,7]");
+            return Xbyak::Xmm(llaminar2::jit::QVectorZone::base_index + q);
+        }
 
         /**
          * @brief Generate the complete kernel
@@ -913,6 +1021,7 @@ namespace llaminar::v2::kernels::jit
             jl("skip_flush", T_NEAR); // Batch not full - skip flush
 
             L("flush_batch");
+
             // ═══════════════════════════════════════════════════════════════════
             // CONTEXT SNAPSHOT (for E2E testing)
             // ═══════════════════════════════════════════════════════════════════
@@ -1543,11 +1652,13 @@ namespace llaminar::v2::kernels::jit
             using namespace Xbyak;
 
             // Load -FLT_MAX for max initialization (approximation of -infinity)
-            Zmm zmm_neg_inf = scratch0().zmm();
+            auto guard_neg_inf = borrow<Scratch0>();
+            Zmm zmm_neg_inf = guard_neg_inf.zmm();
             load_constant_f32(zmm_neg_inf, -3.4028235e+38f);
 
             // Zero for sum initialization
-            Zmm zmm_zero = scratch1().zmm();
+            auto guard_zero = borrow<Scratch1>();
+            Zmm zmm_zero = guard_zero.zmm();
             vxorps(zmm_zero, zmm_zero, zmm_zero);
 
             // Store (max, sum) pairs for each query
@@ -1596,7 +1707,8 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            Zmm zmm_zero = scratch0().zmm();
+            auto guard_zero = borrow<Scratch0>();
+            Zmm zmm_zero = guard_zero.zmm();
             vxorps(zmm_zero, zmm_zero, zmm_zero);
 
             // Zero-fill context buffer using 64-byte ZMM stores
@@ -1666,9 +1778,13 @@ namespace llaminar::v2::kernels::jit
 
             Xmm xmm_log2e = Xmm(const_log2e().zmm().getIdx());
 
-            Zmm zmm_n = scratch0().zmm(); // Integer part
-            Zmm zmm_f = scratch1().zmm(); // Fractional part
-            Zmm zmm_p = scratch2().zmm(); // Polynomial result
+            auto guard_n = borrow<Scratch0>();
+            auto guard_f = borrow<Scratch1>();
+            auto guard_p = borrow<Scratch2>();
+
+            Zmm zmm_n = guard_n.zmm(); // Integer part
+            Zmm zmm_f = guard_f.zmm(); // Fractional part
+            Zmm zmm_p = guard_p.zmm(); // Polynomial result
 
             // Step 1: t = x * log2(e)
             vmulps(zmm_f, src, const_log2e().zmm());
@@ -1834,14 +1950,14 @@ namespace llaminar::v2::kernels::jit
             // Initialize accumulators to zero
             for (int q = 0; q < q_tile_size_; ++q)
             {
-                vxorps(Zmm(q), Zmm(q), Zmm(q));
+                vxorps(tile_accum(q), tile_accum(q), tile_accum(q));
             }
 
             // Optional: Pre-load Q data into registers if it fits
             // We have zmm16-31 available (16 registers)
             // Each query needs num_blocks registers for data
             // Reuse zmm16-31 since Q is only needed for Phase 1
-            bool use_q_registers = (num_blocks * q_tile_size_ <= 16);
+            bool use_q_registers = false; // (num_blocks * q_tile_size_ <= 16);
 
             if (use_q_registers)
             {
@@ -1869,10 +1985,15 @@ namespace llaminar::v2::kernels::jit
                 int q_off_base = q_blocks_offset + b * 64; // Q block base on stack (64-byte aligned)
 
                 // Register assignments for K block data
-                Xmm xmm_d_k(20);          // K scale
-                Ymm ymm_sum_qs_k(21);     // K sum_qs (8 floats for correction)
-                Xmm xmm_sum_qs_k_low(21); // Low 128 bits for load
-                Ymm ymm_k(22);            // K data (32 int8 values)
+                // Uses Scratch0 (zmm20), Scratch1 (zmm21), Scratch2 (zmm22)
+                auto guard_d_k = borrow<Scratch0>();
+                auto guard_sum_qs_k = borrow<Scratch1>();
+                auto guard_k = borrow<Scratch2>();
+
+                Xmm xmm_d_k = guard_d_k.xmm();
+                Ymm ymm_sum_qs_k = guard_sum_qs_k.ymm();
+                Xmm xmm_sum_qs_k_low = guard_sum_qs_k.xmm();
+                Ymm ymm_k = guard_k.ymm();
 
                 // Load K block: scale (FP16 → FP32)
                 vpbroadcastw(xmm_d_k, ptr[reg_K_ptr + k_off]);
@@ -1894,12 +2015,18 @@ namespace llaminar::v2::kernels::jit
                     int q_off = q_off_base + q * num_blocks * 64;
 
                     // Load Q scale
-                    Xmm xmm_d_q(23);
+                    // Uses Scratch3 (zmm23)
+                    auto guard_d_q = borrow<Scratch3>();
+                    Xmm xmm_d_q = guard_d_q.xmm();
+
                     vpbroadcastw(xmm_d_q, ptr[rsp + q_off]);
                     vcvtph2ps(xmm_d_q, xmm_d_q);
 
                     // Dot product accumulator for this block
-                    Ymm ymm_dot(25);
+                    // Uses Scratch5 (zmm25)
+                    auto guard_dot = borrow<Scratch5>();
+                    Ymm ymm_dot = guard_dot.ymm();
+
                     vxorps(ymm_dot, ymm_dot, ymm_dot);
 
                     if (use_q_registers)
@@ -1911,8 +2038,12 @@ namespace llaminar::v2::kernels::jit
                     else
                     {
                         // Load Q data from stack
-                        Ymm ymm_q(24);
+                        // Uses Scratch4 (zmm24)
+                        auto guard_q = borrow<Scratch4>();
+                        Ymm ymm_q = guard_q.ymm();
+
                         vmovdqu8(ymm_q, ptr[rsp + q_off + 4]);
+
                         // Convert unsigned to signed for VNNI
                         vpxord(ymm_q, ymm_q, Ymm(const_128().zmm().getIdx()));
                         // VNNI dot product: result += Q[i] * K[i] (accumulated in 8 lanes)
@@ -1923,17 +2054,27 @@ namespace llaminar::v2::kernels::jit
                     vcvtdq2ps(ymm_dot, ymm_dot);
 
                     // Compute combined scale: d_q * d_k
-                    Xmm xmm_scale(23);
-                    Ymm ymm_scale(23);
+                    // Reuse Scratch3 (guard_d_q)
+                    Xmm xmm_scale = guard_d_q.xmm();
+                    Ymm ymm_scale = guard_d_q.ymm();
+
                     vmulps(xmm_scale, xmm_d_q, xmm_d_k);
                     vbroadcastss(ymm_scale, xmm_scale);
                     vmulps(ymm_dot, ymm_dot, ymm_scale);
 
-                    // Compute correction term: 128 * sum_qs_k * d_q * d_k
-                    // The 128 factor comes from the unsigned→signed conversion offset (XOR 0x80)
-                    Xmm xmm_corr_low(24);
-                    Ymm ymm_corr(24);
-                    mov(eax, 0x43000000); // 128.0f
+                    // Compute correction term: 16 * sum_qs_k * d_q * d_k
+                    // The 128 factor comes from the unsigned→signed conversion offset (XOR 0x80).
+                    // Since we subtract from EACH of the 8 lanes of the YMM accumulator,
+                    // we must divide the total correction by 8: 128 / 8 = 16.
+                    // Reuse Scratch4 (zmm24) - safe because guard_q scope ended if in else,
+                    // or we can just borrow it here.
+                    // Note: guard_q was in the else block, so it's released.
+                    // But we need to be explicit.
+                    auto guard_corr = borrow<Scratch4>();
+                    Xmm xmm_corr_low = guard_corr.xmm();
+                    Ymm ymm_corr = guard_corr.ymm();
+
+                    mov(eax, 0x41800000); // 16.0f
                     vmovd(xmm_corr_low, eax);
                     vbroadcastss(ymm_corr, xmm_corr_low);
                     vmulps(ymm_corr, ymm_corr, ymm_sum_qs_k);
@@ -1943,7 +2084,7 @@ namespace llaminar::v2::kernels::jit
                     vsubps(ymm_dot, ymm_dot, ymm_corr);
 
                     // Accumulate into query's running total
-                    vaddps(Zmm(q), Zmm(q), Zmm(ymm_dot.getIdx()));
+                    vaddps(tile_accum(q), tile_accum(q), Zmm(ymm_dot.getIdx()));
                 }
             }
 
@@ -1952,14 +2093,17 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // Each zmm0..zmm(q_tile_size-1) contains partial sums in 8 lanes
             // Reduce to scalar and apply 1/sqrt(head_dim) scaling
-
-            vmovss(xmm8, Xmm(const_scale().zmm().getIdx())); // Load 1/sqrt(head_dim)
-            for (int q = 0; q < q_tile_size_; ++q)
             {
-                // Reduce YMM to scalar: sum all 8 lanes
-                emit_horizontal_sum_to_scalar(Zmm(q));
-                // Apply attention scale: score *= 1/sqrt(head_dim)
-                vmulss(Xmm(Zmm(q).getIdx()), Xmm(Zmm(q).getIdx()), xmm8);
+                auto guard_scale = borrow<Input0>();
+                Xmm xmm_scale = guard_scale.xmm();
+                vmovss(xmm_scale, Xmm(const_scale().zmm().getIdx())); // Load 1/sqrt(head_dim)
+                for (int q = 0; q < q_tile_size_; ++q)
+                {
+                    // Reduce YMM to scalar: sum all 8 lanes
+                    emit_horizontal_sum_to_scalar(tile_accum(q));
+                    // Apply attention scale: score *= 1/sqrt(head_dim)
+                    vmulss(tile_accum_xmm(q), tile_accum_xmm(q), xmm_scale);
+                }
             }
 
             // ───────────────────────────────────────────────────────────────────
@@ -1999,22 +2143,55 @@ namespace llaminar::v2::kernels::jit
                 int v_off = b * 36;            // V block offset (36 bytes per Q8_1 block)
                 int ctx_off_base = b * 32 * 4; // Context offset (32 floats × 4 bytes)
 
+                // Register assignments for V accumulation
+                // CRITICAL: Must NOT clobber State registers (zmm16-19) as they persist across KV loop!
+                // We use Scratch registers (zmm20-25) instead. We have exactly 6 scratch registers,
+                // which is enough if we reuse v_scale register.
+
+                auto guard_v_scale = borrow<Scratch0>(); // zmm20
+                auto guard_v_lo = borrow<Scratch1>();    // zmm21
+                auto guard_v_hi = borrow<Scratch2>();    // zmm22
+
+                Zmm zmm_v_scale = guard_v_scale.zmm();
+                Xmm xmm_v_scale = guard_v_scale.xmm();
+                Zmm zmm_v_lo = guard_v_lo.zmm();
+                Zmm zmm_v_hi = guard_v_hi.zmm();
+
                 // Load V block: scale (FP16 → FP32, broadcasted)
-                vpbroadcastw(xmm16, ptr[reg_V_ptr + v_off]);
-                vcvtph2ps(xmm16, xmm16);
-                vbroadcastss(zmm16, xmm16);
+                vpbroadcastw(xmm_v_scale, ptr[reg_V_ptr + v_off]);
+                vcvtph2ps(xmm_v_scale, xmm_v_scale);
+                vbroadcastss(zmm_v_scale, xmm_v_scale);
 
                 // Load V block: data (32 int8 → 32 FP32, split into lo/hi)
-                // zmm17: V[0..15] as FP32
-                // zmm18: V[16..31] as FP32
-                vpmovsxbd(zmm17, ptr[reg_V_ptr + v_off + 4]);      // Low 16 bytes
-                vpmovsxbd(zmm18, ptr[reg_V_ptr + v_off + 4 + 16]); // High 16 bytes
-                vcvtdq2ps(zmm17, zmm17);
-                vcvtdq2ps(zmm18, zmm18);
+                // zmm_v_lo: V[0..15] as FP32
+                // zmm_v_hi: V[16..31] as FP32
+                vpmovsxbd(zmm_v_lo, ptr[reg_V_ptr + v_off + 4]);      // Low 16 bytes
+                vpmovsxbd(zmm_v_hi, ptr[reg_V_ptr + v_off + 4 + 16]); // High 16 bytes
+                vcvtdq2ps(zmm_v_lo, zmm_v_lo);
+                vcvtdq2ps(zmm_v_hi, zmm_v_hi);
 
                 // Pre-multiply V * scale (shared across all queries)
-                vmulps(zmm17, zmm17, zmm16); // V_lo_scaled = V_lo * scale
-                vmulps(zmm18, zmm18, zmm16); // V_hi_scaled = V_hi * scale
+                vmulps(zmm_v_lo, zmm_v_lo, zmm_v_scale); // V_lo_scaled = V_lo * scale
+                vmulps(zmm_v_hi, zmm_v_hi, zmm_v_scale); // V_hi_scaled = V_hi * scale
+
+                // Release v_scale (zmm20) so it can be reused as wv_lo
+                guard_v_scale.release();
+
+                // Borrow remaining scratch registers
+                // We use Scratch3 (zmm23) and Scratch4 (zmm24) for context
+                // This avoids clobbering constants (zmm26, zmm27)
+
+                auto guard_ctx_lo = borrow<Scratch3>(); // zmm23
+                auto guard_ctx_hi = borrow<Scratch4>(); // zmm24
+
+                Zmm zmm_ctx_lo = guard_ctx_lo.zmm();
+                Zmm zmm_ctx_hi = guard_ctx_hi.zmm();
+
+                auto guard_wv_lo = borrow<Scratch0>(); // zmm20 (reused)
+                auto guard_wv_hi = borrow<Scratch5>(); // zmm25
+
+                Zmm zmm_wv_lo = guard_wv_lo.zmm();
+                Zmm zmm_wv_hi = guard_wv_hi.zmm();
 
                 // Process each query in tile
                 for (int q = 0; q < q_tile_size_; ++q)
@@ -2039,26 +2216,22 @@ namespace llaminar::v2::kernels::jit
                     add(r9, rsp);
 
                     // Load existing context accumulator
-                    Zmm zmm_ctx_lo = zmm19;
-                    Zmm zmm_ctx_hi = zmm20;
                     vmovups(zmm_ctx_lo, ptr[r9 + q_ctx_offset]);
                     vmovups(zmm_ctx_hi, ptr[r9 + q_ctx_offset + 64]);
 
                     // Compute weighted V: V_scaled * weight[q]
-                    // weight[q] is in Zmm(q + q_tile_size_)
-                    Zmm zmm_wv_lo = zmm21;
-                    Zmm zmm_wv_hi = zmm22;
-                    Zmm zmm_weight_q = Zmm(q + q_tile_size_);
+                    // weight[q] is in tile_weight(q)
+                    Zmm zmm_weight_q = tile_weight(q);
 
-                    vmulps(zmm_wv_lo, zmm17, zmm_weight_q); // V_lo_scaled * weight[q]
-                    vmulps(zmm_wv_hi, zmm18, zmm_weight_q); // V_hi_scaled * weight[q]
+                    vmulps(zmm_wv_lo, zmm_v_lo, zmm_weight_q); // V_lo_scaled * weight[q]
+                    vmulps(zmm_wv_hi, zmm_v_hi, zmm_weight_q); // V_hi_scaled * weight[q]
 
                     // Update context: ctx = ctx * corr[q] + weighted_V
                     // Use FMA: vfmadd231ps(a, b, c) = a + b*c
                     // We want: ctx = ctx * corr + wv
                     // Rewrite as: ctx = wv + ctx * corr → vfmadd231ps(wv, ctx, corr)
-                    vfmadd231ps(zmm_wv_lo, zmm_ctx_lo, Zmm(q)); // wv_lo += ctx_lo * corr[q]
-                    vfmadd231ps(zmm_wv_hi, zmm_ctx_hi, Zmm(q)); // wv_hi += ctx_hi * corr[q]
+                    vfmadd231ps(zmm_wv_lo, zmm_ctx_lo, tile_corr(q)); // wv_lo += ctx_lo * corr[q]
+                    vfmadd231ps(zmm_wv_hi, zmm_ctx_hi, tile_corr(q)); // wv_hi += ctx_hi * corr[q]
 
                     // Store updated context (result is now in zmm_wv)
                     vmovups(ptr[r9 + q_ctx_offset], zmm_wv_lo);
@@ -2576,77 +2749,73 @@ namespace llaminar::v2::kernels::jit
             // zmm22-25: scratch for exp_emitter_
 
             // ───────────────────────────────────────────────────────────────────
-            // STEP 1: Pack scores from individual ZMMs into zmm18
+            // STEP 1: Pack scores from individual ZMMs into state_weight (zmm18)
             // ───────────────────────────────────────────────────────────────────
-            // Each score is in element[0] of its respective ZMM (zmm0..zmm3)
-            // We gather them into the low elements of zmm18 for parallel processing
-            Zmm zmm_scores = Zmm(18);
+            // Each score is in element[0] of its respective ZMM (zmm0..zmm7)
+            // We gather them into the low elements for parallel processing
+            Zmm zmm_scores = state_weight().zmm();      // zmm18 - repurposed for packed scores
             vxorps(zmm_scores, zmm_scores, zmm_scores); // Clear all elements first
 
-            Xmm xmm_scores = Xmm(18);
+            Xmm xmm_scores_lo = Xmm(zmm_scores.getIdx());
+            // Use Scratch1 (zmm21) as temp for high scores (safe, used later for weight_input)
+            Xmm xmm_scores_hi = Xmm(scratch1().zmm().getIdx());
+
+            // Pack low 4 scores (0-3)
             if (q_tile_size_ >= 1)
-                vmovss(xmm_scores, Xmm(0)); // scores[0] = zmm0[0]
+                vmovss(xmm_scores_lo, Xmm(0)); // scores[0] = zmm0[0]
             if (q_tile_size_ >= 2)
-                vinsertps(xmm_scores, xmm_scores, Xmm(1), 0x10); // scores[1] = zmm1[0]
+                vinsertps(xmm_scores_lo, xmm_scores_lo, Xmm(1), 0x10); // scores[1] = zmm1[0]
             if (q_tile_size_ >= 3)
-                vinsertps(xmm_scores, xmm_scores, Xmm(2), 0x20); // scores[2] = zmm2[0]
+                vinsertps(xmm_scores_lo, xmm_scores_lo, Xmm(2), 0x20); // scores[2] = zmm2[0]
             if (q_tile_size_ >= 4)
-                vinsertps(xmm_scores, xmm_scores, Xmm(3), 0x30); // scores[3] = zmm3[0]
-            // Note: For q_tile_size > 4, would need YMM upper portion handling
+                vinsertps(xmm_scores_lo, xmm_scores_lo, Xmm(3), 0x30); // scores[3] = zmm3[0]
+
+            // Pack high 4 scores (4-7)
+            if (q_tile_size_ >= 5)
+                vmovss(xmm_scores_hi, Xmm(4)); // scores[4] = zmm4[0]
+            if (q_tile_size_ >= 6)
+                vinsertps(xmm_scores_hi, xmm_scores_hi, Xmm(5), 0x10); // scores[5] = zmm5[0]
+            if (q_tile_size_ >= 7)
+                vinsertps(xmm_scores_hi, xmm_scores_hi, Xmm(6), 0x20); // scores[6] = zmm6[0]
+            if (q_tile_size_ >= 8)
+                vinsertps(xmm_scores_hi, xmm_scores_hi, Xmm(7), 0x30); // scores[7] = zmm7[0]
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 1.5: APPLY CAUSAL MASKING TO SCORES BEFORE SOFTMAX
             // ───────────────────────────────────────────────────────────────────
             // Set scores[q] = -infinity for q < q_local_start (causally masked)
-            // and for q >= tile_size (partial tile). This ensures:
-            //   - new_max = old_max (since -inf < old_max)
-            //   - corr = 1.0 (exp(0) = 1)
-            //   - weight = 0.0 (exp(-inf) = 0)
-            // And crucially: softmax state is NOT updated for masked queries.
+            // and for q >= tile_size (partial tile).
 
             // Load -FLT_MAX for masking
             Xmm xmm_neg_inf = Xmm(scratch0().zmm().getIdx()); // xmm20
             load_constant_f32(Zmm(scratch0().zmm().getIdx()), -3.4028235e+38f);
 
-            mov(r8, op_tile_size);
-            for (int q = 0; q < q_tile_size_; ++q)
-            {
-                std::string valid_label = ".mask_valid_" + std::to_string(q);
-                std::string done_label = ".mask_done_" + std::to_string(q);
+            // 2. Generate mask for q < q_local_start (Causal)
+            // Clamp negative start to 0 (if k < q_start, no masking needed for causal)
+            xor_(r9d, r9d);
+            mov(r10, reg_q_local_start);
+            test(r10, r10);
+            cmovs(r10, r9);
 
-                // Check: q_local_start > q means this query is masked
-                cmp(reg_q_local_start, q);
-                jle(valid_label, T_NEAR);
+            mov(eax, -1);
+            bzhi(eax, eax, r10d); // eax has 1s for q < start (masked)
 
-                // Masked: set score[q] = -inf
-                // Use insertps to set a single element
-                if (q == 0)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x00);
-                else if (q == 1)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x10);
-                else if (q == 2)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x20);
-                else if (q == 3)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x30);
-                jmp(done_label, T_NEAR);
+            // 3. Generate mask for q >= tile_size (Partial Tile)
+            mov(r9d, -1);
+            mov(r11, op_tile_size); // Load tile_size
+            bzhi(r9d, r9d, r11d);   // r9d has 1s for q < size
+            not_(r9d);              // r9d has 1s for q >= size (masked)
 
-                L(valid_label);
-                // Also check tile_size <= q (partial tile)
-                cmp(r8, q);
-                jg(done_label, T_NEAR);
+            // 4. Combine masks
+            or_(eax, r9d);
+            kmovd(k1, eax);
 
-                // Outside tile: set score[q] = -inf
-                if (q == 0)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x00);
-                else if (q == 1)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x10);
-                else if (q == 2)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x20);
-                else if (q == 3)
-                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x30);
+            // Combine low and high parts into zmm_scores BEFORE masking
+            if (q_tile_size_ > 4)
+                vinsertf32x4(zmm_scores, zmm_scores, xmm_scores_hi, 1);
 
-                L(done_label);
-            }
+            // 5. Apply mask (-inf)
+            vmovups(zmm_scores | k1, Zmm(scratch0().zmm().getIdx()));
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 2: Load max/sum state for all queries from memory
@@ -2654,11 +2823,10 @@ namespace llaminar::v2::kernels::jit
             // State layout in memory: [max0, sum0, max1, sum1, ...]
             // Each (max, sum) pair is 8 bytes
             //
-            // We load into zmm16 (maxs) and zmm17 (sums) using scalar loads
-            // and insertps to build up the packed vectors. This avoids the
-            // complexity of cross-lane shuffle operations for deinterleaving.
-            Zmm zmm_max = Zmm(16);
-            Zmm zmm_sum = Zmm(17);
+            // We load into state_max (zmm16) and state_sum (zmm17) using scalar
+            // loads and insertps to build up the packed vectors.
+            Zmm zmm_max = state_max().zmm(); // zmm16
+            Zmm zmm_sum = state_sum().zmm(); // zmm17
             vxorps(zmm_max, zmm_max, zmm_max);
             vxorps(zmm_sum, zmm_sum, zmm_sum);
 
@@ -2668,44 +2836,78 @@ namespace llaminar::v2::kernels::jit
             // Memory: [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
             // Result: zmm16[0..3] = [max0, max1, max2, max3]
             //         zmm17[0..3] = [sum0, sum1, sum2, sum3]
-            Xmm xmm_max = Xmm(16);
-            Xmm xmm_sum = Xmm(17);
-            Xmm xmm_tmp = Xmm(22);
+            Xmm xmm_max_lo = Xmm(16);
+            Xmm xmm_sum_lo = Xmm(17);
+            Xmm xmm_tmp = Xmm(22); // scratch2
 
-            // Load and deinterleave each (max, sum) pair
-            // Query 0: max at offset 0, sum at offset 4
-            vmovss(xmm_max, ptr[r9 + 0]); // max0
-            vmovss(xmm_sum, ptr[r9 + 4]); // sum0
+            // Load low 4 (0-3)
+            vmovss(xmm_max_lo, ptr[r9 + 0]); // max0
+            vmovss(xmm_sum_lo, ptr[r9 + 4]); // sum0
 
             if (q_tile_size_ >= 2)
             {
-                // Query 1: max at offset 8, sum at offset 12
                 vmovss(xmm_tmp, ptr[r9 + 8]);
-                vinsertps(xmm_max, xmm_max, xmm_tmp, 0x10); // max1 -> slot 1
+                vinsertps(xmm_max_lo, xmm_max_lo, xmm_tmp, 0x10); // max1
                 vmovss(xmm_tmp, ptr[r9 + 12]);
-                vinsertps(xmm_sum, xmm_sum, xmm_tmp, 0x10); // sum1 -> slot 1
+                vinsertps(xmm_sum_lo, xmm_sum_lo, xmm_tmp, 0x10); // sum1
             }
             if (q_tile_size_ >= 3)
             {
-                // Query 2: max at offset 16, sum at offset 20
                 vmovss(xmm_tmp, ptr[r9 + 16]);
-                vinsertps(xmm_max, xmm_max, xmm_tmp, 0x20); // max2 -> slot 2
+                vinsertps(xmm_max_lo, xmm_max_lo, xmm_tmp, 0x20); // max2
                 vmovss(xmm_tmp, ptr[r9 + 20]);
-                vinsertps(xmm_sum, xmm_sum, xmm_tmp, 0x20); // sum2 -> slot 2
+                vinsertps(xmm_sum_lo, xmm_sum_lo, xmm_tmp, 0x20); // sum2
             }
             if (q_tile_size_ >= 4)
             {
-                // Query 3: max at offset 24, sum at offset 28
                 vmovss(xmm_tmp, ptr[r9 + 24]);
-                vinsertps(xmm_max, xmm_max, xmm_tmp, 0x30); // max3 -> slot 3
+                vinsertps(xmm_max_lo, xmm_max_lo, xmm_tmp, 0x30); // max3
                 vmovss(xmm_tmp, ptr[r9 + 28]);
-                vinsertps(xmm_sum, xmm_sum, xmm_tmp, 0x30); // sum3 -> slot 3
+                vinsertps(xmm_sum_lo, xmm_sum_lo, xmm_tmp, 0x30); // sum3
+            }
+
+            // Load high 4 (4-7)
+            if (q_tile_size_ > 4)
+            {
+                Xmm xmm_max_hi = Xmm(scratch0().zmm().getIdx()); // zmm20
+                Xmm xmm_sum_hi = Xmm(scratch1().zmm().getIdx()); // zmm21
+
+                if (q_tile_size_ >= 5)
+                {
+                    vmovss(xmm_max_hi, ptr[r9 + 32]); // max4
+                    vmovss(xmm_sum_hi, ptr[r9 + 36]); // sum4
+                }
+                if (q_tile_size_ >= 6)
+                {
+                    vmovss(xmm_tmp, ptr[r9 + 40]);
+                    vinsertps(xmm_max_hi, xmm_max_hi, xmm_tmp, 0x10); // max5
+                    vmovss(xmm_tmp, ptr[r9 + 44]);
+                    vinsertps(xmm_sum_hi, xmm_sum_hi, xmm_tmp, 0x10); // sum5
+                }
+                if (q_tile_size_ >= 7)
+                {
+                    vmovss(xmm_tmp, ptr[r9 + 48]);
+                    vinsertps(xmm_max_hi, xmm_max_hi, xmm_tmp, 0x20); // max6
+                    vmovss(xmm_tmp, ptr[r9 + 52]);
+                    vinsertps(xmm_sum_hi, xmm_sum_hi, xmm_tmp, 0x20); // sum6
+                }
+                if (q_tile_size_ >= 8)
+                {
+                    vmovss(xmm_tmp, ptr[r9 + 56]);
+                    vinsertps(xmm_max_hi, xmm_max_hi, xmm_tmp, 0x30); // max7
+                    vmovss(xmm_tmp, ptr[r9 + 60]);
+                    vinsertps(xmm_sum_hi, xmm_sum_hi, xmm_tmp, 0x30); // sum7
+                }
+
+                // Combine
+                vinsertf32x4(zmm_max, zmm_max, xmm_max_hi, 1);
+                vinsertf32x4(zmm_sum, zmm_sum, xmm_sum_hi, 1);
             }
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 3: Compute new_max = max(scores, old_max)
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_new_max = Zmm(19);
+            Zmm zmm_new_max = state_corr().zmm(); // zmm19 - repurposed for new_max
             vmaxps(zmm_new_max, zmm_scores, zmm_max);
 
             // ───────────────────────────────────────────────────────────────────
@@ -2713,29 +2915,31 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // corr_input = old_max - new_max (will become exp() for correction)
             // weight_input = score - new_max (will become exp() for weight)
-            //
-            // CRITICAL: Use INPUT zone registers (zmm8, zmm9) instead of SCRATCH
-            // zone (zmm20, zmm21). emit_fast_exp clobbers zmm_scratch(0-2) = zmm20-22
-            // during polynomial evaluation. If we use zmm20/21 for corr/weight,
-            // the exp computation would overwrite them before finishing!
-            Zmm zmm_corr = Zmm(8); // INPUT zone - safe from exp clobber
+
+            // Use RegisterGuard to safely allocate registers for corr/weight.
+            // We use Scratch3 (zmm23) and Scratch4 (zmm24) which are safe from
+            // emit_fast_exp (uses zmm8, zmm14, zmm15) and Phase 1/3 usage.
+            auto guard_corr = borrow<Scratch3>();
+            auto guard_weight = borrow<Scratch4>();
+
+            Zmm zmm_corr = guard_corr.zmm();
             vsubps(zmm_corr, zmm_max, zmm_new_max);
 
-            Zmm zmm_weight = Zmm(9); // INPUT zone - safe from exp clobber
+            Zmm zmm_weight = guard_weight.zmm();
             vsubps(zmm_weight, zmm_scores, zmm_new_max);
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 5: Vectorized exp for corr and weight
             // ───────────────────────────────────────────────────────────────────
             // Uses 16-way parallel exp, only low q_tile_size elements are valid
-            // NOTE: emit_fast_exp clobbers zmm20-22 (SCRATCH zone) but not INPUT zone
+            // emit_fast_exp uses RegisterGuard internally to verify safety.
             exp_emitter_.emit_fast_exp(*this, zmm_corr, zmm_corr);     // corr = exp(old_max - new_max)
             exp_emitter_.emit_fast_exp(*this, zmm_weight, zmm_weight); // weight = exp(score - new_max)
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 6: Compute new_sum = old_sum * corr + weight
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_new_sum = Zmm(17);                      // Reuse zmm_sum register
+            Zmm zmm_new_sum = state_sum().zmm();            // Reuse zmm17 for new_sum
             vfmadd213ps(zmm_new_sum, zmm_corr, zmm_weight); // sum = sum * corr + weight
 
             // ───────────────────────────────────────────────────────────────────
@@ -2745,30 +2949,58 @@ namespace llaminar::v2::kernels::jit
             // Memory layout: [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
             // zmm_new_max (zmm19) has [max0, max1, max2, max3, ...] in low elements
             // zmm_new_sum (zmm17) has [sum0, sum1, sum2, sum3, ...] in low elements
-            Xmm xmm_new_max = Xmm(19);
-            Xmm xmm_new_sum = Xmm(17);
+            Xmm xmm_new_max_lo = Xmm(19);
+            Xmm xmm_new_sum_lo = Xmm(17);
 
             // Query 0: store max at offset 0, sum at offset 4
-            vmovss(ptr[r9 + 0], xmm_new_max);
-            vmovss(ptr[r9 + 4], xmm_new_sum);
+            vmovss(ptr[r9 + 0], xmm_new_max_lo);
+            vmovss(ptr[r9 + 4], xmm_new_sum_lo);
 
             if (q_tile_size_ >= 2)
             {
-                // Query 1: store max at offset 8, sum at offset 12
-                vextractps(ptr[r9 + 8], xmm_new_max, 1);
-                vextractps(ptr[r9 + 12], xmm_new_sum, 1);
+                vextractps(ptr[r9 + 8], xmm_new_max_lo, 1);
+                vextractps(ptr[r9 + 12], xmm_new_sum_lo, 1);
             }
             if (q_tile_size_ >= 3)
             {
-                // Query 2: store max at offset 16, sum at offset 20
-                vextractps(ptr[r9 + 16], xmm_new_max, 2);
-                vextractps(ptr[r9 + 20], xmm_new_sum, 2);
+                vextractps(ptr[r9 + 16], xmm_new_max_lo, 2);
+                vextractps(ptr[r9 + 20], xmm_new_sum_lo, 2);
             }
             if (q_tile_size_ >= 4)
             {
-                // Query 3: store max at offset 24, sum at offset 28
-                vextractps(ptr[r9 + 24], xmm_new_max, 3);
-                vextractps(ptr[r9 + 28], xmm_new_sum, 3);
+                vextractps(ptr[r9 + 24], xmm_new_max_lo, 3);
+                vextractps(ptr[r9 + 28], xmm_new_sum_lo, 3);
+            }
+
+            if (q_tile_size_ > 4)
+            {
+                // Extract high parts to temp XMMs
+                Xmm xmm_new_max_hi = Xmm(scratch0().zmm().getIdx()); // zmm20
+                Xmm xmm_new_sum_hi = Xmm(scratch1().zmm().getIdx()); // zmm21
+
+                vextractf32x4(xmm_new_max_hi, state_corr().zmm(), 1); // zmm19 -> xmm20
+                vextractf32x4(xmm_new_sum_hi, state_sum().zmm(), 1);  // zmm17 -> xmm21
+
+                if (q_tile_size_ >= 5)
+                {
+                    vmovss(ptr[r9 + 32], xmm_new_max_hi);
+                    vmovss(ptr[r9 + 36], xmm_new_sum_hi);
+                }
+                if (q_tile_size_ >= 6)
+                {
+                    vextractps(ptr[r9 + 40], xmm_new_max_hi, 1);
+                    vextractps(ptr[r9 + 44], xmm_new_sum_hi, 1);
+                }
+                if (q_tile_size_ >= 7)
+                {
+                    vextractps(ptr[r9 + 48], xmm_new_max_hi, 2);
+                    vextractps(ptr[r9 + 52], xmm_new_sum_hi, 2);
+                }
+                if (q_tile_size_ >= 8)
+                {
+                    vextractps(ptr[r9 + 56], xmm_new_max_hi, 3);
+                    vextractps(ptr[r9 + 60], xmm_new_sum_hi, 3);
+                }
             }
 
             // ───────────────────────────────────────────────────────────────────
@@ -2777,30 +3009,67 @@ namespace llaminar::v2::kernels::jit
             // Output layout for V accumulation:
             //   zmm0..zmm(q_tile_size-1): broadcasted corr[q]
             //   zmm(q_tile_size)..zmm(2*q_tile_size-1): broadcasted weight[q]
+
+            // Pre-extract high parts if needed
+            Xmm xmm_corr_hi = Xmm(scratch0().zmm().getIdx());   // zmm20
+            Xmm xmm_weight_hi = Xmm(scratch1().zmm().getIdx()); // zmm21
+
+            if (q_tile_size_ > 4)
+            {
+                vextractf32x4(xmm_corr_hi, Zmm(zmm_corr.getIdx()), 1);
+                vextractf32x4(xmm_weight_hi, Zmm(zmm_weight.getIdx()), 1);
+            }
+
             for (int q = 0; q < q_tile_size_; ++q)
             {
-                // Extract corr[q] and broadcast to zmm(q)
-                if (q == 0)
+                // Extract corr[q] and broadcast to tile_corr(q)
+                if (q < 4)
                 {
-                    vbroadcastss(Zmm(q), Xmm(zmm_corr.getIdx()));
+                    if (q == 0)
+                        vbroadcastss(tile_corr(q), Xmm(zmm_corr.getIdx()));
+                    else
+                    {
+                        vextractps(eax, Xmm(zmm_corr.getIdx()), q);
+                        vmovd(tile_accum_xmm(q), eax);
+                        vbroadcastss(tile_corr(q), tile_accum_xmm(q));
+                    }
                 }
                 else
                 {
-                    vextractps(eax, Xmm(zmm_corr.getIdx()), q);
-                    vmovd(Xmm(q), eax);
-                    vbroadcastss(Zmm(q), Xmm(q));
+                    // Extract from high part
+                    if (q == 4)
+                        vbroadcastss(tile_corr(q), xmm_corr_hi);
+                    else
+                    {
+                        vextractps(eax, xmm_corr_hi, q - 4);
+                        vmovd(tile_accum_xmm(q), eax);
+                        vbroadcastss(tile_corr(q), tile_accum_xmm(q));
+                    }
                 }
 
-                // Extract weight[q] and broadcast to zmm(q + q_tile_size)
-                if (q == 0)
+                // Extract weight[q] and broadcast to tile_weight(q)
+                if (q < 4)
                 {
-                    vbroadcastss(Zmm(q + q_tile_size_), Xmm(zmm_weight.getIdx()));
+                    if (q == 0)
+                        vbroadcastss(tile_weight(q), Xmm(zmm_weight.getIdx()));
+                    else
+                    {
+                        vextractps(eax, Xmm(zmm_weight.getIdx()), q);
+                        vmovd(tile_weight_xmm(q), eax);
+                        vbroadcastss(tile_weight(q), tile_weight_xmm(q));
+                    }
                 }
                 else
                 {
-                    vextractps(eax, Xmm(zmm_weight.getIdx()), q);
-                    vmovd(Xmm(q + q_tile_size_), eax);
-                    vbroadcastss(Zmm(q + q_tile_size_), Xmm(q + q_tile_size_));
+                    // Extract from high part
+                    if (q == 4)
+                        vbroadcastss(tile_weight(q), xmm_weight_hi);
+                    else
+                    {
+                        vextractps(eax, xmm_weight_hi, q - 4);
+                        vmovd(tile_weight_xmm(q), eax);
+                        vbroadcastss(tile_weight(q), tile_weight_xmm(q));
+                    }
                 }
             }
 
@@ -2824,8 +3093,8 @@ namespace llaminar::v2::kernels::jit
                 jle(valid_label, T_NEAR);
 
                 // Invalid: mask out
-                vmovups(Zmm(q), const_one().zmm());
-                vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
+                vmovups(tile_corr(q), const_one().zmm());
+                vxorps(tile_weight(q), tile_weight(q), tile_weight(q));
                 jmp(done_label, T_NEAR);
 
                 L(valid_label);
@@ -2834,8 +3103,8 @@ namespace llaminar::v2::kernels::jit
                 jg(done_label, T_NEAR);
 
                 // Invalid: mask out
-                vmovups(Zmm(q), const_one().zmm());
-                vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
+                vmovups(tile_corr(q), const_one().zmm());
+                vxorps(tile_weight(q), tile_weight(q), tile_weight(q));
 
                 L(done_label);
             }
@@ -3137,8 +3406,10 @@ namespace llaminar::v2::kernels::jit
             }
 
             // Advance to next head
-            add(r11, tile_size * 8); // Next head's softmax (tile_size pairs × 8 bytes)
-            add(r10, head_dim * 4);  // Next head's context (head_dim floats × 4 bytes)
+            // BUG FIX: Must use q_tile_size_ (max tile size) for stride, not current tile_size
+            // because softmax state is allocated/layout based on q_tile_size_.
+            add(r11, q_tile_size_ * 8); // Next head's softmax (q_tile_size_ pairs × 8 bytes)
+            add(r10, head_dim * 4);     // Next head's context (head_dim floats × 4 bytes)
 
             inc(r9);
             jmp(".head_loop", T_NEAR);
@@ -3188,8 +3459,8 @@ namespace llaminar::v2::kernels::jit
                 int offset = 0;
                 for (int b = 0; b < copy_bytes / 64; ++b)
                 {
-                    vmovups(Xbyak::Zmm(0), ptr[r11 + offset]);
-                    vmovups(ptr[rax + offset], Xbyak::Zmm(0));
+                    vmovups(accum0().zmm(), ptr[r11 + offset]);
+                    vmovups(ptr[rax + offset], accum0().zmm());
                     offset += 64;
                 }
                 // Handle remaining bytes (< 64)
@@ -3474,8 +3745,8 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             for (int q = 0; q < tile_size; ++q)
             {
-                vxorps(Zmm(q), Zmm(q), Zmm(q));             // acc[q] for row i
-                vxorps(Zmm(q + 8), Zmm(q + 8), Zmm(q + 8)); // acc[q] for row i+1
+                vxorps(tile_accum(q), tile_accum(q), tile_accum(q));                // acc[q] for row i
+                vxorps(tile_accum_row2(q), tile_accum_row2(q), tile_accum_row2(q)); // acc[q] for row i+1
             }
 
             // ───────────────────────────────────────────────────────────────────
@@ -3505,9 +3776,9 @@ namespace llaminar::v2::kernels::jit
 
             // Load and dequantize Wo[i] block
             {
-                Zmm d0 = Zmm(16);    // Scale for row i
-                Zmm w0_lo = Zmm(17); // Weights [0..15] for row i
-                Zmm w0_hi = Zmm(18); // Weights [16..31] for row i
+                Zmm d0 = state_max().zmm();       // Scale for row i (zmm16)
+                Zmm w0_lo = state_sum().zmm();    // Weights [0..15] for row i (zmm17)
+                Zmm w0_hi = state_weight().zmm(); // Weights [16..31] for row i (zmm18)
 
                 // Load FP16 scale → broadcast to all 16 lanes
                 vpbroadcastw(Xmm(d0.getIdx()), ptr[r12 + rax]); // Load scale (FP16)
@@ -3523,9 +3794,9 @@ namespace llaminar::v2::kernels::jit
                 vmulps(w0_hi, w0_hi, d0);
 
                 // Load and dequantize Wo[i+1] block
-                Zmm d1 = Zmm(19);    // Scale for row i+1
-                Zmm w1_lo = Zmm(20); // Weights [0..15] for row i+1
-                Zmm w1_hi = Zmm(21); // Weights [16..31] for row i+1
+                Zmm d1 = state_corr().zmm();  // Scale for row i+1 (zmm19)
+                Zmm w1_lo = scratch0().zmm(); // Weights [0..15] for row i+1 (zmm20)
+                Zmm w1_hi = scratch1().zmm(); // Weights [16..31] for row i+1 (zmm21)
 
                 vpbroadcastw(Xmm(d1.getIdx()), ptr[r13 + rax]);
                 vcvtph2ps(Xmm(d1.getIdx()), Xmm(d1.getIdx()));
@@ -3550,24 +3821,25 @@ namespace llaminar::v2::kernels::jit
 
                 for (int q = 0; q < tile_size; ++q)
                 {
-                    Zmm c_lo = Zmm(22); // Context[q, k*32 .. k*32+15]
-                    Zmm c_hi = Zmm(23); // Context[q, k*32+16 .. k*32+31]
+                    Zmm c_lo = scratch2().zmm(); // Context[q, k*32 .. k*32+15] (zmm22)
+                    Zmm c_hi = scratch3().zmm(); // Context[q, k*32+16 .. k*32+31] (zmm23)
 
-                    // Context offset = q * d_model * sizeof(float)
+                    // Context offset = q * local_dim * sizeof(float)
+                    // BUG FIX: Use local_dim (context buffer width), not d_model (output width)
                     mov(r10, q);
-                    imul(r10, r10, d_model * 4);
+                    imul(r10, r10, local_dim * 4);
 
                     // Load context block for query q
                     vmovups(c_lo, ptr[rdx + r10]);
                     vmovups(c_hi, ptr[rdx + r10 + 64]);
 
                     // Accumulate: acc[q, i] += context[q, k] * Wo[i, k]
-                    vfmadd231ps(Zmm(q), c_lo, w0_lo);
-                    vfmadd231ps(Zmm(q), c_hi, w0_hi);
+                    vfmadd231ps(tile_accum(q), c_lo, w0_lo);
+                    vfmadd231ps(tile_accum(q), c_hi, w0_hi);
 
                     // Accumulate: acc[q, i+1] += context[q, k] * Wo[i+1, k]
-                    vfmadd231ps(Zmm(q + 8), c_lo, w1_lo);
-                    vfmadd231ps(Zmm(q + 8), c_hi, w1_hi);
+                    vfmadd231ps(tile_accum_row2(q), c_lo, w1_lo);
+                    vfmadd231ps(tile_accum_row2(q), c_hi, w1_hi);
                 }
             }
 
@@ -3591,10 +3863,10 @@ namespace llaminar::v2::kernels::jit
                 jle(".skip_store_2_" + std::to_string(q), T_NEAR);
 
                 // Reduce ZMM accumulator to scalar: acc[q] for row i
-                emit_horizontal_sum_to_scalar(Zmm(q));
+                emit_horizontal_sum_to_scalar(tile_accum(q));
 
                 // Reduce ZMM accumulator to scalar: acc[q] for row i+1
-                emit_horizontal_sum_to_scalar(Zmm(q + 8));
+                emit_horizontal_sum_to_scalar(tile_accum_row2(q));
 
                 // Compute output pointer: output + (tile_start + q) * d_model * 4 + i * 4
                 mov(r10, ptr[rsp + tile_start_spill]);
@@ -3603,8 +3875,8 @@ namespace llaminar::v2::kernels::jit
                 add(r10, reg_output);
 
                 // Store: output[tile_start + q, i] and output[tile_start + q, i+1]
-                vmovss(ptr[r10 + r8 * 4], Xmm(Zmm(q).getIdx()));
-                vmovss(ptr[r10 + r8 * 4 + 4], Xmm(Zmm(q + 8).getIdx()));
+                vmovss(ptr[r10 + r8 * 4], tile_accum_xmm(q));
+                vmovss(ptr[r10 + r8 * 4 + 4], tile_accum_row2_xmm(q));
 
                 L(".skip_store_2_" + std::to_string(q));
             }
@@ -3622,7 +3894,7 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             for (int q = 0; q < tile_size; ++q)
             {
-                vxorps(Zmm(q), Zmm(q), Zmm(q));
+                vxorps(tile_accum(q), tile_accum(q), tile_accum(q));
             }
 
             // ───────────────────────────────────────────────────────────────────
@@ -3644,9 +3916,9 @@ namespace llaminar::v2::kernels::jit
 
             // Load and dequantize Wo[i] block (same as double-row version)
             {
-                Zmm d0 = Zmm(16);    // Scale
-                Zmm w0_lo = Zmm(17); // Weights [0..15]
-                Zmm w0_hi = Zmm(18); // Weights [16..31]
+                Zmm d0 = state_max().zmm();       // Scale (zmm16)
+                Zmm w0_lo = state_sum().zmm();    // Weights [0..15] (zmm17)
+                Zmm w0_hi = state_weight().zmm(); // Weights [16..31] (zmm18)
 
                 // Load FP16 scale → broadcast
                 vpbroadcastw(Xmm(d0.getIdx()), ptr[r12 + rax]);
@@ -3670,8 +3942,8 @@ namespace llaminar::v2::kernels::jit
                 // Accumulate for all queries
                 for (int q = 0; q < tile_size; ++q)
                 {
-                    Zmm c_lo = Zmm(22);
-                    Zmm c_hi = Zmm(23);
+                    Zmm c_lo = scratch2().zmm(); // zmm22
+                    Zmm c_hi = scratch3().zmm(); // zmm23
 
                     mov(r10, q);
                     imul(r10, r10, d_model * 4);
@@ -3679,8 +3951,8 @@ namespace llaminar::v2::kernels::jit
                     vmovups(c_lo, ptr[rdx + r10]);
                     vmovups(c_hi, ptr[rdx + r10 + 64]);
 
-                    vfmadd231ps(Zmm(q), c_lo, w0_lo);
-                    vfmadd231ps(Zmm(q), c_hi, w0_hi);
+                    vfmadd231ps(tile_accum(q), c_lo, w0_lo);
+                    vfmadd231ps(tile_accum(q), c_hi, w0_hi);
                 }
             }
 
@@ -3699,14 +3971,14 @@ namespace llaminar::v2::kernels::jit
                 cmp(rax, q);
                 jle(".skip_store_1_" + std::to_string(q), T_NEAR);
 
-                emit_horizontal_sum_to_scalar(Zmm(q));
+                emit_horizontal_sum_to_scalar(tile_accum(q));
 
                 mov(r10, ptr[rsp + tile_start_spill]);
                 add(r10, q);
                 imul(r10, r10, d_model * 4);
                 add(r10, reg_output);
 
-                vmovss(ptr[r10 + r8 * 4], Xmm(Zmm(q).getIdx()));
+                vmovss(ptr[r10 + r8 * 4], tile_accum_xmm(q));
 
                 L(".skip_store_1_" + std::to_string(q));
             }
@@ -6643,9 +6915,10 @@ namespace llaminar::v2::kernels::jit
             // - zmm20 (often the accumulator passed as zmm)
             // - zmm21 (used as scratch in some contexts)
             // ───────────────────────────────────────────────────────────────────
-            Zmm zmm_tmp = Zmm(25);
-            Ymm ymm_tmp = Ymm(zmm_tmp.getIdx());
-            Xmm xmm_tmp = Xmm(zmm_tmp.getIdx());
+            auto guard_tmp = borrow<Scratch5>();
+            Zmm zmm_tmp = guard_tmp.zmm();
+            Ymm ymm_tmp = guard_tmp.ymm();
+            Xmm xmm_tmp = guard_tmp.xmm();
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 1: ZMM → YMM (add upper 256-bit half to lower)

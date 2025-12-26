@@ -860,15 +860,17 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
 
-        // FFN buffers - gate and up use configured activation precision
-        ActivationPrecision ffn_prec = resolveBufferPrecision(
+        // FFN buffers - gate and up are kept FP32 to avoid triple quantization in SwiGLU
+        ActivationPrecision gate_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::FFN_Gate, nullptr);
         state_.gate = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            ffn_prec, device_idx);
+            gate_prec, device_idx);
+        ActivationPrecision up_prec = resolveBufferPrecision(
+            act_prec, HybridBufferType::FFN_Up, nullptr);
         state_.up = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
-            ffn_prec, device_idx);
+            up_prec, device_idx);
         // ffn_output is the output of FFN Down projection which feeds into the residual stream
         // Keep as FP32 for numerical stability in residual connections
         state_.ffn_output = factory.createFP32(

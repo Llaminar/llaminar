@@ -526,3 +526,88 @@ namespace llaminar2::jit
     }
 
 } // namespace llaminar2::jit
+
+// ============================================================================
+// BLOCKING RAW REGISTER CONSTRUCTION
+// ============================================================================
+//
+// When ENFORCE_TYPED_REGISTERS is defined, we shadow Zmm/Ymm/Xmm with wrapper
+// functions that produce compile-time errors when called with integer indices.
+//
+// This catches patterns like:
+//   Zmm(16)           // ERROR: Use state_max().zmm() or StateMax{}.zmm()
+//   Xbyak::Zmm(16)    // Still works (explicit namespace), but Zmm(16) fails
+//
+// To opt-in:
+//   #define ENFORCE_TYPED_REGISTERS
+//   #include "RegisterEnforcement.h"
+//
+// Or add to your CMakeLists.txt:
+//   target_compile_definitions(your_target PRIVATE ENFORCE_TYPED_REGISTERS)
+//
+// ============================================================================
+
+#ifdef ENFORCE_TYPED_REGISTERS
+
+namespace llaminar2::jit::enforcement_detail
+{
+    // Helper that always fails with a descriptive message
+    template <int N>
+    struct BlockedRegisterConstruction
+    {
+        static_assert(N < 0, // Always false but depends on N
+                      "\n\n"
+                      "╔══════════════════════════════════════════════════════════════════╗\n"
+                      "║              RAW REGISTER CONSTRUCTION BLOCKED                    ║\n"
+                      "╠══════════════════════════════════════════════════════════════════╣\n"
+                      "║ Raw Zmm(N)/Ymm(N)/Xmm(N) construction is prohibited.             ║\n"
+                      "║                                                                   ║\n"
+                      "║ Use typed registers from RegisterAllocation.h instead:           ║\n"
+                      "║   zmm0-7:   accum0()-accum7() or Accum0{}-Accum7{}               ║\n"
+                      "║   zmm8-15:  Input0{}-Input7{} (from RegisterAllocation.h)        ║\n"
+                      "║   zmm16-19: state_max(), state_sum(), state_weight(), state_corr()║\n"
+                      "║   zmm20-25: scratch0()-scratch5() or Scratch0{}-Scratch5{}       ║\n"
+                      "║   zmm26-31: const_128(), const_scale(), const_one(), etc.        ║\n"
+                      "║                                                                   ║\n"
+                      "║ Example migration:                                                ║\n"
+                      "║   Before: Zmm zmm_max = Zmm(16);                                 ║\n"
+                      "║   After:  auto zmm_max = state_max().zmm();                      ║\n"
+                      "║                                                                   ║\n"
+                      "║ For dynamic indices (e.g., in loops), use helper functions.      ║\n"
+                      "╚══════════════════════════════════════════════════════════════════╝\n");
+    };
+
+    // Deleted function to block Zmm(int) construction
+    // The template parameter captures the integer at compile time
+    template <int N>
+    [[deprecated("Use typed registers - see RegisterAllocation.h")]]
+    constexpr auto Zmm_blocked(std::integral_constant<int, N>) -> BlockedRegisterConstruction<N>
+    {
+        return {};
+    }
+
+} // namespace llaminar2::jit::enforcement_detail
+
+// ============================================================================
+// Shadowing macros - these intercept raw Zmm/Ymm/Xmm usage
+// ============================================================================
+// When ENFORCE_TYPED_REGISTERS is defined, these macros expand to
+// constructs that fail at compile time with helpful error messages.
+//
+// IMPORTANT: These only work for literal integer arguments like Zmm(16).
+// Variable arguments like Zmm(q) require runtime checking (RegisterTracker).
+// ============================================================================
+
+// Macro to produce compile error for Zmm(N) where N is a literal
+#define LLAMINAR_BLOCK_ZMM(N)                                                                  \
+    static_assert(false,                                                                       \
+                  "Raw Zmm(" #N ") is blocked. Use typed register from RegisterAllocation.h. " \
+                  "For zmm" #N ", use the appropriate typed accessor.")
+
+// Note: We can't easily intercept Zmm(N) without breaking legitimate uses.
+// Instead, rely on:
+// 1. REQUIRE_TYPED_REGISTER() macro in function bodies
+// 2. Code review with grep for "Zmm(" patterns
+// 3. The deprecated warnings on legacy accessors
+
+#endif // ENFORCE_TYPED_REGISTERS

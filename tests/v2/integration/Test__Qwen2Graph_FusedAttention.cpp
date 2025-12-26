@@ -14,6 +14,9 @@ class Test__Qwen2Graph_FusedAttention : public ::testing::Test
 protected:
     void SetUp() override
     {
+        // Force trace logging
+        Logger::getInstance().setLogLevel(LogLevel::TRACE);
+
         // Create dummy contexts
         mpi_ctx_ = std::make_shared<MPIContext>(0, 1);
 
@@ -26,9 +29,14 @@ protected:
         config_.d_ff = 256;
         config_.vocab_size = 1000;
         config_.max_seq_len = 128;
+        config_.activation_precision = ActivationPrecision::Q8_1;
 
         // Create dummy weights
         createDummyWeights();
+        createDummyBuffers();
+
+        // Initialize graph builder
+        graph_builder_ = std::make_unique<Qwen2Graph>(config_, mpi_ctx_);
     }
 
     void createDummyWeights()
@@ -149,6 +157,7 @@ protected:
     Qwen2GraphConfig config_;
     Qwen2ModelWeights weights_;
     Qwen2ModelBuffers buffers_;
+    std::unique_ptr<Qwen2Graph> graph_builder_;
 
     // Storage to keep tensors alive
     std::vector<std::unique_ptr<TensorBase>> tensor_storage_;
@@ -159,12 +168,10 @@ TEST_F(Test__Qwen2Graph_FusedAttention, FusedAttentionEnabled)
 {
     // Enable fused attention
     mutableDebugEnv().attention.fused_wo = true;
+    // config_.activation_precision = ActivationPrecision::Q8_1; // Already set in SetUp
 
-    createDummyBuffers(); // Create buffers
-
-    auto graph_builder = std::make_unique<Qwen2Graph>(config_, mpi_ctx_);
-    graph_builder->setWeights(weights_);
-    graph_builder->setBuffers(buffers_); // Set buffers
+    graph_builder_->setWeights(weights_);
+    graph_builder_->setBuffers(buffers_); // Set buffers
 
     // Build graph
     Qwen2ForwardInput input;
@@ -172,7 +179,7 @@ TEST_F(Test__Qwen2Graph_FusedAttention, FusedAttentionEnabled)
     input.seq_len = 10;
 
     Qwen2ForwardOutput output;
-    auto graph = graph_builder->buildFullForwardGraph(input, output);
+    auto graph = graph_builder_->buildFullForwardGraph(input, output);
 
     // Verify topology
     bool found_fused_stage = false;

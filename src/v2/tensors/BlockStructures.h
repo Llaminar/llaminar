@@ -74,6 +74,31 @@ namespace llaminar2
     };
     static_assert(sizeof(Q8_1Block) == 36, "Q8_1Block must be 36 bytes");
 
+    /**
+     * @brief Q16_1 block: 16-bit quantization with pre-computed sum (72 bytes)
+     *
+     * Like Q8_1 but with 256× more precision (int16 vs int8).
+     * Designed for residual stream where error accumulation is critical.
+     *
+     * Layout:
+     * - uint16_t d: FP16 scale factor (same as Q8_1)
+     * - int32_t sum_qs: INT32 pre-computed sum of qs[i] values (wider range needed)
+     * - int16_t qs[32]: 32 quantized int16 values
+     *
+     * Memory: 2 + 4 + 2 (padding) + 64 = 72 bytes per block (2× Q8_1)
+     *
+     * Range: [-32767, 32767] per element vs [-127, 127] for Q8_1
+     * This provides 256× finer granularity at 2× memory cost.
+     */
+    struct Q16_1Block
+    {
+        uint16_t d;     ///< FP16 scale factor
+        int32_t sum_qs; ///< INT32 pre-computed sum: Σ(qs[i]) - wider range for int16 values!
+        int16_t qs[32]; ///< 32 quantized int16 values
+        static constexpr size_t BLOCK_SIZE = 32;
+    };
+    static_assert(sizeof(Q16_1Block) == 72, "Q16_1Block must be 72 bytes");
+
     /** @brief Q4_0 block: 4-bit quantization (32 elements per block, 18 bytes) */
     struct Q4_0Block
     {

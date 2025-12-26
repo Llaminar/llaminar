@@ -2010,12 +2010,25 @@ namespace llaminar2
         // to avoid reading/writing beyond the actual sequence data.
         const size_t num_elements = params_.num_elements > 0 ? params_.num_elements : params_.input->numel();
 
+        TensorType input_type = params_.input->native_type();
+        TensorType residual_type = params_.residual->native_type();
+        TensorType output_type = params_.output->native_type();
+
         LOG_DEBUG("[ResidualAddStage] Execute: num_elements=" << num_elements
-                                                              << " tensor_type=" << params_.input->dtype_name());
+                                                              << " input_type=" << params_.input->dtype_name()
+                                                              << " residual_type=" << params_.residual->dtype_name()
+                                                              << " output_type=" << params_.output->dtype_name());
+
+        // Handle mixed-type case: FP32 input + Q8_1 residual → Q8_1 output
+        // This occurs when fused attention outputs FP32 but activations are Q8_1
+        if (input_type == TensorType::FP32 && residual_type == TensorType::Q8_1 && output_type == TensorType::Q8_1)
+        {
+            return executeFP32_Q8_1_to_Q8_1(ctx, num_elements);
+        }
 
         // Dispatch based on tensor type, passing num_elements through
-        TensorType ttype = params_.input->native_type();
-        switch (ttype)
+        // Note: This assumes all three tensors have the same type
+        switch (input_type)
         {
         case TensorType::FP32:
             return executeFP32(ctx, num_elements);
@@ -2029,6 +2042,49 @@ namespace llaminar2
             LOG_ERROR("[ResidualAddStage] Unsupported tensor type: " << params_.input->dtype_name());
             return false;
         }
+    }
+
+    bool ResidualAddStage::executeFP32_Q8_1_to_Q8_1(IDeviceContext *ctx, size_t num_elements)
+    {
+        // Mixed-type case: FP32 input + Q8_1 residual → Q8_1 output
+        // This is used when fused attention outputs FP32 (attn_proj) but the hidden state is Q8_1
+        const auto *input_fp32 = dynamic_cast<const FP32Tensor *>(params_.input);
+        const auto *residual_q8 = dynamic_cast<const Q8_1Tensor *>(params_.residual);
+        auto *output_q8 = dynamic_cast<Q8_1Tensor *>(params_.output);
+
+        if (!input_fp32 || !residual_q8 || !output_q8)
+        {
+            LOG_ERROR("[ResidualAddStage::FP32_Q8_1_to_Q8_1] Failed to cast tensors");
+            return false;
+        }
+
+        const float *input_data = input_fp32->data();
+        const float *residual_data = residual_q8->fp32_data(); // Explicit dequantization acknowledgment
+
+        LOG_DEBUG("[ResidualAddStage::FP32_Q8_1_to_Q8_1] Adding " << num_elements << " elements");
+
+        // Add in FP32 and quantize result back to Q8_1
+        // Use block-wise approach for efficiency
+        const size_t num_blocks = num_elements / 32;
+        Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
+
+        // Process block by block
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            alignas(32) float temp[32];
+            const size_t offset = b * 32;
+
+            // Add FP32 input + dequantized Q8_1 residual
+            for (size_t i = 0; i < 32; ++i)
+            {
+                temp[i] = input_data[offset + i] + residual_data[offset + i];
+            }
+
+            // Quantize result block
+            simd::quantize_single_block(temp, output_blocks[b], 32);
+        }
+
+        return true;
     }
 
     bool ResidualAddStage::executeFP32(IDeviceContext *ctx, size_t num_elements)

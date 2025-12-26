@@ -88,6 +88,10 @@ namespace llaminar2
         if (global_precision != ActivationPrecision::Hybrid)
         {
             // Core buffers are always FP32 regardless of global setting
+            // FFN_Gate and FFN_Up are kept FP32 to avoid triple quantization in SwiGLU:
+            //   - Without: gate→Q8_1, up→Q8_1, swiglu_result→Q8_1 (3 rounds)
+            //   - With FP32: silu(gate)*up computed in FP32, only output quantized (1 round)
+            // This significantly reduces error accumulation in the FFN path.
             switch (buffer_type)
             {
             case HybridBufferType::Residual:
@@ -96,6 +100,8 @@ namespace llaminar2
             case HybridBufferType::Logits:
             case HybridBufferType::Attention_Output:
             case HybridBufferType::FFN_Down:
+            case HybridBufferType::FFN_Gate:
+            case HybridBufferType::FFN_Up:
                 return ActivationPrecision::FP32;
 
             default:

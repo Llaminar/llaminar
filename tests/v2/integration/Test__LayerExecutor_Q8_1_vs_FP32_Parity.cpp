@@ -331,10 +331,18 @@ protected:
         owned.K = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)}, precision, device_idx_);
         owned.V = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)}, precision, device_idx_);
         owned.attn_output = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)}, precision, device_idx_);
-        owned.attn_proj = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_idx_);
+
+        // attn_proj and ffn_output are ALWAYS FP32 - they feed into residual streams
+        // This matches GraphOrchestrator::allocateInternalBuffers which creates these as FP32
+        // for numerical stability in residual connections
+        owned.attn_proj = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_idx_);
+
         owned.gate = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_idx_);
         owned.up = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_idx_);
-        owned.ffn_output = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)}, precision, device_idx_);
+
+        // ffn_output is ALWAYS FP32 - feeds into residual stream
+        owned.ffn_output = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_idx_);
+
         owned.current_hidden = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, precision, device_idx_);
 
         // Workspace buffers (always FP32 - used for attention scores)
@@ -498,14 +506,82 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FFNParity)
 /**
  * @brief Test full layer (Attention + FFN) parity between Q8_1 and FP32
  *
- * This test requires KV cache setup which is more complex.
- * Skipped for now - use E2E tests for full layer parity.
+ * This test sets up a full layer execution including attention with KV cache
+ * to validate end-to-end Q8_1 activation precision parity.
  */
 TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
 {
-    // Full layer requires KV cache which adds complexity.
-    // The FFN test above validates the core Q8_1 activation path.
-    GTEST_SKIP() << "Full layer test requires KV cache setup - use E2E tests";
+    constexpr int SEQ_LEN = 8;
+    constexpr int LAYER_IDX = 0;
+    constexpr int MAX_SEQ_LEN = 64;
+
+    // Load real weights from model
+    auto weights = loadLayerWeights(LAYER_IDX);
+    ASSERT_NE(weights.gate_proj, nullptr) << "Failed to load layer weights";
+    ASSERT_NE(weights.wq, nullptr) << "Failed to load attention weights";
+
+    // Create KV caches for both precision modes
+    // KV cache is always FP32 for attention computation
+    auto fp32_kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::FP32>>(
+        *mpi_ctx_,   // MPI context
+        1,           // num_layers (testing single layer)
+        1,           // batch_size
+        MAX_SEQ_LEN, // max_seq_len
+        n_kv_heads_, // n_kv_heads
+        head_dim_,   // head_dim
+        device_idx_  // device_idx
+    );
+
+    auto q8_1_kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::FP32>>(
+        *mpi_ctx_,   // MPI context
+        1,           // num_layers (testing single layer)
+        1,           // batch_size
+        MAX_SEQ_LEN, // max_seq_len
+        n_kv_heads_, // n_kv_heads
+        head_dim_,   // head_dim
+        device_idx_  // device_idx
+    );
+
+    // Create FP32 executor and buffers
+    auto fp32_executor = createExecutor(ActivationPrecision::FP32);
+    auto fp32_buffers = createBuffers(SEQ_LEN, ActivationPrecision::FP32);
+
+    // Initialize FP32 input with test data
+    initInput(fp32_buffers.current_hidden);
+
+    // Create Q8_1 executor and buffers
+    auto q8_1_executor = createExecutor(ActivationPrecision::Q8_1);
+    auto q8_1_buffers = createBuffers(SEQ_LEN, ActivationPrecision::Q8_1);
+
+    // Initialize Q8_1 input with same test data
+    initInput(q8_1_buffers.current_hidden);
+
+    // Create position IDs for attention RoPE
+    std::vector<int> position_ids(SEQ_LEN);
+    std::iota(position_ids.begin(), position_ids.end(), 0); // [0, 1, 2, ..., SEQ_LEN-1]
+
+    // Execute full layer on FP32
+    LOG_INFO("[FullLayerParity] Running FP32 full layer with real weights...");
+    bool fp32_ok = fp32_executor->executeLayer(
+        weights, fp32_buffers,
+        LAYER_IDX, SEQ_LEN,
+        fp32_kv_cache.get(),
+        position_ids.data(), device_idx_);
+    ASSERT_TRUE(fp32_ok) << "FP32 layer execution failed";
+
+    // Execute full layer on Q8_1
+    LOG_INFO("[FullLayerParity] Running Q8_1 full layer with real weights...");
+    bool q8_1_ok = q8_1_executor->executeLayer(
+        weights, q8_1_buffers,
+        LAYER_IDX, SEQ_LEN,
+        q8_1_kv_cache.get(),
+        position_ids.data(), device_idx_);
+    ASSERT_TRUE(q8_1_ok) << "Q8_1 layer execution failed";
+
+    // Compare results
+    bool parity_ok = compareResults(fp32_buffers.current_hidden, q8_1_buffers.current_hidden,
+                                    "Full Layer Output (current_hidden)");
+    EXPECT_TRUE(parity_ok) << "Full layer output parity check failed";
 }
 
 /**

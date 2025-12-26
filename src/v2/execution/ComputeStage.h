@@ -1465,6 +1465,10 @@ namespace llaminar2
         bool executeBF16(IDeviceContext *ctx, size_t num_elements);
         bool executeFP16(IDeviceContext *ctx, size_t num_elements);
         bool executeQ8_1(IDeviceContext *ctx, size_t num_elements);
+
+        // Mixed-type implementations for hybrid precision modes
+        // FP32 input + Q8_1 residual → Q8_1 output (used when fused attention outputs FP32)
+        bool executeFP32_Q8_1_to_Q8_1(IDeviceContext *ctx, size_t num_elements);
     };
 
     // =============================================================================
