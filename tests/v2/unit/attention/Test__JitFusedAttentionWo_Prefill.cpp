@@ -217,8 +217,7 @@ namespace llaminar::v2::kernels::jit::test
                 config.batch_size = seq_len_q; // Triggers prefill mode
                 config.wo_format = WoFormat::FP32;
                 config.causal = causal;
-                config.mode = AttentionMode::PREFILL;   // Explicit prefill
-                config.enable_register_tracking = true; // Enable tracking for debugging
+                config.mode = AttentionMode::PREFILL; // Explicit prefill
 
                 ASSERT_EQ(config.effectiveMode(), AttentionMode::PREFILL)
                     << "Should use prefill mode";
@@ -246,8 +245,7 @@ namespace llaminar::v2::kernels::jit::test
                 config.batch_size = 1; // Triggers decode mode
                 config.wo_format = WoFormat::FP32;
                 config.causal = causal;
-                config.mode = AttentionMode::DECODE;    // Explicit decode
-                config.enable_register_tracking = true; // Enable tracking for debugging
+                config.mode = AttentionMode::DECODE; // Explicit decode
 
                 ASSERT_EQ(config.effectiveMode(), AttentionMode::DECODE)
                     << "Should use decode mode";

@@ -110,9 +110,9 @@ namespace llaminar2
     bool isHybridModeActive(const InferenceMode &mode, const Qwen2ActivationBuffers &buffers)
     {
         // Hybrid mode is active when:
-        // 1. Mode is Hybrid
+        // 1. Mode is any Hybrid variant (Hybrid or HybridQ16)
         // 2. Required Hybrid buffers are allocated (Q_rope, K_rope for RoPE)
-        return mode.isHybrid() && buffers.Q_rope && buffers.K_rope;
+        return mode.isAnyHybrid() && buffers.Q_rope && buffers.K_rope;
     }
 
 } // namespace llaminar2

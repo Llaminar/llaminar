@@ -72,6 +72,37 @@ namespace llaminar2::jit
 {
 
     // ============================================================================
+    // VEX/EVEX Encoding Constraint Tags
+    // ============================================================================
+
+    /**
+     * @brief Registers 0-15 can use VEX encoding (legacy SSE/AVX compatibility)
+     *
+     * VEX-encoded instructions work with xmm0-15/ymm0-15 but NOT xmm16-31/ymm16-31.
+     * Examples: vmovdqu, vshufps (non-512-bit), scalar ops
+     */
+    struct LowRegisterTag
+    {
+        static constexpr bool is_vex_safe = true;
+        static constexpr bool is_evex_only = false;
+        static constexpr const char *name = "LOW(0-15)";
+    };
+
+    /**
+     * @brief Registers 16-31 require EVEX encoding
+     *
+     * These cannot use VEX-encoded instructions. Must use EVEX equivalents:
+     *   - vmovdqu → vmovdqu16/vmovdqu32/vmovdqu64
+     *   - vshufps → vshufps (with EVEX prefix, automatic for zmm)
+     */
+    struct HighRegisterTag
+    {
+        static constexpr bool is_vex_safe = false;
+        static constexpr bool is_evex_only = true;
+        static constexpr const char *name = "HIGH(16-31)";
+    };
+
+    // ============================================================================
     // Register Zone Definitions
     // ============================================================================
 
@@ -84,26 +115,48 @@ namespace llaminar2::jit
 
     /**
      * @brief Accumulator zone: zmm0-zmm7 (8 registers for V accumulation)
+     *
+     * All LOW registers - VEX-safe for xmm/ymm operations.
      */
     struct AccumulatorZone : RegisterZoneBase
     {
         static constexpr int base_index = 0;
         static constexpr int count = 8;
         static constexpr const char *name = "Accumulator";
+
+        // Encoding constraints
+        static constexpr int low_count = 8;  // All 8 are LOW (0-7)
+        static constexpr int high_count = 0; // None are HIGH
+        static constexpr bool has_low = true;
+        static constexpr bool has_high = false;
+        static constexpr bool all_low = true;
+        static constexpr bool all_high = false;
     };
 
     /**
      * @brief Q vector zone: zmm8-zmm15 (8 registers for Q tiles)
+     *
+     * All LOW registers - VEX-safe for xmm/ymm operations.
      */
     struct QVectorZone : RegisterZoneBase
     {
         static constexpr int base_index = 8;
         static constexpr int count = 8;
         static constexpr const char *name = "QVector";
+
+        // Encoding constraints
+        static constexpr int low_count = 8;  // All 8 are LOW (8-15)
+        static constexpr int high_count = 0; // None are HIGH
+        static constexpr bool has_low = true;
+        static constexpr bool has_high = false;
+        static constexpr bool all_low = true;
+        static constexpr bool all_high = false;
     };
 
     /**
      * @brief State zone: zmm16-zmm19 (online softmax state)
+     *
+     * All HIGH registers - require EVEX encoding for xmm/ymm operations.
      *
      * Layout:
      *   zmm16 = max (running maximum for numerical stability)
@@ -122,10 +175,20 @@ namespace llaminar2::jit
         static constexpr int SUM_IDX = 1;    // zmm17
         static constexpr int WEIGHT_IDX = 2; // zmm18
         static constexpr int CORR_IDX = 3;   // zmm19
+
+        // Encoding constraints
+        static constexpr int low_count = 0;  // None are LOW
+        static constexpr int high_count = 4; // All 4 are HIGH (16-19)
+        static constexpr bool has_low = false;
+        static constexpr bool has_high = true;
+        static constexpr bool all_low = false;
+        static constexpr bool all_high = true;
     };
 
     /**
      * @brief Scratch zone: zmm20-zmm25 (6 temporary registers)
+     *
+     * All HIGH registers - require EVEX encoding for xmm/ymm operations.
      *
      * CRITICAL: When used as XMM/YMM overlays, these share the same physical registers!
      *   xmm20 overlays zmm20, etc.
@@ -138,10 +201,20 @@ namespace llaminar2::jit
         static constexpr int base_index = 20;
         static constexpr int count = 6;
         static constexpr const char *name = "Scratch";
+
+        // Encoding constraints
+        static constexpr int low_count = 0;  // None are LOW
+        static constexpr int high_count = 6; // All 6 are HIGH (20-25)
+        static constexpr bool has_low = false;
+        static constexpr bool has_high = true;
+        static constexpr bool all_low = false;
+        static constexpr bool all_high = true;
     };
 
     /**
      * @brief Score zone: xmm20-xmm23 (4 scalar scores for FA2 tiling)
+     *
+     * All HIGH registers - require EVEX encoding.
      *
      * WARNING: Physically overlaps ScratchZone zmm20-zmm23!
      * Using ScoreZone marks those scratch registers as unavailable.
@@ -151,16 +224,34 @@ namespace llaminar2::jit
         static constexpr int base_index = 20;
         static constexpr int count = 4;
         static constexpr const char *name = "Score";
+
+        // Encoding constraints
+        static constexpr int low_count = 0;  // None are LOW
+        static constexpr int high_count = 4; // All 4 are HIGH (20-23)
+        static constexpr bool has_low = false;
+        static constexpr bool has_high = true;
+        static constexpr bool all_low = false;
+        static constexpr bool all_high = true;
     };
 
     /**
      * @brief Reserved zone: zmm26-zmm31 (for future use / callee-saved)
+     *
+     * All HIGH registers - require EVEX encoding.
      */
     struct ReservedZone : RegisterZoneBase
     {
         static constexpr int base_index = 26;
         static constexpr int count = 6;
         static constexpr const char *name = "Reserved";
+
+        // Encoding constraints
+        static constexpr int low_count = 0;  // None are LOW
+        static constexpr int high_count = 6; // All 6 are HIGH (26-31)
+        static constexpr bool has_low = false;
+        static constexpr bool has_high = true;
+        static constexpr bool all_low = false;
+        static constexpr bool all_high = true;
     };
 
     // ============================================================================
@@ -208,6 +299,27 @@ namespace llaminar2::jit
      * @tparam Zone The register zone (AccumulatorZone, ScratchZone, etc.)
      * @tparam LocalIdx Index within the zone (0 to Zone::count-1)
      */
+    /**
+     * @brief Compile-time typed ZMM register - TAG TYPE ONLY
+     *
+     * IMPORTANT: This is a tag type with NO direct register accessors.
+     * To get the underlying Xbyak::Zmm/Ymm/Xmm, you MUST borrow via RegisterGuard:
+     *
+     * @code
+     * // WRONG - won't compile:
+     * Xbyak::Zmm reg = Scratch0{}.zmm();  // ERROR: no .zmm() method
+     *
+     * // CORRECT - use RegisterGuard:
+     * auto guard = borrow<Scratch0>();
+     * gen.vmovaps(guard.zmm(), ...);
+     * @endcode
+     *
+     * This design ENFORCES register tracking - you cannot accidentally
+     * use a register without the guard system knowing about it.
+     *
+     * @tparam Zone The register zone (AccumulatorZone, ScratchZone, etc.)
+     * @tparam LocalIdx Index within the zone (0 to Zone::count-1)
+     */
     template <typename Zone, int LocalIdx>
     struct TypedZmm
     {
@@ -220,17 +332,18 @@ namespace llaminar2::jit
         static constexpr int local_index = LocalIdx;
         static constexpr int absolute_index = Zone::base_index + LocalIdx;
 
-        /// Get the underlying Xbyak register (for use with Xbyak APIs)
-        constexpr Xbyak::Zmm zmm() const { return Xbyak::Zmm(absolute_index); }
+        // Type marker for trait detection (since we removed .zmm()/.ymm() accessors)
+        static constexpr bool is_zmm_type = true;
 
-        /// Implicit conversion to Xbyak::Zmm
-        constexpr operator Xbyak::Zmm() const { return zmm(); }
+        // Encoding constraints - determined by absolute register index
+        static constexpr bool is_low_register = absolute_index < 16;
+        static constexpr bool is_high_register = absolute_index >= 16;
+        static constexpr bool is_vex_safe = is_low_register;
+        static constexpr bool is_evex_only = is_high_register;
+        using encoding_tag = std::conditional_t<is_low_register, LowRegisterTag, HighRegisterTag>;
 
-        /// Get as YMM (lower 256 bits)
-        constexpr Xbyak::Ymm ymm() const { return Xbyak::Ymm(absolute_index); }
-
-        /// Get as XMM (lower 128 bits)
-        constexpr Xbyak::Xmm xmm() const { return Xbyak::Xmm(absolute_index); }
+        // NO .zmm(), .ymm(), .xmm() accessors!
+        // Use borrow<ThisType>() to get a RegisterGuard, then call .zmm() on that.
     };
 
     /**
@@ -238,6 +351,17 @@ namespace llaminar2::jit
      *
      * Similar to TypedZmm but for scalar/128-bit operations.
      * IMPORTANT: XMM registers alias the low bits of ZMM registers!
+     */
+    /**
+     * @brief Compile-time typed XMM register - TAG TYPE ONLY
+     *
+     * Similar to TypedZmm - this is a tag type with NO direct accessors.
+     * You MUST use RegisterGuard to access the underlying Xbyak register.
+     *
+     * IMPORTANT: XMM registers alias the low bits of ZMM registers!
+     *
+     * ENCODING WARNING: XMM16-31 (HIGH) require EVEX encoding.
+     * If you need VEX-safe XMM registers, use AccumulatorZone or QVectorZone.
      */
     template <typename Zone, int LocalIdx>
     struct TypedXmm
@@ -251,14 +375,18 @@ namespace llaminar2::jit
         static constexpr int local_index = LocalIdx;
         static constexpr int absolute_index = Zone::base_index + LocalIdx;
 
-        /// Get the underlying Xbyak register
-        constexpr Xbyak::Xmm xmm() const { return Xbyak::Xmm(absolute_index); }
+        // Type marker for trait detection (since we removed .xmm()/.as_zmm() accessors)
+        static constexpr bool is_xmm_type = true;
 
-        /// Implicit conversion to Xbyak::Xmm
-        constexpr operator Xbyak::Xmm() const { return xmm(); }
+        // Encoding constraints - determined by absolute register index
+        static constexpr bool is_low_register = absolute_index < 16;
+        static constexpr bool is_high_register = absolute_index >= 16;
+        static constexpr bool is_vex_safe = is_low_register;
+        static constexpr bool is_evex_only = is_high_register;
+        using encoding_tag = std::conditional_t<is_low_register, LowRegisterTag, HighRegisterTag>;
 
-        /// WARNING: Accessing as ZMM means you're using the full register
-        constexpr Xbyak::Zmm as_zmm() const { return Xbyak::Zmm(absolute_index); }
+        // NO .xmm() or .as_zmm() accessors!
+        // Use borrow<ThisType>() to get a RegisterGuard, then call .xmm() on that.
     };
 
     // ============================================================================
@@ -287,6 +415,34 @@ namespace llaminar2::jit
      */
     template <typename Reg, typename... Zones>
     inline constexpr bool is_any_zone_v = (is_zone_v<Reg, Zones> || ...);
+
+    // ============================================================================
+    // Encoding Constraint Type Traits
+    // ============================================================================
+
+    /**
+     * @brief Type trait: Register is LOW (0-15), VEX-safe
+     */
+    template <typename Reg>
+    inline constexpr bool is_low_register_v = Reg::is_low_register;
+
+    /**
+     * @brief Type trait: Register is HIGH (16-31), EVEX-only
+     */
+    template <typename Reg>
+    inline constexpr bool is_high_register_v = Reg::is_high_register;
+
+    /**
+     * @brief Type trait: Register can use VEX-encoded instructions (xmm/ymm)
+     */
+    template <typename Reg>
+    inline constexpr bool is_vex_safe_v = Reg::is_vex_safe;
+
+    /**
+     * @brief Type trait: Register requires EVEX encoding for xmm/ymm ops
+     */
+    template <typename Reg>
+    inline constexpr bool is_evex_only_v = Reg::is_evex_only;
 
     // ============================================================================
     // Convenient Type Aliases
@@ -409,5 +565,26 @@ namespace llaminar2::jit
     template <typename Reg>
     using require_safe_scratch_for_fa2 = std::enable_if_t<
         is_zone_v<Reg, ScratchZone> && (Reg::local_index >= 4), bool>;
+
+    /**
+     * @brief Enable function if Reg is VEX-safe (LOW register, 0-15)
+     *
+     * Use this to constrain functions that emit VEX-encoded instructions
+     * on xmm/ymm registers.
+     */
+    template <typename Reg>
+    using require_vex_safe = std::enable_if_t<is_vex_safe_v<Reg>, bool>;
+
+    /**
+     * @brief Enable function if Reg is a LOW register (0-15)
+     */
+    template <typename Reg>
+    using require_low_register = std::enable_if_t<is_low_register_v<Reg>, bool>;
+
+    /**
+     * @brief Enable function if Reg is a HIGH register (16-31)
+     */
+    template <typename Reg>
+    using require_high_register = std::enable_if_t<is_high_register_v<Reg>, bool>;
 
 } // namespace llaminar2::jit

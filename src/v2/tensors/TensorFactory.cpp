@@ -93,7 +93,7 @@ namespace llaminar2
         return std::make_unique<INT32Tensor>(shape);
     }
 
-    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape)
+    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape, int device_idx)
     {
         if (numa_node_ >= 0)
         {
@@ -102,7 +102,7 @@ namespace llaminar2
 
         // Use the mutable activation buffer constructor (no raw_data, allocates internally)
         // This creates a Q8_1Tensor that supports mutable_data() and quantize_from_cache()
-        return std::make_unique<Q8_1Tensor>(shape, -1); // device_idx = -1 (CPU)
+        return std::make_unique<Q8_1Tensor>(shape, device_idx);
     }
 
     std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape,
@@ -114,6 +114,19 @@ namespace llaminar2
         }
 
         return std::make_unique<Q8_1Tensor>(shape, raw_data);
+    }
+
+    std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
+                                                            int device_idx)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        // Use the mutable activation buffer constructor
+        // Q16_1Tensor(shape, device_idx) creates an empty tensor for residual accumulation
+        return std::make_unique<Q16_1Tensor>(shape, device_idx);
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
@@ -144,6 +157,15 @@ namespace llaminar2
         case ActivationPrecision::Q8_1:
             tensor = createQ8_1(shape);
             break;
+
+        case ActivationPrecision::Q16_1:
+            // Q16_1: High-precision quantized format for residual stream
+            return createQ16_1(shape, device_idx);
+
+        case ActivationPrecision::HybridQ16:
+            // For HybridQ16 mode, createActivation returns Q16_1 for residual buffers
+            // Buffer allocation logic in GraphOrchestrator handles specific buffer types
+            return createQ16_1(shape, device_idx);
 
         default:
             LOG_ERROR("TensorFactory::createActivation: unknown precision, defaulting to FP32");

@@ -1665,6 +1665,29 @@ namespace llaminar2
             float theta_base, int device_idx) { return false; }
 
         /**
+         * @brief Apply RoPE in-place to Q16_1 tensors
+         *
+         * Q16_1 has higher precision (256× finer than Q8_1) with FP32 scale,
+         * making in-place rotation with intermediate requantization acceptable.
+         *
+         * @param Q_data Q16_1 Q tensor blocks - modified in-place
+         * @param K_data Q16_1 K tensor blocks - modified in-place (can be nullptr)
+         * @param pos_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param theta_base RoPE frequency base
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply_q16_1(
+            void *Q_data, void *K_data,
+            const int *pos_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float theta_base, int device_idx) { return false; }
+
+        /**
          * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)
          *
          * This method dequantizes Q8_1 input, applies rotation, and outputs
@@ -1976,6 +1999,26 @@ namespace llaminar2
 
         virtual bool apply_q8_1(
             const Q8_1Block *input, const float *weight, Q8_1Block *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) { return false; }
+
+        /**
+         * @brief Apply RMSNorm with Q16_1 input, FP32 output
+         *
+         * Special case for typed residual stream: reads Q16_1, outputs FP32.
+         * Used when the residual is stored in high-precision Q16_1 format but
+         * downstream operations need FP32 (e.g., before attention projections).
+         *
+         * @param input Input Q16_1 blocks [rows * blocks_per_row]
+         * @param weight Weight tensor (gamma) [cols] - always FP32
+         * @param output Output FP32 tensor [rows * cols]
+         * @param rows Number of rows
+         * @param cols Number of columns (hidden_dim, must be multiple of 32)
+         * @param epsilon RMSNorm epsilon
+         * @param device_idx Device index
+         * @return true on success, false if not supported
+         */
+        virtual bool apply_q16_1_to_fp32(
+            const Q16_1Block *input, const float *weight, float *output,
             int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) { return false; }
 
         virtual bool apply_int32_to_int8(

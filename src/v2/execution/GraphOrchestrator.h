@@ -659,6 +659,7 @@ namespace llaminar2
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {
+                    LOG_TRACE("[Snapshot] Callback invoked for stage: " << name << " outputs.size=" << dump.outputs.size());
                     // Handle fused QKV stage specially - split into separate Q, K, V snapshots
                     // The fused stage outputs are ordered: Q (output_q), K (output_k), V (output_v)
                     if (name.find("_qkv_proj") != std::string::npos)
@@ -777,12 +778,20 @@ namespace llaminar2
                         bool has_context = (dump.outputs.size() >= 2);
                         size_t context_idx = has_context ? 0 : SIZE_MAX;
                         size_t output_idx = has_context ? 1 : 0;
+                        LOG_TRACE("[Snapshot] fused_attn_wo handler: prefix=" << prefix
+                                                                              << " has_context=" << has_context
+                                                                              << " context_idx=" << context_idx
+                                                                              << " output_idx=" << output_idx
+                                                                              << " dump.outputs.size()=" << dump.outputs.size()
+                                                                              << " out[0].data=" << (dump.outputs.size() > 0 ? dump.outputs[0].data : nullptr)
+                                                                              << " out[1].data=" << (dump.outputs.size() > 1 ? dump.outputs[1].data : nullptr));
 
                         // Store ATTENTION_CONTEXT (pre-Wo) if available
                         if (has_context && dump.outputs[context_idx].data)
                         {
                             const auto &out = dump.outputs[context_idx];
                             size_t count = out.rows * out.cols;
+                            LOG_TRACE("[Snapshot] Storing ATTENTION_CONTEXT: " << prefix << " rows=" << out.rows << " cols=" << out.cols << " count=" << count);
                             std::vector<float> data(count);
                             std::memcpy(data.data(), out.data, count * sizeof(float));
                             snapshots_[prefix + "_ATTENTION_CONTEXT"] = std::move(data);
@@ -793,6 +802,7 @@ namespace llaminar2
                         {
                             const auto &out = dump.outputs[output_idx];
                             size_t count = out.rows * out.cols;
+                            LOG_TRACE("[Snapshot] Storing ATTENTION_OUTPUT: " << prefix << " rows=" << out.rows << " cols=" << out.cols << " count=" << count);
                             std::vector<float> data(count);
                             std::memcpy(data.data(), out.data, count * sizeof(float));
                             snapshots_[prefix + "_ATTENTION_OUTPUT"] = std::move(data);

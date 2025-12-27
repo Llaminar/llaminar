@@ -15,6 +15,7 @@ namespace llaminar2
         {
         // Core buffers - always FP32
         case HybridBufferType::Residual:
+        case HybridBufferType::ResidualStream:
         case HybridBufferType::Normalized:
         case HybridBufferType::Hidden:
         case HybridBufferType::Logits:
@@ -83,15 +84,21 @@ namespace llaminar2
         HybridBufferType buffer_type,
         const HybridPrecisionConfig *hybrid_config)
     {
+        // For HybridQ16 mode, use the HybridQ16PrecisionConfig
+        if (global_precision == ActivationPrecision::HybridQ16)
+        {
+            static const HybridQ16PrecisionConfig q16_config = HybridQ16PrecisionConfig::defaultConfig();
+            return q16_config.getPrecision(buffer_type);
+        }
+
         // For non-Hybrid modes, return global precision for most buffers
         // (except core buffers which are always FP32)
         if (global_precision != ActivationPrecision::Hybrid)
         {
             // Core buffers are always FP32 regardless of global setting
-            // FFN_Gate and FFN_Up are kept FP32 to avoid triple quantization in SwiGLU:
-            //   - Without: gate→Q8_1, up→Q8_1, swiglu_result→Q8_1 (3 rounds)
-            //   - With FP32: silu(gate)*up computed in FP32, only output quantized (1 round)
-            // This significantly reduces error accumulation in the FFN path.
+            // Note: FFN_Gate, FFN_Up follow global precision (not forced FP32)
+            // to maintain existing behavior. Attention_Output and FFN_Down
+            // are forced FP32 because they feed directly into the residual stream.
             switch (buffer_type)
             {
             case HybridBufferType::Residual:
@@ -100,8 +107,6 @@ namespace llaminar2
             case HybridBufferType::Logits:
             case HybridBufferType::Attention_Output:
             case HybridBufferType::FFN_Down:
-            case HybridBufferType::FFN_Gate:
-            case HybridBufferType::FFN_Up:
                 return ActivationPrecision::FP32;
 
             default:
@@ -150,9 +155,70 @@ namespace llaminar2
             return "FFN_Up";
         case HybridBufferType::FFN_Down:
             return "FFN_Down";
+        case HybridBufferType::ResidualStream:
+            return "ResidualStream";
         default:
             return "Unknown";
         }
+    }
+
+    // =========================================================================
+    // HybridQ16PrecisionConfig Implementation
+    // =========================================================================
+
+    ActivationPrecision HybridQ16PrecisionConfig::getPrecision(HybridBufferType buffer_type) const
+    {
+        switch (buffer_type)
+        {
+        // Residual stream - Q16_1 (the key change from Hybrid mode)
+        case HybridBufferType::Residual:
+        case HybridBufferType::ResidualStream:
+            return residual_stream;
+
+        // Normalized buffer - FP32 (output of RMSNorm for GEMM input)
+        case HybridBufferType::Normalized:
+        case HybridBufferType::Hidden:
+        case HybridBufferType::Logits:
+            return ActivationPrecision::FP32;
+
+        // QKV path (same as Hybrid)
+        case HybridBufferType::QKV_GEMM_Output:
+            return qkv_gemm_output;
+        case HybridBufferType::Q_After_RoPE:
+            return q_after_rope;
+        case HybridBufferType::K_After_RoPE:
+            return k_after_rope;
+        case HybridBufferType::KV_Cache:
+            return kv_cache;
+
+        // Attention - context is FP32, output is Q8_1 (for Q16_1 residual add)
+        case HybridBufferType::Attention_Context:
+            return attention_context;
+        case HybridBufferType::Attention_Output:
+            return attention_output; // Q8_1 in HybridQ16
+
+        // FFN - gate/up are Q8_1, down is Q8_1 (for Q16_1 residual add)
+        case HybridBufferType::FFN_Gate:
+            return ffn_gate;
+        case HybridBufferType::FFN_Up:
+            return ffn_up;
+        case HybridBufferType::FFN_Down:
+            return ffn_down; // Q8_1 in HybridQ16
+
+        default:
+            LOG_WARN("Unknown HybridBufferType in HybridQ16: " << static_cast<int>(buffer_type) << ", defaulting to FP32");
+            return ActivationPrecision::FP32;
+        }
+    }
+
+    HybridQ16PrecisionConfig HybridQ16PrecisionConfig::defaultConfig()
+    {
+        // Returns default HybridQ16 configuration:
+        // - Residual stream: Q16_1 (high-precision accumulator)
+        // - Attention output: Q8_1 (added to Q16_1 residual)
+        // - FFN down: Q8_1 (added to Q16_1 residual)
+        // - Everything else same as Hybrid
+        return HybridQ16PrecisionConfig{};
     }
 
 } // namespace llaminar2

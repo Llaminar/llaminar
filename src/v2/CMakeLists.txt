@@ -512,6 +512,15 @@ set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "Disable FTXUI install" FORCE)
 FetchContent_MakeAvailable(ftxui)
 message(STATUS "V2: FTXUI v5.0.0 configured for interactive chat UI")
 
+# =============================================================================
+# Typed Register Enforcement (JIT Code Quality)
+# =============================================================================
+# Enforce that JIT code uses the typed register system (RegisterGuard.h)
+# instead of raw Xbyak register instantiations like Zmm(5) or Xmm(20).
+# This prevents developers from bypassing the tracking system.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/EnforceTypedRegisters.cmake)
+enforce_typed_register_usage(${CMAKE_CURRENT_SOURCE_DIR})
+
 # V2 Core Library
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp

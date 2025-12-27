@@ -3296,4 +3296,212 @@ namespace llaminar2::primitives
         }
     }
 
+    // ========================================================================
+    // Q16_1 RMSNorm (Q16_1 input → FP32 output)
+    // ========================================================================
+
+    void rmsnorm_q16_1_fp32_row_scalar(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon)
+    {
+        if (!input || !gamma || !output || cols == 0)
+            return;
+
+        const size_t n_blocks = cols / 32;
+
+        // Pass 1: Compute sum of squares with double precision accumulation
+        // Dequantize on-the-fly: val = scale * qs
+        double sum_sq = 0.0;
+        for (size_t blk = 0; blk < n_blocks; ++blk)
+        {
+            const Q16_1Block &block = input[blk];
+            float scale = block.d;
+
+            for (int i = 0; i < 32; ++i)
+            {
+                float val = scale * static_cast<float>(block.qs[i]);
+                sum_sq += static_cast<double>(val * val);
+            }
+        }
+
+        // Compute RMS and inverse
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+
+        // Pass 2: Dequantize + normalize + gamma + write
+        for (size_t blk = 0; blk < n_blocks; ++blk)
+        {
+            const Q16_1Block &block = input[blk];
+            float scale = block.d;
+
+            for (int i = 0; i < 32; ++i)
+            {
+                size_t idx = blk * 32 + i;
+                float val = scale * static_cast<float>(block.qs[i]);
+                output[idx] = val * inv_rms * gamma[idx];
+            }
+        }
+    }
+
+#if defined(__AVX512F__)
+    void rmsnorm_q16_1_fp32_row_avx512(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon)
+    {
+        if (!input || !gamma || !output || cols == 0)
+            return;
+
+        const size_t n_blocks = cols / 32;
+
+        // Pass 1: Vectorized sum of squares
+        // Use double precision accumulation for numerical stability
+        __m512d sum_sq_d_lo = _mm512_setzero_pd();
+        __m512d sum_sq_d_hi = _mm512_setzero_pd();
+
+        for (size_t blk = 0; blk < n_blocks; ++blk)
+        {
+            const Q16_1Block &block = input[blk];
+            __m512 scale_vec = _mm512_set1_ps(block.d);
+
+            // Load 16 int16 elements at a time → expand to 16 int32 → convert to 16 FP32
+            // First half: qs[0..15]
+            __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+            __m512i q32_lo = _mm512_cvtepi16_epi32(q_lo);
+            __m512 f_lo = _mm512_mul_ps(_mm512_cvtepi32_ps(q32_lo), scale_vec);
+
+            // Second half: qs[16..31]
+            __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
+            __m512i q32_hi = _mm512_cvtepi16_epi32(q_hi);
+            __m512 f_hi = _mm512_mul_ps(_mm512_cvtepi32_ps(q32_hi), scale_vec);
+
+            // Compute squares (FP32)
+            __m512 sq_lo = _mm512_mul_ps(f_lo, f_lo);
+            __m512 sq_hi = _mm512_mul_ps(f_hi, f_hi);
+
+            // Convert to double and accumulate (lower 8 floats → 8 doubles)
+            __m256 sq_lo_lo = _mm512_castps512_ps256(sq_lo);
+            __m256 sq_lo_hi = _mm512_extractf32x8_ps(sq_lo, 1);
+            __m256 sq_hi_lo = _mm512_castps512_ps256(sq_hi);
+            __m256 sq_hi_hi = _mm512_extractf32x8_ps(sq_hi, 1);
+
+            sum_sq_d_lo = _mm512_add_pd(sum_sq_d_lo, _mm512_cvtps_pd(sq_lo_lo));
+            sum_sq_d_hi = _mm512_add_pd(sum_sq_d_hi, _mm512_cvtps_pd(sq_lo_hi));
+            sum_sq_d_lo = _mm512_add_pd(sum_sq_d_lo, _mm512_cvtps_pd(sq_hi_lo));
+            sum_sq_d_hi = _mm512_add_pd(sum_sq_d_hi, _mm512_cvtps_pd(sq_hi_hi));
+        }
+
+        // Horizontal sum of doubles
+        __m512d sum_total_d = _mm512_add_pd(sum_sq_d_lo, sum_sq_d_hi);
+        double sum_sq = _mm512_reduce_add_pd(sum_total_d);
+
+        // Compute RMS and inverse
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        __m512 inv_rms_vec = _mm512_set1_ps(1.0f / rms);
+
+        // Pass 2: Vectorized dequant + normalize + gamma + write
+        for (size_t blk = 0; blk < n_blocks; ++blk)
+        {
+            const Q16_1Block &block = input[blk];
+            __m512 scale_vec = _mm512_set1_ps(block.d);
+
+            // Dequantize: qs → FP32
+            __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+            __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
+
+            __m512 f_lo = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q_lo)), scale_vec);
+            __m512 f_hi = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q_hi)), scale_vec);
+
+            // Load gamma
+            __m512 g_lo = _mm512_loadu_ps(gamma + blk * 32);
+            __m512 g_hi = _mm512_loadu_ps(gamma + blk * 32 + 16);
+
+            // Normalize and apply gamma: output = (val * inv_rms) * gamma
+            __m512 out_lo = _mm512_mul_ps(_mm512_mul_ps(f_lo, inv_rms_vec), g_lo);
+            __m512 out_hi = _mm512_mul_ps(_mm512_mul_ps(f_hi, inv_rms_vec), g_hi);
+
+            // Store result
+            _mm512_storeu_ps(output + blk * 32, out_lo);
+            _mm512_storeu_ps(output + blk * 32 + 16, out_hi);
+        }
+    }
+#else
+    void rmsnorm_q16_1_fp32_row_avx512(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Fallback to scalar on non-AVX512 systems
+        rmsnorm_q16_1_fp32_row_scalar(input, gamma, output, cols, epsilon);
+    }
+#endif
+
+    void rmsnorm_q16_1_fp32_fused(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        const RMSNormExecOptions &opts)
+    {
+        if (!input || !gamma || !output || rows == 0 || cols == 0)
+            return;
+
+        const size_t blocks_per_row = cols / 32;
+
+        // Select implementation based on CPU features
+#if defined(__AVX512F__)
+        auto row_fn = rmsnorm_q16_1_fp32_row_avx512;
+#else
+        auto row_fn = rmsnorm_q16_1_fp32_row_scalar;
+#endif
+
+        if (opts.force_scalar)
+        {
+            row_fn = rmsnorm_q16_1_fp32_row_scalar;
+        }
+
+#ifdef _OPENMP
+        bool should_parallelize = opts.allow_parallel && (rows * cols >= opts.parallel_threshold_elems);
+
+        if (should_parallelize)
+        {
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (long long r = 0; r < static_cast<long long>(rows); ++r)
+                {
+                    row_fn(
+                        input + r * blocks_per_row,
+                        gamma,
+                        output + r * cols,
+                        cols,
+                        epsilon);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+            return;
+        }
+#endif
+
+        // Sequential path
+        for (size_t r = 0; r < rows; ++r)
+        {
+            row_fn(
+                input + r * blocks_per_row,
+                gamma,
+                output + r * cols,
+                cols,
+                epsilon);
+        }
+    }
+
 } // namespace llaminar2::primitives

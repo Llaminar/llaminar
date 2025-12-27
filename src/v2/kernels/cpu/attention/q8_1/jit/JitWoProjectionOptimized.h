@@ -62,7 +62,7 @@
 
 #pragma once
 
-#include "JitMicrokernelBase.h"
+#include "../../../jit/JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
 #include <cstdint>
@@ -116,17 +116,17 @@ namespace llaminar::v2::kernels::jit
             constexpr int MR = 4;
 
             // Vector accumulators (per output row)
-            Zmm acc0 = gen.accum0().zmm();
-            Zmm acc1 = gen.accum1().zmm();
-            Zmm acc2 = gen.accum2().zmm();
-            Zmm acc3 = gen.accum3().zmm();
+            Zmm acc0 = gen.zmm_accum0();
+            Zmm acc1 = gen.zmm_accum1();
+            Zmm acc2 = gen.zmm_accum2();
+            Zmm acc3 = gen.zmm_accum3();
 
             // Operands
-            Zmm ctx = gen.accum4().zmm();
-            Zmm wo0 = gen.accum5().zmm();
-            Zmm wo1 = gen.accum6().zmm();
-            Zmm wo2 = gen.accum7().zmm();
-            Zmm wo3 = gen.scratch0().zmm();
+            Zmm ctx = gen.zmm_accum4();
+            Zmm wo0 = gen.zmm_accum5();
+            Zmm wo1 = gen.zmm_accum6();
+            Zmm wo2 = gen.zmm_accum7();
+            Zmm wo3 = gen.borrow<llaminar2::jit::Scratch0>().zmm();
 
             // GPRs (caller-saved only; avoid clobbering persistent regs in the fused kernel)
             // IMPORTANT: reg_context/reg_Wo/reg_output may alias SysV ABI argument regs
@@ -332,15 +332,15 @@ namespace llaminar::v2::kernels::jit
             // - accum0-3 (zmm0-3): 4 accumulators for 64 output elements
             // - accum4 (zmm4): context broadcast
             // - accum5-7 + scratch0 (zmm5-8): Wo column loads
-            Zmm acc0 = gen.accum0().zmm();      // zmm0
-            Zmm acc1 = gen.accum1().zmm();      // zmm1
-            Zmm acc2 = gen.accum2().zmm();      // zmm2
-            Zmm acc3 = gen.accum3().zmm();      // zmm3
-            Zmm ctx_bcast = gen.accum4().zmm(); // zmm4
-            Zmm wo0 = gen.accum5().zmm();       // zmm5
-            Zmm wo1 = gen.accum6().zmm();       // zmm6
-            Zmm wo2 = gen.accum7().zmm();       // zmm7
-            Zmm wo3 = gen.scratch0().zmm();     // zmm20
+            Zmm acc0 = gen.zmm_accum0();                            // zmm0
+            Zmm acc1 = gen.zmm_accum1();                            // zmm1
+            Zmm acc2 = gen.zmm_accum2();                            // zmm2
+            Zmm acc3 = gen.zmm_accum3();                            // zmm3
+            Zmm ctx_bcast = gen.zmm_accum4();                       // zmm4
+            Zmm wo0 = gen.zmm_accum5();                             // zmm5
+            Zmm wo1 = gen.zmm_accum6();                             // zmm6
+            Zmm wo2 = gen.zmm_accum7();                             // zmm7
+            Zmm wo3 = gen.borrow<llaminar2::jit::Scratch0>().zmm(); // zmm20
 
             // GPR allocation
             Reg64 reg_n = gen.r8;        // Outer loop counter (N dimension)
@@ -554,14 +554,14 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_gemm_microkernel_6x16 (K=" + std::to_string(K) + ")");
 
             // 6 accumulators + 1 broadcast + 1 B column
-            Zmm acc0 = gen.accum0().zmm();
-            Zmm acc1 = gen.accum1().zmm();
-            Zmm acc2 = gen.accum2().zmm();
-            Zmm acc3 = gen.accum3().zmm();
-            Zmm acc4 = gen.accum4().zmm();
-            Zmm acc5 = gen.accum5().zmm();
-            Zmm a_bcast = gen.accum6().zmm();
-            Zmm b_col = gen.accum7().zmm();
+            Zmm acc0 = gen.zmm_accum0();
+            Zmm acc1 = gen.zmm_accum1();
+            Zmm acc2 = gen.zmm_accum2();
+            Zmm acc3 = gen.zmm_accum3();
+            Zmm acc4 = gen.zmm_accum4();
+            Zmm acc5 = gen.zmm_accum5();
+            Zmm a_bcast = gen.zmm_accum6();
+            Zmm b_col = gen.zmm_accum7();
 
             // Zero all 6 accumulators
             gen.vxorps(acc0, acc0, acc0);
@@ -755,7 +755,7 @@ namespace llaminar::v2::kernels::jit
             using namespace Xbyak;
 
             // Use a scratch ZMM from the ScratchZone (zmm25 via scratch5())
-            Zmm zmm_tmp = gen.scratch5().zmm();
+            Zmm zmm_tmp = gen.borrow<llaminar2::jit::Scratch5>().zmm();
             Ymm ymm_tmp = Ymm(zmm_tmp.getIdx());
             Xmm xmm_tmp = Xmm(zmm_tmp.getIdx());
 
@@ -789,9 +789,9 @@ namespace llaminar::v2::kernels::jit
         {
             using namespace Xbyak;
 
-            Zmm acc = gen.accum0().zmm();
-            Zmm a_bcast = gen.accum1().zmm();
-            Zmm b_col = gen.accum2().zmm();
+            Zmm acc = gen.zmm_accum0();
+            Zmm a_bcast = gen.zmm_accum1();
+            Zmm b_col = gen.zmm_accum2();
 
             gen.vxorps(acc, acc, acc);
             gen.inLocalLabel();

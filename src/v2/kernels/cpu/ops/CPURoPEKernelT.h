@@ -74,6 +74,14 @@ namespace llaminar2
             static constexpr const char *name = "Q8_1";
             static constexpr float compression_ratio = 4.0f;
         };
+
+        template <>
+        struct RoPEPrecisionMetadata<ActivationPrecision::Q16_1>
+        {
+            using StorageType = Q16_1Block;
+            static constexpr const char *name = "Q16_1";
+            static constexpr float compression_ratio = 2.0f; // 72 bytes per 32 elements = 2.25 bytes/elem
+        };
     } // namespace detail
 
     // =========================================================================
@@ -436,6 +444,95 @@ namespace llaminar2
             TensorBase *K_in,
             TensorBase *Q_out,
             TensorBase *K_out,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+    };
+
+    // =========================================================================
+    // Q16_1 Specialization (High-Precision Integer) - implements ITensorRoPE
+    // =========================================================================
+
+    /**
+     * @brief Q16_1 specialization - high-precision in-place RoPE
+     *
+     * Q16_1 has 256× finer precision than Q8_1 (±32767 vs ±127) with FP32 scale.
+     * This enables in-place rotation with acceptable precision loss:
+     * - Sin/cos quantized to Q15 fixed-point format (same as Q8_1)
+     * - Dequant → Rotate → Requant using FP32 intermediate
+     * - FP32 scale eliminates FP16 conversion errors
+     *
+     * Constraint: head_dim must be divisible by 32 (Q16_1 block size)
+     */
+    template <>
+    class CPURoPEKernelT<ActivationPrecision::Q16_1> : public ITensorRoPE
+    {
+    public:
+        using StorageType = Q16_1Block;
+
+        CPURoPEKernelT() = default;
+        ~CPURoPEKernelT() override = default;
+
+        bool supports_device(int device_idx) const
+        {
+            return device_idx == -1;
+        }
+
+        static constexpr ActivationPrecision precision() { return ActivationPrecision::Q16_1; }
+        static const char *precision_name() { return "Q16_1"; }
+        static constexpr float compression_ratio() { return 2.0f; }
+
+        // Internal typed implementation
+        bool apply_typed(
+            Q16_1Block *Q,
+            Q16_1Block *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            int device_idx = -1);
+
+        // ITensorRoPE interface - apply() stub (required pure virtual)
+        bool apply(
+            float *data, float *output,
+            const int *pos_ids,
+            int batch_size, int seq_len, int head_dim, int num_heads,
+            float theta_base, bool interleaved,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)data;
+            (void)output;
+            (void)pos_ids;
+            (void)batch_size;
+            (void)seq_len;
+            (void)head_dim;
+            (void)num_heads;
+            (void)theta_base;
+            (void)interleaved;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Q16_1 kernel doesn't support FP32 interface
+        }
+
+        // ITensorRoPE interface - apply_q16_1() for Q16_1
+        bool apply_q16_1(
+            void *Q_data, void *K_data,
+            const int *pos_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float theta_base, int device_idx) override;
+
+        // ITensorRoPE interface - apply_tensor() with automatic dispatch
+        bool apply_tensor(
+            TensorBase *Q,
+            TensorBase *K,
             const int *position_ids,
             int seq_len,
             int n_heads,

@@ -798,13 +798,26 @@ namespace llaminar2
                       << batch_size * max_seq_len << ", " << config.vocab_local << "]");
         }
 
-        // Allocate norm/residual buffers (always FP32 - high precision needed for residual stream)
+        // Allocate norm buffer (FP32 - output of RMSNorm for GEMM input)
         state_.normalized = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
-        state_.residual = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+
+        // Allocate residual buffer based on activation precision mode
+        // HybridQ16 uses Q16_1 for 266× better precision than Q8_1 in the residual stream
+        if (act_prec == ActivationPrecision::HybridQ16)
+        {
+            LOG_INFO("[GraphOrchestrator] Using Q16_1 residual stream for HybridQ16 mode");
+            state_.residual = factory.createQ16_1(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device_idx);
+        }
+        else
+        {
+            state_.residual = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device_idx);
+        }
 
         // QKV buffers - use configured activation precision
         // For Hybrid mode: Q/K are Q8_1 (from QKV GEMM), but we need separate FP32 buffers
@@ -821,13 +834,14 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
             qkv_prec, device_idx);
 
-        // Hybrid mode: Allocate separate FP32 buffers for Q/K after RoPE
+        // Hybrid/HybridQ16 mode: Allocate separate FP32 buffers for Q/K after RoPE
         // This eliminates the requantization step in RoPE
         // Also allocate V_dequant buffer for KV cache append (V doesn't go through RoPE
         // but needs to be converted to KV cache precision for storage)
-        if (act_prec == ActivationPrecision::Hybrid)
+        if (act_prec == ActivationPrecision::Hybrid || act_prec == ActivationPrecision::HybridQ16)
         {
-            LOG_INFO("[GraphOrchestrator] Hybrid mode: allocating FP32 Q_rope/K_rope buffers");
+            LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                            << " mode: allocating FP32 Q_rope/K_rope buffers");
             state_.Q_rope = factory.createFP32(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
                 device_idx);
@@ -842,8 +856,9 @@ namespace llaminar2
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 kv_cache_prec, device_idx);
-            LOG_INFO("[GraphOrchestrator] Hybrid mode: allocating V_dequant buffer ("
-                     << activationPrecisionToString(kv_cache_prec) << ")");
+            LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                            << " mode: allocating V_dequant buffer ("
+                                            << activationPrecisionToString(kv_cache_prec) << ")");
         }
 
         // Attention output buffer
@@ -855,10 +870,20 @@ namespace llaminar2
             attn_ctx_prec, device_idx);
 
         // attn_proj is the output of Wo projection which feeds into the residual stream
-        // Keep as FP32 for numerical stability in residual connections
-        state_.attn_proj = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+        // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
+        // Other modes: FP32 for numerical stability in residual connections
+        if (act_prec == ActivationPrecision::HybridQ16)
+        {
+            state_.attn_proj = factory.createQ8_1(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device_idx);
+        }
+        else
+        {
+            state_.attn_proj = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device_idx);
+        }
 
         // FFN buffers - gate and up are kept FP32 to avoid triple quantization in SwiGLU
         ActivationPrecision gate_prec = resolveBufferPrecision(
@@ -872,10 +897,20 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
             up_prec, device_idx);
         // ffn_output is the output of FFN Down projection which feeds into the residual stream
-        // Keep as FP32 for numerical stability in residual connections
-        state_.ffn_output = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
-            device_idx);
+        // HybridQ16 mode: Q8_1 (native add to Q16_1 residual via q16_1_add_q8_1)
+        // Other modes: FP32 for numerical stability in residual connections
+        if (act_prec == ActivationPrecision::HybridQ16)
+        {
+            state_.ffn_output = factory.createQ8_1(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device_idx);
+        }
+        else
+        {
+            state_.ffn_output = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                device_idx);
+        }
 
         // Attention workspace - use local head counts for tensor parallelism
         // scores: [batch_size * buffer_n_heads, max_seq_len, max_seq_len]

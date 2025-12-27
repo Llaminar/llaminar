@@ -11,7 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include "kernels/cpu/attention/q8_1/jit/JitMicrokernelBase.h"
+#include "kernels/cpu/jit/JitMicrokernelBase.h"
 #include "kernels/cpu/attention/q8_1/jit/JitWoProjectionOptimized.h"
 
 #include <cmath>

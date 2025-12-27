@@ -173,10 +173,18 @@ namespace llaminar2
         // -------------------------------------------------------------------------
         // Stage 1: Embedding Lookup
         // -------------------------------------------------------------------------
+        // For HybridQ16 mode: output to Q16_1 residual buffer (the residual stream)
+        // For other modes: output to FP32 current_hidden
+        InferenceMode full_pass_inference_mode(config_.activation_precision);
+        TensorBase *embed_output = buffers_.layer_buffers.residual &&
+                                           full_pass_inference_mode.isHybridQ16()
+                                       ? buffers_.layer_buffers.residual
+                                       : buffers_.current_hidden;
+
         EmbeddingStage::Params embed_params;
         embed_params.embed_table = weights_.embedding_table;
         embed_params.token_ids = input.token_ids;
-        embed_params.output = buffers_.current_hidden;
+        embed_params.output = embed_output;
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
@@ -685,10 +693,16 @@ namespace llaminar2
         }
 
         // Stage 1: Pre-attention RMSNorm
+        // For HybridQ16: read from Q16_1 residual (auto-dispatches to Q16_1->FP32 kernel)
+        // For other modes: read from FP32 current_hidden
         if (env.execution.exec_rmsnorm)
         {
+            InferenceMode inference_mode(config_.activation_precision);
+
             RMSNormStage::Params attn_norm_params;
-            attn_norm_params.input = buffers.current_hidden;
+            attn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
+                                         ? buffers.residual
+                                         : buffers.current_hidden;
             attn_norm_params.output = buffers.normalized;
             attn_norm_params.gamma = layer.attn_norm;
             attn_norm_params.eps = config_.rms_norm_eps;
@@ -962,18 +976,19 @@ namespace llaminar2
             // 2. exec_attention and exec_gemm stages enabled
             // 3. Wo weights available
             // 4. CPU backend (JIT kernel is CPU-only)
-            // 5. Q8_1 or Hybrid activation precision (JIT kernel supports both)
-            //    - Q8_1: Uses Q8_1 Q directly
-            // Note: Hybrid mode should use decomposed attention for FP32 attention scoring.
+            // 5. Q8_1 or HybridQ16 activation precision
+            //    - Q8_1: Uses Q8_1 Q directly, outputs to FP32
+            //    - HybridQ16: Uses FP32 Q_rope, fuses Q16_1 residual add
+            // Note: Regular Hybrid mode should use decomposed attention for FP32 attention scoring.
             // The fused path quantizes Q to Q8_1 and uses Q8_1 K/V, losing the precision benefit.
-            // Hybrid achieves its accuracy by keeping Q/K in FP32 through attention scoring,
-            // then using streaming dequant for Wo projection in the decomposed path.
+            // HybridQ16 enables fused path with Q16_1 residual fusion for better precision.
             bool use_fused_wo = env.attention.fused_wo &&
                                 env.execution.exec_attention &&
                                 env.execution.exec_gemm &&
                                 layer.wo &&
                                 backend == ComputeBackendType::CPU &&
-                                config_.activation_precision == ActivationPrecision::Q8_1;
+                                (config_.activation_precision == ActivationPrecision::Q8_1 ||
+                                 config_.activation_precision == ActivationPrecision::HybridQ16);
 
             LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " fused_wo check: env.fused_wo=" << env.attention.fused_wo
                                             << " exec_attention=" << env.execution.exec_attention
@@ -1031,16 +1046,30 @@ namespace llaminar2
                 fused_params.mpi_ctx = mpi_ctx_.get();
                 fused_params.device_idx = device_idx;
 
-                // Hybrid mode: enable streaming dequantization for FP32-equivalent Wo projection
+                // Hybrid/HybridQ16 mode: enable streaming dequantization for FP32-equivalent Wo projection
                 // This gives highest numerical precision by dequantizing VNNI-packed weights to FP32
                 // row-by-row during GEMM, avoiding the precision loss of quantizing FP32 context.
-                fused_params.use_hybrid_wo = inference_mode.isHybrid();
+                fused_params.use_hybrid_wo = inference_mode.isAnyHybrid();
+
+                // HybridQ16 mode: enable Q16_1 residual fusion
+                // The JIT kernel will fuse residual addition after Wo projection:
+                // - Wo output stays in registers as FP32
+                // - Q16_1 residual is loaded, dequantized, added
+                // - Result is quantized to Q16_1 and stored directly
+                // This eliminates FP32 intermediate memory traffic (2.8× reduction).
+                if (inference_mode.isHybridQ16())
+                {
+                    fused_params.fuse_residual_add = true;
+                    fused_params.output = buffers.residual; // Output directly to Q16_1 residual
+                    LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " HybridQ16: fused residual add enabled");
+                }
 
                 // Optional context snapshot for debugging (enabled via buffer allocation)
                 fused_params.context_snapshot = buffers.context_snapshot;
                 LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " fused_attn_wo context_snapshot="
                                                 << (buffers.context_snapshot ? "allocated" : "NULL")
-                                                << " use_hybrid_wo=" << fused_params.use_hybrid_wo);
+                                                << " use_hybrid_wo=" << fused_params.use_hybrid_wo
+                                                << " fuse_residual_add=" << fused_params.fuse_residual_add);
 
                 wo_producer_node = prefix + "fused_attn_wo";
                 graph.addNode(wo_producer_node,
@@ -1151,10 +1180,16 @@ namespace llaminar2
                     // AllReduce the actual data, not full buffer capacity
                     size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
 
+                    // For HybridQ16 fusion: allreduce the Q16_1 residual buffer
+                    // For standard path: allreduce the FP32 attn_proj buffer
+                    TensorBase *allreduce_buffer = inference_mode.isHybridQ16()
+                                                       ? buffers.residual
+                                                       : buffers.attn_proj;
+
                     graph.addNode(prefix + "wo_allreduce",
                                   ComputeStageFactory::createAllreduce(
                                       AllreduceStage::Params{
-                                          buffers.attn_proj,
+                                          allreduce_buffer,
                                           getMPICommPtr(mpi_ctx_.get()),
                                           allreduce_count}),
                                   device_idx);
@@ -1163,13 +1198,15 @@ namespace llaminar2
                     wo_producer_node = prefix + "wo_allreduce";
 
                     LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                    << " Wo: row-parallel sharded, adding allreduce");
+                                                    << " Wo: row-parallel sharded, adding allreduce"
+                                                    << (inference_mode.isHybridQ16() ? " (Q16_1 residual)" : " (FP32 proj)"));
                 }
             }
         }
 
         // Stage 6: Residual connection
-        if (env.execution.exec_residual)
+        // Skip when HybridQ16 fusion is enabled - the fused kernel already did residual add
+        if (env.execution.exec_residual && !inference_mode.isHybridQ16())
         {
             ResidualAddStage::Params res_params;
             res_params.input = buffers.attn_proj;
@@ -1216,8 +1253,13 @@ namespace llaminar2
         // Stage 1: Pre-FFN RMSNorm
         if (env.execution.exec_rmsnorm)
         {
+            // For HybridQ16, read from Q16_1 residual buffer
+            InferenceMode inference_mode(config_.activation_precision);
+
             RMSNormStage::Params ffn_norm_params;
-            ffn_norm_params.input = buffers.current_hidden;
+            ffn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
+                                        ? buffers.residual
+                                        : buffers.current_hidden;
             ffn_norm_params.output = buffers.normalized;
             ffn_norm_params.gamma = layer.ffn_norm;
             ffn_norm_params.eps = config_.rms_norm_eps;
@@ -1332,10 +1374,17 @@ namespace llaminar2
         // Stage 5: Residual connection
         if (env.execution.exec_residual)
         {
+            // For HybridQ16, FFN residual uses Q16_1 residual buffer
+            InferenceMode inference_mode_ffn_res(config_.activation_precision);
+
             ResidualAddStage::Params res_params;
             res_params.input = buffers.attn_proj;
-            res_params.residual = buffers.current_hidden;
-            res_params.output = buffers.current_hidden;
+            res_params.residual = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
+                                      ? buffers.residual
+                                      : buffers.current_hidden;
+            res_params.output = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
+                                    ? buffers.residual
+                                    : buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
 
             graph.addNode(prefix + "ffn_residual",

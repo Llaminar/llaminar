@@ -406,4 +406,65 @@ namespace llaminar2::primitives
         int head_dim,
         float rope_theta);
 
+    // ============================================================================
+    // Q16_1 In-Place RoPE Primitives
+    // ============================================================================
+    // Q16_1 provides 256× finer quantization than Q8_1 with FP32 scale.
+    // This makes in-place RoPE feasible with acceptable precision loss.
+    //
+    // Key advantages over Q8_1:
+    // - int16 values: ±32767 range vs ±127 (256× finer)
+    // - FP32 scale: no scale quantization error
+    // - Better preservation of rotation precision
+    //
+    // Algorithm:
+    // 1. Dequantize paired blocks (blockA = first half, blockB = second half)
+    // 2. Apply rotation: x' = x*cos - y*sin, y' = x*sin + y*cos
+    // 3. Requantize back to Q16_1 with new scale
+    // ============================================================================
+
+    /**
+     * @brief Apply in-place RoPE rotation to a single Q16_1 head
+     *
+     * @param head_blocks Q16_1 blocks for one head [blocks_per_head]
+     * @param blocks_per_head Number of blocks (head_dim / 32)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     */
+    void apply_rope_q16_1_integer_head(
+        Q16_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+    /**
+     * @brief Apply in-place RoPE to Q16_1 Q and K tensors
+     *
+     * High-level wrapper that handles:
+     * - Position ID processing (skip padding with -1)
+     * - Sin/cos computation and Q15 quantization
+     * - Parallelization across tokens
+     * - Both Q and K tensor processing
+     *
+     * @param Q Q16_1 Q tensor [seq_len * n_heads * blocks_per_head]
+     * @param K Q16_1 K tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
+     * @param position_ids Position indices [seq_len], -1 = padding
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension (must be divisible by 32)
+     * @param rope_theta RoPE base frequency (e.g., 10000.0f)
+     * @param persistent_state Optional persistent state for decode optimization
+     */
+    void apply_rope_q16_1_integer(
+        Q16_1Block *Q,
+        Q16_1Block *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state = nullptr);
+
 } // namespace llaminar2::primitives

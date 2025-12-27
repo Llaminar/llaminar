@@ -15,6 +15,7 @@
 #include "v2/kernels/cpu/primitives/RoPEPrimitives.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/tensors/BlockStructures.h"
+#include "v2/tensors/Tensors.h" // For Q16_1Tensor
 
 #include <vector>
 #include <cmath>
@@ -666,6 +667,319 @@ namespace llaminar2
         float max_diff = max_abs_diff(q_data.data(), expected.data(), q_size);
         EXPECT_LT(max_diff, FP32_LARGE_POS_TOLERANCE)
             << "RoPE with large positions max diff: " << max_diff;
+    }
+
+    // =========================================================================
+    // Q16_1 Specialization Tests
+    // =========================================================================
+
+    TEST_F(CPURoPEKernelTTest, Q16_1_apply_typed_with_conversion)
+    {
+        // Q16_1 requires head_dim divisible by 32
+        const size_t q_size = seq_len_ * n_heads_ * head_dim_;
+        const size_t num_blocks = q_size / 32;
+
+        // Generate FP32 test data
+        auto fp32_q = generate_random_fp32(q_size);
+
+        // Convert to Q16_1
+        std::vector<Q16_1Block> q16_q(num_blocks);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const float *src = fp32_q.data() + b * 32;
+            Q16_1Block &block = q16_q[b];
+
+            // Find max for scale
+            float max_val = 0.0f;
+            for (int i = 0; i < 32; ++i)
+            {
+                max_val = std::max(max_val, std::abs(src[i]));
+            }
+
+            float scale = max_val / 32767.0f;
+            if (scale < 1e-20f)
+                scale = 1e-20f;
+            float inv_scale = 1.0f / scale;
+
+            block.d = scale;
+            int64_t sum = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::round(src[i] * inv_scale));
+                q = std::max(-32767, std::min(32767, q));
+                block.qs[i] = static_cast<int16_t>(q);
+                sum += q;
+            }
+            block.sum_qs = static_cast<int32_t>(sum);
+        }
+
+        // Reference: dequant, apply RoPE in FP32
+        std::vector<float> fp32_expected(q_size);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const Q16_1Block &block = q16_q[b];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_expected[b * 32 + i] = static_cast<float>(block.qs[i]) * block.d;
+            }
+        }
+
+        std::vector<int> position_ids(seq_len_);
+        std::iota(position_ids.begin(), position_ids.end(), 0);
+
+        reference_rope(fp32_expected.data(), seq_len_, n_heads_, head_dim_,
+                       position_ids.data(), ROPE_THETA);
+
+        // Apply RoPE to Q16_1 data (in-place)
+        primitives::apply_rope_q16_1_integer(
+            q16_q.data(), nullptr,
+            position_ids.data(),
+            seq_len_,
+            n_heads_, 0,
+            head_dim_,
+            ROPE_THETA,
+            nullptr);
+
+        // Dequantize result for comparison
+        std::vector<float> fp32_result(q_size);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const Q16_1Block &block = q16_q[b];
+            for (int i = 0; i < 32; ++i)
+            {
+                fp32_result[b * 32 + i] = static_cast<float>(block.qs[i]) * block.d;
+            }
+        }
+
+        // Q16_1 has 256× finer precision than Q8_1, so tolerance should be tighter
+        // Cosine similarity should be very close to 1.0
+        float cosine = cosine_similarity(fp32_result.data(), fp32_expected.data(), q_size);
+        EXPECT_GT(cosine, 0.999f) // Much tighter than Q8_1's 0.98f
+            << "Q16_1 RoPE cosine similarity: " << cosine;
+
+        float max_diff = max_abs_diff(fp32_result.data(), fp32_expected.data(), q_size);
+        EXPECT_LT(max_diff, 0.02f) // Much tighter than Q8_1's 0.20f
+            << "Q16_1 RoPE max diff: " << max_diff;
+    }
+
+    TEST_F(CPURoPEKernelTTest, Q16_1_precision_metadata)
+    {
+        CPURoPEKernelT<ActivationPrecision::Q16_1> kernel;
+        EXPECT_EQ(kernel.precision(), ActivationPrecision::Q16_1);
+        EXPECT_STREQ(kernel.precision_name(), "Q16_1");
+        EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
+    }
+
+    TEST_F(CPURoPEKernelTTest, Q16_1_apply_tensor)
+    {
+        // Test apply_tensor interface with Q16_1 tensors
+        const size_t q_size = seq_len_ * n_heads_ * head_dim_;
+        const size_t num_blocks = q_size / 32;
+
+        // Generate FP32 test data
+        auto fp32_q = generate_random_fp32(q_size);
+
+        // Create Q16_1Tensor from shape (2D for activation tensor)
+        std::vector<size_t> shape = {static_cast<size_t>(seq_len_), static_cast<size_t>(n_heads_ * head_dim_)};
+        Q16_1Tensor q_tensor(shape);
+
+        // Quantize into tensor
+        std::vector<float> fp32_for_quant = fp32_q;
+        q_tensor.copyFrom_fp32(fp32_for_quant.data());
+
+        // Get reference result
+        std::vector<float> fp32_expected = fp32_q;
+        std::vector<int> position_ids(seq_len_);
+        std::iota(position_ids.begin(), position_ids.end(), 0);
+        reference_rope(fp32_expected.data(), seq_len_, n_heads_, head_dim_,
+                       position_ids.data(), ROPE_THETA);
+
+        // Apply RoPE via apply_tensor
+        CPURoPEKernelT<ActivationPrecision::Q16_1> kernel;
+        bool success = kernel.apply_tensor(
+            &q_tensor, nullptr,
+            position_ids.data(),
+            seq_len_, n_heads_, 0, head_dim_,
+            ROPE_THETA);
+        EXPECT_TRUE(success);
+
+        // Dequantize and compare
+        std::vector<float> fp32_result(q_size);
+        q_tensor.to_fp32(fp32_result.data());
+
+        float cosine = cosine_similarity(fp32_result.data(), fp32_expected.data(), q_size);
+        EXPECT_GT(cosine, 0.999f)
+            << "Q16_1 apply_tensor cosine similarity: " << cosine;
+    }
+
+    TEST_F(CPURoPEKernelTTest, Q16_1_vs_Q8_1_precision_improvement)
+    {
+        // Verify that Q16_1 RoPE has better precision than Q8_1
+        // This is a sanity check for the 256× improvement claim
+        const size_t q_size = seq_len_ * n_heads_ * head_dim_;
+        const size_t num_blocks = q_size / 32;
+
+        // Generate FP32 test data
+        auto fp32_q = generate_random_fp32(q_size);
+
+        // Reference: FP32 RoPE result
+        std::vector<float> fp32_expected = fp32_q;
+        std::vector<int> position_ids(seq_len_);
+        std::iota(position_ids.begin(), position_ids.end(), 0);
+        reference_rope(fp32_expected.data(), seq_len_, n_heads_, head_dim_,
+                       position_ids.data(), ROPE_THETA);
+
+        // Q8_1 path
+        std::vector<Q8_1Block> q8_q(num_blocks);
+        simd::quantize_fp32_to_q8_1_blocks(fp32_q.data(), q8_q.data(), q_size);
+        primitives::apply_rope_q8_1_integer(q8_q.data(), nullptr, position_ids.data(),
+                                            seq_len_, n_heads_, 0, head_dim_, ROPE_THETA);
+        std::vector<float> q8_result(q_size);
+        simd::dequantize_q8_1_to_fp32(q8_q.data(), q8_result.data(), q_size);
+        float q8_max_diff = max_abs_diff(q8_result.data(), fp32_expected.data(), q_size);
+
+        // Q16_1 path
+        std::vector<Q16_1Block> q16_q(num_blocks);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const float *src = fp32_q.data() + b * 32;
+            Q16_1Block &block = q16_q[b];
+            float max_val = 0.0f;
+            for (int i = 0; i < 32; ++i)
+                max_val = std::max(max_val, std::abs(src[i]));
+            float scale = max_val / 32767.0f;
+            if (scale < 1e-20f)
+                scale = 1e-20f;
+            float inv_scale = 1.0f / scale;
+            block.d = scale;
+            int64_t sum = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::round(src[i] * inv_scale));
+                q = std::max(-32767, std::min(32767, q));
+                block.qs[i] = static_cast<int16_t>(q);
+                sum += q;
+            }
+            block.sum_qs = static_cast<int32_t>(sum);
+        }
+        primitives::apply_rope_q16_1_integer(q16_q.data(), nullptr, position_ids.data(),
+                                             seq_len_, n_heads_, 0, head_dim_, ROPE_THETA, nullptr);
+        std::vector<float> q16_result(q_size);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const Q16_1Block &block = q16_q[b];
+            for (int i = 0; i < 32; ++i)
+                q16_result[b * 32 + i] = static_cast<float>(block.qs[i]) * block.d;
+        }
+        float q16_max_diff = max_abs_diff(q16_result.data(), fp32_expected.data(), q_size);
+
+        // Q16_1 should have at least 10× better precision than Q8_1
+        // (256× in quantization precision, but rotation adds some error)
+        EXPECT_LT(q16_max_diff, q8_max_diff / 5.0f)
+            << "Q16_1 max_diff=" << q16_max_diff << " should be much better than Q8_1 max_diff=" << q8_max_diff;
+    }
+
+    TEST_F(CPURoPEKernelTTest, Q16_1_vs_FP32_RoPE_accuracy)
+    {
+        // Compare Q16_1 RoPE against pure FP32 RoPE to measure actual precision loss
+        // This tests the full pipeline: FP32 → Q16_1 → RoPE → dequant vs FP32 → RoPE
+        const size_t q_size = seq_len_ * n_heads_ * head_dim_;
+        const size_t num_blocks = q_size / 32;
+
+        // Generate FP32 test data (values in typical activation range)
+        auto fp32_input = generate_random_fp32(q_size);
+
+        // Path 1: Pure FP32 RoPE (ground truth)
+        std::vector<float> fp32_result = fp32_input;
+        std::vector<int> position_ids(seq_len_);
+        std::iota(position_ids.begin(), position_ids.end(), 0);
+
+        CPURoPEKernelT<ActivationPrecision::FP32> fp32_kernel;
+        fp32_kernel.apply_typed(fp32_result.data(), nullptr, position_ids.data(),
+                                seq_len_, n_heads_, 0, head_dim_, ROPE_THETA);
+
+        // Path 2: Q16_1 RoPE (quantize → rope → dequantize)
+        // Step 2a: Quantize FP32 to Q16_1
+        std::vector<Q16_1Block> q16_blocks(num_blocks);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const float *src = fp32_input.data() + b * 32;
+            Q16_1Block &block = q16_blocks[b];
+
+            float max_val = 0.0f;
+            for (int i = 0; i < 32; ++i)
+                max_val = std::max(max_val, std::abs(src[i]));
+
+            float scale = max_val / 32767.0f;
+            if (scale < 1e-20f)
+                scale = 1e-20f;
+            float inv_scale = 1.0f / scale;
+
+            block.d = scale;
+            int64_t sum = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::round(src[i] * inv_scale));
+                q = std::max(-32767, std::min(32767, q));
+                block.qs[i] = static_cast<int16_t>(q);
+                sum += q;
+            }
+            block.sum_qs = static_cast<int32_t>(sum);
+        }
+
+        // Step 2b: Apply Q16_1 RoPE in-place
+        primitives::apply_rope_q16_1_integer(
+            q16_blocks.data(), nullptr,
+            position_ids.data(),
+            seq_len_, n_heads_, 0, head_dim_,
+            ROPE_THETA, nullptr);
+
+        // Step 2c: Dequantize Q16_1 result to FP32
+        std::vector<float> q16_result(q_size);
+        for (size_t b = 0; b < num_blocks; ++b)
+        {
+            const Q16_1Block &block = q16_blocks[b];
+            for (int i = 0; i < 32; ++i)
+            {
+                q16_result[b * 32 + i] = static_cast<float>(block.qs[i]) * block.d;
+            }
+        }
+
+        // Compute error metrics
+        float max_diff = max_abs_diff(q16_result.data(), fp32_result.data(), q_size);
+        float cosine = cosine_similarity(q16_result.data(), fp32_result.data(), q_size);
+
+        // Compute relative error (normalized by output magnitude)
+        float sum_sq_fp32 = 0.0f;
+        float sum_sq_diff = 0.0f;
+        for (size_t i = 0; i < q_size; ++i)
+        {
+            float diff = q16_result[i] - fp32_result[i];
+            sum_sq_diff += diff * diff;
+            sum_sq_fp32 += fp32_result[i] * fp32_result[i];
+        }
+        float rel_rmse = std::sqrt(sum_sq_diff / sum_sq_fp32);
+
+        // Print metrics for visibility
+        printf("\n  Q16_1 vs FP32 RoPE accuracy:\n");
+        printf("    Max absolute diff: %.6e\n", max_diff);
+        printf("    Cosine similarity: %.8f\n", cosine);
+        printf("    Relative RMSE:     %.6e\n", rel_rmse);
+
+        // Assertions (10x margin over measured values):
+        // Measured: max_diff ~9e-05, cosine ~0.99999946, rel_rmse ~2.2e-05
+
+        // 1. Max absolute error (measured ~9e-05, threshold 1e-03)
+        EXPECT_LT(max_diff, 1e-03f)
+            << "Q16_1 RoPE max absolute error too large: " << max_diff;
+
+        // 2. Cosine similarity (measured ~0.99999946, threshold 0.99999)
+        EXPECT_GT(cosine, 0.99999f)
+            << "Q16_1 RoPE cosine similarity too low: " << cosine;
+
+        // 3. Relative RMSE (measured ~2.2e-05, threshold 2.5e-04)
+        EXPECT_LT(rel_rmse, 2.5e-04f)
+            << "Q16_1 RoPE relative RMSE too large: " << rel_rmse;
     }
 
 } // namespace llaminar2

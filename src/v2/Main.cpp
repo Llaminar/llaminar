@@ -397,6 +397,10 @@ int main(int argc, char *argv[])
     {
         runtime_config.activation_precision = ActivationPrecision::Hybrid;
     }
+    else if (args.activation_precision == "hybridq16")
+    {
+        runtime_config.activation_precision = ActivationPrecision::HybridQ16;
+    }
     else
     {
         // This branch should never be reached due to ArgParser validation,

@@ -90,9 +90,10 @@ namespace llaminar2
         /**
          * @brief Create Q8_1 tensor with NUMA-aware allocation
          * @param shape Tensor dimensions (logical element count)
+         * @param device_idx Optional device index (-1 = CPU)
          * @return Q8_1 tensor with properly sized block storage
          */
-        std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape);
+        std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape, int device_idx = -1);
 
         /**
          * @brief Create Q8_1 tensor from existing raw data
@@ -102,6 +103,19 @@ namespace llaminar2
          */
         std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape,
                                                const std::vector<uint8_t> &raw_data);
+
+        /**
+         * @brief Create Q16_1 tensor with NUMA-aware allocation
+         *
+         * Q16_1 provides 256× finer quantization than Q8_1 with FP32 scale.
+         * Ideal for high-precision residual stream storage.
+         *
+         * @param shape Tensor dimensions (logical element count)
+         * @param device_idx Optional device index (-1 = CPU)
+         * @return Q16_1 tensor with properly sized block storage
+         */
+        std::unique_ptr<Q16_1Tensor> createQ16_1(const std::vector<size_t> &shape,
+                                                 int device_idx = -1);
 
         /**
          * @brief Create activation tensor based on precision setting

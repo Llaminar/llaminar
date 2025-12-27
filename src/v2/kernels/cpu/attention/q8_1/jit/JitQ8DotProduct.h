@@ -51,7 +51,7 @@
 
 #pragma once
 
-#include "JitMicrokernelBase.h"
+#include "../../../jit/JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
 #include "../../../jit/RegisterEnforcement.h"
@@ -160,7 +160,7 @@ namespace llaminar::v2::kernels::jit
 
                 // Convert Q from signed to unsigned by XOR with 0x80
                 // vpdpbusd: src1 (Q) must be unsigned, src2 (K) is signed
-                gen.vpxord(ymm_q, ymm_q, gen.const_128().ymm());
+                gen.vpxord(ymm_q, ymm_q, gen.ymm_const_128());
 
                 // Load K scale: d_K (FP16)
                 gen.vpbroadcastw(xmm_d_k, gen.ptr[reg_K_ptr + k_offset]);
@@ -670,7 +670,7 @@ namespace llaminar::v2::kernels::jit
 
             // Initialize constants
             debug_emit("  Init constants");
-            emit_broadcast_i32_const(const_128().zmm(), 0x80808080, rax);
+            emit_broadcast_i32_const(zmm_const_128(), 0x80808080, rax);
 
             // Allocate stack for Q blocks (padded to 64 bytes each)
             // Max stack = max_blocks * 64 + alignment

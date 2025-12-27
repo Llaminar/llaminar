@@ -81,6 +81,19 @@ namespace llaminar2
              * Flow with hybrid_wo:    FP32 context × dequant(VNNI) → FP32
              */
             bool use_hybrid_wo = false;
+
+            /**
+             * @brief Enable Q16_1 residual fusion (HybridQ16 mode)
+             *
+             * When true, the JIT kernel fuses residual addition after Wo projection:
+             * - Wo output stays in registers as FP32 (no intermediate store)
+             * - Q16_1 residual is loaded, dequantized to FP32, added
+             * - Result is quantized to Q16_1 and stored
+             *
+             * This eliminates FP32 intermediate memory traffic (2.8× reduction).
+             * Requires JIT backend and Q16_1 output tensor.
+             */
+            bool fuse_residual_add = false;
         };
 
         explicit FusedAttentionWoKernel(const Config &config)
@@ -231,11 +244,30 @@ namespace llaminar2
             }
 
             // Validate output tensor
-            auto *out_fp32 = dynamic_cast<FP32Tensor *>(output);
-            if (!out_fp32)
+            // For Q16_1 residual fusion: output is Q16_1 (read-modify-write residual)
+            // For standard path: output is FP32
+            float *output_ptr = nullptr;
+            if (config_.fuse_residual_add)
             {
-                LOG_ERROR("FusedAttentionWoKernel requires FP32 output tensor");
-                return false;
+                auto *out_q16 = dynamic_cast<Q16_1Tensor *>(output);
+                if (!out_q16)
+                {
+                    LOG_ERROR("FusedAttentionWoKernel with fuse_residual_add requires Q16_1 output tensor");
+                    return false;
+                }
+                // For Q16_1 fusion, we pass the raw block pointer as output
+                // The JIT kernel interprets this as Q16_1 blocks and does read-modify-write
+                output_ptr = reinterpret_cast<float *>(out_q16->mutable_q16_1_blocks());
+            }
+            else
+            {
+                auto *out_fp32 = dynamic_cast<FP32Tensor *>(output);
+                if (!out_fp32)
+                {
+                    LOG_ERROR("FusedAttentionWoKernel requires FP32 output tensor");
+                    return false;
+                }
+                output_ptr = out_fp32->mutable_data();
             }
 
             // Build params structure
@@ -246,7 +278,7 @@ namespace llaminar2
             params.V = V_q8->q8_1_blocks();
             params.Wo = wo_data;
             params.wo_type = wo_type;
-            params.output = out_fp32->mutable_data();
+            params.output = output_ptr;
             params.batch_size = 1;
             params.kv_seq_lens = nullptr;
             params.position_offsets = nullptr;
@@ -463,6 +495,14 @@ namespace llaminar2
             jit_config.causal = params.causal;
             jit_config.use_fa2_tiling = true; // Always use FA2 path
 
+            // Q16_1 residual fusion: wire config flags from kernel config
+            jit_config.fuse_residual_add = config_.fuse_residual_add;
+            if (config_.fuse_residual_add)
+            {
+                jit_config.residual_type = JitAttentionConfig::ResidualType::Q16_1;
+                LOG_DEBUG("FusedAttentionWoKernel: Q16_1 residual fusion enabled");
+            }
+
             // Explicitly specialize by mode (decode vs prefill) independent of batch_size.
             // In this pipeline kernel, batch_size is typically 1 for both decode and prefill.
             jit_config.mode = (params.seq_len <= 1)
@@ -546,7 +586,11 @@ namespace llaminar2
             const void *wo_ptr = params.Wo;
             llaminar::v2::kernels::jit::JitPackedWoParams packed_params = {}; // Zero-initialize
 
-            if (wo_format == WoFormat::Q8_1_VNNI_PACKED)
+            // Both VNNI_PACKED and FP32_STREAMING_DEQUANT use the same packed weights structure.
+            // The extern C thunks expect JitPackedWoParams, not raw QuantisedPackedWeights*.
+            // FP32_STREAMING_DEQUANT uses original_packed to access the packed weights for
+            // streaming dequantization.
+            if (wo_format == WoFormat::Q8_1_VNNI_PACKED || wo_format == WoFormat::FP32_STREAMING_DEQUANT)
             {
                 const auto *packed = static_cast<const llaminar2::gemm_v4::QuantisedPackedWeights *>(params.Wo);
                 packed_params.packed_data = packed->packed_data.data();
@@ -560,7 +604,8 @@ namespace llaminar2
                 wo_ptr = &packed_params;
                 LOG_DEBUG("FusedAttentionWoKernel: packed_params @ " << &packed_params
                                                                      << " wo_ptr=" << wo_ptr << " N=" << packed_params.N << " K=" << packed_params.K
-                                                                     << " original_packed=" << packed_params.original_packed);
+                                                                     << " original_packed=" << packed_params.original_packed
+                                                                     << " wo_format=" << static_cast<int>(wo_format));
             }
 
             (*slot_ptr)->compute(

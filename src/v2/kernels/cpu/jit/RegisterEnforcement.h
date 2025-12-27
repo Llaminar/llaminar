@@ -61,20 +61,20 @@ namespace llaminar2::jit
         {
         };
 
-        // Specialization: has zone_type, absolute_index, and zmm() accessor
-        // but ALSO has ymm() which TypedXmm does NOT have
+        // Specialization: TypedZmm has zone_type, absolute_index, local_index, and is_zmm_type
+        // Note: TypedZmm is now a pure tag type without .zmm()/.ymm() accessors
         template <typename T>
         struct is_typed_zmm_impl<T,
                                  std::void_t<
                                      typename T::zone_type,
                                      decltype(T::absolute_index),
                                      decltype(T::local_index),
-                                     decltype(std::declval<T>().zmm()),
-                                     decltype(std::declval<T>().ymm())>> : std::true_type
+                                     decltype(T::is_zmm_type)>> : std::true_type
         {
         };
 
-        // Check for TypedXmm - has xmm() and as_zmm() but NOT zmm() directly
+        // Check for TypedXmm - has zone_type, absolute_index, local_index, and is_xmm_type
+        // Note: TypedXmm is now a pure tag type without .xmm() accessor
         template <typename T, typename = void>
         struct is_typed_xmm_impl : std::false_type
         {
@@ -86,8 +86,7 @@ namespace llaminar2::jit
                                      typename T::zone_type,
                                      decltype(T::absolute_index),
                                      decltype(T::local_index),
-                                     decltype(std::declval<T>().xmm()),
-                                     decltype(std::declval<T>().as_zmm())>> : std::true_type
+                                     decltype(T::is_xmm_type)>> : std::true_type
         {
         };
 
@@ -506,13 +505,14 @@ namespace llaminar2::jit
         }
         else if constexpr (is_typed_zmm_v<T>)
         {
-            return reg.zmm();
+            // TypedZmm is now a tag type - construct Xbyak::Zmm from physical index
+            return Xbyak::Zmm(T::absolute_index);
         }
         else
         {
             static_assert(is_typed_register_v<T>,
                           "to_xbyak_zmm requires a typed register");
-            return reg.zmm();
+            return Xbyak::Zmm(T::absolute_index);
         }
     }
 
@@ -522,7 +522,15 @@ namespace llaminar2::jit
     template <typename T>
     constexpr auto to_xbyak_xmm(const T &reg) -> Xbyak::Xmm
     {
-        return reg.xmm();
+        if constexpr (is_register_guard_v<T>)
+        {
+            return reg.xmm();
+        }
+        else
+        {
+            // TypedXmm/TypedZmm is now a tag type - construct from physical index
+            return Xbyak::Xmm(T::absolute_index);
+        }
     }
 
 } // namespace llaminar2::jit

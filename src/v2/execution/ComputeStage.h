@@ -1348,6 +1348,21 @@ namespace llaminar2
             // during GEMM computation, giving FP32-equivalent precision.
             // When false, uses faster Q8_1 VNNI path with quantized activations.
             bool use_hybrid_wo = false;
+
+            // ═══════════════════════════════════════════════════════════════════
+            // Q16_1 RESIDUAL FUSION (HybridQ16 mode)
+            // ═══════════════════════════════════════════════════════════════════
+            // When enabled, the JIT kernel fuses residual addition after Wo projection:
+            // - Wo output stays in registers as FP32 (no intermediate store)
+            // - Residual is loaded (Q16_1), dequantized, added
+            // - Result is quantized to Q16_1 and stored
+            // This eliminates FP32 intermediate memory traffic (2.8× reduction).
+            //
+            // NOTE: When fuse_residual_add=true, the `output` field should point
+            // to the Q16_1 residual buffer (not FP32). The kernel will read the
+            // current residual value, add the Wo projection, and write back.
+            // ═══════════════════════════════════════════════════════════════════
+            bool fuse_residual_add = false;
         };
 
         explicit FusedAttentionWoStage(Params params);
@@ -1469,6 +1484,18 @@ namespace llaminar2
         // Mixed-type implementations for hybrid precision modes
         // FP32 input + Q8_1 residual → Q8_1 output (used when fused attention outputs FP32)
         bool executeFP32_Q8_1_to_Q8_1(IDeviceContext *ctx, size_t num_elements);
+
+        // Q8_1 input + Q16_1 residual → Q16_1 output (HybridQ16 mode)
+        // Uses SIMD-optimized q16_1_add_q8_1 for in-place accumulation
+        bool executeQ8_1_Q16_1_to_Q16_1(IDeviceContext *ctx, size_t num_elements);
+
+        // FP32 input + Q16_1 residual → Q16_1 output (HybridQ16 mode FFN residual)
+        // Uses SIMD-optimized q16_1_add_fp32 for adding FP32 GEMM output to Q16_1 stream
+        bool executeFP32_Q16_1_to_Q16_1(IDeviceContext *ctx, size_t num_elements);
+
+        // Q8_1 input + FP32 residual → FP32 output (HybridQ16 mode when residual starts as FP32)
+        // Dequantizes Q8_1 delta and adds to FP32 residual
+        bool executeQ8_1_FP32_to_FP32(IDeviceContext *ctx, size_t num_elements);
     };
 
     // =============================================================================
@@ -1521,8 +1548,44 @@ namespace llaminar2
     private:
         Params params_;
 
+        /// Execute Q16_1 output path: FP32 lookup + quantization
+        bool executeQ16_1Output();
+
         /// Zero out a row of the output tensor (for padding)
         static void zero_output_row(TensorBase *output, int row_idx, int d_model);
+    };
+
+    /**
+     * @brief Quantize FP32 tensor to Q16_1 format
+     *
+     * Used to initialize the Q16_1 residual stream from FP32 embedding output
+     * in HybridQ16 mode. This stage copies and quantizes FP32 → Q16_1.
+     *
+     * Typically used once at the start of inference to initialize the
+     * typed residual stream before layer 0 runs.
+     */
+    class QuantizeToQ16_1Stage : public IComputeStage
+    {
+    public:
+        struct Params
+        {
+            const TensorBase *input = nullptr; ///< FP32 input [num_elements]
+            TensorBase *output = nullptr;      ///< Q16_1 output [num_elements]
+            size_t num_elements = 0;           ///< Number of elements to quantize
+        };
+
+        explicit QuantizeToQ16_1Stage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override { return ComputeStageType::QUANTIZE; }
+        size_t estimatedFlops() const override { return params_.num_elements * 4; }
+        size_t estimatedMemoryBytes() const override { return params_.num_elements * 6; }
+        bool supportsBackend(ComputeBackendType backend) const override { return backend == ComputeBackendType::CPU; }
+        StageDumpInfo getDumpInfo() const override;
+        StageBufferRequirements getBufferRequirements() const override;
+
+    private:
+        Params params_;
     };
 
     /**

@@ -75,9 +75,9 @@
 
 #pragma once
 
-#include "../../../../../../../external/onednn/third_party/xbyak/xbyak.h"
-#include "../../../jit/RegisterAllocation.h"
-#include "../../../jit/RegisterGuard.h"
+#include "../../../../external/onednn/third_party/xbyak/xbyak.h"
+#include "RegisterAllocation.h"
+#include "RegisterGuard.h"
 #include <array>
 #include <cstdint>
 #include <string>

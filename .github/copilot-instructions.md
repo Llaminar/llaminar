@@ -533,10 +533,16 @@ OMP_WORKSHARE_REGION(do_attention_work);
 
 The JIT kernels (in `src/v2/kernels/cpu/attention/q8_1/jit/`) use Xbyak for runtime code generation. These kernels have **complex register allocation** across ZMM registers (zmm0-31) that are partitioned into zones.
 
-**Key Files**:
+**Key Files** (all in `src/v2/kernels/cpu/jit/`):
 - `RegisterAllocation.h`: Zone definitions and typed register wrappers
 - `RegisterGuard.h`: RAII tracking and conflict detection
+- `RegisterEnforcement.h`: Compile-time concepts for typed access
 - `JitMicrokernelBase.h`: Base class with register accessors and tracking integration
+
+**CMake Enforcement** (`cmake/EnforceTypedRegisters.cmake`):
+- Build-time check that prevents bypassing the guard system
+- Fails cmake configure if raw Xbyak registers (`Zmm(5)`) or untracked accessors (`scratch0().zmm()`) are used
+- Enforced on all `/jit/` files except infrastructure and legacy files
 
 #### Register Zone Layout
 
@@ -550,23 +556,26 @@ The JIT kernels (in `src/v2/kernels/cpu/attention/q8_1/jit/`) use Xbyak for runt
 
 **Critical Aliasing**: XMM/YMM/ZMM registers share the same physical register file. `xmm20` aliases `zmm20`! The **ScoreZone** (xmm20-23) overlaps **ScratchZone** (zmm20-23).
 
-#### Typed Register Accessors
+#### MANDATORY: Use borrow<>() for Register Access
 
-Use typed accessors instead of raw register numbers:
+**All register access MUST use `borrow<RegType>()`** for RAII-tracked lifetime management. This is enforced at build time.
 
 ```cpp
-// Good: Typed accessors with compile-time zone information
-gen.accum0().zmm();     // zmm0
-gen.scratch4().zmm();   // zmm24 (safe during FA2 scoring)
-gen.state_max().zmm();  // zmm16
-gen.const_scale().zmm(); // zmm27
+// ❌ BAD - Raw Xbyak register (build will fail)
+Zmm zmm_temp(20);
+gen.vmovaps(Zmm(5), src);
 
-// Also available: score0()-score3() for xmm20-23 (FA2 tile scores)
+// ❌ BAD - Untracked accessor (build will fail)  
+gen.vmovaps(scratch0().zmm(), src);
+auto zmm = accum4().zmm();
+
+// ✅ GOOD - RAII tracked with borrow<>()
+auto guard = gen.borrow<Scratch0>();
+gen.vmovaps(guard.zmm(), src);
+// guard auto-releases at scope end
 ```
 
-#### RAII Register Borrowing
-
-For complex code paths, use `borrow<RegType>()` to track register lifetimes:
+#### RAII Register Borrowing Pattern
 
 ```cpp
 void emit_complex_operation(JitMicrokernelBase& gen) {
@@ -590,47 +599,39 @@ void emit_complex_operation(JitMicrokernelBase& gen) {
 }
 ```
 
-#### Conflict Detection with `assert_available()`
+#### Available Register Types
 
-When using raw accessors (e.g., in loops where borrow overhead matters), use `assert_available()` to detect conflicts:
+| Type | Zone | Physical Register |
+|------|------|-------------------|
+| `Accum0`-`Accum7` | Accumulator | zmm0-7 |
+| `Input0`-`Input7` | Input/Q | zmm8-15 |
+| `StateMax`, `StateSum`, `StateWeight`, `StateCorr` | State | zmm16-19 |
+| `Scratch0`-`Scratch5` | Scratch | zmm20-25 |
+| `Score0`-`Score3` | Score (aliases Scratch) | xmm20-23 |
+| `Const128`, `ConstScale`, `ConstNegInf`, etc. | Reserved | zmm26-31 |
 
-```cpp
-// Pattern: Check availability before raw accessor use
-if (gen.tracking_enabled()) {
-    gen.tracker()->assert_available<Accum6>("spilled context lo");
-    gen.tracker()->assert_available<Accum7>("spilled context hi");
-}
-zmm_ctx_lo = gen.accum6().zmm();
-zmm_ctx_hi = gen.accum7().zmm();
-```
+#### Conflict Detection
 
-If a conflict is detected, it prints a detailed error:
+If you attempt to borrow a register that's already borrowed, you get a detailed error:
+
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              RAW ACCESSOR CONFLICT DETECTED                       ║
+║              REGISTER BORROW CONFLICT DETECTED                    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║ Physical register: zmm/ymm/xmm4
-║ Currently borrowed by: 'Accumulator[4]'
-║ Raw access attempted in: emit_interleaved_v_accum_4x spilled block
+║ Physical register: zmm/ymm/xmm20
+║ Currently borrowed by: 'Scratch0'
+║ New borrow attempted for: 'Score0'
 ║
 ║ FIX: Either:
-║   1. Use borrow<Accumulator[4]>() instead of raw accessor
+║   1. Release the existing borrow before this access
 ║   2. Use a different register that isn't borrowed
-║   3. Release the borrower before this access
+║   3. Restructure code to avoid the conflict
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
-#### Enabling Register Tracking
+**Note**: Register tracking runs only during JIT compilation (not at inference runtime), so there is zero performance overhead.
 
-Register tracking is enabled per-kernel via config:
-
-```cpp
-JitAttentionConfig config;
-config.enable_register_tracking = true;  // Enable for debugging
-JitFusedAttentionWo kernel(config);
-```
-
-**Performance Note**: Tracking adds overhead during JIT compilation only, not during execution. The generated assembly is identical.
+**Note**: Register tracking is always enabled during JIT compilation with zero runtime overhead (the generated assembly is identical with or without tracking).
 
 ---
 
@@ -817,9 +818,12 @@ For the full list, see `src/v2/utils/DebugEnv.h`.
 | `src/v2/execution/` | ComputeGraph, GraphExecutor, ComputeStages |
 | `src/v2/pipelines/qwen/` | GraphOrchestrator, Qwen2Graph, buffer specs |
 | `src/v2/kernels/cpu/` | CPU kernels (GEMM, attention, primitives) |
+| `src/v2/kernels/cpu/jit/` | JIT infrastructure (RegisterGuard, RegisterAllocation, JitMicrokernelBase) |
+| `src/v2/kernels/cpu/attention/q8_1/jit/` | JIT attention microkernels (Q8DotProduct, OnlineSoftmax, etc.) |
 | `src/v2/tensors/` | Tensor types (FP32, BF16, quantized) |
 | `src/v2/loaders/` | GGUF loading, WeightManager |
 | `src/v2/utils/` | MPIContext, MPITopology, logging |
+| `src/v2/cmake/` | CMake modules (EnforceTypedRegisters, etc.) |
 
 ### Writing Changelogs
 

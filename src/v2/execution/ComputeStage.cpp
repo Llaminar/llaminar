@@ -123,6 +123,13 @@ namespace llaminar2
             return q8_1 ? q8_1->fp32_data() : nullptr;
         }
 
+        if (tensor->native_type() == TensorType::Q16_1)
+        {
+            // Q16_1 tensors throw on data() - use explicit fp32_data() for debugging
+            auto *q16_1 = dynamic_cast<const Q16_1Tensor *>(tensor);
+            return q16_1 ? q16_1->fp32_data() : nullptr;
+        }
+
         return tensor->data();
     }
 
@@ -2026,6 +2033,27 @@ namespace llaminar2
             return executeFP32_Q8_1_to_Q8_1(ctx, num_elements);
         }
 
+        // Handle HybridQ16 case: Q8_1 input + Q16_1 residual → Q16_1 output
+        // This is THE key operation for typed residual connections
+        if (input_type == TensorType::Q8_1 && residual_type == TensorType::Q16_1 && output_type == TensorType::Q16_1)
+        {
+            return executeQ8_1_Q16_1_to_Q16_1(ctx, num_elements);
+        }
+
+        // Handle HybridQ16 FFN residual: FP32 input + Q16_1 residual → Q16_1 output
+        // This is used when the FFN down_proj outputs FP32 but the residual stream is Q16_1
+        if (input_type == TensorType::FP32 && residual_type == TensorType::Q16_1 && output_type == TensorType::Q16_1)
+        {
+            return executeFP32_Q16_1_to_Q16_1(ctx, num_elements);
+        }
+
+        // Handle Q8_1 input + FP32 residual → FP32 output
+        // This is used in HybridQ16 mode FFN residual where delta is Q8_1 but residual stream starts as FP32
+        if (input_type == TensorType::Q8_1 && residual_type == TensorType::FP32 && output_type == TensorType::FP32)
+        {
+            return executeQ8_1_FP32_to_FP32(ctx, num_elements);
+        }
+
         // Dispatch based on tensor type, passing num_elements through
         // Note: This assumes all three tensors have the same type
         switch (input_type)
@@ -2173,6 +2201,119 @@ namespace llaminar2
 
         // Use the SIMD-optimized Q8_1 addition (AVX512/AVX2/scalar)
         simd::q8_1_add_q8_1(input_blocks, residual_blocks, output_blocks, numel);
+
+        return true;
+    }
+
+    bool ResidualAddStage::executeQ8_1_Q16_1_to_Q16_1(IDeviceContext *ctx, size_t num_elements)
+    {
+        // HybridQ16 mode: Q8_1 delta + Q16_1 residual → Q16_1 output (in-place)
+        // This is THE key operation for typed residual connections.
+        //
+        // Note: params_.input is the delta (Q8_1), params_.residual is the accumulator (Q16_1)
+        // The output tensor should be the same as residual for in-place operation.
+        // Q16_1 provides 266× better precision than Q8_1 for the residual stream.
+
+        const auto *delta_q8 = dynamic_cast<const Q8_1Tensor *>(params_.input);
+        auto *residual_q16 = dynamic_cast<Q16_1Tensor *>(params_.output);
+
+        if (!delta_q8 || !residual_q16)
+        {
+            LOG_ERROR("[ResidualAddStage::Q8_1_Q16_1] Failed to cast tensors");
+            return false;
+        }
+
+        if (num_elements % 32 != 0)
+        {
+            LOG_ERROR("[ResidualAddStage::Q8_1_Q16_1] Element count " << num_elements
+                                                                      << " is not a multiple of 32");
+            return false;
+        }
+
+        const Q8_1Block *delta_blocks = delta_q8->q8_1_blocks();
+        Q16_1Block *residual_blocks = residual_q16->mutable_q16_1_blocks();
+
+        LOG_DEBUG("[ResidualAddStage::Q8_1_Q16_1] Adding " << num_elements
+                                                           << " elements (" << (num_elements / 32) << " blocks)");
+
+        // Use SIMD-optimized Q16_1 += Q8_1 addition
+        // This function adds Q8_1 delta to Q16_1 residual in-place
+        simd::q16_1_add_q8_1(residual_blocks, delta_blocks, num_elements);
+
+        return true;
+    }
+
+    bool ResidualAddStage::executeFP32_Q16_1_to_Q16_1(IDeviceContext *ctx, size_t num_elements)
+    {
+        // HybridQ16 FFN residual: FP32 delta + Q16_1 residual → Q16_1 output (in-place)
+        // This is used when the FFN down_proj outputs FP32 (via GEMM) but the residual
+        // stream is maintained in Q16_1 for better precision.
+        //
+        // Note: params_.input is the delta (FP32), params_.output is the Q16_1 residual.
+        // The operation is in-place on the residual buffer.
+
+        const auto *delta_fp32 = dynamic_cast<const FP32Tensor *>(params_.input);
+        auto *residual_q16 = dynamic_cast<Q16_1Tensor *>(params_.output);
+
+        if (!delta_fp32 || !residual_q16)
+        {
+            LOG_ERROR("[ResidualAddStage::FP32_Q16_1] Failed to cast tensors");
+            return false;
+        }
+
+        if (num_elements % 32 != 0)
+        {
+            LOG_ERROR("[ResidualAddStage::FP32_Q16_1] Element count " << num_elements
+                                                                      << " is not a multiple of 32");
+            return false;
+        }
+
+        const float *delta_data = delta_fp32->data();
+        Q16_1Block *residual_blocks = residual_q16->mutable_q16_1_blocks();
+
+        LOG_DEBUG("[ResidualAddStage::FP32_Q16_1] Adding " << num_elements
+                                                           << " elements (" << (num_elements / 32) << " blocks)");
+
+        // Use SIMD-optimized Q16_1 += FP32 addition
+        // This function adds FP32 delta to Q16_1 residual in-place
+        simd::q16_1_add_fp32(residual_blocks, delta_data, num_elements);
+
+        return true;
+    }
+
+    bool ResidualAddStage::executeQ8_1_FP32_to_FP32(IDeviceContext *ctx, size_t num_elements)
+    {
+        // Q8_1 delta + FP32 residual → FP32 output (in-place on residual)
+        // This is used in HybridQ16 mode when the FFN down_proj outputs Q8_1
+        // but the residual stream hasn't been converted to Q16_1 yet.
+        //
+        // Note: params_.input is the delta (Q8_1), params_.output is the FP32 residual.
+        // The operation is in-place on the residual buffer.
+
+        const auto *delta_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
+        auto *residual_fp32 = dynamic_cast<FP32Tensor *>(params_.output);
+
+        if (!delta_q8_1 || !residual_fp32)
+        {
+            LOG_ERROR("[ResidualAddStage::Q8_1_FP32_to_FP32] Failed to cast tensors");
+            return false;
+        }
+
+        if (num_elements % 32 != 0)
+        {
+            LOG_ERROR("[ResidualAddStage::Q8_1_FP32_to_FP32] Element count " << num_elements
+                                                                             << " is not a multiple of 32");
+            return false;
+        }
+
+        const Q8_1Block *delta_blocks = delta_q8_1->q8_1_blocks();
+        float *residual_data = residual_fp32->mutable_data();
+
+        LOG_DEBUG("[ResidualAddStage::Q8_1_FP32_to_FP32] Adding " << num_elements
+                                                                  << " elements (" << (num_elements / 32) << " blocks)");
+
+        // Use SIMD-optimized FP32 += Q8_1 addition (dequant-and-add in one pass)
+        simd::fp32_add_q8_1(residual_data, delta_blocks, num_elements);
 
         return true;
     }
@@ -4251,6 +4392,7 @@ namespace llaminar2
         kernel_config.d_model = params_.d_model;
         kernel_config.backend = params_.backend;
         kernel_config.use_hybrid_wo = params_.use_hybrid_wo;
+        kernel_config.fuse_residual_add = params_.fuse_residual_add;
 
         kernel_ = std::make_unique<FusedAttentionWoKernel>(kernel_config);
     }
@@ -4496,6 +4638,12 @@ namespace llaminar2
             return false;
         }
 
+        // Check if output is Q16_1 - needs special handling since there's no native kernel
+        if (params_.output->native_type() == TensorType::Q16_1)
+        {
+            return executeQ16_1Output();
+        }
+
         // Use the same approach as EmbeddingOp in Qwen2Pipeline:
         // Get the embedding kernel from the output tensor (IActivationTensor::createEmbedding)
         // This handles automatic type dispatch for FP32, Q8_1, etc.
@@ -4574,10 +4722,91 @@ namespace llaminar2
         return true;
     }
 
+    bool EmbeddingStage::executeQ16_1Output()
+    {
+        // Q16_1 output: Do FP32 embedding lookup, then quantize to Q16_1
+        // This is used for HybridQ16 mode where the residual stream is Q16_1
+        LOG_DEBUG("[EmbeddingStage] Q16_1 output path: FP32 lookup + quantization");
+
+        auto *q16_output = dynamic_cast<Q16_1Tensor *>(params_.outputhybridpre);
+        if (!q16_output)
+        {
+            LOG_ERROR("[EmbeddingStage] Failed to cast output to Q16_1Tensor");
+            return false;
+        }
+
+        // Get embedding table data (always FP32)
+        const float *embed_data = params_.embed_table->data();
+        if (!embed_data)
+        {
+            LOG_ERROR("[EmbeddingStage] Null embedding table data");
+            return false;
+        }
+
+        const int num_tokens = params_.token_ids ? params_.num_tokens
+                                                 : static_cast<int>(params_.token_batches->size() * params_.padded_seq_len);
+        const int d_model = params_.d_model;
+
+        // Allocate temporary FP32 buffer for embedding lookup
+        std::vector<float> fp32_buffer(static_cast<size_t>(num_tokens) * d_model);
+
+        // Handle batched vs single sequence input
+        if (params_.token_batches)
+        {
+            // Batched input: flatten token batches with padding
+            const int batch_size = static_cast<int>(params_.token_batches->size());
+            const int padded_len = params_.padded_seq_len;
+
+            int global_idx = 0;
+            for (int b = 0; b < batch_size; ++b)
+            {
+                const auto &tokens = (*params_.token_batches)[b];
+                const int seq_len = static_cast<int>(tokens.size());
+
+                // Copy actual embeddings
+                for (int i = 0; i < seq_len && i < padded_len; ++i)
+                {
+                    const int token_id = tokens[i];
+                    std::memcpy(fp32_buffer.data() + (global_idx + i) * d_model,
+                                embed_data + token_id * d_model,
+                                d_model * sizeof(float));
+                }
+                // Zero out padding positions
+                for (int i = seq_len; i < padded_len; ++i)
+                {
+                    std::memset(fp32_buffer.data() + (global_idx + i) * d_model, 0, d_model * sizeof(float));
+                }
+                global_idx += padded_len;
+            }
+        }
+        else
+        {
+            // Single sequence: direct embedding lookup
+            for (int t = 0; t < num_tokens; ++t)
+            {
+                const int token_id = params_.token_ids[t];
+                std::memcpy(fp32_buffer.data() + t * d_model,
+                            embed_data + token_id * d_model,
+                            d_model * sizeof(float));
+            }
+        }
+
+        // Quantize FP32 → Q16_1 using the partial copy method
+        // Only quantize the rows we actually filled, not the entire tensor
+        if (!q16_output->copyFrom_fp32_rows(fp32_buffer.data(), static_cast<size_t>(num_tokens)))
+        {
+            LOG_ERROR("[EmbeddingStage] Failed to quantize FP32 to Q16_1");
+            return false;
+        }
+
+        LOG_DEBUG("[EmbeddingStage] Q16_1 output: " << num_tokens << " tokens quantized");
+        return true;
+    }
+
     /**
      * @brief Zero out a row of the output tensor (for padding)
      *
-     * Handles both FP32 and Q8_1 output formats.
+     * Handles FP32, Q8_1, and Q16_1 output formats.
      */
     void EmbeddingStage::zero_output_row(TensorBase *output, int row_idx, int d_model)
     {
@@ -4609,6 +4838,29 @@ namespace llaminar2
                         Q8_1Block &block = blocks[row_idx * blocks_per_row + b];
                         block.d = 0.0f;
                         std::memset(block.qs, 0, 32);
+                    }
+                }
+            }
+        }
+        else if (output_type == TensorType::Q16_1)
+        {
+            // For Q16_1, zero out the blocks for this row
+            auto *q16_1_output = dynamic_cast<Q16_1Tensor *>(output);
+            if (q16_1_output)
+            {
+                // Q16_1 has 32 elements per block
+                const int block_size = 32;
+                const int blocks_per_row = (d_model + block_size - 1) / block_size;
+                Q16_1Block *blocks = q16_1_output->mutable_q16_1_blocks();
+
+                if (blocks)
+                {
+                    for (int b = 0; b < blocks_per_row; ++b)
+                    {
+                        Q16_1Block &block = blocks[row_idx * blocks_per_row + b];
+                        block.d = 0.0f;
+                        block.sum_qs = 0;
+                        std::memset(block.qs, 0, sizeof(block.qs));
                     }
                 }
             }

@@ -512,6 +512,19 @@ add_v2_test(V2_Unit_Q8_1PureIntegerRMSNorm
     MPI_PROCS 1
 )
 
+# Test: Q16_1 RMSNorm (Q16_1 input → FP32 output)
+add_executable(v2_test_q16_1_rmsnorm unit/Test__Q16_1RMSNorm.cpp)
+target_link_libraries(v2_test_q16_1_rmsnorm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16_1RMSNorm 
+    COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
+    LABELS "V2;Unit;Kernels;RMSNorm;Q16_1;TypedResiduals;CPU"
+    MPI_PROCS 1
+)
+
 # Test: Q8_1 OnlineSoftmax JIT Kernel Unit Tests (fast, no model loading)
 # Tests the Q8_1 x Q8_1 attention kernel with fused online softmax
 add_executable(v2_test_q8_1_online_softmax_unit unit/kernels/cpu/gemm_v4/Test__Q8_1_OnlineSoftmax_Unit.cpp)
@@ -918,6 +931,18 @@ target_link_libraries(v2_test_q8_1_softmax_primitives
 add_v2_test(V2_Unit_Q8_1SoftmaxPrimitives
     COMMAND $<TARGET_FILE:v2_test_q8_1_softmax_primitives>
     LABELS "V2;Unit;Primitives;Softmax;Q8_1;Quantization;SIMD;AVX2;AVX512;CPU;PrecisionTesting;IntegerDomain"
+    MPI_PROCS 1
+)
+
+# Test: IndexSoftmax integer-domain softmax (IntAttention paper arXiv:2511.21513)
+add_executable(v2_test_index_softmax unit/Test__IndexSoftmax.cpp)
+target_link_libraries(v2_test_index_softmax
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IndexSoftmax
+    COMMAND $<TARGET_FILE:v2_test_index_softmax>
+    LABELS "V2;Unit;Primitives;Softmax;IntegerDomain;IndexSoftmax;LUT;Quantization"
     MPI_PROCS 1
 )
 
@@ -2104,6 +2129,27 @@ add_v2_test(V2_Unit_ExecutionPolicy
     MPI_PROCS 1
 )
 
+# Test: EmbeddingStage Q16_1 Output
+# Tests that EmbeddingStage correctly produces Q16_1 output for HybridQ16 mode
+# Verifies FP32 → Q16_1 quantization preserves embedding values
+add_executable(v2_test_embedding_stage_q16_1 unit/stages/Test__EmbeddingStage_Q16_1Output.cpp)
+target_link_libraries(v2_test_embedding_stage_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_EmbeddingStage_Q16_1Output
+    COMMAND $<TARGET_FILE:v2_test_embedding_stage_q16_1>
+    LABELS "V2;Unit;Execution;ComputeStage;Embedding;Q16_1;HybridQ16;Quantization"
+    MPI_PROCS 1
+)
+
+# Test: HybridQ16 Layer 0 Dataflow Diagnostics
+# Traces data flow from embedding through RMSNorm in HybridQ16 mode
+add_executable(v2_test_hybridq16_layer0_dataflow unit/stages/Test__HybridQ16_Layer0_Dataflow.cpp)
+target_link_libraries(v2_test_hybridq16_layer0_dataflow llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HybridQ16_Layer0_Dataflow
+    COMMAND $<TARGET_FILE:v2_test_hybridq16_layer0_dataflow>
+    LABELS "V2;Unit;Execution;ComputeStage;HybridQ16;Dataflow;Diagnostics"
+    MPI_PROCS 1
+)
+
 # Test: ResidualAddStage Precision Awareness
 # Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
 # Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
@@ -3030,6 +3076,26 @@ if(ZLIB_FOUND)
             MPI_PROCS 1
         )
         message(STATUS "V2: E2E Hybrid vs FP32/Q8_1 pipeline parity test enabled")
+
+        # -----------------------------------------------------------------------------
+        # E2E Parity: HybridQ16 Pipeline vs FP32 (Layer-by-Layer)
+        # -----------------------------------------------------------------------------
+        # Validates that HybridQ16 precision mode (Q16_1 typed residuals) achieves
+        # ≥0.995 cosine similarity with FP32 at residual stages, measuring improvement
+        # over Hybrid mode (Q8_1 residuals). Tests both prefill and decode phases.
+        add_executable(v2_e2e_parity_hybridq16_vs_fp32_pipeline 
+            e2e/parity/internal/hybridq16_vs_fp32/Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
+        )
+        target_link_libraries(v2_e2e_parity_hybridq16_vs_fp32_pipeline 
+            llaminar2_core 
+            GTest::gtest 
+        )
+        add_v2_test(V2_E2E_Parity_HybridQ16Pipeline_vs_FP32
+            COMMAND $<TARGET_FILE:v2_e2e_parity_hybridq16_vs_fp32_pipeline>
+            LABELS "V2;E2E;Parity;Internal;HybridQ16;Q16_1;FP32;LayerByLayer"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2: E2E HybridQ16 vs FP32 pipeline parity test enabled")
     else()
         message(STATUS "V2: E2E parity tests disabled (snapshots not available in Release build)")
         message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
@@ -3056,6 +3122,22 @@ target_link_libraries(v2_e2e_parity_jit_fused_attention_vs_fp32
 add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
     COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_vs_fp32>
     LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;FA2;JIT"
+    MPI_PROCS 1
+)
+
+# JitFusedAttentionWo with Q16_1 Fused Residual vs FP32 Reference
+# Tests Phase 5 of Q16_1 Typed Residual Stream: fused Attention + Wo + Residual Add
+add_executable(v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32 
+    e2e/parity/kernels/attention/Test__JitFusedAttentionWo_Q16_1Fused_vs_FP32.cpp
+)
+target_link_libraries(v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_Q16_1Fused_vs_FP32
+    COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32>
+    LABELS "V2;E2E;Parity;Kernels;Attention;Q16_1;FusedResidual;JIT"
     MPI_PROCS 1
 )
 
@@ -3369,6 +3451,20 @@ target_link_libraries(v2_test_jit_fused_attention_wo_correctness
 add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness 
     COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_correctness>
     LABELS "V2;Unit;JIT;FusedAttention;Correctness;AVX512;Q8_1;NumericalParity"
+    MPI_PROCS 1
+)
+
+# Test: JIT Fused Attention + Wo - Q16_1 Residual Fusion Tests
+# Tests the fused residual addition path for Q16_1 typed residual streams
+add_executable(v2_test_jit_fused_attention_wo_q16_1_residual unit/attention/Test__JitFusedAttentionWo_Q16_1Residual.cpp)
+target_link_libraries(v2_test_jit_fused_attention_wo_q16_1_residual 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttentionWo_Q16_1Residual 
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_q16_1_residual>
+    LABELS "V2;Unit;JIT;FusedAttention;Q16_1;Residual;TypedResiduals"
     MPI_PROCS 1
 )
 

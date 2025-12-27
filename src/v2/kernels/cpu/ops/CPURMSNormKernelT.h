@@ -78,6 +78,14 @@ namespace llaminar2
             static constexpr const char *name = "Q8_1";
             static constexpr float compression_ratio = 3.5f; // 36 bytes per 32 elements vs 128
         };
+
+        template <>
+        struct PrecisionMetadata<ActivationPrecision::Q16_1>
+        {
+            using StorageType = Q16_1Block;
+            static constexpr const char *name = "Q16_1";
+            static constexpr float compression_ratio = 1.778f; // 72 bytes per 32 elements vs 128
+        };
     } // namespace detail
 
     /**
@@ -705,6 +713,157 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q8_1; }
         static const char *precision_name() { return "Q8_1"; }
         static constexpr float compression_ratio() { return 3.556f; }
+    };
+
+    // =========================================================================
+    // Q16_1 Specialization (Q16_1 input → FP32 output)
+    // =========================================================================
+
+    /**
+     * @brief Q16_1 specialization for typed residual pattern
+     *
+     * Special kernel for reading high-precision Q16_1 residuals and outputting FP32.
+     * Used in the typed residual stream where:
+     * - Residual is stored in Q16_1 format (72 bytes per 32 elements)
+     * - Pre-attention/pre-FFN operations need FP32 input
+     * - This kernel dequantizes on-the-fly during RMSNorm computation
+     *
+     * Note: This kernel ALWAYS outputs FP32, unlike other specializations
+     * that output the same type as input.
+     */
+    template <>
+    class CPURMSNormKernelT<ActivationPrecision::Q16_1> : public ITensorRMSNorm, public CPUKernelBase
+    {
+    public:
+        using StorageType = Q16_1Block;
+
+        CPURMSNormKernelT() = default;
+        ~CPURMSNormKernelT() override = default;
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx == -1;
+        }
+
+        // ===== ITensorRMSNorm interface =====
+        // Note: Q16_1 kernel primarily supports Q16_1→FP32 (apply_q16_1_to_fp32)
+        // The other methods return false or delegate where possible
+
+        bool apply(
+            const float *input, const float *weight, float *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)use_bf16;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Q16_1 kernel doesn't handle FP32→FP32
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // Q16_1 kernel doesn't handle BF16
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, const float *weight, uint16_t *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // Q16_1 kernel doesn't handle FP16
+        }
+
+        bool apply_q8_1(
+            const Q8_1Block *input, const float *weight, Q8_1Block *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)device_idx;
+            return false; // Q16_1 kernel doesn't handle Q8_1
+        }
+
+        bool apply_q16_1_to_fp32(
+            const Q16_1Block *input, const float *weight, float *output,
+            int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
+        {
+            return apply_typed(input, weight, output, rows, cols, epsilon, device_idx);
+        }
+
+        // ===== Tensor-based API (type-checked dispatch) =====
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *weight,
+            TensorBase *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Type check: Q16_1 input → FP32 output
+            if (!input || !weight || !output)
+                return false;
+            if (input->native_type() != TensorType::Q16_1 ||
+                output->native_type() != TensorType::FP32)
+                return false;
+            auto *q16_in = static_cast<const Q16_1Tensor *>(input);
+            auto *fp32_out = static_cast<FP32Tensor *>(output);
+            return apply_typed(q16_in->q16_1_blocks(), weight->data(), fp32_out->mutable_data(),
+                               rows, cols, epsilon, device_idx);
+        }
+
+        // ===== Typed API =====
+        /**
+         * @brief Apply RMSNorm with Q16_1 input, FP32 output
+         *
+         * Algorithm:
+         * 1. Dequantize Q16_1 blocks to FP32 on-the-fly (per-block FP32 scale × int16 values)
+         * 2. Compute RMSNorm in FP32
+         * 3. Output is FP32 (no re-quantization)
+         *
+         * Note: cols must be a multiple of 32 (Q16_1 block size)
+         */
+        bool apply_typed(
+            const Q16_1Block *input,
+            const float *gamma,
+            float *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        static constexpr ActivationPrecision precision() { return ActivationPrecision::Q16_1; }
+        static const char *precision_name() { return "Q16_1"; }
+        static constexpr float compression_ratio() { return 1.778f; }
     };
 
 } // namespace llaminar2

@@ -47,7 +47,7 @@
 
 #pragma once
 
-#include "JitMicrokernelBase.h"
+#include "../../../jit/JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
 #include "../../../jit/RegisterEnforcement.h"
@@ -127,10 +127,10 @@ namespace llaminar::v2::kernels::jit
 
             // Clamp input to avoid overflow/underflow
             // x_clamped = max(src, -87.0f)
-            gen.vmaxps(dst, src, gen.const_exp_min().zmm());
+            gen.vmaxps(dst, src, gen.zmm_const_exp_min());
 
             // x * log2(e)
-            gen.vmulps(dst, dst, gen.const_log2e().zmm());
+            gen.vmulps(dst, dst, gen.zmm_const_log2e());
 
             // Compute 2^(x * log2e) using polynomial
             emit_exp2_poly(gen, dst, dst);
@@ -295,8 +295,8 @@ namespace llaminar::v2::kernels::jit
 
             // Initialize constants
             debug_emit("  Init constants");
-            emit_broadcast_fp32_const(const_log2e().zmm(), 1.4426950408889634f, rax);
-            emit_broadcast_fp32_const(const_exp_min().zmm(), -87.0f, rax);
+            emit_broadcast_fp32_const(zmm_const_log2e(), 1.4426950408889634f, rax);
+            emit_broadcast_fp32_const(zmm_const_exp_min(), -87.0f, rax);
 
             // Loop: for (i = 0; i < n; i += 16)
             xor_(reg_i, reg_i);
@@ -307,13 +307,13 @@ namespace llaminar::v2::kernels::jit
             jge(loop_end, T_NEAR);
 
             // Load 16 floats
-            vmovups(accum0().zmm(), ptr[reg_in + reg_i * 4]);
+            vmovups(zmm_accum0(), ptr[reg_in + reg_i * 4]);
 
             // Compute exp
-            exp_emitter_.emit_fast_exp(*this, accum0().zmm(), accum0().zmm());
+            exp_emitter_.emit_fast_exp(*this, zmm_accum0(), zmm_accum0());
 
             // Store 16 floats
-            vmovups(ptr[reg_out + reg_i * 4], accum0().zmm());
+            vmovups(ptr[reg_out + reg_i * 4], zmm_accum0());
 
             // i += 16
             add(reg_i, 16);

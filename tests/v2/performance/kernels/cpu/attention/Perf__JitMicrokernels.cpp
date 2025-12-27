@@ -12,7 +12,7 @@
 #include <iostream>
 #include <iomanip>
 
-#include "kernels/cpu/attention/q8_1/jit/JitMicrokernelBase.h"
+#include "kernels/cpu/jit/JitMicrokernelBase.h"
 #include "kernels/cpu/attention/q8_1/jit/JitQ8DotProduct.h"
 #include "kernels/cpu/attention/q8_1/jit/JitOnlineSoftmax.h"
 #include "kernels/cpu/attention/q8_1/jit/JitVWeightedAccum.h"
@@ -62,7 +62,7 @@ public:
         using namespace Xbyak;
         // Initialize 0x80808080 for unsigned conversion
         mov(eax, 0x80808080);
-        vpbroadcastd(const_128().zmm(), eax);
+        vpbroadcastd(zmm_const_128(), eax);
     }
 };
 
@@ -81,7 +81,7 @@ public:
         // Args: rdi=v_ptr, xmm0=weight, rsi=accum_ptr
 
         // Broadcast weight to ZMM_WEIGHT
-        vbroadcastss(state_weight().zmm(), xmm0);
+        vbroadcastss(zmm_state_weight(), xmm0);
 
         // Zero accumulators (we'll just accumulate into zeroed regs for the test)
         // In real kernel, these hold running sums.
@@ -93,8 +93,8 @@ public:
         // But emit_weighted_accum assumes accumulators are in zmm_accum(0..N) or stack.
 
         // For simplicity, we'll zero the accumulators first
-        vxorps(accum0().zmm(), accum0().zmm(), accum0().zmm());
-        vxorps(accum1().zmm(), accum1().zmm(), accum1().zmm());
+        vxorps(zmm_accum0(), zmm_accum0(), zmm_accum0());
+        vxorps(zmm_accum1(), zmm_accum1(), zmm_accum1());
 
         // We need to handle spilling if num_blocks > 2 (64 elements)
         // emit_weighted_accum takes spill_base_offset.
@@ -151,7 +151,7 @@ public:
         {
             // Initialize constants for Q8_1
             mov(eax, 0x80808080);
-            vpbroadcastd(const_128().zmm(), eax);
+            vpbroadcastd(zmm_const_128(), eax);
 
             emitter.emit_project_q8_1(*this, rdi, rsi, rdx, head_dim);
         }

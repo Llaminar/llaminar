@@ -562,4 +562,74 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts = {});
 
+    // ========================================================================
+    // Q16_1 RMSNorm (Q16_1 input → FP32 output)
+    // ========================================================================
+
+    /**
+     * @brief RMSNorm with Q16_1 input, FP32 output (scalar per-row)
+     *
+     * Algorithm:
+     * 1. Dequantize Q16_1 block → FP32 in registers
+     * 2. Compute sum of squares (for RMS)
+     * 3. Apply normalization and gamma scaling
+     * 4. Write FP32 output
+     *
+     * Memory access: 1 read (Q16_1) + 1 write (FP32) - single pass
+     *
+     * @param input Input Q16_1 blocks [blocks_per_row blocks]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param output Output FP32 row [cols]
+     * @param cols Number of columns (hidden_dim)
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_q16_1_fp32_row_scalar(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm with Q16_1 input, FP32 output (AVX512 per-row)
+     *
+     * Vectorized version using AVX512 intrinsics for high performance.
+     * Dequantizes and normalizes in SIMD registers for memory efficiency.
+     *
+     * @param input Input Q16_1 blocks [blocks_per_row blocks]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param output Output FP32 row [cols]
+     * @param cols Number of columns (hidden_dim)
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_q16_1_fp32_row_avx512(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief Fused Q16_1 RMSNorm for multiple rows (parallelized)
+     *
+     * Dispatches to AVX512 or scalar implementation based on availability.
+     * Uses OpenMP for row-level parallelization on large inputs.
+     *
+     * @param input Input Q16_1 blocks [rows * blocks_per_row]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param output Output FP32 tensor [rows * cols]
+     * @param rows Number of rows
+     * @param cols Number of columns (hidden_dim, must be multiple of 32)
+     * @param epsilon Epsilon for numerical stability
+     * @param opts Execution options
+     */
+    void rmsnorm_q16_1_fp32_fused(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        const RMSNormExecOptions &opts = {});
+
 } // namespace llaminar2::primitives

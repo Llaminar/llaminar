@@ -1445,6 +1445,32 @@ namespace llaminar
                 }
             }
 
+            std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
+                const llaminar2::Q16_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    LOG_DEBUG("[KernelFactory] Q16_1 RMSNorm: CUDA not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    LOG_DEBUG("[KernelFactory] Q16_1 RMSNorm: ROCm not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+#endif
+
+                default:
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q16_1>>();
+                }
+            }
+
             // ==========================================================================
             // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()
             // ==========================================================================
@@ -1467,6 +1493,8 @@ namespace llaminar
                     return createRMSNorm(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
                 case llaminar2::TensorType::Q8_1:
                     return createRMSNorm(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::Q16_1:
+                    return createRMSNorm(static_cast<const llaminar2::Q16_1Tensor *>(tensor), dev_type);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createRMSNorm: unsupported tensor type " +
@@ -1878,8 +1906,8 @@ namespace llaminar
                 if (tensor_n == 896 && tensor_k == 896)
                 {
                     LOG_TRACE("[KernelFactory::getOrCreateGemm] Looking up tensor=" << static_cast<const void *>(tensor)
-                                                                                   << " shape=[" << tensor_n << "," << tensor_k << "]"
-                                                                                   << " cache_size=" << kernel_cache_.size());
+                                                                                    << " shape=[" << tensor_n << "," << tensor_k << "]"
+                                                                                    << " cache_size=" << kernel_cache_.size());
                 }
 
                 // Check kernel cache first
@@ -2020,8 +2048,8 @@ namespace llaminar
                         if (tensor_n == 896 && tensor_k == 896)
                         {
                             LOG_TRACE("[KernelFactory::getOrCreateGemm] CACHE MISS: created new kernel=" << static_cast<const void *>(raw_ptr)
-                                                                                                        << " for tensor=" << static_cast<const void *>(tensor)
-                                                                                                        << " pw.data=" << static_cast<const void *>(packed_cache->packed.packed_data.data()));
+                                                                                                         << " for tensor=" << static_cast<const void *>(tensor)
+                                                                                                         << " pw.data=" << static_cast<const void *>(packed_cache->packed.packed_data.data()));
                         }
 
                         kernel_cache_[tensor] = std::move(kernel);

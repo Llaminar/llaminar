@@ -303,3 +303,18 @@ TEST_F(InferenceModeTest, isHybridModeActive_PartialBuffers)
 
     EXPECT_TRUE(isHybridModeActive(mode, buffers));
 }
+TEST_F(InferenceModeTest, isHybridModeActive_TrueForHybridQ16WithBuffers)
+{
+    InferenceMode mode(ActivationPrecision::HybridQ16);
+    auto buffers = makeHybridBuffers();
+
+    EXPECT_TRUE(isHybridModeActive(mode, buffers));
+}
+
+TEST_F(InferenceModeTest, isHybridModeActive_FalseForHybridQ16WithoutBuffers)
+{
+    InferenceMode mode(ActivationPrecision::HybridQ16);
+    auto buffers = makeBaseBuffers(); // Missing Q_rope, K_rope
+
+    EXPECT_FALSE(isHybridModeActive(mode, buffers));
+}

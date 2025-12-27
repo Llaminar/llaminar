@@ -2129,6 +2129,75 @@ namespace llaminar2
         }
 
         /**
+         * @brief FP32 residual += Q8_1 delta (dequantize-and-add in one pass)
+         *
+         * Used in HybridQ16 mode when the residual stream hasn't transitioned
+         * to Q16_1 yet. Avoids allocating a temporary FP32 buffer for dequantization.
+         *
+         * Algorithm per block:
+         * 1. Dequant Q8_1 delta inline: FP32 = fp16_to_fp32(scale) × int8_qs
+         * 2. Add directly to FP32 residual
+         *
+         * @param residual FP32 buffer (modified in-place)
+         * @param delta Q8_1 block buffer to add
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void fp32_add_q8_1(
+            float *residual, const Q8_1Block *delta, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q8_1Block &block_d = delta[blk];
+                float *res_ptr = residual + blk * 32;
+
+                // Q8_1 uses FP16 scale - convert to FP32
+                const float scale_d = fp16_to_fp32(block_d.d);
+
+#ifdef __AVX512F__
+                // Load delta (Q8_1: int8 → FP32) and add directly to residual
+                __m128i qd_bytes_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs));
+                __m128i qd_bytes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs + 16));
+                __m512i qd_lo = _mm512_cvtepi8_epi32(qd_bytes_lo);
+                __m512i qd_hi = _mm512_cvtepi8_epi32(qd_bytes_hi);
+                __m512 fd0 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d));
+                __m512 fd1 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d));
+
+                // Load existing residual, add, store
+                __m512 r0 = _mm512_loadu_ps(res_ptr);
+                __m512 r1 = _mm512_loadu_ps(res_ptr + 16);
+                _mm512_storeu_ps(res_ptr, _mm512_add_ps(r0, fd0));
+                _mm512_storeu_ps(res_ptr + 16, _mm512_add_ps(r1, fd1));
+
+#elif defined(__AVX2__)
+                __m256 scale_d_vec = _mm256_set1_ps(scale_d);
+
+                // Process 8 elements at a time (4 iterations for 32 elements)
+                for (int i = 0; i < 4; ++i)
+                {
+                    // Dequant Q8_1 delta (load 8 int8 → extend to int32 → FP32)
+                    __m128i qd8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_d.qs + i * 8));
+                    __m256i qd32 = _mm256_cvtepi8_epi32(qd8);
+                    __m256 fd = _mm256_mul_ps(_mm256_cvtepi32_ps(qd32), scale_d_vec);
+
+                    // Load existing residual, add, store
+                    __m256 r = _mm256_loadu_ps(res_ptr + i * 8);
+                    _mm256_storeu_ps(res_ptr + i * 8, _mm256_add_ps(r, fd));
+                }
+
+#else
+                // Scalar fallback
+                for (int i = 0; i < 32; ++i)
+                {
+                    float vd = scale_d * static_cast<float>(block_d.qs[i]);
+                    res_ptr[i] += vd;
+                }
+#endif
+            }
+        }
+
+        /**
          * @brief Convert Q16_1 to Q8_1 with optimized SIMD packing
          *
          * Used for Q16_1 residual → Q8_1 activation conversion before GEMM.

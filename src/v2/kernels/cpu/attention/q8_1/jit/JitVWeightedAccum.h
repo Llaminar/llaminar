@@ -50,7 +50,7 @@
 
 #pragma once
 
-#include "JitMicrokernelBase.h"
+#include "../../../jit/JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterGuard.h"
 #include "../../../jit/RegisterEnforcement.h"
@@ -118,9 +118,9 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_v_weighted_accum (" + std::to_string(num_blocks) + " blocks)");
 
             // Register aliases - use typed accessors
-            Zmm zmm_v_lo = gen.accum4().zmm();  // zmm4: V values 0-15 (dequantized)
-            Zmm zmm_v_hi = gen.accum5().zmm();  // zmm5: V values 16-31 (dequantized)
-            Zmm zmm_d_v = gen.scratch5().zmm(); // zmm25: V scale
+            Zmm zmm_v_lo = gen.zmm_accum4();                            // zmm4: V values 0-15 (dequantized)
+            Zmm zmm_v_hi = gen.zmm_accum5();                            // zmm5: V values 16-31 (dequantized)
+            Zmm zmm_d_v = gen.borrow<llaminar2::jit::Scratch5>().zmm(); // zmm25: V scale
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -150,14 +150,14 @@ namespace llaminar::v2::kernels::jit
                 if (b == 0)
                 {
                     // Block 0: context floats 0-31 in accum0(), accum1()
-                    gen.vfmadd231ps(gen.accum0().zmm(), zmm_v_lo, gen.state_weight().zmm());
-                    gen.vfmadd231ps(gen.accum1().zmm(), zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.zmm_accum0(), zmm_v_lo, gen.zmm_state_weight());
+                    gen.vfmadd231ps(gen.zmm_accum1(), zmm_v_hi, gen.zmm_state_weight());
                 }
                 else if (b == 1)
                 {
                     // Block 1: context floats 32-63 in accum2(), accum3()
-                    gen.vfmadd231ps(gen.accum2().zmm(), zmm_v_lo, gen.state_weight().zmm());
-                    gen.vfmadd231ps(gen.accum3().zmm(), zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.zmm_accum2(), zmm_v_lo, gen.zmm_state_weight());
+                    gen.vfmadd231ps(gen.zmm_accum3(), zmm_v_hi, gen.zmm_state_weight());
                 }
                 else
                 {
@@ -166,16 +166,16 @@ namespace llaminar::v2::kernels::jit
                     int spill_hi = spill_lo + 64;
 
                     // Use scratch1() for temp, NOT scratch0() which holds weight!
-                    Zmm zmm_tmp = gen.scratch1().zmm();
+                    Zmm zmm_tmp = gen.borrow<llaminar2::jit::Scratch1>().zmm();
 
                     // Low half
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_lo]);
-                    gen.vfmadd231ps(zmm_tmp, zmm_v_lo, gen.state_weight().zmm());
+                    gen.vfmadd231ps(zmm_tmp, zmm_v_lo, gen.zmm_state_weight());
                     gen.vmovups(gen.ptr[gen.rsp + spill_lo], zmm_tmp);
 
                     // High half
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_hi]);
-                    gen.vfmadd231ps(zmm_tmp, zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(zmm_tmp, zmm_v_hi, gen.zmm_state_weight());
                     gen.vmovups(gen.ptr[gen.rsp + spill_hi], zmm_tmp);
                 }
             }
@@ -201,13 +201,13 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_rescale_context");
 
             // Rescale register-resident blocks using typed accessors
-            gen.vmulps(gen.accum0().zmm(), gen.accum0().zmm(), gen.state_corr().zmm());
-            gen.vmulps(gen.accum1().zmm(), gen.accum1().zmm(), gen.state_corr().zmm());
+            gen.vmulps(gen.zmm_accum0(), gen.zmm_accum0(), gen.zmm_state_corr());
+            gen.vmulps(gen.zmm_accum1(), gen.zmm_accum1(), gen.zmm_state_corr());
 
             if (num_blocks >= 2)
             {
-                gen.vmulps(gen.accum2().zmm(), gen.accum2().zmm(), gen.state_corr().zmm());
-                gen.vmulps(gen.accum3().zmm(), gen.accum3().zmm(), gen.state_corr().zmm());
+                gen.vmulps(gen.zmm_accum2(), gen.zmm_accum2(), gen.zmm_state_corr());
+                gen.vmulps(gen.zmm_accum3(), gen.zmm_accum3(), gen.zmm_state_corr());
             }
 
             // Rescale spilled blocks
@@ -219,7 +219,7 @@ namespace llaminar::v2::kernels::jit
                 // before they're used for weight computation.
                 //
                 // scratch4() holds tile_max, so use scratch5().
-                Zmm zmm_tmp = gen.scratch5().zmm(); // zmm25 - safe during FA2
+                Zmm zmm_tmp = gen.borrow<llaminar2::jit::Scratch5>().zmm(); // zmm25 - safe during FA2
 
                 for (int b = 2; b < num_blocks; ++b)
                 {
@@ -227,11 +227,11 @@ namespace llaminar::v2::kernels::jit
                     int spill_hi = spill_lo + 64;
 
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_lo]);
-                    gen.vmulps(zmm_tmp, zmm_tmp, gen.state_corr().zmm());
+                    gen.vmulps(zmm_tmp, zmm_tmp, gen.zmm_state_corr());
                     gen.vmovups(gen.ptr[gen.rsp + spill_lo], zmm_tmp);
 
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_hi]);
-                    gen.vmulps(zmm_tmp, zmm_tmp, gen.state_corr().zmm());
+                    gen.vmulps(zmm_tmp, zmm_tmp, gen.zmm_state_corr());
                     gen.vmovups(gen.ptr[gen.rsp + spill_hi], zmm_tmp);
                 }
             }
@@ -254,19 +254,19 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_init_context");
 
             // Zero register-resident blocks using typed accessors
-            gen.vxorps(gen.accum0().zmm(), gen.accum0().zmm(), gen.accum0().zmm());
-            gen.vxorps(gen.accum1().zmm(), gen.accum1().zmm(), gen.accum1().zmm());
+            gen.vxorps(gen.zmm_accum0(), gen.zmm_accum0(), gen.zmm_accum0());
+            gen.vxorps(gen.zmm_accum1(), gen.zmm_accum1(), gen.zmm_accum1());
 
             if (num_blocks >= 2)
             {
-                gen.vxorps(gen.accum2().zmm(), gen.accum2().zmm(), gen.accum2().zmm());
-                gen.vxorps(gen.accum3().zmm(), gen.accum3().zmm(), gen.accum3().zmm());
+                gen.vxorps(gen.zmm_accum2(), gen.zmm_accum2(), gen.zmm_accum2());
+                gen.vxorps(gen.zmm_accum3(), gen.zmm_accum3(), gen.zmm_accum3());
             }
 
             // Zero spilled blocks
             if (num_blocks > 2)
             {
-                Zmm zmm_zero = gen.scratch0().zmm();
+                Zmm zmm_zero = gen.borrow<llaminar2::jit::Scratch0>().zmm();
                 gen.vxorps(zmm_zero, zmm_zero, zmm_zero);
 
                 for (int b = 2; b < num_blocks; ++b)
@@ -299,19 +299,19 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_normalize_context");
 
             // Normalize register-resident blocks using typed accessors
-            gen.vmulps(gen.accum0().zmm(), gen.accum0().zmm(), inv_sum_zmm);
-            gen.vmulps(gen.accum1().zmm(), gen.accum1().zmm(), inv_sum_zmm);
+            gen.vmulps(gen.zmm_accum0(), gen.zmm_accum0(), inv_sum_zmm);
+            gen.vmulps(gen.zmm_accum1(), gen.zmm_accum1(), inv_sum_zmm);
 
             if (num_blocks >= 2)
             {
-                gen.vmulps(gen.accum2().zmm(), gen.accum2().zmm(), inv_sum_zmm);
-                gen.vmulps(gen.accum3().zmm(), gen.accum3().zmm(), inv_sum_zmm);
+                gen.vmulps(gen.zmm_accum2(), gen.zmm_accum2(), inv_sum_zmm);
+                gen.vmulps(gen.zmm_accum3(), gen.zmm_accum3(), inv_sum_zmm);
             }
 
             // Normalize spilled blocks
             if (num_blocks > 2)
             {
-                Zmm zmm_tmp = gen.scratch0().zmm();
+                Zmm zmm_tmp = gen.borrow<llaminar2::jit::Scratch0>().zmm();
 
                 for (int b = 2; b < num_blocks; ++b)
                 {
@@ -364,9 +364,9 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_v_weighted_accum_from_cache (" + std::to_string(num_blocks) + " blocks)");
 
             // Register aliases using typed accessors
-            Zmm zmm_v_lo = gen.accum4().zmm();  // zmm4: V values 0-15 (dequantized)
-            Zmm zmm_v_hi = gen.accum5().zmm();  // zmm5: V values 16-31 (dequantized)
-            Zmm zmm_d_v = gen.scratch5().zmm(); // zmm25: V scale
+            Zmm zmm_v_lo = gen.zmm_accum4();                            // zmm4: V values 0-15 (dequantized)
+            Zmm zmm_v_hi = gen.zmm_accum5();                            // zmm5: V values 16-31 (dequantized)
+            Zmm zmm_d_v = gen.borrow<llaminar2::jit::Scratch5>().zmm(); // zmm25: V scale
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -395,27 +395,27 @@ namespace llaminar::v2::kernels::jit
                 // Current implementation supports head_dim up to 64 (num_blocks <= 2)
                 if (b == 0)
                 {
-                    gen.vfmadd231ps(gen.accum0().zmm(), zmm_v_lo, gen.state_weight().zmm());
-                    gen.vfmadd231ps(gen.accum1().zmm(), zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.zmm_accum0(), zmm_v_lo, gen.zmm_state_weight());
+                    gen.vfmadd231ps(gen.zmm_accum1(), zmm_v_hi, gen.zmm_state_weight());
                 }
                 else if (b == 1)
                 {
-                    gen.vfmadd231ps(gen.accum2().zmm(), zmm_v_lo, gen.state_weight().zmm());
-                    gen.vfmadd231ps(gen.accum3().zmm(), zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.zmm_accum2(), zmm_v_lo, gen.zmm_state_weight());
+                    gen.vfmadd231ps(gen.zmm_accum3(), zmm_v_hi, gen.zmm_state_weight());
                 }
                 else if (b == 2)
                 {
                     // For head_dim=128 (4 blocks), use additional scratch registers
                     // Avoid scratch0() which holds weight!
                     // Use scratch1-2() for block 2
-                    gen.vfmadd231ps(gen.scratch1().zmm(), zmm_v_lo, gen.state_weight().zmm());
-                    gen.vfmadd231ps(gen.scratch2().zmm(), zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.borrow<llaminar2::jit::Scratch1>().zmm(), zmm_v_lo, gen.zmm_state_weight());
+                    gen.vfmadd231ps(gen.borrow<llaminar2::jit::Scratch2>().zmm(), zmm_v_hi, gen.zmm_state_weight());
                 }
                 else if (b == 3)
                 {
                     // Use scratch3-4() for block 3
-                    gen.vfmadd231ps(gen.scratch3().zmm(), zmm_v_lo, gen.state_weight().zmm());
-                    gen.vfmadd231ps(gen.scratch4().zmm(), zmm_v_hi, gen.state_weight().zmm());
+                    gen.vfmadd231ps(gen.borrow<llaminar2::jit::Scratch3>().zmm(), zmm_v_lo, gen.zmm_state_weight());
+                    gen.vfmadd231ps(gen.borrow<llaminar2::jit::Scratch4>().zmm(), zmm_v_hi, gen.zmm_state_weight());
                 }
                 // For larger head_dim, we'd need to spill to memory
             }
@@ -526,24 +526,18 @@ namespace llaminar::v2::kernels::jit
                 if (b == 0)
                 {
                     // Assert that accum0-1 aren't borrowed (they shouldn't be)
-                    if (gen.tracking_enabled())
-                    {
-                        gen.tracker()->assert_available<Accum0>("emit_interleaved_v_accum_4x block 0");
-                        gen.tracker()->assert_available<Accum1>("emit_interleaved_v_accum_4x block 0");
-                    }
-                    zmm_ctx_lo = gen.accum0().zmm();
-                    zmm_ctx_hi = gen.accum1().zmm();
+                    gen.tracker()->assert_available<Accum0>("emit_interleaved_v_accum_4x block 0");
+                    gen.tracker()->assert_available<Accum1>("emit_interleaved_v_accum_4x block 0");
+                    zmm_ctx_lo = gen.zmm_accum0();
+                    zmm_ctx_hi = gen.zmm_accum1();
                 }
                 else if (b == 1)
                 {
                     // Assert that accum2-3 aren't borrowed
-                    if (gen.tracking_enabled())
-                    {
-                        gen.tracker()->assert_available<Accum2>("emit_interleaved_v_accum_4x block 1");
-                        gen.tracker()->assert_available<Accum3>("emit_interleaved_v_accum_4x block 1");
-                    }
-                    zmm_ctx_lo = gen.accum2().zmm();
-                    zmm_ctx_hi = gen.accum3().zmm();
+                    gen.tracker()->assert_available<Accum2>("emit_interleaved_v_accum_4x block 1");
+                    gen.tracker()->assert_available<Accum3>("emit_interleaved_v_accum_4x block 1");
+                    zmm_ctx_lo = gen.zmm_accum2();
+                    zmm_ctx_hi = gen.zmm_accum3();
                 }
                 else
                 {
@@ -553,16 +547,13 @@ namespace llaminar::v2::kernels::jit
                     //
                     // The assert_available check will catch if we accidentally use
                     // borrowed registers:
-                    if (gen.tracking_enabled())
-                    {
-                        gen.tracker()->assert_available<Accum6>("emit_interleaved_v_accum_4x spilled block");
-                        gen.tracker()->assert_available<Accum7>("emit_interleaved_v_accum_4x spilled block");
-                    }
+                    gen.tracker()->assert_available<Accum6>("emit_interleaved_v_accum_4x spilled block");
+                    gen.tracker()->assert_available<Accum7>("emit_interleaved_v_accum_4x spilled block");
                     use_spill = true;
                     spill_lo = spill_base_offset + (b - 2) * 128;
                     spill_hi = spill_lo + 64;
-                    zmm_ctx_lo = gen.accum6().zmm(); // zmm6
-                    zmm_ctx_hi = gen.accum7().zmm(); // zmm7
+                    zmm_ctx_lo = gen.zmm_accum6(); // zmm6
+                    zmm_ctx_hi = gen.zmm_accum7(); // zmm7
                 }
 
                 if (use_spill)

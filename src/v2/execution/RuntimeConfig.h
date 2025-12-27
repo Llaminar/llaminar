@@ -139,11 +139,13 @@ namespace llaminar2
      */
     enum class ActivationPrecision
     {
-        FP32,  ///< 32-bit float activations (default, highest accuracy)
-        BF16,  ///< bfloat16 activations (Intel AMX, reduced bandwidth)
-        FP16,  ///< 16-bit float activations (ARM/GPU optimization)
-        Q8_1,  ///< Block-quantized int8 (36 bytes per 32 elements, 3.5x compression)
-        Hybrid ///< Mixed precision: FP32 residual, BF16 KV cache, Q8_1 QKV activations
+        FP32,     ///< 32-bit float activations (default, highest accuracy)
+        BF16,     ///< bfloat16 activations (Intel AMX, reduced bandwidth)
+        FP16,     ///< 16-bit float activations (ARM/GPU optimization)
+        Q8_1,     ///< Block-quantized int8 (36 bytes per 32 elements, 3.5x compression)
+        Q16_1,    ///< Block-quantized int16 (72 bytes per 32 elements, 266× better than Q8_1)
+        Hybrid,   ///< Mixed precision: FP32 residual, BF16 KV cache, Q8_1 QKV activations
+        HybridQ16 ///< Mixed precision: Q16_1 residual, Q8_1 activations (62% memory savings)
     };
 
     /**
@@ -161,8 +163,12 @@ namespace llaminar2
             return "FP16";
         case ActivationPrecision::Q8_1:
             return "Q8_1";
+        case ActivationPrecision::Q16_1:
+            return "Q16_1";
         case ActivationPrecision::Hybrid:
             return "Hybrid";
+        case ActivationPrecision::HybridQ16:
+            return "HybridQ16";
         default:
             return "Unknown";
         }

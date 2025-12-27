@@ -15,7 +15,7 @@
 #include <vector>
 #include <cstring>
 
-#include "kernels/cpu/attention/q8_1/jit/JitMicrokernelBase.h"
+#include "kernels/cpu/jit/JitMicrokernelBase.h"
 #include "kernels/cpu/attention/q8_1/jit/JitQ8DotProduct.h"
 #include "kernels/cpu/attention/q8_1/jit/JitFastExp.h"
 #include "kernels/cpu/attention/q8_1/jit/JitOnlineSoftmax.h"

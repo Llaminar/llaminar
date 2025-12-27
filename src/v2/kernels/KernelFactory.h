@@ -99,6 +99,7 @@ namespace llaminar2
     class Q4_KTensor;
     class Q5_KTensor;
     class Q8_KTensor;
+    class Q16_1Tensor;
     class IQ1_MTensor;
     class IQ1_STensor;
     class IQ2_STensor;
@@ -515,6 +516,15 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
                     const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RMSNorm kernel for Q16_1 activation tensor
+                 *
+                 * Special case for typed residual stream: Q16_1 input → FP32 output.
+                 * Used when residual is stored in high-precision Q16_1 format.
+                 */
+                static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
+                    const llaminar2::Q16_1Tensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================
                 // Attention Kernel Creation - Device-aware dispatch

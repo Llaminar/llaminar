@@ -95,6 +95,12 @@ namespace llaminar2
         /// Check if this is Hybrid mode (mixed precision)
         bool isHybrid() const { return precision_ == ActivationPrecision::Hybrid; }
 
+        /// Check if this is HybridQ16 mode (Q16_1 residual stream)
+        bool isHybridQ16() const { return precision_ == ActivationPrecision::HybridQ16; }
+
+        /// Check if this is any Hybrid variant (Hybrid or HybridQ16)
+        bool isAnyHybrid() const { return isHybrid() || isHybridQ16(); }
+
         /// Human-readable mode name
         std::string name() const;
 
@@ -105,27 +111,27 @@ namespace llaminar2
         /**
          * @brief Does this mode need a separate Q_rope buffer?
          *
-         * Hybrid mode outputs RoPE to FP32 to avoid Q8_1→rotate→Q8_1 requantization.
+         * Hybrid/HybridQ16 modes output RoPE to FP32 to avoid Q8_1→rotate→Q8_1 requantization.
          * FP32 and Q8_1 modes apply RoPE in-place.
          */
-        bool needsQRope() const { return isHybrid(); }
+        bool needsQRope() const { return isAnyHybrid(); }
 
         /**
          * @brief Does this mode need a separate K_rope buffer?
          *
-         * Hybrid mode outputs RoPE to FP32 for KV cache storage.
+         * Hybrid/HybridQ16 modes output RoPE to FP32 for KV cache storage.
          * FP32 and Q8_1 modes apply RoPE in-place.
          */
-        bool needsKRope() const { return isHybrid(); }
+        bool needsKRope() const { return isAnyHybrid(); }
 
         /**
          * @brief Does this mode need a V_dequant buffer?
          *
-         * Hybrid mode dequantizes V (Q8_1) to FP32 for attention computation.
+         * Hybrid/HybridQ16 modes dequantize V (Q8_1) to FP32 for attention computation.
          * FP32 mode: V is already FP32.
          * Q8_1 mode: Uses fused attention that operates on Q8_1 directly.
          */
-        bool needsVDequant() const { return isHybrid(); }
+        bool needsVDequant() const { return isAnyHybrid(); }
 
         /**
          * @brief Get list of extra buffer names required by this mode

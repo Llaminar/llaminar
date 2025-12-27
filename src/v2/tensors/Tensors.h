@@ -3270,9 +3270,15 @@ namespace llaminar2
         bool is_mutable_ = false;
         mutable bool cache_dirty_ = false;
 
-        // Private helper to copy from FP32 data
+    public:
+        // Copy from FP32 data (quantizes to Q16_1 blocks)
         bool copyFrom_fp32(const float *src_data);
 
+        // Copy from FP32 data for only the first num_rows rows
+        // Used for embedding output where we only fill part of the buffer
+        bool copyFrom_fp32_rows(const float *src_data, size_t num_rows);
+
+    private:
         // Private view constructor
         Q16_1Tensor(const std::vector<size_t> &shape,
                     const uint8_t *parent_raw_data,

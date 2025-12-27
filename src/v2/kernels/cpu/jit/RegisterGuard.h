@@ -36,6 +36,7 @@
 #include <bitset>
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <array>
 #include <utility>
@@ -99,17 +100,14 @@ namespace llaminar2::jit
         RegisterGuard(const RegisterGuard &) = delete;
         RegisterGuard &operator=(const RegisterGuard &) = delete;
 
-        // Access the underlying typed register
+        // Access the underlying typed register (tag type only - no Xbyak accessors)
         RegType reg() const { return reg_; }
 
-        // Convenience accessors - use SFINAE to only enable what the underlying type supports
-        template <typename R = RegType>
-        auto zmm() const -> decltype(std::declval<R>().zmm()) { return reg_.zmm(); }
-
-        template <typename R = RegType>
-        auto ymm() const -> decltype(std::declval<R>().ymm()) { return reg_.ymm(); }
-
-        Xbyak::Xmm xmm() const { return reg_.xmm(); }
+        // Xbyak register accessors - construct directly from physical_index
+        // This is the ONLY way to get Xbyak registers - TypedZmm/TypedXmm don't have accessors
+        Xbyak::Zmm zmm() const { return Xbyak::Zmm(physical_index); }
+        Xbyak::Ymm ymm() const { return Xbyak::Ymm(physical_index); }
+        Xbyak::Xmm xmm() const { return Xbyak::Xmm(physical_index); }
 
         // Explicit release (rarely needed, destructor handles it)
         void release();
@@ -119,6 +117,199 @@ namespace llaminar2::jit
 
         RegisterTracker *tracker_;
         RegType reg_;
+    };
+
+    // ============================================================================
+    // DynamicRegisterGuard: Runtime-determined register from a zone
+    // ============================================================================
+
+    /**
+     * @brief RAII guard for a dynamically borrowed register from a zone
+     *
+     * Unlike RegisterGuard<RegType> which knows the exact register at compile-time,
+     * DynamicRegisterGuard holds a runtime-determined register from a zone.
+     * This enables pool-based borrowing ("give me any available scratch register").
+     *
+     * @tparam Zone The register zone (AccumulatorZone, ScratchZone, etc.)
+     */
+    template <typename Zone>
+    class DynamicRegisterGuard
+    {
+    public:
+        using zone_type = Zone;
+
+        // Constructor: takes ownership of a specific register within the zone
+        DynamicRegisterGuard(RegisterTracker *tracker, int zone_index)
+            : tracker_(tracker), zone_index_(zone_index)
+        {
+            assert(zone_index >= 0 && zone_index < Zone::count);
+        }
+
+        // Destructor: releases the register
+        ~DynamicRegisterGuard()
+        {
+            release_if_owned();
+        }
+
+        // Move constructor
+        DynamicRegisterGuard(DynamicRegisterGuard &&other) noexcept
+            : tracker_(other.tracker_), zone_index_(other.zone_index_)
+        {
+            other.tracker_ = nullptr;
+        }
+
+        // Move assignment
+        DynamicRegisterGuard &operator=(DynamicRegisterGuard &&other) noexcept
+        {
+            if (this != &other)
+            {
+                release_if_owned();
+                tracker_ = other.tracker_;
+                zone_index_ = other.zone_index_;
+                other.tracker_ = nullptr;
+            }
+            return *this;
+        }
+
+        // No copy
+        DynamicRegisterGuard(const DynamicRegisterGuard &) = delete;
+        DynamicRegisterGuard &operator=(const DynamicRegisterGuard &) = delete;
+
+        // Index accessors
+        int zone_index() const { return zone_index_; }
+        int absolute_index() const { return Zone::base_index + zone_index_; }
+
+        // Encoding constraint queries (runtime)
+        bool is_low() const { return absolute_index() < 16; }
+        bool is_high() const { return absolute_index() >= 16; }
+        bool is_vex_safe() const { return is_low(); }
+        bool is_evex_only() const { return is_high(); }
+
+        // ════════════════════════════════════════════════════════════════════════
+        // Xbyak register accessors
+        // ════════════════════════════════════════════════════════════════════════
+
+        /// @brief Get ZMM register (always safe - ZMM uses EVEX)
+        Xbyak::Zmm zmm() const { return Xbyak::Zmm(absolute_index()); }
+
+        /// @brief Get YMM register (check is_vex_safe() if using VEX instructions)
+        Xbyak::Ymm ymm() const { return Xbyak::Ymm(absolute_index()); }
+
+        /// @brief Get XMM register (check is_vex_safe() if using VEX instructions)
+        Xbyak::Xmm xmm() const { return Xbyak::Xmm(absolute_index()); }
+
+        // ════════════════════════════════════════════════════════════════════════
+        // Encoding-checked accessors (assert at runtime)
+        // ════════════════════════════════════════════════════════════════════════
+
+        /// @brief Get YMM register, asserting it's VEX-safe (LOW register)
+        Xbyak::Ymm ymm_vex_safe() const
+        {
+            assert(is_vex_safe() && "VEX encoding requires register 0-15, but this is HIGH");
+            return ymm();
+        }
+
+        /// @brief Get XMM register, asserting it's VEX-safe (LOW register)
+        Xbyak::Xmm xmm_vex_safe() const
+        {
+            assert(is_vex_safe() && "VEX encoding requires register 0-15, but this is HIGH");
+            return xmm();
+        }
+
+        // Explicit release
+        void release();
+
+    private:
+        void release_if_owned();
+
+        RegisterTracker *tracker_;
+        int zone_index_;
+    };
+
+    // Forward declaration for RegisterPool
+    class RegisterTracker;
+
+    // ============================================================================
+    // RegisterPool: Pool-based register borrowing from a zone
+    // ============================================================================
+
+    /**
+     * @brief Pool-based borrowing of registers from a zone
+     *
+     * Instead of specifying exact registers, you can ask for "any available"
+     * register from a zone, optionally with encoding constraints.
+     *
+     * @code
+     * RegisterPool<ScratchZone> scratch_pool(tracker);
+     *
+     * // Borrow any available scratch register
+     * auto guard = scratch_pool.borrow_any();
+     * if (guard) {
+     *     gen.vmovaps(guard->zmm(), ...);
+     * }
+     *
+     * // Borrow specifically a LOW register (VEX-safe) - will fail for ScratchZone
+     * auto low_guard = scratch_pool.borrow_low();
+     * // low_guard is nullopt because ScratchZone has no LOW registers
+     *
+     * // For VEX-safe scratch, use AccumulatorZone instead:
+     * RegisterPool<AccumulatorZone> accum_pool(tracker);
+     * auto vex_safe = accum_pool.borrow_any();  // All accum regs are LOW
+     * @endcode
+     *
+     * @tparam Zone The register zone to borrow from
+     */
+    template <typename Zone>
+    class RegisterPool
+    {
+    public:
+        explicit RegisterPool(RegisterTracker &tracker) : tracker_(tracker) {}
+
+        /**
+         * @brief Borrow any available register from this zone
+         *
+         * @return std::optional<DynamicRegisterGuard<Zone>> - nullopt if all exhausted
+         */
+        [[nodiscard]] std::optional<DynamicRegisterGuard<Zone>> borrow_any();
+
+        /**
+         * @brief Borrow a LOW (VEX-safe) register from this zone
+         *
+         * @return std::optional<DynamicRegisterGuard<Zone>> - nullopt if no LOW available
+         *
+         * @note For zones that are all HIGH (State, Scratch, Score, Reserved),
+         *       this will always return nullopt. Use AccumulatorZone or QVectorZone
+         *       for VEX-safe registers.
+         */
+        [[nodiscard]] std::optional<DynamicRegisterGuard<Zone>> borrow_low();
+
+        /**
+         * @brief Borrow a HIGH (EVEX-only) register from this zone
+         *
+         * @return std::optional<DynamicRegisterGuard<Zone>> - nullopt if no HIGH available
+         *
+         * @note For zones that are all LOW (Accumulator, QVector),
+         *       this will always return nullopt.
+         */
+        [[nodiscard]] std::optional<DynamicRegisterGuard<Zone>> borrow_high();
+
+        /**
+         * @brief Get count of available (not borrowed) registers
+         */
+        int available_count() const;
+
+        /**
+         * @brief Get count of available LOW registers
+         */
+        int available_low_count() const;
+
+        /**
+         * @brief Get count of available HIGH registers
+         */
+        int available_high_count() const;
+
+    private:
+        RegisterTracker &tracker_;
     };
 
     // ============================================================================
@@ -179,6 +370,23 @@ namespace llaminar2::jit
         [[nodiscard]] ScopedRegisterSet<RegTypes...> borrow_set()
         {
             return ScopedRegisterSet<RegTypes...>(*this);
+        }
+
+        /**
+         * @brief Get a pool for borrowing registers from a zone
+         *
+         * @code
+         * auto scratch_pool = tracker.pool<ScratchZone>();
+         * auto guard = scratch_pool.borrow_any();
+         * if (guard) {
+         *     gen.vmovaps(guard->zmm(), ...);
+         * }
+         * @endcode
+         */
+        template <typename Zone>
+        [[nodiscard]] RegisterPool<Zone> pool()
+        {
+            return RegisterPool<Zone>(*this);
         }
 
         /**
@@ -327,6 +535,12 @@ namespace llaminar2::jit
     private:
         template <typename RegType>
         friend class RegisterGuard;
+
+        template <typename Zone>
+        friend class DynamicRegisterGuard;
+
+        template <typename Zone>
+        friend class RegisterPool;
 
         void mark_borrowed(int physical_index, const std::string &name)
         {
@@ -486,5 +700,125 @@ namespace llaminar2::jit
                   "Score1 and Scratch1 must conflict (both map to physical reg 21)");
     static_assert(!registers_conflict_v<Scratch4, Score0>,
                   "Scratch4 (reg 24) should not conflict with Score0 (reg 20)");
+
+    // ============================================================================
+    // DynamicRegisterGuard Implementation
+    // ============================================================================
+
+    template <typename Zone>
+    void DynamicRegisterGuard<Zone>::release()
+    {
+        release_if_owned();
+        tracker_ = nullptr;
+    }
+
+    template <typename Zone>
+    void DynamicRegisterGuard<Zone>::release_if_owned()
+    {
+        if (tracker_)
+        {
+            tracker_->mark_released(absolute_index());
+        }
+    }
+
+    // ============================================================================
+    // RegisterPool Implementation
+    // ============================================================================
+
+    template <typename Zone>
+    std::optional<DynamicRegisterGuard<Zone>> RegisterPool<Zone>::borrow_any()
+    {
+        for (int i = 0; i < Zone::count; ++i)
+        {
+            int phys = Zone::base_index + i;
+            if (!tracker_.is_borrowed(phys))
+            {
+                // Generate name for error messages
+                std::string name = std::string(Zone::name) +
+                                   "[" + std::to_string(i) + "]";
+                tracker_.mark_borrowed(phys, name);
+                return DynamicRegisterGuard<Zone>(&tracker_, i);
+            }
+        }
+        return std::nullopt;
+    }
+
+    template <typename Zone>
+    std::optional<DynamicRegisterGuard<Zone>> RegisterPool<Zone>::borrow_low()
+    {
+        // Only consider registers 0-15 (LOW)
+        for (int i = 0; i < Zone::count; ++i)
+        {
+            int phys = Zone::base_index + i;
+            if (phys >= 16)
+                continue; // Skip HIGH registers
+            if (!tracker_.is_borrowed(phys))
+            {
+                std::string name = std::string(Zone::name) +
+                                   "[" + std::to_string(i) + "]";
+                tracker_.mark_borrowed(phys, name);
+                return DynamicRegisterGuard<Zone>(&tracker_, i);
+            }
+        }
+        return std::nullopt;
+    }
+
+    template <typename Zone>
+    std::optional<DynamicRegisterGuard<Zone>> RegisterPool<Zone>::borrow_high()
+    {
+        // Only consider registers 16-31 (HIGH)
+        for (int i = 0; i < Zone::count; ++i)
+        {
+            int phys = Zone::base_index + i;
+            if (phys < 16)
+                continue; // Skip LOW registers
+            if (!tracker_.is_borrowed(phys))
+            {
+                std::string name = std::string(Zone::name) +
+                                   "[" + std::to_string(i) + "]";
+                tracker_.mark_borrowed(phys, name);
+                return DynamicRegisterGuard<Zone>(&tracker_, i);
+            }
+        }
+        return std::nullopt;
+    }
+
+    template <typename Zone>
+    int RegisterPool<Zone>::available_count() const
+    {
+        int count = 0;
+        for (int i = 0; i < Zone::count; ++i)
+        {
+            if (!tracker_.is_borrowed(Zone::base_index + i))
+                ++count;
+        }
+        return count;
+    }
+
+    template <typename Zone>
+    int RegisterPool<Zone>::available_low_count() const
+    {
+        int count = 0;
+        for (int i = 0; i < Zone::count; ++i)
+        {
+            int phys = Zone::base_index + i;
+            if (phys < 16 && !tracker_.is_borrowed(phys))
+                ++count;
+        }
+        return count;
+    }
+
+    template <typename Zone>
+    int RegisterPool<Zone>::available_high_count() const
+    {
+        int count = 0;
+        for (int i = 0; i < Zone::count; ++i)
+        {
+            int phys = Zone::base_index + i;
+            if (phys >= 16 && !tracker_.is_borrowed(phys))
+                ++count;
+        }
+        return count;
+    }
 
 } // namespace llaminar2::jit

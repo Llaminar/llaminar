@@ -641,6 +641,102 @@ namespace llaminar2
     }
 
     // ============================================================================
+    // Q16_1 Specialization Implementation (High-Precision Integer)
+    // ============================================================================
+
+    bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed(
+        Q16_1Block *Q,
+        Q16_1Block *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        (void)device_idx; // Unused for CPU kernel
+
+        if (!Q)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q16_1>: Null Q pointer");
+            return false;
+        }
+
+        // Validate head_dim divisibility by Q16_1 block size
+        if (head_dim % 32 != 0)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q16_1>: head_dim ("
+                      << head_dim << ") must be divisible by 32 (Q16_1 block size)");
+            return false;
+        }
+
+        // Call Q16_1 RoPE primitive
+        primitives::apply_rope_q16_1_integer(
+            Q, K,
+            position_ids,
+            seq_len,
+            n_heads, n_kv_heads,
+            head_dim,
+            rope_theta,
+            (seq_len == 1) ? &tls_state_ : nullptr);
+
+        return true;
+    }
+
+    // --- Q16_1 apply_q16_1() ---
+    bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_q16_1(
+        void *Q_data, void *K_data,
+        const int *pos_ids,
+        int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        float theta_base, int device_idx)
+    {
+        return apply_typed(
+            static_cast<Q16_1Block *>(Q_data),
+            static_cast<Q16_1Block *>(K_data),
+            pos_ids, seq_len, n_heads, n_kv_heads, head_dim, theta_base, device_idx);
+    }
+
+    // --- Q16_1 apply_tensor() ---
+    bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_tensor(
+        TensorBase *Q,
+        TensorBase *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)mpi_ctx;
+
+        if (!Q || Q->native_type() != TensorType::Q16_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: Q must be Q16_1Tensor");
+            return false;
+        }
+
+        auto *q_q16 = dynamic_cast<Q16_1Tensor *>(Q);
+        Q16_1Tensor *k_q16 = nullptr;
+        if (K)
+        {
+            if (K->native_type() != TensorType::Q16_1)
+            {
+                LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: K must be Q16_1Tensor");
+                return false;
+            }
+            k_q16 = dynamic_cast<Q16_1Tensor *>(K);
+        }
+
+        return apply_typed(
+            q_q16->mutable_q16_1_blocks(),
+            k_q16 ? k_q16->mutable_q16_1_blocks() : nullptr,
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+    }
+
+    // ============================================================================
     // Destructor Definitions (required for vtable emission)
     // ============================================================================
 
@@ -648,6 +744,7 @@ namespace llaminar2
     CPURoPEKernelT<ActivationPrecision::BF16>::~CPURoPEKernelT() = default;
     CPURoPEKernelT<ActivationPrecision::FP16>::~CPURoPEKernelT() = default;
     CPURoPEKernelT<ActivationPrecision::Q8_1>::~CPURoPEKernelT() = default;
+    // Note: Q16_1 destructor is defaulted in-class
 
     // ============================================================================
     // Explicit Template Instantiations
@@ -657,5 +754,6 @@ namespace llaminar2
     template class CPURoPEKernelT<ActivationPrecision::BF16>;
     template class CPURoPEKernelT<ActivationPrecision::FP16>;
     template class CPURoPEKernelT<ActivationPrecision::Q8_1>;
+    template class CPURoPEKernelT<ActivationPrecision::Q16_1>;
 
 } // namespace llaminar2

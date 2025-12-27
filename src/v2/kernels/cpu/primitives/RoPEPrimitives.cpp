@@ -2149,4 +2149,198 @@ namespace llaminar2::primitives
         }
     }
 
+    // ============================================================================
+    // Q16_1 In-Place RoPE Implementation
+    // ============================================================================
+
+    void apply_rope_q16_1_integer_head(
+        Q16_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        const int half_blocks = blocks_per_head / 2;
+
+        // Q16_1 in-place RoPE: Dequant → Rotate → Requant
+        // Uses FP32 for rotation to correctly handle scale differences between blocks.
+        // Q16_1 has FP32 scale (no FP16 conversion) and int16 values (±32767 range).
+
+        for (int b = 0; b < half_blocks; ++b)
+        {
+            Q16_1Block &blockA = head_blocks[b];
+            Q16_1Block &blockB = head_blocks[b + half_blocks];
+
+            // Q16_1 uses FP32 scale directly - no conversion needed
+            float scaleA = blockA.d;
+            float scaleB = blockB.d;
+
+            const int16_t *cos_ptr = cos_q15 + b * 32;
+            const int16_t *sin_ptr = sin_q15 + b * 32;
+
+            float rotA[32];
+            float rotB[32];
+
+            // Compute rotated values in FP32
+            for (int i = 0; i < 32; ++i)
+            {
+                // Dequantize Q16_1 values
+                float x = static_cast<float>(blockA.qs[i]) * scaleA;
+                float y = static_cast<float>(blockB.qs[i]) * scaleB;
+
+                // Convert Q15 sin/cos to float
+                float c = static_cast<float>(cos_ptr[i]) * (1.0f / 32767.0f);
+                float s = static_cast<float>(sin_ptr[i]) * (1.0f / 32767.0f);
+
+                // Rotate
+                rotA[i] = x * c - y * s;
+                rotB[i] = x * s + y * c;
+            }
+
+            // Requantize blockA to Q16_1
+            {
+                float max_val = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_val = std::max(max_val, std::abs(rotA[i]));
+                }
+
+                // Q16_1 uses ±32767 range (256× finer than Q8_1's ±127)
+                float new_scale = max_val / 32767.0f;
+                if (new_scale < 1e-20f)
+                    new_scale = 1e-20f;
+                float inv_scale = 1.0f / new_scale;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(rotA[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    blockA.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += q;
+                }
+                blockA.d = new_scale; // FP32 scale, no conversion
+                blockA.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+
+            // Requantize blockB to Q16_1
+            {
+                float max_val = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_val = std::max(max_val, std::abs(rotB[i]));
+                }
+
+                float new_scale = max_val / 32767.0f;
+                if (new_scale < 1e-20f)
+                    new_scale = 1e-20f;
+                float inv_scale = 1.0f / new_scale;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(rotB[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    blockB.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += q;
+                }
+                blockB.d = new_scale;
+                blockB.sum_qs = static_cast<int32_t>(sum_qs);
+            }
+        }
+    }
+
+    void apply_rope_q16_1_integer(
+        Q16_1Block *Q,
+        Q16_1Block *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state)
+    {
+        if (head_dim % 32 != 0)
+        {
+            return; // head_dim must be divisible by Q16_1 block size
+        }
+
+        const int blocks_per_head = head_dim / 32;
+        const int q_stride_blocks = n_heads * blocks_per_head;
+        const int k_stride_blocks = n_kv_heads * blocks_per_head;
+        const int half_dim = head_dim / 2;
+
+        // Get inverse frequencies (shared with Q8_1 RoPE)
+        const auto &inv_freq = get_inv_freq_cached(head_dim, rope_theta);
+
+        // Precompute sin/cos tables for all positions (Q15 format)
+        // We reuse the same Q15 format as Q8_1 since sin/cos are bounded to [-1, 1]
+        std::vector<int16_t> cos_table(seq_len * half_dim);
+        std::vector<int16_t> sin_table(seq_len * half_dim);
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            const int pos = position_ids[t];
+            if (pos < 0)
+                continue; // Skip padding
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float angle = static_cast<float>(pos) * inv_freq[i];
+                float c = std::cos(angle);
+                float s = std::sin(angle);
+                // Quantize to Q15
+                cos_table[t * half_dim + i] = static_cast<int16_t>(std::round(c * 32767.0f));
+                sin_table[t * half_dim + i] = static_cast<int16_t>(std::round(s * 32767.0f));
+            }
+        }
+
+        // Process Q tensor
+        auto do_q_work = [&]()
+        {
+#pragma omp for collapse(2)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int pos = position_ids[t];
+                    if (pos < 0)
+                        continue;
+
+                    Q16_1Block *head_ptr = Q + t * q_stride_blocks + h * blocks_per_head;
+                    const int16_t *c_ptr = cos_table.data() + t * half_dim;
+                    const int16_t *s_ptr = sin_table.data() + t * half_dim;
+                    apply_rope_q16_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_q_work);
+
+        // Process K tensor if provided
+        if (K)
+        {
+            auto do_k_work = [&]()
+            {
+#pragma omp for collapse(2)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int h = 0; h < n_kv_heads; ++h)
+                    {
+                        const int pos = position_ids[t];
+                        if (pos < 0)
+                            continue;
+
+                        Q16_1Block *head_ptr = K + t * k_stride_blocks + h * blocks_per_head;
+                        const int16_t *c_ptr = cos_table.data() + t * half_dim;
+                        const int16_t *s_ptr = sin_table.data() + t * half_dim;
+                        apply_rope_q16_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_k_work);
+        }
+
+        (void)persistent_state; // TODO: Add persistent state optimization for decode
+    }
+
 } // namespace llaminar2::primitives

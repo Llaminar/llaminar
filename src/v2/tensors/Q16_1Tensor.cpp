@@ -9,6 +9,7 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
+#include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include <cstring>
@@ -456,9 +457,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRoPE> Q16_1Tensor::createRoPE()
     {
-        // Q16_1 RoPE will use FP32 internally
-        LOG_WARN("[Q16_1Tensor::createRoPE] No native Q16_1 RoPE kernel. Use FP32 path.");
-        return nullptr;
+        // Use native Q16_1 in-place RoPE kernel
+        return std::make_unique<CPURoPEKernelT<ActivationPrecision::Q16_1>>();
     }
 
     std::unique_ptr<ITensorSwiGLU> Q16_1Tensor::createSwiGLU()
@@ -508,8 +508,8 @@ namespace llaminar2
         (void)use_bf16;
         (void)mpi_ctx;
 
-        // Q16_1 RoPE: dequantize → apply → re-quantize
-        // For high-precision format, FP32 intermediate is acceptable
+        // Q16_1 In-Place RoPE: Uses native Q16_1 kernel with dequant→rotate→requant internally.
+        // K is passed as float* but is actually Q16_1Block* (same pattern as Q8_1Tensor).
         auto kernel = createRoPE();
         if (!kernel)
         {
@@ -517,26 +517,22 @@ namespace llaminar2
             return false;
         }
 
-        // Dequantize this tensor to FP32
-        std::vector<float> Q_fp32(element_count());
-        to_fp32(Q_fp32.data());
+        // Get Q pointer (this tensor) - use mutable_q16_1_blocks() to invalidate cache
+        void *Q_ptr = mutable_q16_1_blocks();
 
-        // Apply RoPE on FP32 data
-        bool success = kernel->apply(
-            Q_fp32.data(), K,
+        // K is passed as float* but is actually Q16_1 block data
+        // Note: K's cache should have been invalidated by the caller via mutable_q16_1_blocks()
+        void *K_ptr = (void *)K;
+
+        bool success = kernel->apply_q16_1(
+            Q_ptr, K_ptr,
             position_ids,
             seq_len, n_heads, n_kv_heads, head_dim,
             rope_theta,
             device_idx);
 
-        if (!success)
-        {
-            LOG_ERROR("[Q16_1Tensor::applyRoPE] RoPE kernel failed");
-            return false;
-        }
-
-        // Re-quantize back to Q16_1
-        return copyFrom_fp32(Q_fp32.data());
+        // Cache was already cleared by mutable_q16_1_blocks() call above
+        return success;
     }
 
     bool Q16_1Tensor::applyRMSNorm(
@@ -1111,6 +1107,83 @@ namespace llaminar2
     }
 
     // ===== Private Helper Methods =====
+
+    bool Q16_1Tensor::copyFrom_fp32_rows(const float *src_data, size_t num_rows)
+    {
+        if (!src_data)
+        {
+            return false;
+        }
+
+        if (shape_.size() != 2)
+        {
+            LOG_ERROR("[Q16_1Tensor::copyFrom_fp32_rows] Requires 2D tensor");
+            return false;
+        }
+
+        const size_t max_rows = shape_[0];
+        const size_t cols = shape_[1];
+        const size_t actual_rows = std::min(num_rows, max_rows);
+        const size_t blocks_per_row = (cols + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        const size_t n_blocks = actual_rows * blocks_per_row;
+        const size_t elements_per_row = cols;
+
+        Q16_1Block *blocks = mutable_q16_1_blocks();
+
+#pragma omp parallel for if (n_blocks > 4)
+        for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+        {
+            const size_t row_idx = block_idx / blocks_per_row;
+            const size_t col_block = block_idx % blocks_per_row;
+            const size_t col_offset = col_block * Q16_1Block::BLOCK_SIZE;
+            const size_t count = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), cols - col_offset);
+
+            Q16_1Block &block = blocks[block_idx];
+
+            // Source data is row-major: src_data[row * cols + col]
+            const float *row_data = src_data + row_idx * elements_per_row + col_offset;
+
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(row_data[i]));
+            }
+
+            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+            block.d = d;
+
+            int64_t sum_i64 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float scaled = row_data[i] * inv_d;
+                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                    block.qs[i] = quantized;
+                    sum_i64 += static_cast<int64_t>(quantized);
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
+            }
+
+            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            block.sum_qs = static_cast<int32_t>(sum_i64);
+        }
+
+        dequant_cache_.clear();
+        return true;
+    }
 
     bool Q16_1Tensor::copyFrom_fp32(const float *src_data)
     {

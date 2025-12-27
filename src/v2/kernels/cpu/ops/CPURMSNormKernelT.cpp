@@ -685,4 +685,45 @@ namespace llaminar2
         return true;
     }
 
+    // =========================================================================
+    // Q16_1 Specialization (Q16_1 input → FP32 output)
+    // =========================================================================
+
+    bool CPURMSNormKernelT<ActivationPrecision::Q16_1>::apply_typed(
+        const Q16_1Block *input,
+        const float *gamma,
+        float *output,
+        int rows,
+        int cols,
+        float epsilon,
+        int device_idx)
+    {
+        (void)device_idx;
+
+        if (!input || !gamma || !output || rows <= 0 || cols <= 0)
+        {
+            return false;
+        }
+
+        // Q16_1 requires cols to be multiple of 32 (block size)
+        if (cols % 32 != 0)
+        {
+            LOG_ERROR("Q16_1 RMSNorm requires cols to be multiple of 32, got " << cols);
+            return false;
+        }
+
+        const size_t ucols = static_cast<size_t>(cols);
+
+        // Use the Q16_1→FP32 primitive with automatic parallelization
+        primitives::RMSNormExecOptions opts;
+        opts.allow_parallel = want_parallel(rows, ucols);
+
+        primitives::rmsnorm_q16_1_fp32_fused(
+            input, gamma, output,
+            static_cast<size_t>(rows), ucols,
+            epsilon, opts);
+
+        return true;
+    }
+
 } // namespace llaminar2

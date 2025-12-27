@@ -68,7 +68,7 @@
 
 #pragma once
 
-#include "JitMicrokernelBase.h"
+#include "../../../jit/JitMicrokernelBase.h"
 #include "JitFastExp.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterEnforcement.h"
@@ -122,10 +122,10 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_init_softmax_state");
 
             // max = -inf
-            gen.vmovaps(gen.state_max().zmm(), gen.const_neg_inf().zmm());
+            gen.vmovaps(gen.zmm_state_max(), gen.zmm_const_neg_inf());
 
             // sum = 0
-            gen.vxorps(gen.state_sum().zmm(), gen.state_sum().zmm(), gen.state_sum().zmm());
+            gen.vxorps(gen.zmm_state_sum(), gen.zmm_state_sum(), gen.zmm_state_sum());
         }
 
         /**
@@ -166,17 +166,17 @@ namespace llaminar::v2::kernels::jit
 
             // Use scratch5 for score - scratch(0-2) are clobbered by emit_fast_exp
             // scratch0-2 = zmm20-22, scratch5 = zmm25
-            Zmm zmm_score = gen.scratch5().zmm();
+            Zmm zmm_score = gen.borrow<llaminar2::jit::Scratch5>().zmm();
 
             // Broadcast score to all lanes (needed for comparison and subtraction)
             gen.vbroadcastss(zmm_score, score_xmm);
 
             // Initialize state_corr to 1.0 (no rescale needed by default)
             // This will be overwritten if score > max
-            gen.load_constant_f32(gen.state_corr().zmm(), 1.0f);
+            gen.load_constant_f32(gen.zmm_state_corr(), 1.0f);
 
             // Compare score with current max
-            gen.vcomiss(score_xmm, Xmm(gen.state_max().zmm().getIdx()));
+            gen.vcomiss(score_xmm, Xmm(gen.zmm_state_max().getIdx()));
 
             std::string label_score_le_max = label_prefix + "_score_le_max";
             gen.jbe(label_score_le_max.c_str(), Xbyak::CodeGenerator::T_NEAR);
@@ -185,14 +185,14 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("  score > max branch");
             {
                 // correction = exp(max - score)
-                gen.vsubps(gen.state_corr().zmm(), gen.state_max().zmm(), zmm_score);
-                exp_emitter_.emit_fast_exp(gen, gen.state_corr().zmm(), gen.state_corr().zmm());
+                gen.vsubps(gen.zmm_state_corr(), gen.zmm_state_max(), zmm_score);
+                exp_emitter_.emit_fast_exp(gen, gen.zmm_state_corr(), gen.zmm_state_corr());
 
                 // sum *= correction
-                gen.vmulps(gen.state_sum().zmm(), gen.state_sum().zmm(), gen.state_corr().zmm());
+                gen.vmulps(gen.zmm_state_sum(), gen.zmm_state_sum(), gen.zmm_state_corr());
 
                 // max = score
-                gen.vmovaps(gen.state_max().zmm(), zmm_score);
+                gen.vmovaps(gen.zmm_state_max(), zmm_score);
 
                 // state_corr() now contains exp(old_max - new_max) < 1.0
                 // Caller should rescale context accumulators by state_corr()
@@ -201,11 +201,11 @@ namespace llaminar::v2::kernels::jit
             gen.L(label_score_le_max.c_str());
 
             // weight = exp(score - max)
-            gen.vsubps(gen.state_weight().zmm(), zmm_score, gen.state_max().zmm());
-            exp_emitter_.emit_fast_exp(gen, gen.state_weight().zmm(), gen.state_weight().zmm());
+            gen.vsubps(gen.zmm_state_weight(), zmm_score, gen.zmm_state_max());
+            exp_emitter_.emit_fast_exp(gen, gen.zmm_state_weight(), gen.zmm_state_weight());
 
             // sum += weight
-            gen.vaddps(gen.state_sum().zmm(), gen.state_sum().zmm(), gen.state_weight().zmm());
+            gen.vaddps(gen.zmm_state_sum(), gen.zmm_state_sum(), gen.zmm_state_weight());
         }
 
         /**
@@ -226,7 +226,7 @@ namespace llaminar::v2::kernels::jit
 
             // inv_sum = 1.0 / sum
             // Use precise division (not approximate vrcp14ps)
-            gen.vdivps(dst_zmm, gen.const_one().zmm(), gen.state_sum().zmm());
+            gen.vdivps(dst_zmm, gen.zmm_const_one(), gen.zmm_state_sum());
         }
 
         /**
@@ -315,8 +315,8 @@ namespace llaminar::v2::kernels::jit
             const Score3 &s3,
             int num_scores = 4)
         {
-            emit_tile_max_reduction_4(gen, output.zmm(),
-                                      s0.xmm(), s1.xmm(), s2.xmm(), s3.xmm(),
+            emit_tile_max_reduction_4(gen, JitMicrokernelBase::to_zmm(output),
+                                      gen.xmm_score0(), gen.xmm_score1(), gen.xmm_score2(), gen.xmm_score3(),
                                       num_scores);
         }
 
@@ -362,9 +362,9 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_tile_state_update");
 
             // Use typed state accessors for clarity
-            Zmm zmm_max = gen.state_max().zmm();
-            Zmm zmm_sum = gen.state_sum().zmm();
-            Zmm zmm_corr = gen.state_corr().zmm();
+            Zmm zmm_max = gen.zmm_state_max();
+            Zmm zmm_sum = gen.zmm_state_sum();
+            Zmm zmm_corr = gen.zmm_state_corr();
 
             // Initialize correction to 1.0 (no rescale needed by default)
             gen.load_constant_f32(zmm_corr, 1.0f);
@@ -432,8 +432,8 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_compute_weight_and_accumulate");
 
             // Use typed state accessors
-            Zmm zmm_max = gen.state_max().zmm();
-            Zmm zmm_sum = gen.state_sum().zmm();
+            Zmm zmm_max = gen.zmm_state_max();
+            Zmm zmm_sum = gen.zmm_state_sum();
 
             // weight = exp(score - running_max)
             gen.vbroadcastss(weight_zmm, score_xmm);
@@ -514,10 +514,10 @@ namespace llaminar::v2::kernels::jit
 
             // Initialize constants
             debug_emit("  Init constants");
-            emit_broadcast_fp32_const(const_neg_inf().zmm(), -std::numeric_limits<float>::infinity(), rax);
-            emit_broadcast_fp32_const(const_one().zmm(), 1.0f, rax);
-            emit_broadcast_fp32_const(const_log2e().zmm(), 1.4426950408889634f, rax);
-            emit_broadcast_fp32_const(const_exp_min().zmm(), -87.0f, rax);
+            emit_broadcast_fp32_const(zmm_const_neg_inf(), -std::numeric_limits<float>::infinity(), rax);
+            emit_broadcast_fp32_const(zmm_const_one(), 1.0f, rax);
+            emit_broadcast_fp32_const(zmm_const_log2e(), 1.4426950408889634f, rax);
+            emit_broadcast_fp32_const(zmm_const_exp_min(), -87.0f, rax);
 
             // Allocate stack for temporary weight storage
             // We need to store weights during first pass, then normalize
@@ -551,33 +551,33 @@ namespace llaminar::v2::kernels::jit
             // Inline softmax update (without label issues)
             // This duplicates emit_update but avoids label collision in loop
             {
-                Zmm zmm_score = scratch0().zmm();
+                Zmm zmm_score = borrow<llaminar2::jit::Scratch0>().zmm();
                 vbroadcastss(zmm_score, xmm0);
 
                 // Compare score with max
-                vcomiss(xmm0, Xmm(state_max().zmm().getIdx()));
+                vcomiss(xmm0, Xmm(zmm_state_max().getIdx()));
 
                 Label score_le_max;
                 jbe(score_le_max, T_NEAR);
 
                 // score > max: rescale
-                vsubps(state_corr().zmm(), state_max().zmm(), zmm_score);
-                JitFastExpEmitter().emit_fast_exp(*this, state_corr().zmm(), state_corr().zmm());
-                vmulps(state_sum().zmm(), state_sum().zmm(), state_corr().zmm());
-                vmovaps(state_max().zmm(), zmm_score);
+                vsubps(zmm_state_corr(), zmm_state_max(), zmm_score);
+                JitFastExpEmitter().emit_fast_exp(*this, zmm_state_corr(), zmm_state_corr());
+                vmulps(zmm_state_sum(), zmm_state_sum(), zmm_state_corr());
+                vmovaps(zmm_state_max(), zmm_score);
 
                 L(score_le_max);
 
                 // weight = exp(score - max)
-                vsubps(state_weight().zmm(), zmm_score, state_max().zmm());
-                JitFastExpEmitter().emit_fast_exp(*this, state_weight().zmm(), state_weight().zmm());
+                vsubps(zmm_state_weight(), zmm_score, zmm_state_max());
+                JitFastExpEmitter().emit_fast_exp(*this, zmm_state_weight(), zmm_state_weight());
 
                 // sum += weight
-                vaddps(state_sum().zmm(), state_sum().zmm(), state_weight().zmm());
+                vaddps(zmm_state_sum(), zmm_state_sum(), zmm_state_weight());
             }
 
             // Store unnormalized weight to stack
-            vmovss(ptr[rsp + reg_i * 4], Xmm(state_weight().zmm().getIdx()));
+            vmovss(ptr[rsp + reg_i * 4], Xmm(zmm_state_weight().getIdx()));
 
             inc(reg_i);
             jmp(loop1_start, T_NEAR);
@@ -586,7 +586,7 @@ namespace llaminar::v2::kernels::jit
 
             // Compute 1/sum
             debug_emit("  Compute 1/sum");
-            Zmm zmm_inv_sum = scratch3().zmm();
+            Zmm zmm_inv_sum = borrow<llaminar2::jit::Scratch3>().zmm();
             softmax_emitter_.emit_finalize(*this, zmm_inv_sum);
 
             // Pass 2: Normalize weights

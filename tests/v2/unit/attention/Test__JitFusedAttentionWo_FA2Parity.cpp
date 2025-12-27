@@ -214,8 +214,7 @@ namespace llaminar::v2::kernels::jit::test
             config_fa2.batch_size = 1;
             config_fa2.wo_format = WoFormat::FP32;
             config_fa2.causal = false;
-            config_fa2.use_fa2_tiling = true;           // FA2 path
-            config_fa2.enable_register_tracking = true; // Enable tracking for debugging
+            config_fa2.use_fa2_tiling = true; // FA2 path
 
             // Create and run FA1 kernel
             JitFusedAttentionWo kernel_fa1(config_fa1);
@@ -543,9 +542,8 @@ namespace llaminar::v2::kernels::jit::test
         config_fa2.wo_format = WoFormat::FP32;
         config_fa2.causal = false;
         config_fa2.use_fa2_tiling = true;
-        config_fa2.enable_register_tracking = true; // ENABLE TRACKING!
 
-        // Create and run FA2 kernel with tracking
+        // Create and run FA2 kernel
         // If there's a register conflict, this will ASSERT during JIT compilation
         JitFusedAttentionWo kernel_fa2(config_fa2);
         kernel_fa2.compute(

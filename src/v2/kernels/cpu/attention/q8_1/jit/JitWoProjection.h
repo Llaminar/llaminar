@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include "JitMicrokernelBase.h"
+#include "../../../jit/JitMicrokernelBase.h"
 #include "../../../jit/RegisterAllocation.h"
 #include "../../../jit/RegisterEnforcement.h"
 #include <cstdint>
@@ -34,7 +34,7 @@ namespace llaminar::v2::kernels::jit
     // ============================================================================
     // WoProjection Register Manifest (compile-time documentation)
     // ============================================================================
-    // Documents the registers borrowed by emit_wo_projection().
+    // Documents the registers borrowed by emit_wo_projection_* methods.
     // Uses Accum zone for FMA accumulation during projection.
 
     using WoProjectionManifest = KernelRegisterManifest<
@@ -91,15 +91,15 @@ namespace llaminar::v2::kernels::jit
             gen.debug_emit("emit_project_fp32 (head_dim=" + std::to_string(head_dim) + ")");
 
             // Use typed scratch registers for accumulation
-            Zmm zmm_acc = gen.scratch0().zmm();
+            Zmm zmm_acc = gen.borrow<llaminar2::jit::Scratch0>().zmm();
             gen.vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Process 16 floats at a time
             int i = 0;
             for (; i + 16 <= head_dim; i += 16)
             {
-                Zmm zmm_ctx = gen.scratch1().zmm();
-                Zmm zmm_wo = gen.scratch2().zmm();
+                Zmm zmm_ctx = gen.borrow<llaminar2::jit::Scratch1>().zmm();
+                Zmm zmm_wo = gen.borrow<llaminar2::jit::Scratch2>().zmm();
 
                 gen.vmovups(zmm_ctx, gen.ptr[reg_context_ptr + i * 4]);
                 gen.vmovups(zmm_wo, gen.ptr[reg_wo_ptr + i * 4]);
@@ -139,10 +139,10 @@ namespace llaminar::v2::kernels::jit
             int num_blocks = head_dim / 32;
 
             // Accumulator for final result
-            Zmm zmm_acc_int = gen.scratch0().zmm(); // Integer accumulator
+            Zmm zmm_acc_int = gen.borrow<llaminar2::jit::Scratch0>().zmm(); // Integer accumulator
             gen.vxorps(zmm_acc_int, zmm_acc_int, zmm_acc_int);
 
-            Zmm zmm_scale_sum = gen.scratch1().zmm(); // Scale * sum correction
+            Zmm zmm_scale_sum = gen.borrow<llaminar2::jit::Scratch1>().zmm(); // Scale * sum correction
             gen.vxorps(zmm_scale_sum, zmm_scale_sum, zmm_scale_sum);
 
             for (int b = 0; b < num_blocks; ++b)
@@ -186,14 +186,14 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_project_fp16 (head_dim=" + std::to_string(head_dim) + ")");
 
-            Zmm zmm_acc = gen.scratch0().zmm();
+            Zmm zmm_acc = gen.borrow<llaminar2::jit::Scratch0>().zmm();
             gen.vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Process 16 floats at a time
             for (int i = 0; i + 16 <= head_dim; i += 16)
             {
-                Zmm zmm_ctx = gen.scratch1().zmm();
-                Zmm zmm_wo = gen.scratch2().zmm();
+                Zmm zmm_ctx = gen.borrow<llaminar2::jit::Scratch1>().zmm();
+                Zmm zmm_wo = gen.borrow<llaminar2::jit::Scratch2>().zmm();
                 Ymm ymm_fp16 = Ymm(zmm_wo.getIdx());
 
                 // Load context (FP32)
@@ -237,14 +237,14 @@ namespace llaminar::v2::kernels::jit
 
             gen.debug_emit("emit_project_bf16 (head_dim=" + std::to_string(head_dim) + ")");
 
-            Zmm zmm_acc = gen.scratch0().zmm();
+            Zmm zmm_acc = gen.borrow<llaminar2::jit::Scratch0>().zmm();
             gen.vxorps(zmm_acc, zmm_acc, zmm_acc);
 
             // Process 16 floats at a time
             for (int i = 0; i + 16 <= head_dim; i += 16)
             {
-                Zmm zmm_ctx = gen.scratch1().zmm();
-                Zmm zmm_wo = gen.scratch2().zmm();
+                Zmm zmm_ctx = gen.borrow<llaminar2::jit::Scratch1>().zmm();
+                Zmm zmm_wo = gen.borrow<llaminar2::jit::Scratch2>().zmm();
                 Ymm ymm_bf16 = Ymm(zmm_wo.getIdx());
 
                 // Load context (FP32)
@@ -361,8 +361,8 @@ namespace llaminar::v2::kernels::jit
             }
 
             // Step 1: zmm0 -> ymm0 (add upper 256 to lower 256)
-            Ymm ymm = Ymm(zmm_target.getIdx());              // ymm0
-            Ymm ymm_hi = Ymm(gen.scratch5().zmm().getIdx()); // ymm25
+            Ymm ymm = Ymm(zmm_target.getIdx());                                      // ymm0
+            Ymm ymm_hi = Ymm(gen.borrow<llaminar2::jit::Scratch5>().zmm().getIdx()); // ymm25
 
             gen.vextractf32x8(ymm_hi, zmm_target, 1); // Extract upper 256 bits
             gen.vaddps(ymm, ymm, ymm_hi);             // Add
@@ -409,13 +409,13 @@ namespace llaminar::v2::kernels::jit
             int wo_offset = block_idx * 36;      // Q8_1Block: 36 bytes
 
             // Load context block (32 floats)
-            Zmm zmm_ctx_lo = gen.scratch2().zmm();
-            Zmm zmm_ctx_hi = gen.scratch3().zmm();
+            Zmm zmm_ctx_lo = gen.borrow<llaminar2::jit::Scratch2>().zmm();
+            Zmm zmm_ctx_hi = gen.borrow<llaminar2::jit::Scratch3>().zmm();
             gen.vmovups(zmm_ctx_lo, gen.ptr[reg_context_ptr + ctx_offset]);
             gen.vmovups(zmm_ctx_hi, gen.ptr[reg_context_ptr + ctx_offset + 64]);
 
             // Load Wo scale (FP16 at offset 0)
-            Zmm zmm_d_wo = gen.scratch4().zmm();
+            Zmm zmm_d_wo = gen.borrow<llaminar2::jit::Scratch4>().zmm();
 
             // Use xmm0 as temp for loading/conversion to avoid potential EVEX issues with high regs
             // on some instructions or Xbyak edge cases
@@ -424,8 +424,8 @@ namespace llaminar::v2::kernels::jit
             gen.vbroadcastss(zmm_d_wo, gen.xmm0);
 
             // Load Wo data (32 int8 at offset 4)
-            Zmm zmm_wo_lo = gen.scratch5().zmm();
-            Zmm zmm_wo_hi = gen.accum0().zmm(); // Reuse accum0 since we need more regs
+            Zmm zmm_wo_lo = gen.borrow<llaminar2::jit::Scratch5>().zmm();
+            Zmm zmm_wo_hi = gen.zmm_accum0(); // Reuse accum0 since we need more regs
             gen.vpmovsxbd(zmm_wo_lo, gen.ptr[reg_wo_ptr + wo_offset + 4]);
             gen.vpmovsxbd(zmm_wo_hi, gen.ptr[reg_wo_ptr + wo_offset + 4 + 16]);
 
