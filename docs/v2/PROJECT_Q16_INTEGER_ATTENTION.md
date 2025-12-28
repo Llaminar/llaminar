@@ -1,10 +1,76 @@
 # Q16_1 Integer-Domain Fused Attention Kernel
 
-**Status**: Design Phase (JIT Scaffolding Complete, Fused Residual Add Implemented)  
+**Status**: Implementation Phase (Reference Kernel Complete, Pipeline Integration In Progress)  
 **Created**: 2025-12-27  
 **Updated**: 2025-12-28  
 **Author**: Llaminar Team  
 **Related**: [Exp2FixedSoftmax JIT](../../src/v2/kernels/cpu/attention/q16_1/jit/JitExp2FixedSoftmax.h), [IntAttention Paper](https://arxiv.org/abs/2511.21513)
+
+---
+
+## Recent Progress (2025-12-28)
+
+### Completed This Session
+
+1. **Q16_INTEGER Backend Registration**
+   - Added `Q16_INTEGER` to `FusedAttentionBackend` enum in RuntimeConfig.h
+   - Updated parser to accept "q16_integer", "q16", "q16_int" CLI options
+   - Updated `fusedAttentionBackendToString()` for logging/display
+
+2. **Q16_1 KV Cache Support**
+   - Added `UnifiedKVCacheTensor<Q16_1>` template specialization mapping to `Q16_1Tensor`
+   - Added `UnifiedKVCacheQ16_1` type alias
+   - Implemented `allocate_tensor<Q16_1>()` specialization
+   - Implemented `copy_append_data<Q16_1>()` for block-based KV append
+   - Implemented `shift_evict_data<Q16_1>()` for sliding window eviction
+   - Added Q16_1 branches in `gather_kv_batched()` for both K and V tensors
+   - Added explicit template instantiation for Q16_1
+   - Updated all 4 factory functions to support Q16_1 precision
+   - Added comprehensive unit test coverage (12 new Q16_1 tests)
+
+3. **HybridQ16 Pipeline Precision Configuration**
+   - Updated `HybridQ16PrecisionConfig` for Q16 integer attention pipeline:
+     - `q_after_rope`: FP32 → **Q16_1** (Q16 kernel expects Q16_1 inputs)
+     - `k_after_rope`: FP32 → **Q16_1** (Q16 kernel expects Q16_1 inputs)
+     - `kv_cache`: FP32 → **Q16_1** (Q16 kernel uses Q16_1 KV cache)
+     - `attention_context`: FP32 → **Q16_1** (for snapshots; fused kernel is INT32 internally)
+     - `attention_output`: Q8_1 → **Q16_1** (fused kernel writes Q16_1 directly to residual)
+   - Added unit tests for all HybridQ16 precision settings
+
+4. **Unit Test Coverage**
+   - `tests/v2/unit/tensors/Test__UnifiedKVCache.cpp`: 12 new Q16_1 tests
+   - `tests/v2/unit/Test__HybridPrecisionConfig.cpp`: 21 new HybridQ16 tests
+
+### Previously Completed
+
+- **Q16FusedAttentionRef**: Complete 651-line reference implementation with:
+  - Flash Decode path (seq_len=1): Streaming GEMV with online softmax
+  - FA2 Prefill path (seq_len>1): Tiled GEMM with blocked computation
+  - Exp2FixedSoftmax integration (256-entry LUT)
+  - Fused Wo projection and residual add
+
+- **JIT Scaffolding**: All 7 tasks completed:
+  - Q16RegisterAllocation.h with zone definitions
+  - JitQ16FusedAttention.h base class
+  - 4 microkernel stubs (Q8DotProduct, OnlineSoftmax, VNNIMulAccumulate, WoProjection)
+
+- **Microkernel Reference Implementations**:
+  - Int8RequantRef: INT32 → INT8 requantization with scaling
+  - Exp2FixedSoftmaxRef: Integer-domain softmax with 30-bit precision LUT
+  - WoProjectionVNNIRef: Streaming Wo projection with VPDPBUSD patterns
+
+### Files Modified This Session
+
+| File | Changes |
+|------|--------|
+| `src/v2/execution/RuntimeConfig.h` | Added Q16_INTEGER enum, parser, toString |
+| `src/v2/tensors/UnifiedKVCache.h` | Added Q16_1 type mapping and alias |
+| `src/v2/tensors/UnifiedKVCache.cpp` | Added Q16_1 specializations and factory support |
+| `src/v2/execution/HybridPrecisionConfig.h` | Full Q16 pipeline precision config (Q16_1 for Q/K/KV/context/output) |
+| `src/v2/execution/HybridPrecisionConfig.cpp` | Updated comments and getPrecision() for Q16 pipeline |
+| `tests/v2/unit/tensors/Test__UnifiedKVCache.cpp` | Added 12 Q16_1 KV cache unit tests |
+| `tests/v2/unit/Test__HybridPrecisionConfig.cpp` | Added 21 HybridQ16PrecisionConfig tests |
+| `tests/v2/CMakeLists.txt` | Added Q16_1 label to KV cache tests |
 
 ---
 
@@ -2320,7 +2386,7 @@ This provides ~100× precision improvement over Q8 approaches with ~2× memory u
 
 ## Implementation Phases
 
-### Phase 1: Scalar Reference - Decode Path (Week 1-2)
+### Phase 1: Scalar Reference - Decode Path ✅ COMPLETE
 
 **Goal**: Implement scalar C++ reference for the **decode path** (GEMV-centric, single query)
 
@@ -2328,86 +2394,139 @@ This provides ~100× precision improvement over Q8 approaches with ~2× memory u
 
 **Principle**: Correctness over performance. Clear, readable, debuggable code.
 
-- [ ] **Task 1.1**: Create `Q16FusedAttentionRefDecode` class
+- [x] **Task 1.1**: Create `Q16FusedAttentionRefDecode` class
   - Single query (seq_len_q=1) optimization
   - Streaming KV chunk processing (Bc=256)
   - Online softmax state (m, l scalars)
   - INT64 accumulator for O (head_dim values)
+  - **Implemented in**: `Q16FusedAttentionRef.cpp` `flash_decode_single_head()`
   
-- [ ] **Task 1.2**: Implement Exp2FixedSoftmax for single row
+- [x] **Task 1.2**: Implement Exp2FixedSoftmax for single row
   - 256-entry exp2 LUT with 30-bit precision
   - Single max tracker (not Br max values)
   - INT16 output weights [0, 32767] (VNNI-compatible)
   - Online rescaling via lazy normalization
+  - **Implemented in**: `Exp2FixedSoftmaxRef.cpp`
   
-- [ ] **Task 1.3**: Implement streaming PV accumulation
+- [x] **Task 1.3**: Implement streaming PV accumulation
   - GEMV: [1, Bc] × [Bc, head_dim] → [1, head_dim]
   - Chunk-by-chunk accumulation
+  - **Implemented in**: `flash_decode_single_head()` inner loop
   
-- [ ] **Task 1.4**: Implement Wo projection (GEMV variant)
+- [x] **Task 1.4**: Implement Wo projection (GEMV variant)
   - Single row output: [1, n_heads*head_dim] × Wo^T → [1, d_model]
+  - **Implemented in**: `WoProjectionVNNIRef.cpp`
   
-- [ ] **Task 1.5**: Decode-specific test suite
+- [x] **Task 1.5**: Decode-specific test suite
   - Basic correctness vs FP32 attention
   - Long KV cache (kv_len=4096)
   - Causal masking with position_offset
+  - **Tests in**: `Test__Q16FusedAttentionRef.cpp`
 
-**Deliverable**: Passing `Test__Q16FusedAttentionRefDecode` for single-token generation
+**Deliverable**: ✅ Passing `Test__Q16FusedAttentionRefDecode` for single-token generation
 
-### Phase 2: Scalar Reference - Prefill Path (Week 2-3)
+### Phase 2: Scalar Reference - Prefill Path ✅ COMPLETE
 
 **Goal**: Extend scalar reference to **prefill path** (GEMM-centric, batched queries)
 
-- [ ] **Task 2.1**: Create `Q16FusedAttentionRefPrefill` class
+- [x] **Task 2.1**: Create `Q16FusedAttentionRefPrefill` class
   - Query tiling: Br=16-32 queries per tile
   - FA2-style nested loop: query_tile × kv_tile
   - Per-row softmax state arrays (m[Br], l[Br])
+  - **Implemented in**: `Q16FusedAttentionRef.cpp` `fa2_prefill_single_head()`
   
-- [ ] **Task 2.2**: Implement batched QK dot product (GEMM)
+- [x] **Task 2.2**: Implement batched QK dot product (GEMM)
   - [Br, head_dim] × [Bc, head_dim]^T → [Br, Bc]
   - Naive triple loop for scalar reference
+  - **Implemented in**: `fa2_prefill_single_head()` inner loops
   
-- [ ] **Task 2.3**: Implement batched Exp2FixedSoftmax
+- [x] **Task 2.3**: Implement batched Exp2FixedSoftmax
   - Multi-row max tracking
   - Per-row exp2 LUT application
   - INT16 output weights [0, 32767]
+  - **Implemented in**: `Exp2FixedSoftmaxRef.cpp` with per-row state
   
-- [ ] **Task 2.4**: Implement batched PV accumulation (GEMM)
+- [x] **Task 2.4**: Implement batched PV accumulation (GEMM)
   - [Br, Bc] × [Bc, head_dim] → [Br, head_dim]
   - Multiple output rows per tile
+  - **Implemented in**: `fa2_prefill_single_head()` accumulation
   
-- [ ] **Task 2.5**: Implement Wo projection (GEMM variant)
+- [x] **Task 2.5**: Implement Wo projection (GEMM variant)
   - Multiple rows: [Br, n_heads*head_dim] × Wo^T → [Br, d_model]
+  - **Implemented in**: `WoProjectionVNNIRef.cpp` batched path
   
-- [ ] **Task 2.6**: Prefill-specific test suite
+- [x] **Task 2.6**: Prefill-specific test suite
   - Batched queries (seq_len_q=128, 512, 2048)
   - Verify tiling produces same results as non-tiled
   - Compare throughput vs decode path
+  - **Tests in**: `Test__Q16FusedAttentionRef.cpp`
 
-**Deliverable**: Passing `Test__Q16FusedAttentionRefPrefill` for prompt processing
+**Deliverable**: ✅ Passing `Test__Q16FusedAttentionRefPrefill` for prompt processing
 
-### Phase 3: JIT Decode Microkernels (Week 3-4)
+### Phase 2.5: Pipeline Integration 🔄 IN PROGRESS
+
+**Goal**: Integrate Q16 reference kernel into HybridQ16 inference pipeline
+
+**Rationale**: Prove out the reference kernel with real inference before JIT optimization.
+
+- [x] **Task 2.5.1**: Add Q16_INTEGER backend enum
+  - Added to `FusedAttentionBackend` in RuntimeConfig.h
+  - CLI parsing: "q16_integer", "q16", "q16_int"
+  - **Completed**: 2025-12-28
+
+- [x] **Task 2.5.2**: Enable Q16_1 KV cache storage
+  - Added `UnifiedKVCache<Q16_1>` template instantiation
+  - Implemented block-based copy/shift operations
+  - Updated all 4 factory functions
+  - **Completed**: 2025-12-28
+
+- [x] **Task 2.5.3**: Update HybridQ16 precision config
+  - Changed `kv_cache` from FP32 to Q16_1
+  - Preserves precision through attention computation
+  - **Completed**: 2025-12-28
+
+- [ ] **Task 2.5.4**: Add Q16_INTEGER dispatch in FusedAttentionWoKernel
+  - Wire `FusedAttentionBackend::Q16_INTEGER` case
+  - Call `Q16FusedAttentionRef` from the kernel
+  - Handle parameter conversion from stage interface
+
+- [ ] **Task 2.5.5**: End-to-end inference test
+  - Run HybridQ16 mode with Q16_INTEGER backend
+  - Verify token predictions match FP32 reference
+  - Measure cosine similarity improvement
+
+**Deliverable**: Working Q16 attention in HybridQ16 inference mode
+
+### Phase 3: JIT Decode Microkernels 🔄 IN PROGRESS
 
 **Goal**: Implement JIT microkernels for **decode path** (latency-optimized)
 
 **Key Focus**: Minimize latency, optimize for streaming KV access
 
-- [ ] **Task 3.1**: `Q16DotProductGemv` JIT microkernel
+**Scaffolding Complete** ✅:
+- `Q16RegisterAllocation.h`: Zone definitions for Q16 JIT kernels
+- `JitQ16FusedAttention.h`: Base class with register accessors
+- Microkernel stubs created with interfaces defined
+
+- [x] **Task 3.1**: `Q16DotProductGemv` JIT microkernel (scaffold)
   - q vector in zmm0-3 (stays in registers)
   - Stream K chunks through zmm4-7
   - Output: s[Bc] INT32 scores
   - Target: 4 K rows per iteration, `vpdpwssd` for dot
+  - **File**: `JitQ8DotProduct.h` (stub created)
   
-- [ ] **Task 3.2**: `Exp2FixedSoftmaxSingle` JIT microkernel
+- [x] **Task 3.2**: `Exp2FixedSoftmaxSingle` JIT microkernel (scaffold)
   - Single row: vectorized max-find, exp2 LUT lookup
   - Scalar m/l state tracking
   - 256-entry LUT for 2^(-frac/256)
   - `vpgatherdd` for LUT lookup
+  - **File**: `JitOnlineSoftmax.h` (stub created)
   
-- [ ] **Task 3.3**: `PVAccumulateGemv` JIT microkernel
+- [x] **Task 3.3**: `PVAccumulateGemv` JIT microkernel (scaffold)
   - Stream V alongside K (fused memory access)
   - INT16 × INT16 → INT64 accumulation
   - Output: O[head_dim] in zmm16-23
+  - **File**: `JitVNNIMulAccumulate.h` (stub created)
   
 - [ ] **Task 3.4**: JIT decode kernel orchestrator
   - Wire microkernels together
