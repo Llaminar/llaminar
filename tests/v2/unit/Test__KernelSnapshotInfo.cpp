@@ -356,7 +356,7 @@ namespace llaminar2
             EXPECT_EQ(info.scalars.size(), 2);
 
             // Check required input (default is true)
-            EXPECT_TRUE(info.inputs[0].required); // A is required (default)
+            EXPECT_TRUE(info.inputs[0].required);  // A is required (default)
             EXPECT_FALSE(info.inputs[1].required); // bias is optional
 
             // Check intermediate output

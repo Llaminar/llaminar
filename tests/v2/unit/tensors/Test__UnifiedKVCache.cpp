@@ -137,9 +137,9 @@ TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
     int n_layers = 4;
     int batch_size = 1;
     int max_seq_len = 64;
-    int n_kv_heads = 4;        // Total across all ranks
-    int local_n_kv_heads = 2;  // This rank's portion
-    int kv_head_start = 0;     // Starting head index
+    int n_kv_heads = 4;       // Total across all ranks
+    int local_n_kv_heads = 2; // This rank's portion
+    int kv_head_start = 0;    // Starting head index
     int head_dim = 32;
 
     auto cache = createShardedKVCache(
@@ -367,14 +367,14 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_SingleSequence)
     auto cached_k = cache.get_k_typed(0);
     ASSERT_NE(cached_k, nullptr);
     EXPECT_FLOAT_EQ(cached_k->q16_1_blocks()[0].d, 1.0f);
-    EXPECT_EQ(cached_k->q16_1_blocks()[0].qs[0], 0);    // Row 0, element 0
-    EXPECT_EQ(cached_k->q16_1_blocks()[0].qs[1], 1);    // Row 0, element 1
+    EXPECT_EQ(cached_k->q16_1_blocks()[0].qs[0], 0); // Row 0, element 0
+    EXPECT_EQ(cached_k->q16_1_blocks()[0].qs[1], 1); // Row 0, element 1
 
     auto cached_v = cache.get_v_typed(0);
     ASSERT_NE(cached_v, nullptr);
     EXPECT_FLOAT_EQ(cached_v->q16_1_blocks()[0].d, 2.0f);
-    EXPECT_EQ(cached_v->q16_1_blocks()[0].qs[0], 0);     // Row 0, element 0
-    EXPECT_EQ(cached_v->q16_1_blocks()[0].qs[1], -1);    // Row 0, element 1
+    EXPECT_EQ(cached_v->q16_1_blocks()[0].qs[0], 0);  // Row 0, element 0
+    EXPECT_EQ(cached_v->q16_1_blocks()[0].qs[1], -1); // Row 0, element 1
 }
 
 TEST_F(Test__UnifiedKVCache, AppendQ16_1_MultipleAppends)

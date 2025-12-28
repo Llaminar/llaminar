@@ -424,7 +424,7 @@ namespace llaminar2
 
         /**
          * @brief Create info for unspecified/not-yet-implemented kernel snapshot
-         * 
+         *
          * Used as default return value for kernels that haven't had their
          * snapshot info explicitly defined yet. Allows gradual rollout.
          */

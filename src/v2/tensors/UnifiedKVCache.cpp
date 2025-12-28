@@ -925,7 +925,7 @@ namespace llaminar2
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
         case ActivationPrecision::Q16_1:
             return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
         default:
             LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -956,7 +956,7 @@ namespace llaminar2
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
         case ActivationPrecision::Q16_1:
             return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
         default:
             LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;

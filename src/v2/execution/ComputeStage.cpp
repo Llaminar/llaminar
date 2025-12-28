@@ -13,7 +13,7 @@
 #include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "../kernels/cpu/gemm_v4/FusedGEMM.h"
-#include "../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // For FusedAttentionWoStage (Q8_1)
+#include "../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"   // For FusedAttentionWoStage (Q8_1)
 #include "../kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h" // For FusedAttentionWoStage (Q16_1)
 #include "../tensors/UnifiedKVCache.h"
 #include "../tensors/SIMDHelpers.h"
@@ -4668,7 +4668,7 @@ namespace llaminar2
                           "(use JIT or REFERENCE backend for non-fused mode)");
                 return false;
             }
-            
+
             if (!q16_kernel_)
             {
                 LOG_ERROR("[FusedAttentionWoStage] Q16 kernel not initialized");
@@ -4677,12 +4677,12 @@ namespace llaminar2
 
             // Build params for Q16 kernel
             FusedAttentionWoParams q16_params;
-            
+
             // Extract raw data from tensors - Q16 kernel expects void* Q/K/V
             q16_params.Q = params_.Q ? params_.Q->raw_data() : nullptr;
             q16_params.K = params_.K ? params_.K->raw_data() : nullptr;
             q16_params.V = params_.V ? params_.V->raw_data() : nullptr;
-            
+
             // Wo weights - get VNNI packed weights via KernelFactory
             // Check if Wo implements IINT8Unpackable (quantized formats)
             if (dynamic_cast<IINT8Unpackable *>(params_.Wo) != nullptr)
@@ -4707,7 +4707,7 @@ namespace llaminar2
                           << (params_.Wo ? params_.Wo->dtype_name() : "null"));
                 return false;
             }
-            
+
             // Residual fusion: output tensor IS the residual (in-place read-modify-write)
             // Q16_INTEGER always uses fused residual path (validated above)
             if (auto *out_q16 = dynamic_cast<Q16_1Tensor *>(params_.output))
@@ -4723,7 +4723,7 @@ namespace llaminar2
                           << (params_.output ? params_.output->dtype_name() : "null"));
                 return false;
             }
-            
+
             // Dimensions
             q16_params.seq_len_q = params_.seq_len;
             q16_params.kv_len = effective_kv_len;
@@ -4731,20 +4731,22 @@ namespace llaminar2
             q16_params.n_kv_heads = params_.n_kv_heads;
             q16_params.head_dim = params_.head_dim;
             q16_params.d_model = params_.d_model;
-            
+
             // Attention config
             q16_params.scale = 1.0f / std::sqrt(static_cast<float>(params_.head_dim));
             q16_params.causal = params_.causal;
             q16_params.position_offset = position_offset;
-            
+
             // Snapshot buffers
             q16_params.scores_snapshot = nullptr;
-            if (params_.context_snapshot) {
-                if (auto *ctx_fp32 = dynamic_cast<FP32Tensor *>(params_.context_snapshot)) {
+            if (params_.context_snapshot)
+            {
+                if (auto *ctx_fp32 = dynamic_cast<FP32Tensor *>(params_.context_snapshot))
+                {
                     q16_params.context_snapshot = ctx_fp32->mutable_data();
                 }
             }
-            
+
             success = q16_kernel_->compute(q16_params);
         }
         else

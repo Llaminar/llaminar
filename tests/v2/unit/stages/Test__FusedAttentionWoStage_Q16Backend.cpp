@@ -16,7 +16,7 @@
 #include "execution/RuntimeConfig.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
-#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"  // For complete type
+#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // For complete type
 
 namespace llaminar2
 {
@@ -208,7 +208,7 @@ namespace llaminar2
         {
             // Q16_INTEGER backend requires fuse_residual_add=true
             auto params = createParams();
-            params.fuse_residual_add = false;  // This should cause execute() to fail
+            params.fuse_residual_add = false; // This should cause execute() to fail
 
             FusedAttentionWoStage stage(params);
 

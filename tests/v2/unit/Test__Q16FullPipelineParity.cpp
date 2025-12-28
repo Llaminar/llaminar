@@ -690,9 +690,9 @@ TEST_F(Q16FullPipelineParityTest, DecodeContextSnapshotCapture)
     for (int p = 0; p < KV_LEN; ++p)
     {
         quantizeFP32ToQ16_1(K_fp32.data() + p * NUM_KV_HEADS * HEAD_DIM, NUM_KV_HEADS * HEAD_DIM,
-                           K_q16.data() + p * KV_BLOCKS);
+                            K_q16.data() + p * KV_BLOCKS);
         quantizeFP32ToQ16_1(V_fp32.data() + p * NUM_KV_HEADS * HEAD_DIM, NUM_KV_HEADS * HEAD_DIM,
-                           V_q16.data() + p * KV_BLOCKS);
+                            V_q16.data() + p * KV_BLOCKS);
     }
     quantizeFP32ToQ16_1(residual_fp32.data(), D_MODEL, residual_q16.data());
 

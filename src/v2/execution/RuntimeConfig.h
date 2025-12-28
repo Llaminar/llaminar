@@ -25,10 +25,10 @@ namespace llaminar2
      */
     enum class FusedAttentionBackend
     {
-        JIT,          ///< AVX-512 VNNI JIT (fastest, default)
-        REFERENCE,    ///< Pure C++ reference (for testing/debugging)
-        TILED,        ///< Cache-blocked tiled (balanced)
-        Q16_INTEGER   ///< Pure integer Q16_1 reference (experimental)
+        JIT,        ///< AVX-512 VNNI JIT (fastest, default)
+        REFERENCE,  ///< Pure C++ reference (for testing/debugging)
+        TILED,      ///< Cache-blocked tiled (balanced)
+        Q16_INTEGER ///< Pure integer Q16_1 reference (experimental)
     };
 
     /**

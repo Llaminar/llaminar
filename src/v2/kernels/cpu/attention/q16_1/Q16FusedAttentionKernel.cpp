@@ -99,8 +99,8 @@ namespace llaminar2
             if (params.n_heads < 1 || params.n_kv_heads < 1)
             {
                 LOG_ERROR("Q16FusedAttentionKernel: n_heads=" << params.n_heads
-                                                             << " and n_kv_heads=" << params.n_kv_heads
-                                                             << " must be >= 1");
+                                                              << " and n_kv_heads=" << params.n_kv_heads
+                                                              << " must be >= 1");
                 return false;
             }
 
@@ -122,8 +122,8 @@ namespace llaminar2
             if (params.n_heads % params.n_kv_heads != 0)
             {
                 LOG_ERROR("Q16FusedAttentionKernel: n_heads=" << params.n_heads
-                                                             << " must be divisible by n_kv_heads="
-                                                             << params.n_kv_heads);
+                                                              << " must be divisible by n_kv_heads="
+                                                              << params.n_kv_heads);
                 return false;
             }
 

@@ -165,7 +165,7 @@ namespace llaminar2
         if (rows <= 0 || n_blocks_per_row <= 0)
         {
             LOG_DEBUG("CPUSoftmaxKernelT<Q8_1>: Empty input (rows=" << rows
-                                                                        << ", n_blocks_per_row=" << n_blocks_per_row << ")");
+                                                                    << ", n_blocks_per_row=" << n_blocks_per_row << ")");
             return true; // Nothing to do
         }
 

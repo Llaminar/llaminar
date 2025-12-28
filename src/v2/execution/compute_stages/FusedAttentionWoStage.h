@@ -100,8 +100,8 @@ namespace llaminar2
 
     private:
         Params params_;
-        std::unique_ptr<FusedAttentionWoKernel> kernel_;           ///< Q8_1 kernel (JIT/TILED/REFERENCE)
-        std::unique_ptr<ITensorFusedAttentionWo> q16_kernel_;      ///< Q16_1 kernel (Q16_INTEGER)
+        std::unique_ptr<FusedAttentionWoKernel> kernel_;      ///< Q8_1 kernel (JIT/TILED/REFERENCE)
+        std::unique_ptr<ITensorFusedAttentionWo> q16_kernel_; ///< Q16_1 kernel (Q16_INTEGER)
     };
 
 } // namespace llaminar2

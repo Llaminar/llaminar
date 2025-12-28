@@ -1710,12 +1710,12 @@ namespace llaminar2
 
         // ============== Dimensions ==============
 
-        int seq_len_q = 0;    ///< Number of query positions
-        int kv_len = 0;       ///< Number of KV positions (cache length)
-        int n_heads = 0;      ///< Number of query heads
-        int n_kv_heads = 0;   ///< Number of KV heads (for GQA/MQA)
-        int head_dim = 0;     ///< Dimension per head (typically 64 or 128)
-        int d_model = 0;      ///< Model dimension (n_heads * head_dim)
+        int seq_len_q = 0;  ///< Number of query positions
+        int kv_len = 0;     ///< Number of KV positions (cache length)
+        int n_heads = 0;    ///< Number of query heads
+        int n_kv_heads = 0; ///< Number of KV heads (for GQA/MQA)
+        int head_dim = 0;   ///< Dimension per head (typically 64 or 128)
+        int d_model = 0;    ///< Model dimension (n_heads * head_dim)
 
         // ============== Attention configuration ==============
 
