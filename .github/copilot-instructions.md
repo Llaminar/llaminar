@@ -423,6 +423,47 @@ LLAMINAR_STAGE_DUMP=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
 3. **Strategy Pattern**: Generic kernels + format-specific decode via `ITensorGemmTileDataProvider`
 4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
 
+### TypedTensorBase and `typed_data()` Pattern
+
+The `TypedTensorBase<Derived, DataType>` CRTP base provides **zero-overhead typed access** to tensor storage:
+
+```cpp
+// CRTP base for typed tensors
+template<typename Derived, typename DataType>
+class TypedTensorBase {
+public:
+    const DataType* typed_data() const;        // Native type access (Q8_1Block*, uint16_t*, etc.)
+    DataType* mutable_typed_data();            // Mutable native type access
+};
+```
+
+**Usage Pattern** - After `dynamic_cast<>`, use `typed_data()` instead of type-specific accessors:
+
+```cpp
+// ✅ PREFERRED: Unified pattern with typed_data()
+if (auto* q8_tensor = dynamic_cast<Q8_1Tensor*>(tensor)) {
+    Q8_1Block* blocks = q8_tensor->mutable_typed_data();
+    kernel->process(blocks, ...);
+}
+
+// ❌ AVOID: Type-specific accessors (legacy)
+if (auto* q8_tensor = dynamic_cast<Q8_1Tensor*>(tensor)) {
+    Q8_1Block* blocks = q8_tensor->mutable_q8_1_blocks();  // Deprecated
+}
+```
+
+**Supported Tensor Types**:
+| Tensor Class | `typed_data()` Returns |
+|--------------|------------------------|
+| `FP32Tensor` | `float*` |
+| `BF16Tensor` | `uint16_t*` |
+| `FP16Tensor` | `uint16_t*` |
+| `Q8_1Tensor` | `Q8_1Block*` |
+| `Q16_1Tensor` | `Q16_1Block*` |
+| `Q8_0Tensor` | `Q8_0Block*` |
+| `IQ4_NLTensor` | `IQ4_NLBlock*` |
+| (all 27 tensor classes) | Native storage type |
+
 ### ITensorGemmTileDataProvider Strategy Pattern
 
 Quantized tensors implement decode strategies; a single generic GEMM kernel works for all formats:

@@ -1092,7 +1092,7 @@ namespace llaminar2
         // Get source and destination block pointers
         const uint8_t *src_data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         const Q8_1Block *src_blocks = reinterpret_cast<const Q8_1Block *>(src_data_ptr);
-        Q8_1Block *dst_blocks = result->mutable_q8_1_blocks();
+        Q8_1Block *dst_blocks = result->mutable_typed_data();
 
         // Copy blocks row by row (cannot be a zero-copy view since we're slicing columns)
 #pragma omp parallel for schedule(static)

@@ -425,7 +425,7 @@ namespace llaminar2
                 return false;
             auto *bf16_in = static_cast<const BF16Tensor *>(input);
             auto *bf16_out = static_cast<BF16Tensor *>(output);
-            return apply_typed(bf16_in->bf16_data(), weight->data(), bf16_out->mutable_bf16_data(),
+            return apply_typed(bf16_in->typed_data(), weight->data(), bf16_out->mutable_typed_data(),
                                rows, cols, epsilon, device_idx);
         }
 
@@ -567,7 +567,7 @@ namespace llaminar2
                 return false;
             auto *fp16_in = static_cast<const FP16Tensor *>(input);
             auto *fp16_out = static_cast<FP16Tensor *>(output);
-            return apply_typed(fp16_in->fp16_data(), weight->data(), fp16_out->mutable_fp16_data(),
+            return apply_typed(fp16_in->typed_data(), weight->data(), fp16_out->mutable_typed_data(),
                                rows, cols, epsilon, device_idx);
         }
 
@@ -695,7 +695,7 @@ namespace llaminar2
                 return false;
             auto *q8_in = static_cast<const Q8_1Tensor *>(input);
             auto *q8_out = static_cast<Q8_1Tensor *>(output);
-            return apply_typed(q8_in->q8_1_blocks(), weight->data(), q8_out->mutable_q8_1_blocks(),
+            return apply_typed(q8_in->typed_data(), weight->data(), q8_out->mutable_typed_data(),
                                rows, cols, epsilon, device_idx);
         }
 
@@ -873,7 +873,7 @@ namespace llaminar2
                 return false;
             auto *q16_in = static_cast<const Q16_1Tensor *>(input);
             auto *fp32_out = static_cast<FP32Tensor *>(output);
-            return apply_typed(q16_in->q16_1_blocks(), weight->data(), fp32_out->mutable_data(),
+            return apply_typed(q16_in->typed_data(), weight->data(), fp32_out->mutable_typed_data(),
                                rows, cols, epsilon, device_idx);
         }
 

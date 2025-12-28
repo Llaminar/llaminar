@@ -954,8 +954,8 @@ namespace llaminar2
                         LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to FP16Tensor");
                         return false;
                     }
-                    const uint16_t *A_data = A_fp16->fp16_data();
-                    const uint16_t *B_data = B_fp16->fp16_data();
+                    const uint16_t *A_data = A_fp16->typed_data();
+                    const uint16_t *B_data = B_fp16->typed_data();
                     float *C_data = C->mutable_data();
                     return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
@@ -969,8 +969,8 @@ namespace llaminar2
                         LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to BF16Tensor");
                         return false;
                     }
-                    const uint16_t *A_data = A_bf16->bf16_data();
-                    const uint16_t *B_data = B_bf16->bf16_data();
+                    const uint16_t *A_data = A_bf16->typed_data();
+                    const uint16_t *B_data = B_bf16->typed_data();
                     float *C_data = C->mutable_data();
                     return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
@@ -1046,8 +1046,8 @@ namespace llaminar2
                         LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to FP16Tensor");
                         return false;
                     }
-                    const uint16_t *A_data = A_fp16->fp16_data();
-                    const uint16_t *B_data = B_fp16->fp16_data();
+                    const uint16_t *A_data = A_fp16->typed_data();
+                    const uint16_t *B_data = B_fp16->typed_data();
                     float *C_data = C->mutable_data();
                     return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
@@ -1061,8 +1061,8 @@ namespace llaminar2
                         LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to BF16Tensor");
                         return false;
                     }
-                    const uint16_t *A_data = A_bf16->bf16_data();
-                    const uint16_t *B_data = B_bf16->bf16_data();
+                    const uint16_t *A_data = A_bf16->typed_data();
+                    const uint16_t *B_data = B_bf16->typed_data();
                     float *C_data = C->mutable_data();
                     return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
@@ -1104,7 +1104,7 @@ namespace llaminar2
                             return false;
                         }
                         const auto *fp16_tensor = dynamic_cast<const FP16Tensor *>(weight_tensor_);
-                        B_ptr = fp16_tensor ? fp16_tensor->fp16_data() : nullptr;
+                        B_ptr = fp16_tensor ? fp16_tensor->typed_data() : nullptr;
                     }
 
                     if (!B_ptr)
@@ -1126,7 +1126,7 @@ namespace llaminar2
                             return false;
                         }
                         const auto *bf16_tensor = dynamic_cast<const BF16Tensor *>(weight_tensor_);
-                        B_ptr = bf16_tensor ? bf16_tensor->bf16_data() : nullptr;
+                        B_ptr = bf16_tensor ? bf16_tensor->typed_data() : nullptr;
                     }
 
                     if (!B_ptr)
@@ -1253,7 +1253,7 @@ namespace llaminar2
                     if (A_bf16 && B_bf16)
                     {
                         return run_onednn_bf16_matmul(
-                            A_bf16->bf16_data(), B_bf16->bf16_data(), C->mutable_data(),
+                            A_bf16->typed_data(), B_bf16->typed_data(), C->mutable_data(),
                             m, n, k, transpose_B, alpha, beta);
                     }
                 }
@@ -1266,7 +1266,7 @@ namespace llaminar2
                     if (A_fp16 && B_fp16)
                     {
                         return run_onednn_fp16_matmul(
-                            A_fp16->fp16_data(), B_fp16->fp16_data(), C->mutable_data(),
+                            A_fp16->typed_data(), B_fp16->typed_data(), C->mutable_data(),
                             m, n, k, transpose_B, alpha, beta);
                     }
                 }

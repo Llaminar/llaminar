@@ -235,7 +235,7 @@ namespace llaminar2
                 // Q8_1 has 32 elements per block
                 const int block_size = 32;
                 const int blocks_per_row = (d_model + block_size - 1) / block_size;
-                Q8_1Block *blocks = q8_1_output->mutable_q8_1_blocks();
+                Q8_1Block *blocks = q8_1_output->mutable_typed_data();
 
                 if (blocks)
                 {
@@ -257,7 +257,7 @@ namespace llaminar2
                 // Q16_1 has 32 elements per block
                 const int block_size = 32;
                 const int blocks_per_row = (d_model + block_size - 1) / block_size;
-                Q16_1Block *blocks = q16_1_output->mutable_q16_1_blocks();
+                Q16_1Block *blocks = q16_1_output->mutable_typed_data();
 
                 if (blocks)
                 {
@@ -334,6 +334,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

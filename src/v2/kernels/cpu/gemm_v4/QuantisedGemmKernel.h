@@ -2287,8 +2287,8 @@ namespace llaminar2
                         // Q8_1 → Q8_1: Optimal path, both quantized
                         auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
                         return multiply_with_precomputed_q8_1_to_q8_1(
-                            A_q8->q8_1_blocks(),
-                            C_q8->mutable_q8_1_blocks(),
+                            A_q8->typed_data(),
+                            C_q8->mutable_typed_data(),
                             m, n, k,
                             nullptr, // bias
                             false,   // accumulate (not supported for Q8_1 output)
@@ -2299,7 +2299,7 @@ namespace llaminar2
                         // FP32/BF16/FP16 → Q8_1: Quantize input on-the-fly, output to Q8_1
                         return multiply_to_q8_1(
                             A->data(), // Dequant to FP32 if needed
-                            C_q8->mutable_q8_1_blocks(),
+                            C_q8->mutable_typed_data(),
                             m, n, k,
                             mpi_ctx, device_idx);
                     }
@@ -2393,8 +2393,8 @@ namespace llaminar2
                         // Q8_1 → Q8_1: Optimal path, both quantized
                         auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
                         return multiply_with_precomputed_q8_1_to_q8_1(
-                            A_q8->q8_1_blocks(),
-                            C_q8->mutable_q8_1_blocks(),
+                            A_q8->typed_data(),
+                            C_q8->mutable_typed_data(),
                             m, n, k,
                             nullptr, // bias
                             false,   // accumulate (not supported for Q8_1 output)
@@ -2405,7 +2405,7 @@ namespace llaminar2
                         // FP32/BF16/FP16 → Q8_1: Quantize input on-the-fly, output to Q8_1
                         return multiply_to_q8_1(
                             A->data(), // Dequant to FP32 if needed
-                            C_q8->mutable_q8_1_blocks(),
+                            C_q8->mutable_typed_data(),
                             m, n, k,
                             mpi_ctx, device_idx);
                     }

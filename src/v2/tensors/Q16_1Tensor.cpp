@@ -906,7 +906,7 @@ namespace llaminar2
         to_fp32(temp_fp32.data());
 
         // Quantize FP32 to Q8_1
-        Q8_1Block *out_blocks = q8_1_tensor->mutable_q8_1_blocks();
+        Q8_1Block *out_blocks = q8_1_tensor->mutable_typed_data();
 
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)

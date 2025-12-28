@@ -460,8 +460,8 @@ namespace llaminar2
         }
 
         return apply_typed(
-            q_bf16->mutable_bf16_data(),
-            k_bf16 ? k_bf16->mutable_bf16_data() : nullptr,
+            q_bf16->mutable_typed_data(),
+            k_bf16 ? k_bf16->mutable_typed_data() : nullptr,
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
     }
 
@@ -511,8 +511,8 @@ namespace llaminar2
         }
 
         return apply_typed(
-            q_fp16->mutable_fp16_data(),
-            k_fp16 ? k_fp16->mutable_fp16_data() : nullptr,
+            q_fp16->mutable_typed_data(),
+            k_fp16 ? k_fp16->mutable_typed_data() : nullptr,
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
     }
 
@@ -565,8 +565,8 @@ namespace llaminar2
         }
 
         return apply_typed(
-            q_q8->mutable_q8_1_blocks(),
-            k_q8 ? k_q8->mutable_q8_1_blocks() : nullptr,
+            q_q8->mutable_typed_data(),
+            k_q8 ? k_q8->mutable_typed_data() : nullptr,
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
     }
 
@@ -620,15 +620,15 @@ namespace llaminar2
             }
             auto *k_in_q8 = dynamic_cast<Q8_1Tensor *>(K_in);
             auto *k_out_fp32 = dynamic_cast<FP32Tensor *>(K_out);
-            k_in_blocks = k_in_q8->q8_1_blocks();
-            k_out_data = k_out_fp32->mutable_data();
+            k_in_blocks = k_in_q8->typed_data();
+            k_out_data = k_out_fp32->mutable_typed_data();
         }
 
         // Call the primitive
         primitives::apply_rope_q8_1_to_fp32(
-            q_in_q8->q8_1_blocks(),
+            q_in_q8->typed_data(),
             k_in_blocks,
-            q_out_fp32->mutable_data(),
+            q_out_fp32->mutable_typed_data(),
             k_out_data,
             position_ids,
             seq_len,
@@ -731,8 +731,8 @@ namespace llaminar2
         }
 
         return apply_typed(
-            q_q16->mutable_q16_1_blocks(),
-            k_q16 ? k_q16->mutable_q16_1_blocks() : nullptr,
+            q_q16->mutable_typed_data(),
+            k_q16 ? k_q16->mutable_typed_data() : nullptr,
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
     }
 

@@ -74,8 +74,8 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::BF16>::copy_append_data(
         BF16Tensor *dst, const BF16Tensor *src, int offset_tokens, int new_tokens)
     {
-        uint16_t *dst_data = dst->mutable_bf16_data();
-        const uint16_t *src_data = src->bf16_data();
+        uint16_t *dst_data = dst->mutable_typed_data();
+        const uint16_t *src_data = src->typed_data();
         size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
         size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(uint16_t);
         std::memcpy(dst_data + offset, src_data, copy_size);
@@ -85,8 +85,8 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::FP16>::copy_append_data(
         FP16Tensor *dst, const FP16Tensor *src, int offset_tokens, int new_tokens)
     {
-        uint16_t *dst_data = dst->mutable_fp16_data();
-        const uint16_t *src_data = src->fp16_data();
+        uint16_t *dst_data = dst->mutable_typed_data();
+        const uint16_t *src_data = src->typed_data();
         size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
         size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(uint16_t);
         std::memcpy(dst_data + offset, src_data, copy_size);
@@ -96,8 +96,8 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::Q8_1>::copy_append_data(
         Q8_1Tensor *dst, const Q8_1Tensor *src, int offset_tokens, int new_tokens)
     {
-        Q8_1Block *dst_blocks = dst->mutable_q8_1_blocks();
-        const Q8_1Block *src_blocks = src->q8_1_blocks();
+        Q8_1Block *dst_blocks = dst->mutable_typed_data();
+        const Q8_1Block *src_blocks = src->typed_data();
 
         size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
         size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
@@ -111,8 +111,8 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::Q16_1>::copy_append_data(
         Q16_1Tensor *dst, const Q16_1Tensor *src, int offset_tokens, int new_tokens)
     {
-        Q16_1Block *dst_blocks = dst->mutable_q16_1_blocks();
-        const Q16_1Block *src_blocks = src->q16_1_blocks();
+        Q16_1Block *dst_blocks = dst->mutable_typed_data();
+        const Q16_1Block *src_blocks = src->typed_data();
 
         size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
         size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
@@ -140,7 +140,7 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::BF16>::shift_evict_data(
         BF16Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
-        uint16_t *data = tensor->mutable_bf16_data();
+        uint16_t *data = tensor->mutable_typed_data();
         size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
         size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(uint16_t);
         std::memmove(data, data + evict_offset, keep_size);
@@ -150,7 +150,7 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::FP16>::shift_evict_data(
         FP16Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
-        uint16_t *data = tensor->mutable_fp16_data();
+        uint16_t *data = tensor->mutable_typed_data();
         size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
         size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(uint16_t);
         std::memmove(data, data + evict_offset, keep_size);
@@ -160,7 +160,7 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::Q8_1>::shift_evict_data(
         Q8_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
-        Q8_1Block *blocks = tensor->mutable_q8_1_blocks();
+        Q8_1Block *blocks = tensor->mutable_typed_data();
         size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
         size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
         size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
@@ -172,7 +172,7 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::Q16_1>::shift_evict_data(
         Q16_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
-        Q16_1Block *blocks = tensor->mutable_q16_1_blocks();
+        Q16_1Block *blocks = tensor->mutable_typed_data();
         size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
         size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
         size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
@@ -746,24 +746,24 @@ namespace llaminar2
             }
             else if constexpr (Precision == ActivationPrecision::BF16)
             {
-                const uint16_t *src_data = src_k->bf16_data();
-                uint16_t *dst_data = typed_k->mutable_bf16_data();
+                const uint16_t *src_data = src_k->typed_data();
+                uint16_t *dst_data = typed_k->mutable_typed_data();
                 size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
                 size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
                 std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
             }
             else if constexpr (Precision == ActivationPrecision::FP16)
             {
-                const uint16_t *src_data = src_k->fp16_data();
-                uint16_t *dst_data = typed_k->mutable_fp16_data();
+                const uint16_t *src_data = src_k->typed_data();
+                uint16_t *dst_data = typed_k->mutable_typed_data();
                 size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
                 size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
                 std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
             }
             else if constexpr (Precision == ActivationPrecision::Q8_1)
             {
-                const Q8_1Block *src_blocks = src_k->q8_1_blocks();
-                Q8_1Block *dst_blocks = typed_k->mutable_q8_1_blocks();
+                const Q8_1Block *src_blocks = src_k->typed_data();
+                Q8_1Block *dst_blocks = typed_k->mutable_typed_data();
                 size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
                 size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
                 size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
@@ -772,8 +772,8 @@ namespace llaminar2
             }
             else if constexpr (Precision == ActivationPrecision::Q16_1)
             {
-                const Q16_1Block *src_blocks = src_k->q16_1_blocks();
-                Q16_1Block *dst_blocks = typed_k->mutable_q16_1_blocks();
+                const Q16_1Block *src_blocks = src_k->typed_data();
+                Q16_1Block *dst_blocks = typed_k->mutable_typed_data();
                 size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
                 size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
                 size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
@@ -792,24 +792,24 @@ namespace llaminar2
             }
             else if constexpr (Precision == ActivationPrecision::BF16)
             {
-                const uint16_t *src_data = src_v->bf16_data();
-                uint16_t *dst_data = typed_v->mutable_bf16_data();
+                const uint16_t *src_data = src_v->typed_data();
+                uint16_t *dst_data = typed_v->mutable_typed_data();
                 size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
                 size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
                 std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
             }
             else if constexpr (Precision == ActivationPrecision::FP16)
             {
-                const uint16_t *src_data = src_v->fp16_data();
-                uint16_t *dst_data = typed_v->mutable_fp16_data();
+                const uint16_t *src_data = src_v->typed_data();
+                uint16_t *dst_data = typed_v->mutable_typed_data();
                 size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
                 size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
                 std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
             }
             else if constexpr (Precision == ActivationPrecision::Q8_1)
             {
-                const Q8_1Block *src_blocks = src_v->q8_1_blocks();
-                Q8_1Block *dst_blocks = typed_v->mutable_q8_1_blocks();
+                const Q8_1Block *src_blocks = src_v->typed_data();
+                Q8_1Block *dst_blocks = typed_v->mutable_typed_data();
                 size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
                 size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
                 size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
@@ -818,8 +818,8 @@ namespace llaminar2
             }
             else if constexpr (Precision == ActivationPrecision::Q16_1)
             {
-                const Q16_1Block *src_blocks = src_v->q16_1_blocks();
-                Q16_1Block *dst_blocks = typed_v->mutable_q16_1_blocks();
+                const Q16_1Block *src_blocks = src_v->typed_data();
+                Q16_1Block *dst_blocks = typed_v->mutable_typed_data();
                 size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
                 size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
                 size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;

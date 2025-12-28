@@ -4,49 +4,63 @@
  * @author David Sanftenberg
  *
  * This file implements the Curiously Recurring Template Pattern (CRTP) to provide
- * type-safe data() and mutable_data() accessors with zero virtual dispatch overhead
- * when the concrete type is known at compile time.
+ * type-safe typed_data() and mutable_typed_data() accessors with zero virtual dispatch
+ * overhead when the concrete type is known at compile time.
  *
  * Design goals:
- * 1. Type-safe accessors: data() returns the correct native type (float*, uint16_t*, Q8_1Block*, etc.)
+ * 1. Type-safe accessors: typed_data() returns the correct native type (float*, Q8_1Block*, etc.)
  * 2. Zero overhead: No virtual dispatch when type is known at compile time
  * 3. Runtime polymorphism: Compatible with ITensor for heterogeneous collections
  * 4. Backward compatibility: Works alongside existing TensorBase hierarchy
+ *
+ * **Naming Convention**:
+ * - `typed_data()` / `mutable_typed_data()` - Returns native storage type via CRTP
+ * - TensorBase::data() - Legacy accessor returning `float*` (may throw for block tensors)
+ * - Block tensors: Use `blocks()` alias which calls `typed_data()` internally
  *
  * Usage pattern for concrete tensor classes:
  *
  * @code
  * // Define a typed tensor by inheriting from TypedTensorBase
- * class FP32Tensor : public TypedTensorBase<FP32Tensor, float> {
+ * class FP32Tensor : public TypedTensorBase<FP32Tensor, float>, public TensorBase {
  * public:
- *     // CRTP implementation - called by TypedTensorBase::data()
+ *     // CRTP implementation - called by TypedTensorBase::typed_data()
  *     const float* data_impl() const { return host_data_.data(); }
  *     float* mutable_data_impl() { return host_data_.data(); }
  *
- *     // Static type ID for ITensor::is<T>() and typed_as<T>()
- *     static constexpr int static_type_id() { return TensorTypeId::FP32; }
+ *     // Legacy TensorBase::data() - for FP32, same as typed_data()
+ *     const float* data() const override { return typed_data(); }
  *
- * private:
- *     std::vector<float> host_data_;
+ *     static constexpr int static_type_id() { return TensorTypeId::FP32; }
+ * };
+ *
+ * // Block tensor example
+ * class Q8_1Tensor : public TypedTensorBase<Q8_1Tensor, Q8_1Block>, public TensorBase {
+ * public:
+ *     const Q8_1Block* data_impl() const { return raw_blocks_ptr(); }
+ *     Q8_1Block* mutable_data_impl() { return mutable_raw_blocks_ptr(); }
+ *
+ *     // Convenience alias for block tensors
+ *     const Q8_1Block* blocks() const { return typed_data(); }
+ *     Q8_1Block* mutable_blocks() { return mutable_typed_data(); }
+ *
+ *     // Legacy data() throws - Q8_1 doesn't have float data
+ *     const float* data() const override { throw std::runtime_error("Use blocks()"); }
  * };
  *
  * // Usage in templated code (zero overhead)
  * template<typename T>
  * void process(T& tensor) {
- *     auto* data = tensor.data();  // Returns T::value_type*
- *     // ... work with native type
+ *     auto* data = tensor.typed_data();  // Returns T::value_type*
  * }
  *
  * // Usage with runtime polymorphism
  * void process(ITensor& tensor) {
  *     if (auto* fp32 = tensor.try_as<FP32Tensor>()) {
- *         float* data = fp32->data();  // Type-safe!
+ *         float* data = fp32->typed_data();  // Type-safe!
  *     }
  * }
  * @endcode
- *
- * Note: This CRTP layer is optional. Tensors can directly implement ITensor
- * without using TypedTensorBase if they need custom data() semantics.
  */
 
 #pragma once
@@ -61,11 +75,20 @@ namespace llaminar2
      * @brief CRTP base class providing type-safe data accessors
      *
      * TypedTensorBase uses the Curiously Recurring Template Pattern to provide
-     * type-safe data() and mutable_data() methods that return the correct
+     * type-safe typed_data() and mutable_typed_data() methods that return the correct
      * native pointer type (float*, uint16_t*, Q8_1Block*, etc.).
      *
-     * When the concrete type is known at compile time, data() resolves directly
+     * When the concrete type is known at compile time, typed_data() resolves directly
      * to the derived class's data_impl() with no virtual dispatch.
+     *
+     * **Design Note**: This class uses virtual inheritance from ITensor to support
+     * diamond inheritance when combined with TensorBase:
+     *
+     *          ITensor (virtual)
+     *            /      \
+     *   TypedTensorBase  TensorBase
+     *            \      /
+     *           FP32Tensor
      *
      * @tparam Derived The concrete tensor class (CRTP pattern)
      * @tparam DataType The native storage type (float, uint16_t, Q8_1Block, etc.)
@@ -77,7 +100,7 @@ namespace llaminar2
      * - Implement ITensor interface: shape(), numel(), size_bytes(), device_index()
      */
     template <typename Derived, typename DataType>
-    class TypedTensorBase : public ITensor
+    class TypedTensorBase : public virtual ITensor
     {
     public:
         /// Native storage type for this tensor
@@ -97,8 +120,12 @@ namespace llaminar2
          *
          * This method uses CRTP to call the derived class's data_impl() directly,
          * avoiding virtual dispatch when the concrete type is known at compile time.
+         *
+         * @note Named `typed_data()` to avoid conflict with TensorBase::data() which
+         * returns `float*` for legacy compatibility. Use `typed_data()` when you want
+         * the actual native storage type.
          */
-        const_pointer data() const
+        const_pointer typed_data() const
         {
             return static_cast<const Derived *>(this)->data_impl();
         }
@@ -109,8 +136,10 @@ namespace llaminar2
          *
          * Note: Some tensor types (e.g., quantized weights) may throw from mutable_data_impl()
          * as they are read-only.
+         *
+         * @note Named `mutable_typed_data()` to avoid conflict with TensorBase::mutable_data()
          */
-        pointer mutable_data()
+        pointer mutable_typed_data()
         {
             return static_cast<Derived *>(this)->mutable_data_impl();
         }
@@ -125,7 +154,7 @@ namespace llaminar2
          */
         const void *raw_data() const override
         {
-            return static_cast<const void *>(data());
+            return static_cast<const void *>(typed_data());
         }
 
         /**
@@ -134,7 +163,7 @@ namespace llaminar2
          */
         void *raw_mutable_data() override
         {
-            return static_cast<void *>(mutable_data());
+            return static_cast<void *>(mutable_typed_data());
         }
 
         /**

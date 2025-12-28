@@ -1486,10 +1486,10 @@ namespace llaminar2
                 auto V_q8_1 = static_cast<const Q8_1Tensor *>(V);
                 auto out_q8_1 = static_cast<Q8_1Tensor *>(output);
 
-                Q_ptr = reinterpret_cast<const float *>(Q_q8_1->q8_1_blocks());
-                K_ptr = reinterpret_cast<const float *>(K_q8_1->q8_1_blocks());
-                V_ptr = reinterpret_cast<const float *>(V_q8_1->q8_1_blocks());
-                output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks());
+                Q_ptr = reinterpret_cast<const float *>(Q_q8_1->typed_data());
+                K_ptr = reinterpret_cast<const float *>(K_q8_1->typed_data());
+                V_ptr = reinterpret_cast<const float *>(V_q8_1->typed_data());
+                output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_typed_data());
             }
             else
             {

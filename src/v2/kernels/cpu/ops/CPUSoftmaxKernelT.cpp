@@ -264,8 +264,8 @@ namespace llaminar2
             return false;
         }
 
-        const uint16_t *in_data = bf16_input->bf16_data();
-        uint16_t *out_data = bf16_output->mutable_bf16_data();
+        const uint16_t *in_data = bf16_input->typed_data();
+        uint16_t *out_data = bf16_output->mutable_typed_data();
 
         if (!in_data || !out_data)
         {
@@ -314,8 +314,8 @@ namespace llaminar2
             return false;
         }
 
-        const uint16_t *in_data = fp16_input->fp16_data();
-        uint16_t *out_data = fp16_output->mutable_fp16_data();
+        const uint16_t *in_data = fp16_input->typed_data();
+        uint16_t *out_data = fp16_output->mutable_typed_data();
 
         if (!in_data || !out_data)
         {
@@ -364,8 +364,8 @@ namespace llaminar2
             return false;
         }
 
-        const Q8_1Block *in_blocks = q8_input->q8_1_blocks();
-        Q8_1Block *out_blocks = q8_output->mutable_q8_1_blocks();
+        const Q8_1Block *in_blocks = q8_input->typed_data();
+        Q8_1Block *out_blocks = q8_output->mutable_typed_data();
 
         if (!in_blocks || !out_blocks)
         {

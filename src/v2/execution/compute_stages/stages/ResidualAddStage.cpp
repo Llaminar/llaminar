@@ -117,7 +117,7 @@ namespace llaminar2
         // Add in FP32 and quantize result back to Q8_1
         // Use block-wise approach for efficiency
         const size_t num_blocks = num_elements / 32;
-        Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
+        Q8_1Block *output_blocks = output_q8->mutable_typed_data();
 
         // Process block by block
         for (size_t b = 0; b < num_blocks; ++b)
@@ -215,9 +215,9 @@ namespace llaminar2
             return false;
         }
 
-        const Q8_1Block *input_blocks = input_q8->q8_1_blocks();
-        const Q8_1Block *residual_blocks = residual_q8->q8_1_blocks();
-        Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
+        const Q8_1Block *input_blocks = input_q8->typed_data();
+        const Q8_1Block *residual_blocks = residual_q8->typed_data();
+        Q8_1Block *output_blocks = output_q8->mutable_typed_data();
 
         LOG_DEBUG("[ResidualAddStage::Q8_1] Adding " << numel << " elements ("
                                                      << (numel / 32) << " blocks)");
@@ -253,8 +253,8 @@ namespace llaminar2
             return false;
         }
 
-        const Q8_1Block *delta_blocks = delta_q8->q8_1_blocks();
-        Q16_1Block *residual_blocks = residual_q16->mutable_q16_1_blocks();
+        const Q8_1Block *delta_blocks = delta_q8->typed_data();
+        Q16_1Block *residual_blocks = residual_q16->mutable_typed_data();
 
         LOG_DEBUG("[ResidualAddStage::Q8_1_Q16_1] Adding " << num_elements
                                                            << " elements (" << (num_elements / 32) << " blocks)");
@@ -292,7 +292,7 @@ namespace llaminar2
         }
 
         const float *delta_data = delta_fp32->data();
-        Q16_1Block *residual_blocks = residual_q16->mutable_q16_1_blocks();
+        Q16_1Block *residual_blocks = residual_q16->mutable_typed_data();
 
         LOG_DEBUG("[ResidualAddStage::FP32_Q16_1] Adding " << num_elements
                                                            << " elements (" << (num_elements / 32) << " blocks)");
@@ -329,7 +329,7 @@ namespace llaminar2
             return false;
         }
 
-        const Q8_1Block *delta_blocks = delta_q8_1->q8_1_blocks();
+        const Q8_1Block *delta_blocks = delta_q8_1->typed_data();
         float *residual_data = residual_fp32->mutable_data();
 
         LOG_DEBUG("[ResidualAddStage::Q8_1_FP32_to_FP32] Adding " << num_elements
@@ -494,6 +494,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

@@ -85,6 +85,7 @@
 #pragma once
 
 #include "ITensor.h"
+#include "TypedTensorBase.h"  // CRTP base for type-safe typed_data() access
 #include "TensorKernels.h"
 #include "FP16Utils.h"
 #include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
@@ -626,8 +627,21 @@ namespace llaminar2
      * - Runtime type introspection (native_type_id, is<T>, typed_as<T>)
      * - Raw data access (raw_data, raw_mutable_data)
      * - Basic shape/size queries
+     *
+     * **Diamond Inheritance Note**:
+     * TensorBase uses virtual inheritance from ITensor to support diamond inheritance
+     * when combined with TypedTensorBase<Derived, DataType>:
+     *
+     *                    ITensor (virtual)
+     *                   /               \
+     *     TypedTensorBase<T,D>        TensorBase
+     *                   \               /
+     *                    FP32Tensor (etc.)
+     *
+     * This allows concrete tensors to inherit type-safe typed_data() from TypedTensorBase
+     * while still getting the full TensorBase infrastructure.
      */
-    class TensorBase : public ITensor, public std::enable_shared_from_this<TensorBase>
+    class TensorBase : public virtual ITensor, public std::enable_shared_from_this<TensorBase>
     {
     public:
         virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
@@ -1341,7 +1355,8 @@ namespace llaminar2
      * @brief 32-bit floating point tensor (baseline activation format)
      *
      * **Interfaces implemented**:
-     * - `TensorBase`: Core tensor API (inherited)
+     * - `TypedTensorBase<FP32Tensor, float>`: Type-safe `typed_data()` returning `float*`
+     * - `TensorBase`: Core tensor API (device affinity, shape, lazy transfers)
      * - `IActivationTensor`: Kernel creation, in-place ops (RMSNorm, RoPE, SwiGLU)
      * - `ITensorGemmTileDataProvider`: Block-wise FP32 decode (block_size=32, identity decode)
      * - `IQ8_0Decodable`: On-the-fly quantization to Q8_0 (for testing/compatibility)
@@ -1349,15 +1364,29 @@ namespace llaminar2
      *
      * **Usage**: Default activation tensor for FP32 inference pipelines. Provides baseline
      * numerical accuracy for parity testing against PyTorch/llama.cpp.
+     *
+     * **Type-Safe Access**: Use `typed_data()` for native `float*` access. The legacy
+     * `data()` method is equivalent for FP32Tensor.
      */
-    class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
+    class FP32Tensor : public TypedTensorBase<FP32Tensor, float>,
+                       public TensorBase,
+                       public IActivationTensor,
+                       public ITensorGemmTileDataProvider,
+                       public IQ8_0Decodable,
+                       public IQ8_1Decodable
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = float;
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::FP32; }
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data()
+        const float *data_impl() const { return host_data_.data(); }
+        /// Called by TypedTensorBase::mutable_typed_data()
+        float *mutable_data_impl() { return host_data_.data(); }
 
         explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
         ~FP32Tensor() override;
@@ -1371,6 +1400,15 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // ===== Diamond Inheritance Resolution =====
+        // Both TypedTensorBase and TensorBase provide ITensor overrides.
+        // FP32Tensor must provide final overrides to disambiguate.
+        // We delegate to TensorBase's implementations (already working).
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
         float *mutable_fp32_data() override { return mutable_data(); }
@@ -1539,14 +1577,25 @@ namespace llaminar2
      *
      * **Usage**: Activation tensor for FP16 inference (2× memory savings, GPU-optimized).
      */
-    class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
+    class FP16Tensor : public TypedTensorBase<FP16Tensor, uint16_t>,
+                        public TensorBase,
+                        public IActivationTensor,
+                        public ITensorGemmTileDataProvider,
+                        public IQ8_0Decodable,
+                        public IQ8_1Decodable
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = uint16_t;
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::FP16; }
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data() - returns FP16 (uint16_t*)
+        const uint16_t *data_impl() const { return fp16_data(); }
+        /// Called by TypedTensorBase::mutable_typed_data()
+        uint16_t *mutable_data_impl() { return mutable_fp16_data(); }
 
         explicit FP16Tensor(const std::vector<size_t> &shape);
         FP16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &fp16_data);
@@ -1561,6 +1610,12 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
+
+        // ===== Diamond Inheritance Resolution =====
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
         // FP16 is NOT FP32-backed - requires FP16→FP32 conversion
@@ -1736,14 +1791,25 @@ namespace llaminar2
      *
      * **Usage**: Preferred activation tensor for CPU/GPU mixed precision (better overflow resistance than FP16).
      */
-    class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
+    class BF16Tensor : public TypedTensorBase<BF16Tensor, uint16_t>,
+                        public TensorBase,
+                        public IActivationTensor,
+                        public ITensorGemmTileDataProvider,
+                        public IQ8_0Decodable,
+                        public IQ8_1Decodable
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = uint16_t;
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::BF16; }
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data() - returns BF16 (uint16_t*)
+        const uint16_t *data_impl() const { return bf16_data(); }
+        /// Called by TypedTensorBase::mutable_typed_data()
+        uint16_t *mutable_data_impl() { return mutable_bf16_data(); }
 
         explicit BF16Tensor(const std::vector<size_t> &shape);
         BF16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &bf16_data);
@@ -1758,6 +1824,12 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
+
+        // ===== Diamond Inheritance Resolution =====
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -1925,11 +1997,19 @@ namespace llaminar2
      *
      * **NOT implemented**: IActivationTensor (INT8Tensor represents weights, not activations)
      */
-    class INT8Tensor : public TensorBase, public ITensorGemmTileDataProvider
+    class INT8Tensor : public TypedTensorBase<INT8Tensor, int8_t>,
+                        public TensorBase,
+                        public ITensorGemmTileDataProvider
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = int8_t;
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data() - returns int8_t*
+        const int8_t *data_impl() const { return host_int8_data_.data(); }
+        /// Called by TypedTensorBase::mutable_typed_data()
+        int8_t *mutable_data_impl() { return host_int8_data_.data(); }
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::INT8; }
@@ -1951,6 +2031,12 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
+
+        // ===== Diamond Inheritance Resolution =====
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override;
 
@@ -2064,14 +2150,21 @@ namespace llaminar2
      * - `from_int32_with_scales()`: Populate from raw INT32 accumulator + scale factors
      * - `to_fp32()`: Dequantize to FP32 for final output or parity testing
      */
-    class INT32Tensor : public TensorBase
+    class INT32Tensor : public TypedTensorBase<INT32Tensor, int32_t>,
+                         public TensorBase
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = int32_t;
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::INT32; }
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data() - returns int32_t*
+        const int32_t *data_impl() const { return host_int32_data_.data(); }
+        /// Called by TypedTensorBase::mutable_typed_data()
+        int32_t *mutable_data_impl() { return host_int32_data_.data(); }
 
         explicit INT32Tensor(const std::vector<size_t> &shape);
         INT32Tensor(const std::vector<size_t> &shape,
@@ -2090,6 +2183,12 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
+
+        // ===== Diamond Inheritance Resolution =====
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override;
 
@@ -2191,7 +2290,7 @@ namespace llaminar2
      * **Usage**: Default quantization format for model weights (balance of size and quality).
      */
 
-    class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ4_NLTensor : public TypedTensorBase<IQ4_NLTensor, IQ4_NLBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -2199,6 +2298,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ4_NL; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ4_NLBlock *data_impl() const { return reinterpret_cast<const IQ4_NLBlock *>(raw_host_data_ptr()); }
+        IQ4_NLBlock *mutable_data_impl() { throw std::runtime_error("IQ4_NLTensor: weight tensors are read-only"); }
+        const IQ4_NLBlock *blocks() const { return typed_data(); }
 
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ4_NLTensor() override;
@@ -2212,6 +2316,12 @@ namespace llaminar2
 
         const float *data() const override; // Dequantizes to temp buffer
         float *mutable_data() override;     // Not supported for quantized tensors
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const override { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -2303,8 +2413,7 @@ namespace llaminar2
         size_t padded_k() const;
         size_t element_count() const { return shape_[0] * shape_[1]; }
 
-        // Raw data access (raw_data returns void* to match TensorBase interface)
-        const void *raw_data() const override { return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data(); }
+        // Raw data access (raw_blocks provides access via TensorBase pattern)
         const uint8_t *raw_blocks() const { return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data(); }
         size_t raw_size() const
         {
@@ -2412,7 +2521,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + int8[32] values
      * Compression: 4× vs FP32
      */
-    class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q8_0Tensor : public TypedTensorBase<Q8_0Tensor, Q8_0Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -2420,6 +2529,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q8_0; }
+
+        // TypedTensorBase CRTP implementation
+        const Q8_0Block *data_impl() const { return reinterpret_cast<const Q8_0Block *>(raw_host_data_ptr()); }
+        Q8_0Block *mutable_data_impl() { throw std::runtime_error("Q8_0Tensor: weight tensors are read-only"); }
+        const Q8_0Block *blocks() const { return typed_data(); }
 
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q8_0Tensor() override;
@@ -2433,6 +2547,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -2632,14 +2752,29 @@ namespace llaminar2
      *   // Read from Q8_1 buffer (next kernel)
      *   next_kernel->apply_q8_1(output->q8_1_blocks(), ...);
      */
-    class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable, public IINT8Unpackable
+    class Q8_1Tensor : public TypedTensorBase<Q8_1Tensor, Q8_1Block>,
+                        public TensorBase,
+                        public IActivationTensor,
+                        public ITensorGemmTileDataProvider,
+                        public IQ8_1Decodable,
+                        public IINT8Unpackable
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = Q8_1Block;
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q8_1; }
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data() - returns Q8_1Block*
+        const Q8_1Block *data_impl() const { return q8_1_blocks(); }
+        /// Called by TypedTensorBase::mutable_typed_data() - returns mutable Q8_1Block*
+        Q8_1Block *mutable_data_impl() { return mutable_q8_1_blocks(); }
+
+        /// Convenience alias: blocks() returns typed_data()
+        const Q8_1Block *blocks() const { return typed_data(); }
+        Q8_1Block *mutable_blocks() { return mutable_typed_data(); }
 
         /// Construct from existing raw Q8_1 block data (for rare cases like loaded data)
         /// Most Q8_1 tensors should be created as mutable activation buffers.
@@ -2690,6 +2825,12 @@ namespace llaminar2
         const float *fp32_data() const override;
 
         float *mutable_data() override;
+
+        // ===== Diamond Inheritance Resolution =====
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override;
 
@@ -3055,14 +3196,27 @@ namespace llaminar2
      * Use case: High-precision residual stream quantization where error accumulation
      * across 20+ transformer layers causes token prediction divergence with Q8_1.
      */
-    class Q16_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
+    class Q16_1Tensor : public TypedTensorBase<Q16_1Tensor, Q16_1Block>,
+                         public TensorBase,
+                         public IActivationTensor,
+                         public ITensorGemmTileDataProvider
     {
     public:
-        /// Native storage type for CRTP-style type-safe access
+        /// Native storage type (same as TypedTensorBase::value_type)
         using value_type = Q16_1Block;
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q16_1; }
+
+        // ===== CRTP Implementation for TypedTensorBase =====
+        /// Called by TypedTensorBase::typed_data() - returns Q16_1Block*
+        const Q16_1Block *data_impl() const { return q16_1_blocks(); }
+        /// Called by TypedTensorBase::mutable_typed_data() - returns mutable Q16_1Block*
+        Q16_1Block *mutable_data_impl() { return mutable_q16_1_blocks(); }
+
+        /// Convenience alias: blocks() returns typed_data()
+        const Q16_1Block *blocks() const { return typed_data(); }
+        Q16_1Block *mutable_blocks() { return mutable_typed_data(); }
 
         /// Construct from existing raw Q16_1 block data
         Q16_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3088,6 +3242,12 @@ namespace llaminar2
         const float *data() const override;
         const float *fp32_data() const override;
         float *mutable_data() override;
+
+        // ===== Diamond Inheritance Resolution =====
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override;
 
@@ -3295,7 +3455,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + 4-bit packed values
      * Compression: 8× vs FP32
      */
-    class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q4_0Tensor : public TypedTensorBase<Q4_0Tensor, Q4_0Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -3304,9 +3464,15 @@ namespace llaminar2
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q4_0; }
 
+        // TypedTensorBase CRTP implementation
+        const Q4_0Block *data_impl() const { return reinterpret_cast<const Q4_0Block *>(raw_host_data_ptr()); }
+        Q4_0Block *mutable_data_impl() { throw std::runtime_error("Q4_0Tensor: weight tensors are read-only"); }
+        const Q4_0Block *blocks() const { return typed_data(); }
+
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q4_0Tensor() override;
 
+        // TensorBase interface
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_0; }
 
@@ -3315,6 +3481,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -3482,7 +3654,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + FP16 min + 4-bit packed values
      * Compression: ~7.1× vs FP32
      */
-    class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q4_1Tensor : public TypedTensorBase<Q4_1Tensor, Q4_1Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -3491,9 +3663,15 @@ namespace llaminar2
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q4_1; }
 
+        // TypedTensorBase CRTP implementation
+        const Q4_1Block *data_impl() const { return reinterpret_cast<const Q4_1Block *>(raw_host_data_ptr()); }
+        Q4_1Block *mutable_data_impl() { throw std::runtime_error("Q4_1Tensor: weight tensors are read-only"); }
+        const Q4_1Block *blocks() const { return typed_data(); }
+
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q4_1Tensor() override;
 
+        // TensorBase interface
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_1; }
 
@@ -3502,6 +3680,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -3668,7 +3852,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~6.4× vs FP32
      */
-    class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q5_0Tensor : public TypedTensorBase<Q5_0Tensor, Q5_0Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -3676,6 +3860,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q5_0; }
+
+        // TypedTensorBase CRTP implementation
+        const Q5_0Block *data_impl() const { return reinterpret_cast<const Q5_0Block *>(raw_host_data_ptr()); }
+        Q5_0Block *mutable_data_impl() { throw std::runtime_error("Q5_0Tensor: weight tensors are read-only"); }
+        const Q5_0Block *blocks() const { return typed_data(); }
 
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q5_0Tensor() override;
@@ -3688,6 +3877,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -3845,7 +4040,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~5.7× vs FP32
      */
-    class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q5_1Tensor : public TypedTensorBase<Q5_1Tensor, Q5_1Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -3853,6 +4048,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q5_1; }
+
+        // TypedTensorBase CRTP implementation
+        const Q5_1Block *data_impl() const { return reinterpret_cast<const Q5_1Block *>(raw_host_data_ptr()); }
+        Q5_1Block *mutable_data_impl() { throw std::runtime_error("Q5_1Tensor: weight tensors are read-only"); }
+        const Q5_1Block *blocks() const { return typed_data(); }
 
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q5_1Tensor() override;
@@ -3865,6 +4065,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4018,7 +4224,7 @@ namespace llaminar2
     /**
      * @brief Q6_K tensor (6-bit K-quant super-block)
      */
-    class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q6_KTensor : public TypedTensorBase<Q6_KTensor, Q6_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4026,6 +4232,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q6_K; }
+
+        // TypedTensorBase CRTP implementation
+        const Q6_KBlock *data_impl() const { return reinterpret_cast<const Q6_KBlock *>(raw_host_data_ptr()); }
+        Q6_KBlock *mutable_data_impl() { throw std::runtime_error("Q6_KTensor: weight tensors are read-only"); }
+        const Q6_KBlock *blocks() const { return typed_data(); }
 
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q6_KTensor() override;
@@ -4038,6 +4249,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4154,7 +4371,7 @@ namespace llaminar2
     /**
      * @brief Q2_K tensor (2-bit K-quant super-block)
      */
-    class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q2_KTensor : public TypedTensorBase<Q2_KTensor, Q2_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4162,6 +4379,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q2_K; }
+
+        // TypedTensorBase CRTP implementation
+        const Q2_KBlock *data_impl() const { return reinterpret_cast<const Q2_KBlock *>(raw_host_data_ptr()); }
+        Q2_KBlock *mutable_data_impl() { throw std::runtime_error("Q2_KTensor: weight tensors are read-only"); }
+        const Q2_KBlock *blocks() const { return typed_data(); }
 
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q2_KTensor() override;
@@ -4174,6 +4396,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4291,7 +4519,7 @@ namespace llaminar2
     /**
      * @brief Q5_K tensor (5-bit K-quant super-block)
      */
-    class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q5_KTensor : public TypedTensorBase<Q5_KTensor, Q5_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4299,6 +4527,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q5_K; }
+
+        // TypedTensorBase CRTP implementation
+        const Q5_KBlock *data_impl() const { return reinterpret_cast<const Q5_KBlock *>(raw_host_data_ptr()); }
+        Q5_KBlock *mutable_data_impl() { throw std::runtime_error("Q5_KTensor: weight tensors are read-only"); }
+        const Q5_KBlock *blocks() const { return typed_data(); }
 
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q5_KTensor() override;
@@ -4318,6 +4551,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4431,7 +4670,7 @@ namespace llaminar2
     /**
      * @brief Q3_K tensor (3-bit K-quant super-block)
      */
-    class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q3_KTensor : public TypedTensorBase<Q3_KTensor, Q3_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4439,6 +4678,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q3_K; }
+
+        // TypedTensorBase CRTP implementation
+        const Q3_KBlock *data_impl() const { return reinterpret_cast<const Q3_KBlock *>(raw_host_data_ptr()); }
+        Q3_KBlock *mutable_data_impl() { throw std::runtime_error("Q3_KTensor: weight tensors are read-only"); }
+        const Q3_KBlock *blocks() const { return typed_data(); }
 
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q3_KTensor() override;
@@ -4451,6 +4695,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4567,7 +4817,7 @@ namespace llaminar2
     /**
      * @brief Q4_K tensor (4-bit K-quant super-block)
      */
-    class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q4_KTensor : public TypedTensorBase<Q4_KTensor, Q4_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4575,6 +4825,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q4_K; }
+
+        // TypedTensorBase CRTP implementation
+        const Q4_KBlock *data_impl() const { return reinterpret_cast<const Q4_KBlock *>(raw_host_data_ptr()); }
+        Q4_KBlock *mutable_data_impl() { throw std::runtime_error("Q4_KTensor: weight tensors are read-only"); }
+        const Q4_KBlock *blocks() const { return typed_data(); }
 
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q4_KTensor() override;
@@ -4587,6 +4842,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4707,7 +4968,7 @@ namespace llaminar2
     /**
      * @brief Q8_K tensor (8-bit K-quant super-block)
      */
-    class Q8_KTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q8_KTensor : public TypedTensorBase<Q8_KTensor, Q8_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4715,6 +4976,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::Q8_K; }
+
+        // TypedTensorBase CRTP implementation
+        const Q8_KBlock *data_impl() const { return reinterpret_cast<const Q8_KBlock *>(raw_host_data_ptr()); }
+        Q8_KBlock *mutable_data_impl() { throw std::runtime_error("Q8_KTensor: weight tensors are read-only"); }
+        const Q8_KBlock *blocks() const { return typed_data(); }
 
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q8_KTensor() override;
@@ -4727,6 +4993,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -4840,7 +5112,7 @@ namespace llaminar2
     /**
      * @brief IQ4_XS tensor (4-bit extra-small IQ)
      */
-    class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ4_XSTensor : public TypedTensorBase<IQ4_XSTensor, IQ4_XSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4848,6 +5120,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ4_XS; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ4_XSBlock *data_impl() const { return reinterpret_cast<const IQ4_XSBlock *>(raw_host_data_ptr()); }
+        IQ4_XSBlock *mutable_data_impl() { throw std::runtime_error("IQ4_XSTensor: weight tensors are read-only"); }
+        const IQ4_XSBlock *blocks() const { return typed_data(); }
 
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ4_XSTensor() override;
@@ -4860,6 +5137,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5007,7 +5290,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
      */
-    class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ2_XXSTensor : public TypedTensorBase<IQ2_XXSTensor, IQ2_XXSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5015,6 +5298,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ2_XXS; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ2_XXSBlock *data_impl() const { return reinterpret_cast<const IQ2_XXSBlock *>(raw_host_data_ptr()); }
+        IQ2_XXSBlock *mutable_data_impl() { throw std::runtime_error("IQ2_XXSTensor: weight tensors are read-only"); }
+        const IQ2_XXSBlock *blocks() const { return typed_data(); }
 
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ2_XXSTensor() override;
@@ -5027,6 +5315,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5162,7 +5456,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XS tensor (2-bit extra-small IQ)
      */
-    class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ2_XSTensor : public TypedTensorBase<IQ2_XSTensor, IQ2_XSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5170,6 +5464,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ2_XS; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ2_XSBlock *data_impl() const { return reinterpret_cast<const IQ2_XSBlock *>(raw_host_data_ptr()); }
+        IQ2_XSBlock *mutable_data_impl() { throw std::runtime_error("IQ2_XSTensor: weight tensors are read-only"); }
+        const IQ2_XSBlock *blocks() const { return typed_data(); }
 
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ2_XSTensor() override;
@@ -5182,6 +5481,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5317,7 +5622,7 @@ namespace llaminar2
     /**
      * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
      */
-    class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ3_XXSTensor : public TypedTensorBase<IQ3_XXSTensor, IQ3_XXSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5325,6 +5630,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ3_XXS; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ3_XXSBlock *data_impl() const { return reinterpret_cast<const IQ3_XXSBlock *>(raw_host_data_ptr()); }
+        IQ3_XXSBlock *mutable_data_impl() { throw std::runtime_error("IQ3_XXSTensor: weight tensors are read-only"); }
+        const IQ3_XXSBlock *blocks() const { return typed_data(); }
 
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ3_XXSTensor() override;
@@ -5337,6 +5647,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5476,7 +5792,7 @@ namespace llaminar2
     /**
      * @brief IQ2_S tensor (2-bit small IQ)
      */
-    class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ2_STensor : public TypedTensorBase<IQ2_STensor, IQ2_SBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5484,6 +5800,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ2_S; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ2_SBlock *data_impl() const { return reinterpret_cast<const IQ2_SBlock *>(raw_host_data_ptr()); }
+        IQ2_SBlock *mutable_data_impl() { throw std::runtime_error("IQ2_STensor: weight tensors are read-only"); }
+        const IQ2_SBlock *blocks() const { return typed_data(); }
 
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ2_STensor() override;
@@ -5496,6 +5817,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5631,7 +5958,7 @@ namespace llaminar2
     /**
      * @brief IQ3_S tensor (3-bit small IQ)
      */
-    class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ3_STensor : public TypedTensorBase<IQ3_STensor, IQ3_SBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5639,6 +5966,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ3_S; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ3_SBlock *data_impl() const { return reinterpret_cast<const IQ3_SBlock *>(raw_host_data_ptr()); }
+        IQ3_SBlock *mutable_data_impl() { throw std::runtime_error("IQ3_STensor: weight tensors are read-only"); }
+        const IQ3_SBlock *blocks() const { return typed_data(); }
 
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ3_STensor() override;
@@ -5651,6 +5983,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5790,7 +6128,7 @@ namespace llaminar2
     /**
      * @brief IQ1_S tensor (1-bit small IQ)
      */
-    class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ1_STensor : public TypedTensorBase<IQ1_STensor, IQ1_SBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5798,6 +6136,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ1_S; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ1_SBlock *data_impl() const { return reinterpret_cast<const IQ1_SBlock *>(raw_host_data_ptr()); }
+        IQ1_SBlock *mutable_data_impl() { throw std::runtime_error("IQ1_STensor: weight tensors are read-only"); }
+        const IQ1_SBlock *blocks() const { return typed_data(); }
 
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ1_STensor() override;
@@ -5810,6 +6153,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
@@ -5945,7 +6294,7 @@ namespace llaminar2
     /**
      * @brief IQ1_M tensor (1-bit medium IQ)
      */
-    class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ1_MTensor : public TypedTensorBase<IQ1_MTensor, IQ1_MBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5953,6 +6302,11 @@ namespace llaminar2
 
         /// Static type ID for ITensor::is<T>() and typed_as<T>()
         static constexpr int static_type_id() { return TensorTypeId::IQ1_M; }
+
+        // TypedTensorBase CRTP implementation
+        const IQ1_MBlock *data_impl() const { return reinterpret_cast<const IQ1_MBlock *>(raw_host_data_ptr()); }
+        IQ1_MBlock *mutable_data_impl() { throw std::runtime_error("IQ1_MTensor: weight tensors are read-only"); }
+        const IQ1_MBlock *blocks() const { return typed_data(); }
 
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~IQ1_MTensor() override;
@@ -5965,6 +6319,12 @@ namespace llaminar2
 
         const float *data() const override;
         float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
 
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 

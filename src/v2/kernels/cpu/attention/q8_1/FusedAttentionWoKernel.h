@@ -168,11 +168,11 @@ namespace llaminar2
                     LOG_ERROR("FusedAttentionWoKernel: Failed to quantize FP32 Q to Q8_1");
                     return false;
                 }
-                q_blocks = Q_quantized->q8_1_blocks();
+                q_blocks = Q_quantized->typed_data();
             }
             else
             {
-                q_blocks = Q_q8->q8_1_blocks();
+                q_blocks = Q_q8->typed_data();
             }
 
             // Determine Wo weight type
@@ -212,7 +212,7 @@ namespace llaminar2
                     if (auto *wo_q8 = dynamic_cast<Q8_1Tensor *>(Wo))
                     {
                         wo_type = llaminar::v2::kernels::microkernels::WoWeightType::Q8_1;
-                        wo_data = wo_q8->q8_1_blocks();
+                        wo_data = wo_q8->typed_data();
                     }
                     else
                     {
@@ -257,7 +257,7 @@ namespace llaminar2
                 }
                 // For Q16_1 fusion, we pass the raw block pointer as output
                 // The JIT kernel interprets this as Q16_1 blocks and does read-modify-write
-                output_ptr = reinterpret_cast<float *>(out_q16->mutable_q16_1_blocks());
+                output_ptr = reinterpret_cast<float *>(out_q16->mutable_typed_data());
             }
             else
             {
@@ -274,8 +274,8 @@ namespace llaminar2
             // Q8_1Block is now unified via microkernels::Q8_1Block = llaminar2::Q8_1Block
             llaminar::v2::kernels::FusedAttentionWoParams params;
             params.Q = q_blocks; // Use quantized Q (original or from FP32 conversion)
-            params.K = K_q8->q8_1_blocks();
-            params.V = V_q8->q8_1_blocks();
+            params.K = K_q8->typed_data();
+            params.V = V_q8->typed_data();
             params.Wo = wo_data;
             params.wo_type = wo_type;
             params.output = output_ptr;

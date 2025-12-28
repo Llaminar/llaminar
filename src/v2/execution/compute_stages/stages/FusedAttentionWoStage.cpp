@@ -159,8 +159,8 @@ namespace llaminar2
             if (auto *out_q16 = dynamic_cast<Q16_1Tensor *>(params_.output))
             {
                 // residual_in = residual_out = output tensor (in-place accumulation)
-                q16_params.residual_in = out_q16->q16_1_blocks();
-                q16_params.residual_out = out_q16->mutable_q16_1_blocks();
+                q16_params.residual_in = out_q16->typed_data();
+                q16_params.residual_out = out_q16->mutable_typed_data();
                 LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Residual fusion enabled (in-place Q16_1)");
             }
             else

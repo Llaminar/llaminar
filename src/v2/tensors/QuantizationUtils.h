@@ -173,7 +173,7 @@ namespace llaminar2::quantization
         // Quantize
         if (!quantize_fp32_to_q8_1_buffer(
                 fp32_tensor->data(),
-                q8_tensor->mutable_q8_1_blocks(),
+                q8_tensor->mutable_typed_data(),
                 static_cast<int>(rows),
                 static_cast<int>(cols)))
         {
@@ -207,7 +207,7 @@ namespace llaminar2::quantization
 
         return quantize_fp32_to_q8_1_buffer(
             fp32_data,
-            q8_tensor->mutable_q8_1_blocks(),
+            q8_tensor->mutable_typed_data(),
             rows, cols);
     }
 

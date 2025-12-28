@@ -172,19 +172,24 @@ namespace llaminar2
          * auto& fp32 = tensor.typed_as<FP32Tensor>();
          * float* data = fp32.data();  // Type-safe access
          * @endcode
+         *
+         * @note Uses dynamic_cast due to virtual inheritance. Still fast due to assert
+         * checking the type match before cast.
          */
         template <typename T>
         T &typed_as()
         {
             assert(is<T>() && "ITensor::typed_as<T>(): tensor type mismatch");
-            return static_cast<T &>(*this);
+            // dynamic_cast required for virtual inheritance
+            return dynamic_cast<T &>(*this);
         }
 
         template <typename T>
         const T &typed_as() const
         {
             assert(is<T>() && "ITensor::typed_as<T>(): tensor type mismatch");
-            return static_cast<const T &>(*this);
+            // dynamic_cast required for virtual inheritance
+            return dynamic_cast<const T &>(*this);
         }
 
         /**
@@ -200,17 +205,21 @@ namespace llaminar2
          *     uint16_t* data = bf16->native_data();
          * }
          * @endcode
+         *
+         * @note Uses dynamic_cast due to virtual inheritance in TensorBase hierarchy.
          */
         template <typename T>
         T *try_as()
         {
-            return is<T>() ? static_cast<T *>(this) : nullptr;
+            // dynamic_cast required for virtual inheritance
+            return is<T>() ? dynamic_cast<T *>(this) : nullptr;
         }
 
         template <typename T>
         const T *try_as() const
         {
-            return is<T>() ? static_cast<const T *>(this) : nullptr;
+            // dynamic_cast required for virtual inheritance
+            return is<T>() ? dynamic_cast<const T *>(this) : nullptr;
         }
 
         // =========================================================================

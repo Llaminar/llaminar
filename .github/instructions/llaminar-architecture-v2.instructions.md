@@ -376,6 +376,58 @@ std::unique_ptr<ITensorGemm> createGemm() const;
 std::unique_ptr<ITensorAttention> createAttention() const;
 ```
 
+### 4.1.1 TypedTensorBase and `typed_data()` Pattern
+
+All 27 tensor classes inherit from `TypedTensorBase<Derived, DataType>`, a CRTP base that provides
+**zero-overhead typed access** to native storage:
+
+```cpp
+template<typename Derived, typename DataType>
+class TypedTensorBase {
+public:
+    const DataType* typed_data() const;        // Native type access
+    DataType* mutable_typed_data();            // Mutable native type access
+};
+```
+
+**Usage Pattern** – After `dynamic_cast<>`, use `typed_data()` for consistent access:
+
+```cpp
+// KV cache copy (UnifiedKVCache.cpp)
+template <>
+void UnifiedKVCache<ActivationPrecision::Q8_1>::copy_append_data(
+    Q8_1Tensor *dst, const Q8_1Tensor *src, int offset, int tokens)
+{
+    Q8_1Block *dst_blocks = dst->mutable_typed_data();  // ✅ Unified pattern
+    const Q8_1Block *src_blocks = src->typed_data();
+    std::memcpy(dst_blocks + offset, src_blocks, tokens * sizeof(Q8_1Block));
+}
+
+// GEMM kernel (QuantisedGemmKernel.h)
+if (c_type == TensorType::Q8_1) {
+    auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
+    auto *C_q8 = static_cast<Q8_1Tensor *>(C);
+    return multiply_q8_1_to_q8_1(
+        A_q8->typed_data(),           // ✅ const Q8_1Block*
+        C_q8->mutable_typed_data(),   // ✅ Q8_1Block*
+        m, n, k);
+}
+```
+
+**Supported Types**:
+| Tensor Class | `typed_data()` Returns |
+|--------------|------------------------|
+| `FP32Tensor` | `float*` |
+| `BF16Tensor`, `FP16Tensor` | `uint16_t*` |
+| `Q8_1Tensor` | `Q8_1Block*` |
+| `Q16_1Tensor` | `Q16_1Block*` |
+| `Q8_0Tensor`, `Q4_0Tensor`, etc. | Respective block types |
+
+**Legacy Accessors** (deprecated but still available):
+- `q8_1_blocks()` / `mutable_q8_1_blocks()` → Use `typed_data()` instead
+- `bf16_data()` / `mutable_bf16_data()` → Use `typed_data()` instead
+- `fp16_data()` / `mutable_fp16_data()` → Use `typed_data()` instead
+
 ### 4.2 Tensor Kernel Interfaces
 
 Location: `src/v2/tensors/TensorKernels.h`

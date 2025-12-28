@@ -269,7 +269,7 @@ namespace llaminar2
             return false;
         }
 
-        // Cast to BF16Tensor to access bf16_data() / mutable_bf16_data()
+        // Cast to BF16Tensor to access typed_data() / mutable_typed_data()
         auto *gate_bf16 = dynamic_cast<const BF16Tensor *>(gate);
         auto *up_bf16 = dynamic_cast<const BF16Tensor *>(up);
         auto *output_bf16 = dynamic_cast<BF16Tensor *>(output);
@@ -281,9 +281,9 @@ namespace llaminar2
         }
 
         return apply_bf16(
-            gate_bf16->bf16_data(),
-            up_bf16->bf16_data(),
-            output_bf16->mutable_bf16_data(),
+            gate_bf16->typed_data(),
+            up_bf16->typed_data(),
+            output_bf16->mutable_typed_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
     }
 
@@ -347,7 +347,7 @@ namespace llaminar2
             return false;
         }
 
-        // Cast to FP16Tensor to access fp16_data() / mutable_fp16_data()
+        // Cast to FP16Tensor to access typed_data() / mutable_typed_data()
         auto *gate_fp16 = dynamic_cast<const FP16Tensor *>(gate);
         auto *up_fp16 = dynamic_cast<const FP16Tensor *>(up);
         auto *output_fp16 = dynamic_cast<FP16Tensor *>(output);
@@ -359,9 +359,9 @@ namespace llaminar2
         }
 
         return apply_fp16(
-            gate_fp16->fp16_data(),
-            up_fp16->fp16_data(),
-            output_fp16->mutable_fp16_data(),
+            gate_fp16->typed_data(),
+            up_fp16->typed_data(),
+            output_fp16->mutable_typed_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
     }
 
@@ -429,7 +429,7 @@ namespace llaminar2
             return false;
         }
 
-        // Cast to Q8_1Tensor to access q8_1_blocks() / mutable_q8_1_blocks()
+        // Cast to Q8_1Tensor to access typed_data() / mutable_typed_data()
         auto *gate_q8 = dynamic_cast<const Q8_1Tensor *>(gate);
         auto *up_q8 = dynamic_cast<const Q8_1Tensor *>(up);
         auto *output_q8 = dynamic_cast<Q8_1Tensor *>(output);
@@ -441,9 +441,9 @@ namespace llaminar2
         }
 
         return apply_q8_1(
-            gate_q8->q8_1_blocks(),
-            up_q8->q8_1_blocks(),
-            output_q8->mutable_q8_1_blocks(),
+            gate_q8->typed_data(),
+            up_q8->typed_data(),
+            output_q8->mutable_typed_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
     }
 

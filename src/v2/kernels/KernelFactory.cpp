@@ -251,8 +251,8 @@ namespace llaminar
                         }
 
                         // Get Q8_1 block pointers
-                        llaminar2::Q8_1Block *Q_blocks = Q_q8->mutable_q8_1_blocks();
-                        llaminar2::Q8_1Block *K_blocks = K_q8 ? K_q8->mutable_q8_1_blocks() : nullptr;
+                        llaminar2::Q8_1Block *Q_blocks = Q_q8->mutable_typed_data();
+                        llaminar2::Q8_1Block *K_blocks = K_q8 ? K_q8->mutable_typed_data() : nullptr;
 
                         return kernel_.apply_typed(Q_blocks, K_blocks, position_ids,
                                                    seq_len, n_heads, n_kv_heads, head_dim,
@@ -405,9 +405,9 @@ namespace llaminar
                         }
 
                         // Get Q8_1 block pointers
-                        const llaminar2::Q8_1Block *gate_blocks = gate_q8->q8_1_blocks();
-                        const llaminar2::Q8_1Block *up_blocks = up_q8->q8_1_blocks();
-                        llaminar2::Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
+                        const llaminar2::Q8_1Block *gate_blocks = gate_q8->typed_data();
+                        const llaminar2::Q8_1Block *up_blocks = up_q8->typed_data();
+                        llaminar2::Q8_1Block *output_blocks = output_q8->mutable_typed_data();
 
                         return kernel_.apply_typed(gate_blocks, up_blocks, output_blocks, rows * cols, device_idx);
                     }

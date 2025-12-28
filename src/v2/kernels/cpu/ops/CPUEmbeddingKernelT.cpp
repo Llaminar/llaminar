@@ -226,7 +226,7 @@ namespace llaminar2
                 return false;
             }
             return apply_bf16(embed_data, token_ids, num_tokens, d_model,
-                              bf16_output->mutable_bf16_data(), mpi_ctx, device_idx);
+                              bf16_output->mutable_typed_data(), mpi_ctx, device_idx);
         }
         else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
         {
@@ -241,7 +241,7 @@ namespace llaminar2
                 return false;
             }
             return apply_fp16(embed_data, token_ids, num_tokens, d_model,
-                              fp16_output->mutable_fp16_data(), mpi_ctx, device_idx);
+                              fp16_output->mutable_typed_data(), mpi_ctx, device_idx);
         }
         else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
         {
@@ -256,7 +256,7 @@ namespace llaminar2
                 return false;
             }
             return apply_q8_1(embed_data, token_ids, num_tokens, d_model,
-                              q8_output->mutable_q8_1_blocks(), mpi_ctx, device_idx);
+                              q8_output->mutable_typed_data(), mpi_ctx, device_idx);
         }
         else
         {

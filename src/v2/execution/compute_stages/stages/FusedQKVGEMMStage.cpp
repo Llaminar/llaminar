@@ -76,10 +76,10 @@ namespace llaminar2
 
                 // Pure Q8_1 path: Q8_1 input → Q8_1 output
                 bool success = fused_gemm.execute_q8_1_to_q8_1(
-                    input_q8_1->q8_1_blocks(),
-                    output_q_q8_1->mutable_q8_1_blocks(),
-                    output_k_q8_1->mutable_q8_1_blocks(),
-                    output_v_q8_1->mutable_q8_1_blocks(),
+                    input_q8_1->typed_data(),
+                    output_q_q8_1->mutable_typed_data(),
+                    output_k_q8_1->mutable_typed_data(),
+                    output_v_q8_1->mutable_typed_data(),
                     params_.bias_q, params_.bias_k, params_.bias_v,
                     params_.m, params_.n_q, params_.n_k,
                     params_.k,
@@ -105,9 +105,9 @@ namespace llaminar2
 
                 bool success = fused_gemm.execute_to_q8_1(
                     input_fp32,
-                    output_q_q8_1->mutable_q8_1_blocks(),
-                    output_k_q8_1->mutable_q8_1_blocks(),
-                    output_v_q8_1->mutable_q8_1_blocks(),
+                    output_q_q8_1->mutable_typed_data(),
+                    output_k_q8_1->mutable_typed_data(),
+                    output_v_q8_1->mutable_typed_data(),
                     params_.bias_q, params_.bias_k, params_.bias_v,
                     params_.m, params_.n_q, params_.n_k,
                     params_.k,
@@ -302,6 +302,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

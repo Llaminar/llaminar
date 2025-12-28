@@ -733,9 +733,9 @@ namespace llaminar2
 
         // FP16 path: apply_fp16() with FP16 buffers (in-place)
         return kernel->apply_fp16(
-            this->fp16_data(),
+            this->typed_data(),
             gamma,
-            this->mutable_fp16_data(),
+            this->mutable_typed_data(),
             seq_len, d_model, eps,
             device_idx);
     }
@@ -763,7 +763,7 @@ namespace llaminar2
         // Q is this tensor, K must be FP16 as well
         // Note: K is passed as float* but should actually be FP16
         return kernel->apply_fp16(
-            this->mutable_fp16_data(),       // Q (FP16)
+            this->mutable_typed_data(),      // Q (FP16)
             reinterpret_cast<uint16_t *>(K), // K (FP16)
             position_ids,
             seq_len, n_heads, n_kv_heads, head_dim,
