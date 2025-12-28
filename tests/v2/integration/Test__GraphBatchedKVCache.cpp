@@ -21,7 +21,7 @@
 #include "v2/tensors/UnifiedKVCache.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/models/qwen/Qwen2Graph.h"
-#include "v2/execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "v2/loaders/ModelContext.h"
 #include "v2/utils/MPIContext.h"
 #include "v2/utils/Logger.h"

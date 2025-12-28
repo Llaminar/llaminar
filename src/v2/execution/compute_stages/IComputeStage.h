@@ -196,6 +196,14 @@ namespace llaminar2
         EMBEDDING,
         LM_HEAD,
         FINAL_NORM,
+
+        // KV Cache operations
+        KV_CACHE_APPEND,
+        KV_CACHE_GATHER,
+        ATTENTION_COMPUTE,
+
+        // Quantization
+        QUANTIZE_Q16_1,
     };
 
     /**

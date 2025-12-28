@@ -9,7 +9,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "../../../src/v2/execution/BufferRole.h"
 #include "../../../src/v2/tensors/Tensors.h"
 

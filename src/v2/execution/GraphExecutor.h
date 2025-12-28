@@ -29,7 +29,7 @@
 #pragma once
 
 #include "IGraphExecutor.h"
-#include "ComputeStage.h"
+#include "compute_stages/ComputeStages.h"
 #include "DeviceContext.h"
 #include "WorkDistributor.h"
 #include "GraphBufferManager.h"

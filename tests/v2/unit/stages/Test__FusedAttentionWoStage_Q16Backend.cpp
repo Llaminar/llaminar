@@ -12,7 +12,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/ComputeStages.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "execution/RuntimeConfig.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"

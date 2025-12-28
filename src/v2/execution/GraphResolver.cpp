@@ -15,7 +15,7 @@
 
 #include "GraphResolver.h"
 #include "GraphExecutor.h" // For ComputeGraph
-#include "ComputeStage.h"
+#include "compute_stages/ComputeStages.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../tensors/Tensors.h"

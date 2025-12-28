@@ -39,10 +39,17 @@
 #include "execution/RuntimeConfig.h"
 #include "utils/Logger.h"
 
-using namespace llaminar2;
 using namespace llaminar::v2::kernels;
 using namespace llaminar::v2::kernels::jit;
 using namespace llaminar::v2::kernels::microkernels;
+using namespace llaminar2;
+
+// Explicitly alias to resolve ambiguity between llaminar2::FusedAttentionWoParams and llaminar::v2::kernels::FusedAttentionWoParams
+// This alias shadows both namespace imports when unqualified FusedAttentionWoParams is used
+namespace
+{
+    using FusedAttentionWoParamsKernel = llaminar::v2::kernels::FusedAttentionWoParams;
+}
 
 // ============================================================================
 // Benchmark Configuration
@@ -304,7 +311,7 @@ protected:
         // Benchmark 2: Fused Reference Kernel
         // ====================================================================
         {
-            FusedAttentionWoParams params;
+            FusedAttentionWoParamsKernel params;
             params.Q = Q_blocks.data();
             params.K = K_blocks.data();
             params.V = V_blocks.data();

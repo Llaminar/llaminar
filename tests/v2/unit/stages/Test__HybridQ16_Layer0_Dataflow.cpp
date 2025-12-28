@@ -18,7 +18,7 @@
 #include <memory>
 #include <iomanip>
 
-#include "execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "execution/DeviceContext.h"
 #include "backends/ComputeBackend.h"
 #include "tensors/Tensors.h"

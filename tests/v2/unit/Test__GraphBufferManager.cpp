@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 #include "../../../src/v2/execution/GraphBufferManager.h"
 #include "../../../src/v2/execution/GraphExecutor.h"
-#include "../../../src/v2/execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
 #include "../../../src/v2/utils/MPIContext.h"
 

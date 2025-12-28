@@ -31,7 +31,7 @@
 #include <random>
 #include <vector>
 
-#include "execution/ComputeStages.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "../utils/TestTensorFactory.h"
 
 using namespace llaminar2;

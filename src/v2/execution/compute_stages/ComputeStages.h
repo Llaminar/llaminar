@@ -1,0 +1,52 @@
+/**
+ * @file ComputeStages.h
+ * @brief Convenience header that includes all compute stage types
+ *
+ * This header provides backward compatibility and a single include for
+ * all compute stage definitions. Include this file to get access to all
+ * stage types and the ComputeStageFactory.
+ *
+ * Individual stages can also be included directly from stages/ subfolder:
+ *   #include "execution/compute_stages/stages/GEMMStage.h"
+ *   #include "execution/compute_stages/stages/AttentionWithKVCacheStage.h"
+ */
+
+#pragma once
+
+// Base interface and types
+#include "IComputeStage.h"
+
+// GEMM stages
+#include "stages/GEMMStage.h"
+#include "stages/FusedQKVGEMMStage.h"
+#include "stages/FusedGateUpGEMMStage.h"
+
+// Normalization and position encoding
+#include "stages/RMSNormStage.h"
+#include "stages/RoPEStage.h"
+
+// Attention stages
+#include "stages/AttentionWithKVCacheStage.h"
+#include "stages/KVCacheAppendStage.h"
+#include "stages/KVCacheGatherStage.h"
+#include "stages/AttentionComputeStage.h"
+#include "stages/FusedAttentionWoStage.h"
+
+// FFN and residual
+#include "stages/SwiGLUStage.h"
+#include "stages/ResidualAddStage.h"
+
+// Model-level stages
+#include "stages/EmbeddingStage.h"
+#include "stages/LMHeadStage.h"
+#include "stages/QuantizeToQ16_1Stage.h"
+
+// MPI communication stages
+#include "stages/AllreduceStage.h"
+#include "stages/AllGatherStage.h"
+
+// MoE stages
+#include "stages/MoEStages.h"
+
+// Factory
+#include "ComputeStageFactory.h"

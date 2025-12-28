@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "IComputeStage.h"
+#include "../IComputeStage.h"
 #include <memory>
 
 namespace llaminar2

@@ -34,7 +34,7 @@
 #include "GraphExecutor.h"
 #include "GraphBufferManager.h"
 #include "DeviceContext.h"
-#include "ComputeStage.h" // For StageDumpInfo
+#include "compute_stages/ComputeStages.h" // For StageDumpInfo
 #include <memory>
 #include <unordered_map>
 #include <vector>

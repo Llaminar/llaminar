@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "ComputeStage.h"
+#include "compute_stages/ComputeStages.h"
 #include "DeviceContext.h"
 #include <memory>
 #include <vector>

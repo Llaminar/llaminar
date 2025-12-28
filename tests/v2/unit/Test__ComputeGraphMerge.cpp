@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "../../src/v2/execution/GraphExecutor.h"
-#include "../../src/v2/execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include <algorithm>
 #include <unordered_set>
 

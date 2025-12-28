@@ -26,7 +26,7 @@
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
-#include "execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 

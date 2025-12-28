@@ -528,7 +528,27 @@ add_library(llaminar2_core STATIC
     # Execution framework (hierarchical work distribution)
     execution/WorkDistributor.cpp
     execution/DeviceContext.cpp
-    execution/ComputeStage.cpp
+    # ComputeStage base classes and factory in compute_stages/
+    execution/compute_stages/ComputeStageBase.cpp
+    execution/compute_stages/ComputeStageFactory.cpp
+    # Individual stages in compute_stages/stages/
+    execution/compute_stages/stages/GEMMStage.cpp
+    execution/compute_stages/stages/FusedQKVGEMMStage.cpp
+    execution/compute_stages/stages/FusedGateUpGEMMStage.cpp
+    execution/compute_stages/stages/RMSNormStage.cpp
+    execution/compute_stages/stages/RoPEStage.cpp
+    execution/compute_stages/stages/SwiGLUStage.cpp
+    execution/compute_stages/stages/ResidualAddStage.cpp
+    execution/compute_stages/stages/AllreduceStage.cpp
+    execution/compute_stages/stages/AllGatherStage.cpp
+    execution/compute_stages/stages/MoEStages.cpp
+    execution/compute_stages/stages/AttentionWithKVCacheStage.cpp
+    execution/compute_stages/stages/KVCacheAppendStage.cpp
+    execution/compute_stages/stages/KVCacheGatherStage.cpp
+    execution/compute_stages/stages/AttentionComputeStage.cpp
+    execution/compute_stages/stages/FusedAttentionWoStage.cpp
+    execution/compute_stages/stages/EmbeddingStage.cpp
+    execution/compute_stages/stages/LMHeadStage.cpp
     execution/GraphExecutor.cpp
     execution/GraphBufferManager.cpp
     execution/GraphResolver.cpp

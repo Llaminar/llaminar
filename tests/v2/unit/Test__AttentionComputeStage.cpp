@@ -13,7 +13,7 @@
 #include <cmath>
 #include <memory>
 
-#include "v2/execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/MPIContext.h"

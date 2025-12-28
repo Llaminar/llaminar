@@ -15,7 +15,7 @@
 #include "../mocks/MockComputeStage.h"
 #include "execution/ILayerExecutor.h"
 #include "execution/LayerExecutor.h"
-#include "execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;

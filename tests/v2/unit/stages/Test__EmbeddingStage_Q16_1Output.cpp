@@ -24,7 +24,7 @@
 #include <memory>
 #include <numeric>
 
-#include "execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 

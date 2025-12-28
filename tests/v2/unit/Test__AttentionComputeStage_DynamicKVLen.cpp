@@ -13,7 +13,7 @@
 #include <memory>
 #include <cmath>
 
-#include "execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
 #include "tensors/UnifiedKVCache.h"
 

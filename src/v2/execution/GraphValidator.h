@@ -27,7 +27,7 @@
 
 #include "BufferRole.h"
 #include "GraphExecutor.h"
-#include "ComputeStage.h"
+#include "compute_stages/ComputeStages.h"
 #include "../utils/Logger.h"
 
 #include <string>

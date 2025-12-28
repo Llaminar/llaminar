@@ -267,7 +267,7 @@ TEST_F(JitQ16ParityTest, Exp2Softmax_BasicCorrectness)
 
     // Exp2 fixed-point softmax via JIT stub
     std::vector<int16_t> exp2_weights(SEQ_LEN);
-    int32_t sum_out = 0;
+    int64_t sum_out = 0;
 
     JitExp2FixedSoftmaxEmitter::compute_reference(
         int32_scores.data(), exp2_weights.data(), SEQ_LEN, 1.0f / 256.0f, &sum_out);
@@ -302,23 +302,40 @@ TEST_F(JitQ16ParityTest, Exp2Softmax_WeightsSumToOne)
     }
 
     std::vector<int16_t> weights(SEQ_LEN);
-    int32_t sum_out = 0;
+    int64_t sum_out = 0;
 
     JitExp2FixedSoftmaxEmitter::compute_reference(
         int32_scores.data(), weights.data(), SEQ_LEN, 1.0f / 256.0f, &sum_out);
 
-    // Sum of weights should be close to 32767 (represents 1.0 in Q15 format)
-    int32_t sum_weights = 0;
+    // compute_reference returns UNNORMALIZED weights + their sum.
+    // The caller is responsible for normalization (e.g., in online softmax).
+    // Verify that sum_out matches the actual sum of weights.
+    int64_t sum_weights = 0;
     for (int i = 0; i < SEQ_LEN; ++i)
     {
         sum_weights += weights[i];
     }
 
     std::cout << "Exp2Softmax weights sum: " << sum_weights
+              << ", sum_out: " << sum_out << std::endl;
+
+    // Verify sum_out matches actual sum
+    EXPECT_EQ(sum_weights, sum_out);
+
+    // Verify that after normalization, weights would sum to ~32767
+    // Normalized weight[i] = weight[i] * 32767 / sum_weights
+    int64_t normalized_sum = 0;
+    for (int i = 0; i < SEQ_LEN; ++i)
+    {
+        int64_t normalized = (static_cast<int64_t>(weights[i]) * 32767) / sum_weights;
+        normalized_sum += normalized;
+    }
+
+    std::cout << "After normalization, weights would sum to: " << normalized_sum
               << " (expected ~32767)" << std::endl;
 
-    // Allow some tolerance due to rounding
-    EXPECT_NEAR(sum_weights, 32767, 1000);
+    // Allow some tolerance due to integer rounding
+    EXPECT_NEAR(normalized_sum, 32767, 100);
 }
 
 // ============================================================================
@@ -353,14 +370,23 @@ TEST_F(JitQ16ParityTest, PVAccumulate_BasicCorrectness)
         }
     }
 
-    // JIT stub P×V accumulation (FP32 output)
-    std::vector<float> jit_context(HEAD_DIM, 0.0f);
+    // JIT stub P×V accumulation (INT64 accumulators)
+    std::vector<int64_t> jit_accumulators(HEAD_DIM, 0);
     JitPVAccumulateEmitter::compute_reference(
         weights.data(),
         V_blocks.data(),
         BLOCKS_PER_HEAD,
         KV_LEN,
-        jit_context.data());
+        jit_accumulators.data());
+
+    // Convert INT64 accumulators to FP32 for comparison
+    // Scale by 1/(32767 * V_scale) where V_scale is per-block
+    // For simplicity, just convert to FP32 and normalize
+    std::vector<float> jit_context(HEAD_DIM);
+    for (int d = 0; d < HEAD_DIM; ++d)
+    {
+        jit_context[d] = static_cast<float>(jit_accumulators[d]);
+    }
 
     // Compute ground truth: manual FP32 dequant + weighted sum
     std::vector<float> V_fp32(KV_LEN * HEAD_DIM);
@@ -369,10 +395,16 @@ TEST_F(JitQ16ParityTest, PVAccumulate_BasicCorrectness)
     std::vector<float> manual_context(HEAD_DIM, 0.0f);
     for (int kv = 0; kv < KV_LEN; ++kv)
     {
-        float w = static_cast<float>(weights[kv]) / 32767.0f;
+        // Use raw INT16 weight (not normalized to 1.0) to match JIT accumulator behavior
+        float w = static_cast<float>(weights[kv]);
         for (int d = 0; d < HEAD_DIM; ++d)
         {
-            manual_context[d] += w * V_fp32[kv * HEAD_DIM + d];
+            // dequantizeQ16 produces scaled FP32, but JIT uses raw INT16 V values
+            // We need to compare at the INT64 accumulator level
+            int b = d / 32;
+            int i = d % 32;
+            const Q16_1Block &block = V_blocks[kv * BLOCKS_PER_HEAD + b];
+            manual_context[d] += w * static_cast<float>(block.qs[i]);
         }
     }
 
@@ -431,8 +463,8 @@ TEST_F(JitQ16ParityTest, WoProjection_INT16Requantization)
 
 TEST_F(JitQ16ParityTest, FusedPipeline_ConfigValidation)
 {
-    // Test that JitQ16FusedAttentionConfig computes correct values
-    JitQ16FusedAttentionConfig config;
+    // Test that JitQ16AttentionConfig computes correct values
+    JitQ16AttentionConfig config;
     config.seq_len_q = 1;
     config.kv_len = 128;
     config.num_heads = 14;

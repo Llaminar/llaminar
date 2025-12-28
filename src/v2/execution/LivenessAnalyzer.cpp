@@ -7,7 +7,7 @@
 
 #include "LivenessAnalyzer.h"
 #include "GraphExecutor.h"
-#include "ComputeStage.h"
+#include "compute_stages/ComputeStages.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 #include <unordered_set>

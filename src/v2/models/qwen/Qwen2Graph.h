@@ -25,7 +25,7 @@
 
 #include "../../execution/GraphExecutor.h"
 #include "../../execution/GraphBufferManager.h"
-#include "../../execution/ComputeStage.h"
+#include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/DeviceContext.h"
 #include "../../execution/ExecutionPolicy.h"
 #include "../../execution/IGraphBuilder.h"

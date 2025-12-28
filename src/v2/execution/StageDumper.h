@@ -47,7 +47,7 @@
 
 #pragma once
 
-#include "ComputeStage.h"
+#include "compute_stages/ComputeStages.h"
 #include "../utils/DebugEnv.h"
 #include "../tensors/BlockStructures.h"
 

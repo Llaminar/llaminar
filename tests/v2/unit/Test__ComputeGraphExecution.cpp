@@ -17,7 +17,7 @@
 #include <gtest/gtest.h>
 #include "../mocks/MockComputeStage.h"
 #include "execution/LayerExecutor.h"
-#include "execution/ComputeStage.h"
+#include "execution/compute_stages/ComputeStages.h"
 #include "execution/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include <algorithm>
