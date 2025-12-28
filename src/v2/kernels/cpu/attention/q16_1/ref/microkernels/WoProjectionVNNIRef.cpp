@@ -5,6 +5,9 @@
  * ALL INTEGER DOMAIN - maximum precision by using INT16 context (not INT8).
  * Weights are sign-extended from INT8 to INT16 at runtime (lossless).
  * Output is Q16_1 format for direct native Q16_1 + Q16_1 residual addition.
+ *
+ * Pipeline: INT32 context → requant → INT16 → VPDPWSSD → INT32 → requant → Q16_1
+ * Then: Q16_1(projection) + Q16_1(residual) → Q16_1 (via simd::q16_1_add_q16_1)
  */
 
 #include "WoProjectionVNNIRef.h"

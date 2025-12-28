@@ -1,9 +1,10 @@
 # Q16_1 Integer-Domain Fused Attention Kernel
 
-**Status**: Design Phase  
+**Status**: Design Phase (JIT Scaffolding Complete, Fused Residual Add Implemented)  
 **Created**: 2025-12-27  
+**Updated**: 2025-12-28  
 **Author**: Llaminar Team  
-**Related**: [IndexSoftmax Test](../../tests/v2/unit/Test__IndexSoftmax.cpp), [IntAttention Paper](https://arxiv.org/abs/2511.21513)
+**Related**: [Exp2FixedSoftmax JIT](../../src/v2/kernels/cpu/attention/q16_1/jit/JitExp2FixedSoftmax.h), [IntAttention Paper](https://arxiv.org/abs/2511.21513)
 
 ---
 
@@ -17,7 +18,7 @@
 6. [Fused Kernel Design](#fused-kernel-design)
 7. [Development Methodology](#development-methodology)
 8. [Component Specifications](#component-specifications)
-9. [IndexSoftmax Integration](#indexsoftmax-integration)
+9. [Exp2FixedSoftmax Integration](#exp2fixedsoftmax-integration)
 10. [Q16 vs Q8 Precision Analysis](#q16-vs-q8-precision-analysis)
 11. [Implementation Phases](#implementation-phases)
 12. [Testing Strategy](#testing-strategy)
@@ -33,7 +34,7 @@
 This document describes the design for a **fully integer-domain FA2-style fused attention kernel** operating on Q16_1 tensors. The kernel fuses:
 
 1. **Q×K^T dot products** (tiled, online softmax)
-2. **Index16Softmax** (LUT-based integer softmax)
+2. **Exp2FixedSoftmax** (256-entry LUT-based integer softmax using exp2 approximation)
 3. **P×V accumulation** (weighted value sum)
 4. **Wo projection** (streaming weight repack)
 5. **Residual add** (Q16_1 output)
@@ -50,10 +51,10 @@ This document describes the design for a **fully integer-domain FA2-style fused 
 | Weights | Must be INT16 | Values >32767 interpreted as negative! |
 
 **Design Implications:**
-- **Index16Softmax outputs INT16** weights in range `[0, 32767]` (not UINT16)
+- **Exp2FixedSoftmax outputs INT16** weights in range `[0, 32767]` (not UINT16)
 - **P×V uses INT32 accumulators** (not INT64) to match VPDPWSSD output
 - **LUT max value = 32767** (15 bits precision, always non-negative)
-- **FP32 only at final normalization** (after all integer accumulation)
+- **FP32 only for scale factors** — data stays quantized (INT16/INT32) throughout
 
 ### VNNI Instruction Usage in Q16 Pipeline
 
@@ -93,7 +94,7 @@ VPDPWSSD is used **only** for P×V where both operands are runtime activations (
 1. **Single fused kernel** — FA2-style tiling, not separate microkernels
 2. **All-integer dataflow** — No FP32 dequantization until output
 3. **Q16_1 precision preservation** — 16-bit integers throughout
-4. **Index16Softmax** — INT16 LUT-based softmax (32767 levels, VNNI-compatible)
+4. **Exp2FixedSoftmax** — 256-entry LUT for exp2 approximation, INT16 output [0, 32767]
 5. **INT32 accumulators** — Match VPDPWSSD hardware output width
 6. **Wo + Residual fusion** — Complete attention block in one kernel call
 7. **Scalar-first development** — Reference implementation before JIT
@@ -169,12 +170,12 @@ The current `HybridQ16` attention mode achieves only **0.799 cosine similarity**
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
 │  ║      ┌────────────────────────────────────────────────────────────┐  ║   │
-│  ║      │ STEP 2: Online Index16Softmax                               │  ║   │
+│  ║      │ STEP 2: Online Exp2FixedSoftmax                             │  ║   │
 │  ║      │   m_new = max(m, rowmax(S))                                │  ║   │
-│  ║      │   P[Br, Bc] = Index16Softmax(S, m_new) → INT16             │  ║   │
-│  ║      │   (VNNI: weights must be signed INT16 in [0, 32767])       │  ║   │
-│  ║      │   l_new = l × exp_ratio + rowsum(P)                        │  ║   │
-│  ║      │   O_acc = O_acc × exp_ratio (rescale previous accum)       │  ║   │
+│  ║      │   P[Br, Bc] = Exp2FixedSoftmax(S, m_new) → INT16           │  ║   │
+│  ║      │   (Uses 256-entry exp2 LUT, outputs INT16 in [0, 32767])   │  ║   │
+│  ║      │   l_new = l × exp2_ratio + rowsum(P)                       │  ║   │
+│  ║      │   O_acc = O_acc × exp2_ratio (rescale previous accum)      │  ║   │
 │  ║      └────────────────────────────────────────────────────────────┘  ║   │
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
@@ -192,10 +193,10 @@ The current `HybridQ16` attention mode achieves only **0.799 cosine similarity**
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
 │  ║    ┌──────────────────────────────────────────────────────────────┐  ║   │
-│  ║    │ STEP 5: Wo Projection (FP32 context → Q8_1 → VNNI GEMM)      │  ║   │
-│  ║    │   context_q8_1 = quantize_q8_1(O)  (per-block quantization) │  ║   │
-│  ║    │   proj[d_model] = context_q8_1 × Wo_packed  (vpdpbusd)      │  ║   │
-│  ║    │   (Wo is INT8 VNNI-packed, uses existing GEMM infrastructure)│  ║   │
+│  ║    │ STEP 5: Wo Projection (INT32 context → INT16 → VPDPWSSD)     │  ║   │
+│  ║    │   context_int16 = requant(O_int32)  (INT32 → INT16)         │  ║   │
+│  ║    │   proj[d_model] = context_int16 × Wo_int16  (vpdpwssd)      │  ║   │
+│  ║    │   (Wo is INT8 sign-extended to INT16 at runtime)            │  ║   │
 │  ║    └──────────────────────────────────────────────────────────────┘  ║   │
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
@@ -256,7 +257,7 @@ The Q16 fused attention kernel operates on a three-level cache hierarchy. We use
 │  │ • Register spill area for ZMM registers                              │    │
 │  │ • Current Q/K/V block being processed (Q16_1 blocks)                │    │
 │  │ • Score accumulator tile (S[Br, Bc_micro] or s[Bc_micro] for decode)│    │
-│  │ • Index16Softmax LUT (256 bytes)                                    │    │
+│  │ • Exp2FixedSoftmax LUT (1KB: 256 × 4-byte entries)                   │    │
 │  │ • Active softmax state (m, l per row)                               │    │
 │  │                                                                      │    │
 │  │ Prefetch: PREFETCHT0 (non-temporal to L1)                           │    │
@@ -402,7 +403,7 @@ FA2 Prefill processes in tiles [Br × Bc]. The key is to **fit all working data 
 │  │ ════════════════ │  K tile[Bc, head_dim]: 16KB (Bc=64)                    │
 │  │ Working: ~58KB   │  V tile[Bc, head_dim]: 16KB                            │
 │  │                  │  S tile[Br, Bc]: 4KB (INT32)                           │
-│  │                  │  P tile[Br, Bc]: 2KB (UINT16)                          │
+│  │                  │  P tile[Br, Bc]: 2KB (INT16)                           │
 │  │                  │  O_acc[Br, head_dim]: 16KB (INT64)                     │
 │  └────────┬─────────┘                                                        │
 │           │                                                                  │
@@ -586,7 +587,7 @@ void Q16AttentionJit::configure() {
 | **K tile** | L1 (streaming) | L2 | Prefetched from L3/DRAM |
 | **V tile** | L1 (streaming) | L2 | Loaded with K |
 | **S scores** | L1 (micro-tile) | L2 (S tile) | INT32 |
-| **P weights** | L1 (micro-tile) | L2 (P tile) | UINT16 |
+| **P weights** | L1 (micro-tile) | L2 (P tile) | INT16 |
 | **O accumulator** | L2 | L2 | INT64, head_dim sized |
 | **Softmax state** | Registers | L1 | (m, l) per row |
 | **Index16 LUT** | L1 | L1 | 256 bytes |
@@ -640,8 +641,8 @@ The Q16 attention JIT kernel uses the **Register Guard** system from `src/v2/ker
 |----------|-------|----------|-------|
 | zmm26 | `Const128` | 128.0f broadcast | Q16 dequant: val × d / 128 |
 | zmm27 | `ConstScale` | 1/√head_dim | Attention scale factor |
-| zmm28 | `ConstClipC` | 6.6f broadcast | Index16Softmax clip threshold |
-| zmm29 | `ConstLUTStep` | 31.0f / 6.6f | LUT index calculation |
+| zmm28 | `ConstLog2E` | 1.4427f broadcast | Exp2FixedSoftmax: log₂(e) conversion |
+| zmm29 | `Const256` | 256.0f broadcast | Exp2FixedSoftmax: fractional LUT index |
 | zmm30 | `ConstOne` | 1.0f broadcast | Various normalization |
 | zmm31 | `ConstZero` | 0.0f broadcast | Initialization, masking |
 
@@ -688,24 +689,32 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Index16Softmax
+#### Exp2FixedSoftmax
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  INDEX16 SOFTMAX MICROKERNEL                                                │
-│  Purpose: Convert INT32 scores → UINT16 weights via LUT                     │
+│  EXP2 FIXED-POINT SOFTMAX MICROKERNEL                                       │
+│  Purpose: Convert INT32 scores → INT16 weights via exp2 LUT approximation  │
 ├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ALGORITHM: For each score, compute exp2(-delta * beta) where:              │
+│    delta = max_score - score                                                │
+│    beta = alpha * log2(e)                                                   │
+│    t = delta * beta → decompose into integer + fractional parts            │
+│    result = LUT[frac] >> int_part                                           │
+│                                                                              │
+│  LUT: 256-entry table for 2^(-frac/256) with 30-bit precision              │
 │                                                                              │
 │  INPUTS (read, then overwritten):                                           │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
 │  │ Scratch0-3 (zmm20-23) │ INT32 scores from Q16DotProduct               │ │
-│  │                       │ Consumed and overwritten with UINT16 weights  │ │
+│  │                       │ Consumed and overwritten with INT16 weights   │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  OUTPUTS (overwrite input registers):                                       │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Scratch0-3 (zmm20-23) │ UINT16 weights: LUT[max - score]              │ │
-│  │                       │ Packed: 32 UINT16 per ZMM register            │ │
+│  │ Scratch0-3 (zmm20-23) │ INT16 weights in range [0, 32767]             │ │
+│  │                       │ (VNNI-compatible signed INT16)                │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  STATE (persistent across KV iterations - FA2 only):                        │
@@ -718,14 +727,14 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │                                                                              │
 │  SCRATCH (internal temporaries):                                            │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Scratch4-5 (zmm24-25) │ Delta computation, LUT index mapping          │ │
-│  │ Input4-7 (zmm12-15)   │ LUT entries (loaded from memory)              │ │
+│  │ Scratch4-5 (zmm24-25) │ Delta computation, exp2 decomposition         │ │
+│  │ Input4-7 (zmm12-15)   │ LUT entries (256 × 4B = 1KB, L1 resident)     │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  CONSTANTS (read-only):                                                     │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ ConstClipC (zmm28)    │ c = 6.6 clipping threshold                    │ │
-│  │ ConstLUTStep (zmm29)  │ 31 / c for index calculation                  │ │
+│  │ ConstLog2E (zmm28)    │ log2(e) ≈ 1.4427 for ln→log2 conversion      │ │
+│  │ Const256 (zmm29)      │ 256.0 for fractional index calculation       │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  FLASH DECODE vs FA2 PREFILL:                                               │
@@ -745,7 +754,7 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │                                                                              │
 │  INPUTS (read-only):                                                        │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Scratch0-3 (zmm20-23) │ UINT16 weights from Index16Softmax            │ │
+│  │ Scratch0-3 (zmm20-23) │ INT16 weights from Exp2FixedSoftmax           │ │
 │  │                       │ 4 KV positions × 32 weights (though only 1    │ │
 │  │                       │ weight per KV position actually used)         │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
@@ -791,8 +800,8 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │                                                                              │
 │  INPUTS (read-only):                                                        │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Input0-7 (zmm8-15)  │ O_norm: Normalized attention output (FP32)      │ │
-│  │                     │ 8 regs × 16 FP32 = 128 elements (head_dim)      │ │
+│  │ Input0-7 (zmm8-15)  │ O_int32: INT32 context from P×V accumulation    │ │
+│  │                     │ Requantized to INT16 before VPDPWSSD multiply   │ │
 │  │                     │ Concatenated from all heads: [n_heads×head_dim] │ │
 │  │                     │ For models with input_dim > 128, reload in tiles│ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
@@ -803,10 +812,11 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │  │                       │ One output element per row of Wo              │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
-│  OUTPUTS (write to memory):                                                 │
+│  OUTPUTS (Q16_1 projection written to memory):                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Accum0-3 (zmm0-3)   │ proj[4]: 4 output elements accumulated          │ │
-│  │                     │ Stream out to memory in chunks of 4             │ │
+│  │ Output buffer        │ proj[d_model]: Q16_1 projection blocks         │ │
+│  │                      │ INT32 accumulator → requant → Q16_1            │ │
+│  │                      │ Processed in chunks of 32 elements (1 block)   │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  SCRATCH (internal temporaries):                                            │
@@ -820,6 +830,10 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │  │ Const128 (zmm26)      │ Q8_0 dequant: val / 127.0 (or similar)        │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
+│  ALL-INTEGER OUTPUT: This microkernel outputs Q16_1 blocks to memory.      │
+│  The subsequent Q16_1 + Q16_1 residual add uses simd::q16_1_add_q16_1()    │
+│  which is a proven all-integer operation (dequant, add, requant).          │
+│                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -827,36 +841,40 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  RESIDUAL ADD Q16 MICROKERNEL                                               │
-│  Purpose: output_q16 = residual_q16 + projection_fp32                       │
+│  RESIDUAL ADD Q16 (via simd::q16_1_add_q16_1)                               │
+│  Purpose: output_q16 = residual_q16 + projection_q16 (ALL INTEGER)         │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  INPUTS (read from memory):                                                 │
+│  This is NOT a standalone microkernel - uses SIMDHelpers.h::q16_1_add_q16_1 │
+│                                                                              │
+│  ALGORITHM (per Q16_1 block of 32 elements):                                │
+│  1. Load Q16_1 projection block (scale_p, qs_p[32]) from Wo output         │
+│  2. Load Q16_1 residual block (scale_r, qs_r[32]) from residual buffer     │
+│  3. Dequant both to FP32: val_p = qs_p * scale_p, val_r = qs_r * scale_r  │
+│  4. Add in FP32: sum = val_p + val_r                                       │
+│  5. Find max_abs for new output scale                                       │
+│  6. Requant to Q16_1: scale_out = max_abs/32767, qs_out = round(sum/scale) │
+│  7. Store Q16_1 output block (in-place to residual buffer)                 │
+│                                                                              │
+│  KEY POINT: The "FP32" here is just for scale reconciliation during        │
+│  dequant/requant. The DATA stays quantized (INT16) on both sides.          │
+│  This is a proven all-integer pattern from SIMDHelpers.h.                  │
+│                                                                              │
+│  INPUTS:                                                                    │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Input0-3 (zmm8-11)  │ Residual Q16_1 blocks: dequantized FP32         │ │
-│  │                     │ 4 blocks × 32 elements = 128 (d_model chunk)    │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Input4-7 (zmm12-15) │ Projection FP32 from Wo (same chunk)            │ │
+│  │ projection_q16      │ Q16_1 output from WoProjection [d_model/32 blks] │ │
+│  │ residual_q16        │ Q16_1 residual from previous layer [d_model/32]  │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
-│  OUTPUTS (write to memory):                                                 │
+│  OUTPUT (in-place to residual buffer):                                      │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Accum0-3 (zmm0-3)   │ Sum: residual + projection (FP32)               │ │
-│  │                     │ Then quantized back to Q16_1 and stored         │ │
+│  │ residual_q16        │ Q16_1 output = residual + projection             │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
-│  SCRATCH (internal temporaries):                                            │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Scratch0-3 (zmm20-23) │ Find max for scale, quantization temps        │ │
-│  │ Scratch4-5 (zmm24-25) │ Scale computation, rounding                   │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  CONSTANTS (read-only):                                                     │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Const128 (zmm26)      │ Quantization: scale = max / 32767             │ │
-│  │ ConstOne (zmm30)      │ Rounding: add 0.5 before truncation           │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
+│  IMPLEMENTATION: simd::q16_1_add_q16_1(residual, projection, output, n)    │
+│  - AVX512 optimized with vectorized dequant/add/requant                    │
+│  - Processes 32 elements (1 Q16_1 block) at a time                         │
+│  - In-place operation: output can alias residual                           │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -882,8 +900,8 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │  │   Input0-3 (Q, read-only) × K[kv:kv+4] → Scratch0-3 (scores)           │ │
 │  │   K loaded via Input4-7 (streaming)                                    │ │
 │  ├────────────────────────────────────────────────────────────────────────┤ │
-│  │ STEP 2: Softmax (Index16Softmax)                                       │ │
-│  │   Scratch0-3 (scores) → Scratch0-3 (UINT16 weights)                    │ │
+│  │ STEP 2: Softmax (Exp2FixedSoftmax)                                     │ │
+│  │   Scratch0-3 (scores) → Scratch0-3 (INT16 weights [0, 32767])          │ │
 │  │   Update m, l for normalization                                        │ │
 │  ├────────────────────────────────────────────────────────────────────────┤ │
 │  │ STEP 3: P×V (PVAccumulate)                                             │ │
@@ -894,8 +912,8 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │                              ▼ (repeat for all KV)                           │
 │  FINALIZATION:                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ O_norm = Accum0-7 / l × d_v_scale → Input0-7                           │ │
-│  │   (Normalize INT64 accumulators to FP32 attention output)              │ │
+│  │ O_int32 = Accum0-7 / weight_sum → Input0-7 (INT32 context)             │ │
+│  │   (Normalize INT64 accumulators to INT32 context for Wo projection)    │ │
 │  ├────────────────────────────────────────────────────────────────────────┤ │
 │  │ STEP 4: Wo Projection (WoProjection)                                   │ │
 │  │   Input0-7 (O_norm) × Wo → proj (to memory via Accum0-3)               │ │
@@ -928,7 +946,7 @@ Each microkernel declares its register usage. The JIT kernel orchestrates handof
 │    │                                                                      │ │
 │    │   For kv in KV tile (process 4 at a time):                           │ │
 │    │     STEP 1: Q×K^T → Scratch0-3 (4 scores)                            │ │
-│    │     STEP 2: Index16Softmax → Scratch0-3 (4 weights)                  │ │
+│    │     STEP 2: Exp2FixedSoftmax → Scratch0-3 (4 weights [0, 32767])     │ │
 │    │             Update StateZone for online softmax                      │ │
 │    │     STEP 3: P×V → Accum0-7 (accumulate for this Q row)               │ │
 │    │                                                                      │ │
@@ -985,9 +1003,9 @@ void emit_q16_dot_product(Xbyak::CodeGenerator& gen, RegisterTracker& tracker) {
 
 ## FA2-Style Tiled Algorithm
 
-### Online Softmax with Index16Softmax
+### Online Softmax with Exp2FixedSoftmax
 
-The key challenge is combining FA2's online softmax rescaling with our integer-domain Index16Softmax. Here's the approach:
+The key challenge is combining FA2's online softmax rescaling with our integer-domain Exp2FixedSoftmax. Here's the approach:
 
 ```
 Standard FA2 Online Softmax (FP32):
@@ -996,12 +1014,18 @@ Standard FA2 Online Softmax (FP32):
   l_new = l_old × exp(m_old - m_new) + rowsum(P)
   O = O × exp(m_old - m_new) + P × V
 
-Our Integer Adaptation:
-  m_new = max(m_old, rowmax(S))           // INT32 max tracking
-  P = Index16Softmax(S, m_new)            // UINT16 via LUT
-  exp_ratio = LUT[m_old - m_new]          // Integer rescale factor
-  l_new = (l_old × exp_ratio) / 65535 + rowsum(P)
-  O = (O × exp_ratio) / 65535 + P × V
+Our Integer Adaptation (using exp2 approximation):
+  m_new = max(m_old, rowmax(S))             // INT32 max tracking
+  P = Exp2FixedSoftmax(S, m_new)            // INT16 weights via 256-entry LUT
+  exp2_ratio = LUT[m_old - m_new]           // Integer rescale factor (exp2)
+  l_new = (l_old × exp2_ratio) >> shift + rowsum(P)
+  O = (O × exp2_ratio) >> shift + P × V
+
+Algorithm: exp2(-delta * beta) where beta = alpha * log2(e)
+  1. delta = max_score - score
+  2. t = delta * beta
+  3. Decompose t into integer (ip) and fractional (frac) parts
+  4. result = LUT[frac] >> ip (256-entry LUT with 30-bit precision)
 ```
 
 ### Rescaling in Integer Domain
@@ -1013,9 +1037,9 @@ The tricky part is the `exp(m_old - m_new)` rescaling. Options:
 - Simpler, avoids repeated rescaling
 - Slightly less numerically stable for very long sequences
 
-**Option B: Integer Rescale LUT**
-- Use same Index16Softmax LUT for rescaling
-- `exp_ratio = LUT[delta_m_index]` where delta_m = m_old - m_new
+**Option B: Integer Rescale via Exp2 LUT**
+- Use same Exp2FixedSoftmax LUT for rescaling
+- `exp2_ratio = LUT[delta_m_frac] >> delta_m_int` where delta_m = m_old - m_new
 - More FA2-faithful but adds complexity
 
 **Option C: FP32 Rescaling**
@@ -1068,11 +1092,11 @@ The Q16 fused attention kernel must handle two fundamentally different execution
 │                          │                                                   │
 │                          ▼                                                   │
 │      ┌────────────────────────────────────────────────────────────────┐    │
-│      │ STEP 2: Batched Index16Softmax                                 │    │
-│      │   P[Br, Bc] = Index16Softmax(S, m_tile)                       │    │
+│      │ STEP 2: Batched Exp2FixedSoftmax                               │    │
+│      │   P[Br, Bc] = Exp2FixedSoftmax(S, m_tile)                     │    │
 │      │   • Per-row max tracking (Br rows)                            │    │
-│      │   • Vectorized LUT lookup (vpgatherdd)                        │    │
-│      │   • Output: Br × Bc UINT16 weights                            │    │
+│      │   • 256-entry exp2 LUT lookup (vpgatherdd)                    │    │
+│      │   • Output: Br × Bc INT16 weights [0, 32767]                  │    │
 │      └────────────────────────────────────────────────────────────────┘    │
 │                          │                                                   │
 │                          ▼                                                   │
@@ -1080,7 +1104,7 @@ The Q16 fused attention kernel must handle two fundamentally different execution
 │      │ STEP 3: Batched PV Accumulation (GEMM-style)                   │    │
 │      │   O_tile[Br, head_dim] += P[Br, Bc] × V_tile[Bc, head_dim]    │    │
 │      │   • V_tile loaded once, reused across Br queries               │    │
-│      │   • UINT16 × INT16 → INT64 accumulation                       │    │
+│      │   • INT16 × INT16 → INT64 accumulation                        │    │
 │      └────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
 │    end kv_tile loop                                                         │
@@ -1134,10 +1158,10 @@ The Q16 fused attention kernel must handle two fundamentally different execution
 │                          │                                                   │
 │                          ▼                                                   │
 │    ┌────────────────────────────────────────────────────────────────────┐   │
-│    │ STEP 2: Online Index16Softmax (single row)                         │   │
-│    │   p[Bc] = Index16Softmax(s, m)                                     │   │
+│    │ STEP 2: Online Exp2FixedSoftmax (single row)                       │   │
+│    │   p[Bc] = Exp2FixedSoftmax(s, m)                                   │   │
 │    │   • Single max tracker (scalar m)                                  │   │
-│    │   • Vectorized LUT lookup                                          │   │
+│    │   • 256-entry exp2 LUT lookup                                      │   │
 │    │   • Update running softmax state (m, l)                            │   │
 │    └────────────────────────────────────────────────────────────────────┘   │
 │                          │                                                   │
@@ -1183,39 +1207,35 @@ Given the fundamental differences, we define **separate microkernel variants** f
 
 ```
 src/v2/kernels/cpu/attention/q16_1/
-├── ref/
-│   ├── Q16FusedAttentionRef.h           # Common interface
-│   ├── Q16FusedAttentionRefPrefill.cpp  # Prefill: GEMM-centric
-│   └── Q16FusedAttentionRefDecode.cpp   # Decode: GEMV-centric
+├── ref/                                    # Scalar reference implementation
+│   ├── Q16FusedAttentionRef.h             # Scalar reference header
+│   ├── Q16FusedAttentionRef.cpp           # Scalar reference orchestrator
+│   └── microkernels/                       # Reference microkernel implementations
+│       ├── Q16DotProductRef.h              # Q×K^T dot product
+│       ├── Q16DotProductRef.cpp
+│       ├── Exp2FixedSoftmaxRef.h           # exp2 LUT-based softmax
+│       ├── Exp2FixedSoftmaxRef.cpp
+│       ├── PVAccumulateRef.h               # P×V weighted accumulation
+│       ├── PVAccumulateRef.cpp
+│       ├── WoProjectionVNNIRef.h           # Wo projection → Q16_1 output
+│       ├── WoProjectionVNNIRef.cpp         # INT32 → requant → Q16_1
+│       ├── Int8RequantRef.h                # INT16→INT8 requantization
+│       └── Int8RequantRef.cpp
 │
-└── jit/
-    ├── Q16FusedAttentionJit.h           # Dispatcher
-    ├── Q16FusedAttentionJit.cpp
-    │
-    └── microkernels/
-        │
-        ├── prefill/                      # Prefill-specific (GEMM)
-        │   ├── Q16DotProductGemm.h      # Batched QK: [Br,d] × [Bc,d]^T
-        │   ├── Q16DotProductGemm.cpp
-        │   ├── Index16SoftmaxBatched.h  # Multi-row softmax
-        │   ├── Index16SoftmaxBatched.cpp
-        │   ├── PVAccumulateGemm.h       # Batched PV: [Br,Bc] × [Bc,d]
-        │   └── PVAccumulateGemm.cpp
-        │
-        ├── decode/                       # Decode-specific (GEMV)
-        │   ├── Q16DotProductGemv.h      # Single-row QK: [1,d] × [Bc,d]^T
-        │   ├── Q16DotProductGemv.cpp
-        │   ├── Index16SoftmaxSingle.h   # Single-row softmax
-        │   ├── Index16SoftmaxSingle.cpp
-        │   ├── PVAccumulateGemv.h       # Streaming PV: [1,Bc] × [Bc,d]
-        │   └── PVAccumulateGemv.cpp
-        │
-        └── shared/                       # Shared microkernels
-            ├── WoProjectionMicrokernel.h   # Wo: [d_model] or [Br,d_model]
-            ├── WoProjectionMicrokernel.cpp
-            ├── ResidualAddMicrokernel.h    # Residual fusion
-            └── ResidualAddMicrokernel.cpp
+└── jit/                                    # JIT-compiled implementation
+    ├── JitQ16FusedAttention.h              # Fused macro kernel (composes microkernels)
+    └── microkernels/                       # JIT microkernel implementations
+        ├── JitQ16DotProduct.h              # Q×K^T JIT microkernel
+        ├── JitExp2FixedSoftmax.h           # exp2 softmax JIT microkernel
+        ├── JitPVAccumulate.h               # P×V JIT microkernel
+        └── JitWoProjectionVNNI.h           # Wo projection → Q16_1 output
 ```
+
+**Note on ResidualAddQ16**: This is NOT a standalone microkernel file. The residual add
+uses `SIMDHelpers.h::q16_1_add_q16_1()` which is a proven all-integer operation:
+  - Wo projection outputs Q16_1 (INT32 → requant → Q16_1)
+  - Residual add: Q16_1 + Q16_1 → Q16_1 (dequant both, add, requant)
+  - **NO FP32 in the data path** - scales are FP32 but arithmetic is integer
 
 ### Kernel Selection Logic
 
@@ -1266,7 +1286,7 @@ ZMM Registers (32 total):
 ├── zmm0-3:   Q tile buffer (4 rows × head_dim packed)
 ├── zmm4-7:   K tile buffer (4 cols × head_dim packed)
 ├── zmm8-11:  S tile accumulators (4×4 INT32 scores)
-├── zmm12-15: P tile (4×4 UINT16 softmax weights)
+├── zmm12-15: P tile (4×4 INT16 softmax weights)
 ├── zmm16-23: O accumulators (4 rows × head_dim INT64)
 ├── zmm24-27: V tile buffer (for PV accumulation)
 └── zmm28-31: Constants (scale, LUT base, masks)
@@ -1278,7 +1298,7 @@ ZMM Registers (32 total):
 ├── zmm0-3:   q vector (head_dim=128 → 4 ZMM of INT16)
 ├── zmm4-7:   K chunk buffer (streaming, 4 rows at a time)
 ├── zmm8-11:  s scores (Bc INT32 values, chunked)
-├── zmm12-15: p weights (Bc UINT16 values, chunked)
+├── zmm12-15: p weights (Bc INT16 values, chunked)
 ├── zmm16-23: O accumulator (head_dim INT64, 8 ZMM)
 ├── zmm24-27: V chunk buffer (streaming, same pattern as K)
 ├── zmm28:    m (current max, broadcast)
@@ -1475,14 +1495,19 @@ bool q16_fused_attention_reference(const Q16FusedAttentionParams& params);
 namespace llaminar::v2::kernels::q16_1
 {
 
-// Index16Softmax LUT - UINT16 for higher precision than paper's UINT8
-// lut[i] = round(65535 * exp(-6.6 * i / 31))
-alignas(64) static constexpr uint16_t LUT_UINT16[32] = {
-    65535, 55145, 46374, 38997, 32791, 27574, 23189, 19501,
-    16400, 13792, 11598,  9753,  8202,  6897,  5800,  4878,
-     4102,  3450,  2901,  2440,  2052,  1726,  1451,  1221,
-     1027,   864,   726,   611,   514,   432,   363,     0
-};
+// Exp2FixedSoftmax LUT - 256-entry exp2 LUT with 30-bit precision
+// lut[i] = round(2^30 * 2^(-i/256)) for i in [0, 255]
+alignas(64) static uint32_t EXP2_LUT[256];
+static bool exp2_lut_initialized = false;
+
+void init_exp2_lut() {
+    if (exp2_lut_initialized) return;
+    for (int i = 0; i < 256; ++i) {
+        double val = std::pow(2.0, -static_cast<double>(i) / 256.0);
+        EXP2_LUT[i] = static_cast<uint32_t>(val * (1ULL << 30));
+    }
+    exp2_lut_initialized = true;
+}
 
 // Helper: decode Q16_1Block to get INT16 value at position
 inline int16_t q16_block_value(const Q16_1Block* blocks, int row, int col, 
@@ -1576,9 +1601,10 @@ bool q16_fused_attention_reference(const Q16FusedAttentionParams& params)
                 }
                 
                 // ════════════════════════════════════════════════════
-                // STEP 2: Online Index16Softmax
+                // STEP 2: Online Exp2FixedSoftmax
                 // ════════════════════════════════════════════════════
-                alignas(64) uint16_t P[Bc_actual];
+                init_exp2_lut();  // Ensure LUT is initialized
+                alignas(64) int16_t P[Bc_actual];
                 
                 // Find new max for this tile
                 int32_t m_new = m;
@@ -1588,30 +1614,42 @@ bool q16_fused_attention_reference(const Q16FusedAttentionParams& params)
                     }
                 }
                 
-                // Compute Index16Softmax
-                // alpha = scale_Q * scale_K (from Q16_1 block scales)
-                // For simplicity, estimate alpha from typical Q16 range
-                constexpr float CLIP_THRESHOLD = 6.6f;
+                // Compute Exp2FixedSoftmax
+                constexpr float LOG2_E = 1.4426950408889634f;
+                constexpr int16_t WEIGHT_MAX = 32767;  // VNNI-compatible INT16
                 float alpha = 1.0f / 32768.0f;  // Typical Q16 scale
-                int32_t c_int = static_cast<int32_t>(CLIP_THRESHOLD / (alpha * alpha * scale));
+                float beta = alpha * LOG2_E * scale;
                 
-                int64_t tile_sum = 0;
+                // First pass: compute exp2 values
+                std::vector<uint64_t> exp_vals(Bc_actual);
+                uint64_t sum_exp = 0;
                 for (int ki = 0; ki < Bc_actual; ++ki) {
                     if (S[ki] == INT32_MIN) {
-                        P[ki] = 0;  // Masked
+                        exp_vals[ki] = 0;  // Masked
                         continue;
                     }
                     
                     int32_t delta = m_new - S[ki];
-                    if (delta >= c_int) {
-                        P[ki] = 0;  // Saturated to zero
+                    float t = delta * beta;
+                    int32_t t_fixed = static_cast<int32_t>(t * 256.0f);
+                    int32_t ip = t_fixed >> 8;
+                    int32_t frac = t_fixed & 255;
+                    
+                    if (ip >= 30) {
+                        exp_vals[ki] = 0;
                     } else {
-                        int32_t delta_clipped = std::min(delta, c_int);
-                        int idx = (c_int > 0) 
-                            ? static_cast<int>((static_cast<int64_t>(delta_clipped) * 31 + c_int/2) / c_int)
-                            : 0;
-                        idx = std::min(idx, 31);
-                        P[ki] = LUT_UINT16[idx];
+                        exp_vals[ki] = static_cast<uint64_t>(EXP2_LUT[frac]) >> ip;
+                    }
+                    sum_exp += exp_vals[ki];
+                }
+                
+                // Second pass: normalize to INT16 weights
+                int32_t tile_sum = 0;
+                for (int ki = 0; ki < Bc_actual; ++ki) {
+                    if (sum_exp > 0) {
+                        P[ki] = static_cast<int16_t>((exp_vals[ki] * WEIGHT_MAX) / sum_exp);
+                    } else {
+                        P[ki] = 0;
                     }
                     tile_sum += P[ki];
                 }
@@ -1624,7 +1662,7 @@ bool q16_fused_attention_reference(const Q16FusedAttentionParams& params)
                 // STEP 3: Accumulate P × V (INT64)
                 // ════════════════════════════════════════════════════
                 for (int ki = 0; ki < Bc_actual; ++ki) {
-                    uint16_t w = P[ki];
+                    int16_t w = P[ki];  // INT16 weight from Exp2FixedSoftmax
                     if (w == 0) continue;
                     
                     for (int d = 0; d < head_dim; ++d) {
@@ -1706,40 +1744,49 @@ This kernel will be developed in two phases:
 
 ```
 src/v2/kernels/cpu/attention/q16_1/
-├── Q16FusedAttentionKernel.h              # Public interface (dispatches to ref or jit)
-├── Q16FusedAttentionKernel.cpp            # Factory/dispatch implementation
-│
 ├── ref/                                    # Scalar reference implementation
 │   ├── Q16FusedAttentionRef.h             # Scalar reference header
-│   └── Q16FusedAttentionRef.cpp           # Scalar reference impl (ground truth)
+│   ├── Q16FusedAttentionRef.cpp           # Scalar reference orchestrator
+│   └── microkernels/                       # Reference microkernel implementations
+│       ├── Q16DotProductRef.h              # Q×K^T dot product reference
+│       ├── Q16DotProductRef.cpp
+│       ├── Exp2FixedSoftmaxRef.h           # exp2 LUT-based softmax reference
+│       ├── Exp2FixedSoftmaxRef.cpp
+│       ├── PVAccumulateRef.h               # P×V weighted accumulation reference
+│       ├── PVAccumulateRef.cpp
+│       ├── WoProjectionVNNIRef.h           # Wo projection → Q16_1 output
+│       ├── WoProjectionVNNIRef.cpp         # INT32 → requant → Q16_1
+│       ├── Int8RequantRef.h                # INT16→INT8 requantization
+│       └── Int8RequantRef.cpp
 │
-├── jit/                                    # JIT-compiled implementation
-│   ├── Q16FusedAttentionJit.h             # JIT kernel header
-│   ├── Q16FusedAttentionJit.cpp           # JIT kernel orchestrator (composed kernel)
-│   │
-│   └── microkernels/                       # Individual JIT microkernels
-│       ├── Q16DotProductMicrokernel.h     # QK dot product (vpdpwssd)
-│       ├── Q16DotProductMicrokernel.cpp
-│       ├── Index16SoftmaxMicrokernel.h    # LUT-based softmax
-│       ├── Index16SoftmaxMicrokernel.cpp
-│       ├── PVAccumulateMicrokernel.h      # P×V weighted sum
-│       ├── PVAccumulateMicrokernel.cpp
-│       ├── WoProjectionMicrokernel.h      # Wo GEMM with Q8→INT16 repack
-│       ├── WoProjectionMicrokernel.cpp
-│       ├── ResidualAddMicrokernel.h       # Q16_1 residual fusion
-│       └── ResidualAddMicrokernel.cpp
-│
-tests/v2/unit/
-├── Test__Q16FusedAttentionRef.cpp         # Scalar reference unit tests
-├── Test__Q16FusedAttentionJit.cpp         # JIT vs scalar parity tests
-└── Test__Q16FusedAttentionPerf.cpp        # Performance benchmarks (tests/v2/performance/)
+└── jit/                                    # JIT-compiled implementation
+    ├── JitQ16FusedAttention.h              # Fused macro kernel (composes microkernels)
+    └── microkernels/                       # JIT microkernel implementations
+        ├── JitQ16DotProduct.h              # Q×K^T JIT microkernel (scaffolding)
+        ├── JitExp2FixedSoftmax.h           # exp2 softmax JIT microkernel (scaffolding)
+        ├── JitPVAccumulate.h               # P×V JIT microkernel (scaffolding)
+        └── JitWoProjectionVNNI.h           # Wo projection → Q16_1 (scaffolding)
+
+tests/v2/unit/jit/
+└── Test__JitQ16MicrokernelParity.cpp      # JIT vs scalar parity tests (7/7 passing)
 ```
 
+**Note on ResidualAddQ16**: The residual add uses `SIMDHelpers.h::q16_1_add_q16_1()`
+which is a proven all-integer operation:
+  - Wo projection outputs Q16_1 (INT32 → requant → Q16_1)
+  - Residual add: Q16_1 + Q16_1 → Q16_1 (dequant both, add in FP32, requant)
+  - **NO FP32 intermediate data** - FP32 only used for scale reconciliation
+
 **Directory Layout Rationale**:
-- `ref/` contains the scalar C++ reference — the source of truth for correctness
-- `jit/` contains the Xbyak-based JIT kernel, validated against `ref/`
-- `jit/microkernels/` contains composable JIT building blocks
-- Tests live in standard test directories, not alongside kernel source
+- `ref/` and `jit/` share the same structure for consistency
+- Root level contains the macro kernel (orchestrator/composition)
+- `microkernels/` contains individual kernel implementations
+- Both macro kernels compose their respective microkernels
+
+**Current Status (December 28, 2025)**:
+- Reference microkernels: Implemented and tested
+- JIT scaffolding: Complete with reference delegation
+- JIT code generation: TODO (Phase 2)
 
 ---
 
@@ -1795,75 +1842,102 @@ Option C: Use vpmaddwd + horizontal add pattern
 
 ---
 
-### μK2: Index16Softmax (`Index16SoftmaxMicrokernel`)
+### μK2: Exp2FixedSoftmax (`Exp2FixedSoftmaxMicrokernel`)
 
-**Purpose**: Integer-domain softmax with UINT16 output (extended from IndexSoftmax paper)
+**Purpose**: Integer-domain softmax using exp2 (base-2 exponential) LUT approximation
 
-**Innovation**: The IntAttention paper uses UINT8 output (255 levels). We extend to **UINT16** for 65535 levels, providing ~4× precision improvement with minimal overhead.
+**Innovation**: Unlike the IntAttention paper's 32-entry LUT with natural exp, we use a **256-entry exp2 LUT** with 30-bit precision. This provides:
+- Higher precision (256 entries vs 32)
+- Cleaner integer decomposition (powers of 2 via bit shifts)
+- VNNI-compatible INT16 output [0, 32767]
 
 **Input**:
 - `scores_int32`: INT32 attention scores [kv_len]
-- `alpha`: Scale factor from μK1 (d_Q × d_K × inv_sqrt_d)
+- `alpha`: Scale factor from μK1 (combined Q/K scale)
 
 **Output**:
-- `weights_uint16`: UINT16 attention weights [kv_len]
-- `sum_weights`: INT64 sum of weights (for normalization)
+- `weights_int16`: INT16 attention weights [kv_len] in range [0, 32767]
+- `sum_weights`: INT32 sum of weights (for normalization)
 
 **Algorithm**:
 ```cpp
-// Configuration (same as paper)
-constexpr int LUT_BITS = 5;        // 32 entries
-constexpr float CLIP_THRESHOLD = 6.6f;
+// 256-entry LUT for 2^(-frac/256) where frac in [0, 255]
+// Each entry has 30-bit precision
+constexpr int LUT_SIZE = 256;
+constexpr int LUT_VALUE_BITS = 30;
+static uint32_t EXP2_LUT[256];  // Initialized: lut[i] = 2^(-i/256) * 2^30
 
-// Precomputed UINT16 LUT: lut[i] = round(65535 * exp(-c * i / 31))
-static const uint16_t LUT_UINT16[32] = {
-    65535, 55145, 46374, 38997, 32791, 27574, 23189, 19501,
-    16400, 13792, 11598, 9753,  8202,  6897,  5800,  4878,
-    4102,  3450,  2901,  2440,  2052,  1726,  1451,  1221,
-    1027,   864,   726,   611,   514,   432,   363,     0
-};
-
-void index16_softmax(
+void exp2_fixed_softmax(
     const int32_t* scores,
-    uint16_t* weights,
-    int64_t* sum_out,
+    int16_t* weights,
     int n,
-    float alpha)
+    float alpha,
+    int32_t* sum_out)
 {
-    // Step 1: Find max score (integer domain)
-    int32_t max_score = scores[0];
-    for (int i = 1; i < n; ++i) {
-        max_score = std::max(max_score, scores[i]);
-    }
+    constexpr float LOG2_E = 1.4426950408889634f;
+    constexpr int16_t WEIGHT_MAX = 32767;  // VNNI-compatible (signed INT16)
     
-    // Step 2: Compute c_int = round(c / alpha)
-    int32_t c_int = static_cast<int32_t>(std::round(CLIP_THRESHOLD / alpha));
-    
-    // Step 3: For each score, compute clipped delta and LUT index
-    int64_t sum = 0;
+    // Step 1: Find max score (excluding masked positions)
+    int32_t max_score = INT32_MIN;
     for (int i = 0; i < n; ++i) {
-        int32_t delta = max_score - scores[i];           // Always >= 0
-        int32_t delta_clipped = std::min(delta, c_int);  // Clip to [0, c_int]
-        
-        // Map to LUT index: idx = round(delta_clipped * 31 / c_int)
-        int idx = (c_int > 0) 
-            ? static_cast<int>((static_cast<int64_t>(delta_clipped) * 31 + c_int/2) / c_int)
-            : 0;
-        
-        weights[i] = LUT_UINT16[idx];
-        sum += weights[i];
+        if (scores[i] != INT32_MIN)  // INT32_MIN = masked
+            max_score = std::max(max_score, scores[i]);
     }
     
-    *sum_out = sum;
+    // Step 2: Compute exp2 values using LUT
+    float beta = alpha * LOG2_E;  // Convert ln domain to log2 domain
+    std::vector<uint64_t> exp_vals(n);
+    uint64_t sum_exp = 0;
+    
+    for (int i = 0; i < n; ++i) {
+        if (scores[i] == INT32_MIN) {
+            exp_vals[i] = 0;  // Masked position
+            continue;
+        }
+        
+        int32_t delta = max_score - scores[i];  // Always >= 0
+        float t = delta * beta;                  // log2 domain
+        
+        // Decompose t into integer and fractional parts (8 frac bits)
+        int32_t t_fixed = static_cast<int32_t>(t * 256.0f);
+        int32_t ip = t_fixed >> 8;     // Integer part (shift amount)
+        int32_t frac = t_fixed & 255;  // Fractional part [0, 255]
+        
+        // exp2(-t) = LUT[frac] >> ip
+        if (ip >= 30) {
+            exp_vals[i] = 0;  // Underflow to zero
+        } else {
+            exp_vals[i] = static_cast<uint64_t>(EXP2_LUT[frac]) >> ip;
+        }
+        sum_exp += exp_vals[i];
+    }
+    
+    // Step 3: Normalize to INT16 weights [0, 32767]
+    int32_t weight_sum = 0;
+    for (int i = 0; i < n; ++i) {
+        if (sum_exp > 0) {
+            weights[i] = static_cast<int16_t>(
+                (exp_vals[i] * WEIGHT_MAX) / sum_exp);
+        } else {
+            weights[i] = 0;
+        }
+        weight_sum += weights[i];
+    }
+    
+    if (sum_out) *sum_out = weight_sum;
 }
 ```
 
-**UINT16 vs UINT8 Precision**:
+**Exp2 vs Natural Exp Advantages**:
 
-| Format | Levels | Min nonzero prob | Precision |
-|--------|--------|------------------|-----------|
-| UINT8 | 255 | 1/255 ≈ 0.39% | ~2.4 decimal digits |
-| UINT16 | 65535 | 1/65535 ≈ 0.0015% | ~4.8 decimal digits |
+| Aspect | IntAttention (exp) | Exp2FixedSoftmax (exp2) |
+|--------|-------------------|-------------------------|
+| LUT entries | 32 | 256 |
+| Precision | ~5 bits | ~8 bits fractional |
+| Integer part | Requires division | Simple bit shift |
+| LUT value precision | 16-bit | 30-bit |
+| Output range | [0, 65535] UINT16 | [0, 32767] INT16 |
+| VNNI compatible | No (unsigned) | Yes (signed) |
 
 **Memory Impact**: LUT grows from 32 bytes to 64 bytes — negligible.
 
@@ -1874,7 +1948,7 @@ void index16_softmax(
 **Purpose**: Weighted sum of V vectors in integer domain
 
 **Input**:
-- `weights_uint16`: UINT16 attention weights [kv_len]
+- `weights_int16`: INT16 attention weights [kv_len] in range [0, 32767]
 - `V_int16`: INT16 value matrix [kv_len × head_dim] with scales `d_V[kv]`
 - `sum_weights`: INT64 sum from μK2
 
@@ -1885,7 +1959,7 @@ void index16_softmax(
 **Algorithm**:
 ```cpp
 void int_v_accum(
-    const uint16_t* weights,
+    const int16_t* weights,
     const int16_t* V,
     int64_t sum_weights,
     int kv_len,
@@ -1894,12 +1968,12 @@ void int_v_accum(
     float* scale_out)
 {
     // INT64 accumulators to avoid overflow
-    // max: 65535 × 32767 × kv_len ≈ 2^31 × kv_len
-    // For kv_len=4096: 2^43 — needs INT64!
+    // max: 32767 × 32767 × kv_len ≈ 2^30 × kv_len
+    // For kv_len=4096: 2^42 — needs INT64!
     alignas(64) int64_t accum[HEAD_DIM_MAX] = {0};
     
     for (int kv = 0; kv < kv_len; ++kv) {
-        uint16_t w = weights[kv];
+        int16_t w = weights[kv];
         if (w == 0) continue;  // Skip zero weights (masked positions)
         
         const int16_t* v_row = &V[kv * head_dim];
@@ -2139,69 +2213,77 @@ void apply_attention_residual(
 
 ---
 
-## IndexSoftmax Integration
+## Exp2FixedSoftmax Integration
 
-### From UINT8 to UINT16
+### From IntAttention's IndexSoftmax to Exp2FixedSoftmax
 
-The IntAttention paper uses UINT8 probabilities (255 levels). We extend to UINT16:
+The IntAttention paper uses a 32-entry natural exponential LUT. Our Exp2FixedSoftmax improves on this with:
 
-| Aspect | Paper (UINT8) | Our Design (UINT16) |
-|--------|---------------|---------------------|
-| LUT entries | 32 × 1 byte = 32B | 32 × 2 bytes = 64B |
-| Precision | 1/255 ≈ 0.39% | 1/65535 ≈ 0.0015% |
-| V accumulator | INT32 sufficient | INT64 required |
-| Memory BW | Lower | Slightly higher |
-| Accuracy | cos_sim ~0.999 | Expected ~0.9999 |
+| Aspect | IntAttention IndexSoftmax | Our Exp2FixedSoftmax |
+|--------|--------------------------|---------------------|
+| LUT entries | 32 | 256 |
+| Base | e (natural exp) | 2 (exp2) |
+| LUT value precision | 16-bit | 30-bit |
+| Output format | UINT16 [0, 65535] | INT16 [0, 32767] |
+| Integer decomposition | Division-based | Bit shift |
+| VNNI compatibility | No (unsigned) | Yes (signed) |
+| Precision | ~5 bits | ~8 bits fractional |
 
-### LUT Construction for UINT16
+### Key Innovation: exp2 Decomposition
 
-```cpp
-// UINT16 LUT: same exponential curve, higher precision
-static constexpr uint16_t INDEX16_SOFTMAX_LUT[32] = {
-    65535,  // exp(-0.000) = 1.0
-    55145,  // exp(-0.213) 
-    46374,  // exp(-0.426)
-    38997,  // exp(-0.639)
-    32791,  // exp(-0.852)
-    27574,  // exp(-1.065)
-    23189,  // exp(-1.277)
-    19501,  // exp(-1.490)
-    16400,  // exp(-1.703)
-    13792,  // exp(-1.916)
-    11598,  // exp(-2.129)
-    9753,   // exp(-2.342)
-    8202,   // exp(-2.555)
-    6897,   // exp(-2.768)
-    5800,   // exp(-2.981)
-    4878,   // exp(-3.194)
-    4102,   // exp(-3.406)
-    3450,   // exp(-3.619)
-    2901,   // exp(-3.832)
-    2440,   // exp(-4.045)
-    2052,   // exp(-4.258)
-    1726,   // exp(-4.471)
-    1451,   // exp(-4.684)
-    1221,   // exp(-4.897)
-    1027,   // exp(-5.110)
-    864,    // exp(-5.323)
-    726,    // exp(-5.535)
-    611,    // exp(-5.748)
-    514,    // exp(-5.961)
-    432,    // exp(-6.174)
-    363,    // exp(-6.387)
-    0       // exp(-6.600) ≈ 0.00136 → rounds to 0
-};
+The natural exponential `exp(-x)` requires division to decompose into LUT index.
+Our exp2 approach uses `2^(-x)` which decomposes cleanly:
+
+```
+exp(-x) = exp(-x)                    // Requires: x * c / (entries-1) for index
+exp2(-x) = 2^(-x) = 2^(-ip) * 2^(-frac)  // Just: ip = x >> 8, frac = x & 255
+         = LUT[frac] >> ip           // Bit shift for integer part!
 ```
 
-### Alternative: Hybrid Q16/Q8 Softmax
+### LUT Construction for Exp2FixedSoftmax
 
-For maximum flexibility, support both:
+```cpp
+// 256-entry LUT for 2^(-frac/256) with 30-bit precision
+// Precomputed at initialization time
+void init_exp2_lut(uint32_t* lut) {
+    for (int i = 0; i < 256; ++i) {
+        double val = std::pow(2.0, -static_cast<double>(i) / 256.0);
+        lut[i] = static_cast<uint32_t>(val * (1ULL << 30));
+    }
+}
+
+// Example values (first 16 entries):
+// lut[0]   = 1073741824  // 2^30 * 2^(-0/256) = 2^30 * 1.0
+// lut[16]  = 1027745383  // 2^30 * 2^(-16/256) ≈ 2^30 * 0.957
+// lut[32]  =  983525516  // 2^30 * 2^(-32/256) ≈ 2^30 * 0.916
+// lut[128] =  759250125  // 2^30 * 2^(-128/256) ≈ 2^30 * 0.707
+// lut[255] =  537231780  // 2^30 * 2^(-255/256) ≈ 2^30 * 0.500
+```
+
+### VNNI Compatibility: INT16 vs UINT16
+
+**Critical constraint**: VPDPWSSD interprets operands as **signed INT16**.
+
+| Value | As UINT16 | As INT16 (VPDPWSSD) |
+|-------|-----------|---------------------|
+| 32767 | 32767 | 32767 ✓ |
+| 32768 | 32768 | -32768 ✗ |
+| 65535 | 65535 | -1 ✗ |
+
+Our Exp2FixedSoftmax outputs INT16 in range [0, 32767], ensuring:
+- Weights are always non-negative in P×V computation
+- Full VNNI VPDPWSSD compatibility
+- 15-bit precision (sufficient for softmax probabilities)
+
+### Alternative: Hybrid Precision
+
+For maximum flexibility, support configurable precision:
 
 ```cpp
 enum class SoftmaxPrecision {
-    UINT8,   // Paper's approach: 255 levels, faster
-    UINT16,  // Extended: 65535 levels, higher precision
-    HYBRID   // UINT16 weights, but normalize to UINT8 for V accum
+    INT16_VNNI,  // Default: INT16 [0, 32767], VNNI-compatible
+    INT16_FP32,  // Same INT16 output, but use FP32 for P×V (future)
+    INT8_FAST    // Lowest precision, fastest (for less critical layers)
 };
 ```
 
@@ -2228,7 +2310,7 @@ enum class SoftmaxPrecision {
 ### Recommendation
 
 **Use Q16_1 throughout attention** (Q, K, V, context, residual) with:
-- UINT16 softmax probabilities
+- INT16 softmax probabilities [0, 32767]
 - INT64 accumulators where needed
 - Single FP32 scale per tensor (not per-element)
 
@@ -2252,9 +2334,10 @@ This provides ~100× precision improvement over Q8 approaches with ~2× memory u
   - Online softmax state (m, l scalars)
   - INT64 accumulator for O (head_dim values)
   
-- [ ] **Task 1.2**: Implement Index16Softmax for single row
+- [ ] **Task 1.2**: Implement Exp2FixedSoftmax for single row
+  - 256-entry exp2 LUT with 30-bit precision
   - Single max tracker (not Br max values)
-  - Simplified LUT lookup (no batching)
+  - INT16 output weights [0, 32767] (VNNI-compatible)
   - Online rescaling via lazy normalization
   
 - [ ] **Task 1.3**: Implement streaming PV accumulation
@@ -2284,9 +2367,10 @@ This provides ~100× precision improvement over Q8 approaches with ~2× memory u
   - [Br, head_dim] × [Bc, head_dim]^T → [Br, Bc]
   - Naive triple loop for scalar reference
   
-- [ ] **Task 2.3**: Implement batched Index16Softmax
+- [ ] **Task 2.3**: Implement batched Exp2FixedSoftmax
   - Multi-row max tracking
-  - Per-row LUT application
+  - Per-row exp2 LUT application
+  - INT16 output weights [0, 32767]
   
 - [ ] **Task 2.4**: Implement batched PV accumulation (GEMM)
   - [Br, Bc] × [Bc, head_dim] → [Br, head_dim]
@@ -2314,14 +2398,15 @@ This provides ~100× precision improvement over Q8 approaches with ~2× memory u
   - Output: s[Bc] INT32 scores
   - Target: 4 K rows per iteration, `vpdpwssd` for dot
   
-- [ ] **Task 3.2**: `Index16SoftmaxSingle` JIT microkernel
-  - Single row: vectorized max-find, LUT lookup
+- [ ] **Task 3.2**: `Exp2FixedSoftmaxSingle` JIT microkernel
+  - Single row: vectorized max-find, exp2 LUT lookup
   - Scalar m/l state tracking
+  - 256-entry LUT for 2^(-frac/256)
   - `vpgatherdd` for LUT lookup
   
 - [ ] **Task 3.3**: `PVAccumulateGemv` JIT microkernel
   - Stream V alongside K (fused memory access)
-  - UINT16 × INT16 → INT64 accumulation
+  - INT16 × INT16 → INT64 accumulation
   - Output: O[head_dim] in zmm16-23
   
 - [ ] **Task 3.4**: JIT decode kernel orchestrator
@@ -2345,10 +2430,11 @@ This provides ~100× precision improvement over Q8 approaches with ~2× memory u
   - GEMM micro-tile: 4×4 or 8×4 register blocking
   - K tile reused across Br queries
   
-- [ ] **Task 4.2**: `Index16SoftmaxBatched` JIT microkernel
+- [ ] **Task 4.2**: `Exp2FixedSoftmaxBatched` JIT microkernel
   - Multi-row: Br independent softmax rows
   - Per-row max in zmm registers
-  - Vectorized LUT lookup per row
+  - 256-entry exp2 LUT lookup per row
+  - INT16 output [0, 32767]
   
 - [ ] **Task 4.3**: `PVAccumulateGemm` JIT microkernel
   - Batched: [Br, Bc] × [Bc, head_dim] → [Br, head_dim]
@@ -2503,7 +2589,7 @@ For a single query with head_dim=128, kv_len=1024:
 |-----------|---------|-------------|------------|
 | q×K^T | 128×1024 = 131K | INT16×INT16 dot products | Memory (K streaming) |
 | Softmax | ~3×1024 = 3K | LUT lookup + scaling | Memory (LUT access) |
-| w×V | 1024×128 = 131K | UINT16×INT16 products | Memory (V streaming) |
+| w×V | 1024×128 = 131K | INT16×INT16 products | Memory (V streaming) |
 | **Total** | ~265K | ~1 vector ops | **Memory bound** |
 
 **Memory Access** (Decode):
@@ -2587,11 +2673,11 @@ Q16_1 uses per-row scales for K/V cache. Should softmax use:
 ### Q3: Causal Mask Handling
 
 How to handle masked positions in integer domain:
-- **A**: Set weight=0 in Index16Softmax (current approach)
+- **A**: Set weight=0 in Exp2FixedSoftmax (current approach)
 - **B**: Use sentinel value in scores (e.g., INT32_MIN)
 - **C**: Skip masked positions entirely (sparse attention)
 
-**Recommendation**: Option A, verified in IndexSoftmax test.
+**Recommendation**: Option A, verified in Exp2FixedSoftmax implementation.
 
 ### Q4: RMSNorm Placement
 
@@ -2627,8 +2713,8 @@ Support both Q16 and legacy FP32/Hybrid modes:
 ### Critical Hardware Constraint
 
 > **VPDPWSSD interprets both operands as SIGNED INT16.** Values in range [32768, 65535]
-> are treated as negative numbers [-32768, -1]. This means **UINT16 softmax weights
-> cannot be used directly** — we must use INT16 weights in range [0, 32767].
+> are treated as negative numbers [-32768, -1]. This means **softmax weights
+> must be INT16 in range [0, 32767]** — the upper half of UINT16 range is unusable.
 
 ### `vpdpwssd` — Packed Dot Product of Signed Words with Dword Accumulation
 
@@ -2664,43 +2750,86 @@ For each position i:
 
 ---
 
-## Appendix B: Index16Softmax LUT Generation
+## Appendix B: Exp2FixedSoftmax LUT Generation
 
-**VNNI Constraint**: LUT must output INT16 values in range [0, 32767] (not 65535).
+The exp2 LUT approximates `2^(-frac/256)` for fractional values in [0, 255].
 
 ```python
 import numpy as np
 
-def generate_int16_lut(b=5, c=6.6):
-    """Generate INT16 LUT for Index16Softmax (VNNI-compatible).
+def generate_exp2_lut():
+    """Generate 256-entry LUT for Exp2FixedSoftmax.
     
-    CRITICAL: Max value is 32767 (not 65535) because VPDPWSSD
-    interprets operands as SIGNED INT16. Values > 32767 would
-    be treated as negative, causing sign inversion in P×V.
+    Each entry approximates 2^(-i/256) with 30-bit precision.
+    This allows integer-only softmax computation using:
+      exp2(-x) = LUT[frac] >> int_part
+    
+    where x is decomposed into int_part and frac (8 fractional bits).
     """
-    n_entries = 2 ** b  # 32 entries for b=5
+    LUT_SIZE = 256
+    LUT_PRECISION_BITS = 30
+    
     lut = []
-    
-    for i in range(n_entries):
-        x = c * i / (n_entries - 1)  # x in [0, c]
-        exp_val = np.exp(-x)
-        # Scale to INT16 range [0, 32767] instead of [0, 65535]
-        int16_val = int(round(32767 * exp_val))
-        lut.append(int16_val)
-    
-    # Force last entry to 0 (saturated)
-    lut[-1] = 0
+    for i in range(LUT_SIZE):
+        # 2^(-i/256) scaled to 30-bit integer
+        val = 2.0 ** (-i / 256.0)
+        int_val = int(round(val * (1 << LUT_PRECISION_BITS)))
+        lut.append(int_val)
     
     return lut
 
-# Generate and print
-lut = generate_int16_lut()
-print("// VNNI-compatible: INT16 range [0, 32767]")
-print("static constexpr int16_t INDEX16_SOFTMAX_LUT[32] = {")
-for i in range(0, 32, 8):
-    row = ", ".join(f"{v:5d}" for v in lut[i:i+8])
+def exp2_fixed_softmax_example():
+    """Example: compute softmax weight for a given delta.
+    
+    delta = max_score - score (always >= 0)
+    alpha = combined scale factor
+    beta = alpha * log2(e) = alpha * 1.4427
+    t = delta * beta (in log2 domain)
+    """
+    lut = generate_exp2_lut()
+    
+    # Example values
+    delta = 100  # score difference (integer)
+    beta = 0.01  # typical scale factor
+    t = delta * beta  # = 1.0 in this example
+    
+    # Decompose t into fixed-point (8 frac bits)
+    t_fixed = int(t * 256)  # = 256
+    int_part = t_fixed >> 8  # = 1
+    frac_part = t_fixed & 255  # = 0
+    
+    # Lookup and shift
+    if int_part >= 30:
+        result = 0  # Underflow
+    else:
+        result = lut[frac_part] >> int_part
+    
+    # result ≈ 2^(-1.0) * 2^30 = 536870912
+    print(f"exp2(-{t:.2f}) ≈ {result} (out of {1 << 30})")
+
+# Generate and print C++ LUT
+lut = generate_exp2_lut()
+print("// Exp2FixedSoftmax: 256-entry LUT for 2^(-frac/256)")
+print("// 30-bit precision, indexed by fractional part [0, 255]")
+print("static uint32_t EXP2_LUT[256] = {")
+for i in range(0, 256, 8):
+    row = ", ".join(f"{v:10d}" for v in lut[i:i+8])
     print(f"    {row},")
 print("};")
+```
+
+### Example LUT Values
+
+```cpp
+// First 16 entries (frac = 0 to 15):
+// lut[0]  = 1073741824  // 2^30 * 2^(-0/256)   = 2^30 * 1.0000
+// lut[1]  = 1070923228  // 2^30 * 2^(-1/256)   ≈ 2^30 * 0.9973
+// lut[8]  = 1050866141  // 2^30 * 2^(-8/256)   ≈ 2^30 * 0.9786
+// lut[16] = 1028443332  // 2^30 * 2^(-16/256)  ≈ 2^30 * 0.9576
+
+// Key values:
+// lut[128] = 759250125  // 2^30 * 2^(-128/256) = 2^30 * 0.7071 (√½)
+// lut[255] = 537919669  // 2^30 * 2^(-255/256) ≈ 2^30 * 0.5010
 ```
 
 ---

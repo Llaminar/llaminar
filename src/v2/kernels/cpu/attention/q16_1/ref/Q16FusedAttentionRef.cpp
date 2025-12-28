@@ -478,7 +478,7 @@ namespace llaminar2::kernels::q16_1
             total_weight_sum = 1;
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 4: Wo Projection (VPDPWSSD) → Q16_1 output
+        // STEP 4: Wo Projection (VPDPWSSD) → Q16_1 output (ALL INTEGER)
         // ════════════════════════════════════════════════════════════════════════
 
         // Allocate Q16_1 projection output
@@ -503,11 +503,11 @@ namespace llaminar2::kernels::q16_1
         wo_params.d_model = d_model;
         wo_params.bias = nullptr;
 
-        // Execute VPDPWSSD projection → Q16_1 output
+        // Execute VPDPWSSD projection → INT32 → requant → Q16_1 output
         wo_projection_vpdpwssd_to_q16_1_gemv(wo_params, context, projection_out);
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 5: Native Q16_1 Residual Add (simd::q16_1_add_q16_1)
+        // STEP 5: Native Q16_1 Residual Add (ALL INTEGER: Q16_1 + Q16_1 → Q16_1)
         // ════════════════════════════════════════════════════════════════════════
 
         // Copy residual_in to residual_out if different pointers
@@ -517,7 +517,7 @@ namespace llaminar2::kernels::q16_1
                         output_blocks * sizeof(Q16_1Block));
         }
 
-        // Q16_1 + Q16_1 → Q16_1 (in-place on residual_out)
+        // Q16_1 + Q16_1 → Q16_1 (in-place on residual_out) - NO FP32!
         simd::q16_1_add_q16_1(
             params.residual_out,   // Residual (accumulates result in-place)
             projection_out.blocks, // Projection to add
@@ -599,7 +599,7 @@ namespace llaminar2::kernels::q16_1
                 total_weight_sum = 1;
 
             // ════════════════════════════════════════════════════════════════════
-            // STEP 4: Wo Projection → Q16_1 output
+            // STEP 4: Wo Projection → Q16_1 output (ALL INTEGER)
             // ════════════════════════════════════════════════════════════════════
 
             std::vector<Q16_1Block> projection_q16(output_blocks);
@@ -623,7 +623,7 @@ namespace llaminar2::kernels::q16_1
             wo_projection_vpdpwssd_to_q16_1_gemv(wo_params, context, projection_out);
 
             // ════════════════════════════════════════════════════════════════════
-            // STEP 5: Native Q16_1 Residual Add
+            // STEP 5: Native Q16_1 Residual Add (ALL INTEGER)
             // ════════════════════════════════════════════════════════════════════
 
             Q16_1Block *residual_out_row = params.residual_out + q * residual_blocks_per_row;
@@ -636,7 +636,7 @@ namespace llaminar2::kernels::q16_1
                             output_blocks * sizeof(Q16_1Block));
             }
 
-            // Q16_1 + Q16_1 → Q16_1
+            // Q16_1 + Q16_1 → Q16_1 - NO FP32!
             simd::q16_1_add_q16_1(
                 residual_out_row,
                 projection_out.blocks,

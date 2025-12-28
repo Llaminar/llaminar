@@ -284,6 +284,18 @@ add_v2_test(V2_Unit_JitWoProjectionOptimized
     LABELS "V2;Unit;JIT;GEMM;GEMV;Wo;Attention;AVX512"
 )
 
+# Test: JitQ16MicrokernelParity - JIT vs Reference Q16 microkernel parity tests
+add_executable(v2_test_jit_q16_microkernel_parity unit/jit/Test__JitQ16MicrokernelParity.cpp)
+target_link_libraries(v2_test_jit_q16_microkernel_parity 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitQ16MicrokernelParity 
+    COMMAND $<TARGET_FILE:v2_test_jit_q16_microkernel_parity>
+    LABELS "V2;Unit;JIT;Q16;Attention;Parity;AVX512;VNNI"
+)
+
 # Test: SwiGLU formula correctness (regression test for gate/up swap bug)
 # This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
 add_executable(v2_test_swiglu_formula unit/Test__SwiGLUFormula.cpp)

@@ -23,6 +23,12 @@ set(TYPED_REGISTER_LEGACY_FILES
     "JitFusedAttentionWo.h"    # Uses Xmm(0-7) for accum aliasing, Xmm(16-19) for state
     "JitQ8DotProduct.h"        # Uses Xmm/Ymm for input/scratch zones
     "JitWoProjection.h"        # Uses Zmm/Reg64 for direct register access
+    # Q16_1 JIT microkernels (Phase 6 scaffolding - TODO: migrate to borrow<>())
+    "JitQ16DotProduct.h"       # Q×K^T dot product scaffolding
+    "JitExp2FixedSoftmax.h"    # Exp2 softmax scaffolding
+    "JitPVAccumulate.h"        # P×V accumulation scaffolding
+    "JitWoProjectionVNNI.h"    # VPDPWSSD Wo projection scaffolding
+    "JitQ16FusedAttention.h"   # Fused attention orchestrator scaffolding
 )
 
 # Function to check a single file for raw register violations
