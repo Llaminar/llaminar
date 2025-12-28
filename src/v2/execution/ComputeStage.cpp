@@ -13,7 +13,8 @@
 #include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "../kernels/cpu/gemm_v4/FusedGEMM.h"
-#include "../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // For FusedAttentionWoStage
+#include "../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // For FusedAttentionWoStage (Q8_1)
+#include "../kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h" // For FusedAttentionWoStage (Q16_1)
 #include "../tensors/UnifiedKVCache.h"
 #include "../tensors/SIMDHelpers.h"
 #include "../tensors/Tensors.h" // For TensorBase::rows(), cols(), dtype_name()
@@ -2622,6 +2623,22 @@ namespace llaminar2
         return reqs;
     }
 
+    StageDumpInfo AllreduceStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Allreduce operates in-place - buffer is both input and output
+        if (params_.buffer)
+        {
+            size_t count = params_.count > 0 ? params_.count : params_.buffer->numel();
+            info.addInput("buffer", params_.buffer, params_.buffer->rows(), params_.buffer->cols());
+            info.addOutput("buffer", params_.buffer, params_.buffer->rows(), params_.buffer->cols());
+            info.addScalarInt("count", static_cast<int>(count));
+        }
+
+        return info;
+    }
+
     // =============================================================================
     // AllGatherStage Implementation
     // =============================================================================
@@ -2881,6 +2898,30 @@ namespace llaminar2
         return reqs;
     }
 
+    StageDumpInfo AllGatherStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Local input slice (what this rank contributes)
+        if (params_.local_input)
+        {
+            size_t seq_len = params_.actual_seq_len > 0 ? params_.actual_seq_len : params_.local_input->rows();
+            info.addInput("local_input", params_.local_input, seq_len, params_.local_input->cols());
+        }
+
+        // Full gathered output (replicated on all ranks)
+        if (params_.full_output)
+        {
+            size_t seq_len = params_.actual_seq_len > 0 ? params_.actual_seq_len : params_.full_output->rows();
+            info.addOutput("full_output", params_.full_output, seq_len, params_.full_output->cols());
+        }
+
+        info.addScalarInt("world_size", params_.world_size);
+        info.addScalarInt("actual_seq_len", static_cast<int>(params_.actual_seq_len));
+
+        return info;
+    }
+
     // =============================================================================
     // MoE Stages Implementation
     // =============================================================================
@@ -2978,6 +3019,32 @@ namespace llaminar2
         return reqs;
     }
 
+    StageDumpInfo MoERouterStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        if (params_.hidden)
+        {
+            info.addInput("hidden", params_.hidden, params_.seq_len, params_.d_model);
+        }
+
+        if (params_.gate_weights)
+        {
+            info.addWeight("gate_weights", params_.gate_weights);
+        }
+
+        if (params_.router_logits)
+        {
+            info.addOutput("router_logits", params_.router_logits, params_.seq_len, params_.num_experts);
+        }
+
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("num_experts", params_.num_experts);
+
+        return info;
+    }
+
     // -----------------------------------------------------------------------------
 
     MoEExpertStage::MoEExpertStage(Params params) : params_(std::move(params)) {}
@@ -3071,6 +3138,43 @@ namespace llaminar2
         return reqs;
     }
 
+    StageDumpInfo MoEExpertStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        if (params_.input)
+        {
+            info.addInput("input", params_.input, params_.input->rows(), params_.d_model);
+        }
+
+        if (params_.gate_w)
+        {
+            info.addWeight("gate_w", params_.gate_w);
+        }
+
+        if (params_.up_w)
+        {
+            info.addWeight("up_w", params_.up_w);
+        }
+
+        if (params_.down_w)
+        {
+            info.addWeight("down_w", params_.down_w);
+        }
+
+        if (params_.output)
+        {
+            info.addOutput("output", params_.output, params_.output->rows(), params_.d_model);
+        }
+
+        info.addScalarInt("expert_id", params_.expert_id);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("intermediate_dim", params_.intermediate_dim);
+        info.addScalarInt("num_tokens", params_.token_indices ? static_cast<int>(params_.token_indices->size()) : 0);
+
+        return info;
+    }
+
     // -----------------------------------------------------------------------------
 
     MoECombineStage::MoECombineStage(Params params) : params_(std::move(params)) {}
@@ -3133,6 +3237,44 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    StageDumpInfo MoECombineStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Static name storage to avoid dangling pointer issues
+        // Supports up to 16 expert outputs (typical top_k is 2-8)
+        static const char *expert_names[] = {
+            "expert_output_0", "expert_output_1", "expert_output_2", "expert_output_3",
+            "expert_output_4", "expert_output_5", "expert_output_6", "expert_output_7",
+            "expert_output_8", "expert_output_9", "expert_output_10", "expert_output_11",
+            "expert_output_12", "expert_output_13", "expert_output_14", "expert_output_15"};
+        static constexpr size_t MAX_EXPERT_OUTPUTS = sizeof(expert_names) / sizeof(expert_names[0]);
+
+        // Add expert outputs as inputs
+        if (params_.expert_outputs)
+        {
+            for (size_t i = 0; i < params_.expert_outputs->size() && i < MAX_EXPERT_OUTPUTS; ++i)
+            {
+                const TensorBase *expert_out = (*params_.expert_outputs)[i];
+                if (expert_out)
+                {
+                    info.addInput(expert_names[i], expert_out, expert_out->rows(), expert_out->cols());
+                }
+            }
+        }
+
+        if (params_.output)
+        {
+            info.addOutput("output", params_.output, params_.seq_len, params_.d_model);
+        }
+
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("top_k", params_.top_k);
+
+        return info;
     }
 
     // =============================================================================
@@ -3964,6 +4106,35 @@ namespace llaminar2
         return outputs;
     }
 
+    StageDumpInfo KVCacheAppendStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // K input tensor
+        if (params_.K)
+        {
+            info.addInput("K", params_.K, params_.K->rows(), params_.K->cols());
+        }
+
+        // V input tensor
+        if (params_.V)
+        {
+            info.addInput("V", params_.V, params_.V->rows(), params_.V->cols());
+        }
+
+        // V_dequant output (optional, Hybrid mode)
+        if (params_.V_dequant_out)
+        {
+            info.addOutput("V_dequant", params_.V_dequant_out, params_.V_dequant_out->rows(), params_.V_dequant_out->cols());
+        }
+
+        info.addScalarInt("layer_idx", params_.layer_idx);
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("num_tokens", params_.num_tokens);
+
+        return info;
+    }
+
     // =============================================================================
     // KVCacheGatherStage Implementation
     // =============================================================================
@@ -4047,6 +4218,29 @@ namespace llaminar2
         // Note: KV cache itself is external state, not a buffer managed by this stage
 
         return reqs;
+    }
+
+    StageDumpInfo KVCacheGatherStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Output: gathered K from cache
+        if (params_.out_K)
+        {
+            info.addOutput("gathered_K", params_.out_K, params_.out_K->rows(), params_.out_K->cols());
+        }
+
+        // Output: gathered V from cache
+        if (params_.out_V)
+        {
+            info.addOutput("gathered_V", params_.out_V, params_.out_V->rows(), params_.out_V->cols());
+        }
+
+        info.addScalarInt("layer_idx", params_.layer_idx);
+        info.addScalarInt("batch_size", params_.batch_size);
+        info.addScalarInt("last_max_kv_len", last_max_kv_len_);
+
+        return info;
     }
 
     // =============================================================================
@@ -4384,17 +4578,26 @@ namespace llaminar2
     FusedAttentionWoStage::FusedAttentionWoStage(Params params)
         : params_(std::move(params))
     {
-        // Create the kernel with configuration
-        FusedAttentionWoKernel::Config kernel_config;
-        kernel_config.num_heads = params_.n_heads;
-        kernel_config.num_kv_heads = params_.n_kv_heads;
-        kernel_config.head_dim = params_.head_dim;
-        kernel_config.d_model = params_.d_model;
-        kernel_config.backend = params_.backend;
-        kernel_config.use_hybrid_wo = params_.use_hybrid_wo;
-        kernel_config.fuse_residual_add = params_.fuse_residual_add;
+        if (params_.backend == FusedAttentionBackend::Q16_INTEGER)
+        {
+            // Create Q16_1 kernel via ITensorFusedAttentionWo interface
+            q16_kernel_ = std::make_unique<kernels::q16_1::Q16FusedAttentionKernel>(/*use_jit=*/false);
+            LOG_DEBUG("[FusedAttentionWoStage] Created Q16FusedAttentionKernel (Q16_INTEGER backend)");
+        }
+        else
+        {
+            // Create Q8_1 kernel (JIT/TILED/REFERENCE backends)
+            FusedAttentionWoKernel::Config kernel_config;
+            kernel_config.num_heads = params_.n_heads;
+            kernel_config.num_kv_heads = params_.n_kv_heads;
+            kernel_config.head_dim = params_.head_dim;
+            kernel_config.d_model = params_.d_model;
+            kernel_config.backend = params_.backend;
+            kernel_config.use_hybrid_wo = params_.use_hybrid_wo;
+            kernel_config.fuse_residual_add = params_.fuse_residual_add;
 
-        kernel_ = std::make_unique<FusedAttentionWoKernel>(kernel_config);
+            kernel_ = std::make_unique<FusedAttentionWoKernel>(kernel_config);
+        }
     }
 
     bool FusedAttentionWoStage::execute(IDeviceContext *ctx)
@@ -4452,18 +4655,113 @@ namespace llaminar2
             position_offset = effective_kv_len - params_.seq_len;
         }
 
-        // Dispatch to fused kernel
-        bool success = kernel_->compute(
-            params_.Q,
-            params_.K,
-            params_.V,
-            params_.Wo,
-            params_.output,
-            params_.seq_len,
-            effective_kv_len,
-            params_.causal,
-            position_offset,
-            params_.context_snapshot);
+        bool success = false;
+
+        // Dispatch to appropriate kernel based on backend
+        if (params_.backend == FusedAttentionBackend::Q16_INTEGER)
+        {
+            // Q16_1 kernel via ITensorFusedAttentionWo interface
+            // NOTE: Q16_INTEGER backend requires fuse_residual_add=true (HybridQ16 mode)
+            if (!params_.fuse_residual_add)
+            {
+                LOG_ERROR("[FusedAttentionWoStage] Q16_INTEGER backend requires fuse_residual_add=true "
+                          "(use JIT or REFERENCE backend for non-fused mode)");
+                return false;
+            }
+            
+            if (!q16_kernel_)
+            {
+                LOG_ERROR("[FusedAttentionWoStage] Q16 kernel not initialized");
+                return false;
+            }
+
+            // Build params for Q16 kernel
+            FusedAttentionWoParams q16_params;
+            
+            // Extract raw data from tensors - Q16 kernel expects void* Q/K/V
+            q16_params.Q = params_.Q ? params_.Q->raw_data() : nullptr;
+            q16_params.K = params_.K ? params_.K->raw_data() : nullptr;
+            q16_params.V = params_.V ? params_.V->raw_data() : nullptr;
+            
+            // Wo weights - get VNNI packed weights via KernelFactory
+            // Check if Wo implements IINT8Unpackable (quantized formats)
+            if (dynamic_cast<IINT8Unpackable *>(params_.Wo) != nullptr)
+            {
+                // Get VNNI-packed weights from cache (or pack on first call)
+                auto *packed = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(params_.Wo);
+                q16_params.Wo_packed = packed;
+                q16_params.Wo_fp32 = nullptr;
+                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Using VNNI-packed Wo weights from "
+                          << params_.Wo->dtype_name() << " tensor");
+            }
+            else if (auto *wo_fp32 = dynamic_cast<FP32Tensor *>(params_.Wo))
+            {
+                // FP32 Wo weights (no packing needed)
+                q16_params.Wo_packed = nullptr;
+                q16_params.Wo_fp32 = wo_fp32->data();
+                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Using FP32 Wo weights");
+            }
+            else
+            {
+                LOG_ERROR("[FusedAttentionWoStage] Q16_INTEGER: Unsupported Wo weight type: "
+                          << (params_.Wo ? params_.Wo->dtype_name() : "null"));
+                return false;
+            }
+            
+            // Residual fusion: output tensor IS the residual (in-place read-modify-write)
+            // Q16_INTEGER always uses fused residual path (validated above)
+            if (auto *out_q16 = dynamic_cast<Q16_1Tensor *>(params_.output))
+            {
+                // residual_in = residual_out = output tensor (in-place accumulation)
+                q16_params.residual_in = out_q16->q16_1_blocks();
+                q16_params.residual_out = out_q16->mutable_q16_1_blocks();
+                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Residual fusion enabled (in-place Q16_1)");
+            }
+            else
+            {
+                LOG_ERROR("[FusedAttentionWoStage] Q16_INTEGER with fuse_residual_add requires Q16_1 output, got "
+                          << (params_.output ? params_.output->dtype_name() : "null"));
+                return false;
+            }
+            
+            // Dimensions
+            q16_params.seq_len_q = params_.seq_len;
+            q16_params.kv_len = effective_kv_len;
+            q16_params.n_heads = params_.n_heads;
+            q16_params.n_kv_heads = params_.n_kv_heads;
+            q16_params.head_dim = params_.head_dim;
+            q16_params.d_model = params_.d_model;
+            
+            // Attention config
+            q16_params.scale = 1.0f / std::sqrt(static_cast<float>(params_.head_dim));
+            q16_params.causal = params_.causal;
+            q16_params.position_offset = position_offset;
+            
+            // Snapshot buffers
+            q16_params.scores_snapshot = nullptr;
+            if (params_.context_snapshot) {
+                if (auto *ctx_fp32 = dynamic_cast<FP32Tensor *>(params_.context_snapshot)) {
+                    q16_params.context_snapshot = ctx_fp32->mutable_data();
+                }
+            }
+            
+            success = q16_kernel_->compute(q16_params);
+        }
+        else
+        {
+            // Q8_1 kernel (JIT/TILED/REFERENCE)
+            success = kernel_->compute(
+                params_.Q,
+                params_.K,
+                params_.V,
+                params_.Wo,
+                params_.output,
+                params_.seq_len,
+                effective_kv_len,
+                params_.causal,
+                position_offset,
+                params_.context_snapshot);
+        }
 
         if (!success)
         {

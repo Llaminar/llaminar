@@ -178,6 +178,12 @@ namespace llaminar2
         {
             using Type = Q8_1Tensor;
         };
+
+        template <>
+        struct UnifiedKVCacheTensor<ActivationPrecision::Q16_1>
+        {
+            using Type = Q16_1Tensor;
+        };
     } // namespace detail
 
     // =========================================================================
@@ -397,6 +403,7 @@ namespace llaminar2
     using UnifiedKVCacheBF16 = UnifiedKVCache<ActivationPrecision::BF16>;
     using UnifiedKVCacheFP16 = UnifiedKVCache<ActivationPrecision::FP16>;
     using UnifiedKVCacheQ8_1 = UnifiedKVCache<ActivationPrecision::Q8_1>;
+    using UnifiedKVCacheQ16_1 = UnifiedKVCache<ActivationPrecision::Q16_1>;
 
     // =========================================================================
     // Factory Functions

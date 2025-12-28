@@ -1533,6 +1533,23 @@ namespace llaminar2
                 }
             }
         }
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::attention()
+                .withInput("Q", "query tensor [seq_len, n_heads * head_dim]", KernelBufferDtype::FP32)
+                .withInput("K", "key tensor [kv_len, n_kv_heads * head_dim]", KernelBufferDtype::FP32)
+                .withInput("V", "value tensor [kv_len, n_kv_heads * head_dim]", KernelBufferDtype::FP32)
+                .withOutput("scores", "attention scores [n_heads, seq_len, kv_len]", KernelBufferDtype::FP32, true)
+                .withOutput("context", "attention context [seq_len, n_heads * head_dim]", KernelBufferDtype::FP32, true)
+                .withOutput("output", "attention output [seq_len, n_heads * head_dim]", KernelBufferDtype::FP32)
+                .withScalar("seq_len", "query sequence length", KernelBufferDtype::INT32)
+                .withScalar("kv_len", "key/value sequence length", KernelBufferDtype::INT32)
+                .withScalar("n_heads", "number of query heads", KernelBufferDtype::INT32)
+                .withScalar("n_kv_heads", "number of key/value heads", KernelBufferDtype::INT32)
+                .withScalar("head_dim", "dimension per head", KernelBufferDtype::INT32)
+                .withScalar("causal", "apply causal masking", KernelBufferDtype::INT32);
+        }
     };
 
     // Explicit instantiations

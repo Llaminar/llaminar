@@ -160,6 +160,18 @@ namespace llaminar2
         static const char *precision_name() { return "FP32"; }
         static constexpr float compression_ratio() { return 1.0f; }
 
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rope()
+                .withInput("Q", "query tensor [seq_len, n_heads, head_dim]", KernelBufferDtype::FP32)
+                .withInput("K", "key tensor [seq_len, n_kv_heads, head_dim]", KernelBufferDtype::FP32)
+                .withInput("position_ids", "position indices [seq_len]", KernelBufferDtype::INT32)
+                .withOutput("Q_out", "rotated query [seq_len, n_heads, head_dim]", KernelBufferDtype::FP32)
+                .withOutput("K_out", "rotated key [seq_len, n_kv_heads, head_dim]", KernelBufferDtype::FP32)
+                .withScalar("rope_theta", "RoPE frequency base");
+        }
+
         // Internal typed implementation
         bool apply_typed(
             float *Q,
@@ -216,6 +228,18 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
         static const char *precision_name() { return "BF16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rope()
+                .withInput("Q", "query tensor [seq_len, n_heads, head_dim]", KernelBufferDtype::BF16)
+                .withInput("K", "key tensor [seq_len, n_kv_heads, head_dim]", KernelBufferDtype::BF16)
+                .withInput("position_ids", "position indices [seq_len]", KernelBufferDtype::INT32)
+                .withOutput("Q_out", "rotated query [seq_len, n_heads, head_dim]", KernelBufferDtype::BF16)
+                .withOutput("K_out", "rotated key [seq_len, n_kv_heads, head_dim]", KernelBufferDtype::BF16)
+                .withScalar("rope_theta", "RoPE frequency base");
+        }
 
         // Internal typed implementation
         bool apply_typed(
@@ -294,6 +318,18 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
         static const char *precision_name() { return "FP16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rope()
+                .withInput("Q", "query tensor [seq_len, n_heads, head_dim]", KernelBufferDtype::FP16)
+                .withInput("K", "key tensor [seq_len, n_kv_heads, head_dim]", KernelBufferDtype::FP16)
+                .withInput("position_ids", "position indices [seq_len]", KernelBufferDtype::INT32)
+                .withOutput("Q_out", "rotated query [seq_len, n_heads, head_dim]", KernelBufferDtype::FP16)
+                .withOutput("K_out", "rotated key [seq_len, n_kv_heads, head_dim]", KernelBufferDtype::FP16)
+                .withScalar("rope_theta", "RoPE frequency base");
+        }
 
         // Internal typed implementation
         bool apply_typed(
@@ -382,6 +418,18 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q8_1; }
         static const char *precision_name() { return "Q8_1"; }
         static constexpr float compression_ratio() { return 4.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rope()
+                .withInput("Q", "query tensor [seq_len, n_heads, n_blocks_per_head]", KernelBufferDtype::Q8_1)
+                .withInput("K", "key tensor [seq_len, n_kv_heads, n_blocks_per_head]", KernelBufferDtype::Q8_1)
+                .withInput("position_ids", "position indices [seq_len]", KernelBufferDtype::INT32)
+                .withOutput("Q_out", "rotated query [seq_len, n_heads, n_blocks_per_head]", KernelBufferDtype::Q8_1)
+                .withOutput("K_out", "rotated key [seq_len, n_kv_heads, n_blocks_per_head]", KernelBufferDtype::Q8_1)
+                .withScalar("rope_theta", "RoPE frequency base");
+        }
 
         // Internal typed implementation
         bool apply_typed(
@@ -486,6 +534,18 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q16_1; }
         static const char *precision_name() { return "Q16_1"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rope()
+                .withInput("Q", "query tensor [seq_len, n_heads, n_blocks_per_head]", KernelBufferDtype::Q16_1)
+                .withInput("K", "key tensor [seq_len, n_kv_heads, n_blocks_per_head]", KernelBufferDtype::Q16_1)
+                .withInput("position_ids", "position indices [seq_len]", KernelBufferDtype::INT32)
+                .withOutput("Q_out", "rotated query [seq_len, n_heads, n_blocks_per_head]", KernelBufferDtype::Q16_1)
+                .withOutput("K_out", "rotated key [seq_len, n_kv_heads, n_blocks_per_head]", KernelBufferDtype::Q16_1)
+                .withScalar("rope_theta", "RoPE frequency base");
+        }
 
         // Internal typed implementation
         bool apply_typed(

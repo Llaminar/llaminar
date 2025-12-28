@@ -98,6 +98,16 @@ namespace llaminar2
             TensorBase *output,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::embedding()
+                .withWeight("embed_table", "embedding table [vocab_size, d_model]", KernelBufferDtype::FP32)
+                .withInput("token_ids", "input token IDs [num_tokens]", KernelBufferDtype::INT32)
+                .withOutput("output", "embedded output [num_tokens, d_model]", KernelBufferDtype::FP32)
+                .withScalar("num_tokens", "number of tokens", KernelBufferDtype::INT32)
+                .withScalar("d_model", "embedding dimension", KernelBufferDtype::INT32);
+        }
     };
 
     // Backward compatibility alias

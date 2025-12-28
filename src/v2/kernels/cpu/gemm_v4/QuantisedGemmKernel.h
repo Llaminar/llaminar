@@ -865,6 +865,20 @@ namespace llaminar2
                 return multiply_fused(A, C, m, n, k, nullptr, nullptr, false, nullptr, nullptr, accumulate, alpha, beta, ctx, device_idx);
             }
 
+            // IKernelSnapshotCapable interface
+            KernelSnapshotInfo getKernelSnapshotInfo() const override
+            {
+                return KernelSnapshotInfo::gemm()
+                    .withInput("A", "input activations [m, k]", KernelBufferDtype::FP32)
+                    .withWeight("B", "quantized weight matrix [n, k] (packed VNNI format)", KernelBufferDtype::INT8)
+                    .withOutput("C", "output matrix [m, n]", KernelBufferDtype::FP32)
+                    .withScalar("m", "batch dimension", KernelBufferDtype::INT32)
+                    .withScalar("n", "output features", KernelBufferDtype::INT32)
+                    .withScalar("k", "input features", KernelBufferDtype::INT32)
+                    .withScalar("alpha", "output scale factor")
+                    .withScalar("beta", "accumulate scale factor");
+            }
+
             /**
              * @brief Fused GEMM with optional post-operations (bias, mask, softmax, SwiGLU)
              *

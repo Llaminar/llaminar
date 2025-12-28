@@ -25,9 +25,10 @@ namespace llaminar2
      */
     enum class FusedAttentionBackend
     {
-        JIT,       ///< AVX-512 VNNI JIT (fastest, default)
-        REFERENCE, ///< Pure C++ reference (for testing/debugging)
-        TILED      ///< Cache-blocked tiled (balanced)
+        JIT,          ///< AVX-512 VNNI JIT (fastest, default)
+        REFERENCE,    ///< Pure C++ reference (for testing/debugging)
+        TILED,        ///< Cache-blocked tiled (balanced)
+        Q16_INTEGER   ///< Pure integer Q16_1 reference (experimental)
     };
 
     /**
@@ -41,6 +42,8 @@ namespace llaminar2
             return FusedAttentionBackend::REFERENCE;
         if (s == "tiled")
             return FusedAttentionBackend::TILED;
+        if (s == "q16_integer" || s == "q16" || s == "q16_int")
+            return FusedAttentionBackend::Q16_INTEGER;
         return FusedAttentionBackend::JIT; // Default
     }
 
@@ -57,6 +60,8 @@ namespace llaminar2
             return "REFERENCE";
         case FusedAttentionBackend::TILED:
             return "TILED";
+        case FusedAttentionBackend::Q16_INTEGER:
+            return "Q16_INTEGER";
         default:
             return "UNKNOWN";
         }

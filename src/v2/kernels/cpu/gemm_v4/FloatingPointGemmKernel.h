@@ -835,6 +835,27 @@ namespace llaminar2
                 return device_idx == -1; // CPU only
             }
 
+            // IKernelSnapshotCapable interface
+            KernelSnapshotInfo getKernelSnapshotInfo() const override
+            {
+                // Determine weight dtype from bound tensor
+                KernelBufferDtype weight_dtype = KernelBufferDtype::FP32;
+                if (weight_type_ == TensorType::FP16)
+                    weight_dtype = KernelBufferDtype::FP16;
+                else if (weight_type_ == TensorType::BF16)
+                    weight_dtype = KernelBufferDtype::BF16;
+
+                return KernelSnapshotInfo::gemm()
+                    .withInput("A", "input activations [m, k]", weight_dtype)
+                    .withWeight("B", "weight matrix [n, k]", weight_dtype)
+                    .withOutput("C", "output matrix [m, n]", weight_dtype)
+                    .withScalar("m", "batch dimension", KernelBufferDtype::INT32)
+                    .withScalar("n", "output features", KernelBufferDtype::INT32)
+                    .withScalar("k", "input features", KernelBufferDtype::INT32)
+                    .withScalar("alpha", "output scale factor")
+                    .withScalar("beta", "accumulate scale factor");
+            }
+
             // ========== Primary Interface: multiply() ==========
 
             /**

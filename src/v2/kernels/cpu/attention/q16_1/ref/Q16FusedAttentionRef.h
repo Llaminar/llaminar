@@ -138,6 +138,14 @@ namespace llaminar2
             bool causal = true;      ///< Apply causal masking
             int position_offset = 0; ///< Position offset for causal mask
 
+            // ============== Snapshot/Debug config ==============
+
+            /** Optional FP32 buffer for attention context snapshot [seq_len_q × num_heads × head_dim]
+             *  If provided, INT32 context will be converted to FP32 and stored here before Wo projection.
+             *  This enables debugging and parity testing with FP32 reference implementations.
+             */
+            float *context_snapshot = nullptr;
+
             // ============== Helper methods ==============
 
             float get_scale() const

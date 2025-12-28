@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../utils/MPIContext.h"
+#include "KernelSnapshotInfo.h"
 #include <memory>
 #include <vector>
 
@@ -283,8 +284,16 @@ namespace llaminar2
 
     /**
      * @brief Base kernel interface
+     *
+     * All kernels inherit from ITensorKernel, which in turn inherits from
+     * IKernelSnapshotCapable. This enforces that all kernel implementations
+     * MUST implement getKernelSnapshotInfo() for snapshot support.
+     *
+     * @note The pure virtual getKernelSnapshotInfo() method is inherited
+     *       from IKernelSnapshotCapable. Subclasses MUST override it or
+     *       the code will not compile.
      */
-    class ITensorKernel
+    class ITensorKernel : public IKernelSnapshotCapable
     {
     public:
         virtual ~ITensorKernel() = default;
@@ -1632,6 +1641,341 @@ namespace llaminar2
         }
     };
 
+    // =========================================================================
+    // Forward Declarations for Fused Attention
+    // =========================================================================
+
+    namespace gemm_v4
+    {
+        struct QuantisedPackedWeights;
+    }
+
+    // =========================================================================
+    // ITensorFusedAttentionWo - Fused Attention + Wo Projection Interface
+    // =========================================================================
+
+    /**
+     * @brief Parameters for fused attention + Wo projection + residual add
+     *
+     * This struct bundles all parameters for a fully-fused attention block that
+     * combines:
+     * 1. Q×K^T → attention scores (INT32 or FP32 domain)
+     * 2. Softmax → attention weights
+     * 3. Weights×V → attention context
+     * 4. Context×Wo → output projection
+     * 5. Output + residual → final output
+     *
+     * Design Goals:
+     * - **Register-resident intermediate values**: No round-trip to memory between steps
+     * - **Integer-domain pipeline**: Q16_1 implementation keeps everything in INT32
+     * - **Flexible I/O**: Supports various quantized formats (Q16_1, Q8_1, FP32)
+     *
+     * Execution paths (determined by implementation):
+     * - **Flash Decode** (seq_len_q=1): Single query, full KV, no tiling
+     * - **FA2 Prefill** (seq_len_q>1): Batched queries, tiled KV processing
+     *
+     * @note Q, K, V, residual types are void* to support both quantized blocks
+     *       and FP32 pointers. The implementing kernel knows the actual types.
+     */
+    struct FusedAttentionWoParams
+    {
+        // ============== Attention tensors (Q16_1, Q8_1, or FP32) ==============
+
+        const void *Q = nullptr; ///< Query tensor [seq_len_q × n_heads × head_dim]
+        const void *K = nullptr; ///< Key tensor [kv_len × n_kv_heads × head_dim]
+        const void *V = nullptr; ///< Value tensor [kv_len × n_kv_heads × head_dim]
+
+        // ============== Wo projection weights ==============
+
+        /**
+         * @brief VNNI-packed Wo weights for VPDPWSSD (INT16×INT16→INT32)
+         *
+         * Created from Q8_1 via KernelFactory::ensurePackedWeightsInTensorCache()
+         * For FP32 implementations, this may be nullptr (use FP32 Wo instead)
+         */
+        const gemm_v4::QuantisedPackedWeights *Wo_packed = nullptr;
+
+        /**
+         * @brief FP32 Wo weights [d_model × d_model] for FP32 implementations
+         *
+         * Used when Wo_packed is nullptr (pure FP32 path)
+         */
+        const float *Wo_fp32 = nullptr;
+
+        // ============== Residual tensors ==============
+
+        const void *residual_in = nullptr; ///< Input residual [seq_len_q × d_model]
+        void *residual_out = nullptr;      ///< Output residual [seq_len_q × d_model]
+                                           ///< Can be same as residual_in for in-place
+
+        // ============== Dimensions ==============
+
+        int seq_len_q = 0;    ///< Number of query positions
+        int kv_len = 0;       ///< Number of KV positions (cache length)
+        int n_heads = 0;      ///< Number of query heads
+        int n_kv_heads = 0;   ///< Number of KV heads (for GQA/MQA)
+        int head_dim = 0;     ///< Dimension per head (typically 64 or 128)
+        int d_model = 0;      ///< Model dimension (n_heads * head_dim)
+
+        // ============== Attention configuration ==============
+
+        float scale = 0.0f;      ///< 1/sqrt(head_dim), auto-computed if 0
+        bool causal = true;      ///< Apply causal masking
+        int position_offset = 0; ///< Position offset for causal mask (decode)
+        int window_size = -1;    ///< Sliding window size (-1 = disabled)
+
+        // ============== Tiling parameters (for FA2 prefill) ==============
+
+        int Bc = 256; ///< KV tile size for FA2 prefill (ignored for decode)
+        int Br = 16;  ///< Query tile size for FA2 prefill
+
+        // ============== Snapshot/Debug buffers ==============
+
+        /**
+         * @brief Optional FP32 buffer for attention scores snapshot
+         *
+         * If non-null, attention scores (Q×K^T × scale) will be dequantized
+         * to FP32 and stored here [seq_len_q × n_heads × kv_len]
+         * for debugging/parity testing.
+         */
+        float *scores_snapshot = nullptr;
+
+        /**
+         * @brief Optional FP32 buffer for attention context snapshot
+         *
+         * If non-null, context (softmax × V) will be dequantized to FP32
+         * and stored here [seq_len_q × n_heads × head_dim]
+         * before Wo projection.
+         */
+        float *context_snapshot = nullptr;
+
+        /**
+         * @brief Optional FP32 buffer for Wo projection output snapshot
+         *
+         * If non-null, Wo output will be dequantized to FP32
+         * and stored here [seq_len_q × d_model]
+         * before residual add.
+         */
+        float *wo_output_snapshot = nullptr;
+
+        // ============== Helper methods ==============
+
+        /**
+         * @brief Get the attention scale (auto-compute if not set)
+         */
+        float get_scale() const
+        {
+            if (scale > 0.0f)
+                return scale;
+            return 1.0f / std::sqrt(static_cast<float>(head_dim));
+        }
+
+        /**
+         * @brief Check if this is a decode pass (single query token)
+         */
+        bool is_decode() const { return seq_len_q == 1; }
+
+        /**
+         * @brief Get the KV head index for a given query head (GQA mapping)
+         */
+        int get_kv_head(int query_head) const
+        {
+            if (n_kv_heads == n_heads)
+                return query_head;
+            return query_head / (n_heads / n_kv_heads);
+        }
+    };
+
+    /**
+     * @brief Interface for fused attention + Wo projection + residual kernels
+     *
+     * This interface is designed for high-performance fused attention kernels
+     * that combine the entire attention block (QKV → softmax → context → Wo → residual)
+     * into a single kernel call, maximizing register utilization.
+     *
+     * Primary use case: **Integer-domain Q16_1 attention**
+     * - Q×K^T → INT32 scores
+     * - Exp2FixedSoftmax → INT16 weights
+     * - Weights×V → INT32 context accumulators
+     * - Context×Wo (VPDPWSSD) → INT32 → Q16_1
+     * - Q16_1 + Q16_1 residual → Q16_1 output
+     *
+     * The interface also supports FP32 implementations for reference/fallback.
+     *
+     * **Why separate from ITensorAttention?**
+     * ITensorAttention outputs attention context only. This interface outputs
+     * the full attention block result (after Wo and residual), enabling:
+     * - Register-resident Wo projection (no context materialize to memory)
+     * - Native quantized residual add (no FP32 conversion)
+     * - Single kernel launch for entire attention block
+     *
+     * Implementations:
+     * - Q16FusedAttentionRef: Scalar C++ reference (for testing/debugging)
+     * - Q16FusedAttentionJit: AVX512 JIT (production)
+     * - FP32FusedAttentionRef: FP32 fallback (parity testing)
+     */
+    class ITensorFusedAttentionWo : public ITensorKernel
+    {
+    public:
+        /**
+         * @brief Execute fused attention + Wo + residual
+         *
+         * Dispatches to decode or prefill path based on params.seq_len_q.
+         *
+         * @param params Complete parameter struct (see FusedAttentionWoParams)
+         * @param mpi_ctx MPI context for distributed execution (optional)
+         * @param device_idx Device index (-1 = CPU)
+         * @return true on success, false on validation/execution error
+         *
+         * @note This is the primary entry point. Implementations may override
+         *       compute_decode() and compute_prefill() for path-specific optimizations.
+         */
+        virtual bool compute(
+            const FusedAttentionWoParams &params,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
+
+        /**
+         * @brief Execute fused attention for decode (single query token)
+         *
+         * Optimized for autoregressive token generation:
+         * - Single query against full KV cache
+         * - Parallel over KV positions, no tiling
+         * - Latency-optimized
+         *
+         * @param params Parameters (must have seq_len_q == 1)
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @return true on success
+         *
+         * Default: calls compute(params, mpi_ctx, device_idx) with validation
+         */
+        virtual bool compute_decode(
+            const FusedAttentionWoParams &params,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            if (params.seq_len_q != 1)
+                return false;
+            return compute(params, mpi_ctx, device_idx);
+        }
+
+        /**
+         * @brief Execute fused attention for prefill (multiple query tokens)
+         *
+         * Optimized for prompt processing:
+         * - Batched queries with tiled KV processing
+         * - Throughput-optimized (FA2 algorithm)
+         *
+         * @param params Parameters (typically seq_len_q > 1)
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @return true on success
+         *
+         * Default: calls compute(params, mpi_ctx, device_idx) with validation
+         */
+        virtual bool compute_prefill(
+            const FusedAttentionWoParams &params,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            if (params.seq_len_q < 1)
+                return false;
+            return compute(params, mpi_ctx, device_idx);
+        }
+
+        /**
+         * @brief Execute using TensorBase objects with automatic type dispatch
+         *
+         * Inspects tensor native_type() and constructs appropriate params.
+         * This is the type-safe interface for stages that don't know the
+         * concrete tensor format.
+         *
+         * @param Q Query tensor [seq_len_q × n_heads × head_dim]
+         * @param K Key tensor [kv_len × n_kv_heads × head_dim]
+         * @param V Value tensor [kv_len × n_kv_heads × head_dim]
+         * @param Wo_tensor Wo weight tensor (for extracting packed weights or FP32 data)
+         * @param residual_in Input residual tensor [seq_len_q × d_model]
+         * @param residual_out Output residual tensor [seq_len_q × d_model]
+         * @param seq_len_q Query sequence length
+         * @param kv_len KV sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param causal Apply causal masking
+         * @param position_offset Position offset for decode
+         * @param scores_snapshot Optional FP32 buffer for scores
+         * @param context_snapshot Optional FP32 buffer for context
+         * @param wo_output_snapshot Optional FP32 buffer for Wo output
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @return true on success, false if tensor types not supported
+         */
+        virtual bool compute_tensor(
+            const TensorBase *Q,
+            const TensorBase *K,
+            const TensorBase *V,
+            const TensorBase *Wo_tensor,
+            const TensorBase *residual_in,
+            TensorBase *residual_out,
+            int seq_len_q,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal = true,
+            int position_offset = 0,
+            float *scores_snapshot = nullptr,
+            float *context_snapshot = nullptr,
+            float *wo_output_snapshot = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported (subclasses override with type-aware dispatch)
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)Wo_tensor;
+            (void)residual_in;
+            (void)residual_out;
+            (void)seq_len_q;
+            (void)kv_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)position_offset;
+            (void)scores_snapshot;
+            (void)context_snapshot;
+            (void)wo_output_snapshot;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
+         * @brief Get input precision format supported by this kernel
+         *
+         * Returns the activation precision this kernel expects for Q/K/V inputs.
+         * Used by stages to verify tensor format compatibility.
+         */
+        virtual ActivationFormat input_format() const = 0;
+
+        /**
+         * @brief Get output precision format produced by this kernel
+         *
+         * Returns the activation precision of the residual output.
+         */
+        virtual ActivationFormat output_format() const = 0;
+
+        /**
+         * @brief Check if this kernel requires VNNI-packed Wo weights
+         *
+         * @return true if Wo_packed must be provided, false if Wo_fp32 is used
+         */
+        virtual bool requires_packed_wo() const = 0;
+    };
+
     /**
      * @brief Rotary Positional Embedding (RoPE) kernel
      */
@@ -1949,10 +2293,29 @@ namespace llaminar2
 
     /**
      * @brief Softmax kernel
+     *
+     * Computes row-wise softmax normalization with optional causal masking.
+     * Typically used for attention score normalization.
+     *
+     * The modern interface uses apply_tensor() for polymorphic dispatch.
+     * Legacy typed methods (apply_bf16, apply_fp16) are retained for
+     * backward compatibility but implementations should prefer apply_tensor().
      */
     class ITensorSoftmax : public ITensorKernel
     {
     public:
+        /**
+         * @brief Apply softmax to FP32 data (legacy interface)
+         *
+         * @param input Input tensor [rows, cols]
+         * @param output Output tensor [rows, cols]
+         * @param rows Number of rows
+         * @param cols Number of columns per row
+         * @param use_causal_mask Apply causal (lower-triangular) masking
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index (-1 = CPU)
+         * @return true on success
+         */
         virtual bool apply(
             const float *input, float *output,
             int rows, int cols,
@@ -1973,6 +2336,44 @@ namespace llaminar2
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) { return false; }
+
+        /**
+         * @brief Apply softmax using tensor objects with automatic type dispatch
+         *
+         * Modern polymorphic interface. Inspects input/output tensor native_type()
+         * and dispatches to the appropriate precision-specific implementation.
+         *
+         * @param input Input tensor [rows, cols] (any supported precision)
+         * @param output Output tensor [rows, cols] (same type as input, may be same buffer for in-place)
+         * @param rows Number of rows
+         * @param cols Number of columns per row
+         * @param use_causal_mask Apply causal (lower-triangular) masking
+         * @param scale Pre-softmax scale factor (typically 1/sqrt(d_k) for attention)
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index (-1 = CPU)
+         * @return true on success, false on failure or unsupported type
+         *
+         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         */
+        virtual bool apply_tensor(
+            const TensorBase *input,
+            TensorBase *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            float scale = 1.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)use_causal_mask;
+            (void)scale;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Subclasses override with type-aware dispatch
+        }
     };
 
     /**

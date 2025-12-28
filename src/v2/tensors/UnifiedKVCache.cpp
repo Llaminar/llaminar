@@ -48,6 +48,13 @@ namespace llaminar2
         return tensor_factory_->createQ8_1({rows, cols});
     }
 
+    template <>
+    std::shared_ptr<Q16_1Tensor> UnifiedKVCache<ActivationPrecision::Q16_1>::allocate_tensor(
+        size_t rows, size_t cols, int device_idx)
+    {
+        return tensor_factory_->createQ16_1({rows, cols}, device_idx);
+    }
+
     // =========================================================================
     // Helper Specializations: Copy Append Data
     // =========================================================================
@@ -100,6 +107,21 @@ namespace llaminar2
         std::memcpy(dst_blocks + offset_blocks, src_blocks, copy_size);
     }
 
+    template <>
+    void UnifiedKVCache<ActivationPrecision::Q16_1>::copy_append_data(
+        Q16_1Tensor *dst, const Q16_1Tensor *src, int offset_tokens, int new_tokens)
+    {
+        Q16_1Block *dst_blocks = dst->mutable_q16_1_blocks();
+        const Q16_1Block *src_blocks = src->q16_1_blocks();
+
+        size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
+        size_t copy_blocks = static_cast<size_t>(new_tokens) * blocks_per_row;
+        size_t copy_size = copy_blocks * sizeof(Q16_1Block);
+
+        std::memcpy(dst_blocks + offset_blocks, src_blocks, copy_size);
+    }
+
     // =========================================================================
     // Helper Specializations: Shift Evict Data
     // =========================================================================
@@ -143,6 +165,18 @@ namespace llaminar2
         size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
         size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
         size_t keep_size = keep_blocks * sizeof(Q8_1Block);
+        std::memmove(blocks, blocks + evict_blocks, keep_size);
+    }
+
+    template <>
+    void UnifiedKVCache<ActivationPrecision::Q16_1>::shift_evict_data(
+        Q16_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
+    {
+        Q16_1Block *blocks = tensor->mutable_q16_1_blocks();
+        size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
+        size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
+        size_t keep_size = keep_blocks * sizeof(Q16_1Block);
         std::memmove(blocks, blocks + evict_blocks, keep_size);
     }
 
@@ -736,6 +770,16 @@ namespace llaminar2
                 size_t copy_bytes = copy_blocks * sizeof(Q8_1Block);
                 std::memcpy(dst_blocks + dst_offset_blocks, src_blocks, copy_bytes);
             }
+            else if constexpr (Precision == ActivationPrecision::Q16_1)
+            {
+                const Q16_1Block *src_blocks = src_k->q16_1_blocks();
+                Q16_1Block *dst_blocks = typed_k->mutable_q16_1_blocks();
+                size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+                size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
+                size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
+                size_t copy_bytes = copy_blocks * sizeof(Q16_1Block);
+                std::memcpy(dst_blocks + dst_offset_blocks, src_blocks, copy_bytes);
+            }
 
             // Copy V
             if constexpr (Precision == ActivationPrecision::FP32)
@@ -772,6 +816,16 @@ namespace llaminar2
                 size_t copy_bytes = copy_blocks * sizeof(Q8_1Block);
                 std::memcpy(dst_blocks + dst_offset_blocks, src_blocks, copy_bytes);
             }
+            else if constexpr (Precision == ActivationPrecision::Q16_1)
+            {
+                const Q16_1Block *src_blocks = src_v->q16_1_blocks();
+                Q16_1Block *dst_blocks = typed_v->mutable_q16_1_blocks();
+                size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+                size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
+                size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
+                size_t copy_bytes = copy_blocks * sizeof(Q16_1Block);
+                std::memcpy(dst_blocks + dst_offset_blocks, src_blocks, copy_bytes);
+            }
         }
 
         LOG_DEBUG("UnifiedKVCache::gather_kv_batched: layer " << layer
@@ -788,6 +842,7 @@ namespace llaminar2
     template class UnifiedKVCache<ActivationPrecision::BF16>;
     template class UnifiedKVCache<ActivationPrecision::FP16>;
     template class UnifiedKVCache<ActivationPrecision::Q8_1>;
+    template class UnifiedKVCache<ActivationPrecision::Q16_1>;
 
     // =========================================================================
     // Factory Functions
@@ -810,6 +865,8 @@ namespace llaminar2
             return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
         case ActivationPrecision::Q8_1:
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+        case ActivationPrecision::Q16_1:
+            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
         default:
             LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -833,6 +890,8 @@ namespace llaminar2
             return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
         case ActivationPrecision::Q8_1:
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+        case ActivationPrecision::Q16_1:
+            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
         default:
             LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -864,6 +923,9 @@ namespace llaminar2
         case ActivationPrecision::Q8_1:
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+        case ActivationPrecision::Q16_1:
+            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
         default:
             LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -891,6 +953,9 @@ namespace llaminar2
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
         case ActivationPrecision::Q8_1:
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+        case ActivationPrecision::Q16_1:
+            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
         default:
             LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));

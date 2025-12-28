@@ -8,6 +8,8 @@
  * - Internal computation varies by precision
  * - Q8_1 uses integer-aware operations without full FP32 dequantization
  *
+ * All specializations inherit from ITensorSoftmax for proper interface conformance.
+ *
  * Usage:
  *   CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
  *   kernel_fp32.apply_typed(scores_fp32, rows, cols, causal, scale);
@@ -21,8 +23,10 @@
 #include "../CPUKernelBase.h"
 #include "../../../execution/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/TensorKernels.h"
 
 #include <cstdint>
+#include <cstring>
 
 namespace llaminar2
 {
@@ -125,7 +129,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPUSoftmaxKernelT<ActivationPrecision::FP32> : public CPUKernelBase
+    class CPUSoftmaxKernelT<ActivationPrecision::FP32> : public ITensorSoftmax, public CPUKernelBase
     {
     public:
         using StorageType = float;
@@ -133,7 +137,7 @@ namespace llaminar2
         CPUSoftmaxKernelT() = default;
         ~CPUSoftmaxKernelT() override;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
@@ -141,6 +145,44 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
         static const char *precision_name() { return "FP32"; }
         static constexpr float compression_ratio() { return 1.0f; }
+
+        // ===== ITensorSoftmax interface =====
+
+        bool apply(
+            const float *input, float *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Copy input to output for in-place operation if different buffers
+            if (input != output)
+            {
+                std::memcpy(output, input, static_cast<size_t>(rows) * cols * sizeof(float));
+            }
+            return apply_typed(output, rows, cols, use_causal_mask, 1.0f, device_idx);
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            TensorBase *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            float scale = 1.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::softmax()
+                .withInput("input", "attention scores [rows, cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "softmax probabilities [rows, cols]", KernelBufferDtype::FP32)
+                .withScalar("scale", "pre-softmax scale factor")
+                .withScalar("use_causal_mask", "apply causal masking", KernelBufferDtype::INT32);
+        }
+
+        // ===== Typed interface =====
 
         /**
          * @brief Apply softmax to FP32 data
@@ -167,7 +209,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPUSoftmaxKernelT<ActivationPrecision::BF16> : public CPUKernelBase
+    class CPUSoftmaxKernelT<ActivationPrecision::BF16> : public ITensorSoftmax, public CPUKernelBase
     {
     public:
         using StorageType = uint16_t;
@@ -175,7 +217,7 @@ namespace llaminar2
         CPUSoftmaxKernelT() = default;
         ~CPUSoftmaxKernelT() override;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
@@ -183,6 +225,61 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
         static const char *precision_name() { return "BF16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // ===== ITensorSoftmax interface =====
+
+        bool apply(
+            const float *input, float *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)use_causal_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // BF16 kernel doesn't handle FP32
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, uint16_t *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Copy input to output for in-place operation if different buffers
+            if (input != output)
+            {
+                std::memcpy(output, input, static_cast<size_t>(rows) * cols * sizeof(uint16_t));
+            }
+            return apply_typed(output, rows, cols, use_causal_mask, 1.0f, device_idx);
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            TensorBase *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            float scale = 1.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::softmax()
+                .withInput("input", "attention scores [rows, cols]", KernelBufferDtype::BF16)
+                .withOutput("output", "softmax probabilities [rows, cols]", KernelBufferDtype::BF16)
+                .withScalar("scale", "pre-softmax scale factor")
+                .withScalar("use_causal_mask", "apply causal masking", KernelBufferDtype::INT32);
+        }
+
+        // ===== Typed interface =====
 
         /**
          * @brief Apply softmax to BF16 data
@@ -209,7 +306,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPUSoftmaxKernelT<ActivationPrecision::FP16> : public CPUKernelBase
+    class CPUSoftmaxKernelT<ActivationPrecision::FP16> : public ITensorSoftmax, public CPUKernelBase
     {
     public:
         using StorageType = uint16_t;
@@ -217,7 +314,7 @@ namespace llaminar2
         CPUSoftmaxKernelT() = default;
         ~CPUSoftmaxKernelT() override;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
@@ -225,6 +322,61 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
         static const char *precision_name() { return "FP16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // ===== ITensorSoftmax interface =====
+
+        bool apply(
+            const float *input, float *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)use_causal_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // FP16 kernel doesn't handle FP32
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, uint16_t *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Copy input to output for in-place operation if different buffers
+            if (input != output)
+            {
+                std::memcpy(output, input, static_cast<size_t>(rows) * cols * sizeof(uint16_t));
+            }
+            return apply_typed(output, rows, cols, use_causal_mask, 1.0f, device_idx);
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            TensorBase *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            float scale = 1.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::softmax()
+                .withInput("input", "attention scores [rows, cols]", KernelBufferDtype::FP16)
+                .withOutput("output", "softmax probabilities [rows, cols]", KernelBufferDtype::FP16)
+                .withScalar("scale", "pre-softmax scale factor")
+                .withScalar("use_causal_mask", "apply causal masking", KernelBufferDtype::INT32);
+        }
+
+        // ===== Typed interface =====
 
         /**
          * @brief Apply softmax to FP16 data
@@ -267,7 +419,7 @@ namespace llaminar2
      *       Actual column count = n_blocks_per_row * 32 (Q8_1 block size)
      */
     template <>
-    class CPUSoftmaxKernelT<ActivationPrecision::Q8_1> : public CPUKernelBase
+    class CPUSoftmaxKernelT<ActivationPrecision::Q8_1> : public ITensorSoftmax, public CPUKernelBase
     {
     public:
         using StorageType = Q8_1Block;
@@ -275,7 +427,7 @@ namespace llaminar2
         CPUSoftmaxKernelT() = default;
         ~CPUSoftmaxKernelT() override;
 
-        bool supports_device(int device_idx) const
+        bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
@@ -283,6 +435,45 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q8_1; }
         static const char *precision_name() { return "Q8_1"; }
         static constexpr float compression_ratio() { return 4.0f; }
+
+        // ===== ITensorSoftmax interface =====
+
+        bool apply(
+            const float *input, float *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)use_causal_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Q8_1 kernel doesn't handle FP32
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            TensorBase *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            float scale = 1.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::softmax()
+                .withInput("input", "attention scores [rows, n_blocks]", KernelBufferDtype::Q8_1)
+                .withOutput("output", "softmax probabilities [rows, n_blocks]", KernelBufferDtype::Q8_1)
+                .withScalar("scale", "pre-softmax scale factor")
+                .withScalar("use_causal_mask", "apply causal masking", KernelBufferDtype::INT32);
+        }
+
+        // ===== Typed interface =====
 
         /**
          * @brief Apply softmax to Q8_1 data

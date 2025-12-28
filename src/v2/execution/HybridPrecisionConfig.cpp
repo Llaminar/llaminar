@@ -191,13 +191,13 @@ namespace llaminar2
         case HybridBufferType::KV_Cache:
             return kv_cache;
 
-        // Attention - context is FP32, output is Q8_1 (for Q16_1 residual add)
+        // Attention - Q16 fused kernel uses INT32 internally, outputs Q16_1
         case HybridBufferType::Attention_Context:
-            return attention_context;
+            return attention_context; // Q16_1 for snapshots (fused kernel is INT32 internal)
         case HybridBufferType::Attention_Output:
-            return attention_output; // Q8_1 in HybridQ16
+            return attention_output; // Q16_1 in HybridQ16 (fused write to residual)
 
-        // FFN - gate/up are Q8_1, down is Q8_1 (for Q16_1 residual add)
+        // FFN - gate/up are Q8_1, down is Q8_1 (added to Q16_1 residual)
         case HybridBufferType::FFN_Gate:
             return ffn_gate;
         case HybridBufferType::FFN_Up:
@@ -213,11 +213,13 @@ namespace llaminar2
 
     HybridQ16PrecisionConfig HybridQ16PrecisionConfig::defaultConfig()
     {
-        // Returns default HybridQ16 configuration:
+        // Returns default HybridQ16 configuration for Q16 integer attention:
         // - Residual stream: Q16_1 (high-precision accumulator)
-        // - Attention output: Q8_1 (added to Q16_1 residual)
+        // - Q/K after RoPE: Q16_1 (Q16 fused kernel expects Q16_1 inputs)
+        // - KV Cache: Q16_1 (matches Q16 attention)
+        // - Attention context: Q16_1 (for snapshots; fused kernel uses INT32 internally)
+        // - Attention output: Q16_1 (fused kernel writes Q16_1 directly to residual)
         // - FFN down: Q8_1 (added to Q16_1 residual)
-        // - Everything else same as Hybrid
         return HybridQ16PrecisionConfig{};
     }
 

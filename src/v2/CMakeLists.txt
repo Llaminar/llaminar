@@ -607,6 +607,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp             # Reference implementation
     kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp           # Cache-blocked tiled implementation
     # Q16_1 fused attention (PURE INTEGER PIPELINE)
+    kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.cpp        # ITensorFusedAttentionWo implementation
     kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.cpp       # Scalar reference implementation
     kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProductRef.cpp    # μK: Q×K^T dot product (INT16×INT16→INT32)
     kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmaxRef.cpp # μK: exp2 fixed-point softmax (INT32→INT16)

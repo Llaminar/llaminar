@@ -108,40 +108,50 @@ namespace llaminar2
     /**
      * @brief Per-buffer precision configuration for HybridQ16 mode
      *
-     * HybridQ16 mode uses Q16_1 for the residual stream instead of FP32.
-     * This provides 266× better precision than Q8_1 while saving ~62% memory
-     * compared to FP32 residual + FP32 projection buffers.
+     * HybridQ16 mode uses Q16_1 for the residual stream and supports the
+     * Q16 integer-domain fused attention kernel. This provides 266× better
+     * precision than Q8_1 while the fused kernel avoids FP32 intermediates.
      *
      * Key differences from Hybrid mode:
      * - Residual stream: Q16_1 (vs FP32 in Hybrid)
-     * - Attention output: Q8_1 (vs FP32 in Hybrid) - added to Q16_1 residual
+     * - Q/K after RoPE: Q16_1 (vs FP32 in Hybrid) - Q16 kernel expects Q16_1 inputs
+     * - KV Cache: Q16_1 (vs FP32/BF16 in Hybrid)
+     * - Attention context: Q16_1 (fused kernel uses INT32 internally, outputs Q16_1)
+     * - Attention output: Q16_1 (vs FP32 in Hybrid) - fused write to residual
      * - FFN down: Q8_1 (vs FP32 in Hybrid) - added to Q16_1 residual
+     *
+     * Q16 Fused Attention Pipeline (PURE INTEGER):
+     * 1. Q×K^T → INT32 scores (via Int8Requant)
+     * 2. Exp2FixedSoftmax → INT16 weights
+     * 3. P×V → INT32 accumulators
+     * 4. Wo projection (VPDPWSSD) → Q16_1 output
+     * 5. Native Q16_1 residual add
      *
      * Memory layout (Qwen2-0.5B, seq=2048):
      * - residual: Q16_1 (2.25 B/elem) vs FP32 (4 B/elem) = 44% savings
-     * - attn_proj: Q8_1 (1.125 B/elem) vs FP32 (4 B/elem) = 72% savings
+     * - attn_proj: Q16_1 (2.25 B/elem) vs FP32 (4 B/elem) = 44% savings
      * - ffn_output: Q8_1 (1.125 B/elem) vs FP32 (4 B/elem) = 72% savings
-     * - Overall: ~62% memory reduction
+     * - Overall: ~55% memory reduction
      */
     struct HybridQ16PrecisionConfig
     {
         // Residual stream (the key change - Q16_1 instead of FP32)
         ActivationPrecision residual_stream = ActivationPrecision::Q16_1;
 
-        // Layer outputs that add to residual (Q8_1 instead of FP32)
-        ActivationPrecision attention_output = ActivationPrecision::Q8_1;
-        ActivationPrecision ffn_down = ActivationPrecision::Q8_1;
+        // Layer outputs that add to residual
+        ActivationPrecision attention_output = ActivationPrecision::Q16_1; ///< Fused kernel outputs Q16_1 directly
+        ActivationPrecision ffn_down = ActivationPrecision::Q8_1;          ///< FFN still uses Q8_1 (added to Q16_1 residual)
 
-        // QKV path precision (same as Hybrid)
-        ActivationPrecision qkv_gemm_output = ActivationPrecision::Q8_1;
-        ActivationPrecision q_after_rope = ActivationPrecision::FP32;
-        ActivationPrecision k_after_rope = ActivationPrecision::FP32;
-        ActivationPrecision kv_cache = ActivationPrecision::FP32;
+        // QKV path precision - Q16_1 for fused attention kernel
+        ActivationPrecision qkv_gemm_output = ActivationPrecision::Q8_1; ///< QKV projection output
+        ActivationPrecision q_after_rope = ActivationPrecision::Q16_1;   ///< Q16 kernel expects Q16_1 Q input
+        ActivationPrecision k_after_rope = ActivationPrecision::Q16_1;   ///< Q16 kernel expects Q16_1 K input
+        ActivationPrecision kv_cache = ActivationPrecision::Q16_1;       ///< Q16_1 KV cache for Q16 attention
 
-        // Attention precision (same as Hybrid)
-        ActivationPrecision attention_context = ActivationPrecision::FP32;
+        // Attention precision - fused kernel uses INT32 internally, outputs Q16_1
+        ActivationPrecision attention_context = ActivationPrecision::Q16_1; ///< For snapshots (fused kernel is INT32 internal)
 
-        // FFN intermediate precision (same as Hybrid)
+        // FFN intermediate precision (same as Hybrid - Q8_1 is sufficient)
         ActivationPrecision ffn_gate = ActivationPrecision::Q8_1;
         ActivationPrecision ffn_up = ActivationPrecision::Q8_1;
 

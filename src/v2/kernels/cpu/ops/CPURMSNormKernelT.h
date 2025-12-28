@@ -321,6 +321,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
         static const char *precision_name() { return "FP32"; }
         static constexpr float compression_ratio() { return 1.0f; }
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rmsnorm()
+                .withInput("input", "input activations [rows, cols]", KernelBufferDtype::FP32)
+                .withWeight("gamma", "normalization weights [cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "normalized output [rows, cols]", KernelBufferDtype::FP32)
+                .withScalar("epsilon", "numerical stability constant");
+        }
     };
 
     // =========================================================================
@@ -454,6 +463,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
         static const char *precision_name() { return "BF16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rmsnorm()
+                .withInput("input", "input activations [rows, cols]", KernelBufferDtype::BF16)
+                .withWeight("gamma", "normalization weights [cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "normalized output [rows, cols]", KernelBufferDtype::BF16)
+                .withScalar("epsilon", "numerical stability constant");
+        }
     };
 
     // =========================================================================
@@ -582,6 +600,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
         static const char *precision_name() { return "FP16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rmsnorm()
+                .withInput("input", "input activations [rows, cols]", KernelBufferDtype::FP16)
+                .withWeight("gamma", "normalization weights [cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "normalized output [rows, cols]", KernelBufferDtype::FP16)
+                .withScalar("epsilon", "numerical stability constant");
+        }
     };
 
     // =========================================================================
@@ -713,6 +740,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q8_1; }
         static const char *precision_name() { return "Q8_1"; }
         static constexpr float compression_ratio() { return 3.556f; }
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rmsnorm()
+                .withInput("input", "input activations [rows, cols]", KernelBufferDtype::Q8_1)
+                .withWeight("gamma", "normalization weights [cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "normalized output [rows, cols]", KernelBufferDtype::Q8_1)
+                .withScalar("epsilon", "numerical stability constant");
+        }
     };
 
     // =========================================================================
@@ -864,6 +900,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q16_1; }
         static const char *precision_name() { return "Q16_1"; }
         static constexpr float compression_ratio() { return 1.778f; }
+
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::rmsnorm()
+                .withInput("input", "input activations [rows, cols]", KernelBufferDtype::Q16_1)
+                .withWeight("gamma", "normalization weights [cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "normalized output [rows, cols]", KernelBufferDtype::Q16_1)
+                .withScalar("epsilon", "numerical stability constant");
+        }
     };
 
 } // namespace llaminar2

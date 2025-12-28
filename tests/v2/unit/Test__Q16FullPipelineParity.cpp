@@ -641,6 +641,136 @@ TEST_F(Q16FullPipelineParityTest, FullPipeline_GQA)
 }
 
 // ============================================================================
+// Test: Context Snapshot Capture
+// ============================================================================
+
+/**
+ * @brief Verify that context_snapshot captures valid attention context
+ *
+ * This test ensures that:
+ * 1. Setting context_snapshot parameter captures INT32→FP32 converted context
+ * 2. The captured values are non-zero and reasonable
+ * 3. Snapshot doesn't affect the main computation result
+ */
+TEST_F(Q16FullPipelineParityTest, DecodeContextSnapshotCapture)
+{
+    constexpr int NUM_HEADS = 8;
+    constexpr int NUM_KV_HEADS = 2;
+    constexpr int HEAD_DIM = 64;
+    constexpr int KV_LEN = 32;
+    constexpr int D_MODEL = NUM_HEADS * HEAD_DIM;
+    constexpr int INPUT_DIM = NUM_HEADS * HEAD_DIM;
+    constexpr int SEQ_LEN_Q = 1;
+
+    constexpr int Q_BLOCKS = (INPUT_DIM + 31) / 32;
+    constexpr int KV_BLOCKS = (NUM_KV_HEADS * HEAD_DIM + 31) / 32;
+    constexpr int OUTPUT_BLOCKS = (D_MODEL + 31) / 32;
+
+    std::cout << "\n=== Context Snapshot Capture Test ===" << std::endl;
+
+    // Generate random FP32 data and quantize to Q16_1
+    std::vector<float> Q_fp32(SEQ_LEN_Q * INPUT_DIM);
+    std::vector<float> K_fp32(KV_LEN * NUM_KV_HEADS * HEAD_DIM);
+    std::vector<float> V_fp32(KV_LEN * NUM_KV_HEADS * HEAD_DIM);
+    std::vector<float> residual_fp32(SEQ_LEN_Q * D_MODEL);
+
+    generateRandomFP32(Q_fp32.data(), Q_fp32.size(), 1.0f);
+    generateRandomFP32(K_fp32.data(), K_fp32.size(), 1.0f);
+    generateRandomFP32(V_fp32.data(), V_fp32.size(), 1.0f);
+    generateRandomFP32(residual_fp32.data(), residual_fp32.size(), 0.5f);
+
+    std::vector<Q16_1Block> Q_q16(SEQ_LEN_Q * Q_BLOCKS);
+    std::vector<Q16_1Block> K_q16(KV_LEN * KV_BLOCKS);
+    std::vector<Q16_1Block> V_q16(KV_LEN * KV_BLOCKS);
+    std::vector<Q16_1Block> residual_q16(SEQ_LEN_Q * OUTPUT_BLOCKS);
+    std::vector<Q16_1Block> output_q16(SEQ_LEN_Q * OUTPUT_BLOCKS);
+    std::vector<Q16_1Block> output_q16_no_snapshot(SEQ_LEN_Q * OUTPUT_BLOCKS);
+
+    quantizeFP32ToQ16_1(Q_fp32.data(), INPUT_DIM, Q_q16.data());
+    for (int p = 0; p < KV_LEN; ++p)
+    {
+        quantizeFP32ToQ16_1(K_fp32.data() + p * NUM_KV_HEADS * HEAD_DIM, NUM_KV_HEADS * HEAD_DIM,
+                           K_q16.data() + p * KV_BLOCKS);
+        quantizeFP32ToQ16_1(V_fp32.data() + p * NUM_KV_HEADS * HEAD_DIM, NUM_KV_HEADS * HEAD_DIM,
+                           V_q16.data() + p * KV_BLOCKS);
+    }
+    quantizeFP32ToQ16_1(residual_fp32.data(), D_MODEL, residual_q16.data());
+
+    // Create Wo weights - use Q8_1Tensor for VNNI packing
+    std::vector<float> Wo_fp32(D_MODEL * INPUT_DIM);
+    generateRandomFP32(Wo_fp32.data(), Wo_fp32.size(), 0.1f);
+
+    auto Wo_q8 = Q8_1Tensor::quantize_from_fp32(
+        Wo_fp32.data(),
+        {static_cast<size_t>(D_MODEL), static_cast<size_t>(INPUT_DIM)});
+    const auto *Wo_packed = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(Wo_q8.get());
+    ASSERT_NE(Wo_packed, nullptr) << "Failed to pack Wo weights";
+
+    // Allocate context snapshot buffer
+    std::vector<float> context_snapshot(SEQ_LEN_Q * INPUT_DIM, 0.0f);
+
+    // Run with snapshot capture
+    std::memcpy(output_q16.data(), residual_q16.data(), OUTPUT_BLOCKS * sizeof(Q16_1Block));
+
+    Q16FusedAttentionWoResidualParams params;
+    params.Q = Q_q16.data();
+    params.K = K_q16.data();
+    params.V = V_q16.data();
+    params.Wo_packed = Wo_packed;
+    params.residual_in = residual_q16.data();
+    params.residual_out = output_q16.data();
+    params.seq_len_q = SEQ_LEN_Q;
+    params.kv_len = KV_LEN;
+    params.num_heads = NUM_HEADS;
+    params.num_kv_heads = NUM_KV_HEADS;
+    params.head_dim = HEAD_DIM;
+    params.d_model = D_MODEL;
+    params.causal = true;
+    params.context_snapshot = context_snapshot.data();
+
+    bool success_with_snapshot = q16_fused_attention_wo_residual_decode(params);
+    ASSERT_TRUE(success_with_snapshot) << "Kernel failed with snapshot enabled";
+
+    // Run without snapshot capture
+    std::memcpy(output_q16_no_snapshot.data(), residual_q16.data(), OUTPUT_BLOCKS * sizeof(Q16_1Block));
+
+    Q16FusedAttentionWoResidualParams params_no_snapshot = params;
+    params_no_snapshot.context_snapshot = nullptr;
+    params_no_snapshot.residual_out = output_q16_no_snapshot.data();
+
+    bool success_no_snapshot = q16_fused_attention_wo_residual_decode(params_no_snapshot);
+    ASSERT_TRUE(success_no_snapshot) << "Kernel failed without snapshot";
+
+    // Verify snapshot was captured (non-zero values)
+    float snapshot_min = *std::min_element(context_snapshot.begin(), context_snapshot.end());
+    float snapshot_max = *std::max_element(context_snapshot.begin(), context_snapshot.end());
+    float snapshot_sum = std::accumulate(context_snapshot.begin(), context_snapshot.end(), 0.0f);
+    float snapshot_mean = snapshot_sum / static_cast<float>(context_snapshot.size());
+
+    std::cout << "  Context snapshot stats:" << std::endl;
+    std::cout << "    Min: " << snapshot_min << std::endl;
+    std::cout << "    Max: " << snapshot_max << std::endl;
+    std::cout << "    Mean: " << snapshot_mean << std::endl;
+
+    // Snapshot should have meaningful values
+    EXPECT_NE(snapshot_max, 0.0f) << "Snapshot was not captured (all zeros)";
+    EXPECT_NE(snapshot_min, snapshot_max) << "Snapshot has no variance";
+
+    // Verify outputs are identical (snapshot doesn't affect computation)
+    std::vector<float> output_dequant(D_MODEL);
+    std::vector<float> output_no_snapshot_dequant(D_MODEL);
+    dequantizeQ16_1ToFP32(output_q16.data(), D_MODEL, output_dequant.data());
+    dequantizeQ16_1ToFP32(output_q16_no_snapshot.data(), D_MODEL, output_no_snapshot_dequant.data());
+
+    double output_cos_sim = cosineSimilarity(output_dequant.data(), output_no_snapshot_dequant.data(), D_MODEL);
+    std::cout << "  Output cosine similarity (with vs without snapshot): " << output_cos_sim << std::endl;
+
+    EXPECT_GT(output_cos_sim, 0.9999) << "Snapshot capture affected computation result";
+
+    std::cout << "  ✓ Context snapshot capture works correctly" << std::endl;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 

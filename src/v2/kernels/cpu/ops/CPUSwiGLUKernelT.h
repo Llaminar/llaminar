@@ -148,6 +148,15 @@ namespace llaminar2
         static const char *precision_name() { return "FP32"; }
         static constexpr float compression_ratio() { return 1.0f; }
 
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::swiglu()
+                .withInput("gate", "gate projection [rows, cols]", KernelBufferDtype::FP32)
+                .withInput("up", "up projection [rows, cols]", KernelBufferDtype::FP32)
+                .withOutput("output", "SwiGLU result [rows, cols]", KernelBufferDtype::FP32);
+        }
+
         /**
          * @brief Apply SwiGLU to FP32 data
          *
@@ -211,6 +220,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
         static const char *precision_name() { return "BF16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::swiglu()
+                .withInput("gate", "gate projection [rows, cols]", KernelBufferDtype::BF16)
+                .withInput("up", "up projection [rows, cols]", KernelBufferDtype::BF16)
+                .withOutput("output", "SwiGLU result [rows, cols]", KernelBufferDtype::BF16);
+        }
 
         /**
          * @brief Apply SwiGLU to BF16 data
@@ -285,6 +303,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
         static const char *precision_name() { return "FP16"; }
         static constexpr float compression_ratio() { return 2.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::swiglu()
+                .withInput("gate", "gate projection [rows, cols]", KernelBufferDtype::FP16)
+                .withInput("up", "up projection [rows, cols]", KernelBufferDtype::FP16)
+                .withOutput("output", "SwiGLU result [rows, cols]", KernelBufferDtype::FP16);
+        }
 
         /**
          * @brief Apply SwiGLU to FP16 data
@@ -369,6 +396,15 @@ namespace llaminar2
         static constexpr ActivationPrecision precision() { return ActivationPrecision::Q8_1; }
         static const char *precision_name() { return "Q8_1"; }
         static constexpr float compression_ratio() { return 4.0f; }
+
+        // IKernelSnapshotCapable interface
+        KernelSnapshotInfo getKernelSnapshotInfo() const override
+        {
+            return KernelSnapshotInfo::swiglu()
+                .withInput("gate", "gate projection [rows, n_blocks]", KernelBufferDtype::Q8_1)
+                .withInput("up", "up projection [rows, n_blocks]", KernelBufferDtype::Q8_1)
+                .withOutput("output", "SwiGLU result [rows, n_blocks]", KernelBufferDtype::Q8_1);
+        }
 
         /**
          * @brief Apply SwiGLU to Q8_1 data

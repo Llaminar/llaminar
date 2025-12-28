@@ -1,0 +1,426 @@
+/**
+ * @file IComputeStage.h
+ * @brief Base interface for compute stages and supporting types
+ * @author David Sanftenberg
+ * @date December 2025
+ *
+ * ComputeStage represents a single parallelizable operation that can execute
+ * on any device (CPU, GPU). Stages are the unit of work for layer-level
+ * parallelism and enable clean separation of serial setup from parallel compute.
+ *
+ * Key benefits:
+ * 1. Device-agnostic interface - same API for CPU and GPU kernels
+ * 2. Composable - build compute graphs from atomic operations
+ * 3. Introspectable - stages know their FLOP counts, memory needs
+ * 4. MoE-ready - expert FFN stages for parallel expert execution
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
+#include <functional>
+#include "../DeviceContext.h"
+#include "../BufferRole.h"
+#include "../RuntimeConfig.h"
+#include "../../tensors/BlockStructures.h"
+#include "../../tensors/TensorKernels.h"
+#include "../../utils/MPITopology.h"
+
+namespace llaminar2
+{
+
+    // Forward declarations
+    class TensorBase;
+    class IKVCache;
+    class IUnifiedKVCache;
+    class MPIContext;
+    class FusedAttentionWoKernel;
+
+    /**
+     * @brief Detailed dump info for stage debugging
+     *
+     * Contains all input, output, and parameter buffers needed to fully
+     * reproduce and debug a stage execution. Used by StageDumper for
+     * first-class debugging support.
+     */
+    struct StageDumpInfo
+    {
+        // Input buffers (read during execute)
+        struct InputBuffer
+        {
+            const char *name = nullptr;
+            const void *data = nullptr;
+            size_t rows = 0;
+            size_t cols = 0;
+            const char *dtype = "FP32";
+            size_t element_size = sizeof(float);
+        };
+
+        // Output buffers (written during execute)
+        struct OutputBuffer
+        {
+            const char *name = nullptr;
+            const void *data = nullptr;
+            size_t rows = 0;
+            size_t cols = 0;
+            const char *dtype = "FP32";
+            size_t element_size = sizeof(float);
+        };
+
+        // Weight/parameter buffers (read-only during execute)
+        struct WeightBuffer
+        {
+            const char *name = nullptr;
+            const TensorBase *tensor = nullptr;
+            const void *raw_data = nullptr;
+            size_t raw_size = 0;
+            size_t rows = 0;
+            size_t cols = 0;
+            const char *dtype = nullptr;
+        };
+
+        // Scalar parameters
+        struct ScalarParam
+        {
+            const char *name = nullptr;
+            double value = 0;
+            const char *dtype = "float";
+        };
+
+        std::vector<InputBuffer> inputs;
+        std::vector<OutputBuffer> outputs;
+        std::vector<WeightBuffer> weights;
+        std::vector<ScalarParam> scalars;
+
+        // Convenience methods for building dump info
+        StageDumpInfo &addInput(const char *name, const float *data, size_t rows, size_t cols)
+        {
+            inputs.push_back({name, data, rows, cols, "FP32", sizeof(float)});
+            return *this;
+        }
+
+        StageDumpInfo &addInput(const char *name, const TensorBase *tensor, size_t rows, size_t cols);
+
+        StageDumpInfo &addInputQ8_1(const char *name, const void *data, size_t rows, size_t cols)
+        {
+            inputs.push_back({name, data, rows, cols, "Q8_1", sizeof(Q8_1Block)});
+            return *this;
+        }
+
+        StageDumpInfo &addOutput(const char *name, const float *data, size_t rows, size_t cols)
+        {
+            outputs.push_back({name, data, rows, cols, "FP32", sizeof(float)});
+            return *this;
+        }
+
+        StageDumpInfo &addOutput(const char *name, const TensorBase *tensor, size_t rows, size_t cols);
+
+        StageDumpInfo &addWeight(const char *name, const TensorBase *tensor,
+                                 size_t rows, size_t cols, const char *dtype)
+        {
+            weights.push_back({name, tensor, nullptr, 0, rows, cols, dtype});
+            return *this;
+        }
+
+        StageDumpInfo &addWeight(const char *name, const TensorBase *tensor);
+
+        StageDumpInfo &addScalar(const char *name, double value, const char *dtype = "float")
+        {
+            scalars.push_back({name, value, dtype});
+            return *this;
+        }
+
+        StageDumpInfo &addScalarInt(const char *name, int value)
+        {
+            scalars.push_back({name, static_cast<double>(value), "int"});
+            return *this;
+        }
+
+        StageDumpInfo &addScalarBool(const char *name, bool value)
+        {
+            scalars.push_back({name, value ? 1.0 : 0.0, "bool"});
+            return *this;
+        }
+    };
+
+    /**
+     * @brief Types of compute operations
+     */
+    enum class ComputeStageType
+    {
+        // Matrix operations
+        GEMM,
+        GEMM_BIAS,
+        GEMM_FUSED_QKV,
+        GEMM_FUSED_GATE_UP,
+
+        // Normalization
+        RMS_NORM,
+        LAYER_NORM,
+
+        // Activations
+        SWIGLU,
+        GELU,
+        SILU,
+
+        // Attention
+        ROPE,
+        ATTENTION,
+        ATTENTION_QK,
+        ATTENTION_SOFTMAX,
+        ATTENTION_V,
+        FUSED_ATTENTION_WO,
+
+        // Element-wise
+        ADD_RESIDUAL,
+        SCALE,
+
+        // MoE specific
+        MOE_ROUTER,
+        MOE_EXPERT_FFN,
+        MOE_COMBINE,
+
+        // Collective
+        ALLREDUCE,
+        ALLGATHER,
+
+        // Utility
+        COPY,
+        QUANTIZE,
+        DEQUANTIZE,
+
+        // Model-level operations
+        EMBEDDING,
+        LM_HEAD,
+        FINAL_NORM,
+    };
+
+    /**
+     * @brief Convert stage type to string for logging
+     */
+    const char *computeStageTypeName(ComputeStageType type);
+
+    /**
+     * @brief Base class for all compute stages
+     *
+     * Derived classes implement device-specific kernels while maintaining
+     * a common interface for orchestration.
+     */
+    class IComputeStage
+    {
+    public:
+        virtual ~IComputeStage() = default;
+
+        // =========================================================================
+        // Execution
+        // =========================================================================
+
+        /**
+         * @brief Execute this stage on the given device context
+         *
+         * The stage must be compatible with the device type (CPU stages on CPU, etc.)
+         * GPU stages may enqueue work asynchronously - call ctx->synchronize() if
+         * you need completion.
+         *
+         * @param ctx Device context to execute on
+         * @return true on success, false on error
+         */
+        virtual bool execute(IDeviceContext *ctx) = 0;
+
+        // =========================================================================
+        // Introspection
+        // =========================================================================
+
+        /**
+         * @brief Get the operation type
+         */
+        virtual ComputeStageType type() const = 0;
+
+        /**
+         * @brief Human-readable name (for profiling/logging)
+         */
+        virtual std::string name() const
+        {
+            return computeStageTypeName(type());
+        }
+
+        /**
+         * @brief Estimated floating-point operations
+         */
+        virtual size_t estimatedFlops() const { return 0; }
+
+        /**
+         * @brief Estimated memory bandwidth (bytes read + written)
+         */
+        virtual size_t estimatedMemoryBytes() const { return 0; }
+
+        /**
+         * @brief Check if this stage supports a specific backend
+         */
+        virtual bool supportsBackend(ComputeBackendType backend) const = 0;
+
+        /**
+         * @brief Get detailed dump info for debugging
+         *
+         * Returns comprehensive information about all buffers and parameters
+         * used by this stage, enabling full reproducibility of execution.
+         */
+        virtual StageDumpInfo getDumpInfo() const { return StageDumpInfo{}; }
+
+        /**
+         * @brief Get buffer requirements for this stage
+         *
+         * Used by GraphBufferManager for intelligent buffer allocation and reuse.
+         * Stages should declare all buffers they read, write, or allocate.
+         */
+        virtual StageBufferRequirements getBufferRequirements() const
+        {
+            return StageBufferRequirements{};
+        }
+
+        /**
+         * @brief Get output buffer descriptors for this stage
+         *
+         * Returns descriptors for all output buffers this stage produces.
+         * Used by graph analysis for liveness tracking and buffer reuse.
+         */
+        virtual std::vector<BufferDescriptor> getDeclaredOutputs() const
+        {
+            return {};
+        }
+
+        /**
+         * @brief Whether this stage requires MPI allreduce after execution
+         *
+         * Used for dependency analysis in tensor-parallel execution.
+         */
+        virtual bool requiresAllreduce() const { return false; }
+
+        /**
+         * @brief Update dynamic parameters for graph reuse
+         *
+         * Allows updating position-dependent parameters (like RoPE position offset)
+         * without rebuilding the entire compute graph. Called by GraphExecutor
+         * between decode steps.
+         *
+         * @param pos_offset Current position in sequence (for RoPE, causal mask)
+         * @param seq_len Current sequence length being processed
+         */
+        virtual void updateDynamicParams(int pos_offset, int seq_len)
+        {
+            (void)pos_offset;
+            (void)seq_len;
+        }
+
+    protected:
+        // =========================================================================
+        // Tracing Infrastructure (for debugging/profiling)
+        // =========================================================================
+
+        /**
+         * @brief Check if tracing is enabled for this stage.
+         *
+         * Considers both global trace_stages flag and per-stage filter.
+         */
+        bool shouldTrace() const;
+
+        /**
+         * @brief Trace input tensor values (only if tracing enabled).
+         *
+         * @param name Tensor name (e.g., "A", "hidden_states")
+         * @param tensor Tensor to trace
+         */
+        void traceInput(const std::string &name, const TensorBase *tensor) const;
+
+        /**
+         * @brief Trace output tensor values (only if tracing enabled).
+         *
+         * @param name Tensor name (e.g., "C", "output")
+         * @param tensor Tensor to trace
+         */
+        void traceOutput(const std::string &name, const TensorBase *tensor) const;
+
+        /**
+         * @brief Trace intermediate float array values.
+         *
+         * @param name Array name
+         * @param data Pointer to float data
+         * @param count Total element count
+         */
+        void traceIntermediate(const std::string &name, const float *data, size_t count) const;
+
+        /**
+         * @brief Compute checksum for tensor data (for divergence detection).
+         *
+         * @param data Float data pointer
+         * @param count Element count
+         * @return Simple float sum (not cryptographic, just for comparison)
+         */
+        static float computeChecksum(const float *data, size_t count);
+
+        /**
+         * @brief Format float array for logging (first N elements).
+         */
+        static std::string formatFloatArray(const float *data, size_t count);
+
+        // =========================================================================
+        // Shape Validation Infrastructure (Task 7: Debugging)
+        // =========================================================================
+
+    public:
+        /**
+         * @brief Contract for a single tensor's expected shape.
+         *
+         * Used by validateShapes() to verify tensor dimensions match expectations.
+         */
+        struct TensorShapeContract
+        {
+            std::string name;             ///< Tensor name for error messages
+            const TensorBase *tensor;     ///< Tensor to validate
+            std::vector<size_t> expected; ///< Expected shape dimensions
+            bool allow_broadcast = false; ///< If true, trailing dims of 1 are OK
+        };
+
+        /**
+         * @brief Validate tensor shapes match expected contracts.
+         *
+         * @param contracts List of tensor/shape contracts to validate
+         * @throws std::runtime_error if any shape mismatches
+         *
+         * Example usage:
+         * @code
+         *   validateShapes({
+         *       {"input", input_, {batch_size_, d_model_}},
+         *       {"wq", wq_, {n_heads_ * head_dim_, d_model_}},
+         *   });
+         * @endcode
+         */
+        void validateShapes(std::initializer_list<TensorShapeContract> contracts) const;
+
+        /**
+         * @brief Validate a single tensor's shape.
+         *
+         * @param tensor_name Name for error messages
+         * @param tensor Tensor to validate
+         * @param expected Expected shape
+         */
+        void validateShape(const std::string &tensor_name, const TensorBase *tensor,
+                           const std::vector<size_t> &expected) const;
+
+        /**
+         * @brief Validate that two tensors have compatible shapes for matrix multiply
+         */
+        void validateMatmulShapes(const std::string &a_name, const TensorBase *a,
+                                  const std::string &b_name, const TensorBase *b) const;
+
+    private:
+        static bool shapesMatch(const std::vector<size_t> &actual,
+                                const std::vector<size_t> &expected,
+                                bool allow_broadcast);
+        static std::string shapeToString(const std::vector<size_t> &shape);
+    };
+
+} // namespace llaminar2

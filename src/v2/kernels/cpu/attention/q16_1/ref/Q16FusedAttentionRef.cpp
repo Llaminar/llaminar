@@ -478,6 +478,29 @@ namespace llaminar2::kernels::q16_1
             total_weight_sum = 1;
 
         // ════════════════════════════════════════════════════════════════════════
+        // SNAPSHOT: Capture attention context (INT32 → FP32 for debugging)
+        // ════════════════════════════════════════════════════════════════════════
+
+        if (params.context_snapshot)
+        {
+            // Convert INT32 context to FP32 for snapshot
+            // The INT32 values need to be scaled by weight_sum and v_scale to get FP32 equivalents
+            float *ctx_out = params.context_snapshot;
+            const float inv_weight_sum = 1.0f / static_cast<float>(total_weight_sum);
+
+            for (int d = 0; d < input_dim; ++d)
+            {
+                // INT32 accumulator / weight_sum * v_scale → approximate FP32 context value
+                float val = static_cast<float>(int32_context[d]) * inv_weight_sum * total_v_scale;
+                ctx_out[d] = val;
+            }
+
+            LOG_DEBUG("[Q16FusedAttention DECODE] Captured context snapshot: "
+                      << input_dim << " elements, weight_sum=" << total_weight_sum
+                      << ", v_scale=" << total_v_scale);
+        }
+
+        // ════════════════════════════════════════════════════════════════════════
         // STEP 4: Wo Projection (VPDPWSSD) → Q16_1 output (ALL INTEGER)
         // ════════════════════════════════════════════════════════════════════════
 
@@ -597,6 +620,30 @@ namespace llaminar2::kernels::q16_1
             }
             if (total_weight_sum == 0)
                 total_weight_sum = 1;
+
+            // ════════════════════════════════════════════════════════════════════
+            // SNAPSHOT: Capture attention context for this query position
+            // ════════════════════════════════════════════════════════════════════
+
+            if (params.context_snapshot)
+            {
+                // Convert INT32 context to FP32 for snapshot
+                // Output layout: [seq_len_q × input_dim] where input_dim = num_heads × head_dim
+                float *ctx_row = params.context_snapshot + q * input_dim;
+                const float inv_weight_sum = 1.0f / static_cast<float>(total_weight_sum);
+
+                for (int d = 0; d < input_dim; ++d)
+                {
+                    float val = static_cast<float>(int32_context[d]) * inv_weight_sum * total_v_scale;
+                    ctx_row[d] = val;
+                }
+
+                if (q == 0)
+                {
+                    LOG_DEBUG("[Q16FusedAttention PREFILL] Capturing context snapshot for "
+                              << seq_len_q << " positions, input_dim=" << input_dim);
+                }
+            }
 
             // ════════════════════════════════════════════════════════════════════
             // STEP 4: Wo Projection → Q16_1 output (ALL INTEGER)

@@ -416,36 +416,8 @@ namespace llaminar
                     llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::Q8_1> kernel_;
                 };
 
-                // =========================================================================
-                // Adapter: CPUSoftmaxKernelT<FP32> -> ITensorSoftmax
-                // =========================================================================
-                class SoftmaxKernelAdapter : public llaminar2::ITensorSoftmax
-                {
-                public:
-                    bool supports_device(int device_idx) const override
-                    {
-                        return kernel_.supports_device(device_idx);
-                    }
-
-                    bool apply(
-                        const float *input, float *output,
-                        int rows, int cols,
-                        bool use_causal_mask,
-                        const llaminar2::MPIContext *mpi_ctx,
-                        int device_idx) override
-                    {
-                        (void)mpi_ctx; // Not used in typed kernel
-                        // Copy input to output for in-place operation if different buffers
-                        if (input != output)
-                        {
-                            std::memcpy(output, input, rows * cols * sizeof(float));
-                        }
-                        return kernel_.apply_typed(output, rows, cols, use_causal_mask, 1.0f, device_idx);
-                    }
-
-                private:
-                    llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32> kernel_;
-                };
+                // NOTE: SoftmaxKernelAdapter removed - CPUSoftmaxKernelT now directly
+                // implements ITensorSoftmax interface
 
             } // namespace
 
@@ -1274,7 +1246,7 @@ namespace llaminar
 
             // ==========================================================================
             // Softmax Kernel Creation - Device-aware dispatch
-            // CPU fallback for GPU requests since GPU Softmax kernels not yet implemented
+            // Now uses typed kernels directly (no adapter needed)
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
@@ -1284,22 +1256,22 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<SoftmaxKernelAdapter>();
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                     LOG_DEBUG("[KernelFactory] FP32 Softmax: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<SoftmaxKernelAdapter>();
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
                     LOG_DEBUG("[KernelFactory] FP32 Softmax: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<SoftmaxKernelAdapter>();
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
-                    return std::make_unique<SoftmaxKernelAdapter>();
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32>>();
                 }
             }
 
@@ -1307,30 +1279,78 @@ namespace llaminar
                 const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
             {
                 (void)tensor;
-                (void)dev_type;
-                // BF16 Softmax through ITensorSoftmax interface not supported - use typed kernel directly
-                LOG_ERROR("[KernelFactory] BF16 Softmax through ITensorSoftmax interface not supported");
-                throwUnsupportedBackend(dev_type, "BF16 Softmax (use typed kernel)");
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    LOG_DEBUG("[KernelFactory] BF16 Softmax: CUDA not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    LOG_DEBUG("[KernelFactory] BF16 Softmax: ROCm not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+#endif
+
+                default:
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::BF16>>();
+                }
             }
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
                 const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
             {
                 (void)tensor;
-                (void)dev_type;
-                // FP16 Softmax through ITensorSoftmax interface not supported - use typed kernel directly
-                LOG_ERROR("[KernelFactory] FP16 Softmax through ITensorSoftmax interface not supported");
-                throwUnsupportedBackend(dev_type, "FP16 Softmax (use typed kernel)");
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    LOG_DEBUG("[KernelFactory] FP16 Softmax: CUDA not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    LOG_DEBUG("[KernelFactory] FP16 Softmax: ROCm not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+#endif
+
+                default:
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP16>>();
+                }
             }
 
             std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
                 const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
             {
                 (void)tensor;
-                (void)dev_type;
-                // Q8_1 Softmax through ITensorSoftmax interface not supported - use typed kernel directly
-                LOG_ERROR("[KernelFactory] Q8_1 Softmax through ITensorSoftmax interface not supported");
-                throwUnsupportedBackend(dev_type, "Q8_1 Softmax (use typed kernel)");
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    LOG_DEBUG("[KernelFactory] Q8_1 Softmax: CUDA not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    LOG_DEBUG("[KernelFactory] Q8_1 Softmax: ROCm not implemented, using CPU fallback");
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+#endif
+
+                default:
+                    return std::make_unique<llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+                }
             }
 
             // ==========================================================================

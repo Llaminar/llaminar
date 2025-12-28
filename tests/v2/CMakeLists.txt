@@ -1466,7 +1466,7 @@ target_link_libraries(v2_test_unified_kv_cache
 )
 add_v2_test(V2_Unit_UnifiedKVCache 
     COMMAND $<TARGET_FILE:v2_test_unified_kv_cache>
-    LABELS "V2;Unit;KVCache;Batched;SingleSequence;FP32;BF16;FP16;Q8_1;Eviction"
+    LABELS "V2;Unit;KVCache;Batched;SingleSequence;FP32;BF16;FP16;Q8_1;Q16_1;Eviction"
     MPI_PROCS 1
 )
 
@@ -1479,7 +1479,7 @@ target_link_libraries(v2_test_sharded_kv_cache
 )
 add_v2_test(V2_Unit_ShardedKVCache 
     COMMAND $<TARGET_FILE:v2_test_sharded_kv_cache>
-    LABELS "V2;Unit;KVCache;Sharding;TensorParallelism;FP32;BF16;FP16;Q8_1;DistributedArchitecture"
+    LABELS "V2;Unit;KVCache;Sharding;TensorParallelism;FP32;BF16;FP16;Q8_1;Q16_1;DistributedArchitecture"
     MPI_PROCS 1
 )
 
@@ -2216,6 +2216,16 @@ add_v2_test(V2_Unit_HybridQ16_Layer0_Dataflow
     MPI_PROCS 1
 )
 
+# Test: FusedAttentionWoStage with Q16_INTEGER backend
+# Tests stage construction, type, backend support, and dump info with Q16FusedAttentionKernel
+add_executable(v2_test_fused_attention_wo_stage_q16 unit/stages/Test__FusedAttentionWoStage_Q16Backend.cpp)
+target_link_libraries(v2_test_fused_attention_wo_stage_q16 llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_FusedAttentionWoStage_Q16Backend
+    COMMAND $<TARGET_FILE:v2_test_fused_attention_wo_stage_q16>
+    LABELS "V2;Unit;Execution;ComputeStage;FusedAttentionWo;Q16_INTEGER;Q16FusedAttentionKernel"
+    MPI_PROCS 1
+)
+
 # Test: ResidualAddStage Precision Awareness
 # Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
 # Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
@@ -2488,6 +2498,26 @@ target_link_libraries(v2_test_compute_stages llaminar2_core GTest::gtest GTest::
 add_v2_test(V2_Unit_ComputeStages
     COMMAND $<TARGET_FILE:v2_test_compute_stages>
     LABELS "V2;Unit;ComputeStage;GEMM;RMSNorm;RoPE;SwiGLU;ResidualAdd;Precision"
+    MPI_PROCS 1
+)
+
+# Test: StageDumpInfo (getDumpInfo() snapshot support for all compute stages)
+# Validates that each compute stage correctly reports inputs, outputs, weights, and scalars
+add_executable(v2_test_stage_dump_info unit/Test__StageDumpInfo.cpp)
+target_link_libraries(v2_test_stage_dump_info llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageDumpInfo
+    COMMAND $<TARGET_FILE:v2_test_stage_dump_info>
+    LABELS "V2;Unit;ComputeStage;Snapshot;DumpInfo;Debug"
+    MPI_PROCS 1
+)
+
+# Test: KernelSnapshotInfo (getKernelSnapshotInfo() for all kernel implementations)
+# Validates that each kernel correctly reports its I/O buffers via IKernelSnapshotCapable
+add_executable(v2_test_kernel_snapshot_info unit/Test__KernelSnapshotInfo.cpp)
+target_link_libraries(v2_test_kernel_snapshot_info llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_KernelSnapshotInfo
+    COMMAND $<TARGET_FILE:v2_test_kernel_snapshot_info>
+    LABELS "V2;Unit;Kernel;Snapshot;IKernelSnapshotCapable;Debug"
     MPI_PROCS 1
 )
 
