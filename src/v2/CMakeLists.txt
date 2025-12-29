@@ -1,6 +1,31 @@
 # Llaminar v2 - Clean greenfield implementation
 cmake_minimum_required(VERSION 3.18)
 
+# Define custom build types BEFORE project() so they're recognized
+# Define custom build type: E2ERelease (Release + Snapshots for E2E testing)
+# Usage: cmake -DCMAKE_BUILD_TYPE=E2ERelease
+set(CMAKE_CXX_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
+set(CMAKE_C_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
+set(CMAKE_EXE_LINKER_FLAGS_E2ERELEASE "" CACHE STRING "Linker flags for E2E Release builds")
+mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_LINKER_FLAGS_E2ERELEASE)
+
+# Define custom build type: Integration (Release + Snapshots + Debug symbols + Assertions)
+# Usage: cmake -DCMAKE_BUILD_TYPE=Integration
+# This enables optimized code with snapshot capture, backtraces for debugging, AND assertions.
+# Note: NDEBUG is still set to get Release-like behavior from stdlib, but LLAMINAR_ENABLE_ASSERTIONS
+# keeps our custom assertions active for integration testing.
+set(CMAKE_CXX_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "Flags for Integration builds (Release + debug symbols + assertions)")
+set(CMAKE_C_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "Flags for Integration builds (Release + debug symbols + assertions)")
+set(CMAKE_EXE_LINKER_FLAGS_INTEGRATION "" CACHE STRING "Linker flags for Integration builds")
+mark_as_advanced(CMAKE_CXX_FLAGS_INTEGRATION CMAKE_C_FLAGS_INTEGRATION CMAKE_EXE_LINKER_FLAGS_INTEGRATION)
+
+# Add custom build types to valid build types
+set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease;Integration" CACHE STRING "" FORCE)
+
+# Project declaration - MUST come after custom build type definitions
+# The build type flags are picked up by the compiler setup during project()
+project(llaminar2 LANGUAGES C CXX)
+
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -10,16 +35,6 @@ if(CCACHE_PROGRAM)
 else()
     message(STATUS "V2: ccache not found - using direct compilation")
 endif()
-
-# Define custom build type: E2ERelease (Release + Snapshots for E2E testing)
-# Usage: cmake -DCMAKE_BUILD_TYPE=E2ERelease
-set(CMAKE_CXX_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
-set(CMAKE_C_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
-set(CMAKE_EXE_LINKER_FLAGS_E2ERELEASE "" CACHE STRING "Linker flags for E2E Release builds")
-mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_LINKER_FLAGS_E2ERELEASE)
-
-# Add E2ERelease to valid build types
-set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease" CACHE STRING "" FORCE)
 
 # =============================================================================
 # Code Coverage Support (Debug builds only)
@@ -663,6 +678,7 @@ target_include_directories(llaminar2_core PUBLIC
 # Enable pipeline snapshot capture (for parity testing and debugging)
 # - Debug builds: Always enabled (development/debugging)
 # - E2ERelease builds: Always enabled (optimized E2E parity testing)
+# - Integration builds: Always enabled (Release + debug symbols + snapshots)
 # - Release builds: Disabled by default (performance), enable with -DENABLE_SNAPSHOTS=ON
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
@@ -670,6 +686,9 @@ if(CMAKE_BUILD_TYPE MATCHES "Debug")
 elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (E2ERelease build - optimized with snapshots for E2E testing)")
+elseif(CMAKE_BUILD_TYPE MATCHES "Integration")
+    target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
+    message(STATUS "V2: Pipeline snapshot capture enabled (Integration build - optimized with debug symbols and snapshots)")
 else()
     option(ENABLE_SNAPSHOTS "Enable pipeline snapshot capture" OFF)
     if(ENABLE_SNAPSHOTS)

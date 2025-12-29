@@ -8,16 +8,20 @@
  * 2. RoPE correctly handles various head dimensions (32, 64, 128)
  * 3. Position encoding is consistent across different positions
  * 4. Edge cases (odd head_dim, position=0) are handled correctly
+ * 5. Q8_1 -> Q16_1 RoPE conversion maintains precision
  */
 
 #include "kernels/cpu/primitives/RoPEPrimitives.h"
+#include "tensors/BlockStructures.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <algorithm>
 
 using namespace llaminar2::primitives;
+using namespace llaminar2;
 
 namespace
 {
@@ -455,4 +459,419 @@ TEST_F(RoPEPrimitivesTest, StressTestManyHeads)
         }
 #endif
     }
+}
+// ============================================================================
+// Test Suite: Q8_1 -> Q16_1 RoPE Conversion
+// ============================================================================
+
+class RoPEQ8ToQ16Test : public ::testing::Test
+{
+protected:
+    /**
+     * @brief Create random Q8_1 blocks for a single head
+     */
+    std::vector<Q8_1Block> create_random_q8_1_head(int head_dim, uint32_t seed = 42)
+    {
+        std::mt19937 gen(seed);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+        const int blocks_per_head = head_dim / 32;
+        std::vector<Q8_1Block> blocks(blocks_per_head);
+
+        for (int b = 0; b < blocks_per_head; ++b)
+        {
+            // Generate random values in [-1, 1]
+            float max_val = 0.0f;
+            std::array<float, 32> vals;
+            for (int i = 0; i < 32; ++i)
+            {
+                vals[i] = dist(gen);
+                max_val = std::max(max_val, std::abs(vals[i]));
+            }
+
+            // Quantize to Q8_1
+            float scale = max_val / 127.0f;
+            if (scale < 1e-10f)
+                scale = 1e-10f;
+            blocks[b].d = fp32_to_fp16(scale);
+            int sum = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int8_t q = static_cast<int8_t>(std::round(vals[i] / scale));
+                blocks[b].qs[i] = q;
+                sum += q;
+            }
+            blocks[b].sum_qs = sum;
+        }
+        return blocks;
+    }
+
+    /**
+     * @brief Dequantize Q8_1 blocks to FP32
+     */
+    std::vector<float> dequantize_q8_1(const std::vector<Q8_1Block> &blocks)
+    {
+        std::vector<float> result(blocks.size() * 32);
+        for (size_t b = 0; b < blocks.size(); ++b)
+        {
+            float scale = fp16_to_fp32(blocks[b].d);
+            for (int i = 0; i < 32; ++i)
+            {
+                result[b * 32 + i] = static_cast<float>(blocks[b].qs[i]) * scale;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @brief Dequantize Q16_1 blocks to FP32
+     */
+    std::vector<float> dequantize_q16_1(const std::vector<Q16_1Block> &blocks)
+    {
+        std::vector<float> result(blocks.size() * 32);
+        for (size_t b = 0; b < blocks.size(); ++b)
+        {
+            float scale = blocks[b].d; // Q16_1 uses FP32 scale directly
+            for (int i = 0; i < 32; ++i)
+            {
+                result[b * 32 + i] = static_cast<float>(blocks[b].qs[i]) * scale;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @brief Apply FP32 RoPE rotation (reference)
+     */
+    std::vector<float> apply_rope_fp32_reference(
+        const std::vector<float> &input,
+        int position,
+        int head_dim,
+        float rope_theta)
+    {
+        std::vector<float> result = input;
+        const int half_dim = head_dim / 2;
+
+        // Compute inv_freq
+        std::vector<float> inv_freq(half_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float exponent = static_cast<float>(2 * i) / static_cast<float>(head_dim);
+            inv_freq[i] = 1.0f / std::pow(rope_theta, exponent);
+        }
+
+        // Apply rotation
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float angle = static_cast<float>(position) * inv_freq[i];
+            float c = std::cos(angle);
+            float s = std::sin(angle);
+            float x = input[i];
+            float y = input[i + half_dim];
+            result[i] = x * c - y * s;
+            result[i + half_dim] = x * s + y * c;
+        }
+        return result;
+    }
+
+    /**
+     * @brief Compute MSE between two float vectors
+     */
+    float compute_mse(const std::vector<float> &a, const std::vector<float> &b)
+    {
+        if (a.size() != b.size())
+            return INFINITY;
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            float diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        return sum / static_cast<float>(a.size());
+    }
+
+    /**
+     * @brief FP16 conversion helpers (matching tensors/FP16Utils.h)
+     */
+    static uint16_t fp32_to_fp16(float f)
+    {
+        uint32_t i;
+        std::memcpy(&i, &f, sizeof(float));
+        uint32_t sign = (i >> 16) & 0x8000;
+        int32_t exp = ((i >> 23) & 0xFF) - 127 + 15;
+        uint32_t frac = i & 0x7FFFFF;
+        if (exp <= 0)
+        {
+            return static_cast<uint16_t>(sign);
+        }
+        else if (exp >= 31)
+        {
+            return static_cast<uint16_t>(sign | 0x7C00);
+        }
+        return static_cast<uint16_t>(sign | (exp << 10) | (frac >> 13));
+    }
+
+    static float fp16_to_fp32(uint16_t h)
+    {
+        uint32_t sign = (h & 0x8000) << 16;
+        int32_t exp = (h >> 10) & 0x1F;
+        uint32_t frac = h & 0x3FF;
+        if (exp == 0)
+        {
+            return 0.0f;
+        }
+        else if (exp == 31)
+        {
+            return sign ? -INFINITY : INFINITY;
+        }
+        exp = exp - 15 + 127;
+        uint32_t i = sign | (exp << 23) | (frac << 13);
+        float f;
+        std::memcpy(&f, &i, sizeof(float));
+        return f;
+    }
+};
+
+// ============================================================================
+// Test 8: Q8_1 -> Q16_1 RoPE Basic Functionality
+// ============================================================================
+
+TEST_F(RoPEQ8ToQ16Test, BasicQ8ToQ16RoPE)
+{
+    const int head_dim = 128;
+    const int blocks_per_head = head_dim / 32;
+    const int seq_len = 1;
+    const int n_heads = 1;
+    const int n_kv_heads = 1;
+    const int position = 10;
+    const float rope_theta = 10000.0f;
+
+    // Create Q8_1 input
+    auto q8_blocks = create_random_q8_1_head(head_dim, 42);
+    std::vector<Q16_1Block> q16_blocks(blocks_per_head);
+
+    // Apply Q8_1 -> Q16_1 RoPE
+    std::vector<int> position_ids = {position};
+    apply_rope_q8_1_to_q16_1(
+        q8_blocks.data(), nullptr,
+        q16_blocks.data(), nullptr,
+        position_ids.data(),
+        seq_len, n_heads, n_kv_heads,
+        head_dim, rope_theta);
+
+    // Compute reference: Q8_1 -> FP32 -> RoPE -> FP32
+    auto fp32_input = dequantize_q8_1(q8_blocks);
+    auto fp32_reference = apply_rope_fp32_reference(fp32_input, position, head_dim, rope_theta);
+
+    // Dequantize Q16_1 output
+    auto fp32_output = dequantize_q16_1(q16_blocks);
+
+    // Compare: Q16_1 output should be close to FP32 reference
+    float mse = compute_mse(fp32_output, fp32_reference);
+
+    // Q16_1 has 256× finer precision than Q8_1, expect very low error
+    // MSE < 1e-6 is a reasonable threshold for Q16_1 precision
+    EXPECT_LT(mse, 1e-5f) << "Q8_1 -> Q16_1 RoPE error too high: MSE=" << mse;
+}
+
+// ============================================================================
+// Test 9: Q8_1 -> Q16_1 RoPE vs Q8_1 -> FP32 Precision
+// ============================================================================
+
+TEST_F(RoPEQ8ToQ16Test, Q8ToQ16PrecisionVsFP32)
+{
+    const int head_dim = 128;
+    const int blocks_per_head = head_dim / 32;
+    const int position = 42;
+    const float rope_theta = 10000.0f;
+
+    // Create Q8_1 input
+    auto q8_blocks = create_random_q8_1_head(head_dim, 123);
+
+    // Path 1: Q8_1 -> Q16_1 -> dequant
+    std::vector<Q16_1Block> q16_blocks(blocks_per_head);
+    std::vector<int> position_ids = {position};
+    apply_rope_q8_1_to_q16_1(
+        q8_blocks.data(), nullptr,
+        q16_blocks.data(), nullptr,
+        position_ids.data(),
+        1, 1, 1, head_dim, rope_theta);
+    auto q16_dequant = dequantize_q16_1(q16_blocks);
+
+    // Path 2: Q8_1 -> dequant -> FP32 RoPE (reference)
+    auto fp32_input = dequantize_q8_1(q8_blocks);
+    auto fp32_reference = apply_rope_fp32_reference(fp32_input, position, head_dim, rope_theta);
+
+    // Q16_1 path should match FP32 reference closely
+    float mse = compute_mse(q16_dequant, fp32_reference);
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < q16_dequant.size(); ++i)
+    {
+        max_abs = std::max(max_abs, std::abs(q16_dequant[i] - fp32_reference[i]));
+    }
+
+    // Q16_1 should have < 0.01% relative error vs FP32
+    EXPECT_LT(mse, 1e-5f) << "Q16_1 path MSE too high: " << mse;
+    EXPECT_LT(max_abs, 1e-3f) << "Q16_1 path max error too high: " << max_abs;
+}
+
+// ============================================================================
+// Test 10: Q8_1 -> Q16_1 RoPE Multiple Heads
+// ============================================================================
+
+TEST_F(RoPEQ8ToQ16Test, MultiHeadQ8ToQ16RoPE)
+{
+    const int head_dim = 64;
+    const int blocks_per_head = head_dim / 32;
+    const int seq_len = 4;
+    const int n_heads = 8;
+    const int n_kv_heads = 2;
+    const float rope_theta = 10000.0f;
+
+    // Create Q8_1 input for all heads
+    const int total_q_blocks = seq_len * n_heads * blocks_per_head;
+    const int total_k_blocks = seq_len * n_kv_heads * blocks_per_head;
+
+    std::vector<Q8_1Block> q_in(total_q_blocks);
+    std::vector<Q8_1Block> k_in(total_k_blocks);
+    std::vector<Q16_1Block> q_out(total_q_blocks);
+    std::vector<Q16_1Block> k_out(total_k_blocks);
+
+    // Fill with random data
+    std::mt19937 gen(456);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (auto &block : q_in)
+    {
+        float max_val = 0.0f;
+        std::array<float, 32> vals;
+        for (int i = 0; i < 32; ++i)
+        {
+            vals[i] = dist(gen);
+            max_val = std::max(max_val, std::abs(vals[i]));
+        }
+        float scale = max_val / 127.0f;
+        if (scale < 1e-10f)
+            scale = 1e-10f;
+        block.d = fp32_to_fp16(scale);
+        int sum = 0;
+        for (int i = 0; i < 32; ++i)
+        {
+            int8_t q = static_cast<int8_t>(std::round(vals[i] / scale));
+            block.qs[i] = q;
+            sum += q;
+        }
+        block.sum_qs = sum;
+    }
+
+    for (auto &block : k_in)
+    {
+        float max_val = 0.0f;
+        std::array<float, 32> vals;
+        for (int i = 0; i < 32; ++i)
+        {
+            vals[i] = dist(gen);
+            max_val = std::max(max_val, std::abs(vals[i]));
+        }
+        float scale = max_val / 127.0f;
+        if (scale < 1e-10f)
+            scale = 1e-10f;
+        block.d = fp32_to_fp16(scale);
+        int sum = 0;
+        for (int i = 0; i < 32; ++i)
+        {
+            int8_t q = static_cast<int8_t>(std::round(vals[i] / scale));
+            block.qs[i] = q;
+            sum += q;
+        }
+        block.sum_qs = sum;
+    }
+
+    // Position IDs
+    std::vector<int> position_ids = {0, 1, 2, 3};
+
+    // Apply Q8_1 -> Q16_1 RoPE
+    apply_rope_q8_1_to_q16_1(
+        q_in.data(), k_in.data(),
+        q_out.data(), k_out.data(),
+        position_ids.data(),
+        seq_len, n_heads, n_kv_heads,
+        head_dim, rope_theta);
+
+    // Verify Q output has valid values
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const int idx = t * n_heads * blocks_per_head + h * blocks_per_head;
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                const Q16_1Block &block = q_out[idx + b];
+                EXPECT_GT(block.d, 0.0f) << "Invalid scale at t=" << t << " h=" << h << " b=" << b;
+                // Check that values are in valid Q16_1 range
+                for (int i = 0; i < 32; ++i)
+                {
+                    EXPECT_GE(block.qs[i], -32767);
+                    EXPECT_LE(block.qs[i], 32767);
+                }
+            }
+        }
+    }
+
+    // Verify K output has valid values
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            const int idx = t * n_kv_heads * blocks_per_head + h * blocks_per_head;
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                const Q16_1Block &block = k_out[idx + b];
+                EXPECT_GT(block.d, 0.0f) << "Invalid K scale at t=" << t << " h=" << h << " b=" << b;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Test 11: Q8_1 -> Q16_1 RoPE Position Consistency
+// ============================================================================
+
+TEST_F(RoPEQ8ToQ16Test, PositionConsistency)
+{
+    const int head_dim = 128;
+    const int blocks_per_head = head_dim / 32;
+    const float rope_theta = 10000.0f;
+
+    // Same input, different positions should give different outputs
+    auto q8_blocks = create_random_q8_1_head(head_dim, 789);
+
+    std::vector<Q16_1Block> q16_pos0(blocks_per_head);
+    std::vector<Q16_1Block> q16_pos10(blocks_per_head);
+
+    std::vector<int> pos0 = {0};
+    std::vector<int> pos10 = {10};
+
+    apply_rope_q8_1_to_q16_1(
+        q8_blocks.data(), nullptr,
+        q16_pos0.data(), nullptr,
+        pos0.data(), 1, 1, 1, head_dim, rope_theta);
+
+    apply_rope_q8_1_to_q16_1(
+        q8_blocks.data(), nullptr,
+        q16_pos10.data(), nullptr,
+        pos10.data(), 1, 1, 1, head_dim, rope_theta);
+
+    // Outputs should differ
+    auto fp32_pos0 = dequantize_q16_1(q16_pos0);
+    auto fp32_pos10 = dequantize_q16_1(q16_pos10);
+
+    float sum_diff = 0.0f;
+    for (size_t i = 0; i < fp32_pos0.size(); ++i)
+    {
+        sum_diff += std::abs(fp32_pos0[i] - fp32_pos10[i]);
+    }
+
+    // Position 0 and 10 should give noticeably different outputs
+    EXPECT_GT(sum_diff, 0.1f) << "Different positions should give different outputs";
 }

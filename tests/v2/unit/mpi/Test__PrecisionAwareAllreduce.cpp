@@ -116,6 +116,71 @@ namespace llaminar2
                 return fp32;
             }
 
+            // Helper to quantize FP32 to Q16_1 blocks
+            std::vector<Q16_1Block> fp32_to_q16_1_blocks(const std::vector<float> &fp32)
+            {
+                const size_t n_blocks = (fp32.size() + 31) / 32;
+                std::vector<Q16_1Block> blocks(n_blocks);
+
+                // Pad to 32-element boundary
+                std::vector<float> padded = fp32;
+                padded.resize(n_blocks * 32, 0.0f);
+
+                for (size_t b = 0; b < n_blocks; ++b)
+                {
+                    const float *block_data = padded.data() + b * 32;
+                    Q16_1Block &blk = blocks[b];
+
+                    // Find max absolute value
+                    float max_abs = 0.0f;
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        max_abs = std::max(max_abs, std::fabs(block_data[i]));
+                    }
+
+                    // Compute scale: scale = max_abs / 32767.0f
+                    float scale = max_abs / 32767.0f;
+                    if (scale < 1e-10f)
+                        scale = 1e-10f; // Avoid division by zero
+                    float inv_scale = (max_abs < 1e-10f) ? 0.0f : (32767.0f / max_abs);
+
+                    // Quantize
+                    int32_t sum_qs = 0;
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        int16_t q = static_cast<int16_t>(std::round(block_data[i] * inv_scale));
+                        q = std::max<int16_t>(-32767, std::min<int16_t>(32767, q));
+                        blk.qs[i] = q;
+                        sum_qs += q;
+                    }
+
+                    blk.d = scale;
+                    blk.sum_qs = sum_qs;
+                }
+
+                return blocks;
+            }
+
+            // Helper to dequantize Q16_1 blocks to FP32
+            std::vector<float> q16_1_blocks_to_fp32(const std::vector<Q16_1Block> &blocks, size_t count)
+            {
+                std::vector<float> fp32(blocks.size() * 32);
+
+                for (size_t b = 0; b < blocks.size(); ++b)
+                {
+                    const Q16_1Block &blk = blocks[b];
+                    float *block_data = fp32.data() + b * 32;
+
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        block_data[i] = blk.d * static_cast<float>(blk.qs[i]);
+                    }
+                }
+
+                fp32.resize(count);
+                return fp32;
+            }
+
             // Compute reference sum of multiple arrays
             std::vector<float> compute_reference_sum(const std::vector<std::vector<float>> &inputs)
             {
@@ -432,6 +497,194 @@ namespace llaminar2
             auto result = q8_1_blocks_to_fp32(output, count);
             float sim = cosine_similarity(result, ref_sum);
             EXPECT_GT(sim, 0.99f) << "Q8_1 sum with large values should maintain precision";
+        }
+
+        // =============================================================================
+        // Q16_1 N-way Sum Tests
+        // =============================================================================
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_TwoInputs)
+        {
+            const size_t count = 128; // 4 blocks of 32
+
+            auto fp32_a = generate_random_fp32(count);
+            auto fp32_b = generate_random_fp32(count);
+
+            auto q16_a = fp32_to_q16_1_blocks(fp32_a);
+            auto q16_b = fp32_to_q16_1_blocks(fp32_b);
+
+            std::vector<const Q16_1Block *> inputs = {q16_a.data(), q16_b.data()};
+            std::vector<Q16_1Block> output(q16_a.size());
+
+            simd::q16_1_sum_n(inputs.data(), 2, output.data(), q16_a.size());
+
+            // Compute reference from quantized values (not original FP32)
+            auto dequant_a = q16_1_blocks_to_fp32(q16_a, count);
+            auto dequant_b = q16_1_blocks_to_fp32(q16_b, count);
+            auto ref_sum = compute_reference_sum({dequant_a, dequant_b});
+
+            auto result = q16_1_blocks_to_fp32(output, count);
+
+            float sim = cosine_similarity(result, ref_sum);
+            // Q16_1 has better precision than Q8_1 due to 16-bit quantization
+            EXPECT_GT(sim, 0.999f) << "Q16_1 2-way sum should have high similarity to reference";
+        }
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_FourInputs)
+        {
+            const size_t count = 256;
+            const size_t n_inputs = 4;
+            const size_t n_blocks = (count + 31) / 32;
+
+            std::vector<std::vector<float>> fp32_inputs(n_inputs);
+            std::vector<std::vector<Q16_1Block>> q16_inputs(n_inputs);
+            std::vector<const Q16_1Block *> input_ptrs(n_inputs);
+
+            for (size_t i = 0; i < n_inputs; ++i)
+            {
+                fp32_inputs[i] = generate_random_fp32(count);
+                q16_inputs[i] = fp32_to_q16_1_blocks(fp32_inputs[i]);
+                input_ptrs[i] = q16_inputs[i].data();
+            }
+
+            std::vector<Q16_1Block> output(n_blocks);
+            simd::q16_1_sum_n(input_ptrs.data(), n_inputs, output.data(), n_blocks);
+
+            std::vector<std::vector<float>> dequant_inputs(n_inputs);
+            for (size_t i = 0; i < n_inputs; ++i)
+            {
+                dequant_inputs[i] = q16_1_blocks_to_fp32(q16_inputs[i], count);
+            }
+            auto ref_sum = compute_reference_sum(dequant_inputs);
+
+            auto result = q16_1_blocks_to_fp32(output, count);
+            float sim = cosine_similarity(result, ref_sum);
+            EXPECT_GT(sim, 0.995f) << "Q16_1 4-way sum should have high similarity to reference";
+        }
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_SingleInput)
+        {
+            const size_t count = 64;
+            auto fp32 = generate_random_fp32(count);
+            auto q16 = fp32_to_q16_1_blocks(fp32);
+
+            std::vector<const Q16_1Block *> inputs = {q16.data()};
+            std::vector<Q16_1Block> output(q16.size());
+
+            simd::q16_1_sum_n(inputs.data(), 1, output.data(), q16.size());
+
+            // Single input should be copied directly
+            EXPECT_EQ(memcmp(output.data(), q16.data(), q16.size() * sizeof(Q16_1Block)), 0)
+                << "Single input should be copied unchanged";
+        }
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_LargeValues)
+        {
+            // Test with larger values that might cause saturation
+            const size_t count = 128;
+            auto fp32_a = generate_random_fp32(count, -100.0f, 100.0f);
+            auto fp32_b = generate_random_fp32(count, -100.0f, 100.0f);
+
+            auto q16_a = fp32_to_q16_1_blocks(fp32_a);
+            auto q16_b = fp32_to_q16_1_blocks(fp32_b);
+
+            std::vector<const Q16_1Block *> inputs = {q16_a.data(), q16_b.data()};
+            std::vector<Q16_1Block> output(q16_a.size());
+
+            simd::q16_1_sum_n(inputs.data(), 2, output.data(), q16_a.size());
+
+            auto dequant_a = q16_1_blocks_to_fp32(q16_a, count);
+            auto dequant_b = q16_1_blocks_to_fp32(q16_b, count);
+            auto ref_sum = compute_reference_sum({dequant_a, dequant_b});
+
+            auto result = q16_1_blocks_to_fp32(output, count);
+            float sim = cosine_similarity(result, ref_sum);
+            EXPECT_GT(sim, 0.995f) << "Q16_1 sum with large values should maintain precision";
+        }
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_EightInputs)
+        {
+            // Test with 8 inputs (common for 8-rank MPI)
+            const size_t count = 896; // d_model size
+            const size_t n_inputs = 8;
+            const size_t n_blocks = (count + 31) / 32;
+
+            std::vector<std::vector<float>> fp32_inputs(n_inputs);
+            std::vector<std::vector<Q16_1Block>> q16_inputs(n_inputs);
+            std::vector<const Q16_1Block *> input_ptrs(n_inputs);
+
+            for (size_t i = 0; i < n_inputs; ++i)
+            {
+                fp32_inputs[i] = generate_random_fp32(count, -1.0f, 1.0f);
+                q16_inputs[i] = fp32_to_q16_1_blocks(fp32_inputs[i]);
+                input_ptrs[i] = q16_inputs[i].data();
+            }
+
+            std::vector<Q16_1Block> output(n_blocks);
+            simd::q16_1_sum_n(input_ptrs.data(), n_inputs, output.data(), n_blocks);
+
+            std::vector<std::vector<float>> dequant_inputs(n_inputs);
+            for (size_t i = 0; i < n_inputs; ++i)
+            {
+                dequant_inputs[i] = q16_1_blocks_to_fp32(q16_inputs[i], count);
+            }
+            auto ref_sum = compute_reference_sum(dequant_inputs);
+
+            auto result = q16_1_blocks_to_fp32(output, count);
+            float sim = cosine_similarity(result, ref_sum);
+            EXPECT_GT(sim, 0.99f) << "Q16_1 8-way sum should have high similarity to reference";
+        }
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_ZeroInputs)
+        {
+            const size_t count = 64;
+            const size_t n_blocks = (count + 31) / 32;
+
+            // Create inputs with all zeros
+            std::vector<float> fp32_zeros(count, 0.0f);
+            auto q16_a = fp32_to_q16_1_blocks(fp32_zeros);
+            auto q16_b = fp32_to_q16_1_blocks(fp32_zeros);
+
+            std::vector<const Q16_1Block *> inputs = {q16_a.data(), q16_b.data()};
+            std::vector<Q16_1Block> output(n_blocks);
+
+            simd::q16_1_sum_n(inputs.data(), 2, output.data(), n_blocks);
+
+            // Result should be all zeros
+            auto result = q16_1_blocks_to_fp32(output, count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                EXPECT_NEAR(result[i], 0.0f, 1e-6f) << "Zero sum should produce zero at index " << i;
+            }
+        }
+
+        TEST_F(Test__PrecisionAwareAllreduce, Q16_1_SumN_MixedSigns)
+        {
+            // Test with mixed positive and negative values that should cancel
+            const size_t count = 32; // Single block
+
+            std::vector<float> fp32_pos(count);
+            std::vector<float> fp32_neg(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                fp32_pos[i] = 0.5f;
+                fp32_neg[i] = -0.5f;
+            }
+
+            auto q16_pos = fp32_to_q16_1_blocks(fp32_pos);
+            auto q16_neg = fp32_to_q16_1_blocks(fp32_neg);
+
+            std::vector<const Q16_1Block *> inputs = {q16_pos.data(), q16_neg.data()};
+            std::vector<Q16_1Block> output(1);
+
+            simd::q16_1_sum_n(inputs.data(), 2, output.data(), 1);
+
+            // Result should be near zero
+            auto result = q16_1_blocks_to_fp32(output, count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                EXPECT_NEAR(result[i], 0.0f, 0.001f) << "Canceling values should sum to near-zero at index " << i;
+            }
         }
 
     } // namespace testing

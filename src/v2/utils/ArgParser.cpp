@@ -66,7 +66,7 @@ namespace llaminar2
             // Fused attention
             {"--fused-attention-backend",
              {},
-             {"jit", "reference", "tiled"},
+             {"jit", "reference", "tiled", "q16_integer", "q16", "q16_int"},
              "jit",
              true, // Empty allowed (means use default)
              false},
@@ -732,10 +732,11 @@ namespace llaminar2
 
         std::cout << "Fused Attention:\n";
         std::cout << "  --fused-attention         Enable fused attention+Wo kernel (requires Q8_1 activations)\n";
-        std::cout << "  --fused-attention-backend=B  Select backend: jit (default), reference, tiled\n";
-        std::cout << "                              jit       - AVX-512 VNNI optimized (fastest)\n";
-        std::cout << "                              reference - Pure C++ (for debugging)\n";
-        std::cout << "                              tiled     - Cache-blocked (balanced)\n\n";
+        std::cout << "  --fused-attention-backend=B  Select backend: jit (default), reference, tiled, q16_integer\n";
+        std::cout << "                              jit         - AVX-512 VNNI optimized (fastest)\n";
+        std::cout << "                              reference   - Pure C++ (for debugging)\n";
+        std::cout << "                              tiled       - Cache-blocked (balanced)\n";
+        std::cout << "                              q16_integer - Q16 pure integer pipeline (experimental)\n\n";
 
         std::cout << "MPI Bootstrap:\n";
         std::cout << "  --mpi-procs N             Number of MPI processes (default: auto = 1 per socket)\n";

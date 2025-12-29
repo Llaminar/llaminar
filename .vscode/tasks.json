@@ -30,7 +30,7 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure V2 project with Debug settings (CUDA + ROCm enabled)"
+            "detail": "Configure V2 project with Debug settings (CUDA + ROCm enabled, assertions active)"
         },
         {
             "label": "V2: configure (release)",
@@ -87,6 +87,34 @@
             },
             "problemMatcher": [],
             "detail": "Configure V2 project with E2ERelease (Release optimizations + snapshots + CUDA + ROCm)"
+        },
+        {
+            "label": "V2: configure (integration)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-B",
+                "${workspaceFolder}/build_v2_integration",
+                "-S",
+                "${workspaceFolder}/src/v2",
+                "-G",
+                "Unix Makefiles",
+                "-DCMAKE_BUILD_TYPE=Integration",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DHAVE_CUDA=ON",
+                "-DHAVE_ROCM=ON"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "detail": "Configure V2 project with Integration (Release optimizations + debug symbols + snapshots + assertions)"
         },
         {
             "label": "Debug Build",
@@ -164,6 +192,30 @@
             "detail": "Build V2 project in E2ERelease mode (Release optimizations + snapshots)"
         },
         {
+            "label": "Integration Build",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_v2_integration",
+                "--config",
+                "Integration",
+                "--parallel"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "dependsOn": "V2: configure (integration)",
+            "detail": "Build V2 project in Integration mode (Release optimizations + debug symbols + snapshots)"
+        },
+        {
             "label": "V2: clean (debug)",
             "type": "shell",
             "command": "cmake",
@@ -227,6 +279,27 @@
             "detail": "Clean V2 E2ERelease build artifacts"
         },
         {
+            "label": "V2: clean (integration)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_v2_integration",
+                "--target",
+                "clean"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "detail": "Clean V2 Integration build artifacts"
+        },
+        {
             "label": "V2: test all",
             "type": "shell",
             "command": "bash",
@@ -272,7 +345,7 @@
             "command": "ctest",
             "args": [
                 "--test-dir",
-                "${workspaceFolder}/build_v2_release",
+                "${workspaceFolder}/build_v2_integration",
                 "--output-on-failure",
                 "--parallel",
                 "-R",
@@ -287,8 +360,8 @@
                 "showReuseMessage": true,
                 "clear": false
             },
-            "dependsOn": "Release Build",
-            "detail": "Run V2 integration tests (Release build)"
+            "dependsOn": "Integration Build",
+            "detail": "Run V2 integration tests (Integration build with snapshots + debug symbols)"
         },
         {
             "label": "Run E2E Tests",

@@ -7,6 +7,7 @@
  * - Does NOT require MPIContext (uses CPU device -1)
  * - Provides random data filling
  * - Supports creating quantized tensors with test patterns
+ * - Supports VNNI-packed weight creation for Q16 attention tests
  * - Is header-only for easy inclusion
  *
  * Usage:
@@ -16,11 +17,16 @@
  *   TestTensorFactory::fillRandom(input.get());
  *
  *   auto weights = TestTensorFactory::createQ8_0Random({1024, 896});
+ *
+ *   // For Q16 attention tests requiring VNNI-packed Wo weights:
+ *   auto wo_q8 = TestTensorFactory::createQ8_1FromFP32Random({d_model, d_model});
+ *   auto wo_packed = TestTensorFactory::packToVNNI(wo_q8.get());
  */
 
 #pragma once
 
 #include "tensors/Tensors.h"
+#include "kernels/KernelFactory.h"
 #include <memory>
 #include <vector>
 #include <random>
@@ -332,6 +338,119 @@ namespace llaminar2::test
             }
 
             return std::make_unique<Q4_0Tensor>(shape, raw_data);
+        }
+
+        // =========================================================================
+        // Q16_1 Tensor Creation (for Q16 integer-domain attention)
+        // =========================================================================
+
+        /**
+         * @brief Create empty Q16_1 tensor
+         * @param shape Tensor dimensions [rows, cols]
+         * @return Uninitialized Q16_1 tensor
+         */
+        static std::unique_ptr<Q16_1Tensor> createQ16_1(const std::vector<size_t> &shape)
+        {
+            return std::make_unique<Q16_1Tensor>(shape, /*device_idx=*/-1);
+        }
+
+        /**
+         * @brief Create Q16_1 tensor with random quantized data
+         *
+         * Generates random FP32 values, then quantizes to Q16_1 format
+         * with proper scale and sum fields per block.
+         *
+         * @param shape Tensor dimensions [rows, cols]
+         * @param min Minimum value for random generation
+         * @param max Maximum value for random generation
+         * @param seed Random seed
+         */
+        static std::unique_ptr<Q16_1Tensor> createQ16_1Random(
+            const std::vector<size_t> &shape,
+            float min = -1.0f, float max = 1.0f,
+            uint32_t seed = 42)
+        {
+            // Generate FP32 data first
+            size_t numel = 1;
+            for (auto s : shape)
+                numel *= s;
+
+            std::mt19937 rng(seed);
+            std::uniform_real_distribution<float> dist(min, max);
+
+            std::vector<float> fp32_data(numel);
+            for (size_t i = 0; i < numel; ++i)
+            {
+                fp32_data[i] = dist(rng);
+            }
+
+            // Use built-in quantization
+            auto tensor = Q16_1Tensor::quantize_from_fp32(fp32_data.data(), shape);
+
+            // Convert shared_ptr to unique_ptr by creating a new tensor
+            // This is safe because we own the only reference
+            auto result = std::make_unique<Q16_1Tensor>(*tensor);
+            return result;
+        }
+
+        // =========================================================================
+        // VNNI-Packed Weight Creation (for Q16 attention Wo projection)
+        // =========================================================================
+
+        /**
+         * @brief Create Q8_1 tensor by quantizing FP32 random data
+         *
+         * This is useful for creating weight tensors that will be packed
+         * to VNNI format. Uses the tensor's built-in quantization.
+         *
+         * @param shape Tensor dimensions [rows, cols]
+         * @param mean Mean for normal distribution (default 0.0)
+         * @param stddev Standard deviation (default 0.1, typical for weights)
+         * @param seed Random seed
+         */
+        static std::shared_ptr<Q8_1Tensor> createQ8_1FromFP32Random(
+            const std::vector<size_t> &shape,
+            float mean = 0.0f, float stddev = 0.1f,
+            uint32_t seed = 42)
+        {
+            size_t numel = 1;
+            for (auto s : shape)
+                numel *= s;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(mean, stddev);
+
+            std::vector<float> fp32_data(numel);
+            for (size_t i = 0; i < numel; ++i)
+            {
+                fp32_data[i] = dist(rng);
+            }
+
+            return Q8_1Tensor::quantize_from_fp32(fp32_data.data(), shape);
+        }
+
+        /**
+         * @brief Pack a quantized tensor to VNNI format for Q16 attention
+         *
+         * Takes a Q8_1 (or other INT8-based) tensor and returns VNNI-packed
+         * weights suitable for use with Q16FusedAttention kernels.
+         *
+         * The packed weights are cached in the tensor, so this is safe to
+         * call multiple times - subsequent calls return the cached version.
+         *
+         * @param tensor Q8_1 tensor to pack (must implement IINT8Unpackable)
+         * @return Pointer to VNNI-packed weights (lifetime tied to tensor)
+         * @throws std::runtime_error if packing fails
+         *
+         * Example usage:
+         *   auto wo_q8 = TestTensorFactory::createQ8_1FromFP32Random({d_model, d_model});
+         *   auto wo_packed = TestTensorFactory::packToVNNI(wo_q8.get());
+         *   params.Wo_packed = wo_packed;
+         */
+        static const llaminar2::gemm_v4::QuantisedPackedWeights *packToVNNI(
+            const TensorBase *tensor)
+        {
+            return llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(tensor);
         }
 
         // =========================================================================

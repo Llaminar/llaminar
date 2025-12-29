@@ -49,6 +49,13 @@ namespace llaminar2
 
         // Activation precision
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
+
+        // Fused attention backend selection
+        // - JIT: AVX-512 VNNI optimized (default)
+        // - REFERENCE: Pure C++ implementation for testing
+        // - TILED: Cache-blocked implementation
+        // - Q16_INTEGER: Pure Q16 integer-domain kernel (experimental)
+        FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
     };
 
     /**

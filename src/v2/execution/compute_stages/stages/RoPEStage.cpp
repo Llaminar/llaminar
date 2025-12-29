@@ -44,13 +44,19 @@ namespace llaminar2
                                  (params_.Q->native_type() == TensorType::Q8_1) &&
                                  (params_.Q_out->native_type() == TensorType::FP32);
 
+        // Detect HybridQ16 mode: Q8_1 input with Q16_1 output buffers
+        const bool hybrid_q16_mode = (params_.Q_out != nullptr) &&
+                                     (params_.Q->native_type() == TensorType::Q8_1) &&
+                                     (params_.Q_out->native_type() == TensorType::Q16_1);
+
         LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
                                                   << " n_heads=" << params_.n_heads
                                                   << " n_kv_heads=" << params_.n_kv_heads
                                                   << " head_dim=" << params_.head_dim
                                                   << " pos_offset=" << params_.pos_offset
                                                   << " tensor_type=" << params_.Q->dtype_name()
-                                                  << " hybrid_mode=" << (hybrid_mode ? "true" : "false"));
+                                                  << " hybrid_mode=" << (hybrid_mode ? "true" : "false")
+                                                  << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false"));
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
@@ -75,6 +81,25 @@ namespace llaminar2
         if (hybrid_mode)
         {
             return kernel->apply_q8_1_to_fp32(
+                params_.Q,
+                params_.K,
+                params_.Q_out,
+                params_.K_out,
+                position_ids.data(),
+                seq_len,
+                params_.n_heads,
+                n_kv_heads,
+                params_.head_dim,
+                params_.theta_base,
+                params_.mpi_ctx,
+                params_.device_idx);
+        }
+
+        // HybridQ16 mode: use apply_q8_1_to_q16_1() for Q8_1 → Q16_1 with higher precision
+        if (hybrid_q16_mode)
+        {
+            LOG_DEBUG("[RoPEStage] Using HybridQ16 mode: Q8_1 → Q16_1");
+            return kernel->apply_q8_1_to_q16_1(
                 params_.Q,
                 params_.K,
                 params_.Q_out,
@@ -253,6 +278,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

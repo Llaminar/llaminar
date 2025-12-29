@@ -1,39 +1,40 @@
 /**
  * @file Q16FusedAttentionRef.cpp
- * @brief Scalar reference implementation of Q16_1 fully fused attention (PURE INTEGER)
+ * @brief Scalar reference implementation of Q16_1 fused attention (FP32 scores + Q16 context)
  *
  * This file implements the FULL fused attention kernel with two execution paths:
  *
  * FLASH DECODE (seq_len_q=1):
  * - Single query against full KV cache
  * - Parallel over KV positions, no tiling
- * - Single-pass Exp2FixedSoftmax (no online state tracking)
- * - Steps: Q×K^T (INT32) → Softmax (INT16) → P×V (INT32) → Wo (Q16_1) → Residual (Q16_1)
+ * - FP32 softmax (standard exp-based)
+ * - Steps: Q×K^T (FP32) → Softmax (FP32) → P×V (INT32) → Wo (Q16_1) → Residual (Q16_1)
  * - Optimized for latency in token generation
  *
  * FA2 PREFILL (seq_len_q>1):
  * - Batched queries with per-query processing
- * - Per-query Exp2FixedSoftmax (integer domain)
+ * - FP32 softmax per query
  * - Steps: [Per-query: Q×K^T → Softmax → P×V] → Wo → Residual
  * - Optimized for throughput in prompt processing
  *
  * ═══════════════════════════════════════════════════════════════════════════════
- * PURE INTEGER-DOMAIN PIPELINE (NO FP32 INTERMEDIATE!)
+ * FP32 SCORES + Q16 CONTEXT PIPELINE
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- * The entire attention-to-residual pipeline uses integer operations:
+ * The attention pipeline uses FP32 for scores/softmax, Q16 for context/output:
  *
- * 1. Q×K^T → INT32 scores
- *    - Int8RequantRef: Q16→INT8 requant for stable alpha
- *    - INT8×INT8 → INT32 dot products
+ * 1. Q×K^T → FP32 scores
+ *    - Q16DotProductRef: Proper block-scale handling
+ *    - INT16×INT16 → INT32 with FP32 block scale accumulation
+ *    - Full Q16 precision preserved (no INT8 requant!)
  *
- * 2. Exp2FixedSoftmax → INT16 weights
- *    - Fixed-point exp2 approximation
- *    - Outputs INT16 weights [0, 32767]
+ * 2. FP32 Softmax → FP32 weights
+ *    - Standard exp-based softmax with max subtraction
+ *    - Outputs FP32 weights [0.0, 1.0]
  *
- * 3. P×V → INT32 accumulators (NOT FP32!)
- *    - INT16 weights × INT16 V values → INT32 accumulators
- *    - Tracks weight_sum and v_scale_product for deferred scaling
+ * 3. P×V → INT32 accumulators
+ *    - FP32 weights scaled to INT32 × INT16 V values
+ *    - Tracks weighted v_scale for proper output scaling
  *
  * 4. Wo Projection (VPDPWSSD) → Q16_1 output
  *    - INT32→INT16 context requantization (keeps 16 bits!)
@@ -42,7 +43,7 @@
  *
  * 5. Native Q16_1 Residual Add
  *    - Uses simd::q16_1_add_q16_1() for Q16_1 + Q16_1
- *    - No FP32 conversion anywhere in the pipeline!
+ *    - No FP32 conversion in the residual path!
  *
  * ═══════════════════════════════════════════════════════════════════════════════
  *
@@ -59,6 +60,7 @@
 #include "microkernels/Int8RequantRef.h"
 #include "microkernels/WoProjectionVNNIRef.h"
 #include "tensors/SIMDHelpers.h"
+#include "utils/Assertions.h"
 #include "utils/Logger.h"
 #include <vector>
 #include <cstring>
@@ -154,26 +156,27 @@ namespace llaminar2::kernels::q16_1
     }
 
     // ============================================================================
-    // Flash Decode: Pure Integer Attention Core Helper (Single Query)
+    // Flash Decode: FP32 Attention Core Helper (Single Query)
     // ============================================================================
 
     /**
-     * @brief Process attention for a single head in Flash Decode mode (PURE INTEGER)
+     * @brief Process attention for a single head in Flash Decode mode
      *
-     * INTEGER-DOMAIN PIPELINE (NO FP32 INTERMEDIATE!):
-     * 1. Q×K^T → INT32 scores (via Int8Requant)
-     * 2. Exp2FixedSoftmax → INT16 weights
-     * 3. P×V → INT32 accumulators (NOT FP32!)
+     * Uses FP32 scores and softmax for high precision (matching FP32 pipeline),
+     * then accumulates weighted V into INT32 accumulators for downstream processing.
      *
-     * The INT32 accumulators and scale info are returned for Wo projection.
+     * Pipeline:
+     * 1. Q×K^T → FP32 scores (proper Q16 block scale handling)
+     * 2. FP32 Softmax → FP32 weights (standard exp-based)
+     * 3. P×V → INT32 accumulators with FP32 scaling info
      *
      * @param params Full kernel parameters
      * @param head Query head index
      * @param int32_accum Output INT32 accumulator for this head [head_dim]
-     * @param weight_sum Output sum of INT16 weights
-     * @param v_scale_product Output product of V block scales
+     * @param weight_sum Output sum of INT16 weights (scaled to 32767)
+     * @param v_scale_product Output average V block scale
      */
-    static void flash_decode_attention_head_integer(
+    static void flash_decode_attention_head_fp32_scores(
         const Q16FusedAttentionWoResidualParams &params,
         int head,
         int32_t *int32_accum,
@@ -210,59 +213,91 @@ namespace llaminar2::kernels::q16_1
         }
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 1: Q×K^T → INT32 scores (via Int8Requant for stable alpha)
+        // STEP 1: Q×K^T → FP32 scores (proper block scale handling)
+        // This preserves full Q16 precision by computing:
+        //   score = Σ(int_dot_block × q_scale × k_scale) × attention_scale
         // ════════════════════════════════════════════════════════════════════════
 
-        std::vector<int32_t> int32_scores(kv_end);
-        float alpha = 0.0f;
+        std::vector<float> fp32_scores(kv_end);
 
         {
-            microkernels::Int8RequantParams requant_params{};
-            requant_params.Q = params.Q;
-            requant_params.K = params.K;
-            requant_params.q_row = q_row;
-            requant_params.head = head;
-            requant_params.kv_head = kv_head;
-            requant_params.head_dim = head_dim;
-            requant_params.kv_end = kv_end;
-            requant_params.q_blocks_per_row = q_blocks_per_row;
-            requant_params.kv_blocks_per_row = kv_blocks_per_row;
-            requant_params.attention_scale = attention_scale;
+            microkernels::Q16DotProductParams dot_params{};
+            dot_params.Q = params.Q;
+            dot_params.K = params.K;
+            dot_params.q_rows = 1;
+            dot_params.k_rows = kv_end;
+            dot_params.head_dim = head_dim;
+            dot_params.q_head = head;
+            dot_params.kv_head = kv_head;
+            dot_params.q_blocks_per_row = q_blocks_per_row;
+            dot_params.kv_blocks_per_row = kv_blocks_per_row;
+            dot_params.attention_scale = attention_scale;
 
-            microkernels::compute_int8_requant_logits(requant_params, int32_scores.data(), &alpha);
+            microkernels::q16_dot_product_gemv(dot_params, q_row, 0, kv_end, fp32_scores.data());
         }
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 2: Exp2FixedSoftmax → INT16 weights [0, 32767]
+        // STEP 2: FP32 Softmax → FP32 weights [0.0, 1.0]
+        // Standard softmax: weights = exp(score - max) / sum(exp(score - max))
         // ════════════════════════════════════════════════════════════════════════
 
-        std::vector<int16_t> int16_weights(kv_end);
+        // Find max for numerical stability
+        float max_score = fp32_scores[0];
+        for (int i = 1; i < kv_end; ++i)
+        {
+            max_score = std::max(max_score, fp32_scores[i]);
+        }
 
-        microkernels::exp2_fixed_softmax_row(
-            int32_scores.data(),
-            int16_weights.data(),
-            kv_end,
-            alpha,
-            weight_sum);
+        // Compute exp and sum
+        std::vector<float> fp32_weights(kv_end);
+        float exp_sum = 0.0f;
+        for (int i = 0; i < kv_end; ++i)
+        {
+            fp32_weights[i] = std::exp(fp32_scores[i] - max_score);
+            exp_sum += fp32_weights[i];
+        }
+
+        // Normalize weights
+        float inv_sum = 1.0f / exp_sum;
+        for (int i = 0; i < kv_end; ++i)
+        {
+            fp32_weights[i] *= inv_sum;
+        }
+
+        // Track weight sum as scaled INT16 for compatibility with downstream
+        // (32767 = max int16)
+        *weight_sum = 32767;
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 3: P×V → INT32 accumulators (PURE INTEGER, NO FP32!)
-        // INT16 weights × INT16 V values → INT32 accumulators
+        // STEP 3: P×V → INT32 accumulators with proper scale tracking
+        // FP32 weights × Q16 V values, accumulated in INT32 domain
+        //
+        // For each dimension d, we compute:
+        //   context[d] = Σ(w[kv] × v[kv,d]) = Σ(w[kv] × v_int[kv,d] × v_scale[kv,d])
+        //
+        // We use INT32 accumulators scaled by 32767 to maintain precision:
+        //   int32_accum[d] = Σ((w[kv]*32767) × v_int[kv,d])
+        //   actual_value = int32_accum[d] / 32767 * avg_v_scale
         // ════════════════════════════════════════════════════════════════════════
 
-        // Track V scale for later requantization
-        float v_scale_sum = 0.0f;
-        int v_scale_count = 0;
+        // Track weighted V scale for later requantization
+        float weighted_v_scale_sum = 0.0f;
+        float total_weight = 0.0f;
 
         const int v_start_col = kv_head * head_dim;
 
         for (int kv_pos = 0; kv_pos < kv_end; ++kv_pos)
         {
-            int16_t w = int16_weights[kv_pos];
-            if (w == 0)
+            float w = fp32_weights[kv_pos];
+            if (w < 1e-8f)
                 continue;
 
-            // Accumulate weighted V values (all in integer domain)
+            // Convert to scaled INT32 weight (0..32767 range)
+            int32_t w_scaled = static_cast<int32_t>(w * 32767.0f + 0.5f);
+            if (w_scaled == 0)
+                continue;
+
+            // Accumulate weighted V values
             for (int d = 0; d < head_dim; ++d)
             {
                 int v_col = v_start_col + d;
@@ -272,33 +307,33 @@ namespace llaminar2::kernels::q16_1
                 const Q16_1Block &v_block = params.V[kv_pos * kv_blocks_per_row + v_block_idx];
                 int16_t v_val = v_block.qs[v_elem_idx];
 
-                // INT16 × INT16 → INT32 (matches VNNI VPDPWSSD)
-                int32_accum[d] += static_cast<int32_t>(w) * static_cast<int32_t>(v_val);
+                // INT32 × INT16 → INT32
+                int32_accum[d] += w_scaled * static_cast<int32_t>(v_val);
 
-                // Track V scale (sample representative blocks)
+                // Track V scale weighted by attention weight (first elem only)
                 if (d == 0)
                 {
-                    v_scale_sum += v_block.d;
-                    v_scale_count++;
+                    weighted_v_scale_sum += w * v_block.d;
+                    total_weight += w;
                 }
             }
         }
 
-        // Compute average V scale
-        if (v_scale_count > 0)
+        // Compute attention-weighted average V scale
+        if (total_weight > 1e-8f)
         {
-            *v_scale_product = v_scale_sum / static_cast<float>(v_scale_count);
+            *v_scale_product = weighted_v_scale_sum / total_weight;
         }
     }
 
     // ============================================================================
-    // FA2 Prefill: Pure Integer Attention Core Helper (One Query Row)
+    // FA2 Prefill: FP32 Scores Attention Core Helper (One Query Row)
     // ============================================================================
 
     /**
-     * @brief Process attention for a single query row in FA2 Prefill mode (PURE INTEGER)
+     * @brief Process attention for a single query row in FA2 Prefill mode (FP32 scores)
      */
-    static void fa2_prefill_attention_row_integer(
+    static void fa2_prefill_attention_row_fp32_scores(
         const Q16FusedAttentionWoResidualParams &params,
         int q_row,
         int head,
@@ -334,54 +369,75 @@ namespace llaminar2::kernels::q16_1
         }
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 1: Q×K^T → INT32 scores (via Int8Requant)
+        // STEP 1: Q×K^T → FP32 scores (proper block scale handling)
         // ════════════════════════════════════════════════════════════════════════
 
-        std::vector<int32_t> int32_scores(kv_end);
-        float alpha = 0.0f;
+        std::vector<float> fp32_scores(kv_end);
 
         {
-            microkernels::Int8RequantParams requant_params{};
-            requant_params.Q = params.Q;
-            requant_params.K = params.K;
-            requant_params.q_row = q_row;
-            requant_params.head = head;
-            requant_params.kv_head = kv_head;
-            requant_params.head_dim = head_dim;
-            requant_params.kv_end = kv_end;
-            requant_params.q_blocks_per_row = q_blocks_per_row;
-            requant_params.kv_blocks_per_row = kv_blocks_per_row;
-            requant_params.attention_scale = attention_scale;
+            microkernels::Q16DotProductParams dot_params{};
+            dot_params.Q = params.Q;
+            dot_params.K = params.K;
+            dot_params.q_rows = params.seq_len_q;
+            dot_params.k_rows = kv_end;
+            dot_params.head_dim = head_dim;
+            dot_params.q_head = head;
+            dot_params.kv_head = kv_head;
+            dot_params.q_blocks_per_row = q_blocks_per_row;
+            dot_params.kv_blocks_per_row = kv_blocks_per_row;
+            dot_params.attention_scale = attention_scale;
 
-            microkernels::compute_int8_requant_logits(requant_params, int32_scores.data(), &alpha);
+            microkernels::q16_dot_product_gemv(dot_params, q_row, 0, kv_end, fp32_scores.data());
         }
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 2: Exp2FixedSoftmax → INT16 weights [0, 32767]
+        // STEP 2: FP32 Softmax → FP32 weights [0.0, 1.0]
         // ════════════════════════════════════════════════════════════════════════
 
-        std::vector<int16_t> int16_weights(kv_end);
+        // Find max for numerical stability
+        float max_score = fp32_scores[0];
+        for (int i = 1; i < kv_end; ++i)
+        {
+            max_score = std::max(max_score, fp32_scores[i]);
+        }
 
-        microkernels::exp2_fixed_softmax_row(
-            int32_scores.data(),
-            int16_weights.data(),
-            kv_end,
-            alpha,
-            weight_sum);
+        // Compute exp and sum
+        std::vector<float> fp32_weights(kv_end);
+        float exp_sum = 0.0f;
+        for (int i = 0; i < kv_end; ++i)
+        {
+            fp32_weights[i] = std::exp(fp32_scores[i] - max_score);
+            exp_sum += fp32_weights[i];
+        }
+
+        // Normalize weights
+        float inv_sum = 1.0f / exp_sum;
+        for (int i = 0; i < kv_end; ++i)
+        {
+            fp32_weights[i] *= inv_sum;
+        }
+
+        // Track weight sum as scaled INT16 for compatibility
+        *weight_sum = 32767;
 
         // ════════════════════════════════════════════════════════════════════════
-        // STEP 3: P×V → INT32 accumulators (PURE INTEGER, NO FP32!)
+        // STEP 3: P×V → INT32 accumulators
         // ════════════════════════════════════════════════════════════════════════
 
-        float v_scale_sum = 0.0f;
-        int v_scale_count = 0;
+        float weighted_v_scale_sum = 0.0f;
+        float total_weight = 0.0f;
 
         const int v_start_col = kv_head * head_dim;
 
         for (int kv_pos = 0; kv_pos < kv_end; ++kv_pos)
         {
-            int16_t w = int16_weights[kv_pos];
-            if (w == 0)
+            float w = fp32_weights[kv_pos];
+            if (w < 1e-8f)
+                continue;
+
+            // Convert to scaled INT32 weight
+            int32_t w_scaled = static_cast<int32_t>(w * 32767.0f + 0.5f);
+            if (w_scaled == 0)
                 continue;
 
             for (int d = 0; d < head_dim; ++d)
@@ -393,20 +449,20 @@ namespace llaminar2::kernels::q16_1
                 const Q16_1Block &v_block = params.V[kv_pos * kv_blocks_per_row + v_block_idx];
                 int16_t v_val = v_block.qs[v_elem_idx];
 
-                // INT16 × INT16 → INT32
-                int32_accum[d] += static_cast<int32_t>(w) * static_cast<int32_t>(v_val);
+                // INT32 × INT16 → INT32
+                int32_accum[d] += w_scaled * static_cast<int32_t>(v_val);
 
                 if (d == 0)
                 {
-                    v_scale_sum += v_block.d;
-                    v_scale_count++;
+                    weighted_v_scale_sum += w * v_block.d;
+                    total_weight += w;
                 }
             }
         }
 
-        if (v_scale_count > 0)
+        if (total_weight > 1e-8f)
         {
-            *v_scale_product = v_scale_sum / static_cast<float>(v_scale_count);
+            *v_scale_product = weighted_v_scale_sum / total_weight;
         }
     }
 
@@ -456,7 +512,7 @@ namespace llaminar2::kernels::q16_1
             int32_t head_weight_sum = 0;
             float head_v_scale = 1.0f;
 
-            flash_decode_attention_head_integer(
+            flash_decode_attention_head_fp32_scores(
                 params, h, head_accum, &head_weight_sum, &head_v_scale);
 
             if (head_weight_sum > 0)
@@ -480,6 +536,11 @@ namespace llaminar2::kernels::q16_1
         // ════════════════════════════════════════════════════════════════════════
         // SNAPSHOT: Capture attention context (INT32 → FP32 for debugging)
         // ════════════════════════════════════════════════════════════════════════
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        LOG_TRACE("[Q16FusedAttention DECODE] context_snapshot ptr=" << params.context_snapshot
+                                                                     << " (snapshots " << (params.context_snapshot ? "ENABLED" : "DISABLED") << ")");
+#endif
 
         if (params.context_snapshot)
         {
@@ -602,7 +663,7 @@ namespace llaminar2::kernels::q16_1
                 int32_t head_weight_sum = 0;
                 float head_v_scale = 1.0f;
 
-                fa2_prefill_attention_row_integer(
+                fa2_prefill_attention_row_fp32_scores(
                     params, q, h, head_accum, &head_weight_sum, &head_v_scale);
 
                 if (head_weight_sum > 0)
@@ -624,6 +685,14 @@ namespace llaminar2::kernels::q16_1
             // ════════════════════════════════════════════════════════════════════
             // SNAPSHOT: Capture attention context for this query position
             // ════════════════════════════════════════════════════════════════════
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+            if (q == 0)
+            {
+                LOG_TRACE("[Q16FusedAttention PREFILL] context_snapshot ptr=" << params.context_snapshot
+                                                                              << " (snapshots " << (params.context_snapshot ? "ENABLED" : "DISABLED") << ")");
+            }
+#endif
 
             if (params.context_snapshot)
             {

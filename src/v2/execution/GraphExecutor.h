@@ -33,6 +33,7 @@
 #include "DeviceContext.h"
 #include "WorkDistributor.h"
 #include "GraphBufferManager.h"
+#include "../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include <memory>
 #include <vector>
 #include <string>
@@ -350,13 +351,17 @@ namespace llaminar2
         bool executeParallel(ComputeGraph &graph, IDeviceContext *ctx);
         bool executeNode(ComputeNode &node, IDeviceContext *ctx);
 
-        // Buffer validation (debug builds only)
-#ifndef NDEBUG
+        // Buffer validation (Debug/Integration builds only)
+#if LLAMINAR_ASSERTIONS_ACTIVE
         /**
          * @brief Validate stage outputs for zero/NaN tensors
          *
-         * Called after stage execution when LLAMINAR_VALIDATE_BUFFERS=1.
+         * Called automatically after stage execution when assertions are active.
          * Checks all OUTPUT buffers for uninitialized (zero) or corrupted (NaN/Inf) data.
+         *
+         * Can be disabled at runtime with LLAMINAR_VALIDATE_BUFFERS=0.
+         * NaN/Inf failure is enabled by default; zero-tensor warnings are not failures
+         * unless LLAMINAR_FAIL_ON_ZERO=1 is set.
          *
          * @param node The node whose outputs should be validated
          * @return true if validation passes, false if errors detected

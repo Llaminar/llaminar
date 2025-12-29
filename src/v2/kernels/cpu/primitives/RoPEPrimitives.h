@@ -349,6 +349,37 @@ namespace llaminar2::primitives
         const int16_t *sin_q15);
 
     /**
+     * @brief Scalar implementation of Q8_1 RoPE (for testing/reference)
+     */
+    void apply_rope_q8_1_integer_head_scalar(
+        Q8_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+#if defined(__AVX2__)
+    /**
+     * @brief AVX2 implementation of Q8_1 RoPE
+     */
+    void apply_rope_q8_1_integer_head_avx2(
+        Q8_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief AVX512 implementation of Q8_1 RoPE
+     */
+    void apply_rope_q8_1_integer_head_avx512(
+        Q8_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+    /**
      * @brief Apply pure-integer RoPE to Q8_1 Q and K tensors
      *
      * High-level wrapper that handles:
@@ -438,6 +469,37 @@ namespace llaminar2::primitives
         const int16_t *sin_q15);
 
     /**
+     * @brief Scalar implementation for Q16_1 RoPE (for testing/reference)
+     */
+    void apply_rope_q16_1_integer_head_scalar(
+        Q16_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+    /**
+     * @brief AVX2 implementation for Q16_1 RoPE (for testing)
+     */
+    void apply_rope_q16_1_integer_head_avx2(
+        Q16_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief AVX512 implementation for Q16_1 RoPE (for testing)
+     */
+    void apply_rope_q16_1_integer_head_avx512(
+        Q16_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+    /**
      * @brief Apply in-place RoPE to Q16_1 Q and K tensors
      *
      * High-level wrapper that handles:
@@ -466,5 +528,54 @@ namespace llaminar2::primitives
         int head_dim,
         float rope_theta,
         RoPEPersistentState *persistent_state = nullptr);
+
+    // ============================================================================
+    // Q8_1 → Q16_1 RoPE Primitives (HybridQ16 Mode)
+    // ============================================================================
+    // These primitives take Q8_1 input, apply RoPE rotation, and output Q16_1.
+    // This is the optimal path for HybridQ16 mode:
+    // - Q8_1 input from QKV GEMM projection
+    // - Q16_1 output for Q16 fused attention kernel
+    //
+    // Advantages:
+    // - No intermediate FP32 dequant/requant round-trip
+    // - Direct Q8_1 → rotate → Q16_1 quantization
+    // - Q16_1 output has 256× finer precision than Q8_1
+    // ============================================================================
+
+    /**
+     * @brief Apply RoPE to Q8_1 input, output to Q16_1 (HybridQ16 mode)
+     *
+     * This primitive:
+     * 1. Dequantizes Q8_1 blocks to FP32
+     * 2. Applies RoPE rotation
+     * 3. Requantizes to Q16_1 (higher precision output)
+     *
+     * Used in HybridQ16 mode where:
+     * - QKV projection outputs Q8_1 (standard quantized GEMM)
+     * - Q16 fused attention kernel expects Q16_1 inputs
+     *
+     * @param Q_in Q8_1 Q input tensor [seq_len * n_heads * blocks_per_head]
+     * @param K_in Q8_1 K input tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
+     * @param Q_out Q16_1 Q output tensor [seq_len * n_heads * blocks_per_head]
+     * @param K_out Q16_1 K output tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
+     * @param position_ids Position indices [seq_len], -1 = padding
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension (must be divisible by 32)
+     * @param rope_theta RoPE base frequency (e.g., 10000.0f)
+     */
+    void apply_rope_q8_1_to_q16_1(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        Q16_1Block *Q_out,
+        Q16_1Block *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta);
 
 } // namespace llaminar2::primitives

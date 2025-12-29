@@ -9,6 +9,8 @@
 
 namespace llaminar2
 {
+    // Forward declaration
+    class MPIContext;
 
     /**
      * @brief MPI Allreduce stage
@@ -18,9 +20,10 @@ namespace llaminar2
     public:
         struct Params
         {
-            TensorBase *buffer = nullptr; ///< Buffer to allreduce (in-place)
-            void *mpi_comm = nullptr;     ///< MPI communicator (cast to MPI_Comm)
-            size_t count = 0;             ///< Number of elements to reduce (0 = use buffer->numel())
+            TensorBase *buffer = nullptr;        ///< Buffer to allreduce (in-place)
+            void *mpi_comm = nullptr;            ///< MPI communicator (cast to MPI_Comm)
+            size_t count = 0;                    ///< Number of elements to reduce (0 = use buffer->numel())
+            const MPIContext *mpi_ctx = nullptr; ///< Optional: MPIContext for Q8_1/Q16_1 allreduce
         };
 
         explicit AllreduceStage(Params params);

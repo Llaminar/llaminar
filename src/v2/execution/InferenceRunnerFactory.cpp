@@ -116,6 +116,19 @@ namespace llaminar2
         graph_config.activation_precision = config.activation_precision;
         LOG_DEBUG("[InferenceRunner] Activation precision: " << activationPrecisionToString(config.activation_precision));
 
+        // Propagate fused attention backend selection
+        // This determines which kernel implementation to use for fused attention
+        // For HybridQ16 mode, automatically use Q16_INTEGER backend (JIT doesn't support Q16_1)
+        FusedAttentionBackend effective_backend = config.fused_attention_backend;
+        if (config.activation_precision == ActivationPrecision::HybridQ16 &&
+            config.fused_attention_backend == FusedAttentionBackend::JIT)
+        {
+            effective_backend = FusedAttentionBackend::Q16_INTEGER;
+            LOG_DEBUG("[InferenceRunner] HybridQ16 mode: auto-selecting Q16_INTEGER backend (JIT doesn't support Q16_1)");
+        }
+        graph_config.fused_attention_backend = effective_backend;
+        LOG_DEBUG("[InferenceRunner] Fused attention backend: " << fusedAttentionBackendToString(effective_backend));
+
         // Try to get d_ff from metadata (intermediate_size)
         if (model.hasMetadata("llama.feed_forward_length"))
         {

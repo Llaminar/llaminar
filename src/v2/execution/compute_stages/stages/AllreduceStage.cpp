@@ -10,6 +10,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/MPIContext.h"
 #include <mpi.h>
+#include <chrono>
 
 namespace llaminar2
 {
@@ -48,99 +49,106 @@ namespace llaminar2
             return false;
         }
 
-        MPI_Comm comm = static_cast<MPI_Comm>(params_.mpi_comm);
-
-        // Get mutable data pointer based on tensor type
-        void *data_ptr = nullptr;
-        MPI_Datatype mpi_type = MPI_FLOAT;
-
-        if (params_.buffer->native_type() == TensorType::FP32)
-        {
-            auto *fp32_tensor = dynamic_cast<FP32Tensor *>(params_.buffer);
-            if (fp32_tensor)
-            {
-                data_ptr = fp32_tensor->mutable_data();
-                mpi_type = MPI_FLOAT;
-
-                // Debug: dump values before AllReduce
-                float *f = static_cast<float *>(data_ptr);
-                LOG_DEBUG("[AllreduceStage] Before AllReduce: data[0:4]="
-                          << f[0] << "," << f[1] << "," << f[2] << "," << f[3]);
-            }
-        }
-        // Add other types as needed (BF16, FP16, etc.)
-
-        if (!data_ptr)
-        {
-            LOG_ERROR("[AllreduceStage] Unsupported tensor type for allreduce");
-            return false;
-        }
-
-        // Compute checksum before if verification enabled
-        float checksum_before = 0.0f;
-        if (mpi_env.verify_checksums && mpi_type == MPI_FLOAT)
-        {
-            const float *f = static_cast<const float *>(data_ptr);
-            for (size_t i = 0; i < count; ++i)
-            {
-                checksum_before += f[i];
-            }
-            LOG_INFO("[MPI] AllReduce checksum BEFORE: " << checksum_before);
-        }
-
-        LOG_DEBUG("[AllreduceStage] Calling MPI_Allreduce with count=" << count);
-
         // Start timing if enabled
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        int result = MPI_Allreduce(
-            MPI_IN_PLACE,
-            data_ptr,
-            static_cast<int>(count),
-            mpi_type,
-            MPI_SUM,
-            comm);
+        bool success = false;
+
+        // Handle different tensor types
+        if (params_.buffer->native_type() == TensorType::FP32)
+        {
+            // FP32: Direct MPI_Allreduce
+            auto *fp32_tensor = dynamic_cast<FP32Tensor *>(params_.buffer);
+            if (fp32_tensor)
+            {
+                float *data_ptr = fp32_tensor->mutable_data();
+                MPI_Comm comm = static_cast<MPI_Comm>(params_.mpi_comm);
+
+                LOG_DEBUG("[AllreduceStage] FP32 path: before data[0:4]="
+                          << data_ptr[0] << "," << data_ptr[1] << "," << data_ptr[2] << "," << data_ptr[3]);
+
+                int result = MPI_Allreduce(
+                    MPI_IN_PLACE,
+                    data_ptr,
+                    static_cast<int>(count),
+                    MPI_FLOAT,
+                    MPI_SUM,
+                    comm);
+
+                LOG_DEBUG("[AllreduceStage] FP32 path: after data[0:4]="
+                          << data_ptr[0] << "," << data_ptr[1] << "," << data_ptr[2] << "," << data_ptr[3]);
+
+                success = (result == MPI_SUCCESS);
+            }
+        }
+        else if (params_.buffer->native_type() == TensorType::Q16_1)
+        {
+            // Q16_1: Use MPIContext::allreduce_q16_1_inplace for efficient SIMD reduction
+            auto *q16_tensor = dynamic_cast<Q16_1Tensor *>(params_.buffer);
+            if (q16_tensor && params_.mpi_ctx)
+            {
+                Q16_1Block *blocks = q16_tensor->mutable_typed_data();
+                size_t n_blocks = (count + 31) / 32;
+
+                LOG_DEBUG("[AllreduceStage] Q16_1 path: n_blocks=" << n_blocks
+                                                                   << " using MPIContext allreduce");
+
+                params_.mpi_ctx->allreduce_q16_1_inplace(blocks, n_blocks);
+                success = true;
+            }
+            else if (!params_.mpi_ctx)
+            {
+                LOG_ERROR("[AllreduceStage] Q16_1 tensor requires mpi_ctx for allreduce");
+                return false;
+            }
+        }
+        else if (params_.buffer->native_type() == TensorType::Q8_1)
+        {
+            // Q8_1: Use MPIContext::allreduce_q8_1_inplace for efficient SIMD reduction
+            auto *q8_tensor = dynamic_cast<Q8_1Tensor *>(params_.buffer);
+            if (q8_tensor && params_.mpi_ctx)
+            {
+                Q8_1Block *blocks = q8_tensor->mutable_typed_data();
+                size_t n_blocks = (count + 31) / 32;
+
+                LOG_DEBUG("[AllreduceStage] Q8_1 path: n_blocks=" << n_blocks
+                                                                  << " using MPIContext allreduce");
+
+                params_.mpi_ctx->allreduce_q8_1_inplace(blocks, n_blocks);
+                success = true;
+            }
+            else if (!params_.mpi_ctx)
+            {
+                LOG_ERROR("[AllreduceStage] Q8_1 tensor requires mpi_ctx for allreduce");
+                return false;
+            }
+        }
+        else
+        {
+            LOG_ERROR("[AllreduceStage] Unsupported tensor type for allreduce: "
+                      << params_.buffer->dtype_name());
+            return false;
+        }
 
         // End timing
         auto end_time = std::chrono::high_resolution_clock::now();
-
-        // Debug: dump values after AllReduce
-        if (mpi_type == MPI_FLOAT)
-        {
-            float *f = static_cast<float *>(data_ptr);
-            LOG_DEBUG("[AllreduceStage] After AllReduce: data[0:4]="
-                      << f[0] << "," << f[1] << "," << f[2] << "," << f[3]);
-        }
 
         // Log timing if enabled
         if (mpi_env.log_timing)
         {
             double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-            double bytes = count * sizeof(float);
+            double bytes = count * sizeof(float); // Approximate
             double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
             LOG_INFO("[MPI] AllReduce timing: " << ms << " ms for " << count
                                                 << " elements (" << bandwidth_gbps << " GB/s)");
         }
 
-        // Verify checksum after if enabled
-        if (mpi_env.verify_checksums && mpi_type == MPI_FLOAT)
-        {
-            float checksum_after = 0.0f;
-            const float *f = static_cast<const float *>(data_ptr);
-            for (size_t i = 0; i < count; ++i)
-            {
-                checksum_after += f[i];
-            }
-            LOG_INFO("[MPI] AllReduce checksum AFTER: " << checksum_after);
-        }
-
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[MPI] AllReduce END: result=" << (result == MPI_SUCCESS ? "SUCCESS" : "FAILED"));
+            LOG_INFO("[MPI] AllReduce END: result=" << (success ? "SUCCESS" : "FAILED"));
         }
 
-        LOG_DEBUG("[AllreduceStage] MPI_Allreduce returned " << result);
-        return result == MPI_SUCCESS;
+        return success;
     }
 
     bool AllreduceStage::supportsBackend(ComputeBackendType backend) const
@@ -179,6 +187,5 @@ namespace llaminar2
 
         return info;
     }
-
 
 } // namespace llaminar2

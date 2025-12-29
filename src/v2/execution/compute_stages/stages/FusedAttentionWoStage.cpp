@@ -5,6 +5,7 @@
 
 #include "FusedAttentionWoStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/UnifiedKVCache.h"
@@ -124,10 +125,24 @@ namespace llaminar2
             // Build params for Q16 kernel
             FusedAttentionWoParams q16_params;
 
-            // Extract raw data from tensors - Q16 kernel expects void* Q/K/V
-            q16_params.Q = params_.Q ? params_.Q->raw_data() : nullptr;
-            q16_params.K = params_.K ? params_.K->raw_data() : nullptr;
-            q16_params.V = params_.V ? params_.V->raw_data() : nullptr;
+            // Extract typed data from tensors - Q16 kernel expects Q16_1Block* for Q/K/V
+            // Use dynamic_cast + typed_data() for type-safe extraction
+            auto *q_q16 = dynamic_cast<Q16_1Tensor *>(params_.Q);
+            auto *k_q16 = dynamic_cast<Q16_1Tensor *>(params_.K);
+            auto *v_q16 = dynamic_cast<Q16_1Tensor *>(params_.V);
+
+            if (!q_q16 || !k_q16 || !v_q16)
+            {
+                LOG_ERROR("[FusedAttentionWoStage] Q16_INTEGER backend requires Q16_1 tensors for Q/K/V, got: "
+                          << "Q=" << (params_.Q ? params_.Q->dtype_name() : "null") << ", "
+                          << "K=" << (params_.K ? params_.K->dtype_name() : "null") << ", "
+                          << "V=" << (params_.V ? params_.V->dtype_name() : "null"));
+                return false;
+            }
+
+            q16_params.Q = q_q16->typed_data();
+            q16_params.K = k_q16->typed_data();
+            q16_params.V = v_q16->typed_data();
 
             // Wo weights - get VNNI packed weights via KernelFactory
             // Check if Wo implements IINT8Unpackable (quantized formats)
@@ -183,15 +198,21 @@ namespace llaminar2
             q16_params.causal = params_.causal;
             q16_params.position_offset = position_offset;
 
-            // Snapshot buffers
+            // Snapshot buffers - FAIL FAST if snapshot capture is enabled but buffer is wrong type
             q16_params.scores_snapshot = nullptr;
+            q16_params.context_snapshot = nullptr;
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
             if (params_.context_snapshot)
             {
-                if (auto *ctx_fp32 = dynamic_cast<FP32Tensor *>(params_.context_snapshot))
-                {
-                    q16_params.context_snapshot = ctx_fp32->mutable_data();
-                }
+                auto *ctx_fp32 = dynamic_cast<FP32Tensor *>(params_.context_snapshot);
+                LLAMINAR_ASSERT_CAST(ctx_fp32, "FP32Tensor",
+                                     "context_snapshot (got " +
+                                         std::string(params_.context_snapshot->dtype_name()) + ")");
+                q16_params.context_snapshot = ctx_fp32->mutable_data();
+                LOG_TRACE("[FusedAttentionWoStage] Q16_INTEGER: context_snapshot buffer set, ptr="
+                          << q16_params.context_snapshot);
             }
+#endif
 
             success = q16_kernel_->compute(q16_params);
         }

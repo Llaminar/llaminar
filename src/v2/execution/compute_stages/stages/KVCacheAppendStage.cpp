@@ -7,9 +7,12 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/UnifiedKVCache.h"
-#include "../../../utils/DebugEnv.h"
+#include "../../../utils/OpenMPUtils.h"
+
+#include <immintrin.h>
 
 namespace llaminar2
 {
@@ -245,6 +248,158 @@ namespace llaminar2
             return true;
         }
 
+        // Q16_1 cache conversion path - handles HybridQ16 mode where:
+        // - K_rope is Q16_1 (from RoPE Q8_1→Q16_1 conversion)
+        // - V is Q8_1 (from GEMM output)
+        // - KV cache is Q16_1
+        bool cache_is_q16_1 = (params_.kv_cache->precision() == ActivationPrecision::Q16_1);
+        bool k_is_q16_1 = (params_.K->native_type() == TensorType::Q16_1);
+        bool v_is_q8_1 = (params_.V->native_type() == TensorType::Q8_1);
+
+        if (cache_is_q16_1 && k_is_q16_1 && v_is_q8_1)
+        {
+            LOG_DEBUG("[KVCacheAppendStage] HybridQ16 mode: K is Q16_1, converting V from Q8_1 to Q16_1"
+                      << " (tokens=" << total_tokens << ")");
+
+            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+
+            // K is already Q16_1 - can pass directly
+            // V needs Q8_1 → Q16_1 conversion
+            auto v_q16_slice = std::make_unique<Q16_1Tensor>(
+                std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+
+            const auto *v_q8 = dynamic_cast<const Q8_1Tensor *>(params_.V);
+            if (!v_q8)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Expected Q8_1 V tensor but got " << params_.V->dtype_name());
+                return false;
+            }
+
+            // Convert Q8_1 V to Q16_1 with SIMD acceleration
+            // Q16_1 has 256× finer precision (±32767 vs ±127)
+            constexpr size_t block_size = 32; // Q8_1 and Q16_1 both use 32-element blocks
+            const size_t blocks_per_row = (kv_dim + block_size - 1) / block_size;
+            const Q8_1Block *v_q8_data = v_q8->typed_data();
+            Q16_1Block *v_q16_data = v_q16_slice->mutable_typed_data();
+
+            // Parallel conversion using OMP_WORKSHARE_REGION
+            auto do_conversion = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int t = 0; t < total_tokens; ++t)
+                {
+                    const Q8_1Block *src_blocks = v_q8_data + t * blocks_per_row;
+                    Q16_1Block *dst_blocks = v_q16_data + t * blocks_per_row;
+
+                    for (size_t b = 0; b < blocks_per_row; ++b)
+                    {
+                        const Q8_1Block &src = src_blocks[b];
+                        Q16_1Block &dst = dst_blocks[b];
+
+                        // Q8_1 scale is FP16, Q16_1 scale is FP32
+                        // Scale up int8→int16 by 256, divide scale by 256 to preserve value
+                        dst.d = simd::fp16_to_fp32(src.d) / 256.0f;
+
+#if defined(__AVX512F__)
+                        // AVX512: Process all 32 int8 values → 32 int16 values
+                        // Load 32 int8 values (256 bits)
+                        __m256i i8_vec = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(src.qs));
+                        // Sign-extend lower 16 int8 → int16
+                        __m256i lo_16 = _mm256_cvtepi8_epi16(
+                            _mm256_castsi256_si128(i8_vec));
+                        // Sign-extend upper 16 int8 → int16
+                        __m256i hi_16 = _mm256_cvtepi8_epi16(
+                            _mm256_extracti128_si256(i8_vec, 1));
+                        // Multiply by 256 (left shift by 8)
+                        __m256i lo_scaled = _mm256_slli_epi16(lo_16, 8);
+                        __m256i hi_scaled = _mm256_slli_epi16(hi_16, 8);
+                        // Store 32 int16 values
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), lo_scaled);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs + 16), hi_scaled);
+
+                        // Compute sum_qs (sum of all 32 int16 values)
+                        // Horizontal add within each lane
+                        __m256i sum_lo = _mm256_madd_epi16(lo_scaled, _mm256_set1_epi16(1));
+                        __m256i sum_hi = _mm256_madd_epi16(hi_scaled, _mm256_set1_epi16(1));
+                        __m256i sum_all = _mm256_add_epi32(sum_lo, sum_hi);
+                        // Reduce to single int32
+                        __m128i sum128 = _mm_add_epi32(
+                            _mm256_castsi256_si128(sum_all),
+                            _mm256_extracti128_si256(sum_all, 1));
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        dst.sum_qs = _mm_cvtsi128_si32(sum128);
+
+#elif defined(__AVX2__)
+                        // AVX2: Process 32 int8 values in two halves
+                        __m128i i8_lo = _mm_loadu_si128(
+                            reinterpret_cast<const __m128i *>(src.qs));
+                        __m128i i8_hi = _mm_loadu_si128(
+                            reinterpret_cast<const __m128i *>(src.qs + 16));
+                        // Sign-extend int8 → int16
+                        __m256i i16_lo = _mm256_cvtepi8_epi16(i8_lo);
+                        __m256i i16_hi = _mm256_cvtepi8_epi16(i8_hi);
+                        // Multiply by 256 (left shift by 8)
+                        __m256i scaled_lo = _mm256_slli_epi16(i16_lo, 8);
+                        __m256i scaled_hi = _mm256_slli_epi16(i16_hi, 8);
+                        // Store
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), scaled_lo);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs + 16), scaled_hi);
+
+                        // Compute sum_qs
+                        __m256i sum_lo = _mm256_madd_epi16(scaled_lo, _mm256_set1_epi16(1));
+                        __m256i sum_hi = _mm256_madd_epi16(scaled_hi, _mm256_set1_epi16(1));
+                        __m256i sum_all = _mm256_add_epi32(sum_lo, sum_hi);
+                        __m128i sum128 = _mm_add_epi32(
+                            _mm256_castsi256_si128(sum_all),
+                            _mm256_extracti128_si256(sum_all, 1));
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        dst.sum_qs = _mm_cvtsi128_si32(sum128);
+#else
+                        // Scalar fallback
+                        int32_t sum = 0;
+                        for (size_t i = 0; i < block_size; ++i)
+                        {
+                            int16_t scaled = static_cast<int16_t>(src.qs[i]) * 256;
+                            dst.qs[i] = scaled;
+                            sum += scaled;
+                        }
+                        dst.sum_qs = sum;
+#endif
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_conversion);
+
+            // Also populate V_dequant_out if requested (for decomposed attention path)
+            if (params_.V_dequant_out)
+            {
+                auto *v_dequant_q16 = dynamic_cast<Q16_1Tensor *>(params_.V_dequant_out);
+                if (v_dequant_q16 && v_dequant_q16->mutable_typed_data())
+                {
+                    // Copy Q16_1 data to V_dequant_out
+                    std::memcpy(v_dequant_q16->mutable_typed_data(),
+                                v_q16_slice->typed_data(),
+                                total_tokens * blocks_per_row * sizeof(Q16_1Block));
+                    LOG_DEBUG("[KVCacheAppendStage] Populated V_dequant_out with Q16_1 values");
+                }
+            }
+
+            bool success = params_.kv_cache->append_kv(
+                params_.layer_idx, params_.seq_idx,
+                params_.K, v_q16_slice.get(), total_tokens);
+
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] append_kv failed (HybridQ16 conversion)");
+                return false;
+            }
+
+            return true;
+        }
+
         // Direct append path - tensors already match cache precision
         bool success = params_.kv_cache->append_kv(
             params_.layer_idx, params_.seq_idx,
@@ -335,6 +490,5 @@ namespace llaminar2
 
         return info;
     }
-
 
 } // namespace llaminar2

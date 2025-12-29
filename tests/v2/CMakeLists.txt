@@ -126,31 +126,48 @@ function(add_v2_test TEST_NAME)
         list(APPEND MPI_CMD --oversubscribe)
     endif()
     
-    # E2E and Integration tests should use Release build for performance
-    # Unit tests can use Debug build for better diagnostics
-    set(USE_RELEASE_BUILD FALSE)
-    if(CMAKE_BUILD_TYPE MATCHES "Debug" AND ("${ARG_LABELS}" MATCHES "E2E" OR "${ARG_LABELS}" MATCHES "Integration"))
-        set(USE_RELEASE_BUILD TRUE)
+    # Integration tests use build_v2_integration (Release + snapshots + debug symbols)
+    # E2E tests use build_v2_e2e_release
+    # Unit tests use current build (Debug or whatever is configured)
+    set(USE_INTEGRATION_BUILD FALSE)
+    set(USE_E2E_BUILD FALSE)
+    if(CMAKE_BUILD_TYPE MATCHES "Debug")
+        if("${ARG_LABELS}" MATCHES "Integration")
+            set(USE_INTEGRATION_BUILD TRUE)
+        elseif("${ARG_LABELS}" MATCHES "E2E")
+            set(USE_E2E_BUILD TRUE)
+        endif()
     endif()
     
-    # Determine executable path based on build type
-    if(USE_RELEASE_BUILD)
-        # Use Release build (build_v2_release)
-        set(RELEASE_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build_v2_release")
+    # Determine executable path based on test type
+    if(USE_INTEGRATION_BUILD)
+        # Use Integration build (build_v2_integration)
+        set(INTEGRATION_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build_v2_integration")
         list(GET ARG_COMMAND 0 EXECUTABLE_TARGET)
-        # Extract just the target name (remove any path components)
         get_filename_component(EXECUTABLE_NAME ${EXECUTABLE_TARGET} NAME)
         
-        # Check if this is a target file reference or direct path
         if(EXECUTABLE_TARGET MATCHES "\\$<TARGET_FILE:")
-            # Extract target name from generator expression
             string(REGEX REPLACE ".*TARGET_FILE:([^>]+)>.*" "\\1" TARGET_NAME "${EXECUTABLE_TARGET}")
-            set(EXECUTABLE_PATH "${RELEASE_BUILD_DIR}/tests/v2/${TARGET_NAME}")
+            set(EXECUTABLE_PATH "${INTEGRATION_BUILD_DIR}/tests/v2/${TARGET_NAME}")
         else()
-            set(EXECUTABLE_PATH "${RELEASE_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
+            set(EXECUTABLE_PATH "${INTEGRATION_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
         endif()
         
-        # Replace first argument with Release build path
+        list(REMOVE_AT ARG_COMMAND 0)
+        set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
+    elseif(USE_E2E_BUILD)
+        # Use E2E Release build (build_v2_e2e_release)
+        set(E2E_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build_v2_e2e_release")
+        list(GET ARG_COMMAND 0 EXECUTABLE_TARGET)
+        get_filename_component(EXECUTABLE_NAME ${EXECUTABLE_TARGET} NAME)
+        
+        if(EXECUTABLE_TARGET MATCHES "\\$<TARGET_FILE:")
+            string(REGEX REPLACE ".*TARGET_FILE:([^>]+)>.*" "\\1" TARGET_NAME "${EXECUTABLE_TARGET}")
+            set(EXECUTABLE_PATH "${E2E_BUILD_DIR}/tests/v2/${TARGET_NAME}")
+        else()
+            set(EXECUTABLE_PATH "${E2E_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
+        endif()
+        
         list(REMOVE_AT ARG_COMMAND 0)
         set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
     else()
@@ -205,6 +222,8 @@ find_package(GTest REQUIRED)
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
 elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
+    add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+elseif(CMAKE_BUILD_TYPE MATCHES "Integration")
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
 elseif(ENABLE_SNAPSHOTS)
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
@@ -1167,7 +1186,7 @@ add_v2_test(V2_Unit_BF16_SIMD_Accuracy
     MPI_PROCS 1  # CPU-only SIMD tests, single rank
 )
 
-# Test: Precision-aware allreduce N-way sum functions (FP16, BF16, Q8_1)
+# Test: Precision-aware allreduce N-way sum functions (FP16, BF16, Q8_1, Q16_1)
 add_executable(v2_test_precision_aware_allreduce unit/mpi/Test__PrecisionAwareAllreduce.cpp)
 target_link_libraries(v2_test_precision_aware_allreduce 
     llaminar2_core 
@@ -1176,7 +1195,7 @@ target_link_libraries(v2_test_precision_aware_allreduce
 )
 add_v2_test(V2_Unit_PrecisionAwareAllreduce
     COMMAND $<TARGET_FILE:v2_test_precision_aware_allreduce>
-    LABELS "V2;Unit;MPI;Allreduce;SIMD;FP16;BF16;Q8_1;AVX512;Precision"
+    LABELS "V2;Unit;MPI;Allreduce;SIMD;FP16;BF16;Q8_1;Q16_1;AVX512;Precision"
     MPI_PROCS 1  # Tests SIMD sum functions locally, no MPI communication needed
 )
 
@@ -1210,6 +1229,45 @@ add_v2_test(V2_Unit_RoPEPrecisionCorrectness
     COMMAND $<TARGET_FILE:v2_test_rope_precision>
     LABELS "V2;Unit;Primitives;RoPE;SIMD;AVX2;AVX512;Correctness;FP32;BF16;FP16;INT32;PrecisionTesting;CPU"
     MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: Q16_1 RoPE SIMD correctness and performance
+add_executable(v2_test_q16_1_rope unit/Test__Q16_1RoPE.cpp)
+target_link_libraries(v2_test_q16_1_rope 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16_1RoPE_Correctness 
+    COMMAND $<TARGET_FILE:v2_test_q16_1_rope>
+    LABELS "V2;Unit;Primitives;RoPE;Q16_1;SIMD;AVX2;AVX512;Correctness;Performance;CPU"
+    MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: Q8_1 RoPE SIMD correctness and performance
+add_executable(v2_test_q8_1_rope unit/Test__Q8_1RoPE.cpp)
+target_link_libraries(v2_test_q8_1_rope 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1RoPE_Correctness 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_rope>
+    LABELS "V2;Unit;Primitives;RoPE;Q8_1;SIMD;AVX2;AVX512;Correctness;Performance;CPU"
+    MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: Q16 Attention Context Parity (diagnose INT32→FP32 conversion)
+add_executable(v2_test_q16_attention_context_parity unit/Test__Q16AttentionContextParity.cpp)
+target_link_libraries(v2_test_q16_attention_context_parity 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16AttentionContextParity 
+    COMMAND $<TARGET_FILE:v2_test_q16_attention_context_parity>
+    LABELS "V2;Unit;Attention;Q16_1;Parity;Context"
+    MPI_PROCS 1
 )
 
 # Test: CPURoPEKernelT class interface
@@ -2762,7 +2820,7 @@ add_v2_test(V2_Integration_LayerExecutor_Q8_1_vs_FP32_Parity
 #   - Allgatherv result combination
 
 # Test: Precision-Aware MPI Allreduce Integration Tests
-# Tests actual MPI communication for FP32, FP16, BF16, and Q8_1 formats
+# Tests actual MPI communication for FP32, FP16, BF16, Q8_1, and Q16_1 formats
 # Validates correctness of partial sum accumulation across ranks
 add_executable(v2_integration_mpi_precision_allreduce integration/Test__MPI_PrecisionAwareAllreduce.cpp)
 target_link_libraries(v2_integration_mpi_precision_allreduce
@@ -2772,7 +2830,7 @@ target_link_libraries(v2_integration_mpi_precision_allreduce
 add_v2_test(V2_Integration_MPI_PrecisionAwareAllreduce
     COMMAND $<TARGET_FILE:v2_integration_mpi_precision_allreduce>
     MPI_PROCS 2
-    LABELS "V2;Integration;MPI;Allreduce;FP32;FP16;BF16;Q8_1;Bandwidth"
+    LABELS "V2;Integration;MPI;Allreduce;FP32;FP16;BF16;Q8_1;Q16_1;Bandwidth"
 )
 
 # Test: Row-Parallel Multi-Precision MPI Integration Tests
@@ -3089,7 +3147,7 @@ add_v2_test(V2_Unit_IQ4_XSTensor
 # E2E Parity: MPI Tensor-Parallel vs Single-Rank
 # -----------------------------------------------------------------------------
 # Compares distributed execution against single-node to ensure TP correctness
-if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
+if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
     add_executable(v2_e2e_parity_mpi_vs_single_rank 
         e2e/parity/internal/mpi_vs_single_rank/Test__MPIPipeline_vs_SingleRank.cpp
         e2e/parity/gtest_mpi_main.cpp
@@ -3114,7 +3172,7 @@ find_package(ZLIB)
 if(ZLIB_FOUND)
     get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
-    if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
+    if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
         add_executable(v2_e2e_parity_fp32_vs_pytorch 
             e2e/parity/pytorch/qwen2/Test__FP32Pipeline_vs_PyTorch.cpp
             ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
@@ -3795,4 +3853,25 @@ target_link_libraries(v2_test_qwen2_graph_fused_attention
 add_v2_test(V2_Integration_Qwen2Graph_FusedAttention 
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_fused_attention>
     LABELS "V2;Integration;Graph;Attention;FusedAttention"
+)
+
+# Test: Graph Snapshot Callback Invocation Integration Tests
+# Verifies that snapshot callbacks are properly invoked for ALL stages during graph execution.
+# Critical for E2E parity testing and debugging - ensures no stages silently skip callbacks.
+# Tests:
+#   - Basic stage types (RMSNorm, SwiGLU, ResidualAdd)
+#   - Multi-stage graphs
+#   - Full Qwen2 graph with GraphOrchestrator
+#   - FusedAttentionWo context/output capture
+#   - Decode phase callback invocation
+add_executable(v2_test_graph_snapshot_callback_invocation integration/Test__GraphSnapshotCallbackInvocation.cpp)
+target_link_libraries(v2_test_graph_snapshot_callback_invocation
+    llaminar2_core
+    GTest::gtest
+    # NOTE: No gtest_main - this test has custom main() with MPI_Init
+)
+add_v2_test(V2_Integration_GraphSnapshotCallbackInvocation
+    COMMAND $<TARGET_FILE:v2_test_graph_snapshot_callback_invocation>
+    LABELS "V2;Integration;Graph;Snapshot;Callback"
+    MPI_PROCS 1
 )

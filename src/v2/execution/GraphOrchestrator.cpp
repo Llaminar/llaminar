@@ -840,17 +840,27 @@ namespace llaminar2
         // but needs to be converted to KV cache precision for storage)
         if (act_prec == ActivationPrecision::Hybrid || act_prec == ActivationPrecision::HybridQ16)
         {
+            // Use resolveBufferPrecision to get the correct precision for Q/K after RoPE
+            // Hybrid: FP32, HybridQ16: Q16_1
+            ActivationPrecision q_rope_prec = resolveBufferPrecision(
+                act_prec, HybridBufferType::Q_After_RoPE, nullptr);
+            ActivationPrecision k_rope_prec = resolveBufferPrecision(
+                act_prec, HybridBufferType::K_After_RoPE, nullptr);
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                            << " mode: allocating FP32 Q_rope/K_rope buffers");
-            state_.Q_rope = factory.createFP32(
+                                            << " mode: allocating Q_rope buffer ("
+                                            << activationPrecisionToString(q_rope_prec) << ")");
+            state_.Q_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-                device_idx);
-            state_.K_rope = factory.createFP32(
+                q_rope_prec, device_idx);
+            LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                            << " mode: allocating K_rope buffer ("
+                                            << activationPrecisionToString(k_rope_prec) << ")");
+            state_.K_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                device_idx);
+                k_rope_prec, device_idx);
 
-            // V_dequant: FP32 buffer for V before KV cache append
-            // V is Q8_1 from GEMM but KV cache is FP32, so we need dequantization
+            // V_dequant: buffer for V before KV cache append
+            // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
             ActivationPrecision kv_cache_prec = resolveBufferPrecision(
                 act_prec, HybridBufferType::KV_Cache, nullptr);
             state_.V_dequant = factory.createActivation(

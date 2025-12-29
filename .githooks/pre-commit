@@ -24,7 +24,7 @@ echo ""
 
 # Build directories
 BUILD_V2_DEBUG="build_v2"
-BUILD_V2_RELEASE="build_v2_release"
+BUILD_V2_INTEGRATION="build_v2_integration"
 
 # Step 1: Build Debug (for development testing)
 echo -e "${YELLOW}[1/4] Building V2 Debug...${NC}"
@@ -41,19 +41,19 @@ fi
 echo -e "${GREEN}✓ Debug build successful${NC}"
 echo ""
 
-# Step 2: Build Release (for performance testing)
-echo -e "${YELLOW}[2/4] Building V2 Release...${NC}"
-if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1; then
-    echo -e "${RED}❌ CMake configuration failed (Release)${NC}"
+# Step 2: Build Integration (for integration testing with snapshots + debug symbols)
+echo -e "${YELLOW}[2/4] Building V2 Integration...${NC}"
+if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -DCMAKE_BUILD_TYPE=Integration > /dev/null 2>&1; then
+    echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
     exit 1
 fi
 
-if ! cmake --build "$BUILD_V2_RELEASE" --parallel > /dev/null 2>&1; then
-    echo -e "${RED}❌ Build failed (Release)${NC}"
-    echo -e "${YELLOW}Run manually to see errors: cmake --build $BUILD_V2_RELEASE --parallel${NC}"
+if ! cmake --build "$BUILD_V2_INTEGRATION" --parallel > /dev/null 2>&1; then
+    echo -e "${RED}❌ Build failed (Integration)${NC}"
+    echo -e "${YELLOW}Run manually to see errors: cmake --build $BUILD_V2_INTEGRATION --parallel${NC}"
     exit 1
 fi
-echo -e "${GREEN}✓ Release build successful${NC}"
+echo -e "${GREEN}✓ Integration build successful${NC}"
 echo ""
 
 # Step 3: Run Unit Tests (Debug build)
@@ -81,14 +81,14 @@ fi
 echo -e "${GREEN}✓ All unit tests passed${NC}"
 echo ""
 
-# Step 4: Run Integration Tests (Release build)
-echo -e "${YELLOW}[4/4] Running V2 integration tests (Release build)...${NC}"
+# Step 4: Run Integration Tests (Integration build - optimized with debug symbols + snapshots)
+echo -e "${YELLOW}[4/4] Running V2 integration tests (Integration build)...${NC}"
 echo ""
 
 # Filter: ^V2_Integration_ matches all integration tests
-# NOTE: Integration tests should run against optimized Release build
+# NOTE: Integration tests run against Integration build (Release + debug symbols + snapshots)
 set +e
-ctest --test-dir "$BUILD_V2_RELEASE" -R "^V2_Integration_" --output-on-failure --parallel
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" --output-on-failure --parallel
 INTEGRATION_EXIT_CODE=$?
 set -e
 
@@ -97,14 +97,14 @@ echo "================================================"
 if [ $INTEGRATION_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
     echo -e "${GREEN}  • Debug build: OK${NC}"
-    echo -e "${GREEN}  • Release build: OK${NC}"
+    echo -e "${GREEN}  • Integration build: OK${NC}"
     echo -e "${GREEN}  • Unit tests (Debug): OK${NC}"
-    echo -e "${GREEN}  • Integration tests (Release): OK${NC}"
+    echo -e "${GREEN}  • Integration tests (Integration): OK${NC}"
     echo ""
     echo -e "${GREEN}Proceeding with commit...${NC}"
     exit 0
 else
-    echo -e "${RED}❌ Integration tests failed (Release).${NC}"
+    echo -e "${RED}❌ Integration tests failed (Integration).${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"

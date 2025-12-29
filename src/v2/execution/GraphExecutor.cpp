@@ -540,8 +540,9 @@ namespace llaminar2
             StageDumper::finalizeDump(dump_ctx, ms);
         }
 
-        // Validate stage outputs if buffer validation is enabled (debug builds only)
-#ifndef NDEBUG
+        // Validate stage outputs if buffer validation is enabled
+        // (only compiles in Debug/Integration builds with assertions active)
+#if LLAMINAR_ASSERTIONS_ACTIVE
         if (success && debugEnv().validation.validate_buffers)
         {
             success = validateStageOutputs(node);
@@ -559,10 +560,10 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // Buffer Validation (Debug Builds Only)
+    // Buffer Validation (Debug/Integration Builds Only)
     // =============================================================================
 
-#ifndef NDEBUG
+#if LLAMINAR_ASSERTIONS_ACTIVE
     bool GraphExecutor::validateStageOutputs(const ComputeNode &node)
     {
         if (!node.stage)
@@ -649,7 +650,7 @@ namespace llaminar2
 
         return all_valid;
     }
-#endif
+#endif // LLAMINAR_ASSERTIONS_ACTIVE
 
     // =============================================================================
     // Buffer Management

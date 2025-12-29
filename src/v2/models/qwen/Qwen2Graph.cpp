@@ -803,12 +803,15 @@ namespace llaminar2
             rope_params.theta_base = config_.rope_theta;
             rope_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
 
-            // Hybrid mode: output to separate FP32 buffers to avoid requantization
+            // Hybrid/HybridQ16 mode: output to separate buffers to avoid requantization
+            // Hybrid: Q8_1 → FP32, HybridQ16: Q8_1 → Q16_1
             if (use_hybrid_mode)
             {
                 rope_params.Q_out = buffers.Q_rope;
                 rope_params.K_out = buffers.K_rope;
-                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " using Hybrid RoPE: Q8_1→FP32 output");
+                LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
+                                                << " using " << (inference_mode.isHybridQ16() ? "HybridQ16" : "Hybrid")
+                                                << " RoPE: Q8_1→" << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << " output");
             }
 
             graph.addNode(prefix + "rope",
@@ -836,13 +839,14 @@ namespace llaminar2
 
                 KVCacheAppendStage::Params kv_append_params;
 
-                // Hybrid mode: Use K_rope (post-RoPE FP32) instead of K (pre-RoPE Q8_1)
-                // The KV cache in Hybrid mode stores post-RoPE values
+                // Hybrid/HybridQ16 mode: Use K_rope (post-RoPE) instead of K (pre-RoPE Q8_1)
+                // The KV cache stores post-RoPE values (FP32 for Hybrid, Q16_1 for HybridQ16)
                 if (use_hybrid_mode && inference_mode.needsKRope())
                 {
                     kv_append_params.K = buffers.K_rope;
                     LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx
-                                                    << " KVCacheAppend using K_rope (post-RoPE FP32)");
+                                                    << " KVCacheAppend using K_rope (post-RoPE "
+                                                    << (inference_mode.isHybridQ16() ? "Q16_1" : "FP32") << ")");
                 }
                 else
                 {
@@ -1040,7 +1044,7 @@ namespace llaminar2
                 fused_params.d_model = config_.d_model;
                 fused_params.causal = true;
                 fused_params.position_offset = position_ids ? position_ids[0] : 0;
-                fused_params.backend = FusedAttentionBackend::JIT;
+                fused_params.backend = config_.fused_attention_backend; // Use configured backend
                 fused_params.kv_cache = kv_cache;
                 fused_params.layer_idx = layer_idx;
                 fused_params.mpi_ctx = mpi_ctx_.get();
@@ -1191,7 +1195,8 @@ namespace llaminar2
                                       AllreduceStage::Params{
                                           allreduce_buffer,
                                           getMPICommPtr(mpi_ctx_.get()),
-                                          allreduce_count}),
+                                          allreduce_count,
+                                          mpi_ctx_.get()}),
                                   device_idx);
 
                     graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
@@ -1364,7 +1369,8 @@ namespace llaminar2
                                   AllreduceStage::Params{
                                       buffers.attn_proj,
                                       comm,
-                                      allreduce_count}),
+                                      allreduce_count,
+                                      mpi_ctx_.get()}),
                               device_idx);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");

@@ -423,10 +423,20 @@ int main(int argc, char *argv[])
     {
         LOG_INFO("Fused attention+Wo kernel enabled (backend="
                  << fusedAttentionBackendToString(runtime_config.fused_attention_backend) << ")");
-        if (runtime_config.activation_precision != ActivationPrecision::Q8_1)
+        // Fused attention supports Q8_1, Hybrid, and HybridQ16 modes
+        // Q16_INTEGER backend specifically requires HybridQ16 mode
+        if (runtime_config.activation_precision != ActivationPrecision::Q8_1 &&
+            runtime_config.activation_precision != ActivationPrecision::Hybrid &&
+            runtime_config.activation_precision != ActivationPrecision::HybridQ16)
         {
-            LOG_WARN("Fused attention requires Q8_1 activation precision, current: "
+            LOG_WARN("Fused attention requires Q8_1, Hybrid, or HybridQ16 activation precision, current: "
                      << args.activation_precision << ". Will use unfused path.");
+        }
+        if (runtime_config.fused_attention_backend == FusedAttentionBackend::Q16_INTEGER &&
+            runtime_config.activation_precision != ActivationPrecision::HybridQ16)
+        {
+            LOG_WARN("Q16_INTEGER backend requires HybridQ16 activation precision, current: "
+                     << args.activation_precision << ". May not work correctly.");
         }
     }
 
@@ -567,6 +577,7 @@ int main(int argc, char *argv[])
     InferenceRunnerConfig runner_config;
     runner_config.max_seq_len = runtime_config.max_seq_len;
     runner_config.activation_precision = runtime_config.activation_precision;
+    runner_config.fused_attention_backend = runtime_config.fused_attention_backend;
 
     auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, runner_config);
     if (!runner)

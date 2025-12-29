@@ -16,6 +16,21 @@
  * All environment variables are parsed once at startup to avoid hot-path overhead.
  */
 
+// =============================================================================
+// ASSERTIONS ACTIVE CHECK (duplicated from Assertions.h to avoid circular dep)
+// =============================================================================
+// Assertions are active when:
+//   1. NDEBUG is NOT defined (Debug builds), OR
+//   2. LLAMINAR_ENABLE_ASSERTIONS is defined (Integration builds)
+// =============================================================================
+#ifndef LLAMINAR_ASSERTIONS_ACTIVE
+#if !defined(NDEBUG) || defined(LLAMINAR_ENABLE_ASSERTIONS)
+#define LLAMINAR_ASSERTIONS_ACTIVE 1
+#else
+#define LLAMINAR_ASSERTIONS_ACTIVE 0
+#endif
+#endif
+
 namespace llaminar2
 {
 
@@ -1177,17 +1192,25 @@ namespace llaminar2
      * - `LLAMINAR_FAIL_ON_ZERO`: Fail immediately when zero tensor detected (0/1)
      * - `LLAMINAR_FAIL_ON_NAN`: Fail immediately when NaN/Inf detected (0/1)
      *
+     * **Automatic Enablement**:
+     * When `LLAMINAR_ASSERTIONS_ACTIVE` is defined (Debug/Integration builds),
+     * `validate_buffers` defaults to true. Set `LLAMINAR_VALIDATE_BUFFERS=0` to
+     * explicitly disable in these builds.
+     *
      * **Usage**:
      * @code
-     *   # Enable buffer validation (debug builds only)
-     *   LLAMINAR_VALIDATE_BUFFERS=1 ./build_v2/llaminar2 -m model.gguf -p "test"
+     *   # Buffer validation is automatic in Debug/Integration builds
+     *   ./build_v2/llaminar2 -m model.gguf -p "test"
      *
      *   # Strict mode: fail on any zero or NaN tensor
-     *   LLAMINAR_VALIDATE_BUFFERS=1 LLAMINAR_FAIL_ON_ZERO=1 LLAMINAR_FAIL_ON_NAN=1 ...
+     *   LLAMINAR_FAIL_ON_ZERO=1 LLAMINAR_FAIL_ON_NAN=1 ./build_v2/llaminar2 ...
+     *
+     *   # Disable validation even in debug builds
+     *   LLAMINAR_VALIDATE_BUFFERS=0 ./build_v2/llaminar2 ...
      * @endcode
      *
-     * @note Validation only runs in debug builds (#ifndef NDEBUG)
-     * @see TensorValidation.h for validation functions
+     * @note Validation only compiles in when LLAMINAR_ASSERTIONS_ACTIVE is defined
+     * @see Assertions.h for LLAMINAR_ASSERTIONS_ACTIVE definition
      */
     struct ValidationConfig
     {
@@ -1202,6 +1225,14 @@ namespace llaminar2
 
         void reload()
         {
+            // Auto-enable buffer validation when assertions are active
+            // This is the default for Debug and Integration builds
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            validate_buffers = true;
+            fail_on_nan = true; // NaN/Inf is always a bug, fail by default
+#endif
+
+            // Environment variables can override the defaults
             const char *validate_env = std::getenv("LLAMINAR_VALIDATE_BUFFERS");
             if (validate_env)
             {

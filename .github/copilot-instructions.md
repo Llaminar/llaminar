@@ -59,8 +59,12 @@ cmake --build build_v2 --parallel
 cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
 
+# Integration build (for integration tests with snapshots + debug symbols)
+cmake -B build_v2_integration -S src/v2 -DCMAKE_BUILD_TYPE=Integration
+cmake --build build_v2_integration --parallel
+
 # E2E Release build (for parity testing with snapshots)
-cmake -B build_v2_e2e_release -S src/v2 -DCMAKE_BUILD_TYPE=Release -DENABLE_PIPELINE_SNAPSHOTS=ON
+cmake -B build_v2_e2e_release -S src/v2 -DCMAKE_BUILD_TYPE=E2ERelease
 cmake --build build_v2_e2e_release --parallel
 ```
 
@@ -68,12 +72,20 @@ cmake --build build_v2_e2e_release --parallel
 - `llaminar2_core`: Core library (linked by tests and tools)
 - `llaminar2`: Main executable
 
+**CMake Build Types**:
+| Build Type | Optimization | Debug Symbols | Snapshots | Use Case |
+|------------|-------------|---------------|-----------|----------|
+| `Debug` | Off | Yes | Yes | Development, debugging |
+| `Release` | Full (-O3) | No | No | Production, benchmarks |
+| `Integration` | Full (-O3) | Yes | Yes | Integration tests with backtraces |
+| `E2ERelease` | Full (-O3) | No | Yes | E2E parity tests |
+
 **CMake Options**:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `HAVE_CUDA` | OFF | Enable CUDA backend |
 | `HAVE_ROCM` | OFF | Enable ROCm backend |
-| `ENABLE_PIPELINE_SNAPSHOTS` | OFF | Enable tensor snapshot capture for E2E tests |
+| `ENABLE_SNAPSHOTS` | OFF | Enable tensor snapshot capture (auto-enabled for Debug/Integration/E2ERelease) |
 
 ---
 
@@ -191,8 +203,8 @@ LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.ggu
 # Unit tests (fast)
 ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
-# Integration tests (require models)
-ctest --test-dir build_v2_release -R "^V2_Integration_" --output-on-failure
+# Integration tests (require models, use Integration build for snapshots + backtraces)
+ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure
 
 # E2E parity tests (require snapshot build)
 ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
@@ -777,6 +789,59 @@ if (total_elements < 8192) {
 
 ## Code Quality Guidelines
 
+### Assertion Framework
+
+Llaminar uses a systematic assertion framework that is **automatically enabled** in Debug and Integration builds, and **compiled out** in Release builds.
+
+**Build Type Behavior**:
+| Build Type | `LLAMINAR_ASSERTIONS_ACTIVE` | Buffer Validation | NaN/Inf Check |
+|------------|------------------------------|-------------------|---------------|
+| Debug | 1 | Auto-ON | Fail by default |
+| Integration | 1 | Auto-ON | Fail by default |
+| Release | 0 | Compiled out | Compiled out |
+| E2ERelease | 0 | Compiled out | Compiled out |
+
+**Available Assertion Macros** (see `utils/Assertions.h`):
+
+| Macro | Purpose | Release Behavior |
+|-------|---------|------------------|
+| `LLAMINAR_ASSERT(cond, msg)` | Basic condition check | No-op |
+| `LLAMINAR_ASSERT_NOT_NULL(ptr, name)` | Null pointer check | No-op |
+| `LLAMINAR_ASSERTF(cond, msg_stream)` | Formatted message | No-op |
+| `LLAMINAR_ASSERT_CAST(result, type, desc)` | `dynamic_cast` validation | No-op |
+| `LLAMINAR_UNREACHABLE(msg_stream)` | Unreachable code marker | **Always active** |
+| `LLAMINAR_SNAPSHOT_ASSERT*` | Snapshot-only assertions | No-op |
+
+**Automatic Buffer Validation** (GraphExecutor):
+
+When assertions are active, the GraphExecutor automatically validates stage outputs after each execution:
+
+- **NaN/Inf detection**: Fails by default (catches numerical bugs early)
+- **Zero-tensor detection**: Warns but doesn't fail (set `LLAMINAR_FAIL_ON_ZERO=1` for strict mode)
+- **No per-stage code needed**: Validation is done by the framework using `getDumpInfo()`
+
+**Override at Runtime**:
+```bash
+# Disable validation even in Debug builds
+LLAMINAR_VALIDATE_BUFFERS=0 ./build_v2/llaminar2 ...
+
+# Enable strict zero-tensor checking
+LLAMINAR_FAIL_ON_ZERO=1 ./build_v2/llaminar2 ...
+
+# Disable NaN/Inf failure (just warn)
+LLAMINAR_FAIL_ON_NAN=0 ./build_v2/llaminar2 ...
+```
+
+**Usage in Stages**:
+
+For type-safe tensor access, use `dynamic_cast` + `typed_data()` with assertion macros:
+
+```cpp
+auto* q_q16 = dynamic_cast<Q16_1Tensor*>(params_.Q);
+LLAMINAR_ASSERT_CAST(q_q16, "Q16_1Tensor", "Q tensor");
+const Q16_1Block* data = q_q16->typed_data();  // Type-safe access
+```
+
 ### Logging Standards
 
 ```cpp
@@ -823,7 +888,9 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_LOG_LEVEL` | Logging verbosity (ERROR/WARN/INFO/DEBUG/TRACE) | INFO |
 | `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing in benchmark mode | Disabled |
 | `LLAMINAR_EXECUTOR_PROFILING` | Enable per-stage profiling in GraphExecutor | Disabled |
-| `LLAMINAR_EXECUTOR_VALIDATION` | Enable output validation after each stage | Disabled |
+| `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
+| `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |
+| `LLAMINAR_FAIL_ON_NAN` | Fail on NaN/Inf during validation | Auto-ON in Debug/Integration |
 | `LLAMINAR_STAGE_DUMP` | Dump per-stage tensor outputs | Disabled |
 | `LLAMINAR_DETERMINISTIC` | Force deterministic execution | Disabled |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk | Disabled |

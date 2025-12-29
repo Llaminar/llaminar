@@ -1760,6 +1760,242 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Sum multiple Q16_1 block arrays into one (N-way reduction)
+         *
+         * Used for MPI allreduce operations where we need to sum Q16_1 contributions
+         * from N ranks. This is more efficient than N-1 pairwise additions.
+         *
+         * Algorithm per block:
+         * 1. Dequantize all N blocks to FP32 (accumulated in registers)
+         * 2. Sum all FP32 values
+         * 3. Find new max_abs for quantization
+         * 4. Requantize to Q16_1
+         *
+         * @param inputs Array of N pointers to Q16_1 block arrays
+         * @param n_inputs Number of input arrays (typically world_size)
+         * @param output Output Q16_1 block buffer
+         * @param n_blocks Number of blocks per array
+         */
+        inline void q16_1_sum_n(
+            const Q16_1Block *const *inputs, size_t n_inputs, Q16_1Block *output, size_t n_blocks)
+        {
+            if (n_inputs == 0)
+                return;
+            if (n_inputs == 1)
+            {
+                std::memcpy(output, inputs[0], n_blocks * sizeof(Q16_1Block));
+                return;
+            }
+
+            // N-way reduction (N >= 2)
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                alignas(64) float sum_vals[32] = {0.0f};
+
+#ifdef __AVX512F__
+                // Initialize accumulators to zero
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+
+                // Accumulate all inputs
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q16_1Block &block = inputs[i][blk];
+                    const float scale = block.d; // Q16_1 uses FP32 scale directly
+                    const __m512 vscale = _mm512_set1_ps(scale);
+
+                    // Load 32 int16 values (two 256-bit loads)
+                    __m256i q_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+                    __m256i q_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
+
+                    // Convert int16 → int32 → float
+                    __m512i i32_lo = _mm512_cvtepi16_epi32(q_lo);
+                    __m512i i32_hi = _mm512_cvtepi16_epi32(q_hi);
+                    __m512 f_lo = _mm512_cvtepi32_ps(i32_lo);
+                    __m512 f_hi = _mm512_cvtepi32_ps(i32_hi);
+
+                    // Scale and accumulate
+                    acc0 = _mm512_fmadd_ps(f_lo, vscale, acc0);
+                    acc1 = _mm512_fmadd_ps(f_hi, vscale, acc1);
+                }
+
+                // Find max_abs for requantization
+                __m512 abs0 = _mm512_abs_ps(acc0);
+                __m512 abs1 = _mm512_abs_ps(acc1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
+
+                Q16_1Block &block_out = output[blk];
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64); // 32 int16 = 64 bytes
+                    continue;
+                }
+
+                // Compute scale and inverse (Q16_1 uses ±32767 range)
+                float out_scale = max_abs / 32767.0f;
+                float inv_scale = 32767.0f / max_abs;
+                block_out.d = out_scale;
+
+                // Quantize: round(sum * inv_scale), clamp to [-32767, 32767]
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(
+                    _mm512_mul_ps(acc0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(
+                    _mm512_mul_ps(acc1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                // Clamp to [-32767, 32767]
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(32767)),
+                                                    _mm512_set1_epi32(-32767));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(32767)),
+                                                    _mm512_set1_epi32(-32767));
+
+                // Pack int32 → int16 with saturation
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_out.qs), packed0);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_out.qs + 16), packed1);
+
+                // Compute sum_qs (sum of int32 before packing, fits in int32)
+                int32_t sum_qs = _mm512_reduce_add_epi32(clamped0) + _mm512_reduce_add_epi32(clamped1);
+                block_out.sum_qs = sum_qs;
+
+#elif defined(__AVX2__)
+                // AVX2: Process 8 elements at a time
+                __m256 acc_0 = _mm256_setzero_ps();
+                __m256 acc_1 = _mm256_setzero_ps();
+                __m256 acc_2 = _mm256_setzero_ps();
+                __m256 acc_3 = _mm256_setzero_ps();
+
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q16_1Block &block = inputs[i][blk];
+                    const float scale = block.d;
+                    __m256 scale_vec = _mm256_set1_ps(scale);
+
+                    for (int chunk = 0; chunk < 4; ++chunk)
+                    {
+                        // Load 8 int16 values
+                        __m128i q16 = _mm_loadu_si128(
+                            reinterpret_cast<const __m128i *>(block.qs + chunk * 8));
+                        // Convert int16 → int32 → float
+                        __m256i q32 = _mm256_cvtepi16_epi32(q16);
+                        __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(q32), scale_vec);
+
+                        switch (chunk)
+                        {
+                        case 0:
+                            acc_0 = _mm256_add_ps(acc_0, f);
+                            break;
+                        case 1:
+                            acc_1 = _mm256_add_ps(acc_1, f);
+                            break;
+                        case 2:
+                            acc_2 = _mm256_add_ps(acc_2, f);
+                            break;
+                        case 3:
+                            acc_3 = _mm256_add_ps(acc_3, f);
+                            break;
+                        }
+                    }
+                }
+
+                // Store to temp buffer
+                _mm256_store_ps(sum_vals, acc_0);
+                _mm256_store_ps(sum_vals + 8, acc_1);
+                _mm256_store_ps(sum_vals + 16, acc_2);
+                _mm256_store_ps(sum_vals + 24, acc_3);
+
+                // Find max_abs
+                __m256 sign_mask = _mm256_set1_ps(-0.0f);
+                __m256 abs0 = _mm256_andnot_ps(sign_mask, acc_0);
+                __m256 abs1 = _mm256_andnot_ps(sign_mask, acc_1);
+                __m256 abs2 = _mm256_andnot_ps(sign_mask, acc_2);
+                __m256 abs3 = _mm256_andnot_ps(sign_mask, acc_3);
+                __m256 vmax_01 = _mm256_max_ps(abs0, abs1);
+                __m256 vmax_23 = _mm256_max_ps(abs2, abs3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                Q16_1Block &block_out = output[blk];
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                float inv_scale = 32767.0f / max_abs;
+                block_out.d = out_scale;
+
+                int32_t sum_qs_val = 0;
+                for (int j = 0; j < 32; ++j)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(sum_vals[j] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_out.qs[j] = static_cast<int16_t>(q);
+                    sum_qs_val += q;
+                }
+                block_out.sum_qs = sum_qs_val;
+
+#else
+                // Scalar fallback
+                for (size_t i = 0; i < n_inputs; ++i)
+                {
+                    const Q16_1Block &block = inputs[i][blk];
+                    const float scale = block.d;
+                    for (int j = 0; j < 32; ++j)
+                    {
+                        sum_vals[j] += scale * static_cast<float>(block.qs[j]);
+                    }
+                }
+
+                float max_abs = 0.0f;
+                for (int j = 0; j < 32; ++j)
+                {
+                    max_abs = std::max(max_abs, std::abs(sum_vals[j]));
+                }
+
+                Q16_1Block &block_out = output[blk];
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                float inv_scale = 32767.0f / max_abs;
+                block_out.d = out_scale;
+
+                int32_t sum_qs_val = 0;
+                for (int j = 0; j < 32; ++j)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(sum_vals[j] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_out.qs[j] = static_cast<int16_t>(q);
+                    sum_qs_val += q;
+                }
+                block_out.sum_qs = sum_qs_val;
+#endif
+            }
+        }
+
         // ==================== Q16_1 Native Operations ====================
 
         /**

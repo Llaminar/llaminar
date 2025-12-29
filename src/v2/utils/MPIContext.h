@@ -119,6 +119,46 @@ namespace llaminar2
         }
 
         /**
+         * @brief All-reduce sum operation for Q16_1 blocks (in-place)
+         *
+         * Performs N-way reduction of Q16_1 quantized blocks across all MPI ranks.
+         * Uses allgather + vectorized local reduction with AVX512/AVX2 SIMD.
+         *
+         * Memory: Temporarily allocates n_blocks * world_size * sizeof(Q16_1Block) bytes.
+         *
+         * @param data Q16_1 block buffer (input and output)
+         * @param n_blocks Number of Q16_1 blocks per rank
+         */
+        void allreduce_q16_1_inplace(Q16_1Block *data, size_t n_blocks) const
+        {
+            if (world_size_ == 1)
+            {
+                return; // No reduction needed for single rank
+            }
+
+            const size_t block_bytes = sizeof(Q16_1Block); // 72 bytes (32*int16 + float + int32)
+            const size_t total_bytes = n_blocks * block_bytes;
+            const size_t gathered_blocks = n_blocks * world_size_;
+
+            // Allocate buffer for all ranks' contributions
+            std::vector<Q16_1Block> gathered(gathered_blocks);
+
+            // Allgather Q16_1 blocks from all ranks
+            MPI_Allgather(data, total_bytes, MPI_BYTE,
+                          gathered.data(), total_bytes, MPI_BYTE, comm_);
+
+            // Build pointer array for q16_1_sum_n
+            std::vector<const Q16_1Block *> inputs(world_size_);
+            for (int r = 0; r < world_size_; ++r)
+            {
+                inputs[r] = gathered.data() + r * n_blocks;
+            }
+
+            // Sum all contributions using AVX512/AVX2 vectorized reduction
+            simd::q16_1_sum_n(inputs.data(), world_size_, data, n_blocks);
+        }
+
+        /**
          * @brief All-reduce sum operation for FP16 elements (in-place)
          *
          * Performs N-way reduction of FP16 values across all MPI ranks without

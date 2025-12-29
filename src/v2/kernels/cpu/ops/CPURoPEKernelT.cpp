@@ -640,6 +640,76 @@ namespace llaminar2
         return true;
     }
 
+    // --- Q8_1 apply_q8_1_to_q16_1() (HybridQ16 mode) ---
+    bool CPURoPEKernelT<ActivationPrecision::Q8_1>::apply_q8_1_to_q16_1(
+        TensorBase *Q_in,
+        TensorBase *K_in,
+        TensorBase *Q_out,
+        TensorBase *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)mpi_ctx;
+        (void)device_idx;
+
+        // Validate Q inputs
+        if (!Q_in || Q_in->native_type() != TensorType::Q8_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_1: Q_in must be Q8_1Tensor");
+            return false;
+        }
+        if (!Q_out || Q_out->native_type() != TensorType::Q16_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_1: Q_out must be Q16_1Tensor");
+            return false;
+        }
+
+        auto *q_in_q8 = dynamic_cast<Q8_1Tensor *>(Q_in);
+        auto *q_out_q16 = dynamic_cast<Q16_1Tensor *>(Q_out);
+
+        const Q8_1Block *k_in_blocks = nullptr;
+        Q16_1Block *k_out_blocks = nullptr;
+
+        if (K_in && K_out)
+        {
+            if (K_in->native_type() != TensorType::Q8_1)
+            {
+                LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_1: K_in must be Q8_1Tensor");
+                return false;
+            }
+            if (K_out->native_type() != TensorType::Q16_1)
+            {
+                LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_1: K_out must be Q16_1Tensor");
+                return false;
+            }
+            auto *k_in_q8 = dynamic_cast<Q8_1Tensor *>(K_in);
+            auto *k_out_q16 = dynamic_cast<Q16_1Tensor *>(K_out);
+            k_in_blocks = k_in_q8->typed_data();
+            k_out_blocks = k_out_q16->mutable_typed_data();
+        }
+
+        // Call the primitive
+        primitives::apply_rope_q8_1_to_q16_1(
+            q_in_q8->typed_data(),
+            k_in_blocks,
+            q_out_q16->mutable_typed_data(),
+            k_out_blocks,
+            position_ids,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rope_theta);
+
+        return true;
+    }
+
     // ============================================================================
     // Q16_1 Specialization Implementation (High-Precision Integer)
     // ============================================================================
