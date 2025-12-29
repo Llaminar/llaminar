@@ -245,6 +245,14 @@ namespace llaminar2
         /// Optional buffer to capture attention context before Wo projection
         /// Shape: [batch_size * seq_len, n_heads * head_dim]
         TensorBase *context_snapshot = nullptr;
+
+        /// Optional buffer to capture attention output (Wo projection result, before residual add)
+        /// Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_OUTPUT
+        TensorBase *attention_output_snapshot = nullptr;
+
+        /// Optional buffer to capture attention residual (after residual add)
+        /// Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
+        TensorBase *attention_residual_snapshot = nullptr;
     };
 
     /**
@@ -607,6 +615,7 @@ namespace llaminar2
         void addFinalNormToGraph(
             ComputeGraph &graph,
             TensorBase *hidden,
+            TensorBase *normalized_out,
             const std::string &prev_node,
             int seq_len,
             int device_idx);

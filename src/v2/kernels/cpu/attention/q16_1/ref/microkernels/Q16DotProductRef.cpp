@@ -46,7 +46,7 @@ namespace llaminar2::kernels::q16_1::microkernels
             const Q16_1Block &q_block = Q_blocks[q_row * q_blocks_per_row + q_block_idx];
             const Q16_1Block &k_block = K_blocks[k_row * kv_blocks_per_row + k_block_idx];
 
-            // Block dot product
+            // Block dot product (int32 accumulator matches AVX512 VNNI behavior)
             int32_t block_dot = 0;
             int elems_in_block = std::min(BLOCK_SIZE, head_dim - b * BLOCK_SIZE);
 

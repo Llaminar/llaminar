@@ -52,8 +52,10 @@ namespace llaminar2
             q16_params.Bc = params.Bc;
             q16_params.Br = params.Br;
 
-            // Snapshot buffer (context only in Q16 reference)
+            // Snapshot buffers
             q16_params.context_snapshot = params.context_snapshot;
+            q16_params.attention_output_snapshot = params.wo_output_snapshot;
+            q16_params.attention_residual_snapshot = params.attention_residual_snapshot;
 
             return q16_params;
         }

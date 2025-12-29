@@ -181,7 +181,7 @@ namespace llaminar2::kernels::q16_1
         int head,
         int32_t *int32_accum,
         int32_t *weight_sum,
-        float *v_scale_product)
+        float *v_scales_out)
     {
         const int head_dim = params.head_dim;
         const int kv_len = params.kv_len;
@@ -198,7 +198,10 @@ namespace llaminar2::kernels::q16_1
         // Zero the accumulator
         std::memset(int32_accum, 0, head_dim * sizeof(int32_t));
         *weight_sum = 0;
-        *v_scale_product = 1.0f;
+        if (v_scales_out)
+        {
+            std::memset(v_scales_out, 0, head_dim * sizeof(float));
+        }
 
         // Determine effective KV length (causal masking)
         int kv_end = kv_len;
@@ -264,9 +267,9 @@ namespace llaminar2::kernels::q16_1
             fp32_weights[i] *= inv_sum;
         }
 
-        // Track weight sum as scaled INT16 for compatibility with downstream
-        // (32767 = max int16)
-        *weight_sum = 32767;
+        // Track weight sum in the same integer domain used for accumulation.
+        // This must reflect the actual integer weights used in P×V.
+        int64_t weight_sum_i64 = 0;
 
         // ════════════════════════════════════════════════════════════════════════
         // STEP 3: P×V → INT32 accumulators with proper scale tracking
@@ -280,11 +283,16 @@ namespace llaminar2::kernels::q16_1
         //   actual_value = int32_accum[d] / 32767 * avg_v_scale
         // ════════════════════════════════════════════════════════════════════════
 
-        // Track weighted V scale for later requantization
-        float weighted_v_scale_sum = 0.0f;
-        float total_weight = 0.0f;
+        // Track attention-weighted V scales.
+        // Q16_1 uses per-block scales, but reconstructing a single scale per block is
+        // still noticeably lossy for some layers; prefer per-element effective scales
+        // when numerically stable, and fall back to per-block scales otherwise.
+        const int blocks_per_head = (head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        std::vector<float> weighted_v_scale_sum(blocks_per_head, 0.0f);
+        std::vector<double> weighted_v_d_qs_sum(head_dim, 0.0);
 
         const int v_start_col = kv_head * head_dim;
+        const int v_start_block = v_start_col / BLOCK_SIZE;
 
         for (int kv_pos = 0; kv_pos < kv_end; ++kv_pos)
         {
@@ -296,6 +304,15 @@ namespace llaminar2::kernels::q16_1
             int32_t w_scaled = static_cast<int32_t>(w * 32767.0f + 0.5f);
             if (w_scaled == 0)
                 continue;
+
+            weight_sum_i64 += static_cast<int64_t>(w_scaled);
+
+            // Update per-block V scales once per KV position.
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                const Q16_1Block &v_block_for_scale = params.V[kv_pos * kv_blocks_per_row + (v_start_block + b)];
+                weighted_v_scale_sum[b] += static_cast<float>(w_scaled) * v_block_for_scale.d;
+            }
 
             // Accumulate weighted V values
             for (int d = 0; d < head_dim; ++d)
@@ -310,19 +327,52 @@ namespace llaminar2::kernels::q16_1
                 // INT32 × INT16 → INT32
                 int32_accum[d] += w_scaled * static_cast<int32_t>(v_val);
 
-                // Track V scale weighted by attention weight (first elem only)
-                if (d == 0)
-                {
-                    weighted_v_scale_sum += w * v_block.d;
-                    total_weight += w;
-                }
+                // Track Σ(w_scaled * v_block.d * v_val) for per-element effective scaling.
+                weighted_v_d_qs_sum[d] += static_cast<double>(w_scaled) *
+                                          static_cast<double>(v_block.d) *
+                                          static_cast<double>(v_val);
             }
         }
 
-        // Compute attention-weighted average V scale
-        if (total_weight > 1e-8f)
+        // Finalize weight sum and per-element V scales.
+        if (weight_sum_i64 <= 0)
         {
-            *v_scale_product = weighted_v_scale_sum / total_weight;
+            *weight_sum = 1;
+            if (v_scales_out)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    v_scales_out[d] = 1.0f;
+                }
+            }
+            return;
+        }
+
+        *weight_sum = static_cast<int32_t>(std::min<int64_t>(weight_sum_i64, static_cast<int64_t>(INT32_MAX)));
+        const float inv_weight_sum = 1.0f / static_cast<float>(weight_sum_i64);
+
+        if (v_scales_out)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                const float v_scale_eff = weighted_v_scale_sum[b] * inv_weight_sum;
+                const int start = b * BLOCK_SIZE;
+                const int end = std::min(start + BLOCK_SIZE, head_dim);
+                for (int d = start; d < end; ++d)
+                {
+                    const int32_t denom = int32_accum[d];
+                    if (denom != 0 && std::abs(denom) >= 256)
+                    {
+                        v_scales_out[d] = static_cast<float>(weighted_v_d_qs_sum[d] /
+                                                             static_cast<double>(denom));
+                    }
+                    else
+                    {
+                        // Fallback: stable per-block scale estimate.
+                        v_scales_out[d] = v_scale_eff;
+                    }
+                }
+            }
         }
     }
 
@@ -339,7 +389,7 @@ namespace llaminar2::kernels::q16_1
         int head,
         int32_t *int32_accum,
         int32_t *weight_sum,
-        float *v_scale_product)
+        float *v_scales_out)
     {
         const int head_dim = params.head_dim;
         const int kv_len = params.kv_len;
@@ -354,7 +404,10 @@ namespace llaminar2::kernels::q16_1
         // Zero the accumulator
         std::memset(int32_accum, 0, head_dim * sizeof(int32_t));
         *weight_sum = 0;
-        *v_scale_product = 1.0f;
+        if (v_scales_out)
+        {
+            std::memset(v_scales_out, 0, head_dim * sizeof(float));
+        }
 
         // Determine effective KV length (causal masking)
         int kv_end = kv_len;
@@ -401,6 +454,11 @@ namespace llaminar2::kernels::q16_1
             max_score = std::max(max_score, fp32_scores[i]);
         }
 
+        // Debug: dump scores for head 0, row 0
+        if (head == 0 && q_row == 0)
+        {
+            LOG_DEBUG("[Q16FusedAttentionRef] FA2 head0 row0 scores[0:3]: " << fp32_scores[0] << " " << (kv_end > 1 ? fp32_scores[1] : 0) << " " << (kv_end > 2 ? fp32_scores[2] : 0) << " max=" << max_score << " attention_scale=" << attention_scale);
+        }
         // Compute exp and sum
         std::vector<float> fp32_weights(kv_end);
         float exp_sum = 0.0f;
@@ -417,17 +475,23 @@ namespace llaminar2::kernels::q16_1
             fp32_weights[i] *= inv_sum;
         }
 
-        // Track weight sum as scaled INT16 for compatibility
-        *weight_sum = 32767;
+        // Track weight sum in the same integer domain used for accumulation.
+        int64_t weight_sum_i64 = 0;
 
         // ════════════════════════════════════════════════════════════════════════
         // STEP 3: P×V → INT32 accumulators
         // ════════════════════════════════════════════════════════════════════════
 
-        float weighted_v_scale_sum = 0.0f;
-        float total_weight = 0.0f;
+        // Track effective V scale per element.
+        // This can become unstable when the signed denominator Σ(w_scaled * v_qs) is near zero
+        // (cancellation between positive/negative int16 values). In that case, fall back to a
+        // stable per-block scale estimate.
+        const int blocks_per_head = (head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        std::vector<float> weighted_v_scale_sum(blocks_per_head, 0.0f);
+        std::vector<double> weighted_v_d_qs_sum(head_dim, 0.0);
 
         const int v_start_col = kv_head * head_dim;
+        const int v_start_block = v_start_col / BLOCK_SIZE;
 
         for (int kv_pos = 0; kv_pos < kv_end; ++kv_pos)
         {
@@ -439,6 +503,15 @@ namespace llaminar2::kernels::q16_1
             int32_t w_scaled = static_cast<int32_t>(w * 32767.0f + 0.5f);
             if (w_scaled == 0)
                 continue;
+
+            weight_sum_i64 += static_cast<int64_t>(w_scaled);
+
+            // Update per-block V scales once per KV position.
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                const Q16_1Block &v_block_for_scale = params.V[kv_pos * kv_blocks_per_row + (v_start_block + b)];
+                weighted_v_scale_sum[b] += static_cast<float>(w_scaled) * v_block_for_scale.d;
+            }
 
             for (int d = 0; d < head_dim; ++d)
             {
@@ -452,17 +525,49 @@ namespace llaminar2::kernels::q16_1
                 // INT32 × INT16 → INT32
                 int32_accum[d] += w_scaled * static_cast<int32_t>(v_val);
 
-                if (d == 0)
-                {
-                    weighted_v_scale_sum += w * v_block.d;
-                    total_weight += w;
-                }
+                // Track Σ(w_scaled * v_block.d * v_val) for per-element effective scaling.
+                weighted_v_d_qs_sum[d] += static_cast<double>(w_scaled) *
+                                          static_cast<double>(v_block.d) *
+                                          static_cast<double>(v_val);
             }
         }
 
-        if (total_weight > 1e-8f)
+        if (weight_sum_i64 <= 0)
         {
-            *v_scale_product = weighted_v_scale_sum / total_weight;
+            *weight_sum = 1;
+            if (v_scales_out)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    v_scales_out[d] = 1.0f;
+                }
+            }
+            return;
+        }
+
+        *weight_sum = static_cast<int32_t>(std::min<int64_t>(weight_sum_i64, static_cast<int64_t>(INT32_MAX)));
+        const float inv_weight_sum = 1.0f / static_cast<float>(weight_sum_i64);
+        if (v_scales_out)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                const float v_scale_eff = weighted_v_scale_sum[b] * inv_weight_sum;
+                const int start = b * BLOCK_SIZE;
+                const int end = std::min(start + BLOCK_SIZE, head_dim);
+                for (int d = start; d < end; ++d)
+                {
+                    const int32_t denom = int32_accum[d];
+                    if (denom != 0 && std::abs(denom) >= 256)
+                    {
+                        v_scales_out[d] = static_cast<float>(weighted_v_d_qs_sum[d] /
+                                                             static_cast<double>(denom));
+                    }
+                    else
+                    {
+                        v_scales_out[d] = v_scale_eff;
+                    }
+                }
+            }
         }
     }
 
@@ -502,36 +607,20 @@ namespace llaminar2::kernels::q16_1
         // ════════════════════════════════════════════════════════════════════════
 
         std::vector<int32_t> int32_context(input_dim, 0);
-        int32_t total_weight_sum = 0;
-        float total_v_scale = 0.0f;
-        int heads_processed = 0;
+        std::vector<int32_t> head_weight_sums(num_heads, 1);
+        std::vector<float> context_v_scales(input_dim, 1.0f);
 
         for (int h = 0; h < num_heads; ++h)
         {
             int32_t *head_accum = int32_context.data() + h * head_dim;
             int32_t head_weight_sum = 0;
-            float head_v_scale = 1.0f;
+            float *head_v_scales = context_v_scales.data() + h * head_dim;
 
             flash_decode_attention_head_fp32_scores(
-                params, h, head_accum, &head_weight_sum, &head_v_scale);
+                params, h, head_accum, &head_weight_sum, head_v_scales);
 
-            if (head_weight_sum > 0)
-            {
-                total_weight_sum += head_weight_sum;
-                total_v_scale += head_v_scale;
-                heads_processed++;
-            }
+            head_weight_sums[h] = (head_weight_sum > 0) ? head_weight_sum : 1;
         }
-
-        // Average the scale info across heads
-        if (heads_processed > 0)
-        {
-            total_v_scale /= heads_processed;
-            // Use per-head average weight sum for normalization
-            total_weight_sum = total_weight_sum / heads_processed;
-        }
-        if (total_weight_sum == 0)
-            total_weight_sum = 1;
 
         // ════════════════════════════════════════════════════════════════════════
         // SNAPSHOT: Capture attention context (INT32 → FP32 for debugging)
@@ -547,18 +636,18 @@ namespace llaminar2::kernels::q16_1
             // Convert INT32 context to FP32 for snapshot
             // The INT32 values need to be scaled by weight_sum and v_scale to get FP32 equivalents
             float *ctx_out = params.context_snapshot;
-            const float inv_weight_sum = 1.0f / static_cast<float>(total_weight_sum);
-
-            for (int d = 0; d < input_dim; ++d)
+            for (int h = 0; h < num_heads; ++h)
             {
-                // INT32 accumulator / weight_sum * v_scale → approximate FP32 context value
-                float val = static_cast<float>(int32_context[d]) * inv_weight_sum * total_v_scale;
-                ctx_out[d] = val;
+                const float inv_weight_sum = 1.0f / static_cast<float>(head_weight_sums[h]);
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    int idx = h * head_dim + d;
+                    ctx_out[idx] = static_cast<float>(int32_context[idx]) * inv_weight_sum * context_v_scales[idx];
+                }
             }
 
             LOG_DEBUG("[Q16FusedAttention DECODE] Captured context snapshot: "
-                      << input_dim << " elements, weight_sum=" << total_weight_sum
-                      << ", v_scale=" << total_v_scale);
+                      << input_dim << " elements");
         }
 
         // ════════════════════════════════════════════════════════════════════════
@@ -571,8 +660,10 @@ namespace llaminar2::kernels::q16_1
         // Create IntegerContext for Wo projection
         IntegerContext context;
         context.int32_data = int32_context.data();
-        context.weight_sum = total_weight_sum;
-        context.v_scale_product = total_v_scale;
+        context.weight_sums = head_weight_sums.data();
+        context.v_scales = context_v_scales.data();
+        context.num_heads = num_heads;
+        context.head_dim = head_dim;
         context.count = input_dim;
 
         // Create output structure
@@ -591,6 +682,27 @@ namespace llaminar2::kernels::q16_1
         wo_projection_vpdpwssd_to_q16_1_gemv(wo_params, context, projection_out);
 
         // ════════════════════════════════════════════════════════════════════════
+        // SNAPSHOT: Capture attention output (Wo projection result, before residual)
+        // ════════════════════════════════════════════════════════════════════════
+
+        if (params.attention_output_snapshot)
+        {
+            // Dequantize Q16_1 projection output to FP32 for snapshot
+            float *out_snapshot = params.attention_output_snapshot;
+            for (int b = 0; b < output_blocks; ++b)
+            {
+                const Q16_1Block &block = projection_q16[b];
+                const int start = b * Q16_1Block::BLOCK_SIZE;
+                const int end = std::min(start + static_cast<int>(Q16_1Block::BLOCK_SIZE), d_model);
+                for (int i = start; i < end; ++i)
+                {
+                    out_snapshot[i] = block.d * static_cast<float>(block.qs[i - start]);
+                }
+            }
+            LOG_DEBUG("[Q16FusedAttention DECODE] Captured attention_output snapshot: " << d_model << " elements");
+        }
+
+        // ════════════════════════════════════════════════════════════════════════
         // STEP 5: Native Q16_1 Residual Add (ALL INTEGER: Q16_1 + Q16_1 → Q16_1)
         // ════════════════════════════════════════════════════════════════════════
 
@@ -607,6 +719,27 @@ namespace llaminar2::kernels::q16_1
             projection_out.blocks, // Projection to add
             params.residual_out,   // Output (same as residual for in-place)
             d_model);
+
+        // ════════════════════════════════════════════════════════════════════════
+        // SNAPSHOT: Capture attention residual (final output after residual add)
+        // ════════════════════════════════════════════════════════════════════════
+
+        if (params.attention_residual_snapshot)
+        {
+            // Dequantize Q16_1 residual output to FP32 for snapshot
+            float *res_snapshot = params.attention_residual_snapshot;
+            for (int b = 0; b < output_blocks; ++b)
+            {
+                const Q16_1Block &block = params.residual_out[b];
+                const int start = b * Q16_1Block::BLOCK_SIZE;
+                const int end = std::min(start + static_cast<int>(Q16_1Block::BLOCK_SIZE), d_model);
+                for (int i = start; i < end; ++i)
+                {
+                    res_snapshot[i] = block.d * static_cast<float>(block.qs[i - start]);
+                }
+            }
+            LOG_DEBUG("[Q16FusedAttention DECODE] Captured attention_residual snapshot: " << d_model << " elements");
+        }
 
         return true;
     }
@@ -653,34 +786,20 @@ namespace llaminar2::kernels::q16_1
             // ════════════════════════════════════════════════════════════════════
 
             std::vector<int32_t> int32_context(input_dim, 0);
-            int32_t total_weight_sum = 0;
-            float total_v_scale = 0.0f;
-            int heads_processed = 0;
+            std::vector<int32_t> head_weight_sums(num_heads, 1);
+            std::vector<float> context_v_scales(input_dim, 1.0f);
 
             for (int h = 0; h < num_heads; ++h)
             {
                 int32_t *head_accum = int32_context.data() + h * head_dim;
                 int32_t head_weight_sum = 0;
-                float head_v_scale = 1.0f;
+                float *head_v_scales = context_v_scales.data() + h * head_dim;
 
                 fa2_prefill_attention_row_fp32_scores(
-                    params, q, h, head_accum, &head_weight_sum, &head_v_scale);
+                    params, q, h, head_accum, &head_weight_sum, head_v_scales);
 
-                if (head_weight_sum > 0)
-                {
-                    total_weight_sum += head_weight_sum;
-                    total_v_scale += head_v_scale;
-                    heads_processed++;
-                }
+                head_weight_sums[h] = (head_weight_sum > 0) ? head_weight_sum : 1;
             }
-
-            if (heads_processed > 0)
-            {
-                total_v_scale /= heads_processed;
-                total_weight_sum = total_weight_sum / heads_processed;
-            }
-            if (total_weight_sum == 0)
-                total_weight_sum = 1;
 
             // ════════════════════════════════════════════════════════════════════
             // SNAPSHOT: Capture attention context for this query position
@@ -699,12 +818,14 @@ namespace llaminar2::kernels::q16_1
                 // Convert INT32 context to FP32 for snapshot
                 // Output layout: [seq_len_q × input_dim] where input_dim = num_heads × head_dim
                 float *ctx_row = params.context_snapshot + q * input_dim;
-                const float inv_weight_sum = 1.0f / static_cast<float>(total_weight_sum);
-
-                for (int d = 0; d < input_dim; ++d)
+                for (int h = 0; h < num_heads; ++h)
                 {
-                    float val = static_cast<float>(int32_context[d]) * inv_weight_sum * total_v_scale;
-                    ctx_row[d] = val;
+                    const float inv_weight_sum = 1.0f / static_cast<float>(head_weight_sums[h]);
+                    for (int d = 0; d < head_dim; ++d)
+                    {
+                        int idx = h * head_dim + d;
+                        ctx_row[idx] = static_cast<float>(int32_context[idx]) * inv_weight_sum * context_v_scales[idx];
+                    }
                 }
 
                 if (q == 0)
@@ -722,8 +843,10 @@ namespace llaminar2::kernels::q16_1
 
             IntegerContext context;
             context.int32_data = int32_context.data();
-            context.weight_sum = total_weight_sum;
-            context.v_scale_product = total_v_scale;
+            context.weight_sums = head_weight_sums.data();
+            context.v_scales = context_v_scales.data();
+            context.num_heads = num_heads;
+            context.head_dim = head_dim;
             context.count = input_dim;
 
             Q16_1Projection projection_out;
@@ -737,6 +860,31 @@ namespace llaminar2::kernels::q16_1
             wo_params.bias = nullptr;
 
             wo_projection_vpdpwssd_to_q16_1_gemv(wo_params, context, projection_out);
+
+            // ════════════════════════════════════════════════════════════════════
+            // SNAPSHOT: Capture attention output (Wo projection, before residual) for this position
+            // ════════════════════════════════════════════════════════════════════
+
+            if (params.attention_output_snapshot)
+            {
+                // Output layout: [seq_len_q × d_model]
+                float *out_row = params.attention_output_snapshot + q * d_model;
+                for (int b = 0; b < output_blocks; ++b)
+                {
+                    const Q16_1Block &block = projection_q16[b];
+                    const int start = b * Q16_1Block::BLOCK_SIZE;
+                    const int end = std::min(start + static_cast<int>(Q16_1Block::BLOCK_SIZE), d_model);
+                    for (int i = start; i < end; ++i)
+                    {
+                        out_row[i] = block.d * static_cast<float>(block.qs[i - start]);
+                    }
+                }
+                if (q == 0)
+                {
+                    LOG_DEBUG("[Q16FusedAttention PREFILL] Capturing attention_output snapshot for "
+                              << seq_len_q << " positions, d_model=" << d_model);
+                }
+            }
 
             // ════════════════════════════════════════════════════════════════════
             // STEP 5: Native Q16_1 Residual Add (ALL INTEGER)
@@ -758,6 +906,31 @@ namespace llaminar2::kernels::q16_1
                 projection_out.blocks,
                 residual_out_row,
                 d_model);
+
+            // ════════════════════════════════════════════════════════════════════
+            // SNAPSHOT: Capture attention residual (final output) for this position
+            // ════════════════════════════════════════════════════════════════════
+
+            if (params.attention_residual_snapshot)
+            {
+                // Output layout: [seq_len_q × d_model]
+                float *res_row = params.attention_residual_snapshot + q * d_model;
+                for (int b = 0; b < output_blocks; ++b)
+                {
+                    const Q16_1Block &block = residual_out_row[b];
+                    const int start = b * Q16_1Block::BLOCK_SIZE;
+                    const int end = std::min(start + static_cast<int>(Q16_1Block::BLOCK_SIZE), d_model);
+                    for (int i = start; i < end; ++i)
+                    {
+                        res_row[i] = block.d * static_cast<float>(block.qs[i - start]);
+                    }
+                }
+                if (q == 0)
+                {
+                    LOG_DEBUG("[Q16FusedAttention PREFILL] Capturing attention_residual snapshot for "
+                              << seq_len_q << " positions, d_model=" << d_model);
+                }
+            }
         }
 
         return true;

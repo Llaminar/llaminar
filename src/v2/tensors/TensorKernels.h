@@ -1758,6 +1758,15 @@ namespace llaminar2
          */
         float *wo_output_snapshot = nullptr;
 
+        /**
+         * @brief Optional FP32 buffer for attention residual output snapshot
+         *
+         * If non-null, the final output (after residual add) will be
+         * dequantized to FP32 and stored here [seq_len_q × d_model].
+         * Corresponds to ATTENTION_RESIDUAL in the FP32 pipeline.
+         */
+        float *attention_residual_snapshot = nullptr;
+
         // ============== Helper methods ==============
 
         /**

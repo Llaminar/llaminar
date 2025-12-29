@@ -51,7 +51,7 @@ See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-s
 ### Build Commands
 
 ```bash
-# Debug build (for development)
+# Debug build (for development and "V2_Unit*" unit tests)
 cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build build_v2 --parallel
 
@@ -59,11 +59,11 @@ cmake --build build_v2 --parallel
 cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
 
-# Integration build (for integration tests with snapshots + debug symbols)
+# Integration build (for "V2_Integration*" integration tests with snapshots + debug symbols)
 cmake -B build_v2_integration -S src/v2 -DCMAKE_BUILD_TYPE=Integration
 cmake --build build_v2_integration --parallel
 
-# E2E Release build (for parity testing with snapshots)
+# E2E Release build (for "V2_E2E*" Llaminar vs Pytorch parity testing)
 cmake -B build_v2_e2e_release -S src/v2 -DCMAKE_BUILD_TYPE=E2ERelease
 cmake --build build_v2_e2e_release --parallel
 ```
@@ -200,13 +200,13 @@ LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.ggu
 ### Running Tests
 
 ```bash
-# Unit tests (fast)
+# Unit tests
 ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
-# Integration tests (require models, use Integration build for snapshots + backtraces)
+# Integration tests (uses real model data, use Integration build for snapshots + backtraces)
 ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure
 
-# E2E parity tests (require snapshot build)
+# E2E parity tests that test Llaminar vs Pytorch
 ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
 
 # Performance benchmarks

@@ -367,9 +367,8 @@ protected:
         {
             // Per-query INT32 accumulator for full context (all heads concatenated)
             std::vector<int32_t> int32_context(input_dim, 0);
-            float total_v_scale_product = 0.0f;
-            int32_t total_weight_sum = 0;
-            int heads_processed = 0;
+            std::vector<int32_t> head_weight_sums(num_heads, 1);
+            std::vector<float> v_scales(input_dim, 1.0f);
 
             for (int h = 0; h < num_heads; ++h)
             {
@@ -455,19 +454,12 @@ protected:
                     }
                 }
 
-                total_v_scale_product += v_scale_product;
-                total_weight_sum += weight_sum;
-                heads_processed++;
+                head_weight_sums[h] = (weight_sum == 0) ? 1 : weight_sum;
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    v_scales[h * head_dim + d] = v_scale_product;
+                }
             }
-
-            // Average scale info across heads
-            if (heads_processed > 0)
-            {
-                total_v_scale_product /= heads_processed;
-                total_weight_sum /= heads_processed;
-            }
-            if (total_weight_sum == 0)
-                total_weight_sum = 1;
 
             // ════════════════════════════════════════════════════════════════
             // STEP 4: VPDPWSSD Wo Projection → Q16_1 output
@@ -476,8 +468,10 @@ protected:
             // Create IntegerContext from accumulated INT32 values
             IntegerContext context;
             context.int32_data = int32_context.data();
-            context.weight_sum = total_weight_sum;
-            context.v_scale_product = total_v_scale_product;
+            context.weight_sums = head_weight_sums.data();
+            context.v_scales = v_scales.data();
+            context.num_heads = num_heads;
+            context.head_dim = head_dim;
             context.count = input_dim;
 
             // Create output structure

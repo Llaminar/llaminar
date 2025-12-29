@@ -282,6 +282,13 @@ namespace llaminar2
             const Q8_1Block *v_q8_data = v_q8->typed_data();
             Q16_1Block *v_q16_data = v_q16_slice->mutable_typed_data();
 
+            // Debug: Log Q8_1 V scale before conversion
+            if (params_.layer_idx == 0)
+            {
+                LOG_DEBUG("[KVCacheAppendStage] Layer 0 V Q8_1 scale: d=" << simd::fp16_to_fp32(v_q8_data[0].d)
+                                                                          << " qs[0]=" << static_cast<int>(v_q8_data[0].qs[0]));
+            }
+
             // Parallel conversion using OMP_WORKSHARE_REGION
             auto do_conversion = [&]()
             {

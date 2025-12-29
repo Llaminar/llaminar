@@ -128,16 +128,45 @@ namespace llaminar2
             // Extract typed data from tensors - Q16 kernel expects Q16_1Block* for Q/K/V
             // Use dynamic_cast + typed_data() for type-safe extraction
             auto *q_q16 = dynamic_cast<Q16_1Tensor *>(params_.Q);
-            auto *k_q16 = dynamic_cast<Q16_1Tensor *>(params_.K);
-            auto *v_q16 = dynamic_cast<Q16_1Tensor *>(params_.V);
+
+            // For Q16_INTEGER backend (HybridQ16 mode), fetch K/V from KV cache at runtime
+            // The KV cache stores Q16_1 data (K from RoPE, V converted from Q8_1)
+            // This is necessary because:
+            // - During prefill: params_.K/V are Q8_1 from QKV GEMM, but cache has Q16_1
+            // - During decode: params_.K/V point to current token, cache has full context
+            TensorBase *k_tensor = params_.K;
+            TensorBase *v_tensor = params_.V;
+            if (params_.kv_cache && params_.layer_idx >= 0)
+            {
+                // Always use cache for Q16_INTEGER - cache has properly typed Q16_1 tensors
+                k_tensor = params_.kv_cache->get_k_base(params_.layer_idx, 0);
+                v_tensor = params_.kv_cache->get_v_base(params_.layer_idx, 0);
+                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER using KV cache: K="
+                          << (k_tensor ? k_tensor->dtype_name() : "null")
+                          << " V=" << (v_tensor ? v_tensor->dtype_name() : "null"));
+            }
+
+            auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_tensor);
+            auto *v_q16 = dynamic_cast<Q16_1Tensor *>(v_tensor);
 
             if (!q_q16 || !k_q16 || !v_q16)
             {
                 LOG_ERROR("[FusedAttentionWoStage] Q16_INTEGER backend requires Q16_1 tensors for Q/K/V, got: "
                           << "Q=" << (params_.Q ? params_.Q->dtype_name() : "null") << ", "
-                          << "K=" << (params_.K ? params_.K->dtype_name() : "null") << ", "
-                          << "V=" << (params_.V ? params_.V->dtype_name() : "null"));
+                          << "K=" << (k_tensor ? k_tensor->dtype_name() : "null") << ", "
+                          << "V=" << (v_tensor ? v_tensor->dtype_name() : "null"));
                 return false;
+            }
+
+            // Debug: Check Q/K/V scale factors for first few blocks
+            if (params_.layer_idx == 0)
+            {
+                LOG_DEBUG("[FusedAttentionWoStage] Layer 0 Q16_1 scales: Q[0].d=" << q_q16->typed_data()[0].d
+                                                                                  << " K[0].d=" << k_q16->typed_data()[0].d
+                                                                                  << " V[0].d=" << v_q16->typed_data()[0].d);
+                LOG_DEBUG("[FusedAttentionWoStage] Layer 0 Q16_1 first qs: Q[0].qs[0]=" << q_q16->typed_data()[0].qs[0]
+                                                                                        << " K[0].qs[0]=" << k_q16->typed_data()[0].qs[0]
+                                                                                        << " V[0].qs[0]=" << v_q16->typed_data()[0].qs[0]);
             }
 
             q16_params.Q = q_q16->typed_data();
@@ -201,6 +230,8 @@ namespace llaminar2
             // Snapshot buffers - FAIL FAST if snapshot capture is enabled but buffer is wrong type
             q16_params.scores_snapshot = nullptr;
             q16_params.context_snapshot = nullptr;
+            q16_params.wo_output_snapshot = nullptr;
+            q16_params.attention_residual_snapshot = nullptr;
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
             if (params_.context_snapshot)
             {
@@ -211,6 +242,26 @@ namespace llaminar2
                 q16_params.context_snapshot = ctx_fp32->mutable_data();
                 LOG_TRACE("[FusedAttentionWoStage] Q16_INTEGER: context_snapshot buffer set, ptr="
                           << q16_params.context_snapshot);
+            }
+            if (params_.attention_output_snapshot)
+            {
+                auto *out_fp32 = dynamic_cast<FP32Tensor *>(params_.attention_output_snapshot);
+                LLAMINAR_ASSERT_CAST(out_fp32, "FP32Tensor",
+                                     "attention_output_snapshot (got " +
+                                         std::string(params_.attention_output_snapshot->dtype_name()) + ")");
+                q16_params.wo_output_snapshot = out_fp32->mutable_data();
+                LOG_TRACE("[FusedAttentionWoStage] Q16_INTEGER: wo_output_snapshot (attention_output) buffer set, ptr="
+                          << q16_params.wo_output_snapshot);
+            }
+            if (params_.attention_residual_snapshot)
+            {
+                auto *res_fp32 = dynamic_cast<FP32Tensor *>(params_.attention_residual_snapshot);
+                LLAMINAR_ASSERT_CAST(res_fp32, "FP32Tensor",
+                                     "attention_residual_snapshot (got " +
+                                         std::string(params_.attention_residual_snapshot->dtype_name()) + ")");
+                q16_params.attention_residual_snapshot = res_fp32->mutable_data();
+                LOG_TRACE("[FusedAttentionWoStage] Q16_INTEGER: attention_residual_snapshot buffer set, ptr="
+                          << q16_params.attention_residual_snapshot);
             }
 #endif
 
@@ -278,6 +329,7 @@ namespace llaminar2
         StageDumpInfo info;
 
         // Context snapshot: pre-Wo attention output (for debugging/parity testing)
+        // This is ATTENTION_CONTEXT in pipeline terminology
         if (params_.context_snapshot)
         {
             const float *ctx_data = getSafeFp32Data(params_.context_snapshot);
@@ -299,7 +351,47 @@ namespace llaminar2
             LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] context_snapshot is NULL");
         }
 
-        // Output: fused attention+Wo projection result
+        // Attention output snapshot: Wo projection result (before residual add)
+        // This is ATTENTION_OUTPUT in pipeline terminology
+        if (params_.attention_output_snapshot)
+        {
+            const float *out_snap_data = getSafeFp32Data(params_.attention_output_snapshot);
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] attention_output_snapshot tensor type: "
+                      << static_cast<int>(params_.attention_output_snapshot->native_type())
+                      << " data=" << (out_snap_data ? "valid" : "NULL")
+                      << " seq_len=" << params_.seq_len
+                      << " d_model=" << params_.d_model);
+            if (out_snap_data)
+            {
+                info.addOutput("attention_output",
+                               out_snap_data,
+                               params_.seq_len,
+                               params_.d_model);
+            }
+        }
+
+        // Attention residual snapshot: after residual add (final attention block output)
+        // This is ATTENTION_RESIDUAL in pipeline terminology
+        if (params_.attention_residual_snapshot)
+        {
+            const float *res_snap_data = getSafeFp32Data(params_.attention_residual_snapshot);
+            LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] attention_residual_snapshot tensor type: "
+                      << static_cast<int>(params_.attention_residual_snapshot->native_type())
+                      << " data=" << (res_snap_data ? "valid" : "NULL")
+                      << " seq_len=" << params_.seq_len
+                      << " d_model=" << params_.d_model);
+            if (res_snap_data)
+            {
+                info.addOutput("attention_residual",
+                               res_snap_data,
+                               params_.seq_len,
+                               params_.d_model);
+            }
+        }
+
+        // Output: fused attention+Wo projection result (primary output tensor)
+        // Note: For HybridQ16 with fuse_residual_add, this IS the residual (Q16_1)
+        // but we can't expose raw data here - use snapshots instead
         if (params_.output)
         {
             const float *out_data = getSafeFp32Data(params_.output);

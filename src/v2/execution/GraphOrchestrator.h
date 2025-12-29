@@ -144,6 +144,14 @@ namespace llaminar2
         /// Allocated when ENABLE_PIPELINE_SNAPSHOTS is defined
         std::shared_ptr<TensorBase> context_snapshot;
 
+        /// Optional buffer to capture attention output (Wo projection, before residual)
+        /// Shape: [batch_size * max_seq_len, d_model] - corresponds to ATTENTION_OUTPUT
+        std::shared_ptr<TensorBase> attention_output_snapshot;
+
+        /// Optional buffer to capture attention residual (after residual add)
+        /// Shape: [batch_size * max_seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
+        std::shared_ptr<TensorBase> attention_residual_snapshot;
+
         // === Configuration ===
         int batch_size = 0;
         int max_seq_len = 0;
@@ -762,50 +770,61 @@ namespace llaminar2
                         return;
                     }
 
-                    // Handle fused attention+Wo stage - captures ATTENTION_CONTEXT and ATTENTION_OUTPUT
-                    // The fused stage outputs are ordered: context (pre-Wo), output (post-Wo)
+                    // Handle fused attention+Wo stage - captures ATTENTION_CONTEXT, ATTENTION_OUTPUT, and ATTENTION_RESIDUAL
+                    // FusedAttentionWoStage::getDumpInfo() outputs are named (in order):
+                    //   "context" (ATTENTION_CONTEXT) - pre-Wo attention output
+                    //   "attention_output" (ATTENTION_OUTPUT) - post-Wo projection, before residual add
+                    //   "attention_residual" (ATTENTION_RESIDUAL) - after residual add
+                    //   "output" - primary output tensor (may be Q16_1 for HybridQ16)
+                    // The outputs vector preserves this order for non-null snapshots.
                     if (name.find("_fused_attn_wo") != std::string::npos)
                     {
                         size_t pos = name.find("_fused_attn_wo");
                         std::string prefix = name.substr(0, pos);
 
-                        // FusedAttentionWoStage outputs:
-                        // [0] = context (pre-Wo attention context) - if snapshot buffer provided
-                        // [1] = output (post-Wo projection result)
-                        // OR (if no snapshot buffer):
-                        // [0] = output (post-Wo projection result)
-
-                        bool has_context = (dump.outputs.size() >= 2);
-                        size_t context_idx = has_context ? 0 : SIZE_MAX;
-                        size_t output_idx = has_context ? 1 : 0;
                         LOG_TRACE("[Snapshot] fused_attn_wo handler: prefix=" << prefix
-                                                                              << " has_context=" << has_context
-                                                                              << " context_idx=" << context_idx
-                                                                              << " output_idx=" << output_idx
-                                                                              << " dump.outputs.size()=" << dump.outputs.size()
-                                                                              << " out[0].data=" << (dump.outputs.size() > 0 ? dump.outputs[0].data : nullptr)
-                                                                              << " out[1].data=" << (dump.outputs.size() > 1 ? dump.outputs[1].data : nullptr));
+                                                                              << " dump.outputs.size()=" << dump.outputs.size());
 
-                        // Store ATTENTION_CONTEXT (pre-Wo) if available
-                        if (has_context && dump.outputs[context_idx].data)
+                        // Iterate through outputs and map by name to snapshot keys
+                        for (size_t i = 0; i < dump.outputs.size(); ++i)
                         {
-                            const auto &out = dump.outputs[context_idx];
+                            const auto &out = dump.outputs[i];
+                            if (!out.data || !out.name)
+                                continue;
+
+                            std::string key;
+                            std::string out_name(out.name);
+
+                            // Match by name from StageDumpInfo::OutputBuffer
+                            if (out_name == "context")
+                            {
+                                key = prefix + "_ATTENTION_CONTEXT";
+                            }
+                            else if (out_name == "attention_output")
+                            {
+                                key = prefix + "_ATTENTION_OUTPUT";
+                            }
+                            else if (out_name == "attention_residual")
+                            {
+                                key = prefix + "_ATTENTION_RESIDUAL";
+                            }
+                            else if (out_name == "output")
+                            {
+                                // Skip primary output - it's handled by residual stage or is Q16_1
+                                continue;
+                            }
+                            else
+                            {
+                                LOG_WARN("[Snapshot] fused_attn_wo unknown output name: " << out_name);
+                                continue;
+                            }
+
                             size_t count = out.rows * out.cols;
-                            LOG_TRACE("[Snapshot] Storing ATTENTION_CONTEXT: " << prefix << " rows=" << out.rows << " cols=" << out.cols << " count=" << count);
+                            LOG_TRACE("[Snapshot] Storing " << key << ": rows=" << out.rows
+                                                            << " cols=" << out.cols << " count=" << count);
                             std::vector<float> data(count);
                             std::memcpy(data.data(), out.data, count * sizeof(float));
-                            snapshots_[prefix + "_ATTENTION_CONTEXT"] = std::move(data);
-                        }
-
-                        // Store ATTENTION_OUTPUT (post-Wo)
-                        if (output_idx < dump.outputs.size() && dump.outputs[output_idx].data)
-                        {
-                            const auto &out = dump.outputs[output_idx];
-                            size_t count = out.rows * out.cols;
-                            LOG_TRACE("[Snapshot] Storing ATTENTION_OUTPUT: " << prefix << " rows=" << out.rows << " cols=" << out.cols << " count=" << count);
-                            std::vector<float> data(count);
-                            std::memcpy(data.data(), out.data, count * sizeof(float));
-                            snapshots_[prefix + "_ATTENTION_OUTPUT"] = std::move(data);
+                            snapshots_[key] = std::move(data);
                         }
                         return;
                     }

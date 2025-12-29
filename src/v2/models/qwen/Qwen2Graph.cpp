@@ -285,7 +285,19 @@ namespace llaminar2
         // -------------------------------------------------------------------------
         // Stage 3: Final RMSNorm
         // -------------------------------------------------------------------------
-        addFinalNormToGraph(graph, buffers_.current_hidden, prev_node, total_tokens, device_idx);
+        // IMPORTANT:
+        // - In HybridQ16, the live activation stream is Q16_1 in buffers_.layer_buffers.residual.
+        // - Our Q16_1 RMSNorm kernel is Q16_1 input -> FP32 output.
+        // Therefore final_norm must:
+        //   1) read from the correct activation stream (residual for HybridQ16)
+        //   2) write out-of-place into the FP32 normalized buffer
+        InferenceMode final_norm_mode(config_.activation_precision);
+        TensorBase *final_norm_input = (final_norm_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                                           ? buffers_.layer_buffers.residual
+                                           : buffers_.current_hidden;
+
+        addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
+                            prev_node, total_tokens, device_idx);
         prev_node = "final_norm";
 
         // -------------------------------------------------------------------------
@@ -306,7 +318,8 @@ namespace llaminar2
                   << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
         LMHeadStage::Params lm_params;
-        lm_params.hidden_states = buffers_.current_hidden;
+        // Feed LM head from the final RMSNorm output (FP32).
+        lm_params.hidden_states = buffers_.layer_buffers.normalized;
         lm_params.lm_head_weight = weights_.lm_head;
         lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
@@ -1070,8 +1083,15 @@ namespace llaminar2
 
                 // Optional context snapshot for debugging (enabled via buffer allocation)
                 fused_params.context_snapshot = buffers.context_snapshot;
+                // Optional attention output/residual snapshots for HybridQ16 debugging
+                fused_params.attention_output_snapshot = buffers.attention_output_snapshot;
+                fused_params.attention_residual_snapshot = buffers.attention_residual_snapshot;
                 LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " fused_attn_wo context_snapshot="
                                                 << (buffers.context_snapshot ? "allocated" : "NULL")
+                                                << " attention_output_snapshot="
+                                                << (buffers.attention_output_snapshot ? "allocated" : "NULL")
+                                                << " attention_residual_snapshot="
+                                                << (buffers.attention_residual_snapshot ? "allocated" : "NULL")
                                                 << " use_hybrid_wo=" << fused_params.use_hybrid_wo
                                                 << " fuse_residual_add=" << fused_params.fuse_residual_add);
 
@@ -1515,13 +1535,14 @@ namespace llaminar2
     void Qwen2Graph::addFinalNormToGraph(
         ComputeGraph &graph,
         TensorBase *hidden,
+        TensorBase *normalized_out,
         const std::string &prev_node,
         int n_tokens,
         int device_idx)
     {
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
-        norm_params.output = hidden; // In-place norm
+        norm_params.output = normalized_out;
         norm_params.gamma = weights_.final_norm;
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = n_tokens;

@@ -944,6 +944,22 @@ namespace llaminar2
             device_idx);
         LOG_DEBUG("[GraphOrchestrator] Allocated context_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << buffer_n_heads * head_dim << "]");
+
+        // Allocate attention output snapshot buffer (Wo projection result, before residual)
+        // Shape: [batch_size * max_seq_len, d_model]
+        state_.attention_output_snapshot = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            device_idx);
+        LOG_DEBUG("[GraphOrchestrator] Allocated attention_output_snapshot buffer: ["
+                  << batch_size * max_seq_len << ", " << d_model << "]");
+
+        // Allocate attention residual snapshot buffer (after residual add)
+        // Shape: [batch_size * max_seq_len, d_model]
+        state_.attention_residual_snapshot = factory.createFP32(
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            device_idx);
+        LOG_DEBUG("[GraphOrchestrator] Allocated attention_residual_snapshot buffer: ["
+                  << batch_size * max_seq_len << ", " << d_model << "]");
 #endif
 
         // Create KV cache - use sharded cache for tensor parallelism
@@ -1086,6 +1102,10 @@ namespace llaminar2
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         // Pass context snapshot buffer for attention debugging
         model_buffers.layer_buffers.context_snapshot = state_.context_snapshot.get();
+        // Pass attention output snapshot buffer (Wo projection, before residual)
+        model_buffers.layer_buffers.attention_output_snapshot = state_.attention_output_snapshot.get();
+        // Pass attention residual snapshot buffer (after residual add)
+        model_buffers.layer_buffers.attention_residual_snapshot = state_.attention_residual_snapshot.get();
 #endif
 
         setBuffers(model_buffers);

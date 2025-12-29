@@ -219,14 +219,19 @@ find_package(GTest REQUIRED)
 # This compile definition enables the snapshot infrastructure in PipelineBase.
 # In release builds (without this flag), all snapshot code compiles away to NOOPs.
 # CRITICAL: Must match core library definition to avoid ODR violations!
+# We also set a CMake variable for conditional test registration.
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+    set(ENABLE_PIPELINE_SNAPSHOTS TRUE)
 elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+    set(ENABLE_PIPELINE_SNAPSHOTS TRUE)
 elseif(CMAKE_BUILD_TYPE MATCHES "Integration")
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+    set(ENABLE_PIPELINE_SNAPSHOTS TRUE)
 elseif(ENABLE_SNAPSHOTS)
     add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+    set(ENABLE_PIPELINE_SNAPSHOTS TRUE)
 endif()
 
 # Test: FP32Tensor class
@@ -2792,6 +2797,28 @@ add_v2_test(V2_Integration_LayerExecutor_Q8_1_vs_FP32_Parity
     MPI_PROCS 1
 )
 
+# Integration: HybridQ16 Pipeline vs FP32 (Layer-by-Layer)
+# -----------------------------------------------------------------------------
+# Validates that HybridQ16 precision mode (Q16_1 typed residuals) achieves
+# ≥0.995 cosine similarity with FP32 at residual stages, measuring improvement
+# over Hybrid mode (Q8_1 residuals). Tests both prefill and decode phases.
+# Requires ENABLE_PIPELINE_SNAPSHOTS for snapshot capture.
+if(ENABLE_PIPELINE_SNAPSHOTS)
+    add_executable(v2_integration_hybridq16_vs_fp32_pipeline 
+        integration/Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
+    )
+    target_link_libraries(v2_integration_hybridq16_vs_fp32_pipeline 
+        llaminar2_core 
+        GTest::gtest 
+    )
+    add_v2_test(V2_Integration_HybridQ16Pipeline_vs_FP32
+        COMMAND $<TARGET_FILE:v2_integration_hybridq16_vs_fp32_pipeline>
+        LABELS "V2;Integration;Parity;HybridQ16;Q16_1;FP32;LayerByLayer;Snapshots"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2: Integration HybridQ16 vs FP32 pipeline parity test enabled")
+endif()
+
 # Test: Pipeline vs LayerExecutor FP32 Parity
 # Validates that the new LayerExecutor framework produces equivalent results
 # to the legacy imperative pipeline code when both use FP32 precision.
@@ -3232,24 +3259,8 @@ if(ZLIB_FOUND)
         message(STATUS "V2: E2E Hybrid vs FP32/Q8_1 pipeline parity test enabled")
 
         # -----------------------------------------------------------------------------
-        # E2E Parity: HybridQ16 Pipeline vs FP32 (Layer-by-Layer)
-        # -----------------------------------------------------------------------------
-        # Validates that HybridQ16 precision mode (Q16_1 typed residuals) achieves
-        # ≥0.995 cosine similarity with FP32 at residual stages, measuring improvement
-        # over Hybrid mode (Q8_1 residuals). Tests both prefill and decode phases.
-        add_executable(v2_e2e_parity_hybridq16_vs_fp32_pipeline 
-            e2e/parity/internal/hybridq16_vs_fp32/Test__HybridQ16Pipeline_vs_FP32_LayerByLayer.cpp
-        )
-        target_link_libraries(v2_e2e_parity_hybridq16_vs_fp32_pipeline 
-            llaminar2_core 
-            GTest::gtest 
-        )
-        add_v2_test(V2_E2E_Parity_HybridQ16Pipeline_vs_FP32
-            COMMAND $<TARGET_FILE:v2_e2e_parity_hybridq16_vs_fp32_pipeline>
-            LABELS "V2;E2E;Parity;Internal;HybridQ16;Q16_1;FP32;LayerByLayer"
-            MPI_PROCS 1
-        )
-        message(STATUS "V2: E2E HybridQ16 vs FP32 pipeline parity test enabled")
+        # (Moved to Integration tests - see V2_Integration_HybridQ16Pipeline_vs_FP32)
+        message(STATUS "V2: HybridQ16 vs FP32 parity test is now in integration tests")
     else()
         message(STATUS "V2: E2E parity tests disabled (snapshots not available in Release build)")
         message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")

@@ -116,11 +116,13 @@ namespace llaminar2::kernels::q16_1::microkernels
         /** INT32 P×V accumulators [num_heads × head_dim] */
         const int32_t *int32_data = nullptr;
 
-        /** Sum of INT16 softmax weights (for normalization) */
-        int32_t weight_sum = 0;
+        /** Per-head sum of INT16 softmax weights (for normalization) [num_heads] */
+        const int32_t *weight_sums = nullptr;
 
-        /** Product of V block scales used in accumulation */
-        float v_scale_product = 1.0f;
+        /** Per-element effective V scales used in accumulation [count] */
+        const float *v_scales = nullptr;
+        int num_heads = 0;
+        int head_dim = 0;
 
         /** Number of elements */
         int count = 0;
@@ -183,8 +185,9 @@ namespace llaminar2::kernels::q16_1::microkernels
     void requantize_int32_to_int16_context(
         const int32_t *int32_input,
         int n,
-        int32_t weight_sum,
-        float v_scale_product,
+        const int32_t *weight_sums,
+        const float *v_scales,
+        int head_dim,
         int16_t *int16_output,
         float *out_combined_scale);
 

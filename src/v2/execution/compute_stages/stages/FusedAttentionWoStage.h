@@ -73,6 +73,14 @@ namespace llaminar2
             // Optional context snapshot buffer for debugging
             TensorBase *context_snapshot = nullptr;
 
+            // Optional attention output snapshot buffer (Wo projection result, before residual add)
+            // Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_OUTPUT
+            TensorBase *attention_output_snapshot = nullptr;
+
+            // Optional attention residual snapshot buffer (after residual add)
+            // Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
+            TensorBase *attention_residual_snapshot = nullptr;
+
             // Hybrid mode: use streaming dequantization for Wo projection
             bool use_hybrid_wo = false;
 

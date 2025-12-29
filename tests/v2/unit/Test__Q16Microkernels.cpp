@@ -344,10 +344,14 @@ TEST_F(Q16MicrokernelTest, WoProjectionVNNI_BasicOutput)
         v = int_dist(rng_);
 
     // Set up IntegerContext
+    std::vector<float> v_scales(INPUT_DIM, 0.01f);
+    const int32_t weight_sum = 32767; // Full softmax weight
     IntegerContext context;
     context.int32_data = int32_context.data();
-    context.weight_sum = 32767; // Full softmax weight
-    context.v_scale_product = 0.01f;
+    context.weight_sums = &weight_sum;
+    context.v_scales = v_scales.data();
+    context.num_heads = 1;
+    context.head_dim = INPUT_DIM;
     context.count = INPUT_DIM;
 
     // Output blocks
@@ -402,10 +406,14 @@ TEST_F(Q16MicrokernelTest, WoProjectionVNNI_NoNaNsOrInfs)
         for (auto &v : int32_context)
             v = int_dist(rng_);
 
+        std::vector<float> v_scales(INPUT_DIM, 0.01f);
+        const int32_t weight_sum = 32767;
         IntegerContext context;
         context.int32_data = int32_context.data();
-        context.weight_sum = 32767;
-        context.v_scale_product = 0.01f;
+        context.weight_sums = &weight_sum;
+        context.v_scales = v_scales.data();
+        context.num_heads = 1;
+        context.head_dim = INPUT_DIM;
         context.count = INPUT_DIM;
 
         const int output_blocks = (D_MODEL + 31) / 32;

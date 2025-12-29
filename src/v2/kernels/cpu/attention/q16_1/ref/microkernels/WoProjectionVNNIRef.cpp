@@ -101,30 +101,116 @@ namespace llaminar2::kernels::q16_1::microkernels
     void requantize_int32_to_int16_context(
         const int32_t *int32_input,
         int n,
-        int32_t weight_sum,
-        float v_scale_product,
+        const int32_t *weight_sums,
+        const float *v_scales,
+        int head_dim,
         int16_t *int16_output,
         float *out_combined_scale)
     {
-        // Find global maxabs to determine scale
-        int64_t global_maxabs = int32_maxabs(int32_input, n);
+        // Calculate true float values to find global maxabs
+        // true_val = int32_val * v_scale / weight_sum
+        float global_maxabs = 0.0f;
 
-        // Compute scale for INT32 → INT16 conversion
-        // This maps the full INT32 range to INT16 [-32767, 32767]
-        float int32_to_int16_scale = (global_maxabs > 0)
-                                         ? static_cast<float>(global_maxabs) / 32767.0f
-                                         : 1.0f;
+        const int safe_head_dim = (head_dim > 0) ? head_dim : n;
 
-        // Quantize to INT16
-        quantize_int32_to_int16(int32_input, n, int32_to_int16_scale, int16_output);
+        // Per-element scaling: element i belongs to head (i / head_dim).
+        // Each element also has an effective V scale (typically per 32-wide Q16_1 block).
+        for (int idx = 0; idx < n; ++idx)
+        {
+            const int head = idx / safe_head_dim;
+            const int32_t ws = (weight_sums) ? weight_sums[head] : 1;
+            const float inv_ws = (ws > 0) ? 1.0f / static_cast<float>(ws) : 0.0f;
+            const float v_scale = (v_scales) ? v_scales[idx] : 1.0f;
 
-        // Combined scale incorporates:
-        // - INT32→INT16 quantization scale
-        // - V block scales (from Q16_1 V tensor)
-        // - Softmax normalization (1/weight_sum)
+            float val = static_cast<float>(int32_input[idx]) * inv_ws * v_scale;
+            global_maxabs = std::max(global_maxabs, std::abs(val));
+        }
+
+        // Determine common scale to map maxabs to 32767
+        // S_common = maxabs / 32767
+        float common_scale = (global_maxabs > 0.0f) ? global_maxabs / 32767.0f : 1.0f;
+        float inv_common_scale = (common_scale > 0.0f) ? 1.0f / common_scale : 0.0f;
+
+        // Quantize to INT16 using per-element scaling
+        // int16_val = round((int32_val / weight_sum(head) * v_scale(idx)) / common_scale)
+        for (int idx = 0; idx < n; ++idx)
+        {
+            const int head = idx / safe_head_dim;
+            const int32_t ws = (weight_sums) ? weight_sums[head] : 1;
+            const float inv_ws = (ws > 0) ? 1.0f / static_cast<float>(ws) : 0.0f;
+            const float v_scale = (v_scales) ? v_scales[idx] : 1.0f;
+
+            float val = static_cast<float>(int32_input[idx]) * inv_ws * v_scale * inv_common_scale;
+            int16_t q = static_cast<int16_t>(std::round(std::clamp(val, -32767.0f, 32767.0f)));
+            int16_output[idx] = q;
+        }
+
         if (out_combined_scale)
         {
-            *out_combined_scale = int32_to_int16_scale * v_scale_product / static_cast<float>(weight_sum);
+            *out_combined_scale = common_scale;
+        }
+    }
+
+    // ============================================================================
+    // Output Requantization (FP32 → Q16_1)
+    // ============================================================================
+
+    void requantize_fp32_to_q16_1(
+        const float *fp32_output,
+        int n,
+        const float *bias,
+        Q16_1Block *output)
+    {
+        constexpr int BLOCK_SIZE = 32;
+        const int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        for (int b = 0; b < num_blocks; ++b)
+        {
+            const int start = b * BLOCK_SIZE;
+            const int end = std::min(start + BLOCK_SIZE, n);
+            const int count = end - start;
+
+            // Find maxabs in this block (with bias added if present)
+            float block_maxabs = 0.0f;
+            for (int i = 0; i < count; ++i)
+            {
+                float val = fp32_output[start + i];
+                if (bias)
+                {
+                    val += bias[start + i];
+                }
+                block_maxabs = std::max(block_maxabs, std::abs(val));
+            }
+
+            // Compute Q16_1 scale (value = scale * qs)
+            float block_scale = (block_maxabs > 0.0f) ? block_maxabs / 32767.0f : 1.0f;
+            float inv_scale = (block_scale > 0.0f) ? 1.0f / block_scale : 0.0f;
+
+            // Quantize FP32 → INT16
+            Q16_1Block &blk = output[b];
+            blk.d = block_scale;
+            int64_t sum_qs = 0;
+
+            for (int i = 0; i < BLOCK_SIZE; ++i)
+            {
+                if (i < count)
+                {
+                    float val = fp32_output[start + i];
+                    if (bias)
+                    {
+                        val += bias[start + i];
+                    }
+                    int16_t q = static_cast<int16_t>(std::round(val * inv_scale));
+                    q = std::max(static_cast<int16_t>(-32767), std::min(static_cast<int16_t>(32767), q));
+                    blk.qs[i] = q;
+                    sum_qs += q;
+                }
+                else
+                {
+                    blk.qs[i] = 0;
+                }
+            }
+            blk.sum_qs = static_cast<int32_t>(sum_qs);
         }
     }
 
@@ -220,8 +306,9 @@ namespace llaminar2::kernels::q16_1::microkernels
         requantize_int32_to_int16_context(
             context.int32_data,
             context.count,
-            context.weight_sum,
-            context.v_scale_product,
+            context.weight_sums,
+            context.v_scales,
+            context.head_dim,
             context_int16.data(),
             &context_scale);
 
@@ -232,22 +319,14 @@ namespace llaminar2::kernels::q16_1::microkernels
         const int K_blocks = (K + 31) / 32;
         const int N_padded = (N + 63) / 64 * 64;
 
-        // Temporary INT32 output
-        std::vector<int32_t> int32_output(d_model);
-        float combined_scale = 0.0f;
+        // Compute per-dimension FP32 output (INT32 * per-dim scale)
+        // This is needed because each output dimension has its own weight scale
+        std::vector<float> fp32_output(d_model);
 
         // For each output dimension
         for (int n = 0; n < d_model; ++n)
         {
-            int32_t int32_acc = 0;
-
-            // Extract weight scale for this output
-            float w_scale = 0.0f;
-            for (int k_blk = 0; k_blk < K_blocks; ++k_blk)
-            {
-                w_scale += packed->scales[k_blk * N_padded + n];
-            }
-            w_scale /= K_blocks; // Average scale
+            float fp32_acc = 0.0f;
 
             // For each K position
             for (int k = 0; k < input_dim; ++k)
@@ -266,30 +345,23 @@ namespace llaminar2::kernels::q16_1::microkernels
                 int8_t w_int8 = packed->packed_data[pack_idx];
                 int16_t w_int16 = static_cast<int16_t>(w_int8); // Sign-extend!
 
-                // INT16 × INT16 → INT32 (what VPDPWSSD does, 2 elements at a time)
-                int32_acc += static_cast<int32_t>(ctx_val) * static_cast<int32_t>(w_int16);
+                // Get block scale
+                int k_blk = k / 32;
+                float blk_scale = packed->scales[k_blk * N_padded + n];
+
+                // Accumulate with correct scale
+                fp32_acc += static_cast<float>(ctx_val) * static_cast<float>(w_int16) * blk_scale;
             }
 
-            int32_output[n] = int32_acc;
-
-            // Track combined scale (context_scale * weight_scale)
-            if (n == 0)
-            {
-                combined_scale = context_scale * w_scale;
-            }
+            // Apply context scale
+            fp32_output[n] = fp32_acc * context_scale;
         }
 
-        // Use reasonable scale if not computed
-        if (combined_scale <= 0.0f)
-        {
-            combined_scale = 1.0f;
-        }
-
-        // Step 3: Requantize INT32 → Q16_1
-        requantize_int32_to_q16_1(
-            int32_output.data(),
+        // Step 3: Requantize FP32 → Q16_1
+        // Use the new FP32→Q16_1 requantization path
+        requantize_fp32_to_q16_1(
+            fp32_output.data(),
             d_model,
-            combined_scale,
             params.bias,
             output.blocks);
 

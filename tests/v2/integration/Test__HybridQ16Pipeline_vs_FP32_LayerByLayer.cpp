@@ -457,11 +457,14 @@ TEST_F(Test__HybridQ16Pipeline_LayerByLayer, Prefill_SnapshotComparison)
     std::string worst_hybridq16_stage, best_hybridq16_stage;
 
     // Stages to skip for HybridQ16 due to architectural differences:
-    // ATTENTION_OUTPUT in HybridQ16 mode is the fused residual (residual + Wo output),
-    // not just the Wo output. Comparing it to FP32's pure Wo output is meaningless.
-    auto isSkippedStageForHybridQ16 = [](const std::string &key)
+    // Previously ATTENTION_OUTPUT in HybridQ16 mode was the fused residual, but now
+    // the Q16 kernel captures proper snapshots matching FP32 semantics:
+    // - ATTENTION_OUTPUT: Wo projection result (before residual add)
+    // - ATTENTION_RESIDUAL: Final output (after residual add)
+    // No stages need to be skipped anymore.
+    auto isSkippedStageForHybridQ16 = [](const std::string & /* key */)
     {
-        return key.find("ATTENTION_OUTPUT") != std::string::npos;
+        return false; // All stages now comparable
     };
 
     for (const auto &key : fp32_keys)
@@ -897,6 +900,10 @@ TEST_F(Test__HybridQ16Pipeline_LayerByLayer, ResidualStages_Q16_1Benefit)
 
     for (int layer = 0; layer < num_layers; ++layer)
     {
+        // NOTE: HybridQ16 mode previously fused Attention+Wo+ResidualAdd without
+        // producing ATTENTION_RESIDUAL snapshots. Now the Q16 kernel captures all
+        // snapshot stages (ATTENTION_CONTEXT, ATTENTION_OUTPUT, ATTENTION_RESIDUAL)
+        // matching the FP32 pipeline, enabling full comparison.
         for (const std::string &suffix : {"ATTENTION_RESIDUAL", "FFN_RESIDUAL"})
         {
             std::string key = "layer" + std::to_string(layer) + "_" + suffix;

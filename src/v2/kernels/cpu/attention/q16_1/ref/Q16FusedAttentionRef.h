@@ -146,6 +146,18 @@ namespace llaminar2
              */
             float *context_snapshot = nullptr;
 
+            /** Optional FP32 buffer for attention output snapshot [seq_len_q × d_model]
+             *  If provided, captures the Wo projection output (after GEMV, before residual add).
+             *  Corresponds to ATTENTION_OUTPUT in the FP32 pipeline.
+             */
+            float *attention_output_snapshot = nullptr;
+
+            /** Optional FP32 buffer for attention residual snapshot [seq_len_q × d_model]
+             *  If provided, captures the final output after residual addition.
+             *  Corresponds to ATTENTION_RESIDUAL in the FP32 pipeline.
+             */
+            float *attention_residual_snapshot = nullptr;
+
             // ============== Helper methods ==============
 
             float get_scale() const

@@ -181,10 +181,18 @@ namespace llaminar2
         // Use explicit seq_len if provided, otherwise derive from tensor
         const int seq_len = (params_.seq_len > 0) ? params_.seq_len : static_cast<int>(params_.Q->rows());
 
-        // Detect Hybrid mode: Q8_1 input with FP32 output buffers
+        // Detect Hybrid mode variants with separate output buffers.
+        // Hybrid:      Q8_1 input -> FP32 output buffers
+        // HybridQ16:   Q8_1 input -> Q16_1 output buffers
         const bool hybrid_mode = (params_.Q_out != nullptr) &&
                                  (params_.Q->native_type() == TensorType::Q8_1) &&
                                  (params_.Q_out->native_type() == TensorType::FP32);
+
+        const bool hybrid_q16_mode = (params_.Q_out != nullptr) &&
+                                     (params_.Q->native_type() == TensorType::Q8_1) &&
+                                     (params_.Q_out->native_type() == TensorType::Q16_1);
+
+        const bool separate_output_mode = hybrid_mode || hybrid_q16_mode;
 
         // Q input
         const float *q_input_data = getSafeFp32Data(params_.Q);
@@ -194,8 +202,8 @@ namespace llaminar2
                           seq_len, params_.n_heads * params_.head_dim);
         }
 
-        // Q output - use Q_out in Hybrid mode, otherwise same as input (in-place)
-        if (hybrid_mode && params_.Q_out)
+        // Q output - use Q_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
+        if (separate_output_mode && params_.Q_out)
         {
             const float *q_out_data = getSafeFp32Data(params_.Q_out);
             if (q_out_data)
@@ -223,8 +231,8 @@ namespace llaminar2
                               seq_len, n_kv_heads * params_.head_dim);
             }
 
-            // K output - use K_out in Hybrid mode, otherwise same as input (in-place)
-            if (hybrid_mode && params_.K_out)
+            // K output - use K_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
+            if (separate_output_mode && params_.K_out)
             {
                 const float *k_out_data = getSafeFp32Data(params_.K_out);
                 if (k_out_data)

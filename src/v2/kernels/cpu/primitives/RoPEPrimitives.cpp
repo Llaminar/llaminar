@@ -3302,58 +3302,71 @@ namespace llaminar2::primitives
             // scaled_a * cos_q15 range: [-32768 * 32767, 32767 * 32767] = ~[-1B, 1B]
             // After subtraction: ~[-2B, 2B], needs >> 23 to fit int16
 
-            // out_a_lo = (scaled_a_lo * cos - scaled_b_lo * sin) >> 23
+            // out_a_lo = (scaled_a_lo * cos - scaled_b_lo * sin) >> 15
             __m512i ac_lo = _mm512_mullo_epi32(scaled_a_lo, cos_lo_i32);
             __m512i bs_lo = _mm512_mullo_epi32(scaled_b_lo, sin_lo_i32);
-            __m512i out_a_lo_i32 = _mm512_srai_epi32(_mm512_sub_epi32(ac_lo, bs_lo), 23);
+            // Symmetric rounding before >> 15
+            __m512i tmp_a_lo = _mm512_sub_epi32(ac_lo, bs_lo);
+            __m512i sign_a_lo = _mm512_srai_epi32(tmp_a_lo, 31);
+            __m512i bias_a_lo = _mm512_sub_epi32(
+                _mm512_set1_epi32(1 << 14),
+                _mm512_and_si512(sign_a_lo, _mm512_set1_epi32(1 << 15)));
+            __m512i out_a_lo_i32 = _mm512_srai_epi32(_mm512_add_epi32(tmp_a_lo, bias_a_lo), 15);
 
             __m512i ac_hi = _mm512_mullo_epi32(scaled_a_hi, cos_hi_i32);
             __m512i bs_hi = _mm512_mullo_epi32(scaled_b_hi, sin_hi_i32);
-            __m512i out_a_hi_i32 = _mm512_srai_epi32(_mm512_sub_epi32(ac_hi, bs_hi), 23);
+            __m512i tmp_a_hi = _mm512_sub_epi32(ac_hi, bs_hi);
+            __m512i sign_a_hi = _mm512_srai_epi32(tmp_a_hi, 31);
+            __m512i bias_a_hi = _mm512_sub_epi32(
+                _mm512_set1_epi32(1 << 14),
+                _mm512_and_si512(sign_a_hi, _mm512_set1_epi32(1 << 15)));
+            __m512i out_a_hi_i32 = _mm512_srai_epi32(_mm512_add_epi32(tmp_a_hi, bias_a_hi), 15);
 
-            // out_b_lo = (scaled_a_lo * sin + scaled_b_lo * cos) >> 23
+            // out_b_lo = (scaled_a_lo * sin + scaled_b_lo * cos) >> 15
             __m512i as_lo = _mm512_mullo_epi32(scaled_a_lo, sin_lo_i32);
             __m512i bc_lo = _mm512_mullo_epi32(scaled_b_lo, cos_lo_i32);
-            __m512i out_b_lo_i32 = _mm512_srai_epi32(_mm512_add_epi32(as_lo, bc_lo), 23);
+            __m512i tmp_b_lo = _mm512_add_epi32(as_lo, bc_lo);
+            __m512i sign_b_lo = _mm512_srai_epi32(tmp_b_lo, 31);
+            __m512i bias_b_lo = _mm512_sub_epi32(
+                _mm512_set1_epi32(1 << 14),
+                _mm512_and_si512(sign_b_lo, _mm512_set1_epi32(1 << 15)));
+            __m512i out_b_lo_i32 = _mm512_srai_epi32(_mm512_add_epi32(tmp_b_lo, bias_b_lo), 15);
 
             __m512i as_hi = _mm512_mullo_epi32(scaled_a_hi, sin_hi_i32);
             __m512i bc_hi = _mm512_mullo_epi32(scaled_b_hi, cos_hi_i32);
-            __m512i out_b_hi_i32 = _mm512_srai_epi32(_mm512_add_epi32(as_hi, bc_hi), 23);
+            __m512i tmp_b_hi = _mm512_add_epi32(as_hi, bc_hi);
+            __m512i sign_b_hi = _mm512_srai_epi32(tmp_b_hi, 31);
+            __m512i bias_b_hi = _mm512_sub_epi32(
+                _mm512_set1_epi32(1 << 14),
+                _mm512_and_si512(sign_b_hi, _mm512_set1_epi32(1 << 15)));
+            __m512i out_b_hi_i32 = _mm512_srai_epi32(_mm512_add_epi32(tmp_b_hi, bias_b_hi), 15);
 
-            // Pack int32 → int16 with saturation
-            // _mm512_packs_epi32 saturates to [-32768, 32767]
-            __m512i out_a_i16 = _mm512_packs_epi32(out_a_lo_i32, out_a_hi_i32);
-            __m512i out_b_i16 = _mm512_packs_epi32(out_b_lo_i32, out_b_hi_i32);
+            // Pack to int16 in a stable, sequential order.
+            // Using 256-bit pack avoids tricky 512-bit lane interleaving.
+            const __m256i a_lo_256 = _mm512_castsi512_si256(out_a_lo_i32);
+            const __m256i a_hi_256 = _mm512_extracti64x4_epi64(out_a_lo_i32, 1);
+            const __m256i a0_i16 = _mm256_packs_epi32(a_lo_256, a_hi_256); // 16×int16
 
-            // The packs interleaves, need to permute back to sequential order
-            // packs_epi32([0-15], [16-31]) gives [0,1,2,3,16,17,18,19,4,5,6,7,20,21,22,23,...]
-            // Use permutex2var to fix ordering
-            const __m512i perm_idx = _mm512_setr_epi32(
-                0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15);
-            out_a_i16 = _mm512_permutexvar_epi32(perm_idx, out_a_i16);
-            out_b_i16 = _mm512_permutexvar_epi32(perm_idx, out_b_i16);
+            const __m256i a2_lo_256 = _mm512_castsi512_si256(out_a_hi_i32);
+            const __m256i a2_hi_256 = _mm512_extracti64x4_epi64(out_a_hi_i32, 1);
+            const __m256i a1_i16 = _mm256_packs_epi32(a2_lo_256, a2_hi_256); // 16×int16
 
-            // Store results
-            _mm512_storeu_si512(outA.qs, out_a_i16);
-            _mm512_storeu_si512(outB.qs, out_b_i16);
+            const __m256i b_lo_256 = _mm512_castsi512_si256(out_b_lo_i32);
+            const __m256i b_hi_256 = _mm512_extracti64x4_epi64(out_b_lo_i32, 1);
+            const __m256i b0_i16 = _mm256_packs_epi32(b_lo_256, b_hi_256);
 
-            // Compute sum_qs using horizontal add
-            // For int16, sum 32 values
-            __m256i out_a_lo_16 = _mm512_castsi512_si256(out_a_i16);
-            __m256i out_a_hi_16 = _mm512_extracti64x4_epi64(out_a_i16, 1);
-            __m256i out_b_lo_16 = _mm512_castsi512_si256(out_b_i16);
-            __m256i out_b_hi_16 = _mm512_extracti64x4_epi64(out_b_i16, 1);
+            const __m256i b2_lo_256 = _mm512_castsi512_si256(out_b_hi_i32);
+            const __m256i b2_hi_256 = _mm512_extracti64x4_epi64(out_b_hi_i32, 1);
+            const __m256i b1_i16 = _mm256_packs_epi32(b2_lo_256, b2_hi_256);
 
-            // Widen to int32 and sum
-            __m512i sum_a_i32 = _mm512_add_epi32(
-                _mm512_cvtepi16_epi32(out_a_lo_16),
-                _mm512_cvtepi16_epi32(out_a_hi_16));
-            __m512i sum_b_i32 = _mm512_add_epi32(
-                _mm512_cvtepi16_epi32(out_b_lo_16),
-                _mm512_cvtepi16_epi32(out_b_hi_16));
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(outA.qs), a0_i16);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(outA.qs + 16), a1_i16);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(outB.qs), b0_i16);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(outB.qs + 16), b1_i16);
 
-            int32_t sum_a = _mm512_reduce_add_epi32(sum_a_i32);
-            int32_t sum_b = _mm512_reduce_add_epi32(sum_b_i32);
+            // Sum can be taken from the int32 results directly (before saturation to int16).
+            const int32_t sum_a = _mm512_reduce_add_epi32(out_a_lo_i32) + _mm512_reduce_add_epi32(out_a_hi_i32);
+            const int32_t sum_b = _mm512_reduce_add_epi32(out_b_lo_i32) + _mm512_reduce_add_epi32(out_b_hi_i32);
 
             // Set output block metadata
             // common_scale is per-head max / 127, output needs scale for int16 range
@@ -3369,11 +3382,11 @@ namespace llaminar2::primitives
             // Solution: shift by (8 + 15 - 8) = 15 to keep more precision
             // This gives output range [-32512, 32512] which fits Q16_1
 
-            // Let me redo with >> 15 shift for full Q16_1 precision
-            // ... but that's a code change. For now, output scale compensates:
-            outA.d = common_scale; // Scale to reconstruct original magnitude
+            // Keep the implicit *256 factor from ratio_q8 in the int16 output.
+            // Compensate in the output scale.
+            outA.d = common_scale / 256.0f;
             outA.sum_qs = sum_a;
-            outB.d = common_scale;
+            outB.d = common_scale / 256.0f;
             outB.sum_qs = sum_b;
 
 #else
@@ -3443,29 +3456,32 @@ namespace llaminar2::primitives
                 __m256i as = _mm256_mullo_epi32(scaled_a, sin_i32);
                 __m256i bc = _mm256_mullo_epi32(scaled_b, cos_i32);
 
-                __m256i out_a_i32 = _mm256_srai_epi32(_mm256_sub_epi32(ac, bs), 23);
-                __m256i out_b_i32 = _mm256_srai_epi32(_mm256_add_epi32(as, bc), 23);
+                // Symmetric rounding before >> 15
+                __m256i tmp_a = _mm256_sub_epi32(ac, bs);
+                __m256i sign_a = _mm256_srai_epi32(tmp_a, 31);
+                __m256i bias_a = _mm256_sub_epi32(
+                    _mm256_set1_epi32(1 << 14),
+                    _mm256_and_si256(sign_a, _mm256_set1_epi32(1 << 15)));
+                __m256i out_a_i32 = _mm256_srai_epi32(_mm256_add_epi32(tmp_a, bias_a), 15);
 
-                // Pack to int16 with saturation and store
-                // _mm256_packs_epi32 needs two __m256i inputs, outputs interleaved
-                // For 8 values, pack with zeros
-                __m256i out_a_16 = _mm256_packs_epi32(out_a_i32, _mm256_setzero_si256());
-                __m256i out_b_16 = _mm256_packs_epi32(out_b_i32, _mm256_setzero_si256());
+                __m256i tmp_b = _mm256_add_epi32(as, bc);
+                __m256i sign_b = _mm256_srai_epi32(tmp_b, 31);
+                __m256i bias_b = _mm256_sub_epi32(
+                    _mm256_set1_epi32(1 << 14),
+                    _mm256_and_si256(sign_b, _mm256_set1_epi32(1 << 15)));
+                __m256i out_b_i32 = _mm256_srai_epi32(_mm256_add_epi32(tmp_b, bias_b), 15);
 
-                // Extract low 128 bits (8 int16 values)
-                __m128i out_a_128 = _mm256_castsi256_si128(out_a_16);
-                __m128i out_b_128 = _mm256_castsi256_si128(out_b_16);
+                // Pack 8×int32 -> 8×int16 in correct order.
+                const __m128i out_a_lo_128 = _mm256_castsi256_si128(out_a_i32);
+                const __m128i out_a_hi_128 = _mm256_extracti128_si256(out_a_i32, 1);
+                const __m128i out_a_i16 = _mm_packs_epi32(out_a_lo_128, out_a_hi_128);
 
-                // Need to fix interleaving from packs_epi32
-                // packs([0,1,2,3,4,5,6,7], zeros) gives [0,1,2,3,0,0,0,0,4,5,6,7,0,0,0,0]
-                // Extract correctly: low 64 bits has first 4, bits 128-192 have next 4
-                __m128i out_a_fixed = _mm_unpacklo_epi64(
-                    out_a_128, _mm256_extracti128_si256(out_a_16, 1));
-                __m128i out_b_fixed = _mm_unpacklo_epi64(
-                    out_b_128, _mm256_extracti128_si256(out_b_16, 1));
+                const __m128i out_b_lo_128 = _mm256_castsi256_si128(out_b_i32);
+                const __m128i out_b_hi_128 = _mm256_extracti128_si256(out_b_i32, 1);
+                const __m128i out_b_i16 = _mm_packs_epi32(out_b_lo_128, out_b_hi_128);
 
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(outA.qs + offset), out_a_fixed);
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(outB.qs + offset), out_b_fixed);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(outA.qs + offset), out_a_i16);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(outB.qs + offset), out_b_i16);
 
                 // Accumulate sum
                 // Sum the int32 values before packing
@@ -3484,9 +3500,9 @@ namespace llaminar2::primitives
                 sum_b += _mm_cvtsi128_si32(sum_b_128);
             }
 
-            outA.d = common_scale;
+            outA.d = common_scale / 256.0f;
             outA.sum_qs = sum_a;
-            outB.d = common_scale;
+            outB.d = common_scale / 256.0f;
             outB.sum_qs = sum_b;
 #else
             (void)blockA;
@@ -3528,10 +3544,18 @@ namespace llaminar2::primitives
                 int32_t cos_val = cos_q15[i];
                 int32_t sin_val = sin_q15[i];
 
-                // Rotate: (scaled_a * cos - scaled_b * sin) >> 23
-                // (scaled_a * sin + scaled_b * cos) >> 23
-                int32_t out_a = (scaled_a * cos_val - scaled_b * sin_val) >> 23;
-                int32_t out_b = (scaled_a * sin_val + scaled_b * cos_val) >> 23;
+                // Rotate in integer domain.
+                // scaled_* has an implicit *256 factor from ratio_q8.
+                // cos/sin are Q15. Compute with int64 intermediates to avoid overflow:
+                // scaled_* can be ~4e6, multiplying by ~3e4 exceeds int32 range.
+                int64_t tmp_a = (static_cast<int64_t>(scaled_a) * cos_val - static_cast<int64_t>(scaled_b) * sin_val);
+                int64_t tmp_b = (static_cast<int64_t>(scaled_a) * sin_val + static_cast<int64_t>(scaled_b) * cos_val);
+
+                // Symmetric rounding before >> 15
+                tmp_a += (tmp_a >= 0) ? (1LL << 14) : -(1LL << 14);
+                tmp_b += (tmp_b >= 0) ? (1LL << 14) : -(1LL << 14);
+                int32_t out_a = static_cast<int32_t>(tmp_a >> 15);
+                int32_t out_b = static_cast<int32_t>(tmp_b >> 15);
 
                 // Clamp to int16 range
                 out_a = std::max(-32767, std::min(32767, out_a));
@@ -3544,9 +3568,9 @@ namespace llaminar2::primitives
                 sum_b += out_b;
             }
 
-            outA.d = common_scale;
+            outA.d = common_scale / 256.0f;
             outA.sum_qs = sum_a;
-            outB.d = common_scale;
+            outB.d = common_scale / 256.0f;
             outB.sum_qs = sum_b;
         }
 
@@ -3560,17 +3584,13 @@ namespace llaminar2::primitives
             const int16_t *sin_q15,
             float common_scale)
         {
-#if defined(__AVX512F__)
-            rotate_q8_1_block_pair_to_q16_1_avx512(blockA, blockB, outA, outB, cos_q15, sin_q15, common_scale);
-#elif defined(__AVX2__)
-            rotate_q8_1_block_pair_to_q16_1_avx2(blockA, blockB, outA, outB, cos_q15, sin_q15, common_scale);
-#else
+            // Correctness-first: use the scalar implementation with int64 intermediates.
+            // The AVX2/AVX512 variants use int32 products and can overflow for typical ranges.
             rotate_q8_1_block_pair_to_q16_1_scalar(blockA, blockB, outA, outB, cos_q15, sin_q15, common_scale);
-#endif
         }
 
         // Process one head: compute common scale, then rotate all block pairs
-        inline void apply_rope_q8_1_to_q16_1_head(
+        inline float apply_rope_q8_1_to_q16_1_head(
             const Q8_1Block *head_in,
             Q16_1Block *head_out,
             int blocks_per_head,
@@ -3602,6 +3622,8 @@ namespace llaminar2::primitives
                     sin_q15 + b * 32,
                     common_scale);
             }
+
+            return common_scale;
         }
 
     } // anonymous namespace
@@ -3656,8 +3678,19 @@ namespace llaminar2::primitives
             for (int i = 0; i < half_dim; ++i)
             {
                 float angle = static_cast<float>(pos) * inv_freq[i];
-                c_ptr[i] = static_cast<int16_t>(std::cos(angle) * 32767.0f);
-                s_ptr[i] = static_cast<int16_t>(std::sin(angle) * 32767.0f);
+                // Use rounded Q15 sin/cos to avoid truncation bias.
+                int32_t c = static_cast<int32_t>(std::lround(std::cos(angle) * 32767.0f));
+                int32_t s = static_cast<int32_t>(std::lround(std::sin(angle) * 32767.0f));
+                if (c > 32767)
+                    c = 32767;
+                if (c < -32767)
+                    c = -32767;
+                if (s > 32767)
+                    s = 32767;
+                if (s < -32767)
+                    s = -32767;
+                c_ptr[i] = static_cast<int16_t>(c);
+                s_ptr[i] = static_cast<int16_t>(s);
             }
         }
 
@@ -3674,7 +3707,7 @@ namespace llaminar2::primitives
                     const int16_t *c_ptr = cos_q15.data() + t * half_dim;
                     const int16_t *s_ptr = sin_q15.data() + t * half_dim;
 
-                    apply_rope_q8_1_to_q16_1_head(head_in, head_out, blocks_per_head, c_ptr, s_ptr);
+                    (void)apply_rope_q8_1_to_q16_1_head(head_in, head_out, blocks_per_head, c_ptr, s_ptr);
                 }
             }
         };
@@ -3695,7 +3728,7 @@ namespace llaminar2::primitives
                         const int16_t *c_ptr = cos_q15.data() + t * half_dim;
                         const int16_t *s_ptr = sin_q15.data() + t * half_dim;
 
-                        apply_rope_q8_1_to_q16_1_head(head_in, head_out, blocks_per_head, c_ptr, s_ptr);
+                        (void)apply_rope_q8_1_to_q16_1_head(head_in, head_out, blocks_per_head, c_ptr, s_ptr);
                     }
                 }
             };
