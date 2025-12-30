@@ -38,9 +38,10 @@ namespace llaminar2::kernels::q16_1::microkernels
     namespace
     {
         /// Thread-safe singleton LUT for 2^(-frac) values
+        /// 2048 entries × 4 bytes = 8KB, fits easily in L1 cache
         struct Exp2LUT
         {
-            std::array<uint32_t, 256> data{};
+            std::array<uint32_t, EXP2_LUT_SIZE> data{};
             int value_bits = 0;
             bool ready = false;
             std::mutex init_mutex;
@@ -56,10 +57,10 @@ namespace llaminar2::kernels::q16_1::microkernels
 
                 const double scale = static_cast<double>(1ULL << lut_value_bits);
 
-                for (int i = 0; i < 256; ++i)
+                for (int i = 0; i < EXP2_LUT_SIZE; ++i)
                 {
-                    // u ∈ [0, 1) at 256 uniformly spaced points
-                    const double u = static_cast<double>(i) / 256.0;
+                    // u ∈ [0, 1) at 2048 uniformly spaced points
+                    const double u = static_cast<double>(i) / static_cast<double>(EXP2_LUT_SIZE);
 
                     // 2^(-u) ∈ (0.5, 1]
                     const double v = std::pow(2.0, -u);

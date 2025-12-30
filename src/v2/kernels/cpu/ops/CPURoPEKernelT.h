@@ -516,6 +516,25 @@ namespace llaminar2
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        // HybridQ16 mode with head scales: Q8_1 → Q16 with per-head scale output
+        // Uses pure integer arithmetic (Q8 fixed-point ratios, Q15 sin/cos)
+        bool apply_q8_1_to_q16(
+            TensorBase *Q_in,
+            TensorBase *K_in,
+            TensorBase *Q_out,
+            TensorBase *K_out,
+            float *Q_head_scales,
+            float *K_head_scales,
+            Q16BlockSize block_size,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
     };
 
     // =========================================================================
@@ -579,7 +598,7 @@ namespace llaminar2
          * @brief Templated apply for variable Q16 block sizes
          *
          * Calls the appropriate templated RoPE primitive for the given block type.
-         * Supports: Q16_1Block (32), Q16_1Block_64, Q16_1Block_128, Q16_1Block_192
+         * Supports: Q16_1Block (32), Q16_1Block_64, Q16_1Block_128
          *
          * @tparam BlockType Q16 block type
          */

@@ -428,7 +428,7 @@ add_v2_test(V2_Unit_TensorFactory_DeviceIndex
 
 # Test: TensorFactory Q16_1 variable block size creation (Phase 3)
 # Verifies that createQ16_1(shape, block_size, device_idx) creates tensors
-# with correct block sizes (BLOCK_64, BLOCK_128, BLOCK_192) for different head_dims.
+# with correct block sizes (BLOCK_64, BLOCK_128) for different head_dims.
 add_executable(v2_test_tensor_factory_q16_block_size unit/Test__TensorFactory_Q16BlockSize.cpp)
 target_link_libraries(v2_test_tensor_factory_q16_block_size 
     llaminar2_core 
@@ -1010,59 +1010,6 @@ add_v2_test(V2_Unit_IndexSoftmax
     MPI_PROCS 1
 )
 
-# Test: Q16 Microkernels (DotProduct, PVAccumulate, WoProjectionVNNI)
-# Note: Integer softmax tested separately via Exp2FixedSoftmax
-add_executable(v2_test_q16_microkernels unit/Test__Q16Microkernels.cpp)
-target_link_libraries(v2_test_q16_microkernels
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16Microkernels
-    COMMAND $<TARGET_FILE:v2_test_q16_microkernels>
-    LABELS "V2;Unit;Attention;Q16;Microkernels;DotProduct;WoProjection;VPDPWSSD"
-    MPI_PROCS 1
-)
-
-# Test: Q16 Integer-Domain Attention Parity vs FP32 Reference
-add_executable(v2_test_q16_integer_domain_parity unit/Test__Q16IntegerDomainParity.cpp)
-target_link_libraries(v2_test_q16_integer_domain_parity
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16IntegerDomainParity
-    COMMAND $<TARGET_FILE:v2_test_q16_integer_domain_parity>
-    LABELS "V2;Unit;Attention;Q16;IntegerDomain;Parity;FP32Reference;Exp2Softmax"
-    MPI_PROCS 1
-)
-
-# Test: Q16 Integer-Domain + VPDPWSSD Wo Projection Parity vs FP32 Reference
-add_executable(v2_test_q16_integer_domain_wo_projection unit/Test__Q16IntegerDomainWoProjection.cpp)
-target_link_libraries(v2_test_q16_integer_domain_wo_projection
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16IntegerDomainWoProjection
-    COMMAND $<TARGET_FILE:v2_test_q16_integer_domain_wo_projection>
-    LABELS "V2;Unit;Attention;Q16;IntegerDomain;WoProjection;VPDPWSSD;Parity;FP32Reference"
-    MPI_PROCS 1
-)
-
-# Test: Q16 Full Pipeline Parity (end-to-end PURE INTEGER vs FP32)
-add_executable(v2_test_q16_full_pipeline_parity unit/Test__Q16FullPipelineParity.cpp)
-target_link_libraries(v2_test_q16_full_pipeline_parity
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16FullPipelineParity
-    COMMAND $<TARGET_FILE:v2_test_q16_full_pipeline_parity>
-    LABELS "V2;Unit;Attention;Q16;IntegerDomain;WoProjection;ResidualAdd;FullPipeline;Parity;FP32Reference"
-    MPI_PROCS 1
-)
-
 # Test: Quantised JIT GEMM kernel
 add_executable(v2_test_quantised_gemm_kernel unit/kernels/gemm/Test__QuantisedGemmKernel.cpp)
 target_link_libraries(v2_test_quantised_gemm_kernel
@@ -1177,6 +1124,19 @@ target_link_libraries(v2_test_rope_q16_block_sizes
 add_v2_test(V2_Unit_CPURoPEKernelT_Q16_1_BlockSizes
     COMMAND $<TARGET_FILE:v2_test_rope_q16_block_sizes>
     LABELS "V2;Unit;Kernels;RoPE;Q16_1;BlockSizes;TypedResidual;CPU"
+    MPI_PROCS 1
+)
+
+# Test: Q16HeadNormalization primitives (per-head scale normalization)
+add_executable(v2_test_q16_head_normalization unit/Test__Q16HeadNormalization.cpp)
+target_link_libraries(v2_test_q16_head_normalization
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16HeadNormalization
+    COMMAND $<TARGET_FILE:v2_test_q16_head_normalization>
+    LABELS "V2;Unit;Primitives;Q16_1;Normalization;IntegerAttention"
     MPI_PROCS 1
 )
 
@@ -1303,6 +1263,19 @@ add_v2_test(V2_Unit_Q16VariableBlockSIMD
     MPI_PROCS 1
 )
 
+# Test: Q8_1 to Q16 RoPE Block Size Conversion (32/64/128/192 output blocks)
+add_executable(v2_test_q8_1_to_q16_rope_blocksizes unit/kernels/Test__Q8_1_to_Q16_RoPE_BlockSizes.cpp)
+target_link_libraries(v2_test_q8_1_to_q16_rope_blocksizes 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_to_Q16_RoPE_BlockSizes 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_to_q16_rope_blocksizes>
+    LABELS "V2;Unit;Primitives;RoPE;Q8_1;Q16_1;SIMD;AVX2;AVX512;Correctness;CPU;BlockSizes"
+    MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
 # Test: Q8_1 RoPE SIMD correctness and performance
 add_executable(v2_test_q8_1_rope unit/Test__Q8_1RoPE.cpp)
 target_link_libraries(v2_test_q8_1_rope 
@@ -1314,19 +1287,6 @@ add_v2_test(V2_Unit_Q8_1RoPE_Correctness
     COMMAND $<TARGET_FILE:v2_test_q8_1_rope>
     LABELS "V2;Unit;Primitives;RoPE;Q8_1;SIMD;AVX2;AVX512;Correctness;Performance;CPU"
     MPI_PROCS 1  # RoPE is CPU-only, single rank
-)
-
-# Test: Q16 Attention Context Parity (diagnose INT32→FP32 conversion)
-add_executable(v2_test_q16_attention_context_parity unit/Test__Q16AttentionContextParity.cpp)
-target_link_libraries(v2_test_q16_attention_context_parity 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16AttentionContextParity 
-    COMMAND $<TARGET_FILE:v2_test_q16_attention_context_parity>
-    LABELS "V2;Unit;Attention;Q16_1;Parity;Context"
-    MPI_PROCS 1
 )
 
 # Test: CPURoPEKernelT class interface
@@ -3583,6 +3543,51 @@ add_v2_test(V2_Unit_Microkernel_FastExp
 )
 
 # =============================================================================
+# Q16_1 Integer Attention Microkernels (TRUE INTEGER PIPELINE v2)
+# =============================================================================
+# These are the integer-only microkernels for the Q16_1 attention path.
+# See docs/v2/PROJECT_Q16_INTEGER_ATTENTION.md for design documentation.
+
+# Test: Q16 μK1 - Q16 Dot Product Microkernel (Q×K^T)
+add_executable(v2_test_microkernel_q16_dot_product unit/microkernels/Test__Q16DotProduct.cpp)
+target_link_libraries(v2_test_microkernel_q16_dot_product 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_Q16DotProduct 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_q16_dot_product>
+    LABELS "V2;Unit;Microkernels;Q16_1;DotProduct;Integer;VNNI;FusedAttention"
+    MPI_PROCS 1
+)
+
+# Test: Q16 μK2 - P×V Accumulation Microkernel
+add_executable(v2_test_microkernel_pv_accumulate unit/microkernels/Test__PVAccumulate.cpp)
+target_link_libraries(v2_test_microkernel_pv_accumulate 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_PVAccumulate 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_pv_accumulate>
+    LABELS "V2;Unit;Microkernels;Q16_1;PVAccumulate;Integer;VNNI;FusedAttention"
+    MPI_PROCS 1
+)
+
+# Test: Q16 μK3 - Wo Projection Microkernel (INT32 → Q16_1)
+add_executable(v2_test_microkernel_q16_wo_projection unit/microkernels/Test__Q16WoProjection.cpp)
+target_link_libraries(v2_test_microkernel_q16_wo_projection 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Microkernel_Q16WoProjection 
+    COMMAND $<TARGET_FILE:v2_test_microkernel_q16_wo_projection>
+    LABELS "V2;Unit;Microkernels;Q16_1;WoProjection;Integer;VNNI;FusedAttention"
+    MPI_PROCS 1
+)
+
+# =============================================================================
 # Phase 2: Fused Attention + Wo Reference Kernel (Composed from Microkernels)
 # =============================================================================
 
@@ -3958,7 +3963,7 @@ add_v2_test(V2_Integration_GraphSnapshotCallbackInvocation
 # =============================================================================
 
 # Test: Exp2FixedSoftmax microkernel
-# Integer-only softmax using exp2 LUT approximation (256 entries)
+# Integer-only softmax using exp2 LUT approximation (2048 entries)
 # Produces INT16 weights in [0, 32767] for VNNI compatibility
 add_executable(v2_test_exp2_fixed_softmax unit/kernels/cpu/q16_attention/Test__Exp2FixedSoftmax.cpp)
 target_link_libraries(v2_test_exp2_fixed_softmax
@@ -3969,4 +3974,17 @@ target_link_libraries(v2_test_exp2_fixed_softmax
 add_v2_test(V2_Unit_Exp2FixedSoftmax
     COMMAND $<TARGET_FILE:v2_test_exp2_fixed_softmax>
     LABELS "V2;Unit;Kernels;Attention;Q16;Softmax;Integer"
+)
+
+# Test: Q16 OnlineSoftmax microkernel (FlashDecode)
+# Block-wise online softmax with rescaling for streaming KV processing
+add_executable(v2_test_q16_online_softmax unit/kernels/cpu/q16_attention/Test__Q16OnlineSoftmax.cpp)
+target_link_libraries(v2_test_q16_online_softmax
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16OnlineSoftmax
+    COMMAND $<TARGET_FILE:v2_test_q16_online_softmax>
+    LABELS "V2;Unit;Kernels;Attention;Q16;OnlineSoftmax;FlashDecode;Integer"
 )

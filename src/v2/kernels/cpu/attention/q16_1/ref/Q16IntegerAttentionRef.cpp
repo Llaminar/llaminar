@@ -11,6 +11,10 @@
 
 #include "Q16IntegerAttentionRef.h"
 #include "microkernels/Exp2FixedSoftmax.h"
+#include "microkernels/Q16DotProduct.h"
+#include "microkernels/PVAccumulate.h"
+#include "microkernels/WoProjection.h"
+#include "microkernels/OnlineSoftmax.h"
 #include "utils/Assertions.h"
 #include "utils/Logger.h"
 
@@ -48,7 +52,7 @@ namespace llaminar2::kernels::q16_1
         /**
          * @brief Get INT16 value from variable-size block at specified position.
          *
-         * @tparam BlockType One of Q16_1Block_64, Q16_1Block_128, Q16_1Block_192
+         * @tparam BlockType One of Q16_1Block_64, Q16_1Block_128
          */
         template <typename BlockType>
         inline int16_t get_block_value(
@@ -96,59 +100,18 @@ namespace llaminar2::kernels::q16_1
     } // namespace
 
     // ============================================================================
-    // INTEGER Q×K^T Dot Product (VPDPWSSD)
+    // INTEGER Q×K^T Dot Product - Delegated to Q16DotProduct Microkernel
     // ============================================================================
+
+    // NOTE: The actual implementations are in microkernels/Q16DotProduct.h/.cpp
+    // The inline helpers below are retained only for internal dispatch compatibility.
 
     namespace
     {
         /**
-         * @brief Compute single Q×K dot product in pure INT32.
-         *
-         * This is the REAL integer implementation - no FP32 anywhere.
-         * Uses INT16×INT16→INT32 accumulation.
-         *
-         * With 1 block per head (aligned head_dim), we have a single scale pair.
-         */
-        template <typename BlockType>
-        int32_t integer_qk_dot_single(
-            const BlockType *Q_blocks,
-            const BlockType *K_blocks,
-            int q_row,
-            int k_row,
-            int head_dim,
-            int blocks_per_row)
-        {
-            constexpr int BLOCK_SIZE = BlockType::BLOCK_SIZE;
-
-            int32_t acc = 0;
-
-            // For aligned head_dim, we have exactly 1 block
-            // For non-aligned, we iterate over blocks
-            for (int b = 0; b < blocks_per_row; ++b)
-            {
-                const int16_t *q_data = Q_blocks[q_row * blocks_per_row + b].qs;
-                const int16_t *k_data = K_blocks[k_row * blocks_per_row + b].qs;
-
-                // Determine how many elements in this block
-                int start = b * BLOCK_SIZE;
-                int end = std::min(start + BLOCK_SIZE, head_dim);
-                int count = end - start;
-
-                // Pure INT32 accumulation (will be vectorized with VPDPWSSD)
-                for (int i = 0; i < count; ++i)
-                {
-                    acc += static_cast<int32_t>(q_data[i]) * static_cast<int32_t>(k_data[i]);
-                }
-            }
-
-            return acc;
-        }
-
-        /**
          * @brief Compute Q×K^T for all KV positions (Flash Decode).
          *
-         * Output is INT32 scores - NOT scaled to FP32.
-         * Scale application happens once after softmax.
+         * Delegates to the Q16DotProduct microkernel.
          */
         template <typename BlockType>
         void integer_qk_gemv(
@@ -160,29 +123,30 @@ namespace llaminar2::kernels::q16_1
             int head_dim,
             int blocks_per_row)
         {
-// Parallel over KV positions (FLASH DECODE: all at once)
-#pragma omp parallel for schedule(static)
-            for (int k = 0; k < k_count; ++k)
-            {
-                scores[k] = integer_qk_dot_single<BlockType>(
-                    Q_blocks, K_blocks, q_row, k, head_dim, blocks_per_row);
-            }
+            // Get Q pointer for the specified row
+            const BlockType *Q_row = Q_blocks + q_row * blocks_per_row;
+
+            // Delegate to microkernel
+            microkernels::q16_qk_gemv<BlockType>(
+                Q_row, K_blocks, scores,
+                k_count, head_dim, blocks_per_row);
         }
 
     } // namespace
 
     // ============================================================================
-    // INTEGER P×V Accumulation (VPDPWSSD)
+    // INTEGER P×V Accumulation - Delegated to PVAccumulate Microkernel
     // ============================================================================
+
+    // NOTE: The actual implementations are in microkernels/PVAccumulate.h/.cpp
+    // The inline helper below is retained only for internal dispatch compatibility.
 
     namespace
     {
         /**
          * @brief Accumulate P×V in pure INT32.
          *
-         * P (weights) is INT16 [0, 32767] from Exp2FixedSoftmax.
-         * V is Q16_1 blocks with INT16 values.
-         * Output is INT32 accumulator per head dimension.
+         * Delegates to the PVAccumulate microkernel.
          */
         template <typename BlockType>
         void integer_pv_accumulate_impl(
@@ -193,42 +157,43 @@ namespace llaminar2::kernels::q16_1
             int head_dim,
             int blocks_per_row)
         {
-            constexpr int BLOCK_SIZE = BlockType::BLOCK_SIZE;
-
-            // Initialize context accumulator to zero
-            std::memset(context, 0, head_dim * sizeof(int32_t));
-
-            // For each KV position
-            for (int k = 0; k < kv_len; ++k)
-            {
-                int16_t w = weights[k];
-                if (w == 0)
-                    continue; // Skip masked/zero weights
-
-                // For each block in head
-                for (int b = 0; b < blocks_per_row; ++b)
-                {
-                    const int16_t *v_data = V_blocks[k * blocks_per_row + b].qs;
-
-                    int start = b * BLOCK_SIZE;
-                    int end = std::min(start + BLOCK_SIZE, head_dim);
-                    int count = end - start;
-
-                    // Pure INT32 accumulation: context[d] += w × v[d]
-                    for (int i = 0; i < count; ++i)
-                    {
-                        context[start + i] += static_cast<int32_t>(w) * static_cast<int32_t>(v_data[i]);
-                    }
-                }
-            }
+            // Delegate to microkernel
+            microkernels::q16_pv_accumulate<BlockType>(
+                weights, V_blocks, context,
+                kv_len, head_dim, blocks_per_row);
         }
 
     } // namespace
 
     // ============================================================================
-    // Flash Decode Implementation (seq_len_q = 1)
+    // Flash Decode Implementation (seq_len_q = 1) - Online Softmax
     // ============================================================================
 
+    /**
+     * @brief TRUE FlashDecode with online softmax - block-at-a-time processing.
+     *
+     * This is the memory-efficient FlashDecode algorithm:
+     * - Processes KV cache in blocks (default 32 positions)
+     * - Maintains online softmax state (running max, sum, context)
+     * - Never materializes full [kv_len] scores array
+     * - Rescales previous context when running max changes
+     *
+     * Algorithm:
+     *   m = -inf, l = 0, O = 0
+     *   for each KV block:
+     *     scores = Q × K[block]^T
+     *     m_new = max(m, max(scores))
+     *     if m_new > m:
+     *       correction = exp(m - m_new)
+     *       l *= correction
+     *       O *= correction
+     *     for k in block:
+     *       w = exp(scores[k] - m_new)
+     *       l += w
+     *       O += w * V[k]
+     *     m = m_new
+     *   output = O / l
+     */
     bool q16_integer_attention_decode(const Q16IntegerAttentionParams &params)
     {
         // Validate
@@ -244,11 +209,20 @@ namespace llaminar2::kernels::q16_1
         const int head_dim = params.head_dim;
         const int blocks_per_row = params.q_blocks_per_row();
 
-        // Allocate per-thread scratch buffers
-        // TODO(v2): These should come from a buffer pool
-        std::vector<int32_t> scores(kv_len);
-        std::vector<int16_t> weights(kv_len);
+        // FlashDecode block size
+        constexpr int KV_BLOCK_SIZE = microkernels::FLASH_DECODE_KV_BLOCK_SIZE;
+
+        // Per-head scratch buffers (small, fixed size)
+        std::vector<int32_t> scores_scratch(KV_BLOCK_SIZE);
+        std::vector<int32_t> weights_scratch(KV_BLOCK_SIZE);
         std::vector<int32_t> context(head_dim);
+
+        // For snapshots: need to accumulate all weights if requested
+        std::vector<int32_t> all_weights_unnorm;
+        if (params.snapshot_weights || params.snapshot_scores)
+        {
+            all_weights_unnorm.resize(kv_len, 0);
+        }
 
         // Process each head
         for (int h = 0; h < num_heads; ++h)
@@ -259,51 +233,82 @@ namespace llaminar2::kernels::q16_1
             float qk_scale = params.get_qk_scale(h, kv_h);
             float pv_scale = params.get_pv_scale(kv_h);
 
+            // Initialize online softmax state
+            microkernels::OnlineSoftmaxState state;
+            state.frac_bits = 11;
+            state.lut_value_bits = 30;
+
+            // Zero context
+            std::memset(context.data(), 0, head_dim * sizeof(int32_t));
+
             // ================================================================
-            // Step 1: Q×K^T → INT32 scores (pure integer)
+            // FlashDecode: Process KV cache in blocks
             // ================================================================
 
-            // Dispatch based on block size
             switch (params.block_size)
             {
             case Q16BlockSize::BLOCK_64:
             {
                 auto Q = reinterpret_cast<const Q16_1Block_64 *>(params.Q);
                 auto K = reinterpret_cast<const Q16_1Block_64 *>(params.K);
-                // Get head's Q and K pointers
-                // Layout: [seq_len, num_heads, blocks_per_row]
-                const Q16_1Block_64 *Q_head = Q + h * blocks_per_row;
-                const Q16_1Block_64 *K_head = K + kv_h * blocks_per_row;
+                auto V = reinterpret_cast<const Q16_1Block_64 *>(params.V);
 
-                // TODO(v2): Handle multi-head layout properly
-                // For now, assume Q is [1, num_heads, head_dim] flattened
-                integer_qk_gemv<Q16_1Block_64>(
-                    Q_head, K_head, scores.data(),
-                    0, kv_len, head_dim, blocks_per_row);
+                const Q16_1Block_64 *Q_head = Q + h * blocks_per_row;
+                const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
+                const Q16_1Block_64 *V_head = V + kv_h * kv_len * blocks_per_row;
+
+                // Process in blocks
+                for (int kv_start = 0; kv_start < kv_len; kv_start += KV_BLOCK_SIZE)
+                {
+                    int block_size = std::min(KV_BLOCK_SIZE, kv_len - kv_start);
+
+                    microkernels::flash_decode_process_kv_block<Q16_1Block_64>(
+                        Q_head, K_head, V_head,
+                        context.data(), state,
+                        scores_scratch.data(), weights_scratch.data(),
+                        kv_start, block_size,
+                        head_dim, blocks_per_row, qk_scale);
+
+                    // Capture unnormalized weights for snapshot
+                    if (params.snapshot_weights || params.snapshot_scores)
+                    {
+                        for (int i = 0; i < block_size; ++i)
+                        {
+                            all_weights_unnorm[kv_start + i] = weights_scratch[i];
+                        }
+                    }
+                }
                 break;
             }
             case Q16BlockSize::BLOCK_128:
             {
                 auto Q = reinterpret_cast<const Q16_1Block_128 *>(params.Q);
                 auto K = reinterpret_cast<const Q16_1Block_128 *>(params.K);
+                auto V = reinterpret_cast<const Q16_1Block_128 *>(params.V);
+
                 const Q16_1Block_128 *Q_head = Q + h * blocks_per_row;
-                const Q16_1Block_128 *K_head = K + kv_h * blocks_per_row;
+                const Q16_1Block_128 *K_head = K + kv_h * kv_len * blocks_per_row;
+                const Q16_1Block_128 *V_head = V + kv_h * kv_len * blocks_per_row;
 
-                integer_qk_gemv<Q16_1Block_128>(
-                    Q_head, K_head, scores.data(),
-                    0, kv_len, head_dim, blocks_per_row);
-                break;
-            }
-            case Q16BlockSize::BLOCK_192:
-            {
-                auto Q = reinterpret_cast<const Q16_1Block_192 *>(params.Q);
-                auto K = reinterpret_cast<const Q16_1Block_192 *>(params.K);
-                const Q16_1Block_192 *Q_head = Q + h * blocks_per_row;
-                const Q16_1Block_192 *K_head = K + kv_h * blocks_per_row;
+                for (int kv_start = 0; kv_start < kv_len; kv_start += KV_BLOCK_SIZE)
+                {
+                    int block_size = std::min(KV_BLOCK_SIZE, kv_len - kv_start);
 
-                integer_qk_gemv<Q16_1Block_192>(
-                    Q_head, K_head, scores.data(),
-                    0, kv_len, head_dim, blocks_per_row);
+                    microkernels::flash_decode_process_kv_block<Q16_1Block_128>(
+                        Q_head, K_head, V_head,
+                        context.data(), state,
+                        scores_scratch.data(), weights_scratch.data(),
+                        kv_start, block_size,
+                        head_dim, blocks_per_row, qk_scale);
+
+                    if (params.snapshot_weights || params.snapshot_scores)
+                    {
+                        for (int i = 0; i < block_size; ++i)
+                        {
+                            all_weights_unnorm[kv_start + i] = weights_scratch[i];
+                        }
+                    }
+                }
                 break;
             }
             default:
@@ -312,27 +317,25 @@ namespace llaminar2::kernels::q16_1
             }
 
             // ================================================================
-            // Step 2: Softmax → INT16 weights (Exp2FixedSoftmax LUT)
+            // Finalize: Normalize context by sum of weights
             // ================================================================
 
-            int32_t weight_sum = 0;
-
-            // The exp2_softmax_int32 takes INT32 scores and produces INT16 weights
-            // It needs the alpha (qk_scale) to compute exp(-alpha * delta)
-            microkernels::exp2_softmax_int32(
-                scores.data(),
-                weights.data(),
-                kv_len,
-                qk_scale, // Combined QK scale
-                &weight_sum);
+            // Context is currently: Σ (w_unnorm * V) where w_unnorm are in LUT precision
+            // Final context = context / l (the running sum)
 
             // Snapshot: pre-softmax scores (if requested)
+            // Note: In online softmax, we don't have raw scores after the fact
+            // We store the final max and reconstruct approximate scores
             if (params.snapshot_scores)
             {
                 for (int k = 0; k < kv_len; ++k)
                 {
-                    params.snapshot_scores[h * kv_len + k] =
-                        static_cast<float>(scores[k]) * qk_scale;
+                    // Reconstruct approximate score from weight
+                    // This is lossy but useful for debugging
+                    float w_approx = static_cast<float>(all_weights_unnorm[k]) /
+                                     static_cast<float>(1U << state.lut_value_bits);
+                    float score_approx = (w_approx > 0) ? (-std::log2(w_approx) / qk_scale + state.m) : 0;
+                    params.snapshot_scores[h * kv_len + k] = score_approx * qk_scale;
                 }
             }
 
@@ -341,59 +344,25 @@ namespace llaminar2::kernels::q16_1
             {
                 for (int k = 0; k < kv_len; ++k)
                 {
-                    params.snapshot_weights[h * kv_len + k] =
-                        static_cast<float>(weights[k]) / static_cast<float>(WEIGHT_MAX);
+                    // Normalize to [0, 1]
+                    float w_norm = (state.l > 0)
+                                       ? static_cast<float>(all_weights_unnorm[k]) / static_cast<float>(state.l)
+                                       : 0.0f;
+                    params.snapshot_weights[h * kv_len + k] = w_norm;
                 }
             }
 
-            // ================================================================
-            // Step 3: P×V → INT32 context (pure integer)
-            // ================================================================
-
-            switch (params.block_size)
-            {
-            case Q16BlockSize::BLOCK_64:
-            {
-                auto V = reinterpret_cast<const Q16_1Block_64 *>(params.V);
-                const Q16_1Block_64 *V_head = V + kv_h * blocks_per_row;
-
-                integer_pv_accumulate_impl<Q16_1Block_64>(
-                    weights.data(), V_head, context.data(),
-                    kv_len, head_dim, blocks_per_row);
-                break;
-            }
-            case Q16BlockSize::BLOCK_128:
-            {
-                auto V = reinterpret_cast<const Q16_1Block_128 *>(params.V);
-                const Q16_1Block_128 *V_head = V + kv_h * blocks_per_row;
-
-                integer_pv_accumulate_impl<Q16_1Block_128>(
-                    weights.data(), V_head, context.data(),
-                    kv_len, head_dim, blocks_per_row);
-                break;
-            }
-            case Q16BlockSize::BLOCK_192:
-            {
-                auto V = reinterpret_cast<const Q16_1Block_192 *>(params.V);
-                const Q16_1Block_192 *V_head = V + kv_h * blocks_per_row;
-
-                integer_pv_accumulate_impl<Q16_1Block_192>(
-                    weights.data(), V_head, context.data(),
-                    kv_len, head_dim, blocks_per_row);
-                break;
-            }
-            default:
-                return false;
-            }
-
             // Snapshot: attention context (if requested)
-            // Convert INT32 context to FP32 for debugging
+            // Context needs to be divided by l and scaled
             if (params.snapshot_context)
             {
+                float context_scale = (state.l > 0)
+                                          ? pv_scale / static_cast<float>(state.l >> (state.lut_value_bits - 15))
+                                          : 0.0f;
                 for (int d = 0; d < head_dim; ++d)
                 {
                     params.snapshot_context[h * head_dim + d] =
-                        static_cast<float>(context[d]) * pv_scale;
+                        static_cast<float>(context[d]) * context_scale;
                 }
             }
 
@@ -531,32 +500,10 @@ namespace llaminar2::kernels::q16_1
         int head_dim,
         Q16BlockSize block_size)
     {
-        int bpr = blocks_per_row(head_dim, block_size);
-
-        switch (block_size)
-        {
-        case Q16BlockSize::BLOCK_64:
-            integer_qk_gemv<Q16_1Block_64>(
-                reinterpret_cast<const Q16_1Block_64 *>(Q),
-                reinterpret_cast<const Q16_1Block_64 *>(K),
-                scores, 0, k_count, head_dim, bpr);
-            break;
-        case Q16BlockSize::BLOCK_128:
-            integer_qk_gemv<Q16_1Block_128>(
-                reinterpret_cast<const Q16_1Block_128 *>(Q),
-                reinterpret_cast<const Q16_1Block_128 *>(K),
-                scores, 0, k_count, head_dim, bpr);
-            break;
-        case Q16BlockSize::BLOCK_192:
-            integer_qk_gemv<Q16_1Block_192>(
-                reinterpret_cast<const Q16_1Block_192 *>(Q),
-                reinterpret_cast<const Q16_1Block_192 *>(K),
-                scores, 0, k_count, head_dim, bpr);
-            break;
-        default:
-            LOG_ERROR("Unsupported block size for QK dotproduct: " << static_cast<int>(block_size));
-            break;
-        }
+        // Delegate to microkernel dispatch
+        microkernels::q16_qk_gemv_dispatch(
+            Q, K, scores,
+            k_count, head_dim, block_size);
     }
 
     void q16_integer_pv_accumulate(
@@ -567,32 +514,10 @@ namespace llaminar2::kernels::q16_1
         int head_dim,
         Q16BlockSize block_size)
     {
-        int bpr = blocks_per_row(head_dim, block_size);
-
-        switch (block_size)
-        {
-        case Q16BlockSize::BLOCK_64:
-            integer_pv_accumulate_impl<Q16_1Block_64>(
-                weights,
-                reinterpret_cast<const Q16_1Block_64 *>(V),
-                context, kv_len, head_dim, bpr);
-            break;
-        case Q16BlockSize::BLOCK_128:
-            integer_pv_accumulate_impl<Q16_1Block_128>(
-                weights,
-                reinterpret_cast<const Q16_1Block_128 *>(V),
-                context, kv_len, head_dim, bpr);
-            break;
-        case Q16BlockSize::BLOCK_192:
-            integer_pv_accumulate_impl<Q16_1Block_192>(
-                weights,
-                reinterpret_cast<const Q16_1Block_192 *>(V),
-                context, kv_len, head_dim, bpr);
-            break;
-        default:
-            LOG_ERROR("Unsupported block size for PV accumulate: " << static_cast<int>(block_size));
-            break;
-        }
+        // Delegate to microkernel dispatch
+        microkernels::q16_pv_accumulate_dispatch(
+            weights, V, context,
+            kv_len, head_dim, block_size);
     }
 
 } // namespace llaminar2::kernels::q16_1

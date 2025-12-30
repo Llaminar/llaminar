@@ -153,6 +153,18 @@ namespace llaminar2
             schema.name = "qwen2";
             schema.version = "1.0";
 
+            // ==============================================================
+            // Quantization Configuration
+            // ==============================================================
+            // Use default kv_cache_scale of 8.0 (±8.0 range)
+            // This conservative fixed scale covers typical Qwen2 K/V activations
+            // with ~2× headroom. Post-RMSNorm activations typically fall in [-3, 3].
+            //
+            // For tighter precision (if profiling shows smaller activation range):
+            //   schema.kv_cache_scale = 4.0f;  // ±4.0 range, better precision
+            //
+            // schema.kv_cache_scale = 8.0f;  // Default, explicit for documentation
+
             // Required parameters
             schema.required_params = {
                 "n_layers", "d_model", "n_heads", "n_kv_heads",

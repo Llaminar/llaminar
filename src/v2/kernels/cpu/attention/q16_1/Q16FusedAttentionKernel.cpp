@@ -15,53 +15,9 @@ namespace llaminar2
     {
 
         // =================================================================
-        // Parameter Conversion
+        // NOTE: Q16_INTEGER backend is a stub - v2 implementation in progress
+        // See: ref/Q16IntegerAttentionRef.h for the new API
         // =================================================================
-
-        Q16FusedAttentionWoResidualParams Q16FusedAttentionKernel::convert_params(
-            const FusedAttentionWoParams &params) const
-        {
-            Q16FusedAttentionWoResidualParams q16_params;
-
-            // Attention tensors (cast from void* to Q16_1Block*)
-            q16_params.Q = static_cast<const Q16_1Block *>(params.Q);
-            q16_params.K = static_cast<const Q16_1Block *>(params.K);
-            q16_params.V = static_cast<const Q16_1Block *>(params.V);
-
-            // Wo projection weights (VNNI-packed)
-            q16_params.Wo_packed = params.Wo_packed;
-
-            // Residual tensors
-            q16_params.residual_in = static_cast<const Q16_1Block *>(params.residual_in);
-            q16_params.residual_out = static_cast<Q16_1Block *>(params.residual_out);
-
-            // Dimensions
-            q16_params.seq_len_q = params.seq_len_q;
-            q16_params.kv_len = params.kv_len;
-            q16_params.num_heads = params.n_heads;
-            q16_params.num_kv_heads = params.n_kv_heads;
-            q16_params.head_dim = params.head_dim;
-            q16_params.d_model = params.d_model;
-
-            // Attention config
-            q16_params.scale = params.scale;
-            q16_params.causal = params.causal;
-            q16_params.position_offset = params.position_offset;
-
-            // Tiling parameters
-            q16_params.Bc = params.Bc;
-            q16_params.Br = params.Br;
-
-            // Snapshot buffers
-            q16_params.context_snapshot = params.context_snapshot;
-            q16_params.attention_output_snapshot = params.wo_output_snapshot;
-            q16_params.attention_residual_snapshot = params.attention_residual_snapshot;
-
-            // Debug metadata
-            q16_params.layer_idx = params.layer_idx;
-
-            return q16_params;
-        }
 
         // =================================================================
         // Parameter Validation
@@ -158,12 +114,11 @@ namespace llaminar2
                 return false;
             }
 
-            // Convert to Q16 params and dispatch
-            Q16FusedAttentionWoResidualParams q16_params = convert_params(params);
-
-            // TODO: When JIT kernels are ready, dispatch to them when use_jit_ is true
-            // For now, always use reference implementation
-            return q16_fused_attention_wo_residual_reference(q16_params);
+            // STUB: Q16_INTEGER backend v2 implementation in progress
+            // The new API uses Q16IntegerAttentionParams with model-aware block sizes.
+            // See: ref/Q16IntegerAttentionRef.h and docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md
+            LOG_ERROR("Q16FusedAttentionKernel: Q16_INTEGER backend not yet implemented (v2 in progress)");
+            return false;
         }
 
         bool Q16FusedAttentionKernel::compute_decode(

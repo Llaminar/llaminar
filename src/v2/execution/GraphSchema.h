@@ -401,6 +401,30 @@ namespace llaminar2
 
         /// Parameter names that must be provided at resolution time
         std::vector<std::string> required_params; // ["n_layers", "d_model", "n_heads", ...]
+
+        // =================================================================
+        // Quantization Configuration
+        // =================================================================
+
+        /// KV cache scale for Q16_1 quantized attention (default: ±8.0 range)
+        ///
+        /// This is a "Conservative Fixed Scale" approach to avoid the "growing scale"
+        /// problem where new tokens with larger activations would require re-quantizing
+        /// the entire KV cache.
+        ///
+        /// The scale value represents the maximum absolute value that can be represented
+        /// without clipping: [-kv_cache_scale, +kv_cache_scale].
+        ///
+        /// Default of 8.0 covers typical K/V activation ranges with headroom:
+        /// - Post-RMSNorm activations typically fall in [-3, 3]
+        /// - K/V projections can amplify slightly
+        /// - 8.0 provides ~2× headroom over typical maximum values
+        ///
+        /// Architecture-specific overrides:
+        /// - Models with known activation ranges can use tighter scales for precision
+        /// - Use KV activation profiling tool (python/tools/profile_kv_activations.py)
+        ///   to determine optimal scales for specific models
+        float kv_cache_scale = 8.0f;
     };
 
     // =========================================================================

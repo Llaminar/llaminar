@@ -66,16 +66,6 @@ TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock128)
     EXPECT_EQ(tensor->blocks_per_row(), 1); // 128 / 128 = 1
 }
 
-TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock192)
-{
-    auto tensor = factory_->createQ16_1({4, 192}, Q16BlockSize::BLOCK_192, -1);
-
-    ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->block_size(), 192);
-    EXPECT_EQ(tensor->q16_block_size(), Q16BlockSize::BLOCK_192);
-    EXPECT_EQ(tensor->blocks_per_row(), 1); // 192 / 192 = 1
-}
-
 // =============================================================================
 // Device Index Tests (ensure block_size overload respects device_idx)
 // =============================================================================
@@ -121,14 +111,6 @@ TEST_F(Test__TensorFactory_Q16BlockSize, MemorySizesCorrect)
         EXPECT_EQ(tensor->size_bytes(), rows * 1 * sizeof(Q16_1Block_128));
         EXPECT_EQ(tensor->size_bytes(), rows * 264);
     }
-
-    // BLOCK_192: 392 bytes per block, 1 block per row for 192-elem rows
-    {
-        auto tensor = factory_->createQ16_1({rows, 192}, Q16BlockSize::BLOCK_192, -1);
-        ASSERT_NE(tensor, nullptr);
-        EXPECT_EQ(tensor->size_bytes(), rows * 1 * sizeof(Q16_1Block_192));
-        EXPECT_EQ(tensor->size_bytes(), rows * 392);
-    }
 }
 
 // =============================================================================
@@ -171,23 +153,9 @@ TEST_F(Test__TensorFactory_Q16BlockSize, Llama3_HeadDim128)
     EXPECT_EQ(tensor->total_blocks(), n_heads);
 }
 
-TEST_F(Test__TensorFactory_Q16BlockSize, DeepSeekV3_MLA_HeadDim192)
-{
-    // DeepSeek V3 MLA: Q/K head_dim=192 (128 nope + 64 rope)
-    const size_t batch_size = 1;
-    const size_t n_heads = 16;
-    const size_t head_dim = 192;
-
-    auto tensor = factory_->createQ16_1(
-        {batch_size * n_heads, head_dim},
-        Q16BlockSize::BLOCK_192,
-        -1);
-
-    ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->block_size(), 192);
-    EXPECT_EQ(tensor->blocks_per_row(), 1); // One block per head
-    EXPECT_EQ(tensor->total_blocks(), n_heads);
-}
+// Note: DeepSeek V3 MLA uses separate NOPE (head_dim=128) + ROPE (head_dim=64)
+// tensors with independent scales, not a combined 192-dim block.
+// See PROJECT_Q16_INTEGER_ATTENTION_V2.md MLA Architecture section.
 
 // =============================================================================
 // Multiple Blocks Per Row Tests
@@ -200,14 +168,6 @@ TEST_F(Test__TensorFactory_Q16BlockSize, MultipleBlocksPerRow)
     // 256 elements with BLOCK_128 = 2 blocks per row
     {
         auto tensor = factory_->createQ16_1({rows, 256}, Q16BlockSize::BLOCK_128, -1);
-        ASSERT_NE(tensor, nullptr);
-        EXPECT_EQ(tensor->blocks_per_row(), 2);
-        EXPECT_EQ(tensor->total_blocks(), rows * 2);
-    }
-
-    // 384 elements with BLOCK_192 = 2 blocks per row
-    {
-        auto tensor = factory_->createQ16_1({rows, 384}, Q16BlockSize::BLOCK_192, -1);
         ASSERT_NE(tensor, nullptr);
         EXPECT_EQ(tensor->blocks_per_row(), 2);
         EXPECT_EQ(tensor->total_blocks(), rows * 2);

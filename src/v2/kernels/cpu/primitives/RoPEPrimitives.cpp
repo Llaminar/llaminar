@@ -3899,7 +3899,6 @@ namespace llaminar2::primitives
     template void apply_rope_q16_integer_head_scalar<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head_scalar<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head_scalar<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
-    template void apply_rope_q16_integer_head_scalar<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
 
 #if defined(__AVX2__) || defined(__AVX512F__)
     /**
@@ -4155,7 +4154,6 @@ namespace llaminar2::primitives
     template void apply_rope_q16_integer_head_avx2<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head_avx2<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head_avx2<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
-    template void apply_rope_q16_integer_head_avx2<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
 #endif // __AVX2__
 
 #if defined(__AVX512F__)
@@ -4376,7 +4374,6 @@ namespace llaminar2::primitives
     template void apply_rope_q16_integer_head_avx512<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head_avx512<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head_avx512<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
-    template void apply_rope_q16_integer_head_avx512<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
 #endif // __AVX512F__
 
     /**
@@ -4404,7 +4401,6 @@ namespace llaminar2::primitives
     template void apply_rope_q16_integer_head<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
     template void apply_rope_q16_integer_head<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
-    template void apply_rope_q16_integer_head<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
 
     /**
      * @brief Templated high-level RoPE wrapper for Q16 tensors
@@ -4517,7 +4513,6 @@ namespace llaminar2::primitives
     template void apply_rope_q16_integer<Q16_1Block>(Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, RoPEPersistentState *);
     template void apply_rope_q16_integer<Q16_1Block_64>(Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, RoPEPersistentState *);
     template void apply_rope_q16_integer<Q16_1Block_128>(Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, RoPEPersistentState *);
-    template void apply_rope_q16_integer<Q16_1Block_192>(Q16_1Block_192 *, Q16_1Block_192 *, const int *, int, int, int, int, float, RoPEPersistentState *);
 
     /**
      * @brief Runtime dispatch for Q16 RoPE based on Q16BlockSize enum
@@ -4554,14 +4549,724 @@ namespace llaminar2::primitives
                 static_cast<Q16_1Block_128 *>(K),
                 position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
             break;
-        case Q16BlockSize::BLOCK_192:
-            apply_rope_q16_integer<Q16_1Block_192>(
-                static_cast<Q16_1Block_192 *>(Q),
-                static_cast<Q16_1Block_192 *>(K),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
-            break;
         default:
             LOG_ERROR("apply_rope_q16_integer_dispatch: unsupported block size");
+            break;
+        }
+    }
+
+    // ============================================================================
+    // Templated Q8_1 → Q16 RoPE Conversion (Variable Output Block Size)
+    // ============================================================================
+    //
+    // These functions convert Q8_1 input blocks to variable-size Q16 output blocks
+    // with per-head scale normalization. The key insight is:
+    //
+    // - Input: Always Q8_1Block (32-element), with head_dim/32 blocks per head
+    // - Output: OutBlockType template, with head_dim/BLOCK_SIZE blocks per head
+    // - Scale: Single scale per head (max |dequant| across all input blocks)
+    // - Returns: Head scale for use in attention score computation
+    //
+    // For optimal performance, choose OutBlockType::BLOCK_SIZE == head_dim to get
+    // 1 output block per head, eliminating multi-block scale mixing in attention.
+    // ============================================================================
+
+    /**
+     * @brief Scalar implementation: Q8_1 → Q16 per-head RoPE conversion (INTEGER ARITHMETIC)
+     *
+     * Pure integer implementation using Q8 fixed-point scale ratios:
+     * 1. Finds max |dequantized value| across all Q8_1 input blocks (common scale)
+     * 2. Computes Q8 fixed-point scale ratios: ratio_q8 = (block_scale / common_scale) * 256
+     * 3. For each element pair (first half, second half of head):
+     *    - Scales int8 to int16 range: scaled = int8_qs * ratio_q8
+     *    - Applies RoPE rotation using Q15 sin/cos and int64 intermediates
+     *    - Result: (scaled_a * cos_q15 - scaled_b * sin_q15) >> 15
+     * 4. Writes to output blocks with unified scale
+     *
+     * Integer math avoids FP32 intermediate buffers - rotation happens in-place.
+     *
+     * @tparam OutBlockType Q16 output block type
+     * @return Head scale factor (common_scale)
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head_scalar(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
+        const int q8_blocks_per_head = head_dim / 32;
+        const int q16_blocks_per_head = head_dim / OUT_BLOCK_SIZE;
+        const int half_dim = head_dim / 2;
+
+        // Step 1: Compute common scale (max |dequant| across all Q8_1 blocks)
+        // This is the only FP32 step - needed to determine unified output scale
+        float max_abs = 0.0f;
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const float block_scale = fp16_to_fp32_rope(q8_in[b].d);
+            for (int i = 0; i < 32; ++i)
+            {
+                float val = static_cast<float>(q8_in[b].qs[i]) * block_scale;
+                max_abs = std::max(max_abs, std::abs(val));
+            }
+        }
+        if (max_abs < 1e-20f)
+            max_abs = 1e-20f;
+
+        // common_scale: normalized so max_abs / common_scale ≈ 127
+        const float common_scale = max_abs / 127.0f;
+
+        // Step 2: Compute Q8 fixed-point scale ratios for each input block
+        // ratio_q8 = (block_scale / common_scale) * 256, range [0, 256]
+        std::vector<int16_t> ratio_q8(q8_blocks_per_head);
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const float block_scale = fp16_to_fp32_rope(q8_in[b].d);
+            const float ratio = block_scale / common_scale;
+            ratio_q8[b] = static_cast<int16_t>(std::round(ratio * 256.0f));
+        }
+
+        // Step 3: Scale int8 inputs to int16 range using Q8 ratios
+        // scaled[i] = int8_qs[i] * ratio_q8, range ~[-32768, 32767]
+        std::vector<int32_t> scaled(head_dim);
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const int16_t r = ratio_q8[b];
+            for (int i = 0; i < 32; ++i)
+            {
+                scaled[b * 32 + i] = static_cast<int32_t>(q8_in[b].qs[i]) * r;
+            }
+        }
+
+        // Step 4: Apply RoPE rotation using pure integer arithmetic
+        // out_a = (scaled_a * cos_q15 - scaled_b * sin_q15) >> 23
+        // out_b = (scaled_a * sin_q15 + scaled_b * cos_q15) >> 23
+        // The >> 23 accounts for: Q15 sin/cos (>>15) + Q8 ratio (>>8) = >>23
+        // Using int64 intermediates to avoid overflow:
+        // scaled range: ~[-32768, 32767], cos/sin_q15 range: [-32767, 32767]
+        // Product range: ~[-1B, 1B], sum range: ~[-2B, 2B] - fits int64
+        std::vector<int16_t> rotated(head_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            const int64_t a = scaled[i];
+            const int64_t b = scaled[i + half_dim];
+            const int64_t c = cos_q15[i];
+            const int64_t s = sin_q15[i];
+
+            // Rotation with symmetric rounding
+            // Note: We shift by 15 (not 23) to preserve full int16 range utilization.
+            // The extra factor of 256 from ratio_q8 is absorbed into the output scale.
+            int64_t out_a = a * c - b * s;
+            int64_t out_b = a * s + b * c;
+
+            // Symmetric rounding for >> 15
+            out_a = (out_a + (1 << 14)) >> 15;
+            out_b = (out_b + (1 << 14)) >> 15;
+
+            // Clamp to int16 range
+            out_a = std::max(static_cast<int64_t>(-32767), std::min(static_cast<int64_t>(32767), out_a));
+            out_b = std::max(static_cast<int64_t>(-32767), std::min(static_cast<int64_t>(32767), out_b));
+
+            rotated[i] = static_cast<int16_t>(out_a);
+            rotated[i + half_dim] = static_cast<int16_t>(out_b);
+        }
+
+        // Step 5: Write to Q16 output blocks with unified scale
+        // Scale is divided by 256 to account for the ratio_q8 factor preserved in rotated values
+        const float output_scale = common_scale / 256.0f;
+        for (int b = 0; b < q16_blocks_per_head; ++b)
+        {
+            OutBlockType &out_block = q16_out[b];
+            out_block.d = output_scale;
+            int32_t sum_qs = 0;
+
+            for (int i = 0; i < OUT_BLOCK_SIZE; ++i)
+            {
+                const int elem_idx = b * OUT_BLOCK_SIZE + i;
+                out_block.qs[i] = rotated[elem_idx];
+                sum_qs += rotated[elem_idx];
+            }
+
+            out_block.sum_qs = sum_qs;
+        }
+
+        return output_scale;
+    }
+
+    // Explicit instantiations for scalar
+    template float apply_rope_q8_1_to_q16_head_scalar<Q16_1Block>(const Q8_1Block *, Q16_1Block *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head_scalar<Q16_1Block_64>(const Q8_1Block *, Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head_scalar<Q16_1Block_128>(const Q8_1Block *, Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+    /**
+     * @brief AVX2 implementation: Q8_1 → Q16 per-head RoPE conversion
+     *
+     * Optimized vectorized version using int16 arithmetic and vpmaddwd.
+     * Avoids scalar int64 math by using 32-bit intermediate accumulation.
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head_avx2(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+#if defined(__AVX2__)
+        constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
+        const int q8_blocks_per_head = head_dim / 32;
+        const int q16_blocks_per_head = head_dim / OUT_BLOCK_SIZE;
+        const int half_dim = head_dim / 2;
+
+        // Step 1: Compute common scale using AVX2
+        __m256 vmax = _mm256_setzero_ps();
+        const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const float block_scale = fp16_to_fp32_rope(q8_in[b].d);
+            const __m256 vscale = _mm256_set1_ps(block_scale);
+
+            for (int chunk = 0; chunk < 4; ++chunk)
+            {
+                const __m128i bytes8 = _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(q8_in[b].qs + chunk * 8));
+                const __m256i i32 = _mm256_cvtepi8_epi32(bytes8);
+                const __m256 f32 = _mm256_cvtepi32_ps(i32);
+                const __m256 scaled = _mm256_mul_ps(f32, vscale);
+                const __m256 abs_val = _mm256_andnot_ps(sign_mask, scaled);
+                vmax = _mm256_max_ps(vmax, abs_val);
+            }
+        }
+
+        // Horizontal max reduction
+        __m128 hi = _mm256_extractf128_ps(vmax, 1);
+        __m128 lo = _mm256_castps256_ps128(vmax);
+        __m128 m = _mm_max_ps(lo, hi);
+        m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(2, 3, 0, 1)));
+        m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1, 0, 3, 2)));
+        float max_abs = _mm_cvtss_f32(m);
+        if (max_abs < 1e-20f)
+            max_abs = 1e-20f;
+
+        const float common_scale = max_abs / 127.0f;
+
+        // Step 2 & 3: RoPE rotation using vectorized int16 arithmetic
+        alignas(32) int16_t rotated[256]; // Max head_dim = 192
+
+        const __m256i bias = _mm256_set1_epi32(1 << 14); // For >> 15 rounding
+        const __m256i zero = _mm256_setzero_si256();
+
+        for (int i = 0; i < half_dim; i += 16)
+        {
+            int blk_a = i / 32;
+            int blk_b = (i + half_dim) / 32;
+            int off_a = i % 32;
+            int off_b = (i + half_dim) % 32;
+
+            // Compute ratios
+            float scale_a = fp16_to_fp32_rope(q8_in[blk_a].d);
+            float scale_b = fp16_to_fp32_rope(q8_in[blk_b].d);
+
+            int32_t ratio_a_val = static_cast<int32_t>(std::round((scale_a / common_scale) * 256.0f));
+            int32_t ratio_b_val = static_cast<int32_t>(std::round((scale_b / common_scale) * 256.0f));
+
+            // Clamp to 256 to ensure int16 fit
+            ratio_a_val = std::min(256, ratio_a_val);
+            ratio_b_val = std::min(256, ratio_b_val);
+
+            __m256i vratio_a = _mm256_set1_epi16(static_cast<int16_t>(ratio_a_val));
+            __m256i vratio_b = _mm256_set1_epi16(static_cast<int16_t>(ratio_b_val));
+
+            // Load 16 int8s
+            __m128i a_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q8_in[blk_a].qs + off_a));
+            __m128i b_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q8_in[blk_b].qs + off_b));
+
+            // Convert to int16 and scale
+            __m256i a_16 = _mm256_cvtepi8_epi16(a_bytes);
+            __m256i b_16 = _mm256_cvtepi8_epi16(b_bytes);
+            __m256i scaled_a = _mm256_mullo_epi16(a_16, vratio_a);
+            __m256i scaled_b = _mm256_mullo_epi16(b_16, vratio_b);
+
+            // Interleave a and b
+            __m256i ab_lo = _mm256_unpacklo_epi16(scaled_a, scaled_b);
+            __m256i ab_hi = _mm256_unpackhi_epi16(scaled_a, scaled_b);
+
+            // Load trig
+            __m256i cos_val = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cos_q15 + i));
+            __m256i sin_val = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(sin_q15 + i));
+            __m256i neg_sin_val = _mm256_sub_epi16(zero, sin_val);
+
+            // Interleave trig for out_a = a*c - b*s = a*c + b*(-s)
+            __m256i cs_minus_lo = _mm256_unpacklo_epi16(cos_val, neg_sin_val);
+            __m256i cs_minus_hi = _mm256_unpackhi_epi16(cos_val, neg_sin_val);
+
+            // Interleave trig for out_b = a*s + b*c
+            __m256i sc_lo = _mm256_unpacklo_epi16(sin_val, cos_val);
+            __m256i sc_hi = _mm256_unpackhi_epi16(sin_val, cos_val);
+
+            // Multiply-Add (produces int32)
+            __m256i res_a_lo = _mm256_madd_epi16(ab_lo, cs_minus_lo);
+            __m256i res_a_hi = _mm256_madd_epi16(ab_hi, cs_minus_hi);
+            __m256i res_b_lo = _mm256_madd_epi16(ab_lo, sc_lo);
+            __m256i res_b_hi = _mm256_madd_epi16(ab_hi, sc_hi);
+
+            // Round and Shift >> 15 (not 23)
+            // The extra factor of 256 from ratio_q8 is absorbed into the output scale
+            res_a_lo = _mm256_srai_epi32(_mm256_add_epi32(res_a_lo, bias), 15);
+            res_a_hi = _mm256_srai_epi32(_mm256_add_epi32(res_a_hi, bias), 15);
+            res_b_lo = _mm256_srai_epi32(_mm256_add_epi32(res_b_lo, bias), 15);
+            res_b_hi = _mm256_srai_epi32(_mm256_add_epi32(res_b_hi, bias), 15);
+
+            // Pack back to int16
+            __m256i out_a = _mm256_packs_epi32(res_a_lo, res_a_hi);
+            __m256i out_b = _mm256_packs_epi32(res_b_lo, res_b_hi);
+
+            // Store
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(&rotated[i]), out_a);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(&rotated[i + half_dim]), out_b);
+        }
+
+        // Step 4: Pack rotated int16 values into Q16 output blocks using AVX2
+        // Scale is divided by 256 to account for the ratio_q8 factor preserved in rotated values
+        const float output_scale = common_scale / 256.0f;
+        for (int b = 0; b < q16_blocks_per_head; ++b)
+        {
+            OutBlockType &out_block = q16_out[b];
+            out_block.d = output_scale;
+
+            __m256i vsum = _mm256_setzero_si256();
+
+            // Use AVX2 to load int16s and compute sum
+            for (int chunk = 0; chunk < OUT_BLOCK_SIZE; chunk += 16)
+            {
+                const int elem_idx = b * OUT_BLOCK_SIZE + chunk;
+                if (chunk + 16 <= OUT_BLOCK_SIZE)
+                {
+                    // Load 16 int16s
+                    __m256i vals = _mm256_load_si256(reinterpret_cast<const __m256i *>(&rotated[elem_idx]));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out_block.qs[chunk]), vals);
+
+                    // Extend to int32 and accumulate sum
+                    __m128i lo16 = _mm256_castsi256_si128(vals);
+                    __m128i hi16 = _mm256_extracti128_si256(vals, 1);
+                    __m256i lo32 = _mm256_cvtepi16_epi32(lo16);
+                    __m256i hi32 = _mm256_cvtepi16_epi32(hi16);
+                    vsum = _mm256_add_epi32(vsum, _mm256_add_epi32(lo32, hi32));
+                }
+            }
+
+            // Handle remainder for block sizes not divisible by 16
+            int32_t scalar_sum = 0;
+            for (int j = (OUT_BLOCK_SIZE / 16) * 16; j < OUT_BLOCK_SIZE; ++j)
+            {
+                out_block.qs[j] = rotated[b * OUT_BLOCK_SIZE + j];
+                scalar_sum += rotated[b * OUT_BLOCK_SIZE + j];
+            }
+
+            // Horizontal sum
+            __m128i sum_lo = _mm256_castsi256_si128(vsum);
+            __m128i sum_hi = _mm256_extracti128_si256(vsum, 1);
+            __m128i sum128 = _mm_add_epi32(sum_lo, sum_hi);
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1)));
+            sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+            out_block.sum_qs = _mm_cvtsi128_si32(sum128) + scalar_sum;
+        }
+
+        return output_scale;
+#else
+        return apply_rope_q8_1_to_q16_head_scalar<OutBlockType>(q8_in, q16_out, head_dim, cos_q15, sin_q15);
+#endif
+    }
+
+    // Explicit instantiations for AVX2
+    template float apply_rope_q8_1_to_q16_head_avx2<Q16_1Block>(const Q8_1Block *, Q16_1Block *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head_avx2<Q16_1Block_64>(const Q8_1Block *, Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head_avx2<Q16_1Block_128>(const Q8_1Block *, Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+#endif // __AVX2__
+
+#if defined(__AVX512F__)
+    /**
+     * @brief AVX512 implementation: Q8_1 → Q16 per-head RoPE conversion
+     *
+     * Optimized vectorized version using int16 arithmetic and vpmaddwd.
+     * Processes 32 elements (16 pairs) at a time.
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head_avx512(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
+        const int q8_blocks_per_head = head_dim / 32;
+        const int q16_blocks_per_head = head_dim / OUT_BLOCK_SIZE;
+        const int half_dim = head_dim / 2;
+
+        // Step 1: Compute common scale using AVX512
+        __m512 vmax = _mm512_setzero_ps();
+
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const float block_scale = fp16_to_fp32_rope(q8_in[b].d);
+            const __m512 vscale = _mm512_set1_ps(block_scale);
+
+            // Load 32 int8 values
+            const __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8_in[b].qs));
+
+            // Convert low 16 int8 → float
+            const __m128i lo_bytes = _mm256_castsi256_si128(bytes);
+            const __m256i lo16_i16 = _mm256_cvtepi8_epi16(lo_bytes);
+            const __m512i lo16_i32 = _mm512_cvtepi16_epi32(lo16_i16);
+            const __m512 lo16_f32 = _mm512_cvtepi32_ps(lo16_i32);
+
+            // Convert high 16 int8 → float
+            const __m128i hi_bytes = _mm256_extracti128_si256(bytes, 1);
+            const __m256i hi16_i16 = _mm256_cvtepi8_epi16(hi_bytes);
+            const __m512i hi16_i32 = _mm512_cvtepi16_epi32(hi16_i16);
+            const __m512 hi16_f32 = _mm512_cvtepi32_ps(hi16_i32);
+
+            // Scale and find max abs
+            const __m512 scaled_lo = _mm512_mul_ps(lo16_f32, vscale);
+            const __m512 scaled_hi = _mm512_mul_ps(hi16_f32, vscale);
+            const __m512 abs_lo = _mm512_abs_ps(scaled_lo);
+            const __m512 abs_hi = _mm512_abs_ps(scaled_hi);
+            vmax = _mm512_max_ps(vmax, _mm512_max_ps(abs_lo, abs_hi));
+        }
+
+        float max_abs = _mm512_reduce_max_ps(vmax);
+        if (max_abs < 1e-20f)
+            max_abs = 1e-20f;
+
+        const float common_scale = max_abs / 127.0f;
+
+        // Step 2 & 3: RoPE rotation using vectorized int16 arithmetic
+        alignas(64) int16_t rotated[256];
+
+        const __m512i bias = _mm512_set1_epi32(1 << 14); // For >> 15 rounding
+        const __m512i zero = _mm512_setzero_si512();
+
+        for (int i = 0; i < half_dim; i += 32)
+        {
+            // Process 32 elements (16 pairs) at a time if possible
+            // If half_dim is not multiple of 32, we need masking or scalar fallback?
+            // head_dim is usually 64, 128, etc. So half_dim is 32, 64.
+            // So i=0, 32... fits perfectly.
+
+            int blk_a = i / 32;
+            int blk_b = (i + half_dim) / 32;
+            // off_a = 0, off_b = 0 since i is multiple of 32.
+
+            // Compute ratios
+            float scale_a = fp16_to_fp32_rope(q8_in[blk_a].d);
+            float scale_b = fp16_to_fp32_rope(q8_in[blk_b].d);
+
+            int32_t ratio_a_val = static_cast<int32_t>(std::round((scale_a / common_scale) * 256.0f));
+            int32_t ratio_b_val = static_cast<int32_t>(std::round((scale_b / common_scale) * 256.0f));
+
+            ratio_a_val = std::min(256, ratio_a_val);
+            ratio_b_val = std::min(256, ratio_b_val);
+
+            __m512i vratio_a = _mm512_set1_epi16(static_cast<int16_t>(ratio_a_val));
+            __m512i vratio_b = _mm512_set1_epi16(static_cast<int16_t>(ratio_b_val));
+
+            // Load 32 int8s
+            __m256i a_bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8_in[blk_a].qs));
+            __m256i b_bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8_in[blk_b].qs));
+
+            // Convert to int16
+            __m512i a_16 = _mm512_cvtepi8_epi16(a_bytes);
+            __m512i b_16 = _mm512_cvtepi8_epi16(b_bytes);
+
+            // Scale
+            __m512i scaled_a = _mm512_mullo_epi16(a_16, vratio_a);
+            __m512i scaled_b = _mm512_mullo_epi16(b_16, vratio_b);
+
+            // Interleave a and b
+            __m512i ab_lo = _mm512_unpacklo_epi16(scaled_a, scaled_b);
+            __m512i ab_hi = _mm512_unpackhi_epi16(scaled_a, scaled_b);
+
+            // Load trig
+            __m512i cos_val = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(cos_q15 + i));
+            __m512i sin_val = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(sin_q15 + i));
+            __m512i neg_sin_val = _mm512_sub_epi16(zero, sin_val);
+
+            // Interleave trig
+            __m512i cs_minus_lo = _mm512_unpacklo_epi16(cos_val, neg_sin_val);
+            __m512i cs_minus_hi = _mm512_unpackhi_epi16(cos_val, neg_sin_val);
+
+            __m512i sc_lo = _mm512_unpacklo_epi16(sin_val, cos_val);
+            __m512i sc_hi = _mm512_unpackhi_epi16(sin_val, cos_val);
+
+            // Multiply-Add
+            __m512i res_a_lo = _mm512_madd_epi16(ab_lo, cs_minus_lo);
+            __m512i res_a_hi = _mm512_madd_epi16(ab_hi, cs_minus_hi);
+            __m512i res_b_lo = _mm512_madd_epi16(ab_lo, sc_lo);
+            __m512i res_b_hi = _mm512_madd_epi16(ab_hi, sc_hi);
+
+            // Round and Shift >> 15 (not 23)
+            // The extra factor of 256 from ratio_q8 is absorbed into the output scale
+            res_a_lo = _mm512_srai_epi32(_mm512_add_epi32(res_a_lo, bias), 15);
+            res_a_hi = _mm512_srai_epi32(_mm512_add_epi32(res_a_hi, bias), 15);
+            res_b_lo = _mm512_srai_epi32(_mm512_add_epi32(res_b_lo, bias), 15);
+            res_b_hi = _mm512_srai_epi32(_mm512_add_epi32(res_b_hi, bias), 15);
+
+            // Pack
+            __m512i out_a = _mm512_packs_epi32(res_a_lo, res_a_hi);
+            __m512i out_b = _mm512_packs_epi32(res_b_lo, res_b_hi);
+
+            // Store
+            _mm512_storeu_si512(reinterpret_cast<__m512i *>(&rotated[i]), out_a);
+            _mm512_storeu_si512(reinterpret_cast<__m512i *>(&rotated[i + half_dim]), out_b);
+        }
+
+        // Step 4: Pack rotated int16 values into Q16 output blocks using AVX512
+        // Scale is divided by 256 to account for the ratio_q8 factor preserved in rotated values
+        const float output_scale = common_scale / 256.0f;
+        for (int b = 0; b < q16_blocks_per_head; ++b)
+        {
+            OutBlockType &out_block = q16_out[b];
+            out_block.d = output_scale;
+
+            __m512i vsum = _mm512_setzero_si512();
+
+            // Use AVX512 to load int16s and compute sum
+            for (int chunk = 0; chunk < OUT_BLOCK_SIZE; chunk += 16)
+            {
+                const int elem_idx = b * OUT_BLOCK_SIZE + chunk;
+                if (chunk + 16 <= OUT_BLOCK_SIZE)
+                {
+                    // Load 16 int16s (256 bits)
+                    __m256i vals = _mm256_load_si256(reinterpret_cast<const __m256i *>(&rotated[elem_idx]));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out_block.qs[chunk]), vals);
+
+                    // Extend to int32 and accumulate sum
+                    __m512i vals32 = _mm512_cvtepi16_epi32(vals);
+                    vsum = _mm512_add_epi32(vsum, vals32);
+                }
+            }
+
+            // Handle remainder for block sizes not divisible by 16
+            int32_t scalar_sum = 0;
+            for (int j = (OUT_BLOCK_SIZE / 16) * 16; j < OUT_BLOCK_SIZE; ++j)
+            {
+                out_block.qs[j] = rotated[b * OUT_BLOCK_SIZE + j];
+                scalar_sum += rotated[b * OUT_BLOCK_SIZE + j];
+            }
+
+            // Horizontal sum
+            out_block.sum_qs = _mm512_reduce_add_epi32(vsum) + scalar_sum;
+        }
+
+        return output_scale;
+    }
+
+    // Explicit instantiations for AVX512
+    template float apply_rope_q8_1_to_q16_head_avx512<Q16_1Block>(const Q8_1Block *, Q16_1Block *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head_avx512<Q16_1Block_64>(const Q8_1Block *, Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head_avx512<Q16_1Block_128>(const Q8_1Block *, Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+#endif // __AVX512F__
+
+    /**
+     * @brief Auto-dispatching Q8_1 → Q16 per-head implementation
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+#if defined(__AVX512F__)
+        return apply_rope_q8_1_to_q16_head_avx512<OutBlockType>(q8_in, q16_out, head_dim, cos_q15, sin_q15);
+#elif defined(__AVX2__)
+        return apply_rope_q8_1_to_q16_head_avx2<OutBlockType>(q8_in, q16_out, head_dim, cos_q15, sin_q15);
+#else
+        return apply_rope_q8_1_to_q16_head_scalar<OutBlockType>(q8_in, q16_out, head_dim, cos_q15, sin_q15);
+#endif
+    }
+
+    // Explicit instantiations for dispatch
+    template float apply_rope_q8_1_to_q16_head<Q16_1Block>(const Q8_1Block *, Q16_1Block *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head<Q16_1Block_64>(const Q8_1Block *, Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template float apply_rope_q8_1_to_q16_head<Q16_1Block_128>(const Q8_1Block *, Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+
+    /**
+     * @brief High-level Q8_1 → Q16 RoPE wrapper for Q and K tensors
+     */
+    template <typename OutBlockType>
+    void apply_rope_q8_1_to_q16(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        OutBlockType *Q_out,
+        OutBlockType *K_out,
+        float *Q_head_scales,
+        float *K_head_scales,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta)
+    {
+        constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
+        if (!Q_in || !Q_out)
+        {
+            LOG_ERROR("apply_rope_q8_1_to_q16: Q_in and Q_out must not be null");
+            return;
+        }
+
+        if (head_dim % 32 != 0 || head_dim % OUT_BLOCK_SIZE != 0)
+        {
+            LOG_ERROR("apply_rope_q8_1_to_q16: head_dim (" << head_dim << ") must be divisible by both 32 and " << OUT_BLOCK_SIZE);
+            return;
+        }
+
+        const int q8_blocks_per_head = head_dim / 32;
+        const int q16_blocks_per_head = head_dim / OUT_BLOCK_SIZE;
+        const int half_dim = head_dim / 2;
+        const int q8_q_stride = n_heads * q8_blocks_per_head;
+        const int q8_k_stride = n_kv_heads * q8_blocks_per_head;
+        const int q16_q_stride = n_heads * q16_blocks_per_head;
+        const int q16_k_stride = n_kv_heads * q16_blocks_per_head;
+
+        // Get cached inverse frequencies
+        const auto &inv_freq = get_inv_freq_cached(head_dim, rope_theta);
+
+        // Pre-compute Q15 sin/cos tables for all positions
+        std::vector<int16_t> cos_q15(seq_len * half_dim);
+        std::vector<int16_t> sin_q15(seq_len * half_dim);
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            int pos = position_ids ? position_ids[t] : t;
+            if (pos < 0)
+                pos = 0;
+
+            int16_t *c_ptr = cos_q15.data() + t * half_dim;
+            int16_t *s_ptr = sin_q15.data() + t * half_dim;
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float angle = static_cast<float>(pos) * inv_freq[i];
+                int32_t c = static_cast<int32_t>(std::lround(std::cos(angle) * 32767.0f));
+                int32_t s = static_cast<int32_t>(std::lround(std::sin(angle) * 32767.0f));
+                c = std::max(-32767, std::min(32767, c));
+                s = std::max(-32767, std::min(32767, s));
+                c_ptr[i] = static_cast<int16_t>(c);
+                s_ptr[i] = static_cast<int16_t>(s);
+            }
+        }
+
+        // Process Q tensor
+        auto do_q_work = [&]()
+        {
+#pragma omp for collapse(2)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const Q8_1Block *q8_head = Q_in + t * q8_q_stride + h * q8_blocks_per_head;
+                    OutBlockType *q16_head = Q_out + t * q16_q_stride + h * q16_blocks_per_head;
+                    const int16_t *c_ptr = cos_q15.data() + t * half_dim;
+                    const int16_t *s_ptr = sin_q15.data() + t * half_dim;
+
+                    float head_scale = apply_rope_q8_1_to_q16_head<OutBlockType>(
+                        q8_head, q16_head, head_dim, c_ptr, s_ptr);
+
+                    if (Q_head_scales)
+                    {
+                        Q_head_scales[t * n_heads + h] = head_scale;
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_q_work);
+
+        // Process K tensor if provided
+        if (K_in && K_out)
+        {
+            auto do_k_work = [&]()
+            {
+#pragma omp for collapse(2)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int h = 0; h < n_kv_heads; ++h)
+                    {
+                        const Q8_1Block *q8_head = K_in + t * q8_k_stride + h * q8_blocks_per_head;
+                        OutBlockType *q16_head = K_out + t * q16_k_stride + h * q16_blocks_per_head;
+                        const int16_t *c_ptr = cos_q15.data() + t * half_dim;
+                        const int16_t *s_ptr = sin_q15.data() + t * half_dim;
+
+                        float head_scale = apply_rope_q8_1_to_q16_head<OutBlockType>(
+                            q8_head, q16_head, head_dim, c_ptr, s_ptr);
+
+                        if (K_head_scales)
+                        {
+                            K_head_scales[t * n_kv_heads + h] = head_scale;
+                        }
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_k_work);
+        }
+    }
+
+    // Explicit instantiations for high-level wrapper
+    template void apply_rope_q8_1_to_q16<Q16_1Block>(const Q8_1Block *, const Q8_1Block *, Q16_1Block *, Q16_1Block *, float *, float *, const int *, int, int, int, int, float);
+    template void apply_rope_q8_1_to_q16<Q16_1Block_64>(const Q8_1Block *, const Q8_1Block *, Q16_1Block_64 *, Q16_1Block_64 *, float *, float *, const int *, int, int, int, int, float);
+    template void apply_rope_q8_1_to_q16<Q16_1Block_128>(const Q8_1Block *, const Q8_1Block *, Q16_1Block_128 *, Q16_1Block_128 *, float *, float *, const int *, int, int, int, int, float);
+
+    /**
+     * @brief Runtime dispatch for Q8_1→Q16 based on Q16BlockSize enum
+     */
+    void apply_rope_q8_1_to_q16_dispatch(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        void *Q_out,
+        void *K_out,
+        float *Q_head_scales,
+        float *K_head_scales,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta)
+    {
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32:
+            apply_rope_q8_1_to_q16<Q16_1Block>(
+                Q_in, K_in,
+                static_cast<Q16_1Block *>(Q_out), static_cast<Q16_1Block *>(K_out),
+                Q_head_scales, K_head_scales,
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            apply_rope_q8_1_to_q16<Q16_1Block_64>(
+                Q_in, K_in,
+                static_cast<Q16_1Block_64 *>(Q_out), static_cast<Q16_1Block_64 *>(K_out),
+                Q_head_scales, K_head_scales,
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            apply_rope_q8_1_to_q16<Q16_1Block_128>(
+                Q_in, K_in,
+                static_cast<Q16_1Block_128 *>(Q_out), static_cast<Q16_1Block_128 *>(K_out),
+                Q_head_scales, K_head_scales,
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta);
+            break;
+        default:
+            LOG_ERROR("apply_rope_q8_1_to_q16_dispatch: unsupported block size");
             break;
         }
     }

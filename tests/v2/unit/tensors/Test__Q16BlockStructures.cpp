@@ -2,8 +2,11 @@
  * @file Test__Q16BlockStructures.cpp
  * @brief Unit tests for Q16_1 variable block size structures
  *
- * Tests the new Q16_1Block_64, Q16_1Block_128, Q16_1Block_192 structures
+ * Tests the Q16_1Block_64 and Q16_1Block_128 structures
  * and the Q16BlockSize enum and type traits.
+ *
+ * Note: Q16_1Block_192 was removed. DeepSeek V3 MLA uses separate NOPE (128-dim)
+ * and ROPE (64-dim) tensors with independent scales.
  */
 
 #include <gtest/gtest.h>
@@ -31,7 +34,6 @@ TEST_F(Test__Q16BlockStructures, BlockSizesCorrect)
     EXPECT_EQ(Q16_1Block::BLOCK_SIZE, 32);
     EXPECT_EQ(Q16_1Block_64::BLOCK_SIZE, 64);
     EXPECT_EQ(Q16_1Block_128::BLOCK_SIZE, 128);
-    EXPECT_EQ(Q16_1Block_192::BLOCK_SIZE, 192);
 }
 
 TEST_F(Test__Q16BlockStructures, StructureSizesCorrect)
@@ -40,7 +42,6 @@ TEST_F(Test__Q16BlockStructures, StructureSizesCorrect)
     EXPECT_EQ(sizeof(Q16_1Block), 72);      // 4 + 4 + 64 = 72
     EXPECT_EQ(sizeof(Q16_1Block_64), 136);  // 4 + 4 + 128 = 136
     EXPECT_EQ(sizeof(Q16_1Block_128), 264); // 4 + 4 + 256 = 264
-    EXPECT_EQ(sizeof(Q16_1Block_192), 392); // 4 + 4 + 384 = 392
 }
 
 TEST_F(Test__Q16BlockStructures, MemoryOverheadDecreases)
@@ -50,11 +51,9 @@ TEST_F(Test__Q16BlockStructures, MemoryOverheadDecreases)
     constexpr float overhead_32 = 8.0f / (2.0f * 32);   // 12.5%
     constexpr float overhead_64 = 8.0f / (2.0f * 64);   // 6.25%
     constexpr float overhead_128 = 8.0f / (2.0f * 128); // 3.125%
-    constexpr float overhead_192 = 8.0f / (2.0f * 192); // 2.08%
 
     EXPECT_GT(overhead_32, overhead_64);
     EXPECT_GT(overhead_64, overhead_128);
-    EXPECT_GT(overhead_128, overhead_192);
 }
 
 TEST_F(Test__Q16BlockStructures, FieldOffsetsConsistent)
@@ -72,10 +71,6 @@ TEST_F(Test__Q16BlockStructures, FieldOffsetsConsistent)
     EXPECT_EQ(offsetof(Q16_1Block_128, d), 0);
     EXPECT_EQ(offsetof(Q16_1Block_128, sum_qs), 4);
     EXPECT_EQ(offsetof(Q16_1Block_128, qs), 8);
-
-    EXPECT_EQ(offsetof(Q16_1Block_192, d), 0);
-    EXPECT_EQ(offsetof(Q16_1Block_192, sum_qs), 4);
-    EXPECT_EQ(offsetof(Q16_1Block_192, qs), 8);
 }
 
 // =============================================================================
@@ -87,7 +82,6 @@ TEST_F(Test__Q16BlockStructures, EnumValuesMatchBlockSizes)
     EXPECT_EQ(static_cast<int>(Q16BlockSize::BLOCK_32), 32);
     EXPECT_EQ(static_cast<int>(Q16BlockSize::BLOCK_64), 64);
     EXPECT_EQ(static_cast<int>(Q16BlockSize::BLOCK_128), 128);
-    EXPECT_EQ(static_cast<int>(Q16BlockSize::BLOCK_192), 192);
 }
 
 // =============================================================================
@@ -103,14 +97,11 @@ TEST_F(Test__Q16BlockStructures, TypeTraitsMappingCorrect)
                   "BLOCK_64 should map to Q16_1Block_64");
     static_assert(std::is_same_v<Q16BlockType_t<Q16BlockSize::BLOCK_128>, Q16_1Block_128>,
                   "BLOCK_128 should map to Q16_1Block_128");
-    static_assert(std::is_same_v<Q16BlockType_t<Q16BlockSize::BLOCK_192>, Q16_1Block_192>,
-                  "BLOCK_192 should map to Q16_1Block_192");
 
     // Runtime check (compile-time already passed)
     EXPECT_EQ(sizeof(Q16BlockType_t<Q16BlockSize::BLOCK_32>), sizeof(Q16_1Block));
     EXPECT_EQ(sizeof(Q16BlockType_t<Q16BlockSize::BLOCK_64>), sizeof(Q16_1Block_64));
     EXPECT_EQ(sizeof(Q16BlockType_t<Q16BlockSize::BLOCK_128>), sizeof(Q16_1Block_128));
-    EXPECT_EQ(sizeof(Q16BlockType_t<Q16BlockSize::BLOCK_192>), sizeof(Q16_1Block_192));
 }
 
 // =============================================================================
@@ -122,14 +113,12 @@ TEST_F(Test__Q16BlockStructures, OptimalBlockSizeForCommonHeadDims)
     // Exact matches
     EXPECT_EQ(optimal_q16_block_size(64), Q16BlockSize::BLOCK_64);
     EXPECT_EQ(optimal_q16_block_size(128), Q16BlockSize::BLOCK_128);
-    EXPECT_EQ(optimal_q16_block_size(192), Q16BlockSize::BLOCK_192);
 }
 
 TEST_F(Test__Q16BlockStructures, OptimalBlockSizeForMultiples)
 {
     // Multiples should prefer largest fitting block
     EXPECT_EQ(optimal_q16_block_size(256), Q16BlockSize::BLOCK_128); // 256 / 128 = 2 blocks
-    EXPECT_EQ(optimal_q16_block_size(384), Q16BlockSize::BLOCK_192); // 384 / 192 = 2 blocks
     EXPECT_EQ(optimal_q16_block_size(512), Q16BlockSize::BLOCK_128); // 512 / 128 = 4 blocks
 }
 
@@ -150,8 +139,8 @@ TEST_F(Test__Q16BlockStructures, OptimalBlockSizeForRealModels)
     // Llama-3, Qwen3, Mistral: head_dim = 128
     EXPECT_EQ(optimal_q16_block_size(128), Q16BlockSize::BLOCK_128);
 
-    // DeepSeek V3, Kimi K2 MLA Q/K: head_dim = 192
-    EXPECT_EQ(optimal_q16_block_size(192), Q16BlockSize::BLOCK_192);
+    // Note: DeepSeek V3 MLA uses separate NOPE (128-dim) + ROPE (64-dim) tensors
+    // with independent scales, not a combined 192-dim block.
 }
 
 // =============================================================================
@@ -234,11 +223,6 @@ TEST_F(Test__Q16BlockStructures, QuantDequantRoundTrip128)
     test_quantize_dequant_roundtrip<Q16_1Block_128>();
 }
 
-TEST_F(Test__Q16BlockStructures, QuantDequantRoundTrip192)
-{
-    test_quantize_dequant_roundtrip<Q16_1Block_192>();
-}
-
 // =============================================================================
 // SIMD Alignment Tests
 // =============================================================================
@@ -251,12 +235,10 @@ TEST_F(Test__Q16BlockStructures, BlocksAreAligned)
 
     Q16_1Block_64 block64;
     Q16_1Block_128 block128;
-    Q16_1Block_192 block192;
 
     // The qs array should be at least 4-byte aligned (for int16_t pairs)
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&block64.qs) % 4, 0);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&block128.qs) % 4, 0);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&block192.qs) % 4, 0);
 }
 
 TEST_F(Test__Q16BlockStructures, QsArraySizesSIMDFriendly)
@@ -267,7 +249,6 @@ TEST_F(Test__Q16BlockStructures, QsArraySizesSIMDFriendly)
 
     EXPECT_EQ(Q16_1Block_64::BLOCK_SIZE % 16, 0) << "64 should be divisible by 16 (AVX2)";
     EXPECT_EQ(Q16_1Block_128::BLOCK_SIZE % 32, 0) << "128 should be divisible by 32 (AVX512)";
-    EXPECT_EQ(Q16_1Block_192::BLOCK_SIZE % 32, 0) << "192 should be divisible by 32 (AVX512)";
 }
 
 // =============================================================================
@@ -283,8 +264,6 @@ TEST_F(Test__Q16BlockStructures, BlocksArePOD)
                   "Q16_1Block_64 must be trivially copyable");
     static_assert(std::is_trivially_copyable_v<Q16_1Block_128>,
                   "Q16_1Block_128 must be trivially copyable");
-    static_assert(std::is_trivially_copyable_v<Q16_1Block_192>,
-                  "Q16_1Block_192 must be trivially copyable");
 
     static_assert(std::is_standard_layout_v<Q16_1Block>,
                   "Q16_1Block must have standard layout");
@@ -292,8 +271,6 @@ TEST_F(Test__Q16BlockStructures, BlocksArePOD)
                   "Q16_1Block_64 must have standard layout");
     static_assert(std::is_standard_layout_v<Q16_1Block_128>,
                   "Q16_1Block_128 must have standard layout");
-    static_assert(std::is_standard_layout_v<Q16_1Block_192>,
-                  "Q16_1Block_192 must have standard layout");
 
     SUCCEED(); // Static asserts passed
 }
@@ -307,13 +284,11 @@ TEST_F(Test__Q16BlockStructures, Q16BlockSizeBytesCorrect)
     EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_32), sizeof(Q16_1Block));
     EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_64), sizeof(Q16_1Block_64));
     EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_128), sizeof(Q16_1Block_128));
-    EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_192), sizeof(Q16_1Block_192));
 
     // Verify actual byte counts
     EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_32), 72);   // 4+4+64
     EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_64), 136);  // 4+4+128
     EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_128), 264); // 4+4+256
-    EXPECT_EQ(q16_block_size_bytes(Q16BlockSize::BLOCK_192), 392); // 4+4+384
 }
 
 TEST_F(Test__Q16BlockStructures, Q16BlockSizeElementsCorrect)
@@ -322,7 +297,6 @@ TEST_F(Test__Q16BlockStructures, Q16BlockSizeElementsCorrect)
     EXPECT_EQ(q16_block_size_elements(Q16BlockSize::BLOCK_32), 32);
     EXPECT_EQ(q16_block_size_elements(Q16BlockSize::BLOCK_64), 64);
     EXPECT_EQ(q16_block_size_elements(Q16BlockSize::BLOCK_128), 128);
-    EXPECT_EQ(q16_block_size_elements(Q16BlockSize::BLOCK_192), 192);
 }
 
 TEST_F(Test__Q16BlockStructures, HelperFunctionsAreConstexpr)
@@ -331,12 +305,10 @@ TEST_F(Test__Q16BlockStructures, HelperFunctionsAreConstexpr)
     constexpr size_t bytes_32 = q16_block_size_bytes(Q16BlockSize::BLOCK_32);
     constexpr size_t bytes_64 = q16_block_size_bytes(Q16BlockSize::BLOCK_64);
     constexpr size_t elems_128 = q16_block_size_elements(Q16BlockSize::BLOCK_128);
-    constexpr size_t elems_192 = q16_block_size_elements(Q16BlockSize::BLOCK_192);
 
     EXPECT_EQ(bytes_32, 72);
     EXPECT_EQ(bytes_64, 136);
     EXPECT_EQ(elems_128, 128);
-    EXPECT_EQ(elems_192, 192);
 }
 
 TEST_F(Test__Q16BlockStructures, BlockSizeCalculationFormula)
@@ -353,5 +325,4 @@ TEST_F(Test__Q16BlockStructures, BlockSizeCalculationFormula)
     verify_formula(Q16BlockSize::BLOCK_32);
     verify_formula(Q16BlockSize::BLOCK_64);
     verify_formula(Q16BlockSize::BLOCK_128);
-    verify_formula(Q16BlockSize::BLOCK_192);
 }

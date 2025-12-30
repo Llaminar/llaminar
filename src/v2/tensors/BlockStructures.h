@@ -117,13 +117,16 @@ namespace llaminar2
 
     /**
      * @brief Q16BlockSize enum for compile-time block size selection
+     *
+     * Note: MLA architectures (DeepSeek V3, Kimi K2) should use separate
+     * NOPE (128-dim) and ROPE (64-dim) tensors with their own scales,
+     * rather than a single 192-block.
      */
     enum class Q16BlockSize : uint8_t
     {
-        BLOCK_32 = 32,   ///< Legacy, GEMM compatibility (Q16_1Block)
-        BLOCK_64 = 64,   ///< Universal for attention (head_dim=64)
-        BLOCK_128 = 128, ///< Optimal for head_dim=128 (Llama-3, Qwen3)
-        BLOCK_192 = 192  ///< Optimal for MLA Q/K (DeepSeek V3, Kimi K2)
+        BLOCK_32 = 32,  ///< Legacy, GEMM compatibility (Q16_1Block)
+        BLOCK_64 = 64,  ///< Universal for attention (head_dim=64)
+        BLOCK_128 = 128 ///< Optimal for head_dim=128 (Llama-3, Qwen3)
     };
 
     /**
@@ -157,21 +160,6 @@ namespace llaminar2
     static_assert(sizeof(Q16_1Block_128) == 264, "Q16_1Block_128 must be 264 bytes");
 
     /**
-     * @brief Q16_1 block with 192 elements (optimal for MLA 192-dim Q/K)
-     *
-     * Memory: 4 + 4 + 384 = 392 bytes per block
-     * Overhead: 8/192 = 4.2% (vs 25% for 32-element blocks)
-     */
-    struct alignas(4) Q16_1Block_192
-    {
-        float d;         ///< FP32 scale factor
-        int32_t sum_qs;  ///< INT32 pre-computed sum: Σ(qs[i])
-        int16_t qs[192]; ///< 192 quantized int16 values
-        static constexpr size_t BLOCK_SIZE = 192;
-    };
-    static_assert(sizeof(Q16_1Block_192) == 392, "Q16_1Block_192 must be 392 bytes");
-
-    /**
      * @brief Type trait to get Q16_1 block type from Q16BlockSize enum
      */
     template <Q16BlockSize Size>
@@ -192,11 +180,6 @@ namespace llaminar2
     {
         using type = Q16_1Block_128;
     };
-    template <>
-    struct Q16BlockType<Q16BlockSize::BLOCK_192>
-    {
-        using type = Q16_1Block_192;
-    };
 
     template <Q16BlockSize Size>
     using Q16BlockType_t = typename Q16BlockType<Size>::type;
@@ -206,6 +189,9 @@ namespace llaminar2
      *
      * Returns the block size that achieves 1 block per head (optimal) or
      * minimizes blocks per head for non-standard dimensions.
+     *
+     * Note: For MLA architectures (DeepSeek V3, Kimi K2), use separate
+     * NOPE and ROPE tensors with BLOCK_128 and BLOCK_64 respectively.
      */
     constexpr Q16BlockSize optimal_q16_block_size(int head_dim)
     {
@@ -213,11 +199,7 @@ namespace llaminar2
             return Q16BlockSize::BLOCK_64;
         if (head_dim == 128)
             return Q16BlockSize::BLOCK_128;
-        if (head_dim == 192)
-            return Q16BlockSize::BLOCK_192;
         // Fallback: use largest block that divides evenly, or 64 as universal
-        if (head_dim % 192 == 0)
-            return Q16BlockSize::BLOCK_192;
         if (head_dim % 128 == 0)
             return Q16BlockSize::BLOCK_128;
         if (head_dim % 64 == 0)
@@ -241,8 +223,6 @@ namespace llaminar2
             return sizeof(Q16_1Block_64); // 136 bytes
         case Q16BlockSize::BLOCK_128:
             return sizeof(Q16_1Block_128); // 264 bytes
-        case Q16BlockSize::BLOCK_192:
-            return sizeof(Q16_1Block_192); // 392 bytes
         default:
             return sizeof(Q16_1Block); // Fallback
         }

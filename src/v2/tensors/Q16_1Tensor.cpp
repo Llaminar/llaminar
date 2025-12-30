@@ -181,9 +181,6 @@ namespace llaminar2
         case Q16BlockSize::BLOCK_128:
             block_bytes = sizeof(Q16_1Block_128);
             break;
-        case Q16BlockSize::BLOCK_192:
-            block_bytes = sizeof(Q16_1Block_192);
-            break;
         }
         const size_t required_bytes = n_blocks * block_bytes;
 
@@ -373,12 +370,6 @@ namespace llaminar2
             decode_q16_block<Q16_1Block_128>(&blocks[row_idx * blocks_per_row_ + k_block_offset], output);
             break;
         }
-        case Q16BlockSize::BLOCK_192:
-        {
-            const Q16_1Block_192 *blocks = reinterpret_cast<const Q16_1Block_192 *>(data_ptr);
-            decode_q16_block<Q16_1Block_192>(&blocks[row_idx * blocks_per_row_ + k_block_offset], output);
-            break;
-        }
         }
     }
 
@@ -403,11 +394,6 @@ namespace llaminar2
         case Q16BlockSize::BLOCK_128:
         {
             const Q16_1Block_128 *blocks = reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
-            return &blocks[row_idx * blocks_per_row_ + k_block_offset];
-        }
-        case Q16BlockSize::BLOCK_192:
-        {
-            const Q16_1Block_192 *blocks = reinterpret_cast<const Q16_1Block_192 *>(data_ptr);
             return &blocks[row_idx * blocks_per_row_ + k_block_offset];
         }
         default:
@@ -1404,9 +1390,6 @@ namespace llaminar2
             break;
         case Q16BlockSize::BLOCK_128:
             quantize_fp32_to_q16_blocks<Q16_1Block_128>(src_data, raw_blocks, total_elements, n_blocks);
-            break;
-        case Q16BlockSize::BLOCK_192:
-            quantize_fp32_to_q16_blocks<Q16_1Block_192>(src_data, raw_blocks, total_elements, n_blocks);
             break;
         default:
             LOG_ERROR("[Q16_1Tensor::copyFrom_fp32] Unknown block size");

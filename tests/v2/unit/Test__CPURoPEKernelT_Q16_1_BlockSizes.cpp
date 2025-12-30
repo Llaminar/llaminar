@@ -6,7 +6,9 @@
  * - 32-element blocks (Q16_1Block)
  * - 64-element blocks (Q16_1Block_64)
  * - 128-element blocks (Q16_1Block_128)
- * - 192-element blocks (Q16_1Block_192)
+ *
+ * Note: MLA architectures (DeepSeek V3, Kimi K2) should use separate
+ * NOPE (128-dim) and ROPE (64-dim) tensors with their own scales.
  *
  * Each block size is tested for:
  * 1. Basic RoPE application (Q-only)
@@ -441,32 +443,6 @@ namespace llaminar2
     }
 
     // =======================================================================
-    // Block Size 192 Tests (Q16_1Block_192)
-    // =======================================================================
-
-    TEST_F(CPURoPEKernelT_Q16_1_BlockSizesTest, Block192_QOnly_Basic)
-    {
-        testApplyTensor_QOnly<Q16BlockSize::BLOCK_192>(2, 4, 192);
-    }
-
-    TEST_F(CPURoPEKernelT_Q16_1_BlockSizesTest, Block192_QK)
-    {
-        testApplyTensor_QK<Q16BlockSize::BLOCK_192>(2, 4, 2, 192);
-    }
-
-    TEST_F(CPURoPEKernelT_Q16_1_BlockSizesTest, Block192_DecodeMode)
-    {
-        testDecodeMode<Q16BlockSize::BLOCK_192>(4, 192, 0);
-        testDecodeMode<Q16BlockSize::BLOCK_192>(4, 192, 10);
-        testDecodeMode<Q16BlockSize::BLOCK_192>(4, 192, 100);
-    }
-
-    TEST_F(CPURoPEKernelT_Q16_1_BlockSizesTest, Block192_Padding)
-    {
-        testPaddingHandling<Q16BlockSize::BLOCK_192>(4, 192);
-    }
-
-    // =======================================================================
     // Cross-block-size Tests
     // =======================================================================
 
@@ -554,8 +530,7 @@ namespace llaminar2
         std::vector<Q16BlockSize> block_sizes = {
             Q16BlockSize::BLOCK_32,
             Q16BlockSize::BLOCK_64,
-            Q16BlockSize::BLOCK_128,
-            Q16BlockSize::BLOCK_192};
+            Q16BlockSize::BLOCK_128};
 
         for (auto bs : block_sizes)
         {

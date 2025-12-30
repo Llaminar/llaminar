@@ -28,9 +28,10 @@
  *
  * PRECISION
  * =========
- * - 8 fractional bits → 256 LUT entries → ~0.4% max relative error on 2^(-frac)
+ * - 11 fractional bits → 2048 LUT entries → ~0.05% max relative error on 2^(-frac)
  * - 30-bit internal precision → robust normalization for sequences up to 128K
  * - INT16 output → 15-bit effective precision, sufficient for attention
+ * - 4KB LUT fits easily in L1 cache (typically 32-64KB per core)
  *
  * @see docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md
  */
@@ -49,8 +50,9 @@ namespace llaminar2::kernels::q16_1::microkernels
      */
     struct Exp2SoftmaxConfig
     {
-        /// Fractional bits for LUT indexing. 8 = 256 entries, good balance of size/precision.
-        int frac_bits = 8;
+        /// Fractional bits for LUT indexing. 11 = 2048 entries (4KB), excellent precision.
+        /// 8× finer granularity than 256-entry LUT, critical for attention distribution quality.
+        int frac_bits = 11;
 
         /// Internal scaling bits for fixed-point β computation.
         /// Higher = more precision but risk of overflow for large deltas.
@@ -91,8 +93,9 @@ namespace llaminar2::kernels::q16_1::microkernels
     /**
      * @brief Initialize the exp2 LUT (called automatically on first use).
      *
-     * The LUT stores 2^(-u) for u ∈ [0, 1) at 256 uniformly spaced points.
+     * The LUT stores 2^(-u) for u ∈ [0, 1) at 2048 uniformly spaced points.
      * Values are scaled by 2^lut_value_bits for integer arithmetic.
+     * Total size: 2048 × 4 bytes = 8KB (fits in L1 cache).
      *
      * This is thread-safe (uses static initialization).
      */
@@ -101,8 +104,11 @@ namespace llaminar2::kernels::q16_1::microkernels
     /**
      * @brief Get pointer to the exp2 LUT (for testing/debugging).
      *
-     * @return Pointer to 256-entry uint32_t array, or nullptr if not initialized.
+     * @return Pointer to 2048-entry uint32_t array, or nullptr if not initialized.
      */
     const uint32_t *get_exp2_lut_data();
+
+    /// LUT size constant (2^11 = 2048 entries)
+    constexpr int EXP2_LUT_SIZE = 2048;
 
 } // namespace llaminar2::kernels::q16_1::microkernels

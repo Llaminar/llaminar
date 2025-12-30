@@ -622,6 +622,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/RMSNormPrimitives.cpp
     kernels/cpu/primitives/SoftmaxPrimitives.cpp
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
+    kernels/cpu/primitives/Q16HeadNormalization.cpp
     # CPU GEMM kernels and auto-tuning infrastructure
     # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm_v4 (OneDNN) remains
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
@@ -644,14 +645,11 @@ add_library(llaminar2_core STATIC
     # Q16_1 fused attention (TRUE INTEGER PIPELINE v2)
     kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.cpp        # ITensorFusedAttentionWo implementation
     kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp     # v2: TRUE integer attention (replaces Q16FusedAttentionRef)
-    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmax.cpp    # v2: exp2 fixed-point softmax (INT32→INT16)
-    # Deprecated v1 kernels - kept for existing infrastructure until v2 is wired up
-    kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.deprecated.cpp       # v1: Scalar reference (DEPRECATED)
-    kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProductRef.deprecated.cpp    # v1 μK (DEPRECATED)
-    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmaxRef.deprecated.cpp # v1 μK (DEPRECATED)
-    kernels/cpu/attention/q16_1/ref/microkernels/Int8RequantRef.deprecated.cpp      # v1 μK (DEPRECATED)
-    kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulateRef.deprecated.cpp     # v1 μK (DEPRECATED)
-    kernels/cpu/attention/q16_1/ref/microkernels/WoProjectionVNNIRef.deprecated.cpp # v1 μK (DEPRECATED)
+    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmax.cpp    # v2: exp2 fixed-point softmax (INT32→INT16, 2048-entry LUT)
+    kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProduct.cpp       # v2: Q×K^T integer dot product microkernel
+    kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulate.cpp        # v2: P×V integer accumulation microkernel
+    kernels/cpu/attention/q16_1/ref/microkernels/WoProjection.cpp        # v2: Wo projection INT32→Q16_1 microkernel
+    kernels/cpu/attention/q16_1/ref/microkernels/OnlineSoftmax.cpp       # v2: FlashDecode online softmax microkernel
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)

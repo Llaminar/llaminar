@@ -2791,8 +2791,8 @@ namespace llaminar2
         // Q16_1 Variable Block Size Operations (for Integer Attention v2)
         // ========================================================================
         //
-        // These templated functions support Q16_1Block_64, Q16_1Block_128, and
-        // Q16_1Block_192 in addition to the standard Q16_1Block (32 elements).
+        // These templated functions support Q16_1Block_64 and Q16_1Block_128
+        // in addition to the standard Q16_1Block (32 elements).
         // They enable per-head scale normalization for attention computation.
         //
         // All functions use BlockType::BLOCK_SIZE to determine iteration count,
@@ -2803,7 +2803,7 @@ namespace llaminar2
          * @brief Templated Q16 + Q16 addition for variable block sizes
          *
          * Adds two Q16 blocks element-wise: output = a + b
-         * Works with Q16_1Block, Q16_1Block_64, Q16_1Block_128, Q16_1Block_192.
+         * Works with Q16_1Block, Q16_1Block_64, Q16_1Block_128.
          *
          * @tparam BlockType Q16 block type (must have BLOCK_SIZE, d, sum_qs, qs members)
          * @param a First input block

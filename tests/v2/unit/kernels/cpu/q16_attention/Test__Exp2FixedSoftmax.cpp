@@ -119,14 +119,15 @@ TEST_F(Test__Exp2FixedSoftmax, LUTInitialization)
     const uint32_t expected_one = 1U << 30;
     EXPECT_EQ(lut[0], expected_one);
 
-    // LUT[128] should be close to 2^30 * 2^(-0.5) ≈ 0.707 * 2^30
+    // LUT[1024] should be close to 2^30 * 2^(-0.5) ≈ 0.707 * 2^30
+    // (1024/2048 = 0.5)
     const float expected_half = std::pow(2.0f, -0.5f);
-    const float actual_half = static_cast<float>(lut[128]) / static_cast<float>(expected_one);
+    const float actual_half = static_cast<float>(lut[1024]) / static_cast<float>(expected_one);
     EXPECT_NEAR(actual_half, expected_half, 0.001f);
 
-    // LUT[255] should be close to 2^30 * 2^(-255/256) ≈ 0.503 * 2^30
-    const float expected_last = std::pow(2.0f, -255.0f / 256.0f);
-    const float actual_last = static_cast<float>(lut[255]) / static_cast<float>(expected_one);
+    // LUT[2047] should be close to 2^30 * 2^(-2047/2048) ≈ 0.5002 * 2^30
+    const float expected_last = std::pow(2.0f, -2047.0f / 2048.0f);
+    const float actual_last = static_cast<float>(lut[2047]) / static_cast<float>(expected_one);
     EXPECT_NEAR(actual_last, expected_last, 0.001f);
 }
 
@@ -776,4 +777,217 @@ TEST_F(Test__Exp2FixedSoftmax, SpikyPeakPosition)
         std::cout << "    Peak at " << peak_pos << ": weight=" << actual[peak_pos]
                   << " (ref=" << ref[peak_pos] << ")" << std::endl;
     }
+}
+
+// ============================================================================
+// Mass Random Tests (10,000 Vectors) - Per Gemini3 Battle Testing Requirements
+// ============================================================================
+
+TEST_F(Test__Exp2FixedSoftmax, MassRandom_10000Vectors_KLDivergence)
+{
+    /**
+     * BATTLE TEST: Run exp2 LUT softmax against FP32 std::exp reference
+     * for 10,000 random input vectors.
+     *
+     * Metrics computed:
+     * - KL Divergence: D_KL(P || Q) where P = FP32 reference, Q = exp2 LUT
+     * - RMS Error: sqrt(mean((p_i - q_i)²))
+     * - Max Absolute Error: max |p_i - q_i|
+     * - L1 Error (Total Variation): Σ |p_i - q_i|
+     *
+     * Per Gemini3: "If this LUT is inaccurate, the whole kernel fails
+     * regardless of how good the dot products are."
+     */
+    const int num_vectors = 10000;
+    const int seq_lengths[] = {8, 16, 32, 64, 128, 256, 512, 1024};
+    const float alphas[] = {
+        0.001f,                   // Very smooth
+        1.0f / std::sqrt(64.0f),  // head_dim=64
+        1.0f / std::sqrt(128.0f), // head_dim=128 (typical)
+        0.1f,                     // Medium
+        1.0f                      // Sharp
+    };
+
+    std::mt19937 rng(12345);
+
+    // Aggregate statistics
+    double total_kl = 0.0;
+    double total_rms = 0.0;
+    double worst_kl = 0.0;
+    double worst_max_err = 0.0;
+    int num_tests = 0;
+    int kl_failures = 0;  // KL > 0.01 nats
+    int rms_failures = 0; // RMS > 0.02
+
+    std::cout << "\n"
+              << "╔══════════════════════════════════════════════════════════════════════════╗\n"
+              << "║     EXP2 LUT SOFTMAX vs FP32 STD::EXP - BATTLE TEST (10,000 Vectors)     ║\n"
+              << "╠══════════════════════════════════════════════════════════════════════════╣\n";
+
+    for (float alpha : alphas)
+    {
+        for (int seq_len : seq_lengths)
+        {
+            // Score distribution parameters (realistic attention score ranges)
+            std::normal_distribution<float> score_dist(0.0f, 1000.0f * alpha);
+
+            double alpha_kl_sum = 0.0;
+            double alpha_rms_sum = 0.0;
+            double alpha_worst_kl = 0.0;
+            double alpha_worst_max_err = 0.0;
+            int alpha_count = 0;
+
+            for (int v = 0; v < num_vectors / (8 * 5); ++v) // Distribute evenly
+            {
+                // Generate random scores
+                std::vector<int32_t> scores(seq_len);
+                for (int i = 0; i < seq_len; ++i)
+                {
+                    scores[i] = static_cast<int32_t>(score_dist(rng) / alpha);
+                }
+
+                // Exp2 LUT softmax
+                std::vector<int16_t> weights(seq_len);
+                exp2_softmax_int32(scores.data(), weights.data(), seq_len, alpha);
+
+                // FP32 reference
+                auto ref = reference_softmax(scores, alpha);
+                auto actual = weights_to_probs(weights);
+
+                // Compute metrics
+                float kl = kl_divergence(ref, actual);
+                float max_err = max_abs_error(ref, actual);
+
+                // RMS error
+                double rms_sum = 0.0;
+                for (size_t i = 0; i < ref.size(); ++i)
+                {
+                    double diff = ref[i] - actual[i];
+                    rms_sum += diff * diff;
+                }
+                float rms_err = std::sqrt(rms_sum / ref.size());
+
+                // Track failures
+                if (kl > 0.01f)
+                    kl_failures++;
+                if (rms_err > 0.02f)
+                    rms_failures++;
+
+                // Accumulate
+                alpha_kl_sum += kl;
+                alpha_rms_sum += rms_err;
+                alpha_worst_kl = std::max(alpha_worst_kl, static_cast<double>(kl));
+                alpha_worst_max_err = std::max(alpha_worst_max_err, static_cast<double>(max_err));
+                alpha_count++;
+
+                total_kl += kl;
+                total_rms += rms_err;
+                worst_kl = std::max(worst_kl, static_cast<double>(kl));
+                worst_max_err = std::max(worst_max_err, static_cast<double>(max_err));
+                num_tests++;
+            }
+
+            // Per-config summary
+            double avg_kl = alpha_kl_sum / alpha_count;
+            double avg_rms = alpha_rms_sum / alpha_count;
+
+            std::cout << "║ alpha=" << std::setw(8) << std::fixed << std::setprecision(5) << alpha
+                      << " seq=" << std::setw(4) << seq_len
+                      << " | KL_avg=" << std::setw(10) << std::scientific << std::setprecision(3) << avg_kl
+                      << " KL_max=" << std::setw(10) << alpha_worst_kl
+                      << " RMS_avg=" << std::setw(8) << avg_rms
+                      << " ║\n";
+        }
+    }
+
+    // Final summary
+    double mean_kl = total_kl / num_tests;
+    double mean_rms = total_rms / num_tests;
+    double failure_rate_kl = 100.0 * kl_failures / num_tests;
+    double failure_rate_rms = 100.0 * rms_failures / num_tests;
+
+    std::cout << "╠══════════════════════════════════════════════════════════════════════════╣\n"
+              << "║                              AGGREGATE RESULTS                           ║\n"
+              << "╠══════════════════════════════════════════════════════════════════════════╣\n"
+              << "║ Total test vectors:      " << std::setw(10) << num_tests << "                                    ║\n"
+              << "║ Mean KL Divergence:      " << std::setw(10) << std::scientific << std::setprecision(4) << mean_kl << " nats                                ║\n"
+              << "║ Worst KL Divergence:     " << std::setw(10) << worst_kl << " nats                                ║\n"
+              << "║ Mean RMS Error:          " << std::setw(10) << mean_rms << "                                     ║\n"
+              << "║ Worst Max Abs Error:     " << std::setw(10) << worst_max_err << "                                     ║\n"
+              << "║ KL > 0.01 failures:      " << std::setw(10) << kl_failures << " (" << std::fixed << std::setprecision(2) << failure_rate_kl << "%)                              ║\n"
+              << "║ RMS > 0.02 failures:     " << std::setw(10) << rms_failures << " (" << failure_rate_rms << "%)                              ║\n"
+              << "╚══════════════════════════════════════════════════════════════════════════╝\n\n";
+
+    // Assertions: strict quality gates
+    EXPECT_LT(mean_kl, 0.005) << "Mean KL divergence too high! LUT accuracy compromised.";
+    EXPECT_LT(worst_kl, 0.1) << "Worst-case KL divergence unacceptable.";
+    EXPECT_LT(mean_rms, 0.01) << "Mean RMS error too high.";
+    EXPECT_LT(failure_rate_kl, 1.0) << "Too many high-KL failures (>1%).";
+    EXPECT_LT(failure_rate_rms, 1.0) << "Too many high-RMS failures (>1%).";
+}
+
+TEST_F(Test__Exp2FixedSoftmax, MassRandom_LUTvsStdExp_DirectComparison)
+{
+    /**
+     * Direct comparison of exp2 LUT values against std::exp
+     * Tests the LUT accuracy in isolation, independent of softmax normalization.
+     *
+     * For random x values in the typical attention range, compare:
+     *   exp2_lut(x) vs std::exp(-x * alpha * log2e)
+     */
+    const int num_samples = 100000;
+    std::mt19937 rng(54321);
+
+    // Score differences in typical range (after subtracting max)
+    // Test the LUT accuracy for exp2(-u) where u ∈ [0, 1)
+    // The LUT stores 2^(-u) scaled by 2^30 at 2048 uniformly spaced points
+    // LUT[i] = round(2^30 * 2^(-i/2048)) for i ∈ [0, 2047]
+
+    ensure_exp2_lut_initialized(30);
+    const uint32_t *lut = get_exp2_lut_data();
+    const uint32_t LUT_ONE = 1U << 30;
+
+    double total_rel_error = 0.0;
+    double max_rel_error = 0.0;
+    double total_abs_error = 0.0;
+    double max_abs_error_val = 0.0;
+
+    // Test each LUT entry directly
+    for (int i = 0; i < EXP2_LUT_SIZE; ++i)
+    {
+        // u = i / 2048, so LUT[i] should approximate 2^30 * 2^(-i/2048)
+        double u = static_cast<double>(i) / EXP2_LUT_SIZE;
+        double expected = std::exp2(-u); // FP64 reference: 2^(-u)
+        double actual = static_cast<double>(lut[i]) / static_cast<double>(LUT_ONE);
+
+        double abs_err = std::abs(expected - actual);
+        double rel_err = abs_err / expected; // expected is always > 0.5
+
+        total_abs_error += abs_err;
+        total_rel_error += rel_err;
+        max_abs_error_val = std::max(max_abs_error_val, abs_err);
+        max_rel_error = std::max(max_rel_error, rel_err);
+    }
+
+    double mean_abs_error = total_abs_error / EXP2_LUT_SIZE;
+    double mean_rel_error = total_rel_error / EXP2_LUT_SIZE;
+
+    std::cout << "\n"
+              << "╔══════════════════════════════════════════════════════════════════════════╗\n"
+              << "║           EXP2 LUT TABLE ACCURACY TEST (2048 entries)                    ║\n"
+              << "╠══════════════════════════════════════════════════════════════════════════╣\n"
+              << "║ LUT[i] stores: 2^30 × 2^(-i/2048) for i ∈ [0, 2047]                       ║\n"
+              << "╠══════════════════════════════════════════════════════════════════════════╣\n"
+              << "║ LUT entries tested:      " << std::setw(10) << EXP2_LUT_SIZE << "                                    ║\n"
+              << "║ Mean Absolute Error:     " << std::setw(14) << std::scientific << std::setprecision(6) << mean_abs_error << "                            ║\n"
+              << "║ Max Absolute Error:      " << std::setw(14) << max_abs_error_val << "                            ║\n"
+              << "║ Mean Relative Error:     " << std::setw(14) << mean_rel_error << "                            ║\n"
+              << "║ Max Relative Error:      " << std::setw(14) << max_rel_error << "                            ║\n"
+              << "╚══════════════════════════════════════════════════════════════════════════╝\n\n";
+
+    // LUT values are computed with Q30 precision (2^30 scaling)
+    // Rounding error should be at most 0.5 LSB = 0.5/2^30 ≈ 4.7e-10
+    // Relative error should be < 1e-9
+    EXPECT_LT(mean_rel_error, 1e-8) << "Mean relative error too high for Q30 LUT";
+    EXPECT_LT(max_rel_error, 1e-8) << "Worst-case relative error too high";
 }

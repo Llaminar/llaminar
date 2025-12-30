@@ -301,74 +301,9 @@ namespace llaminar2
             }
         }
 
-        // =============================================================================
-        // Q16_1Block_192 (192 elements) Tests
-        // =============================================================================
-
-        TEST_F(Q16MPIAllreduceTest, AllreduceQ16Block192_SingleBlock)
-        {
-            constexpr size_t n_blocks = 1;
-            Q16_1Block_192 block;
-
-            block.d = 3.0f;
-            block.sum_qs = 0;
-            for (int i = 0; i < 192; ++i)
-            {
-                block.qs[i] = static_cast<int16_t>(rank_ * 50 + (i % 50));
-                block.sum_qs += block.qs[i];
-            }
-
-            mpi_ctx_->allreduce_q16_inplace<Q16_1Block_192>(&block, n_blocks);
-
-            // Verify dequantized values
-            for (int i = 0; i < 192; ++i)
-            {
-                // Rank 0: 3.0 * (0 + i%50), Rank 1: 3.0 * (50 + i%50)
-                // Sum: 3.0 * (50 + 2*(i%50))
-                float expected = 3.0f * (50.0f + 2.0f * (i % 50));
-                float actual = dequantize_element(block, i);
-                EXPECT_NEAR(actual, expected, Q16_TOLERANCE * std::abs(expected) + 0.5f)
-                    << "Mismatch at element " << i;
-            }
-        }
-
-        TEST_F(Q16MPIAllreduceTest, AllreduceQ16Block192_DeepSeekV3Config)
-        {
-            // DeepSeek V3 MLA: 16 Q/K heads with head_dim=192
-            constexpr size_t n_heads = 16;
-            std::vector<Q16_1Block_192> blocks(n_heads);
-            std::vector<std::vector<float>> expected(n_heads, std::vector<float>(192));
-
-            for (size_t h = 0; h < n_heads; ++h)
-            {
-                const float scale = 0.1f * (h + 1); // Different scale per head
-                blocks[h].d = scale;
-                blocks[h].sum_qs = 0;
-                for (int i = 0; i < 192; ++i)
-                {
-                    int16_t val = static_cast<int16_t>(rank_ * 100 + h * 5 + (i % 5));
-                    blocks[h].qs[i] = val;
-                    blocks[h].sum_qs += val;
-
-                    // Both ranks have same scale, same qs values except rank offset
-                    // Rank 0: scale * (0 + h*5 + i%5), Rank 1: scale * (100 + h*5 + i%5)
-                    // Sum: scale * (100 + 2*h*5 + 2*(i%5))
-                    expected[h][i] = scale * (100.0f + 2.0f * h * 5.0f + 2.0f * (i % 5));
-                }
-            }
-
-            mpi_ctx_->allreduce_q16_inplace<Q16_1Block_192>(blocks.data(), n_heads);
-
-            for (size_t h = 0; h < n_heads; ++h)
-            {
-                for (int i = 0; i < 192; ++i)
-                {
-                    float actual = dequantize_element(blocks[h], i);
-                    EXPECT_NEAR(actual, expected[h][i], Q16_TOLERANCE * std::abs(expected[h][i]) + 0.5f)
-                        << "Head " << h << " elem " << i;
-                }
-            }
-        }
+        // Note: DeepSeek V3 MLA uses separate NOPE (128-dim) + ROPE (64-dim) tensors
+        // with independent scales, not a combined 192-dim block.
+        // See PROJECT_Q16_INTEGER_ATTENTION_V2.md MLA Architecture section.
 
         // =============================================================================
         // Edge Case Tests

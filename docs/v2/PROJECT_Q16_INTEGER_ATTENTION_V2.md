@@ -1,8 +1,8 @@
 # Q16_1 Integer-Domain Attention Kernel v2
 
-**Status**: In Progress (Phase 4 - Per-head Scale Normalization)  
+**Status**: In Progress (Phase 5.3 - MLA Microkernel Support)  
 **Created**: 2025-12-30  
-**Updated**: 2025-12-30  
+**Updated**: 2025-12-31  
 **Author**: Llaminar Team  
 **Supersedes**: [PROJECT_Q16_INTEGER_ATTENTION.md](./PROJECT_Q16_INTEGER_ATTENTION.md)
 
@@ -20,7 +20,8 @@
   - [x] Integer P×V accumulation (templated)
   - [x] Integration with new `Exp2FixedSoftmax` microkernel
   - [x] Fresh `Exp2FixedSoftmax.h/.cpp` with cleaner API
-  - [x] 29 unit tests for Exp2FixedSoftmax (17 basic + 12 spiky activation tests, all passing)
+  - [x] **Expanded LUT from 256→2048 entries** (11-bit index, 4KB, ~0.05% error) ✅
+  - [x] 28 unit tests for Exp2FixedSoftmax (16 basic + 12 spiky activation tests, all passing)
 - [x] Phase 1.5: Codebase audit for block size dependencies
   - [x] Identified 25 files with 40 functions requiring updates
   - [x] Categorized by priority: P0 (blocking) → P3 (integration)
@@ -52,12 +53,241 @@
     - [x] `Test__Q16MPI_Allreduce.cpp`: NEW - 10 MPI integration tests (2-rank) for all block sizes ✅
     - [x] Fixed 2 pre-existing KV cache tests (`AppendQ16_1_MultipleAppends`, `EvictQ16_1`) ✅
     - [x] Fixed `MPIContext::allreduce_q16_inplace` to correctly loop over blocks for `q16_sum_n` ✅
-- [ ] Phase 4: Per-head scale normalization
-- [ ] Phase 5: Implement Wo projection (VPDPWSSD)
+  - [x] **Kernel-Level Updates** (2025-12-30):
+    - [x] `CPURoPEKernelT<Q16_1>`: Updated `apply_tensor()` to dispatch by `q16_block_size()` ✅
+    - [x] `CPURoPEKernelT<Q16_1>`: Added `apply_typed_block<BlockType>()` template method ✅
+    - [x] `Q16_1Tensor::copyFrom_fp32()`: Fixed to support all block sizes (32, 64, 128, 192) ✅
+    - [x] `Q16_1Tensor::decode_block_at()`: Fixed to dispatch by block size ✅
+    - [x] `Q16_1Tensor::get_raw_block_at()`: Fixed to dispatch by block size ✅
+    - [x] `Test__CPURoPEKernelT_Q16_1_BlockSizes.cpp`: NEW - 23 tests for kernel-level RoPE with all block sizes ✅
+- [x] Phase 4: Per-head scale normalization ✅
+  - [x] `Q16HeadNormalization.h/.cpp`: Core normalization primitives ✅
+    - [x] `normalize_q16_head<BlockType>()`: Requantize blocks within a head to unified scale ✅
+    - [x] `find_head_max_scale<BlockType>()`: Find max |d| across blocks in head ✅
+    - [x] `requantize_blocks_to_scale<BlockType>()`: Adjust qs values for new scale ✅
+    - [x] `needs_normalization<BlockType>()`: Check if head needs normalization ✅
+  - [x] `Q16_1HeadMetadata` struct for storing per-head scales ✅
+  - [x] `blocks_per_head()` and `is_optimal_block_size()` constexpr helpers ✅
+  - [x] Explicit template instantiations for all 4 block types (32, 64, 128, 192) ✅
+  - [x] `Test__Q16HeadNormalization.cpp`: NEW - 27 unit tests (all passing) ✅
+    - [x] `find_head_max_scale` tests: SingleBlock, MultipleBlocks, NegativeScales, AllZero, Empty, AllBlockTypes
+    - [x] `requantize_blocks_to_scale` tests: SingleBlock, MultipleBlocks, ZeroBlock
+    - [x] `normalize_q16_head` tests: SingleBlock optimal path, MultipleBlocks, PreservesSum, Block192
+    - [x] `needs_normalization` tests: SingleBlock, DifferentScales, SameScales, WithTolerance, AfterNormalize
+    - [x] Precision tests: LargeScaleDifference (10×), TypicalDistribution
+    - [x] Edge cases: NullPointer, ZeroNumBlocks, ZeroHeadScale, MaxINT16Values
+  - [ ] Integration with FusedQKVGEMMStage for Q normalization (Phase 5+)
+  - [ ] Integration with KVCacheAppendStage for K/V normalization (Phase 5+)
+- [x] Phase 5: Implement Wo projection (VPDPWSSD) ✅
+  - [x] `WoProjection.h/.cpp`: INT32→INT16 normalization, GEMV, quantization microkernels ✅
+  - [x] `q16_context_normalize_to_int16()`: Requantize INT32 context for Wo projection ✅
+  - [x] `q16_wo_row_gemv<BlockType>()`: Single row × weight GEMV with VPDPWSSD ✅
+  - [x] `q16_wo_projection<BlockType>()`: Full context → projected output ✅
+  - [x] `q16_wo_projection_batched<BlockType>()`: Multi-query batched projection ✅
+  - [x] `q16_quantize_to_q16_1<BlockType>()`: INT32→Q16_1 final quantization ✅
+  - [x] `Test__Q16WoProjection.cpp`: 12 unit tests (all passing) ✅
+- [x] Phase 5.1: QK Dot Product Microkernels ✅
+  - [x] `Q16DotProduct.h/.cpp`: Templated dot products for all block sizes ✅
+  - [x] `q16_dot_single<BlockType>()`: Inner loop for Q·K^T computation ✅
+  - [x] `q16_qk_gemv<BlockType>()`: Flash Decode path (seq_len_q=1) ✅
+  - [x] `q16_qk_gemm_tile<BlockType>()`: FA2 Prefill tiled path ✅
+  - [x] Runtime dispatch functions (`dispatch_q16_dot_single`, etc.) ✅
+  - [x] `Test__Q16DotProduct.cpp`: 11 unit tests (all passing) ✅
+- [x] Phase 5.2: PV Accumulation Microkernels ✅
+  - [x] `PVAccumulate.h/.cpp`: Weighted V accumulation (P×V) ✅
+  - [x] `q16_pv_accumulate<BlockType>()`: Zero context + accumulate ✅
+  - [x] `q16_pv_accumulate_add<BlockType>()`: Add to existing context ✅
+  - [x] `q16_pv_gemm_tile<BlockType>()`: FA2 tiled P×V path ✅
+  - [x] `q16_context_rescale()`: Online softmax rescaling ✅
+  - [x] `Test__PVAccumulate.cpp`: 12 unit tests (all passing) ✅
+- [ ] Phase 5.3: MLA (Multi-head Latent Attention) Support
+  - [ ] `MLAAttentionParams` struct with split NOPE/ROPE tensors
+  - [ ] `q16_qk_gemv_mla()`: Dual dot product (NOPE + ROPE)
+  - [ ] `q16_qk_gemm_tile_mla()`: Tiled MLA variant
+  - [ ] MLA-aware KV cache with separate NOPE/ROPE storage
+  - [ ] Integration tests with DeepSeek V3 / Kimi K2 configs
 - [ ] Phase 6: Implement integer residual add
 - [ ] Phase 7: FA2 Prefill tiled implementation
 - [ ] Phase 8: Unit tests for Q16IntegerAttention
 - [ ] Phase 9: E2E parity tests
+- [ ] Phase 10: KV Cache Scale Profiling Tool
+  - [ ] Create `python/tools/profile_kv_activations.py` 
+  - [ ] Extend existing PyTorch snapshot infrastructure
+  - [ ] Collect per-layer, per-head K/V activation statistics (min, max, mean, std, percentiles)
+  - [ ] Run on representative prompts (diverse dataset)
+  - [ ] Output recommended `kv_cache_scale` values per model family
+  - [ ] Profile: Qwen 2.5 (0.5B, 7B), Llama 3 (8B), DeepSeek V3
+
+---
+
+## Design Goal: Full Integer Residual Stream
+
+### Core Principle: NO FP32 Intermediate Residuals
+
+**The residual stream is the backbone of transformer inference.** In v2, the residual is maintained as **Q16_1 throughout the entire forward pass**, with block sizes selected based on the model's head dimension.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Q16_1 RESIDUAL STREAM (FULL INTEGER)                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  EMBEDDING                                                                   │
+│  ─────────                                                                   │
+│  Token IDs → Embedding Table → Q16_1 residual (block size = head_dim)       │
+│                                                                              │
+│  FOR EACH TRANSFORMER LAYER:                                                 │
+│  ────────────────────────────                                                │
+│                                                                              │
+│    ┌─────────────────────────────────────────────────────────────────────┐  │
+│    │  ATTENTION BLOCK                                                     │  │
+│    │                                                                      │  │
+│    │  1. RMSNorm(Q16_1 residual) → Q16_1 normalized                      │  │
+│    │                                                                      │  │
+│    │  2. QKV PROJECTION (see "QKV Projection Exception" below)           │  │
+│    │     Q16_1 → Q8_1 → GEMM → Q8_1 Q,K,V → RoPE → Q16_1 Q,K,V          │  │
+│    │                                                                      │  │
+│    │  3. KV Cache: Store Q16_1 K,V (model-appropriate block size)        │  │
+│    │                                                                      │  │
+│    │  4. Integer Attention: Q16_1 Q,K,V → INT32 → Q16_1 context          │  │
+│    │                                                                      │  │
+│    │  5. Wo Projection: Q16_1 context × Q8_0 Wo → Q16_1 projected        │  │
+│    │                                                                      │  │
+│    │  6. Residual Add: Q16_1 residual + Q16_1 projected → Q16_1 residual │  │
+│    └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│    ┌─────────────────────────────────────────────────────────────────────┐  │
+│    │  FFN BLOCK                                                           │  │
+│    │                                                                      │  │
+│    │  1. RMSNorm(Q16_1 residual) → Q16_1 normalized                      │  │
+│    │                                                                      │  │
+│    │  2. Gate+Up GEMM: Q16_1 → Q8_1 → GEMM → Q16_1 gate, up              │  │
+│    │                                                                      │  │
+│    │  3. SiLU(gate) × up → Q16_1 activated                               │  │
+│    │                                                                      │  │
+│    │  4. Down GEMM: Q16_1 → Q8_1 → GEMM → Q16_1 down                     │  │
+│    │                                                                      │  │
+│    │  5. Residual Add: Q16_1 residual + Q16_1 down → Q16_1 residual      │  │
+│    └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  FINAL OUTPUT                                                                │
+│  ────────────                                                                │
+│  RMSNorm(Q16_1 residual) → LM Head GEMM → FP32 logits (only FP32 output!)   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### What This Means
+
+| Aspect | v1 (Broken) | v2 (Goal) |
+|--------|-------------|-----------|
+| **Residual storage** | FP32 | **Q16_1** |
+| **Intermediate activations** | FP32 dequantize/requantize | **Q16_1 or Q8_1 only** |
+| **Attention KV cache** | FP32 | **Q16_1** |
+| **Scale factors** | FP32 (unavoidable) | FP32 (unavoidable) |
+| **Data computation** | FP32 GEMM/attention | **INT16/INT32 VNNI** |
+
+**The ONLY FP32 in the forward pass should be:**
+1. Scale factors (the `float d` in Q16_1/Q8_1 blocks) — unavoidable
+2. Final logits output — required for sampling
+
+### QKV Projection Exception: The Q16_1 → Q8_1 → Q16_1 Path
+
+The QKV projections are the **one place where we temporarily convert to Q8_1** for GEMM efficiency. This is a deliberate design choice:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                QKV PROJECTION PATH (FusedQKVGEMMStage)                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUT: Q16_1 residual (after RMSNorm)                                       │
+│         Block size: model-appropriate (64 or 128)                            │
+│                                                                              │
+│  STEP 1: Convert Q16_1 → Q8_1                                               │
+│  ─────────────────────────────                                               │
+│  Why: VPDPBUSD (UINT8×INT8→INT32) is 2× faster than VPDPWSSD (INT16×INT16)  │
+│  How: Requantize with scale adjustment (preserves information, loses range) │
+│                                                                              │
+│  STEP 2: Q8_1 × Q8_0 Wq/Wk/Wv GEMM → Q8_1 Q, K, V                          │
+│  ───────────────────────────────────────────────────                         │
+│  Why: VNNI-optimized GEMM path (existing infrastructure)                     │
+│  Note: Output is Q8_1 with per-row scales                                    │
+│                                                                              │
+│  STEP 3: Apply RoPE in Q8_1 → Q16_1                                         │
+│  ──────────────────────────────────                                          │
+│  Input:  Q8_1 Q and K tensors                                                │
+│  Output: Q16_1 Q and K tensors with per-head scales                          │
+│                                                                              │
+│  Why Q16_1 output?                                                           │
+│  1. RoPE involves sin/cos multiplication - expands dynamic range             │
+│  2. Q16_1 preserves precision for subsequent Q×K^T dot products             │
+│  3. Per-head scale normalization is applied at this stage                    │
+│                                                                              │
+│  STEP 4: Store K, V in Q16_1 KV Cache                                        │
+│  ─────────────────────────────────                                           │
+│  Block size: model-appropriate (matches head_dim for 1 block/head)           │
+│  Scale: Per-head normalized scale                                            │
+│                                                                              │
+│  OUTPUT: Q16_1 Q, K, V with per-head scales                                  │
+│          Ready for integer attention kernel                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why not stay in Q16_1 for GEMM?**
+
+| Approach | Memory BW | Compute | Trade-off |
+|----------|-----------|---------|-----------|
+| Q16_1 activations × Q16_0 weights | 2× | VPDPWSSD | Higher precision, slower |
+| Q8_1 activations × Q8_0 weights | 1× | VPDPBUSD | Lower precision, **2× faster** |
+
+For projection layers (Wq, Wk, Wv, Wo, FFN), the GEMM is compute-bound. The Q8_1 path is preferred because:
+1. **Weights are stored as Q8_0** — no choice, must use INT8
+2. **VPDPBUSD is optimized** — 2× throughput vs VPDPWSSD  
+3. **Post-GEMM expansion** — RoPE and normalization expand back to Q16_1
+
+### Model-Appropriate Block Sizes
+
+The Q16_1 residual block size is selected **at model load time** based on `head_dim`:
+
+```cpp
+Q16BlockSize select_residual_block_size(const ModelConfig& config) {
+    const int head_dim = config.hidden_size / config.n_heads;
+    
+    // Goal: 1 block per head for optimal integer attention
+    switch (head_dim) {
+        case 64:  return Q16BlockSize::BLOCK_64;   // Qwen2.5-0.5B, GPT-2
+        case 128: return Q16BlockSize::BLOCK_128;  // Llama, Mistral, Qwen3
+        default:  return Q16BlockSize::BLOCK_64;   // Universal fallback
+    }
+    // NOTE: MLA models (DeepSeek V3, Kimi K2) use separate NOPE/ROPE tensors
+    // with their own block sizes (128 for NOPE, 64 for ROPE) - see MLA section
+}
+```
+
+**This block size is used for:**
+- Embedding output tensor
+- All Q16_1 residual tensors throughout the forward pass
+- KV cache storage (K and V tensors)
+- Intermediate Q16_1 activations
+
+### Summary: Zero FP32 Intermediate Data
+
+| Stage | Input | Output | FP32 Data? |
+|-------|-------|--------|------------|
+| Embedding | Token IDs | Q16_1 | ❌ No |
+| RMSNorm | Q16_1 | Q16_1 | ❌ No (scale only) |
+| QKV input convert | Q16_1 | Q8_1 | ❌ No |
+| QKV GEMM | Q8_1 × Q8_0 | Q8_1 | ❌ No |
+| RoPE | Q8_1 | Q16_1 | ❌ No (sin/cos LUT) |
+| KV Cache | Q16_1 | Q16_1 | ❌ No |
+| Q×K^T | INT16 × INT16 | INT32 | ❌ No |
+| Softmax | INT32 | INT16 | ❌ No (LUT) |
+| P×V | INT16 × INT16 | INT32 | ❌ No |
+| Wo convert | Q16_1 | Q8_1 | ❌ No |
+| Wo GEMM | Q8_1 × Q8_0 | Q16_1 | ❌ No |
+| Residual Add | Q16_1 + Q16_1 | Q16_1 | ❌ No |
+| FFN (same pattern) | Q16_1 | Q16_1 | ❌ No |
+| Final Norm + LM Head | Q16_1 | **FP32** | ✅ Only here! |
 
 ---
 
@@ -95,7 +325,7 @@ Without normalization, agents fell back to FP32 to handle arbitrary scale combin
 The Q16_1 format inherited Q8_1's 32-element block size without considering:
 
 1. **INT16 has 256× more precision** than INT8 - can handle larger block variance
-2. **Common head dimensions** (64, 128, 192) would benefit from aligned block sizes
+2. **Common head dimensions** (64, 128) would benefit from aligned block sizes
 3. **Attention algorithm** specifically needs per-head (not per-block) scales
 
 This wasn't obvious at design time because Q16_1 was designed for **GEMM**, where per-block scales work fine. The problem only manifests in **attention** where multiple scale combinations compound.
@@ -109,20 +339,20 @@ This wasn't obvious at design time because Q16_1 was designed for **GEMM**, wher
 Common head dimensions across model families:
 - **64**: Qwen2.5-0.5B, GPT-2
 - **128**: Qwen3, MiniMax-M1, Llama-2/3, Mistral
-- **192**: DeepSeek V3, Kimi K2 (MLA: 128 nope + 64 rope)
+- **MLA (DeepSeek V3, Kimi K2)**: 128 NOPE + 64 ROPE (separate tensors, separate scales)
 
-**64 divides all of them evenly**, making it the universal fallback block size.
+**64 divides all standard head_dims evenly**, making it the universal fallback block size.
 
 ### Model Survey
 
-| Model | Architecture | Q/K head_dim | V head_dim | 64-block | 128-block | 192-block |
-|-------|-------------|--------------|------------|----------|-----------|-----------|
-| Qwen2.5-0.5B | Standard | 64 | 64 | ✅ 1/head | ❌ Broken | ❌ Broken |
-| Qwen3-8B | Standard | 128 | 128 | 2/head | ✅ 1/head | ❌ Broken |
-| MiniMax-M1 | Standard | 128 | 128 | 2/head | ✅ 1/head | ❌ Broken |
-| Llama-3-8B | Standard | 128 | 128 | 2/head | ✅ 1/head | ❌ Broken |
-| DeepSeek V3 | MLA | **192** | 128 | 3/head | 1.5 ❌ | ✅ 1/head |
-| Kimi K2 | MLA | **192** | 128 | 3/head | 1.5 ❌ | ✅ 1/head |
+| Model | Architecture | Q/K head_dim | V head_dim | 64-block | 128-block | Notes |
+|-------|-------------|--------------|------------|----------|-----------|-------|
+| Qwen2.5-0.5B | Standard | 64 | 64 | ✅ 1/head | ❌ Broken | Optimal |
+| Qwen3-8B | Standard | 128 | 128 | 2/head | ✅ 1/head | Optimal |
+| MiniMax-M1 | Standard | 128 | 128 | 2/head | ✅ 1/head | Optimal |
+| Llama-3-8B | Standard | 128 | 128 | 2/head | ✅ 1/head | Optimal |
+| DeepSeek V3 | **MLA** | 128+64 | 128 | See below | See below | Separate NOPE/ROPE |
+| Kimi K2 | **MLA** | 128+64 | 128 | See below | See below | Separate NOPE/ROPE |
 
 ### Block Size Strategy
 
@@ -134,13 +364,10 @@ Common head dimensions across model families:
 │  AT QUANTIZATION TIME (model-aware):                            │
 │                                                                  │
 │    if model.architecture == MLA:                                │
-│      // Option A: Semantic split (preserves nope/rope)          │
-│      Q/K weights → Q16_64 blocks (3 per head, needs normalize) │
-│      V weights   → Q16_128 blocks (1 per head)                 │
-│                                                                  │
-│      // Option B: Maximum performance (loses nope/rope split)   │
-│      Q/K weights → Q16_192 blocks (1 per head) ← OPTIMAL!      │
-│      V weights   → Q16_128 blocks (1 per head)                 │
+│      // Separate NOPE and ROPE with their own scales            │
+│      Q_nope, K_nope → Q16_128 blocks (1 per head)              │
+│      Q_rope, K_rope → Q16_64 blocks (1 per head)               │
+│      V weights      → Q16_128 blocks (1 per head)              │
 │                                                                  │
 │    else if model.head_dim == 64:                                │
 │      → Q16_64 blocks (1 per head) ← OPTIMAL, no normalization! │
@@ -164,25 +391,68 @@ Common head dimensions across model families:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### MLA Block Size Tradeoffs
+### MLA Architecture: Separate NOPE/ROPE Scales
 
-For DeepSeek V3 / Kimi K2 with 192-dim Q/K:
+DeepSeek V3 and Kimi K2 use Multi-head Latent Attention (MLA), which splits Q/K into:
+- **NOPE (No Position Embedding)**: 128 dimensions - context-dependent, no rotation
+- **ROPE (Rotary Position Embedding)**: 64 dimensions - position-encoded via rotation
 
-| Approach | Block Config | Blocks/Head | Normalization | Nope/Rope Semantics |
-|----------|-------------|-------------|---------------|---------------------|
-| **64-block + normalize** | Q16_64 | 3 | Required | Preserved (can split 2+1) |
-| **192-block optimal** | Q16_192 | **1** | None | Lost (single scale) |
+**Why NOT merge into 192-block:**
+1. NOPE and ROPE have fundamentally different value distributions
+2. A single scale for both loses precision where it matters most
+3. The 192-block approach was optimizing for "blocks per head" metric, not accuracy
 
-**Recommendation**: Start with 192-block for simplicity and performance. If precision issues arise due to nope/rope distribution differences, fall back to 64-block with normalization.
+**Correct approach: Separate tensors with optimal block sizes**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              MLA Q/K STORAGE (DeepSeek V3, Kimi K2)             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Q_nope: Q16_1Block_128 × n_heads                               │
+│          → 1 block per head, 1 scale per head                   │
+│          → Stores context-dependent query components            │
+│                                                                  │
+│  Q_rope: Q16_1Block_64 × n_heads                                │
+│          → 1 block per head, 1 scale per head                   │
+│          → Stores position-encoded query components             │
+│                                                                  │
+│  K_nope: Q16_1Block_128 × n_kv_heads  (cached)                  │
+│  K_rope: Q16_1Block_64 × n_kv_heads   (cached)                  │
+│                                                                  │
+│  V:      Q16_1Block_128 × n_kv_heads  (standard, no split)      │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ATTENTION COMPUTATION:                                          │
+│                                                                  │
+│  score = Q_nope × K_nope^T  +  Q_rope × K_rope^T                │
+│          ↑                     ↑                                 │
+│          INT32 (scale_q_nope   INT32 (scale_q_rope              │
+│                 × scale_k_nope)       × scale_k_rope)           │
+│                                                                  │
+│  Combined score uses 2 scale pairs (still tractable!)           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits of separate NOPE/ROPE:**
+| Aspect | 192-block (rejected) | Separate tensors (correct) |
+|--------|---------------------|---------------------------|
+| Scales per head | 1 | 2 (one per component) |
+| Precision | Compromised | Optimal for each component |
+| Memory overhead | ~4.2% | ~6.25% (NOPE) + ~12.5% (ROPE) |
+| Implementation | Simpler | Slightly more complex |
+| Accuracy | Potentially lossy | Preserves semantics |
 
 ### Memory Efficiency Comparison
 
 | Block Size | Overhead | Bytes/Value | Use Case |
 |------------|----------|-------------|----------|
-| 32 (current) | 8B / 32 = 25% | 2.25 | Legacy GEMM |
-| 64 | 8B / 64 = 12.5% | 2.125 | head_dim=64, universal fallback |
-| 128 | 8B / 128 = 6.25% | 2.0625 | head_dim=128 (most modern models) |
-| 192 | 8B / 192 = 4.2% | **2.04** | MLA Q/K (DeepSeek V3, Kimi K2) |
+| 32 (legacy) | 8B / 32 = 25% | 2.25 | GEMM compatibility |
+| 64 | 8B / 64 = 12.5% | 2.125 | head_dim=64, MLA ROPE, universal fallback |
+| 128 | 8B / 128 = 6.25% | 2.0625 | head_dim=128, MLA NOPE/V (most modern models) |
+| 192 | 8B / 192 = 4.2% | 2.04 | *Not recommended* - see MLA section |
 
 ### New Q16 Format Variants
 
@@ -208,7 +478,8 @@ struct Q16_1Block_128 {
     int16_t qs[128];
 };
 
-// New: 192-element blocks (optimal for MLA Q/K)
+// 192-element blocks exist but NOT recommended for MLA
+// See "MLA Architecture: Separate NOPE/ROPE Scales" section
 struct Q16_1Block_192 {
     float d;
     int32_t sum_qs;
@@ -217,50 +488,245 @@ struct Q16_1Block_192 {
 
 // Tensor metadata includes block size
 struct Q16_1TensorMetadata {
-    uint32_t block_size;  // 32, 64, 128, or 192
+    uint32_t block_size;  // 32, 64, 128 (192 exists but not recommended)
     uint32_t num_blocks;
     // ... existing fields ...
 };
 ```
 
-### MLA Block Size Options
+### MLA Block Size: Separate NOPE/ROPE (Recommended)
 
-For DeepSeek V3 / Kimi K2 with MLA architecture, two approaches:
-
-#### Option A: 192-Block (Recommended for Performance)
+For DeepSeek V3 / Kimi K2 with MLA architecture, the correct approach is **separate tensors**:
 
 ```cpp
-// Single 192-element block per Q/K head - optimal path!
-struct MLAHeadLayout_192 {
-    Q16_1Block_192 qk[1];     // 192-dim as 1×192 block ← OPTIMAL!
-    Q16_1Block_128 v[1];      // 128-dim as 1×128 block ← OPTIMAL!
-};
-
-// Both Q/K and V get 1-block-per-head optimal integer path
-// No normalization overhead at all!
-```
-
-#### Option B: 64-Block Split (Preserves Nope/Rope Semantics)
-
-```cpp
-// Split into nope (non-positional) and rope (rotary) parts
-struct MLAHeadLayout_Split {
-    // Q/K: 192 = 128 (nope) + 64 (rope)
-    Q16_1Block_64 qk_nope[2];  // 128-dim as 2×64 blocks
-    Q16_1Block_64 qk_rope[1];  // 64-dim as 1×64 block
+// MLA Q/K layout with separate NOPE and ROPE tensors
+// Each gets optimal 1-block-per-head with its own scale
+struct MLAAttentionTensors {
+    // NOPE (No Position Embedding) - context-dependent
+    Q16_1Block_128* Q_nope;     // [n_heads, 1 block] - 128-dim
+    Q16_1Block_128* K_nope;     // [n_kv_heads, seq_len, 1 block]
     
-    // V: 128-dim
-    Q16_1Block_128 v[1];       // 128-dim as 1×128 block (optimal!)
+    // ROPE (Rotary Position Embedding) - position-encoded
+    Q16_1Block_64* Q_rope;      // [n_heads, 1 block] - 64-dim
+    Q16_1Block_64* K_rope;      // [n_kv_heads, seq_len, 1 block]
+    
+    // V is standard (no NOPE/ROPE split)
+    Q16_1Block_128* V;          // [n_kv_heads, seq_len, 1 block] - 128-dim
 };
 
-// Attention dot product naturally splits:
-// score = dot(Q.nope, K.nope) + dot(Q.rope, K.rope)
-//       = (nope_dot × nope_scale) + (rope_dot × rope_scale)
+// Attention score computation:
+// score[q][k] = dot(Q_nope[q], K_nope[k]) * scale_nope
+//             + dot(Q_rope[q], K_rope[k]) * scale_rope
 //
-// Only 2 scale combinations instead of 3!
+// Only 2 scale pairs per score - tractable integer arithmetic!
 ```
 
-The nope and rope portions have **different scaling characteristics** anyway (rope values are rotated), so treating them separately is semantically correct.
+**Why this is better than 192-block:**
+- NOPE and ROPE have fundamentally different value distributions
+- Each component gets its own optimal scale
+- The 192-block loses semantic information for marginal memory savings
+
+---
+
+## MLA Microkernel Implementation Design
+
+### Overview
+
+The Q16 microkernel framework is designed from the ground up to support MLA (Multi-head Latent Attention) models like DeepSeek V3 and Kimi K2. The key insight is that our **templated microkernels work for any block size**, so MLA support is achieved through orchestration rather than new inner loops.
+
+### MLA Attention Parameters
+
+```cpp
+// Standard attention (Qwen, Llama, etc.)
+struct Q16IntegerAttentionParams {
+    const void* Q;              // Q16_1Block_64 or Q16_1Block_128
+    const void* K;              // Same block type as Q
+    const void* V;              // Same block type as Q
+    float* scale_q;             // [n_heads] per-head scales
+    float* scale_k;             // [n_kv_heads]
+    float* scale_v;             // [n_kv_heads]
+    Q16BlockSize block_size;    // 64 or 128
+    // ... other params
+};
+
+// MLA attention (DeepSeek V3, Kimi K2)
+struct MLAAttentionParams {
+    // NOPE component (128-dim, no position embedding)
+    const Q16_1Block_128* Q_nope;  // [n_heads × 1 block]
+    const Q16_1Block_128* K_nope;  // [n_kv_heads × seq_len × 1 block]
+    float* scale_q_nope;           // [n_heads] per-head scales
+    float* scale_k_nope;           // [n_kv_heads]
+    
+    // ROPE component (64-dim, rotary position embedding)
+    const Q16_1Block_64* Q_rope;   // [n_heads × 1 block]
+    const Q16_1Block_64* K_rope;   // [n_kv_heads × seq_len × 1 block]
+    float* scale_q_rope;           // [n_heads]
+    float* scale_k_rope;           // [n_kv_heads]
+    
+    // V is standard (no NOPE/ROPE split)
+    const Q16_1Block_128* V;       // [n_kv_heads × seq_len × 1 block]
+    float* scale_v;                // [n_kv_heads]
+    
+    // Dimensions
+    int n_heads;
+    int n_kv_heads;
+    int seq_len_q;
+    int seq_len_kv;
+};
+```
+
+### MLA QK Dot Product Kernel
+
+The MLA variant calls **two separate dot products** and sums the results in INT32:
+
+```cpp
+// MLA-aware QK dot product (Flash Decode path, seq_len_q=1)
+void q16_qk_gemv_mla(
+    const Q16_1Block_128* Q_nope,    // [n_heads × 1 block]
+    const Q16_1Block_128* K_nope,    // [n_kv_heads × seq_len × 1 block]
+    const Q16_1Block_64* Q_rope,     // [n_heads × 1 block]
+    const Q16_1Block_64* K_rope,     // [n_kv_heads × seq_len × 1 block]
+    int32_t* scores,                  // Output: [seq_len_kv]
+    int seq_len_kv,
+    int head_idx,                     // Which query head
+    int kv_head_idx                   // Which KV head (for GQA)
+) {
+    const Q16_1Block_128* q_nope = &Q_nope[head_idx];
+    const Q16_1Block_64* q_rope = &Q_rope[head_idx];
+    
+    for (int k = 0; k < seq_len_kv; ++k) {
+        // NOPE dot product (128-dim, one Q16_1Block_128 each)
+        int32_t nope_score = q16_dot_single<Q16_1Block_128>(
+            q_nope,
+            &K_nope[kv_head_idx * seq_len_kv + k],
+            1  // num_blocks = 1 (optimal path)
+        );
+        
+        // ROPE dot product (64-dim, one Q16_1Block_64 each)
+        int32_t rope_score = q16_dot_single<Q16_1Block_64>(
+            q_rope,
+            &K_rope[kv_head_idx * seq_len_kv + k],
+            1  // num_blocks = 1 (optimal path)
+        );
+        
+        // Combine in INT32 domain (scales applied later)
+        scores[k] = nope_score + rope_score;
+    }
+}
+```
+
+### MLA Scale Combination
+
+After softmax, the combined scale for the attention output is:
+
+```cpp
+// Scale combination for MLA (applied once at output)
+float compute_mla_qk_scale(
+    float scale_q_nope, float scale_k_nope,
+    float scale_q_rope, float scale_k_rope,
+    int head_dim_nope,   // 128
+    int head_dim_rope    // 64
+) {
+    // Both components contribute to the score
+    // The INT32 score = nope_dot + rope_dot
+    // where nope_dot has implicit scale (scale_q_nope * scale_k_nope)
+    // and rope_dot has implicit scale (scale_q_rope * scale_k_rope)
+    //
+    // For softmax input, we need:
+    //   float_score = INT32_score * combined_scale / sqrt(total_head_dim)
+    //
+    // With per-head normalization, all blocks share the same scale,
+    // so we can compute the combined scale factor once.
+    
+    float nope_scale = scale_q_nope * scale_k_nope;
+    float rope_scale = scale_q_rope * scale_k_rope;
+    float total_head_dim = static_cast<float>(head_dim_nope + head_dim_rope);
+    
+    // Approximation: weight by dimension ratio
+    // (More sophisticated: track separate accumulators)
+    float combined = (nope_scale * head_dim_nope + rope_scale * head_dim_rope) 
+                   / total_head_dim;
+    
+    return combined / std::sqrt(total_head_dim);
+}
+```
+
+### MLA KV Cache Storage
+
+The KV cache for MLA models stores NOPE and ROPE components separately:
+
+```cpp
+// MLA KV Cache layout
+struct MLAKVCacheConfig {
+    Q16BlockSize nope_block_size = Q16BlockSize::BLOCK_128;  // 128-dim
+    Q16BlockSize rope_block_size = Q16BlockSize::BLOCK_64;   // 64-dim
+    Q16BlockSize v_block_size = Q16BlockSize::BLOCK_128;     // 128-dim (no split)
+    
+    int n_kv_heads;
+    int max_seq_len;
+};
+
+// Cache stores 4 separate tensors:
+// K_nope: [n_kv_heads, max_seq_len, 128]  as Q16_1Block_128
+// K_rope: [n_kv_heads, max_seq_len, 64]   as Q16_1Block_64
+// V:      [n_kv_heads, max_seq_len, 128]  as Q16_1Block_128
+// (No V_nope/V_rope split - V is standard)
+```
+
+### FA2 Prefill with MLA
+
+The tiled prefill path also uses dual dot products:
+
+```cpp
+// MLA FA2 Prefill (tiled GEMM)
+void q16_qk_gemm_tile_mla(
+    const Q16_1Block_128* Q_nope,  // [tile_q × 1 block]
+    const Q16_1Block_128* K_nope,  // [tile_k × 1 block]
+    const Q16_1Block_64* Q_rope,   // [tile_q × 1 block]
+    const Q16_1Block_64* K_rope,   // [tile_k × 1 block]
+    int32_t* scores,                // [tile_q × tile_k]
+    int tile_q, int tile_k
+) {
+    // Outer loops over query and key positions
+    for (int q = 0; q < tile_q; ++q) {
+        for (int k = 0; k < tile_k; ++k) {
+            int32_t nope = q16_dot_single<Q16_1Block_128>(&Q_nope[q], &K_nope[k], 1);
+            int32_t rope = q16_dot_single<Q16_1Block_64>(&Q_rope[q], &K_rope[k], 1);
+            scores[q * tile_k + k] = nope + rope;
+        }
+    }
+}
+```
+
+### Why This Design Works
+
+| Aspect | Standard Attention | MLA Attention |
+|--------|-------------------|---------------|
+| **Block types used** | Single (64 or 128) | Two (128 + 64) |
+| **Dot products per score** | 1 | 2 (summed in INT32) |
+| **Scale pairs per head** | 1 | 2 (NOPE + ROPE) |
+| **KV cache tensors** | 2 (K, V) | 4 (K_nope, K_rope, V) |
+| **Inner loop changes** | None | None (same microkernels) |
+| **Orchestration changes** | None | New dispatch path |
+
+The key advantage of our templated microkernel design:
+- `q16_dot_single<Q16_1Block_128>()` and `q16_dot_single<Q16_1Block_64>()` are **already implemented**
+- MLA support is purely **orchestration** - calling the same inner loops twice
+- No new SIMD code required for MLA models
+
+### Implementation Checklist for MLA Support
+
+```
+[ ] Phase 5.3: MLA Microkernel Support
+    [ ] Add MLAAttentionParams struct to Q16IntegerAttentionRef.h
+    [ ] Implement q16_qk_gemv_mla() in Q16DotProduct.cpp
+    [ ] Implement q16_qk_gemm_tile_mla() in Q16DotProduct.cpp  
+    [ ] Add compute_mla_qk_scale() helper
+    [ ] Extend UnifiedKVCache for separate NOPE/ROPE storage
+    [ ] Update GraphOrchestrator to detect MLA architecture from model config
+    [ ] Create Test__MLAAttention.cpp with DeepSeek V3 config
+    [ ] E2E parity test with PyTorch MLA reference
+```
 
 ---
 
@@ -435,7 +901,9 @@ struct Q16_1HeadMetadata {
 
 ---
 
-## Precision Flow Summary
+## Precision Flow Summary (Attention Kernel)
+
+This table covers the **integer attention kernel** specifically. For the full forward pass precision flow, see [Design Goal: Full Integer Residual Stream](#design-goal-full-integer-residual-stream) above.
 
 | Stage | Input Types | Accumulator | Output | FP32 Usage |
 |-------|-------------|-------------|--------|------------|
@@ -449,6 +917,22 @@ struct Q16_1HeadMetadata {
 | Residual add | Q16_1 + Q16_1 | - | Q16_1 | None |
 
 **FP32 is used ONLY for scale factors, never for data computation.**
+
+### Critical: QKV Projection Uses Q8_1 GEMM
+
+The attention kernel receives Q16_1 Q, K, V as inputs. However, these are produced by the **FusedQKVGEMMStage** which uses Q8_1 GEMM for efficiency:
+
+```
+Q16_1 residual → [RMSNorm] → Q16_1 norm → [Q8_1 convert] → Q8_1 activations
+                                                              ↓
+                                        [Q8_1 × Q8_0 GEMM] → Q8_1 Q, K, V
+                                                              ↓
+                                              [RoPE Q8→Q16] → Q16_1 Q, K, V (normalized)
+                                                              ↓
+                                         [Integer Attention Kernel starts here]
+```
+
+This Q16_1 → Q8_1 → Q16_1 roundtrip is **intentional** — see "QKV Projection Exception" section above.
 
 ---
 
@@ -487,10 +971,10 @@ This section documents ALL locations in the codebase where Q16_1 operations assu
 
 | File | Function | Current State | Action Required |
 |------|----------|---------------|-----------------|
-| [RoPEPrimitives.h](../../src/v2/kernels/cpu/primitives/RoPEPrimitives.h#L569) | `apply_rope_q8_1_to_q16_1()` | Outputs 32-block Q16_1 | ⬜ Add output block_size param |
+| [RoPEPrimitives.h](../../src/v2/kernels/cpu/primitives/RoPEPrimitives.h#L569) | `apply_rope_q8_1_to_q16<T>()` | ✅ Templatized on OutBlockType | ✅ **DONE** - Supports 32/64/128/192 |
 | [RoPEPrimitives.h](../../src/v2/kernels/cpu/primitives/RoPEPrimitives.h#L521) | `apply_rope_q16_1_integer()` | In-place 32-block | ⬜ Add block_size param |
 | [RoPEPrimitives.h](../../src/v2/kernels/cpu/primitives/RoPEPrimitives.h#L465) | `apply_rope_q16_1_integer_head()` | Per-head RoPE (32-block) | ⬜ Templatize on BlockType |
-| [RoPEPrimitives.cpp](../../src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp#L3593) | `apply_rope_q8_1_to_q16_1_head()` | Internal impl (32-block) | ⬜ Templatize on BlockType |
+| [RoPEPrimitives.cpp](../../src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp#L3593) | `apply_rope_q8_1_to_q16_head<T>()` | ✅ Templatized, AVX2/AVX512 | ✅ **DONE** - 5.6x/10x speedup |
 | [CPURoPEKernelT.cpp](../../src/v2/kernels/cpu/ops/CPURoPEKernelT.cpp#L644) | `apply_q8_1_to_q16_1()` | Kernel dispatch (32-block) | ⬜ Add block_size dispatch |
 | [CPURoPEKernelT.cpp](../../src/v2/kernels/cpu/ops/CPURoPEKernelT.cpp#L717) | `apply_typed()` (Q16_1) | In-place Q16_1 RoPE | ⬜ Add block_size dispatch |
 | [RoPEStage.cpp](../../src/v2/execution/compute_stages/stages/RoPEStage.cpp) | Stage execution | Creates 32-block output | ⬜ Pass block_size to kernel |
@@ -627,9 +1111,9 @@ This section documents ALL locations in the codebase where Q16_1 operations assu
 
 enum class Q16BlockSize : uint32_t {
     BLOCK_32 = 32,    // Legacy, GEMM compatibility
-    BLOCK_64 = 64,    // Universal for attention (GCD)
-    BLOCK_128 = 128,  // Optimal for head_dim=128
-    BLOCK_192 = 192,  // Optimal for MLA Q/K (DeepSeek V3, Kimi K2)
+    BLOCK_64 = 64,    // Universal for attention (GCD), MLA ROPE
+    BLOCK_128 = 128,  // Optimal for head_dim=128, MLA NOPE/V
+    BLOCK_192 = 192,  // Available but NOT recommended for MLA (see MLA section)
 };
 
 struct Q16_1Block_64 {
@@ -656,26 +1140,38 @@ struct Q16_1Block_192 {
 // src/v2/loaders/BlockSizeSelector.h
 
 struct AttentionBlockSizes {
-    Q16BlockSize qk_block_size;  // For Q and K
-    Q16BlockSize v_block_size;   // For V (may differ!)
+    Q16BlockSize q_block_size;     // For standard Q
+    Q16BlockSize k_block_size;     // For standard K
+    Q16BlockSize v_block_size;     // For V
+    // MLA-specific (optional, only set for MLA architectures)
+    Q16BlockSize nope_block_size;  // For Q_nope, K_nope (128-dim)
+    Q16BlockSize rope_block_size;  // For Q_rope, K_rope (64-dim)
+    bool is_mla;                   // True for DeepSeek V3, Kimi K2
 };
 
 AttentionBlockSizes select_attention_block_sizes(const ModelConfig& cfg) {
     if (cfg.architecture == Architecture::MLA) {
-        // DeepSeek V3, Kimi K2: 192-dim Q/K, 128-dim V
+        // DeepSeek V3, Kimi K2: separate NOPE (128) + ROPE (64)
         return {
-            .qk_block_size = Q16BlockSize::BLOCK_192,  // 1 block/head - optimal!
-            .v_block_size = Q16BlockSize::BLOCK_128    // 1 block/head - optimal!
+            .q_block_size = Q16BlockSize::BLOCK_128,   // Not used directly
+            .k_block_size = Q16BlockSize::BLOCK_128,   // Not used directly
+            .v_block_size = Q16BlockSize::BLOCK_128,   // 1 block/head - optimal!
+            .nope_block_size = Q16BlockSize::BLOCK_128, // 1 block/head
+            .rope_block_size = Q16BlockSize::BLOCK_64,  // 1 block/head
+            .is_mla = true
         };
     }
     
     switch (cfg.head_dim) {
         case 64:
-            return { Q16BlockSize::BLOCK_64, Q16BlockSize::BLOCK_64 };
+            return { Q16BlockSize::BLOCK_64, Q16BlockSize::BLOCK_64, 
+                     Q16BlockSize::BLOCK_64, {}, {}, false };
         case 128:
-            return { Q16BlockSize::BLOCK_128, Q16BlockSize::BLOCK_128 };
+            return { Q16BlockSize::BLOCK_128, Q16BlockSize::BLOCK_128,
+                     Q16BlockSize::BLOCK_128, {}, {}, false };
         default:
-            return { Q16BlockSize::BLOCK_64, Q16BlockSize::BLOCK_64 };
+            return { Q16BlockSize::BLOCK_64, Q16BlockSize::BLOCK_64,
+                     Q16BlockSize::BLOCK_64, {}, {}, false };
     }
 }
 ```
@@ -759,10 +1255,26 @@ struct KVCacheUpdateParams {
 **Option A: Conservative Fixed Scale** (Recommended for v2.0)
 ```cpp
 // Use model-wide statistics to set conservative fixed scales
-// Avoids renormalization complexity
-constexpr float K_FIXED_SCALE = 2.0f;  // Determined from profiling
-constexpr float V_FIXED_SCALE = 2.0f;
+// Avoids renormalization complexity - no cache re-quantization needed
+// Default: ±8.0 range configured in GraphSchema::kv_cache_scale
+// Architecture overrides in Qwen2Schema, LlamaSchema, etc.
+
+// The scale is set in GraphSchema and flows through to KVCacheUpdateParams:
+struct GraphSchema {
+    // ...
+    float kv_cache_scale = 8.0f;  // Default ±8.0 range, covers typical activations
+};
+
+// Usage in KV cache stage:
+float fixed_scale = schema.kv_cache_scale;  // e.g., 8.0f
+// Q16 range: [-32767, 32767] × (scale / 32767) = [-scale, +scale]
 ```
+
+**Why ±8.0 default?**
+- Post-RMSNorm activations typically fall in [-3, 3] range
+- K/V linear projections can amplify slightly (typical max ~4.0)
+- 8.0 provides ~2× headroom over typical maximum values
+- Use profiling tool (Phase 10) to determine tighter scales per-model
 
 **Option B: Running Max with Renormalization** (Future)
 ```cpp
@@ -975,7 +1487,8 @@ bool q16_integer_attention_decode(const Q16IntegerAttentionParams& params) {
 
 #### Task 6.1: MLA-Specific Attention Kernel
 ```cpp
-// MLA has split Q/K: nope (128-dim) + rope (64-dim) = 192 total
+// MLA has split Q/K: NOPE (128-dim) + ROPE (64-dim)
+// Stored as SEPARATE tensors with their own scales (NOT merged into 192-block)
 struct MLAAttentionParams {
     // Q/K split structure
     const int16_t* Q_nope;      // [n_heads × 128]
@@ -1009,14 +1522,14 @@ void compute_mla_qk_scores_int32(const MLAAttentionParams& params, ...) {
 
 #### Task 6.2: MLA KV Cache Layout
 - [ ] Store K_nope and K_rope separately in cache
-- [ ] K_nope: 128-dim as 2×64-blocks (normalize to head scale)
-- [ ] K_rope: 64-dim as 1×64-block (already optimal!)
-- [ ] V: 128-dim as 1×128-block (optimal!)
+- [ ] K_nope: 128-dim as 1×Q16_1Block_128 (1 block/head - optimal!)
+- [ ] K_rope: 64-dim as 1×Q16_1Block_64 (1 block/head - optimal!)
+- [ ] V: 128-dim as 1×Q16_1Block_128 (1 block/head - optimal!)
 
 #### Task 6.3: MLA Unit Tests
-- [ ] Test: nope/rope split produces same scores as combined
+- [ ] Test: nope/rope split produces same scores as combined 192-dim approach
 - [ ] Test: MLA-specific normalization works correctly
-- [ ] Test: V path achieves 1-block-per-head optimal path
+- [ ] Test: All tensors achieve 1-block-per-head optimal path
 
 ### Phase 7: Performance Optimization (Future)
 
@@ -1086,13 +1599,32 @@ void compute_mla_qk_scores_int32(const MLAAttentionParams& params, ...) {
 
 ## File Manifest
 
-### New Files
+### New Files (Implemented)
 ```
-src/v2/kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp
+src/v2/kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp      # Macrokernel
 src/v2/kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.h
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProduct.h    # QK dot product
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProduct.cpp
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulate.h     # P×V accumulation
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulate.cpp
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/WoProjection.h     # Wo projection
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/WoProjection.cpp
+tests/v2/unit/microkernels/Test__Q16DotProduct.cpp                     # 11 tests
+tests/v2/unit/microkernels/Test__PVAccumulate.cpp                      # 12 tests
+tests/v2/unit/microkernels/Test__Q16WoProjection.cpp                   # 12 tests
+```
+
+### New Files (Pending - MLA Support)
+```
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/MLADotProduct.h    # MLA QK dual dot
+src/v2/kernels/cpu/attention/q16_1/ref/microkernels/MLADotProduct.cpp
+src/v2/tensors/MLAKVCache.h                                             # NOPE/ROPE split cache
+src/v2/tensors/MLAKVCache.cpp
+tests/v2/unit/microkernels/Test__MLADotProduct.cpp
 tests/v2/integration/Test__Q16IntegerAttention_vs_FP32.cpp
 tests/v2/unit/Test__Q16Normalization.cpp
 tests/v2/unit/Test__Q16BlockFormats.cpp
+python/tools/profile_kv_activations.py                                  # KV scale profiler
 ```
 
 ### Modified Files
@@ -1101,6 +1633,8 @@ src/v2/execution/RuntimeConfig.h                  # Add Q16_INTEGER_V2 enum
 src/v2/execution/compute_stages/stages/FusedQKVGEMMStage.h/cpp  # Q normalization + block size
 src/v2/execution/compute_stages/stages/KVCacheUpdateStage.h/cpp # K/V normalization + block size
 src/v2/execution/compute_stages/stages/FusedAttentionWoStage.cpp # Dispatch
+src/v2/execution/GraphSchema.h                    # Add kv_cache_scale field
+src/v2/models/qwen/Qwen2Schema.h                  # Document kv_cache_scale usage
 src/v2/tensors/UnifiedKVCache.h/cpp              # Head scale storage + variable block size
 src/v2/loaders/GGUFLoader.cpp                     # Block size selection based on model
 ```
@@ -1112,20 +1646,148 @@ src/v2/kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.cpp  # Keep as cauti
 
 ---
 
+## Phase 10: KV Cache Scale Profiling Tool
+
+### Overview
+
+The profiling tool addresses the "Conservative Fixed Scale" approach by empirically determining optimal `kv_cache_scale` values for different model architectures. This eliminates the "growing scale" problem while maximizing quantization precision.
+
+### Task 10.1: Create Profiling Script
+
+**File**: `python/tools/profile_kv_activations.py`
+
+```python
+#!/usr/bin/env python3
+"""
+KV Cache Activation Profiler for Q16_1 Integer Attention
+
+Profiles K/V activations across transformer layers to determine optimal
+fixed scales for the Conservative Fixed Scale quantization strategy.
+
+Usage:
+    python profile_kv_activations.py \
+        --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
+        --prompts data/diverse_prompts.txt \
+        --output kv_scale_report.json
+"""
+
+import torch
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Dict
+
+@dataclass
+class ActivationStats:
+    min_val: float
+    max_val: float
+    mean: float
+    std: float
+    p99: float      # 99th percentile
+    p999: float     # 99.9th percentile  
+    p9999: float    # 99.99th percentile
+    
+def recommend_scale(stats: ActivationStats, headroom: float = 2.0) -> float:
+    """Recommend kv_cache_scale with headroom above p99.9"""
+    return stats.p999 * headroom
+
+# Hook-based capture extending existing snapshot infrastructure
+class KVActivationProfiler:
+    def __init__(self, model):
+        self.k_activations: Dict[int, List[torch.Tensor]] = {}
+        self.v_activations: Dict[int, List[torch.Tensor]] = {}
+        self._register_hooks(model)
+    
+    def _register_hooks(self, model):
+        for layer_idx, layer in enumerate(model.layers):
+            # Hook K projection output
+            layer.self_attn.k_proj.register_forward_hook(
+                lambda m, inp, out, idx=layer_idx: 
+                    self.k_activations.setdefault(idx, []).append(out.detach()))
+            # Hook V projection output  
+            layer.self_attn.v_proj.register_forward_hook(
+                lambda m, inp, out, idx=layer_idx:
+                    self.v_activations.setdefault(idx, []).append(out.detach()))
+    
+    def compute_stats(self) -> Dict[str, ActivationStats]:
+        results = {}
+        for layer_idx in self.k_activations:
+            k_all = torch.cat(self.k_activations[layer_idx]).flatten()
+            v_all = torch.cat(self.v_activations[layer_idx]).flatten()
+            
+            results[f"layer{layer_idx}_K"] = ActivationStats(
+                min_val=k_all.min().item(),
+                max_val=k_all.max().item(),
+                mean=k_all.mean().item(),
+                std=k_all.std().item(),
+                p99=np.percentile(k_all.numpy(), 99),
+                p999=np.percentile(k_all.numpy(), 99.9),
+                p9999=np.percentile(k_all.numpy(), 99.99))
+            # ... similar for V
+        return results
+```
+
+### Task 10.2: Representative Prompt Dataset
+
+Create diverse prompt set covering:
+- Short prompts (1-10 tokens)
+- Medium prompts (50-200 tokens) 
+- Long context (1000+ tokens)
+- Code, prose, dialog, technical content
+- Multiple languages (if multilingual model)
+
+### Task 10.3: Run Profiling on Target Models
+
+| Model | Expected K Range | Expected V Range | Recommended Scale |
+|-------|------------------|------------------|-------------------|
+| Qwen2.5-0.5B | TBD | TBD | TBD |
+| Qwen2.5-7B | TBD | TBD | TBD |
+| Llama-3-8B | TBD | TBD | TBD |
+| DeepSeek V3 | TBD | TBD | TBD |
+
+### Task 10.4: Update Architecture Schemas
+
+After profiling, update per-architecture schemas:
+
+```cpp
+// If Qwen2 profiling shows max ~3.5 with p99.9 ~3.2:
+GraphSchema createSchema() const override {
+    GraphSchema schema;
+    // ...
+    schema.kv_cache_scale = 4.0f;  // Tighter than default 8.0, better precision
+    return schema;
+}
+```
+
+### Expected Outcomes
+
+1. **Model-specific optimal scales** - Better precision than conservative default
+2. **Validation of ±8.0 default** - Confirm it covers all models with headroom
+3. **Documentation** - Per-model activation characteristics for future reference
+4. **Regression test data** - Known activation ranges for E2E validation
+
+---
+
 ## Timeline Estimate
 
-| Phase | Tasks | Estimated Effort |
-|-------|-------|------------------|
-| Phase 0 | Variable Block Size Infrastructure | 3-4 hours |
-| Phase 1 | Per-Head Scale Metadata | 2-3 hours |
-| Phase 2 | Q Normalization | 3-4 hours |
-| Phase 3 | K/V Normalization | 4-5 hours |
-| Phase 4 | Integer Attention Kernel | 6-8 hours |
-| Phase 5 | Integration & Testing | 4-5 hours |
-| Phase 6 | MLA Architecture Support | 4-6 hours |
-| Phase 7 | Performance Optimization | 6-8 hours (future) |
-| **Total (core)** | Phases 0-5 | **~22-29 hours** |
-| **Total (with MLA)** | Phases 0-6 | **~26-35 hours** |
+| Phase | Tasks | Estimated Effort | Status |
+|-------|-------|------------------|--------|
+| Phase 0 | Deprecate v1 kernel, scaffold v2 | 2-3 hours | ✅ Complete |
+| Phase 1 | Variable block size infrastructure | 3-4 hours | ✅ Complete |
+| Phase 2 | Core tensor + RoPE block size support | 4-5 hours | ✅ Complete |
+| Phase 3 | Residual + MPI + KV Cache | 4-5 hours | ✅ Complete |
+| Phase 4 | Per-head scale normalization | 3-4 hours | ✅ Complete |
+| Phase 5 | Wo projection microkernels | 2-3 hours | ✅ Complete |
+| Phase 5.1 | QK dot product microkernels | 2-3 hours | ✅ Complete |
+| Phase 5.2 | PV accumulation microkernels | 2-3 hours | ✅ Complete |
+| Phase 5.3 | **MLA microkernel support** | 3-4 hours | 🔜 Next |
+| Phase 6 | Integer residual add | 2-3 hours | Pending |
+| Phase 7 | FA2 Prefill tiled implementation | 4-6 hours | Pending |
+| Phase 8 | Unit tests for Q16IntegerAttention | 3-4 hours | Pending |
+| Phase 9 | E2E parity tests | 4-6 hours | Pending |
+| Phase 10 | KV Cache Scale Profiling Tool | 4-6 hours | Pending |
+| **Completed** | Phases 0-5.2 | **~22-28 hours** | ✅ |
+| **Remaining (core)** | Phases 5.3-9 | **~16-23 hours** | |
+| **Remaining (with profiling)** | Phases 5.3-10 | **~20-29 hours** | |
 
 ---
 
@@ -1139,13 +1801,13 @@ src/v2/kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.cpp  # Keep as cauti
 | Llama-3-8B | Standard | 128 | 128 | 128 | 128 | **1** (optimal) |
 | MiniMax-M1 | Standard | 128 | 128 | 128 | 128 | **1** (optimal) |
 | Mistral-7B | Standard | 128 | 128 | 128 | 128 | **1** (optimal) |
-| DeepSeek V3 | MLA | 192 | 128 | **192** | 128 | **1** (optimal) |
-| Kimi K2 | MLA | 192 | 128 | **192** | 128 | **1** (optimal) |
+| DeepSeek V3 | MLA | 128+64 | 128 | 128/64 | 128 | **1** (separate NOPE/ROPE) |
+| Kimi K2 | MLA | 128+64 | 128 | 128/64 | 128 | **1** (separate NOPE/ROPE) |
 
 **Key insight**: With model-aware block sizes, **all model families get optimal 1-block-per-head path**:
 - Standard 64-dim models → 64-block
 - Standard 128-dim models → 128-block  
-- MLA 192-dim Q/K → 192-block, 128-dim V → 128-block
+- MLA models → 128-block NOPE + 64-block ROPE (separate tensors, separate scales)
 
 No normalization needed for any model when using the correct block size!
 // For i=0   (input=-128): LUT[0] = ~0 (negligible weight)

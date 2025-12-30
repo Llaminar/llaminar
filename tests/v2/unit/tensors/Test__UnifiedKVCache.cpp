@@ -876,21 +876,8 @@ TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim128)
     EXPECT_EQ(k_q16->q16_block_size(), Q16BlockSize::BLOCK_128);
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim192)
-{
-    // DeepSeek V3 MLA: head_dim=192 should auto-select BLOCK_192
-    int head_dim = 192;
-    int n_kv_heads = 4;
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
-
-    auto k_base = cache.get_k_base(0);
-    ASSERT_NE(k_base, nullptr);
-
-    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_base);
-    ASSERT_NE(k_q16, nullptr);
-    EXPECT_EQ(k_q16->block_size(), 192) << "head_dim=192 should use BLOCK_192";
-    EXPECT_EQ(k_q16->q16_block_size(), Q16BlockSize::BLOCK_192);
-}
+// Note: DeepSeek V3 MLA uses separate NOPE (128-dim) + ROPE (64-dim) tensors
+// with independent scales, not a combined 192-dim block.
 
 TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim64)
 {

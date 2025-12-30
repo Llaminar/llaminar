@@ -2154,6 +2154,65 @@ namespace llaminar2
         }
 
         /**
+         * @brief Apply RoPE to Q8_1 input, output to Q16 with per-head scale output
+         *
+         * Pure integer arithmetic implementation: Q8 fixed-point ratios, Q15 sin/cos,
+         * integer rotation without FP32 intermediate storage. Only FP32 used is for
+         * computing the output scale.
+         *
+         * @param Q_in Q8_1 Q input tensor [seq_len, n_heads * head_dim]
+         * @param K_in Q8_1 K input tensor [seq_len, n_kv_heads * head_dim] or nullptr
+         * @param Q_out Q16 Q output tensor [seq_len, n_heads * head_dim]
+         * @param K_out Q16 K output tensor [seq_len, n_kv_heads * head_dim] or nullptr
+         * @param Q_head_scales Output: per-head Q scales [seq_len * n_heads] or nullptr
+         * @param K_head_scales Output: per-head K scales [seq_len * n_kv_heads] or nullptr
+         * @param block_size Q16 output block size (32, 64, 128, or 192)
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param rope_theta RoPE frequency base
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply_q8_1_to_q16(
+            TensorBase *Q_in,
+            TensorBase *K_in,
+            TensorBase *Q_out,
+            TensorBase *K_out,
+            float *Q_head_scales,
+            float *K_head_scales,
+            Q16BlockSize block_size,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q_in;
+            (void)K_in;
+            (void)Q_out;
+            (void)K_out;
+            (void)Q_head_scales;
+            (void)K_head_scales;
+            (void)block_size;
+            (void)position_ids;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)rope_theta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Default: not supported
+        }
+
+        /**
          * @brief Apply RoPE using tensor objects with automatic type dispatch
          *
          * Inspects Q/K tensor native_type() and dispatches to the appropriate

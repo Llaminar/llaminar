@@ -532,7 +532,7 @@ namespace llaminar2::primitives
     // ============================================================================
     // Templated Q16 RoPE Primitives (Variable Block Size Support)
     // ============================================================================
-    // These templated functions support all Q16 block sizes (32, 64, 128, 192).
+    // These templated functions support all Q16 block sizes (32, 64, 128).
     // The block type determines BLOCK_SIZE at compile time for optimal vectorization.
     //
     // Template parameter BlockType must have:
@@ -541,7 +541,10 @@ namespace llaminar2::primitives
     //   - int32_t sum_qs (pre-computed sum)
     //   - int16_t qs[BLOCK_SIZE] (quantized values)
     //
-    // Supported block types: Q16_1Block, Q16_1Block_64, Q16_1Block_128, Q16_1Block_192
+    // Supported block types: Q16_1Block, Q16_1Block_64, Q16_1Block_128
+    //
+    // Note: For MLA architectures (DeepSeek V3, Kimi K2), use separate
+    // NOPE (128-dim) and ROPE (64-dim) tensors with their own scales.
     // ============================================================================
 
     /**
@@ -690,33 +693,181 @@ namespace llaminar2::primitives
     // ============================================================================
 
     /**
-     * @brief Apply RoPE to Q8_1 input, output to Q16_1 (HybridQ16 mode)
+     * @brief Apply RoPE to Q8_1 input, output to Q16_1 (HybridQ16 mode) - LEGACY
      *
-     * This primitive:
-     * 1. Dequantizes Q8_1 blocks to FP32
-     * 2. Applies RoPE rotation
-     * 3. Requantizes to Q16_1 (higher precision output)
+     * This is the legacy 32-block version. Use the templated version below for
+     * variable block size support.
      *
-     * Used in HybridQ16 mode where:
-     * - QKV projection outputs Q8_1 (standard quantized GEMM)
-     * - Q16 fused attention kernel expects Q16_1 inputs
-     *
-     * @param Q_in Q8_1 Q input tensor [seq_len * n_heads * blocks_per_head]
-     * @param K_in Q8_1 K input tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
-     * @param Q_out Q16_1 Q output tensor [seq_len * n_heads * blocks_per_head]
-     * @param K_out Q16_1 K output tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
-     * @param position_ids Position indices [seq_len], -1 = padding
-     * @param seq_len Sequence length
-     * @param n_heads Number of query heads
-     * @param n_kv_heads Number of key/value heads
-     * @param head_dim Head dimension (must be divisible by 32)
-     * @param rope_theta RoPE base frequency (e.g., 10000.0f)
+     * @deprecated Use apply_rope_q8_1_to_q16<OutBlockType>() for variable block sizes.
      */
     void apply_rope_q8_1_to_q16_1(
         const Q8_1Block *Q_in,
         const Q8_1Block *K_in,
         Q16_1Block *Q_out,
         Q16_1Block *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta);
+
+    // ============================================================================
+    // Templated Q8_1 → Q16 RoPE Primitives (Variable Output Block Size)
+    // ============================================================================
+    // These templated functions convert Q8_1 input to variable-size Q16 output.
+    //
+    // Key design:
+    // - Input: Always Q8_1Block (32-element), head_dim/32 blocks per head
+    // - Output: OutBlockType template, head_dim/OutBlockType::BLOCK_SIZE blocks per head
+    // - Per-head normalization: All output blocks share ONE scale (max |dequant| across input)
+    // - Returns: Head scale for use in attention score computation
+    //
+    // Supported output types: Q16_1Block, Q16_1Block_64, Q16_1Block_128
+    //
+    // Note: For MLA architectures (DeepSeek V3, Kimi K2), use separate
+    // NOPE (128-dim) and ROPE (64-dim) tensors with their own scales.
+    //
+    // The optimal path is when OutBlockType::BLOCK_SIZE == head_dim, giving 1 block
+    // per head and eliminating multi-block scale mixing in attention.
+    // ============================================================================
+
+    /**
+     * @brief Per-head Q8_1→Q16 scalar implementation (reference)
+     *
+     * Processes one head: reads Q8_1 input blocks, applies RoPE rotation,
+     * outputs to variable-size Q16 blocks with unified per-head scale.
+     *
+     * @tparam OutBlockType Output Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param q8_in Input Q8_1 blocks [head_dim / 32 blocks]
+     * @param q16_out Output Q16 blocks [head_dim / OutBlockType::BLOCK_SIZE blocks]
+     * @param head_dim Head dimension (must be divisible by both 32 and BLOCK_SIZE)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     * @return Head scale factor (max |dequant| / 127.0f from input, used for output blocks)
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head_scalar(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+    /**
+     * @brief Per-head Q8_1→Q16 AVX2 implementation
+     *
+     * Vectorized version processing 8 elements at a time.
+     *
+     * @tparam OutBlockType Output Q16 block type
+     * @return Head scale factor
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head_avx2(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Per-head Q8_1→Q16 AVX512 implementation
+     *
+     * Vectorized version processing 16 elements at a time.
+     *
+     * @tparam OutBlockType Output Q16 block type
+     * @return Head scale factor
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head_avx512(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+    /**
+     * @brief Per-head Q8_1→Q16 auto-dispatching implementation
+     *
+     * Automatically selects optimal implementation (AVX512 > AVX2 > scalar).
+     *
+     * @tparam OutBlockType Output Q16 block type
+     * @return Head scale factor
+     */
+    template <typename OutBlockType>
+    float apply_rope_q8_1_to_q16_head(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+    /**
+     * @brief Apply RoPE to Q8_1 Q and K tensors, output to variable-size Q16
+     *
+     * High-level wrapper for any Q16 output block size. Processes all heads
+     * in parallel using OMP.
+     *
+     * @tparam OutBlockType Output Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param Q_in Q8_1 Q input [seq_len * n_heads * (head_dim/32)]
+     * @param K_in Q8_1 K input [seq_len * n_kv_heads * (head_dim/32)] or nullptr
+     * @param Q_out Q16 Q output [seq_len * n_heads * (head_dim/BLOCK_SIZE)]
+     * @param K_out Q16 K output [seq_len * n_kv_heads * (head_dim/BLOCK_SIZE)] or nullptr
+     * @param Q_head_scales Output: per-head Q scales [seq_len * n_heads] or nullptr
+     * @param K_head_scales Output: per-head K scales [seq_len * n_kv_heads] or nullptr
+     * @param position_ids Position indices [seq_len], nullptr = use index
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension
+     * @param rope_theta RoPE base frequency
+     */
+    template <typename OutBlockType>
+    void apply_rope_q8_1_to_q16(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        OutBlockType *Q_out,
+        OutBlockType *K_out,
+        float *Q_head_scales,
+        float *K_head_scales,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta);
+
+    /**
+     * @brief Apply RoPE Q8_1→Q16 with runtime block size dispatch
+     *
+     * Dispatches to correct template instantiation based on Q16BlockSize enum.
+     *
+     * @param Q_in Q8_1 Q input
+     * @param K_in Q8_1 K input or nullptr
+     * @param Q_out Q16 Q output (void* for runtime polymorphism)
+     * @param K_out Q16 K output (void*) or nullptr
+     * @param Q_head_scales Output: per-head Q scales or nullptr
+     * @param K_head_scales Output: per-head K scales or nullptr
+     * @param block_size Runtime block size selector
+     * @param position_ids Position indices
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension
+     * @param rope_theta RoPE base frequency
+     */
+    void apply_rope_q8_1_to_q16_dispatch(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        void *Q_out,
+        void *K_out,
+        float *Q_head_scales,
+        float *K_head_scales,
+        Q16BlockSize block_size,
         const int *position_ids,
         int seq_len,
         int n_heads,

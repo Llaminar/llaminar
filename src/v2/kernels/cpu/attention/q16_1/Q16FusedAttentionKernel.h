@@ -2,19 +2,21 @@
  * @file Q16FusedAttentionKernel.h
  * @brief Q16_1 fused attention kernel implementing ITensorFusedAttentionWo
  *
- * Provides a kernel wrapper that implements the ITensorFusedAttentionWo interface
- * and delegates to either:
- * - Q16FusedAttentionRef: Scalar C++ reference (for testing/debugging)
+ * STATUS: STUB IMPLEMENTATION (v2 in development)
+ * ================================================
+ * This kernel is currently a stub - compute() returns "not implemented" error.
+ * The Q16_INTEGER backend is under active development with the new v2 API
+ * that uses model-appropriate block sizes (64/128/192) for true integer attention.
+ *
+ * See: Q16IntegerAttentionRef.h for the v2 implementation in progress.
+ * See: docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md for design rationale.
+ *
+ * When v2 is complete, this kernel will delegate to:
+ * - Q16IntegerAttentionRef: Scalar C++ reference (for testing/debugging)
  * - JitQ16FlashDecodeKernel / JitQ16FA2PrefillKernel: AVX512 JIT (production)
  *
- * The interface enables:
- * - Uniform kernel API across all fused attention implementations
- * - Compile-time snapshot capability enforcement
- * - Clean integration with FusedAttentionWo compute stage
- *
  * @see tensors/TensorKernels.h for ITensorFusedAttentionWo interface
- * @see Q16FusedAttentionRef.h for reference implementation
- * @see JitQ16FusedAttention.h for JIT implementations
+ * @see ref/Q16IntegerAttentionRef.h for v2 implementation
  *
  * @author David Sanftenberg
  * @date December 2025
@@ -24,7 +26,6 @@
 #include "tensors/TensorKernels.h"
 #include "tensors/KernelSnapshotInfo.h"
 #include "tensors/BlockStructures.h"
-#include "ref/Q16FusedAttentionRef.deprecated.h"
 #include <memory>
 
 namespace llaminar2
@@ -213,11 +214,6 @@ namespace llaminar2
 
         private:
             bool use_jit_;
-
-            /**
-             * @brief Convert FusedAttentionWoParams to Q16FusedAttentionWoResidualParams
-             */
-            Q16FusedAttentionWoResidualParams convert_params(const FusedAttentionWoParams &params) const;
 
             /**
              * @brief Validate input parameters

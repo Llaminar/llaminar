@@ -670,7 +670,7 @@ TEST_F(Test__Q16_1RoPE_Performance, AVX512_Speedup_VsScalar)
 #endif
 
 // ============================================================================
-// Variable Block Size Tests (Q16_1Block_64, Q16_1Block_128, Q16_1Block_192)
+// Variable Block Size Tests (Q16_1Block_64, Q16_1Block_128)
 // ============================================================================
 
 namespace
@@ -807,71 +807,9 @@ namespace
         return fp32;
     }
 
-    /**
-     * @brief Quantize FP32 data to Q16_1Block_192
-     */
-    std::vector<Q16_1Block_192> fp32_to_q16_1_block192(const std::vector<float> &fp32)
-    {
-        constexpr size_t BLOCK_SIZE = Q16_1Block_192::BLOCK_SIZE;
-        const size_t n_blocks = (fp32.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        std::vector<Q16_1Block_192> blocks(n_blocks);
-
-        std::vector<float> padded = fp32;
-        padded.resize(n_blocks * BLOCK_SIZE, 0.0f);
-
-        for (size_t b = 0; b < n_blocks; ++b)
-        {
-            const float *block_data = padded.data() + b * BLOCK_SIZE;
-            Q16_1Block_192 &blk = blocks[b];
-
-            float max_abs = 0.0f;
-            for (size_t i = 0; i < BLOCK_SIZE; ++i)
-            {
-                max_abs = std::max(max_abs, std::fabs(block_data[i]));
-            }
-
-            float scale = max_abs / 32767.0f;
-            if (scale < 1e-20f)
-                scale = 1e-20f;
-            float inv_scale = 1.0f / scale;
-
-            int32_t sum_qs = 0;
-            for (size_t i = 0; i < BLOCK_SIZE; ++i)
-            {
-                int32_t q = static_cast<int32_t>(std::round(block_data[i] * inv_scale));
-                q = std::max(-32767, std::min(32767, q));
-                blk.qs[i] = static_cast<int16_t>(q);
-                sum_qs += q;
-            }
-
-            blk.d = scale;
-            blk.sum_qs = sum_qs;
-        }
-
-        return blocks;
-    }
-
-    /**
-     * @brief Dequantize Q16_1Block_192 blocks to FP32
-     */
-    std::vector<float> q16_1_block192_to_fp32(const std::vector<Q16_1Block_192> &blocks)
-    {
-        constexpr size_t BLOCK_SIZE = Q16_1Block_192::BLOCK_SIZE;
-        std::vector<float> fp32(blocks.size() * BLOCK_SIZE);
-
-        for (size_t b = 0; b < blocks.size(); ++b)
-        {
-            const Q16_1Block_192 &blk = blocks[b];
-            float *block_data = fp32.data() + b * BLOCK_SIZE;
-
-            for (size_t i = 0; i < BLOCK_SIZE; ++i)
-            {
-                block_data[i] = blk.d * static_cast<float>(blk.qs[i]);
-            }
-        }
-
-        return fp32;
-    }
+    // Note: DeepSeek V3 MLA uses separate NOPE (128-dim) + ROPE (64-dim) tensors
+    // with independent scales, not a combined 192-dim block.
+    // See PROJECT_Q16_INTEGER_ATTENTION_V2.md MLA Architecture section.
 
 } // anonymous namespace
 
@@ -1151,131 +1089,9 @@ TEST_F(Test__Q16_VariableBlockRoPE, Block128_AVX512_Correctness)
 }
 #endif
 
-// ============================================================================
-// Block Size 192 Tests (head_dim=192, 1 block per head, DeepSeek V3 MLA)
-// ============================================================================
-
-TEST_F(Test__Q16_VariableBlockRoPE, Block192_Scalar_Correctness)
-{
-    constexpr int HEAD_DIM = 192;
-    constexpr int BLOCK_SIZE = 192;
-    constexpr int BLOCKS_PER_HEAD = HEAD_DIM / BLOCK_SIZE;
-    const int half_dim = HEAD_DIM / 2;
-
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float> fp32_data(HEAD_DIM);
-    for (auto &v : fp32_data)
-        v = dist(rng);
-
-    std::vector<int16_t> cos_q15(half_dim), sin_q15(half_dim);
-    std::vector<float> cos_fp32(half_dim), sin_fp32(half_dim);
-    for (int i = 0; i < half_dim; ++i)
-    {
-        float freq = 1.0f / std::pow(ROPE_THETA, static_cast<float>(2 * i) / HEAD_DIM);
-        float angle = static_cast<float>(POSITION) * freq;
-        cos_fp32[i] = std::cos(angle);
-        sin_fp32[i] = std::sin(angle);
-        cos_q15[i] = static_cast<int16_t>(std::round(cos_fp32[i] * 32767.0f));
-        sin_q15[i] = static_cast<int16_t>(std::round(sin_fp32[i] * 32767.0f));
-    }
-
-    std::vector<float> fp32_reference = fp32_data;
-    apply_rope_fp32_reference(fp32_reference.data(), HEAD_DIM, cos_fp32.data(), sin_fp32.data());
-
-    auto q16_blocks = fp32_to_q16_1_block192(fp32_data);
-    apply_rope_q16_integer_head_scalar<Q16_1Block_192>(q16_blocks.data(), BLOCKS_PER_HEAD, cos_q15.data(), sin_q15.data());
-    auto q16_result = q16_1_block192_to_fp32(q16_blocks);
-    q16_result.resize(HEAD_DIM);
-
-    float sim = cosine_similarity(q16_result, fp32_reference);
-    float max_err = max_abs_error(q16_result, fp32_reference);
-
-    EXPECT_GT(sim, 0.9999f) << "Block192 scalar should match FP32 reference closely";
-    EXPECT_LT(max_err, 1e-3f) << "Block192 scalar max error too high: " << max_err;
-}
-
-#if defined(__AVX2__)
-TEST_F(Test__Q16_VariableBlockRoPE, Block192_AVX2_Correctness)
-{
-    constexpr int HEAD_DIM = 192;
-    constexpr int BLOCKS_PER_HEAD = 1;
-    const int half_dim = HEAD_DIM / 2;
-
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float> fp32_data(HEAD_DIM);
-    for (auto &v : fp32_data)
-        v = dist(rng);
-
-    std::vector<int16_t> cos_q15(half_dim), sin_q15(half_dim);
-    std::vector<float> cos_fp32(half_dim), sin_fp32(half_dim);
-    for (int i = 0; i < half_dim; ++i)
-    {
-        float freq = 1.0f / std::pow(ROPE_THETA, static_cast<float>(2 * i) / HEAD_DIM);
-        float angle = static_cast<float>(POSITION) * freq;
-        cos_fp32[i] = std::cos(angle);
-        sin_fp32[i] = std::sin(angle);
-        cos_q15[i] = static_cast<int16_t>(std::round(cos_fp32[i] * 32767.0f));
-        sin_q15[i] = static_cast<int16_t>(std::round(sin_fp32[i] * 32767.0f));
-    }
-
-    std::vector<float> fp32_reference = fp32_data;
-    apply_rope_fp32_reference(fp32_reference.data(), HEAD_DIM, cos_fp32.data(), sin_fp32.data());
-
-    auto q16_blocks = fp32_to_q16_1_block192(fp32_data);
-    apply_rope_q16_integer_head_avx2<Q16_1Block_192>(q16_blocks.data(), BLOCKS_PER_HEAD, cos_q15.data(), sin_q15.data());
-    auto q16_result = q16_1_block192_to_fp32(q16_blocks);
-    q16_result.resize(HEAD_DIM);
-
-    float sim = cosine_similarity(q16_result, fp32_reference);
-    float max_err = max_abs_error(q16_result, fp32_reference);
-
-    EXPECT_GT(sim, 0.9999f) << "Block192 AVX2 should match FP32 reference closely";
-    EXPECT_LT(max_err, 1e-3f) << "Block192 AVX2 max error too high: " << max_err;
-}
-#endif
-
-#if defined(__AVX512F__)
-TEST_F(Test__Q16_VariableBlockRoPE, Block192_AVX512_Correctness)
-{
-    constexpr int HEAD_DIM = 192;
-    constexpr int BLOCKS_PER_HEAD = 1;
-    const int half_dim = HEAD_DIM / 2;
-
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float> fp32_data(HEAD_DIM);
-    for (auto &v : fp32_data)
-        v = dist(rng);
-
-    std::vector<int16_t> cos_q15(half_dim), sin_q15(half_dim);
-    std::vector<float> cos_fp32(half_dim), sin_fp32(half_dim);
-    for (int i = 0; i < half_dim; ++i)
-    {
-        float freq = 1.0f / std::pow(ROPE_THETA, static_cast<float>(2 * i) / HEAD_DIM);
-        float angle = static_cast<float>(POSITION) * freq;
-        cos_fp32[i] = std::cos(angle);
-        sin_fp32[i] = std::sin(angle);
-        cos_q15[i] = static_cast<int16_t>(std::round(cos_fp32[i] * 32767.0f));
-        sin_q15[i] = static_cast<int16_t>(std::round(sin_fp32[i] * 32767.0f));
-    }
-
-    std::vector<float> fp32_reference = fp32_data;
-    apply_rope_fp32_reference(fp32_reference.data(), HEAD_DIM, cos_fp32.data(), sin_fp32.data());
-
-    auto q16_blocks = fp32_to_q16_1_block192(fp32_data);
-    apply_rope_q16_integer_head_avx512<Q16_1Block_192>(q16_blocks.data(), BLOCKS_PER_HEAD, cos_q15.data(), sin_q15.data());
-    auto q16_result = q16_1_block192_to_fp32(q16_blocks);
-    q16_result.resize(HEAD_DIM);
-
-    float sim = cosine_similarity(q16_result, fp32_reference);
-    float max_err = max_abs_error(q16_result, fp32_reference);
-
-    EXPECT_GT(sim, 0.9999f) << "Block192 AVX512 should match FP32 reference closely";
-    EXPECT_LT(max_err, 1e-3f) << "Block192 AVX512 max error too high: " << max_err;
-}
-#endif
+// Note: DeepSeek V3 MLA uses separate NOPE (128-dim) + ROPE (64-dim) tensors
+// with independent scales, not a combined 192-dim block.
+// See PROJECT_Q16_INTEGER_ATTENTION_V2.md MLA Architecture section.
 
 // ============================================================================
 // Dispatch Function Tests

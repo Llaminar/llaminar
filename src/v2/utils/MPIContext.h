@@ -162,13 +162,13 @@ namespace llaminar2
          * @brief All-reduce sum operation for variable-size Q16 blocks (in-place)
          *
          * Templated version that supports Q16_1Block (32), Q16_1Block_64 (64),
-         * Q16_1Block_128 (128), and Q16_1Block_192 (192) element blocks.
+         * and Q16_1Block_128 (128) element blocks.
          *
          * Uses allgather + vectorized local reduction with AVX512/AVX2 SIMD.
          *
          * Memory: Temporarily allocates n_blocks * world_size * sizeof(BlockType) bytes.
          *
-         * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128, Q16_1Block_192)
+         * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128)
          * @param data Q16 block buffer (input and output)
          * @param n_blocks Number of Q16 blocks per rank
          */

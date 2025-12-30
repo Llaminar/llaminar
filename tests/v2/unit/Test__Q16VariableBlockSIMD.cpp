@@ -207,30 +207,6 @@ TEST_F(Test__Q16VariableBlockSIMD, AddQ16_Block128_Correctness)
     EXPECT_LT(mse, 0.01f) << "Block128 q16_add_q16 MSE too high";
 }
 
-TEST_F(Test__Q16VariableBlockSIMD, AddQ16_Block192_Correctness)
-{
-    constexpr size_t BLOCK_SIZE = Q16_1Block_192::BLOCK_SIZE;
-    alignas(64) float a_fp32[BLOCK_SIZE], b_fp32[BLOCK_SIZE];
-    generate_random(a_fp32, BLOCK_SIZE, 10.0f);
-    generate_random(b_fp32, BLOCK_SIZE, 10.0f);
-
-    Q16_1Block_192 a, b, out;
-    quantize_to_q16(a_fp32, &a);
-    quantize_to_q16(b_fp32, &b);
-
-    q16_add_q16(&a, &b, &out);
-
-    alignas(64) float expected[BLOCK_SIZE], actual[BLOCK_SIZE];
-    for (size_t i = 0; i < BLOCK_SIZE; ++i)
-    {
-        expected[i] = a.d * a.qs[i] + b.d * b.qs[i];
-    }
-    dequantize_from_q16(&out, actual);
-
-    float mse = compute_mse(expected, actual, BLOCK_SIZE);
-    EXPECT_LT(mse, 0.01f) << "Block192 q16_add_q16 MSE too high";
-}
-
 // ============================================================================
 // q16_add_fp32 Tests
 // ============================================================================
@@ -312,32 +288,6 @@ TEST_F(Test__Q16VariableBlockSIMD, AddFP32_Block128_Correctness)
 
     float mse = compute_mse(expected, actual, BLOCK_SIZE);
     EXPECT_LT(mse, 0.01f) << "Block128 q16_add_fp32 MSE too high";
-}
-
-TEST_F(Test__Q16VariableBlockSIMD, AddFP32_Block192_Correctness)
-{
-    constexpr size_t BLOCK_SIZE = Q16_1Block_192::BLOCK_SIZE;
-    alignas(64) float block_fp32[BLOCK_SIZE], delta[BLOCK_SIZE];
-    generate_random(block_fp32, BLOCK_SIZE, 10.0f);
-    generate_random(delta, BLOCK_SIZE, 5.0f);
-
-    Q16_1Block_192 block;
-    quantize_to_q16(block_fp32, &block);
-
-    alignas(64) float orig[BLOCK_SIZE];
-    dequantize_from_q16(&block, orig);
-
-    q16_add_fp32(&block, delta);
-
-    alignas(64) float expected[BLOCK_SIZE], actual[BLOCK_SIZE];
-    for (size_t i = 0; i < BLOCK_SIZE; ++i)
-    {
-        expected[i] = orig[i] + delta[i];
-    }
-    dequantize_from_q16(&block, actual);
-
-    float mse = compute_mse(expected, actual, BLOCK_SIZE);
-    EXPECT_LT(mse, 0.01f) << "Block192 q16_add_fp32 MSE too high";
 }
 
 // ============================================================================
@@ -582,41 +532,6 @@ TEST_F(Test__Q16VariableBlockSIMD, SumN_Block128_Correctness)
 
     float mse = compute_mse(expected, actual, BLOCK_SIZE);
     EXPECT_LT(mse, 0.1f) << "Block128 q16_sum_n MSE too high";
-}
-
-TEST_F(Test__Q16VariableBlockSIMD, SumN_Block192_Correctness)
-{
-    constexpr size_t BLOCK_SIZE = Q16_1Block_192::BLOCK_SIZE;
-    constexpr size_t N_INPUTS = 4;
-
-    alignas(64) float inputs_fp32[N_INPUTS][BLOCK_SIZE];
-    Q16_1Block_192 inputs[N_INPUTS];
-    const Q16_1Block_192 *input_ptrs[N_INPUTS];
-
-    for (size_t i = 0; i < N_INPUTS; ++i)
-    {
-        generate_random(inputs_fp32[i], BLOCK_SIZE, 5.0f);
-        quantize_to_q16(inputs_fp32[i], &inputs[i]);
-        input_ptrs[i] = &inputs[i];
-    }
-
-    Q16_1Block_192 output;
-    q16_sum_n(input_ptrs, N_INPUTS, &output);
-
-    alignas(64) float expected[BLOCK_SIZE] = {0.0f};
-    for (size_t i = 0; i < N_INPUTS; ++i)
-    {
-        for (size_t j = 0; j < BLOCK_SIZE; ++j)
-        {
-            expected[j] += inputs[i].d * static_cast<float>(inputs[i].qs[j]);
-        }
-    }
-
-    alignas(64) float actual[BLOCK_SIZE];
-    dequantize_from_q16(&output, actual);
-
-    float mse = compute_mse(expected, actual, BLOCK_SIZE);
-    EXPECT_LT(mse, 0.1f) << "Block192 q16_sum_n MSE too high";
 }
 
 // ============================================================================

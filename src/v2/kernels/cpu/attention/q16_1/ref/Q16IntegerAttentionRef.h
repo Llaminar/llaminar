@@ -77,7 +77,6 @@ namespace llaminar2::kernels::q16_1
     using llaminar2::optimal_q16_block_size;
     using llaminar2::Q16_1Block;
     using llaminar2::Q16_1Block_128;
-    using llaminar2::Q16_1Block_192;
     using llaminar2::Q16_1Block_64;
     using llaminar2::Q16BlockSize;
     using llaminar2::Q16BlockType;
@@ -87,12 +86,12 @@ namespace llaminar2::kernels::q16_1
      * @brief Check if head_dim perfectly aligns with a supported block size.
      *
      * When aligned, we get exactly 1 block per head = single scale = no FP32 fallback.
+     * Note: MLA architectures should use separate NOPE (128) + ROPE (64) tensors.
      */
     constexpr bool is_head_aligned(int head_dim)
     {
-        return head_dim == 64 || head_dim == 128 || head_dim == 192;
+        return head_dim == 64 || head_dim == 128;
     }
-
     /**
      * @brief Calculate blocks per row for given dimension and block size.
      */
