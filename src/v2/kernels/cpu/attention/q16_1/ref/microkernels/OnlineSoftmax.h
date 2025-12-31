@@ -41,10 +41,14 @@
  * - Rescaling uses exp2 LUT + integer shifts
  *
  * @see docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md
+ * @see Exp2Core.h for shared exp2 LUT primitives
  */
 #pragma once
 
+#include "Exp2Core.h" // Shared exp2 LUT primitives and AdaptiveAlphaConfig
+
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <algorithm>
 #include "utils/CPUFeatures.h"
@@ -204,6 +208,9 @@ namespace llaminar2::kernels::q16_1::microkernels
     constexpr int FA2_TILE_BR = 8; // Max Br value from compute_fa2_tile_config()
     constexpr int FA2_TILE_BC = 32;
 
+    // Note: AdaptiveAlphaConfig is now provided by Exp2Core.h for all
+    // softmax implementations to share.
+
     // ============================================================================
     // Online Softmax State
     // ============================================================================
@@ -213,15 +220,36 @@ namespace llaminar2::kernels::q16_1::microkernels
      *
      * Maintains the incremental softmax state across KV blocks.
      * All values are in integer domain for JIT-friendly computation.
+     *
+     * RUNNING AVERAGE DESIGN (v2):
+     * ============================
+     * Instead of accumulating raw sums that grow with sequence length,
+     * we maintain context as a NORMALIZED running average:
+     *
+     *   context = Σ(w_i * v_i) / Σ(w_i)
+     *
+     * This keeps context values bounded regardless of sequence length.
+     *
+     * Incremental update for each block:
+     *   l_new = l_old + block_sum
+     *   context_new = (context_old * l_old + block_contribution) / l_new
+     *
+     * The key insight: softmax weights sum to 1, so the final weighted
+     * average of V values stays bounded by the V value range.
      */
     struct OnlineSoftmaxState
     {
-        /// Running maximum score (INT32)
+        /// Running maximum score (INT32) - in SCALED domain when adaptive scaling
         int32_t m = std::numeric_limits<int32_t>::min();
 
         /// Running sum of unnormalized weights (INT64 for precision)
         /// This is Σ exp2_lut(s[k] - m) before final normalization
         int64_t l = 0;
+
+        /// Sum of weights already incorporated into context (for running average)
+        /// Using double to avoid precision loss during rescaling at very long sequences.
+        /// The merge formula needs: l_old / l_new which is exact with double.
+        double l_processed = 0.0;
 
         /// Number of unmasked positions processed so far
         int count = 0;
@@ -232,12 +260,26 @@ namespace llaminar2::kernels::q16_1::microkernels
         /// Configuration: LUT value bits for exp2
         int lut_value_bits = 30;
 
+        /// Adaptive alpha configuration (computed once at init)
+        AdaptiveAlphaConfig alpha_config;
+
         /// Reset to initial state
         void reset()
         {
             m = std::numeric_limits<int32_t>::min();
             l = 0;
+            l_processed = 0.0;
             count = 0;
+            // Note: alpha_config is preserved across reset
+        }
+
+        /// Initialize with alpha for adaptive scaling
+        void init(float alpha, int frac = 11, int lut_bits = 30)
+        {
+            reset();
+            frac_bits = frac;
+            lut_value_bits = lut_bits;
+            alpha_config = AdaptiveAlphaConfig::compute(alpha);
         }
 
         /// Check if any positions have been processed
@@ -287,6 +329,18 @@ namespace llaminar2::kernels::q16_1::microkernels
         int lut_value_bits = 30);
 
     /**
+     * @brief Compute rescale factor with adaptive alpha (internal).
+     */
+    void online_softmax_compute_rescale_adaptive(
+        int32_t m_old,
+        int32_t m_new,
+        const AdaptiveAlphaConfig &alpha_config,
+        int32_t &scale_num,
+        int &scale_shift,
+        int frac_bits = 11,
+        int lut_value_bits = 30);
+
+    /**
      * @brief Compute unnormalized exp2 weights for a block of scores.
      *
      * For each score s[k], computes w[k] = exp2_lut(s[k] - m) where m is
@@ -307,6 +361,18 @@ namespace llaminar2::kernels::q16_1::microkernels
         int block_size,
         int32_t running_max,
         float alpha,
+        int frac_bits = 11,
+        int lut_value_bits = 30);
+
+    /**
+     * @brief Compute block weights with adaptive alpha (internal).
+     */
+    int64_t online_softmax_compute_block_weights_adaptive(
+        const int32_t *scores,
+        int32_t *weights,
+        int block_size,
+        int32_t running_max,
+        const AdaptiveAlphaConfig &alpha_config,
         int frac_bits = 11,
         int lut_value_bits = 30);
 
@@ -420,6 +486,10 @@ namespace llaminar2::kernels::q16_1::microkernels
         /// Running sum of unnormalized weights [Br] - one per query row
         int64_t l[FA2_TILE_BR];
 
+        /// Sum of weights already incorporated into context [Br] (for running average)
+        /// Using double to avoid precision loss during rescaling at very long sequences.
+        double l_processed[FA2_TILE_BR];
+
         /// Number of unmasked positions processed [Br]
         int count[FA2_TILE_BR];
 
@@ -432,18 +502,29 @@ namespace llaminar2::kernels::q16_1::microkernels
         /// Configuration: LUT value bits for exp2
         int lut_value_bits = 30;
 
-        /// Initialize for Br rows
-        void init(int br, int frac = 11, int lut_bits = 30)
+        /// Adaptive alpha configuration (computed once at init, shared by all rows)
+        AdaptiveAlphaConfig alpha_config;
+
+        /// Initialize for Br rows with adaptive alpha
+        void init(int br, float alpha, int frac = 11, int lut_bits = 30)
         {
             num_rows = br;
             frac_bits = frac;
             lut_value_bits = lut_bits;
+            alpha_config = AdaptiveAlphaConfig::compute(alpha);
             for (int r = 0; r < FA2_TILE_BR; ++r)
             {
                 m[r] = std::numeric_limits<int32_t>::min();
                 l[r] = 0;
+                l_processed[r] = 0.0;
                 count[r] = 0;
             }
+        }
+
+        /// Legacy init without alpha (for backwards compatibility)
+        void init(int br, int frac = 11, int lut_bits = 30)
+        {
+            init(br, 0.0f, frac, lut_bits);
         }
 
         /// Check if row r has any positions processed

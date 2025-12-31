@@ -4052,6 +4052,20 @@ add_v2_test(V2_Unit_Exp2FixedSoftmax
     LABELS "V2;Unit;Kernels;Attention;Q16;Softmax;Integer"
 )
 
+# Test: Exp2Core primitives
+# Core exp2 LUT primitives shared by Exp2FixedSoftmax and OnlineSoftmax
+# Tests LUT initialization, AdaptiveAlphaConfig, weight/rescale computation
+add_executable(v2_test_exp2_core unit/kernels/cpu/q16_attention/Test__Exp2Core.cpp)
+target_link_libraries(v2_test_exp2_core
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Exp2Core
+    COMMAND $<TARGET_FILE:v2_test_exp2_core>
+    LABELS "V2;Unit;Kernels;Attention;Q16;Exp2;Primitives;Integer"
+)
+
 # Test: Q16 OnlineSoftmax microkernel (FlashDecode)
 # Block-wise online softmax with rescaling for streaming KV processing
 add_executable(v2_test_q16_online_softmax unit/kernels/cpu/q16_attention/Test__Q16OnlineSoftmax.cpp)

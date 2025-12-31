@@ -3,10 +3,12 @@
  * @brief Online softmax microkernel implementation for FlashDecode
  *
  * @see OnlineSoftmax.h for algorithm description
+ * @see Exp2Core.h for shared exp2 LUT primitives
  * @see docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md
  */
 
 #include "OnlineSoftmax.h"
+#include "Exp2Core.h"
 #include "Exp2FixedSoftmax.h"
 #include "Q16DotProduct.h"
 #include "PVAccumulate.h"
@@ -20,20 +22,6 @@ namespace llaminar2::kernels::q16_1::microkernels
 {
 
     // ============================================================================
-    // Constants (shared with Exp2FixedSoftmax)
-    // ============================================================================
-
-    namespace
-    {
-        /// log₂(e) ≈ 1.4427
-        constexpr double LOG2E = 1.4426950408889634073599246810018921;
-
-        /// Mask value for causal attention / padding
-        constexpr int32_t MASKED = std::numeric_limits<int32_t>::min();
-
-    } // namespace
-
-    // ============================================================================
     // Block-wise Online Softmax Operations
     // ============================================================================
 
@@ -42,17 +30,21 @@ namespace llaminar2::kernels::q16_1::microkernels
         int block_size,
         int32_t mask_value)
     {
-        int32_t block_max = mask_value;
+        // Delegate to shared implementation
+        return exp2_find_block_max(scores, block_size, mask_value);
+    }
 
-        for (int i = 0; i < block_size; ++i)
-        {
-            if (scores[i] != mask_value && scores[i] > block_max)
-            {
-                block_max = scores[i];
-            }
-        }
-
-        return block_max;
+    void online_softmax_compute_rescale_adaptive(
+        int32_t m_old,
+        int32_t m_new,
+        const AdaptiveAlphaConfig &alpha_config,
+        int32_t &scale_num,
+        int &scale_shift,
+        int frac_bits,
+        int lut_value_bits)
+    {
+        // Delegate to shared implementation
+        exp2_compute_rescale(m_old, m_new, alpha_config, scale_num, scale_shift, frac_bits, lut_value_bits);
     }
 
     void online_softmax_compute_rescale(
@@ -64,47 +56,22 @@ namespace llaminar2::kernels::q16_1::microkernels
         int frac_bits,
         int lut_value_bits)
     {
-        // m_new >= m_old always (running max is non-decreasing)
-        // We need: correction = exp(m_old - m_new) = 2^((m_old - m_new) * alpha * log2e)
-        //        = 2^(-delta * beta) where delta = m_new - m_old >= 0
+        // Use adaptive scaling for better precision with small alpha
+        AdaptiveAlphaConfig alpha_config = AdaptiveAlphaConfig::compute(alpha);
+        exp2_compute_rescale(m_old, m_new, alpha_config, scale_num, scale_shift, frac_bits, lut_value_bits);
+    }
 
-        if (m_old == MASKED || m_new <= m_old)
-        {
-            // No rescaling needed
-            scale_num = 1 << lut_value_bits;
-            scale_shift = lut_value_bits;
-            return;
-        }
-
-        int32_t delta = m_new - m_old;
-        double beta = static_cast<double>(alpha) * LOG2E;
-
-        // t = delta * beta (how many powers of 2 to scale down)
-        double t = static_cast<double>(delta) * beta;
-
-        // Decompose t = ip + frac
-        int ip = static_cast<int>(t);
-        double frac = t - ip;
-
-        // If ip >= 31, underflow to zero
-        if (ip >= 31)
-        {
-            scale_num = 0;
-            scale_shift = 0;
-            return;
-        }
-
-        // Get exp2 LUT for fractional part
-        ensure_exp2_lut_initialized(lut_value_bits);
-        const uint32_t *lut = get_exp2_lut_data();
-
-        // Index into LUT: frac * 2^frac_bits
-        int lut_idx = static_cast<int>(frac * (1 << frac_bits));
-        lut_idx = std::clamp(lut_idx, 0, EXP2_LUT_SIZE - 1);
-
-        // 2^(-t) = 2^(-ip) * 2^(-frac) = lut[idx] >> ip
-        scale_num = static_cast<int32_t>(lut[lut_idx]);
-        scale_shift = lut_value_bits + ip;
+    int64_t online_softmax_compute_block_weights_adaptive(
+        const int32_t *scores,
+        int32_t *weights,
+        int block_size,
+        int32_t running_max,
+        const AdaptiveAlphaConfig &alpha_config,
+        int frac_bits,
+        int lut_value_bits)
+    {
+        // Delegate to shared implementation
+        return exp2_compute_block_weights(scores, weights, block_size, running_max, alpha_config, frac_bits, lut_value_bits);
     }
 
     int64_t online_softmax_compute_block_weights(
@@ -116,63 +83,9 @@ namespace llaminar2::kernels::q16_1::microkernels
         int frac_bits,
         int lut_value_bits)
     {
-        // Initialize LUT
-        ensure_exp2_lut_initialized(lut_value_bits);
-        const uint32_t *lut = get_exp2_lut_data();
-
-        // Compute beta = alpha * log2(e)
-        double beta = static_cast<double>(alpha) * LOG2E;
-        int beta_scale_bits = 24;
-        int64_t M = static_cast<int64_t>(
-            std::llround(beta * static_cast<double>(1ULL << beta_scale_bits)));
-
-        int shift_for_t = beta_scale_bits - frac_bits;
-        uint32_t one = static_cast<uint32_t>(1U << lut_value_bits);
-
-        int64_t sum = 0;
-
-        for (int i = 0; i < block_size; ++i)
-        {
-            if (scores[i] == MASKED)
-            {
-                weights[i] = 0;
-                continue;
-            }
-
-            int32_t delta = running_max - scores[i];
-
-            // delta = 0 means this is the max
-            if (delta <= 0)
-            {
-                weights[i] = static_cast<int32_t>(one);
-                sum += one;
-                continue;
-            }
-
-            // t_fixed = delta * M in Q(frac_bits) format
-            int64_t prod = static_cast<int64_t>(delta) * M;
-            int64_t t_fixed = (shift_for_t >= 0)
-                                  ? (prod >> shift_for_t)
-                                  : (prod << (-shift_for_t));
-
-            // Decompose: t = ip + frac
-            int64_t ip = t_fixed >> frac_bits;
-            int frac_idx = static_cast<int>(t_fixed & ((1 << frac_bits) - 1));
-
-            // Underflow check
-            if (ip >= 31)
-            {
-                weights[i] = 0;
-                continue;
-            }
-
-            // 2^(-t) = lut[frac] >> ip
-            uint32_t w = lut[frac_idx] >> static_cast<int>(ip);
-            weights[i] = static_cast<int32_t>(w);
-            sum += w;
-        }
-
-        return sum;
+        // Use adaptive scaling for better precision with small alpha
+        AdaptiveAlphaConfig alpha_config = AdaptiveAlphaConfig::compute(alpha);
+        return exp2_compute_block_weights(scores, weights, block_size, running_max, alpha_config, frac_bits, lut_value_bits);
     }
 
     bool online_softmax_update_block(
@@ -184,11 +97,18 @@ namespace llaminar2::kernels::q16_1::microkernels
         int32_t &scale_num,
         int &scale_shift)
     {
-        // Step 1: Find block max
-        int32_t block_max = online_softmax_find_block_max(scores, block_size, MASKED);
+        // Ensure state has alpha_config initialized (lazy init if needed)
+        // Note: For best performance, call state.init(alpha) once before processing
+        if (state.alpha_config.original_alpha == 0.0f && alpha != 0.0f)
+        {
+            state.alpha_config = AdaptiveAlphaConfig::compute(alpha);
+        }
+
+        // Step 1: Find block max (using shared primitive)
+        int32_t block_max = exp2_find_block_max(scores, block_size, MASKED_SCORE);
 
         // All masked in this block
-        if (block_max == MASKED)
+        if (block_max == MASKED_SCORE)
         {
             std::memset(weights, 0, block_size * sizeof(int32_t));
             scale_num = 1 << state.lut_value_bits;
@@ -207,11 +127,11 @@ namespace llaminar2::kernels::q16_1::microkernels
             needs_rescale = !state.empty(); // Don't rescale on first block
         }
 
-        // Step 3: Compute rescale factor
+        // Step 3: Compute rescale factor using shared primitive
         if (needs_rescale)
         {
-            online_softmax_compute_rescale(
-                m_old, m_new, alpha,
+            exp2_compute_rescale(
+                m_old, m_new, state.alpha_config,
                 scale_num, scale_shift,
                 state.frac_bits, state.lut_value_bits);
 
@@ -225,10 +145,10 @@ namespace llaminar2::kernels::q16_1::microkernels
             scale_shift = state.lut_value_bits;
         }
 
-        // Step 4: Compute weights for this block (using new max)
-        int64_t block_sum = online_softmax_compute_block_weights(
+        // Step 4: Compute weights for this block using shared primitive
+        int64_t block_sum = exp2_compute_block_weights(
             scores, weights, block_size,
-            m_new, alpha,
+            m_new, state.alpha_config,
             state.frac_bits, state.lut_value_bits);
 
         // Step 5: Update state
@@ -238,7 +158,7 @@ namespace llaminar2::kernels::q16_1::microkernels
         // Count unmasked positions
         for (int i = 0; i < block_size; ++i)
         {
-            if (scores[i] != MASKED)
+            if (scores[i] != MASKED_SCORE)
             {
                 ++state.count;
             }
@@ -254,35 +174,8 @@ namespace llaminar2::kernels::q16_1::microkernels
         int total_len,
         int16_t weight_max)
     {
-        if (state.l == 0)
-        {
-            // No unmasked positions - uniform or zero
-            std::memset(final_weights, 0, total_len * sizeof(int16_t));
-            return 0;
-        }
-
-        // Normalize: w_final = block_weights * weight_max / l
-        int64_t half = state.l / 2;
-        int64_t sum = 0;
-
-        for (int i = 0; i < total_len; ++i)
-        {
-            if (block_weights[i] == 0)
-            {
-                final_weights[i] = 0;
-                continue;
-            }
-
-            int64_t num = static_cast<int64_t>(block_weights[i]) *
-                          static_cast<int64_t>(weight_max);
-            int64_t w = (num + half) / state.l;
-
-            w = std::min<int64_t>(w, weight_max);
-            final_weights[i] = static_cast<int16_t>(w);
-            sum += w;
-        }
-
-        return static_cast<int32_t>(std::min<int64_t>(sum, std::numeric_limits<int32_t>::max()));
+        // Delegate to shared implementation
+        return exp2_normalize_weights(block_weights, final_weights, total_len, state.l, weight_max);
     }
 
     // ============================================================================
@@ -321,35 +214,66 @@ namespace llaminar2::kernels::q16_1::microkernels
             kv_block_size, alpha,
             scale_num, scale_shift);
 
-        // Step 3: Rescale existing context if max changed
+        // Step 3: Rescale l_processed if max changed (using double precision)
+        // NOTE: Context does NOT need rescaling!
+        // Context stores the normalized weighted average: Σ(w*V) / Σ(w)
+        // When weights scale by k: numerator and denominator both scale by k,
+        // so the ratio (the running average) is unchanged.
+        // We only need to rescale l_processed so the merge formula works correctly.
         if (needs_rescale)
         {
-            q16_context_rescale(context, head_dim, scale_num, scale_shift);
+            // Rescale l_processed using exact double arithmetic
+            // scale_factor = scale_num / 2^scale_shift
+            double scale_factor = static_cast<double>(scale_num) / static_cast<double>(1ULL << scale_shift);
+            state.l_processed *= scale_factor;
         }
 
-        // Step 4: Accumulate P×V for this block
-        // We use unnormalized INT32 weights here, final normalization happens at the end
-        // Convert INT32 weights to INT16 for accumulation (scale down by lut_value_bits)
-        // For now, we'll accumulate with scaled-down weights
+        // Step 4: Compute weighted V sum for this block and merge using running average
+        // Using RUNNING AVERAGE approach to keep context bounded
+        //
+        // DESIGN INSIGHT:
+        // We want context to store the running weighted average: Σ(w*V) / Σ(w)
+        // This stays bounded regardless of sequence length.
+        //
+        // For this block:
+        //   block_contribution = Σ(w[k] * V[k]) for k in block
+        //   block_sum = Σ(w[k]) for k in block
+        //
+        // Merge formula:
+        //   context_new = (context_old * l_old + block_contribution) / l_new
+        //               = (context_old * l_old + block_contribution) / (l_old + block_sum)
+        //
+        // To avoid overflow, we scale weights down to INT16 range first.
         const BlockType *V_block = V + kv_block_start * blocks_per_row;
+        constexpr int BLOCK_SIZE = BlockType::BLOCK_SIZE;
+
+        // Compute block sum of weights at scaled-down precision
+        double block_sum_scaled = 0.0;
+        for (int k = 0; k < kv_block_size; ++k)
+        {
+            int32_t w_scaled = weights_scratch[k] >> (state.lut_value_bits - 15);
+            block_sum_scaled += w_scaled;
+        }
+
+        // Temp buffer for block's weighted V sum (scaled)
+        alignas(64) int64_t block_context[256]; // Max head_dim
+        std::memset(block_context, 0, head_dim * sizeof(int64_t));
 
         for (int k = 0; k < kv_block_size; ++k)
         {
             if (weights_scratch[k] == 0)
                 continue;
 
-            // Scale weight from LUT precision to usable range
-            // LUT values are in [0, 2^30], scale to [0, 2^15] for INT16 range
+            // Scale weight down to INT16 range (same as before)
             int32_t w_scaled = weights_scratch[k] >> (state.lut_value_bits - 15);
             if (w_scaled == 0 && weights_scratch[k] > 0)
             {
-                w_scaled = 1; // Preserve non-zero contribution
+                w_scaled = 1;
             }
 
             const BlockType *V_row = V_block + k * blocks_per_row;
 
-            // Accumulate w * V[k] into context
-            constexpr int BLOCK_SIZE = BlockType::BLOCK_SIZE;
+            // Accumulate w_scaled * V[k] into block_context
             for (int b = 0; b < blocks_per_row; ++b)
             {
                 const int16_t *v_data = V_row[b].qs;
@@ -359,10 +283,31 @@ namespace llaminar2::kernels::q16_1::microkernels
 
                 for (int i = 0; i < count; ++i)
                 {
-                    context[start + i] += w_scaled * static_cast<int32_t>(v_data[i]);
+                    block_context[start + i] += static_cast<int64_t>(w_scaled) * static_cast<int64_t>(v_data[i]);
                 }
             }
         }
+
+        // Step 5: Merge with running context using weighted average (double precision)
+        // context stores: (Σ w_scaled * V) / l_processed
+        // So we need to un-normalize, add, and re-normalize
+        double l_old = state.l_processed;
+        double l_new = l_old + block_sum_scaled;
+
+        if (l_new > 0.0)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                // Un-normalize: context * l_old gives the accumulated weighted sum
+                // Add new block contribution
+                // Re-normalize by dividing by l_new
+                double numerator = static_cast<double>(context[d]) * l_old + static_cast<double>(block_context[d]);
+                context[d] = static_cast<int32_t>(std::round(numerator / l_new));
+            }
+        }
+
+        // Update l_processed (in scaled units, matching block_sum_scaled)
+        state.l_processed = l_new;
     }
 
     // ============================================================================
@@ -426,31 +371,24 @@ namespace llaminar2::kernels::q16_1::microkernels
                     // Mask out future positions (k > q)
                     if (k_pos > q_pos)
                     {
-                        scores_scratch[r * Bc + c] = MASKED;
+                        scores_scratch[r * Bc + c] = MASKED_SCORE;
                     }
                 }
             }
         }
 
-        // Step 3: Per-row online softmax update
+        // Step 3: Per-row online softmax update with running average
         // Process each query row independently
         for (int r = 0; r < Br; ++r)
         {
             int32_t *row_scores = scores_scratch + r * Bc;
             int32_t *row_weights = weights_scratch + r * Bc;
 
-            // Find max in this row's scores
-            int32_t row_max = MASKED;
-            for (int c = 0; c < Bc; ++c)
-            {
-                if (row_scores[c] != MASKED && row_scores[c] > row_max)
-                {
-                    row_max = row_scores[c];
-                }
-            }
+            // Find max in this row's scores (using shared primitive)
+            int32_t row_max = exp2_find_block_max(row_scores, Bc, MASKED_SCORE);
 
             // Skip if all masked
-            if (row_max == MASKED)
+            if (row_max == MASKED_SCORE)
             {
                 std::memset(row_weights, 0, Bc * sizeof(int32_t));
                 continue;
@@ -471,10 +409,16 @@ namespace llaminar2::kernels::q16_1::microkernels
             int32_t scale_num = 1 << state.lut_value_bits;
             int scale_shift = state.lut_value_bits;
 
+            // Lazy init alpha_config if not already set
+            if (state.alpha_config.original_alpha == 0.0f && alpha != 0.0f)
+            {
+                state.alpha_config = AdaptiveAlphaConfig::compute(alpha);
+            }
+
             if (needs_rescale)
             {
-                online_softmax_compute_rescale(
-                    m_old, m_new, alpha,
+                exp2_compute_rescale(
+                    m_old, m_new, state.alpha_config,
                     scale_num, scale_shift,
                     state.frac_bits, state.lut_value_bits);
 
@@ -482,15 +426,16 @@ namespace llaminar2::kernels::q16_1::microkernels
                 int64_t scaled_l = (static_cast<int64_t>(state.l[r]) * scale_num) >> scale_shift;
                 state.l[r] = scaled_l;
 
-                // Rescale existing context for this row
-                int32_t *row_context = context + r * context_stride;
-                q16_context_rescale(row_context, head_dim, scale_num, scale_shift);
+                // Rescale l_processed using exact double arithmetic
+                // NOTE: Context does NOT need rescaling - it's a normalized average
+                double scale_factor = static_cast<double>(scale_num) / static_cast<double>(1ULL << scale_shift);
+                state.l_processed[r] *= scale_factor;
             }
 
-            // Compute weights for this row
-            int64_t row_sum = online_softmax_compute_block_weights(
+            // Compute weights for this row using shared primitive
+            int64_t row_sum = exp2_compute_block_weights(
                 row_scores, row_weights, Bc,
-                m_new, alpha,
+                m_new, state.alpha_config,
                 state.frac_bits, state.lut_value_bits);
 
             // Update state for this row
@@ -500,23 +445,35 @@ namespace llaminar2::kernels::q16_1::microkernels
             // Count unmasked positions
             for (int c = 0; c < Bc; ++c)
             {
-                if (row_scores[c] != MASKED)
+                if (row_scores[c] != MASKED_SCORE)
                 {
                     ++state.count[r];
                 }
             }
 
-            // Step 4: Accumulate P×V for this row
-            // Accumulate: context[r, :] += Σ_k weights[r, k] × V[k, :]
+            // Step 4: Compute weighted V sum for this tile into temp buffer
+            // Using RUNNING AVERAGE approach to keep context bounded
             int32_t *row_context = context + r * context_stride;
             const BlockType *V_tile = V + kv_tile_start * k_stride;
+
+            // Compute tile sum of weights at scaled-down precision (double for accuracy)
+            double tile_sum_scaled = 0.0;
+            for (int c = 0; c < Bc; ++c)
+            {
+                int32_t w_scaled = row_weights[c] >> (state.lut_value_bits - 15);
+                tile_sum_scaled += w_scaled;
+            }
+
+            // Temp buffer for tile's weighted V sum (per row)
+            alignas(64) int64_t tile_context[256]; // Max head_dim
+            std::memset(tile_context, 0, head_dim * sizeof(int64_t));
 
             for (int k = 0; k < Bc; ++k)
             {
                 if (row_weights[k] == 0)
                     continue;
 
-                // Scale weight from LUT precision to usable range
+                // Scale weight down to INT16 range
                 int32_t w_scaled = row_weights[k] >> (state.lut_value_bits - 15);
                 if (w_scaled == 0 && row_weights[k] > 0)
                 {
@@ -525,7 +482,7 @@ namespace llaminar2::kernels::q16_1::microkernels
 
                 const BlockType *V_row = V_tile + k * k_stride;
 
-                // Accumulate w * V[k] into context
+                // Accumulate w_scaled * V[k] into tile_context
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
                     const int16_t *v_data = V_row[b].qs;
@@ -535,10 +492,26 @@ namespace llaminar2::kernels::q16_1::microkernels
 
                     for (int i = 0; i < count; ++i)
                     {
-                        row_context[start + i] += w_scaled * static_cast<int32_t>(v_data[i]);
+                        tile_context[start + i] += static_cast<int64_t>(w_scaled) * static_cast<int64_t>(v_data[i]);
                     }
                 }
             }
+
+            // Step 5: Merge with running context using weighted average (double precision)
+            double l_old = state.l_processed[r];
+            double l_new = l_old + tile_sum_scaled;
+
+            if (l_new > 0.0)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    double numerator = static_cast<double>(row_context[d]) * l_old + static_cast<double>(tile_context[d]);
+                    row_context[d] = static_cast<int32_t>(std::round(numerator / l_new));
+                }
+            }
+
+            // Update l_processed for this row (in scaled units)
+            state.l_processed[r] = l_new;
         }
     }
 

@@ -645,6 +645,7 @@ add_library(llaminar2_core STATIC
     # Q16_1 fused attention (TRUE INTEGER PIPELINE v2)
     kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.cpp        # ITensorFusedAttentionWo implementation
     kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp     # v2: TRUE integer attention (replaces Q16FusedAttentionRef)
+    kernels/cpu/attention/q16_1/ref/microkernels/Exp2Core.cpp            # v2: shared exp2 LUT primitives for all softmax impls
     kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmax.cpp    # v2: exp2 fixed-point softmax (INT32→INT16, 2048-entry LUT)
     kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProduct.cpp       # v2: Q×K^T integer dot product microkernel
     kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulate.cpp        # v2: P×V integer accumulation microkernel

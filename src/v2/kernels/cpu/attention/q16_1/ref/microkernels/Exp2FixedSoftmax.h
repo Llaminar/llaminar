@@ -34,8 +34,11 @@
  * - 4KB LUT fits easily in L1 cache (typically 32-64KB per core)
  *
  * @see docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md
+ * @see Exp2Core.h for shared LUT primitives
  */
 #pragma once
+
+#include "Exp2Core.h" // Shared LUT primitives and constants
 
 #include <cstdint>
 
@@ -52,14 +55,14 @@ namespace llaminar2::kernels::q16_1::microkernels
     {
         /// Fractional bits for LUT indexing. 11 = 2048 entries (4KB), excellent precision.
         /// 8× finer granularity than 256-entry LUT, critical for attention distribution quality.
-        int frac_bits = 11;
+        int frac_bits = DEFAULT_FRAC_BITS;
 
         /// Internal scaling bits for fixed-point β computation.
         /// Higher = more precision but risk of overflow for large deltas.
         int beta_scale_bits = 24;
 
         /// LUT value precision bits. 30 gives good normalization headroom.
-        int lut_value_bits = 30;
+        int lut_value_bits = DEFAULT_LUT_VALUE_BITS;
 
         /// Maximum output weight (INT16 range for VNNI compatibility).
         int16_t weight_max = 32767;
@@ -90,25 +93,8 @@ namespace llaminar2::kernels::q16_1::microkernels
         int32_t *sum_out = nullptr,
         const Exp2SoftmaxConfig &config = Exp2SoftmaxConfig{});
 
-    /**
-     * @brief Initialize the exp2 LUT (called automatically on first use).
-     *
-     * The LUT stores 2^(-u) for u ∈ [0, 1) at 2048 uniformly spaced points.
-     * Values are scaled by 2^lut_value_bits for integer arithmetic.
-     * Total size: 2048 × 4 bytes = 8KB (fits in L1 cache).
-     *
-     * This is thread-safe (uses static initialization).
-     */
-    void ensure_exp2_lut_initialized(int lut_value_bits = 30);
-
-    /**
-     * @brief Get pointer to the exp2 LUT (for testing/debugging).
-     *
-     * @return Pointer to 2048-entry uint32_t array, or nullptr if not initialized.
-     */
-    const uint32_t *get_exp2_lut_data();
-
-    /// LUT size constant (2^11 = 2048 entries)
-    constexpr int EXP2_LUT_SIZE = 2048;
+    // Note: ensure_exp2_lut_initialized() and get_exp2_lut_data() are now
+    // provided by Exp2Core.h for all softmax implementations to share.
+    // EXP2_LUT_SIZE constant is also in Exp2Core.h.
 
 } // namespace llaminar2::kernels::q16_1::microkernels

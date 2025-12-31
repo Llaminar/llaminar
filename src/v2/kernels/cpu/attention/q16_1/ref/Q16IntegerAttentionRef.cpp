@@ -236,10 +236,9 @@ namespace llaminar2::kernels::q16_1
             float qk_scale = params.get_qk_scale(h, kv_h);
             float pv_scale = params.get_pv_scale(kv_h);
 
-            // Initialize online softmax state
+            // Initialize online softmax state with adaptive alpha for small qk_scale values
             microkernels::OnlineSoftmaxState state;
-            state.frac_bits = 11;
-            state.lut_value_bits = 30;
+            state.init(qk_scale, 11, 30); // frac_bits=11, lut_value_bits=30
 
             // Zero context
             std::memset(context.data(), 0, head_dim * sizeof(int32_t));
@@ -349,13 +348,25 @@ namespace llaminar2::kernels::q16_1
                 microkernels::ensure_exp2_lut_initialized(state.lut_value_bits);
                 const uint32_t *lut = microkernels::get_exp2_lut_data();
 
-                // Compute beta = alpha * log2(e) for exp2 conversion
+                // Use adaptive alpha from state (already computed during processing)
+                // This ensures we use the same scaling as the actual attention computation
+                //
+                // PRECISION FIX: Instead of dividing delta by score_divisor (which loses
+                // precision due to integer truncation), we keep delta intact and adjust
+                // the fixed-point scaling.
+                //
+                // Formula: t = delta * original_alpha * log2e
+                //        = delta * (effective_alpha / 2^alpha_shift) * log2e
+                // We compute: M = effective_beta * 2^24
+                //             t_fixed = (delta * M) >> (24 - frac_bits + alpha_shift)
+                const auto &alpha_config = state.alpha_config;
                 constexpr double LOG2E = 1.4426950408889634073599246810018921;
-                double beta = static_cast<double>(qk_scale) * LOG2E;
+                double effective_beta = static_cast<double>(alpha_config.effective_alpha) * LOG2E;
                 int beta_scale_bits = 24;
                 int64_t M = static_cast<int64_t>(
-                    std::llround(beta * static_cast<double>(1ULL << beta_scale_bits)));
-                int shift_for_t = beta_scale_bits - state.frac_bits;
+                    std::llround(effective_beta * static_cast<double>(1ULL << beta_scale_bits)));
+                // Adjust shift to account for alpha_shift
+                int shift_for_t = beta_scale_bits - state.frac_bits + alpha_config.alpha_shift;
                 uint32_t one = static_cast<uint32_t>(1U << state.lut_value_bits);
 
                 // Recompute all weights using final max and accumulate sum
@@ -370,6 +381,7 @@ namespace llaminar2::kernels::q16_1
                         continue;
                     }
 
+                    // Use original delta - NO division for precision
                     int32_t delta = state.m - all_scores_raw[k];
 
                     if (delta <= 0)
@@ -380,7 +392,8 @@ namespace llaminar2::kernels::q16_1
                         continue;
                     }
 
-                    // t_fixed = delta * M in Q(frac_bits) format
+                    // t_fixed = delta * M >> shift_for_t
+                    // This computes delta * original_alpha * log2e in Q(frac_bits) format
                     int64_t prod = static_cast<int64_t>(delta) * M;
                     int64_t t_fixed = (shift_for_t >= 0)
                                           ? (prod >> shift_for_t)
@@ -414,16 +427,16 @@ namespace llaminar2::kernels::q16_1
             }
 
             // Snapshot: attention context (if requested)
-            // Context needs to be divided by l and scaled
+            // With running average, context already contains the normalized weighted average
+            // of V values (in INT16 units). Just need to scale to FP32.
             if (params.snapshot_context)
             {
-                float context_scale = (state.l > 0)
-                                          ? pv_scale / static_cast<float>(state.l >> (state.lut_value_bits - 15))
-                                          : 0.0f;
+                // Context stores: Σ(w * V) / Σ(w) where V is in INT16 units
+                // To convert to FP32: multiply by pv_scale (block scale d)
                 for (int d = 0; d < head_dim; ++d)
                 {
                     params.snapshot_context[h * head_dim + d] =
-                        static_cast<float>(context[d]) * context_scale;
+                        static_cast<float>(context[d]) * pv_scale;
                 }
             }
 
@@ -532,9 +545,9 @@ namespace llaminar2::kernels::q16_1
             {
                 int Br = std::min(TILE_BR, seq_len_q - q_tile_start);
 
-                // Initialize batch softmax state for this Q tile
+                // Initialize batch softmax state for this Q tile with adaptive alpha
                 microkernels::OnlineSoftmaxStateBatch state;
-                state.init(Br);
+                state.init(Br, qk_scale); // Use overload with alpha for adaptive scaling
 
                 // Zero context tile
                 std::memset(context_tile.data(), 0, TILE_BR * head_dim * sizeof(int32_t));
@@ -677,13 +690,18 @@ namespace llaminar2::kernels::q16_1
                         microkernels::ensure_exp2_lut_initialized(state.lut_value_bits);
                         const uint32_t *lut = microkernels::get_exp2_lut_data();
 
-                        // Compute beta = alpha * log2(e)
+                        // Use adaptive alpha from state for consistent scaling
+                        //
+                        // PRECISION FIX: Instead of dividing delta by score_divisor,
+                        // keep delta intact and adjust the shift.
+                        const auto &alpha_config = state.alpha_config;
                         constexpr double LOG2E = 1.4426950408889634073599246810018921;
-                        double beta = static_cast<double>(qk_scale) * LOG2E;
+                        double effective_beta = static_cast<double>(alpha_config.effective_alpha) * LOG2E;
                         int beta_scale_bits = 24;
                         int64_t M = static_cast<int64_t>(
-                            std::llround(beta * static_cast<double>(1ULL << beta_scale_bits)));
-                        int shift_for_t = beta_scale_bits - state.frac_bits;
+                            std::llround(effective_beta * static_cast<double>(1ULL << beta_scale_bits)));
+                        // Adjust shift to account for alpha_shift
+                        int shift_for_t = beta_scale_bits - state.frac_bits + alpha_config.alpha_shift;
                         uint32_t one = static_cast<uint32_t>(1U << state.lut_value_bits);
 
                         // Recompute all weights using final max and accumulate sum
@@ -699,6 +717,7 @@ namespace llaminar2::kernels::q16_1
                                 continue;
                             }
 
+                            // Use original delta - NO division for precision
                             int32_t delta = state.m[r] - score_raw;
 
                             if (delta <= 0)
@@ -709,7 +728,7 @@ namespace llaminar2::kernels::q16_1
                                 continue;
                             }
 
-                            // t_fixed = delta * M in Q(frac_bits) format
+                            // t_fixed = delta * M >> shift_for_t
                             int64_t prod = static_cast<int64_t>(delta) * M;
                             int64_t t_fixed = (shift_for_t >= 0)
                                                   ? (prod >> shift_for_t)
@@ -743,18 +762,14 @@ namespace llaminar2::kernels::q16_1
                     }
 
                     // Snapshot: attention context
+                    // With running average, context already contains the normalized weighted
+                    // average of V values. Just need to scale to FP32.
                     if (params.snapshot_context)
                     {
-                        int64_t l_val = state.l[r];
-                        int shift_amt = state.lut_value_bits - 15;
-                        int64_t l_shifted = l_val >> shift_amt;
-                        float context_scale = (l_shifted > 0)
-                                                  ? pv_scale / static_cast<float>(l_shifted)
-                                                  : 0.0f;
                         for (int d = 0; d < head_dim; ++d)
                         {
                             params.snapshot_context[(h * seq_len_q + q_idx) * head_dim + d] =
-                                static_cast<float>(context_tile[r * head_dim + d]) * context_scale;
+                                static_cast<float>(context_tile[r * head_dim + d]) * pv_scale;
                         }
                     }
                 }
