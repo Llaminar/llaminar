@@ -779,7 +779,7 @@ TEST_F(Test__MLAAttention, SubBlockAccumulation_NoOverflow)
     }
 
     int32_t safe_result = q16_dot_single_mla(&Q_nope_safe, &Q_rope_safe,
-                                              &K_nope_safe, &K_rope_safe);
+                                             &K_nope_safe, &K_rope_safe);
 
     // Expected: 192 * 3345^2 = 2,148,176,400 - just at INT32_MAX
     int64_t expected = static_cast<int64_t>(MLAConfig::MAX_SAFE_VALUE) *
