@@ -148,6 +148,24 @@ namespace llaminar2
                                                      int device_idx = -1);
 
         /**
+         * @brief Create activation tensor with explicit head_dim for Q16 block size
+         *
+         * For Q16_1 and HybridQ16 precisions, uses optimal_q16_block_size(head_dim)
+         * to determine the block size. This ensures Q tensor block size matches
+         * the KV cache block size (which also uses optimal_q16_block_size).
+         *
+         * @param shape Tensor dimensions
+         * @param precision Activation precision
+         * @param head_dim Attention head dimension (used for Q16 block size)
+         * @param device_idx Optional device index (-1 = CPU)
+         * @return Tensor of appropriate type
+         */
+        std::unique_ptr<TensorBase> createActivation(const std::vector<size_t> &shape,
+                                                     ActivationPrecision precision,
+                                                     int head_dim,
+                                                     int device_idx);
+
+        /**
          * @brief Create quantized tensor from raw GGUF data
          * @param type Quantization type
          * @param shape Tensor dimensions

@@ -2,21 +2,18 @@
  * @file Q16FusedAttentionKernel.h
  * @brief Q16_1 fused attention kernel implementing ITensorFusedAttentionWo
  *
- * STATUS: STUB IMPLEMENTATION (v2 in development)
- * ================================================
- * This kernel is currently a stub - compute() returns "not implemented" error.
- * The Q16_INTEGER backend is under active development with the new v2 API
- * that uses model-appropriate block sizes (64/128/192) for true integer attention.
+ * This kernel delegates to Q16IntegerAttentionRef for true integer attention.
+ * The v2 API uses model-appropriate block sizes (64/128) for optimal performance.
  *
- * See: Q16IntegerAttentionRef.h for the v2 implementation in progress.
- * See: docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md for design rationale.
- *
- * When v2 is complete, this kernel will delegate to:
+ * Current implementation uses:
  * - Q16IntegerAttentionRef: Scalar C++ reference (for testing/debugging)
+ *
+ * Future JIT optimization:
  * - JitQ16FlashDecodeKernel / JitQ16FA2PrefillKernel: AVX512 JIT (production)
  *
  * @see tensors/TensorKernels.h for ITensorFusedAttentionWo interface
  * @see ref/Q16IntegerAttentionRef.h for v2 implementation
+ * @see docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md for design rationale
  *
  * @author David Sanftenberg
  * @date December 2025

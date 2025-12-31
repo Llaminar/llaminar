@@ -849,15 +849,16 @@ namespace llaminar2
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
                                             << " mode: allocating Q_rope buffer ("
                                             << activationPrecisionToString(q_rope_prec) << ")");
+            // Pass head_dim for Q16 block size selection (must match KV cache block size)
             state_.Q_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
-                q_rope_prec, device_idx);
+                q_rope_prec, head_dim, device_idx);
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
                                             << " mode: allocating K_rope buffer ("
                                             << activationPrecisionToString(k_rope_prec) << ")");
             state_.K_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                k_rope_prec, device_idx);
+                k_rope_prec, head_dim, device_idx);
 
             // V_dequant: buffer for V before KV cache append
             // V is Q8_1 from GEMM, needs to match KV cache precision (FP32 for Hybrid, Q16_1 for HybridQ16)
@@ -865,7 +866,7 @@ namespace llaminar2
                 act_prec, HybridBufferType::KV_Cache, nullptr);
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
-                kv_cache_prec, device_idx);
+                kv_cache_prec, head_dim, device_idx);
             LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
                                             << " mode: allocating V_dequant buffer ("
                                             << activationPrecisionToString(kv_cache_prec) << ")");

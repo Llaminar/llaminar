@@ -198,6 +198,25 @@ namespace llaminar2
         return tensor;
     }
 
+    std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
+                                                                ActivationPrecision precision,
+                                                                int head_dim,
+                                                                int device_idx)
+    {
+        // For Q16_1 and HybridQ16, use optimal block size based on head_dim
+        if (precision == ActivationPrecision::Q16_1 ||
+            precision == ActivationPrecision::HybridQ16)
+        {
+            Q16BlockSize block_size = optimal_q16_block_size(head_dim);
+            LOG_DEBUG("TensorFactory::createActivation: Q16 with head_dim=" << head_dim
+                                                                            << " -> block_size=" << static_cast<int>(block_size));
+            return createQ16_1(shape, block_size, device_idx);
+        }
+
+        // All other precisions: delegate to base overload
+        return createActivation(shape, precision, device_idx);
+    }
+
     std::unique_ptr<TensorBase> TensorFactory::createQuantized(TensorType type,
                                                                const std::vector<size_t> &shape,
                                                                const std::vector<uint8_t> &raw_data)

@@ -764,11 +764,13 @@ namespace llaminar2::kernels::q16_1
                     // Snapshot: attention context
                     // With running average, context already contains the normalized weighted
                     // average of V values. Just need to scale to FP32.
+                    // Layout: [seq_len_q, num_heads * head_dim] for compatibility with pipeline
                     if (params.snapshot_context)
                     {
                         for (int d = 0; d < head_dim; ++d)
                         {
-                            params.snapshot_context[(h * seq_len_q + q_idx) * head_dim + d] =
+                            // Write in [seq, heads*head_dim] layout
+                            params.snapshot_context[q_idx * params.num_heads * head_dim + h * head_dim + d] =
                                 static_cast<float>(context_tile[r * head_dim + d]) * pv_scale;
                         }
                     }

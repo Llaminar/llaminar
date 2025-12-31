@@ -1,6 +1,6 @@
 # Q16_1 Integer-Domain Attention Kernel v2
 
-**Status**: In Progress (Phase 8 Complete - Moving to Phase 9)  
+**Status**: In Progress (Phase 9 - Graph Wiring Complete, Numerical Debugging Needed)  
 **Created**: 2025-12-30  
 **Updated**: 2025-01-01  
 **Author**: Llaminar Team  
@@ -248,7 +248,21 @@
        `Test__Exp2Core.cpp` validating: zero input, high precision at boundaries, NaN handling,
        special values, negative range, and extreme values (-127.9f).
        **Files**: `Exp2Core.h`, `Test__Exp2Core.cpp`
-- [ ] Phase 9: E2E parity tests
+- [x] Phase 9: Graph Wiring + E2E Tests (PARTIAL)
+  - [x] Wire Q16IntegerAttentionRef to Q16FusedAttentionKernel::compute() (2025-01-01)
+    - [x] Added include for `ref/Q16IntegerAttentionRef.h`
+    - [x] Translate `FusedAttentionWoParams` → `Q16IntegerAttentionParams`
+    - [x] Call `q16_integer_attention_reference()` for decode/prefill dispatch
+    - [x] Auto-select optimal block size via `optimal_q16_block_size(head_dim)`
+    - [x] Integration tests: 53/54 passing (up from 52/54)
+    - [x] `V2_Integration_GraphSnapshotCallbackInvocation` now passes
+  - [!] KNOWN ISSUE: `V2_Integration_HybridQ16Pipeline_vs_FP32` still fails
+    - Attention context has near-zero cosine similarity vs FP32 reference
+    - Root cause: Q16IntegerAttentionRef attention computation needs debugging
+    - The kernel runs but produces numerically incorrect output
+  - [ ] TODO: Debug Q16IntegerAttentionRef numerical output
+  - [ ] TODO: Implement Wo projection in Q16IntegerAttentionRef (currently stub)
+  - [ ] TODO: Implement residual add in Q16IntegerAttentionRef (currently stub)
   - [ ] Create `tests/v2/e2e/Test__Q16IntegerAttentionParity.cpp`
   - [ ] PyTorch reference generation:
     - [ ] Generate Q,K,V snapshots in FP32 from real model (Qwen2.5-0.5B)
