@@ -547,8 +547,14 @@ TEST_F(ComputeGraphExecutionTest, SnapshotCallback_ReceivesDumpInfo)
     builder.addNode("test", ComputeStageType::GEMM);
 
     // Configure mock with specific dump info
+    // Use valid memory to avoid ASAN errors when buffer validation is enabled
+    constexpr size_t kRows = 32;
+    constexpr size_t kCols = 896;
+    std::vector<float> test_buffer(kRows * kCols, 1.0f); // Non-zero to pass validation
+    const float *test_data = test_buffer.data();
+
     StageDumpInfo test_info;
-    test_info.addOutput("C", reinterpret_cast<const float *>(0x12345678), 32, 896);
+    test_info.addOutput("C", test_data, kRows, kCols);
     builder.getStage("test")->setDumpInfo(test_info);
 
     auto graph = builder.build();
@@ -556,9 +562,9 @@ TEST_F(ComputeGraphExecutionTest, SnapshotCallback_ReceivesDumpInfo)
     EXPECT_TRUE(executor_->execute(graph, ctx_.get()));
 
     ASSERT_EQ(received_info.outputs.size(), 1);
-    EXPECT_EQ(received_info.outputs[0].rows, 32);
-    EXPECT_EQ(received_info.outputs[0].cols, 896);
-    EXPECT_EQ(received_info.outputs[0].data, reinterpret_cast<const float *>(0x12345678));
+    EXPECT_EQ(received_info.outputs[0].rows, kRows);
+    EXPECT_EQ(received_info.outputs[0].cols, kCols);
+    EXPECT_EQ(received_info.outputs[0].data, test_data);
 }
 
 // =============================================================================

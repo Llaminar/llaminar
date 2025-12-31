@@ -13786,6 +13786,180 @@ namespace llaminar2
         }
 
         // ==========================================
+        // Q16 Block Decode to FP32 (Templated for Variable Block Sizes)
+        // ==========================================
+
+        /**
+         * @brief Decode Q16 block to FP32 (scalar, templated)
+         *
+         * Works with any Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128).
+         * Formula: output[i] = scale * qs[i]
+         *
+         * @tparam BlockType Q16 block type with BLOCK_SIZE, d, qs members
+         * @param block Q16 block to decode
+         * @param output FP32 output buffer (must hold BLOCK_SIZE floats)
+         */
+        template <typename BlockType>
+        inline void decode_q16_block_to_fp32_scalar(const BlockType &block, float *output)
+        {
+            constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+            const float scale = block.d;
+            for (size_t i = 0; i < BLOCK_SIZE; ++i)
+            {
+                output[i] = scale * static_cast<float>(block.qs[i]);
+            }
+        }
+
+#if defined(__AVX512F__)
+        /**
+         * @brief Decode Q16 block to FP32 (AVX-512, templated)
+         *
+         * Uses AVX-512 to process 32 int16 values at a time with ILP optimization.
+         * Processes in 32-element chunks, handles any block size (32, 64, 128).
+         *
+         * @tparam BlockType Q16 block type with BLOCK_SIZE, d, qs members
+         * @param block Q16 block to decode
+         * @param output FP32 output buffer (must hold BLOCK_SIZE floats)
+         */
+        template <typename BlockType>
+        inline void decode_q16_block_to_fp32_avx512(const BlockType &block, float *output)
+        {
+            constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+            constexpr size_t CHUNKS_32 = BLOCK_SIZE / 32;
+
+            const float scale = block.d;
+            const __m512 vscale = _mm512_set1_ps(scale);
+
+            const __m256i *qs_ptr = reinterpret_cast<const __m256i *>(block.qs);
+
+            // Simple sequential processing - memory-bound operations benefit from
+            // sequential access patterns that the HW prefetcher can follow
+            for (size_t chunk = 0; chunk < CHUNKS_32; ++chunk)
+            {
+                // Load 32 int16s (2 x 256-bit = 64 bytes)
+                __m256i vi16_0 = _mm256_loadu_si256(qs_ptr + chunk * 2);
+                __m256i vi16_1 = _mm256_loadu_si256(qs_ptr + chunk * 2 + 1);
+
+                // Convert int16 -> int32 (sign extension)
+                __m512i vi32_0 = _mm512_cvtepi16_epi32(vi16_0);
+                __m512i vi32_1 = _mm512_cvtepi16_epi32(vi16_1);
+
+                // Convert int32 -> float
+                __m512 vf_0 = _mm512_cvtepi32_ps(vi32_0);
+                __m512 vf_1 = _mm512_cvtepi32_ps(vi32_1);
+
+                // Scale
+                vf_0 = _mm512_mul_ps(vf_0, vscale);
+                vf_1 = _mm512_mul_ps(vf_1, vscale);
+
+                // Store sequentially - allows HW prefetcher to work effectively
+                _mm512_storeu_ps(output + chunk * 32, vf_0);
+                _mm512_storeu_ps(output + chunk * 32 + 16, vf_1);
+            }
+        }
+#endif
+
+#if defined(__AVX2__)
+        /**
+         * @brief Decode Q16 block to FP32 (AVX2, templated)
+         *
+         * Uses AVX2 to process 8 int16 values at a time with ILP optimization.
+         * Processes in 16-element chunks (2 x 8), handles any block size.
+         *
+         * @tparam BlockType Q16 block type with BLOCK_SIZE, d, qs members
+         * @param block Q16 block to decode
+         * @param output FP32 output buffer (must hold BLOCK_SIZE floats)
+         */
+        template <typename BlockType>
+        inline void decode_q16_block_to_fp32_avx2(const BlockType &block, float *output)
+        {
+            constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+            constexpr size_t CHUNKS_16 = BLOCK_SIZE / 16;
+
+            const float scale = block.d;
+            const __m256 vscale = _mm256_set1_ps(scale);
+
+            const __m128i *qs_ptr = reinterpret_cast<const __m128i *>(block.qs);
+
+            size_t chunk = 0;
+
+            // Process 2 chunks (32 elements) per iteration for maximum ILP
+            for (; chunk + 1 < CHUNKS_16; chunk += 2)
+            {
+                // Interleaved loads (4 x 8 int16s = 32 values)
+                __m128i vi16_0a = _mm_loadu_si128(qs_ptr + chunk * 2);
+                __m128i vi16_1a = _mm_loadu_si128(qs_ptr + (chunk + 1) * 2);
+                __m128i vi16_0b = _mm_loadu_si128(qs_ptr + chunk * 2 + 1);
+                __m128i vi16_1b = _mm_loadu_si128(qs_ptr + (chunk + 1) * 2 + 1);
+
+                // Convert int16 -> int32 (interleaved)
+                __m256i vi32_0a = _mm256_cvtepi16_epi32(vi16_0a);
+                __m256i vi32_1a = _mm256_cvtepi16_epi32(vi16_1a);
+                __m256i vi32_0b = _mm256_cvtepi16_epi32(vi16_0b);
+                __m256i vi32_1b = _mm256_cvtepi16_epi32(vi16_1b);
+
+                // Convert int32 -> float (interleaved)
+                __m256 vf_0a = _mm256_cvtepi32_ps(vi32_0a);
+                __m256 vf_1a = _mm256_cvtepi32_ps(vi32_1a);
+                __m256 vf_0b = _mm256_cvtepi32_ps(vi32_0b);
+                __m256 vf_1b = _mm256_cvtepi32_ps(vi32_1b);
+
+                // Scale (interleaved)
+                vf_0a = _mm256_mul_ps(vf_0a, vscale);
+                vf_1a = _mm256_mul_ps(vf_1a, vscale);
+                vf_0b = _mm256_mul_ps(vf_0b, vscale);
+                vf_1b = _mm256_mul_ps(vf_1b, vscale);
+
+                // Store results (interleaved)
+                _mm256_storeu_ps(output + chunk * 16, vf_0a);
+                _mm256_storeu_ps(output + (chunk + 1) * 16, vf_1a);
+                _mm256_storeu_ps(output + chunk * 16 + 8, vf_0b);
+                _mm256_storeu_ps(output + (chunk + 1) * 16 + 8, vf_1b);
+            }
+
+            // Handle remaining single chunk
+            for (; chunk < CHUNKS_16; ++chunk)
+            {
+                __m128i vi16_0 = _mm_loadu_si128(qs_ptr + chunk * 2);
+                __m128i vi16_1 = _mm_loadu_si128(qs_ptr + chunk * 2 + 1);
+
+                __m256i vi32_0 = _mm256_cvtepi16_epi32(vi16_0);
+                __m256i vi32_1 = _mm256_cvtepi16_epi32(vi16_1);
+
+                __m256 vf_0 = _mm256_cvtepi32_ps(vi32_0);
+                __m256 vf_1 = _mm256_cvtepi32_ps(vi32_1);
+
+                vf_0 = _mm256_mul_ps(vf_0, vscale);
+                vf_1 = _mm256_mul_ps(vf_1, vscale);
+
+                _mm256_storeu_ps(output + chunk * 16, vf_0);
+                _mm256_storeu_ps(output + chunk * 16 + 8, vf_1);
+            }
+        }
+#endif
+
+        /**
+         * @brief Decode Q16 block to FP32 (auto-dispatch, templated)
+         *
+         * Automatically selects the best available SIMD implementation.
+         *
+         * @tparam BlockType Q16 block type with BLOCK_SIZE, d, qs members
+         * @param block Q16 block to decode
+         * @param output FP32 output buffer (must hold BLOCK_SIZE floats)
+         */
+        template <typename BlockType>
+        inline void decode_q16_block_to_fp32(const BlockType &block, float *output)
+        {
+#if defined(__AVX512F__)
+            decode_q16_block_to_fp32_avx512<BlockType>(block, output);
+#elif defined(__AVX2__)
+            decode_q16_block_to_fp32_avx2<BlockType>(block, output);
+#else
+            decode_q16_block_to_fp32_scalar<BlockType>(block, output);
+#endif
+        }
+
+        // ==========================================
         // Q16_1 Block Quantization from FP32
         // ==========================================
 

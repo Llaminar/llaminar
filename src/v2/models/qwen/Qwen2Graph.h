@@ -103,6 +103,16 @@ namespace llaminar2
         float rope_theta = 10000.0f;
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
 
+        // =================================================================
+        // Q16 KV Cache VNNI Safety (Phase 5.4)
+        // =================================================================
+        /// Fixed scale for Q16 KV cache quantization (FP32 range: ±kv_cache_scale).
+        /// All K/V values are quantized with this scale, producing INT16 values in
+        /// range [-32767 * kv_cache_scale, +32767 * kv_cache_scale]. The value must
+        /// match the expected activation range to avoid clipping. Default 8.0f works
+        /// for typical Qwen2 models. See VNNISafetyConstants.h for VNNI overflow limits.
+        float kv_cache_scale = 8.0f;
+
         // Execution settings
         int default_device = 0;
         bool enable_profiling = false;

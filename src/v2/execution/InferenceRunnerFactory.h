@@ -56,6 +56,11 @@ namespace llaminar2
         // - TILED: Cache-blocked implementation
         // - Q16_INTEGER: Pure Q16 integer-domain kernel (experimental)
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
+
+        // Fixed scale for Q16_1 KV cache quantization (FP32 range: ±kv_cache_scale)
+        // See RuntimeConfig.h for detailed documentation on scale selection.
+        // Default 8.0f covers typical K/V activation ranges with ~2× headroom.
+        float kv_cache_scale = 8.0f;
     };
 
     /**

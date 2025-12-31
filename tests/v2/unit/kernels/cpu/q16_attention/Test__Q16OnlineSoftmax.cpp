@@ -1009,3 +1009,509 @@ TEST_F(Test__Q16OnlineSoftmax, OnlineSoftmaxState_Empty)
     state.count = 0;
     EXPECT_TRUE(state.empty()) << "State with count = 0 should be empty";
 }
+
+// ============================================================================
+// FA2 Prefill Tests
+// ============================================================================
+
+/**
+ * @brief Test OnlineSoftmaxStateBatch initialization
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2_BatchState_Init)
+{
+    OnlineSoftmaxStateBatch state;
+    state.init(4);
+
+    EXPECT_EQ(state.num_rows, 4);
+    for (int r = 0; r < FA2_TILE_BR; ++r)
+    {
+        EXPECT_EQ(state.m[r], std::numeric_limits<int32_t>::min());
+        EXPECT_EQ(state.l[r], 0);
+        EXPECT_EQ(state.count[r], 0);
+        EXPECT_TRUE(state.empty(r));
+    }
+}
+
+/**
+ * @brief Test FA2 prefill with a single KV tile (Br=4, Bc=32)
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2_PrefillTile_Block64_SingleKVTile)
+{
+    constexpr int Br = 4;
+    constexpr int Bc = 32;
+    constexpr int head_dim = 64;
+    constexpr int blocks_per_row = 1; // head_dim/64
+    constexpr float alpha = 1.0f / std::sqrt(64.0f);
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int16_t> dist(-100, 100);
+
+    // Create Q tile [Br, head_dim]
+    std::vector<Q16_1Block_64> Q(Br);
+    for (int r = 0; r < Br; ++r)
+    {
+        Q[r].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            Q[r].qs[i] = dist(rng);
+        }
+    }
+
+    // Create K, V tiles [Bc, head_dim]
+    std::vector<Q16_1Block_64> K(Bc);
+    std::vector<Q16_1Block_64> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    // Context tile [Br, head_dim]
+    std::vector<int32_t> context(Br * head_dim, 0);
+
+    // Batch softmax state
+    OnlineSoftmaxStateBatch state;
+    state.init(Br);
+
+    // Scratch buffers [Br × Bc]
+    std::vector<int32_t> scores_scratch(Br * Bc);
+    std::vector<int32_t> weights_scratch(Br * Bc);
+
+    // Process the KV tile
+    fa2_prefill_process_kv_tile<Q16_1Block_64>(
+        Q.data(), K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        0, Br, Bc,
+        head_dim, blocks_per_row,
+        blocks_per_row, blocks_per_row, head_dim,
+        alpha, false, 0);
+
+    // Verify each row processed
+    for (int r = 0; r < Br; ++r)
+    {
+        EXPECT_EQ(state.count[r], Bc) << "Row " << r << " should have processed Bc positions";
+        EXPECT_GT(state.l[r], 0) << "Row " << r << " should have positive sum";
+        EXPECT_NE(state.m[r], std::numeric_limits<int32_t>::min()) << "Row " << r << " max should be updated";
+    }
+
+    // Verify context has non-zero values
+    bool has_nonzero = false;
+    for (int i = 0; i < Br * head_dim; ++i)
+    {
+        if (context[i] != 0)
+            has_nonzero = true;
+    }
+    EXPECT_TRUE(has_nonzero) << "Context should have non-zero values after P×V";
+}
+
+/**
+ * @brief Test FA2 prefill with causal masking
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2_PrefillTile_CausalMask)
+{
+    constexpr int Br = 4;
+    constexpr int Bc = 8;
+    constexpr int head_dim = 64;
+    constexpr int blocks_per_row = 1;
+    constexpr float alpha = 1.0f / std::sqrt(64.0f);
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int16_t> dist(-100, 100);
+
+    // Create Q tile [Br, head_dim]
+    std::vector<Q16_1Block_64> Q(Br);
+    for (int r = 0; r < Br; ++r)
+    {
+        Q[r].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            Q[r].qs[i] = dist(rng);
+        }
+    }
+
+    // Create K, V tiles [Bc, head_dim]
+    std::vector<Q16_1Block_64> K(Bc);
+    std::vector<Q16_1Block_64> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+    OnlineSoftmaxStateBatch state;
+    state.init(Br);
+
+    std::vector<int32_t> scores_scratch(Br * Bc);
+    std::vector<int32_t> weights_scratch(Br * Bc);
+
+    // With causal=true and q_offset=0:
+    // - Row 0 can attend to position 0 only
+    // - Row 1 can attend to positions 0,1
+    // - Row 2 can attend to positions 0,1,2
+    // - Row 3 can attend to positions 0,1,2,3
+    fa2_prefill_process_kv_tile<Q16_1Block_64>(
+        Q.data(), K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        0, Br, Bc,
+        head_dim, blocks_per_row,
+        blocks_per_row, blocks_per_row, head_dim,
+        alpha, true, 0); // causal=true, q_offset=0
+
+    // Verify causal masking affected the counts
+    EXPECT_EQ(state.count[0], 1) << "Row 0 should attend to only position 0";
+    EXPECT_EQ(state.count[1], 2) << "Row 1 should attend to positions 0,1";
+    EXPECT_EQ(state.count[2], 3) << "Row 2 should attend to positions 0,1,2";
+    EXPECT_EQ(state.count[3], 4) << "Row 3 should attend to positions 0,1,2,3";
+}
+
+/**
+ * @brief Test FA2 prefill with multiple KV tiles (online softmax rescaling)
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2_PrefillTile_MultiKVTile_Rescale)
+{
+    constexpr int Br = 2;
+    constexpr int Bc = 4;
+    constexpr int head_dim = 64;
+    constexpr int blocks_per_row = 1;
+    constexpr int kv_len = 8; // Two tiles of Bc=4
+    constexpr float alpha = 1.0f / std::sqrt(64.0f);
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int16_t> dist(-100, 100);
+
+    // Create Q tile [Br, head_dim]
+    std::vector<Q16_1Block_64> Q(Br);
+    for (int r = 0; r < Br; ++r)
+    {
+        Q[r].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            Q[r].qs[i] = dist(rng);
+        }
+    }
+
+    // Create full K, V [kv_len, head_dim]
+    std::vector<Q16_1Block_64> K(kv_len);
+    std::vector<Q16_1Block_64> V(kv_len);
+    for (int k = 0; k < kv_len; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+    OnlineSoftmaxStateBatch state;
+    state.init(Br);
+
+    std::vector<int32_t> scores_scratch(Br * Bc);
+    std::vector<int32_t> weights_scratch(Br * Bc);
+
+    // Process first KV tile [0, Bc)
+    fa2_prefill_process_kv_tile<Q16_1Block_64>(
+        Q.data(), K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        0, Br, Bc,
+        head_dim, blocks_per_row,
+        blocks_per_row, blocks_per_row, head_dim,
+        alpha, false, 0);
+
+    int32_t m0_after_tile1[Br];
+    int64_t l0_after_tile1[Br];
+    for (int r = 0; r < Br; ++r)
+    {
+        m0_after_tile1[r] = state.m[r];
+        l0_after_tile1[r] = state.l[r];
+    }
+
+    // Process second KV tile [Bc, 2*Bc)
+    fa2_prefill_process_kv_tile<Q16_1Block_64>(
+        Q.data(), K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        Bc, Br, Bc, // kv_tile_start = Bc
+        head_dim, blocks_per_row,
+        blocks_per_row, blocks_per_row, head_dim,
+        alpha, false, 0);
+
+    // Verify all positions processed
+    for (int r = 0; r < Br; ++r)
+    {
+        EXPECT_EQ(state.count[r], kv_len) << "Row " << r << " should process all KV positions";
+        // l should increase after second tile
+        EXPECT_GE(state.l[r], l0_after_tile1[r]) << "Row " << r << " sum should not decrease";
+    }
+}
+
+/**
+ * @brief Test FA2 prefill with Block128
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2_PrefillTile_Block128)
+{
+    constexpr int Br = 4;
+    constexpr int Bc = 16;
+    constexpr int head_dim = 128;
+    constexpr int blocks_per_row = 1;
+    constexpr float alpha = 1.0f / std::sqrt(128.0f);
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int16_t> dist(-100, 100);
+
+    std::vector<Q16_1Block_128> Q(Br);
+    for (int r = 0; r < Br; ++r)
+    {
+        Q[r].d = 1.0f;
+        for (int i = 0; i < 128; ++i)
+        {
+            Q[r].qs[i] = dist(rng);
+        }
+    }
+
+    std::vector<Q16_1Block_128> K(Bc);
+    std::vector<Q16_1Block_128> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 128; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+    OnlineSoftmaxStateBatch state;
+    state.init(Br);
+
+    std::vector<int32_t> scores_scratch(Br * Bc);
+    std::vector<int32_t> weights_scratch(Br * Bc);
+
+    fa2_prefill_process_kv_tile<Q16_1Block_128>(
+        Q.data(), K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        0, Br, Bc,
+        head_dim, blocks_per_row,
+        blocks_per_row, blocks_per_row, head_dim,
+        alpha, false, 0);
+
+    for (int r = 0; r < Br; ++r)
+    {
+        EXPECT_EQ(state.count[r], Bc);
+        EXPECT_GT(state.l[r], 0);
+    }
+
+    bool has_nonzero = false;
+    for (int i = 0; i < Br * head_dim; ++i)
+    {
+        if (context[i] != 0)
+            has_nonzero = true;
+    }
+    EXPECT_TRUE(has_nonzero);
+}
+
+// ============================================================================
+// FA2 Cache-Aware Tile Configuration Tests
+// ============================================================================
+
+/**
+ * @brief Test that compute_fa2_tile_config returns reasonable tile sizes
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2TileConfig_SanityCheck)
+{
+    // Test various head dimensions
+    for (int head_dim : {64, 96, 128, 256})
+    {
+        auto cfg = compute_fa2_tile_config(head_dim);
+
+        // Basic sanity checks
+        EXPECT_GE(cfg.Br, 2) << "Br should be at least 2 for head_dim=" << head_dim;
+        EXPECT_LE(cfg.Br, 8) << "Br should be at most 8 for head_dim=" << head_dim;
+        EXPECT_GE(cfg.Bc, 8) << "Bc should be at least 8 for head_dim=" << head_dim;
+        EXPECT_LE(cfg.Bc, 128) << "Bc should be at most 128 for head_dim=" << head_dim;
+        EXPECT_EQ(cfg.head_dim, head_dim);
+
+        // Bc should be multiple of 8 for SIMD alignment
+        EXPECT_EQ(cfg.Bc % 8, 0) << "Bc should be multiple of 8 for head_dim=" << head_dim;
+    }
+}
+
+/**
+ * @brief Test that tile sizes respect L1 cache constraints
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2TileConfig_L1CacheConstraint)
+{
+    // Get actual cache info
+    const auto &cache = cache_info();
+
+    // Skip test if cache detection failed (returns conservative defaults)
+    if (cache.l1_size == 0)
+    {
+        GTEST_SKIP() << "Cache detection not available";
+    }
+
+    for (int head_dim : {64, 128})
+    {
+        auto cfg = compute_fa2_tile_config(head_dim);
+
+        // Scratch buffers should fit in 50% of L1
+        size_t scratch_bytes = cfg.scratch_bytes();
+        size_t l1_target = cache.l1_size / 2;
+
+        EXPECT_LE(scratch_bytes, l1_target)
+            << "Scratch buffers (" << scratch_bytes << " bytes) should fit in 50% of L1 ("
+            << l1_target << " bytes) for head_dim=" << head_dim;
+    }
+}
+
+/**
+ * @brief Test default tile config returns reasonable defaults
+ *
+ * Note: FA2_TILE_BR (8) is the maximum array size, not the default Br value.
+ * default_fa2_tile_config() returns conservative defaults (Br=4, Bc=32).
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2TileConfig_DefaultsAreReasonable)
+{
+    auto cfg = default_fa2_tile_config(128);
+
+    // Default values should be conservative
+    EXPECT_EQ(cfg.Br, 4) << "Default Br should be 4 (conservative)";
+    EXPECT_EQ(cfg.Bc, 32) << "Default Bc should match FA2_TILE_BC";
+    EXPECT_EQ(cfg.head_dim, 128);
+
+    // Default Br must fit within the array bounds
+    EXPECT_LE(cfg.Br, FA2_TILE_BR) << "Default Br must not exceed FA2_TILE_BR array size";
+}
+
+/**
+ * @brief Test KV length-based tuning
+ */
+TEST_F(Test__Q16OnlineSoftmax, FA2TileConfig_KVLengthTuning)
+{
+    const int head_dim = 128;
+
+    // Short KV sequence should use smaller Bc
+    auto cfg_short = compute_fa2_tile_config(head_dim, 32);
+    EXPECT_LE(cfg_short.Bc, 16) << "Short KV should use small tiles";
+
+    // Long KV sequence should use larger Bc (or at least not smaller)
+    auto cfg_long = compute_fa2_tile_config(head_dim, 2048);
+    EXPECT_GE(cfg_long.Bc, 32) << "Long KV should use larger tiles";
+}
+
+/**
+ * @brief Test FlashDecode block size computation
+ */
+TEST_F(Test__Q16OnlineSoftmax, FlashDecodeBlockSize_SanityCheck)
+{
+    for (int head_dim : {64, 128, 256})
+    {
+        int block_size = compute_flash_decode_kv_block_size(head_dim);
+
+        // Basic sanity checks
+        EXPECT_GE(block_size, 16) << "Block size should be at least 16";
+        EXPECT_LE(block_size, 128) << "Block size should be at most 128";
+        EXPECT_EQ(block_size % 8, 0) << "Block size should be multiple of 8";
+
+        // Default constant should be valid
+        EXPECT_EQ(FLASH_DECODE_KV_BLOCK_SIZE, 32);
+    }
+}
+// ============================================================================
+// Regression Tests for Fixed Bugs
+// ============================================================================
+
+/**
+ * @brief REGRESSION: FA2_TILE_BR must be >= max Br from compute_fa2_tile_config()
+ *
+ * Bug discovered 2025-12-31: OnlineSoftmaxStateBatch had arrays sized for
+ * FA2_TILE_BR=4, but compute_fa2_tile_config() could return Br=8. This caused
+ * buffer overflow corrupting lut_value_bits (30→69), producing ±inf outputs.
+ *
+ * Fix: Changed FA2_TILE_BR from 4 to 8 in OnlineSoftmax.h
+ */
+TEST_F(Test__Q16OnlineSoftmax, Regression_FA2TileBr_ArraySizeMatchesMaxConfig)
+{
+    // Test all possible head_dim and kv_len combinations to find max Br
+    int max_br_seen = 0;
+
+    for (int head_dim : {64, 96, 128, 192, 256})
+    {
+        for (int kv_len : {0, 32, 64, 128, 256, 512, 1024, 2048, 4096})
+        {
+            auto cfg = compute_fa2_tile_config(head_dim, kv_len);
+            max_br_seen = std::max(max_br_seen, cfg.Br);
+
+            // Critical: Br must never exceed FA2_TILE_BR (array size)
+            EXPECT_LE(cfg.Br, FA2_TILE_BR)
+                << "compute_fa2_tile_config(head_dim=" << head_dim << ", kv_len=" << kv_len
+                << ") returned Br=" << cfg.Br << " which exceeds FA2_TILE_BR=" << FA2_TILE_BR
+                << ". This would cause buffer overflow in OnlineSoftmaxStateBatch!";
+        }
+    }
+
+    // Also verify that FA2_TILE_BR is set to the documented maximum (8)
+    EXPECT_EQ(FA2_TILE_BR, 8) << "FA2_TILE_BR should be 8 to match compute_fa2_tile_config max";
+    EXPECT_LE(max_br_seen, FA2_TILE_BR) << "Max Br seen across all configs exceeds array size";
+}
+
+/**
+ * @brief REGRESSION: OnlineSoftmaxStateBatch state is not corrupted after init
+ *
+ * Verifies that the state struct maintains its integrity after initialization,
+ * specifically checking that lut_value_bits remains correct (was corrupted to 69).
+ */
+TEST_F(Test__Q16OnlineSoftmax, Regression_BatchStateIntegrity_AfterInit)
+{
+    // Test with max Br to stress the array boundaries
+    OnlineSoftmaxStateBatch state;
+    state.init(FA2_TILE_BR); // Use maximum Br
+
+    // Verify initial state is correct
+    EXPECT_EQ(state.lut_value_bits, 30) << "lut_value_bits should be 30 after init";
+    EXPECT_EQ(state.frac_bits, 11) << "frac_bits should be 11 after init";
+    EXPECT_EQ(state.num_rows, FA2_TILE_BR) << "num_rows should match init parameter";
+
+    // Verify all array elements are properly initialized
+    for (int r = 0; r < FA2_TILE_BR; ++r)
+    {
+        EXPECT_EQ(state.m[r], std::numeric_limits<int32_t>::min())
+            << "m[" << r << "] should be INT32_MIN after init";
+        EXPECT_EQ(state.l[r], 0) << "l[" << r << "] should be 0 after init";
+        EXPECT_EQ(state.count[r], 0) << "count[" << r << "] should be 0 after init";
+        EXPECT_TRUE(state.empty(r)) << "Row " << r << " should be empty after init";
+    }
+
+    // Write to all array positions to verify no overflow
+    for (int r = 0; r < FA2_TILE_BR; ++r)
+    {
+        state.m[r] = 1000 + r;
+        state.l[r] = 2000 + r;
+        state.count[r] = r + 1;
+    }
+
+    // Verify config fields were NOT corrupted by array writes
+    EXPECT_EQ(state.lut_value_bits, 30)
+        << "lut_value_bits corrupted after writing to arrays (was the original bug!)";
+    EXPECT_EQ(state.frac_bits, 11) << "frac_bits corrupted after writing to arrays";
+    EXPECT_EQ(state.num_rows, FA2_TILE_BR) << "num_rows corrupted after writing to arrays";
+}

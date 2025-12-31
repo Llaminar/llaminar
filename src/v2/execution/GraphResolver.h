@@ -147,6 +147,14 @@ namespace llaminar2
         float rms_norm_eps = 1e-6f;
         float rope_theta = 10000.0f;
 
+        // =================================================================
+        // Q16 KV Cache VNNI Safety (Phase 5.4)
+        // =================================================================
+
+        /// Fixed scale for Q16 KV cache quantization (FP32 range: ±kv_cache_scale).
+        /// Used by KVCacheAppendStage for VNNI-safe quantization.
+        float kv_cache_scale = 8.0f;
+
         // TP-adjusted dimensions
         int local_n_heads = 0;    ///< Heads on this rank
         int local_n_kv_heads = 0; ///< KV heads on this rank

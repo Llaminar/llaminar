@@ -11,6 +11,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../tensors/UnifiedKVCache.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../kernels/cpu/attention/q16_1/VNNISafetyConstants.h"
 
 #include <immintrin.h>
 
@@ -248,159 +249,224 @@ namespace llaminar2
             return true;
         }
 
-        // Q16_1 cache conversion path - handles HybridQ16 mode where:
-        // - K_rope is Q16_1 (from RoPE Q8_1→Q16_1 conversion)
-        // - V is Q8_1 (from GEMM output)
-        // - KV cache is Q16_1
+        // =================================================================
+        // Q16_1 cache path with VNNI-safe fixed-scale quantization
+        // =================================================================
+        // For Q16_1 cache, we MUST use fixed-scale quantization with VNNI-safe
+        // clipping to prevent INT32 overflow during VNNI dot-product accumulation.
+        //
+        // See: VNNISafetyConstants.h for MAX_SAFE_INT16 limits per head_dim
+        // See: PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
+        // =================================================================
+
         bool cache_is_q16_1 = (params_.kv_cache->precision() == ActivationPrecision::Q16_1);
-        bool k_is_q16_1 = (params_.K->native_type() == TensorType::Q16_1);
-        bool v_is_q8_1 = (params_.V->native_type() == TensorType::Q8_1);
 
-        if (cache_is_q16_1 && k_is_q16_1 && v_is_q8_1)
+        if (cache_is_q16_1)
         {
-            LOG_DEBUG("[KVCacheAppendStage] HybridQ16 mode: K is Q16_1, converting V from Q8_1 to Q16_1"
-                      << " (tokens=" << total_tokens << ")");
-
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+            const float kv_cache_scale = params_.kv_cache_scale;
+            const int head_dim = params_.head_dim;
 
-            // K is already Q16_1 - can pass directly
-            // V needs Q8_1 → Q16_1 conversion
-            auto v_q16_slice = std::make_unique<Q16_1Tensor>(
-                std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+            // Get VNNI-safe clipping limit
+            const int16_t max_safe_int16 = vnni_safety::get_max_safe_int16(head_dim);
 
-            const auto *v_q8 = dynamic_cast<const Q8_1Tensor *>(params_.V);
-            if (!v_q8)
+            LOG_DEBUG("[KVCacheAppendStage] Q16_1 cache with VNNI-safe fixed-scale quantization"
+                      << " (scale=" << kv_cache_scale
+                      << ", head_dim=" << head_dim
+                      << ", max_safe_int16=" << max_safe_int16
+                      << ", tokens=" << total_tokens << ")");
+
+            // Determine input types
+            bool k_is_q16_1 = (params_.K->native_type() == TensorType::Q16_1);
+            bool k_is_fp32 = (params_.K->native_type() == TensorType::FP32);
+            bool v_is_q8_1 = (params_.V->native_type() == TensorType::Q8_1);
+            bool v_is_fp32 = (params_.V->native_type() == TensorType::FP32);
+
+            // -----------------------------------------------------------------
+            // Handle K tensor conversion/passthrough
+            // -----------------------------------------------------------------
+            std::unique_ptr<Q16_1Tensor> k_q16_owned;
+            const TensorBase *k_for_cache = nullptr;
+
+            if (k_is_q16_1)
             {
-                LOG_ERROR("[KVCacheAppendStage] Expected Q8_1 V tensor but got " << params_.V->dtype_name());
-                return false;
+                // K is already Q16_1 - pass through directly
+                // Assumption: K was quantized with the same fixed scale (e.g., from RoPE stage)
+                k_for_cache = params_.K;
+                LOG_TRACE("[KVCacheAppendStage] K is already Q16_1, passing through");
             }
-
-            // Convert Q8_1 V to Q16_1 with SIMD acceleration
-            // Q16_1 has 256× finer precision (±32767 vs ±127)
-            constexpr size_t block_size = 32; // Q8_1 and Q16_1 both use 32-element blocks
-            const size_t blocks_per_row = (kv_dim + block_size - 1) / block_size;
-            const Q8_1Block *v_q8_data = v_q8->typed_data();
-            Q16_1Block *v_q16_data = v_q16_slice->mutable_typed_data();
-
-            // Debug: Log Q8_1 V scale before conversion
-            if (params_.layer_idx == 0)
+            else if (k_is_fp32)
             {
-                LOG_DEBUG("[KVCacheAppendStage] Layer 0 V Q8_1 scale: d=" << simd::fp16_to_fp32(v_q8_data[0].d)
-                                                                          << " qs[0]=" << static_cast<int>(v_q8_data[0].qs[0]));
-            }
+                // K is FP32 - quantize to Q16_1 with fixed scale and VNNI clipping
+                k_q16_owned = std::make_unique<Q16_1Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
 
-            // Parallel conversion using OMP_WORKSHARE_REGION
-            auto do_conversion = [&]()
-            {
-#pragma omp for schedule(static)
-                for (int t = 0; t < total_tokens; ++t)
+                const float *k_fp32 = params_.K->fp32_data();
+                if (!k_fp32)
                 {
-                    const Q8_1Block *src_blocks = v_q8_data + t * blocks_per_row;
-                    Q16_1Block *dst_blocks = v_q16_data + t * blocks_per_row;
+                    LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for K tensor");
+                    return false;
+                }
 
-                    for (size_t b = 0; b < blocks_per_row; ++b)
+                // Use fixed-scale quantization with VNNI-safe clipping
+                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale, head_dim))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale K quantization failed");
+                    return false;
+                }
+
+                k_for_cache = k_q16_owned.get();
+                LOG_TRACE("[KVCacheAppendStage] Quantized K from FP32 to Q16_1 with fixed scale");
+            }
+            else
+            {
+                // K is some other format (Q8_1, etc.) - dequant to FP32 first
+                k_q16_owned = std::make_unique<Q16_1Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+
+                const float *k_fp32 = params_.K->fp32_data();
+                if (!k_fp32)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Cannot dequantize K to FP32");
+                    return false;
+                }
+
+                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale, head_dim))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale K quantization failed");
+                    return false;
+                }
+
+                k_for_cache = k_q16_owned.get();
+                LOG_TRACE("[KVCacheAppendStage] Converted K from " << params_.K->dtype_name()
+                                                                   << " to Q16_1 via FP32 with fixed scale");
+            }
+
+            // -----------------------------------------------------------------
+            // Handle V tensor conversion
+            // -----------------------------------------------------------------
+            std::unique_ptr<Q16_1Tensor> v_q16_owned;
+            const TensorBase *v_for_cache = nullptr;
+
+            if (v_is_fp32)
+            {
+                // V is FP32 - quantize to Q16_1 with fixed scale and VNNI clipping
+                v_q16_owned = std::make_unique<Q16_1Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+
+                const float *v_fp32 = params_.V->fp32_data();
+                if (!v_fp32)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for V tensor");
+                    return false;
+                }
+
+                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale, head_dim))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
+                    return false;
+                }
+
+                v_for_cache = v_q16_owned.get();
+                LOG_TRACE("[KVCacheAppendStage] Quantized V from FP32 to Q16_1 with fixed scale");
+            }
+            else if (v_is_q8_1)
+            {
+                // V is Q8_1 - dequant to FP32, then requant to Q16_1 with fixed scale
+                // NOTE: This is different from the old path which did direct int8→int16 scaling!
+                // The old path (×256) was NOT VNNI-safe because it produced values close to ±32767.
+                v_q16_owned = std::make_unique<Q16_1Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+
+                const auto *v_q8 = dynamic_cast<const Q8_1Tensor *>(params_.V);
+                if (!v_q8)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Failed to cast V to Q8_1Tensor");
+                    return false;
+                }
+
+                // Allocate temporary FP32 buffer for dequantization
+                std::vector<float> v_fp32_temp(total_tokens * kv_dim);
+
+                // Dequantize Q8_1 → FP32 (row by row for small token counts, batch for large)
+                constexpr int SMALL_TOKEN_THRESHOLD = 32;
+                if (total_tokens <= SMALL_TOKEN_THRESHOLD)
+                {
+                    for (int t = 0; t < total_tokens; ++t)
                     {
-                        const Q8_1Block &src = src_blocks[b];
-                        Q16_1Block &dst = dst_blocks[b];
-
-                        // Q8_1 scale is FP16, Q16_1 scale is FP32
-                        // Scale up int8→int16 by 256, divide scale by 256 to preserve value
-                        dst.d = simd::fp16_to_fp32(src.d) / 256.0f;
-
-#if defined(__AVX512F__)
-                        // AVX512: Process all 32 int8 values → 32 int16 values
-                        // Load 32 int8 values (256 bits)
-                        __m256i i8_vec = _mm256_loadu_si256(
-                            reinterpret_cast<const __m256i *>(src.qs));
-                        // Sign-extend lower 16 int8 → int16
-                        __m256i lo_16 = _mm256_cvtepi8_epi16(
-                            _mm256_castsi256_si128(i8_vec));
-                        // Sign-extend upper 16 int8 → int16
-                        __m256i hi_16 = _mm256_cvtepi8_epi16(
-                            _mm256_extracti128_si256(i8_vec, 1));
-                        // Multiply by 256 (left shift by 8)
-                        __m256i lo_scaled = _mm256_slli_epi16(lo_16, 8);
-                        __m256i hi_scaled = _mm256_slli_epi16(hi_16, 8);
-                        // Store 32 int16 values
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), lo_scaled);
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs + 16), hi_scaled);
-
-                        // Compute sum_qs (sum of all 32 int16 values)
-                        // Horizontal add within each lane
-                        __m256i sum_lo = _mm256_madd_epi16(lo_scaled, _mm256_set1_epi16(1));
-                        __m256i sum_hi = _mm256_madd_epi16(hi_scaled, _mm256_set1_epi16(1));
-                        __m256i sum_all = _mm256_add_epi32(sum_lo, sum_hi);
-                        // Reduce to single int32
-                        __m128i sum128 = _mm_add_epi32(
-                            _mm256_castsi256_si128(sum_all),
-                            _mm256_extracti128_si256(sum_all, 1));
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        dst.sum_qs = _mm_cvtsi128_si32(sum128);
-
-#elif defined(__AVX2__)
-                        // AVX2: Process 32 int8 values in two halves
-                        __m128i i8_lo = _mm_loadu_si128(
-                            reinterpret_cast<const __m128i *>(src.qs));
-                        __m128i i8_hi = _mm_loadu_si128(
-                            reinterpret_cast<const __m128i *>(src.qs + 16));
-                        // Sign-extend int8 → int16
-                        __m256i i16_lo = _mm256_cvtepi8_epi16(i8_lo);
-                        __m256i i16_hi = _mm256_cvtepi8_epi16(i8_hi);
-                        // Multiply by 256 (left shift by 8)
-                        __m256i scaled_lo = _mm256_slli_epi16(i16_lo, 8);
-                        __m256i scaled_hi = _mm256_slli_epi16(i16_hi, 8);
-                        // Store
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), scaled_lo);
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs + 16), scaled_hi);
-
-                        // Compute sum_qs
-                        __m256i sum_lo = _mm256_madd_epi16(scaled_lo, _mm256_set1_epi16(1));
-                        __m256i sum_hi = _mm256_madd_epi16(scaled_hi, _mm256_set1_epi16(1));
-                        __m256i sum_all = _mm256_add_epi32(sum_lo, sum_hi);
-                        __m128i sum128 = _mm_add_epi32(
-                            _mm256_castsi256_si128(sum_all),
-                            _mm256_extracti128_si256(sum_all, 1));
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        dst.sum_qs = _mm_cvtsi128_si32(sum128);
-#else
-                        // Scalar fallback
-                        int32_t sum = 0;
-                        for (size_t i = 0; i < block_size; ++i)
-                        {
-                            int16_t scaled = static_cast<int16_t>(src.qs[i]) * 256;
-                            dst.qs[i] = scaled;
-                            sum += scaled;
-                        }
-                        dst.sum_qs = sum;
-#endif
+                        v_q8->to_fp32_row(t, v_fp32_temp.data() + t * kv_dim);
                     }
                 }
-            };
-            OMP_WORKSHARE_REGION(do_conversion);
+                else
+                {
+                    // Use fp32_data() for larger token counts
+                    const float *v_fp32 = v_q8->fp32_data();
+                    if (!v_fp32)
+                    {
+                        LOG_ERROR("[KVCacheAppendStage] Cannot dequantize V from Q8_1");
+                        return false;
+                    }
+                    std::memcpy(v_fp32_temp.data(), v_fp32, total_tokens * kv_dim * sizeof(float));
+                }
+
+                // Requantize with fixed scale and VNNI-safe clipping
+                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32_temp.data(), kv_cache_scale, head_dim))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
+                    return false;
+                }
+
+                v_for_cache = v_q16_owned.get();
+                LOG_TRACE("[KVCacheAppendStage] Converted V from Q8_1 to Q16_1 via FP32 with fixed scale"
+                          << " (VNNI-safe, max_int16=" << max_safe_int16 << ")");
+            }
+            else
+            {
+                // V is some other format - try to dequant via fp32_data()
+                v_q16_owned = std::make_unique<Q16_1Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim});
+
+                const float *v_fp32 = params_.V->fp32_data();
+                if (!v_fp32)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Cannot convert V (" << params_.V->dtype_name()
+                                                                        << ") to Q16_1");
+                    return false;
+                }
+
+                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale, head_dim))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
+                    return false;
+                }
+
+                v_for_cache = v_q16_owned.get();
+                LOG_TRACE("[KVCacheAppendStage] Converted V from " << params_.V->dtype_name()
+                                                                   << " to Q16_1 via FP32 with fixed scale");
+            }
 
             // Also populate V_dequant_out if requested (for decomposed attention path)
-            if (params_.V_dequant_out)
+            if (params_.V_dequant_out && v_q16_owned)
             {
                 auto *v_dequant_q16 = dynamic_cast<Q16_1Tensor *>(params_.V_dequant_out);
                 if (v_dequant_q16 && v_dequant_q16->mutable_typed_data())
                 {
-                    // Copy Q16_1 data to V_dequant_out
+                    constexpr size_t block_size = Q16_1Block::BLOCK_SIZE;
+                    const size_t blocks_per_row = (kv_dim + block_size - 1) / block_size;
                     std::memcpy(v_dequant_q16->mutable_typed_data(),
-                                v_q16_slice->typed_data(),
+                                v_q16_owned->typed_data(),
                                 total_tokens * blocks_per_row * sizeof(Q16_1Block));
-                    LOG_DEBUG("[KVCacheAppendStage] Populated V_dequant_out with Q16_1 values");
+                    LOG_DEBUG("[KVCacheAppendStage] Populated V_dequant_out with VNNI-safe Q16_1 values");
                 }
             }
 
             bool success = params_.kv_cache->append_kv(
                 params_.layer_idx, params_.seq_idx,
-                params_.K, v_q16_slice.get(), total_tokens);
+                k_for_cache, v_for_cache, total_tokens);
 
             if (!success)
             {
-                LOG_ERROR("[KVCacheAppendStage] append_kv failed (HybridQ16 conversion)");
+                LOG_ERROR("[KVCacheAppendStage] append_kv failed (Q16_1 cache)");
                 return false;
             }
 

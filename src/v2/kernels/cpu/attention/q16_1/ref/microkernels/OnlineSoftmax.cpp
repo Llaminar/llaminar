@@ -379,4 +379,181 @@ namespace llaminar2::kernels::q16_1::microkernels
         int32_t *, OnlineSoftmaxState &, int32_t *, int32_t *,
         int, int, int, int, float);
 
+    // ============================================================================
+    // FA2 Prefill Tile Processing
+    // ============================================================================
+
+    template <typename BlockType>
+    void fa2_prefill_process_kv_tile(
+        const BlockType *Q,
+        const BlockType *K,
+        const BlockType *V,
+        int32_t *context,
+        OnlineSoftmaxStateBatch &state,
+        int32_t *scores_scratch,
+        int32_t *weights_scratch,
+        int kv_tile_start,
+        int Br,
+        int Bc,
+        int head_dim,
+        int blocks_per_row,
+        int q_stride,
+        int k_stride,
+        int context_stride,
+        float alpha,
+        bool causal,
+        int q_offset)
+    {
+        constexpr int BLOCK_SIZE = BlockType::BLOCK_SIZE;
+
+        // Step 1: Compute Q×K^T scores for this tile [Br × Bc]
+        // Use the tiled GEMM microkernel
+        q16_qk_gemm_tile<BlockType>(
+            Q, K + kv_tile_start * k_stride,
+            scores_scratch,
+            Br, Bc, head_dim, blocks_per_row,
+            q_stride, k_stride);
+
+        // Step 2: Apply causal mask if needed
+        if (causal)
+        {
+            for (int r = 0; r < Br; ++r)
+            {
+                int q_pos = q_offset + r;
+                for (int c = 0; c < Bc; ++c)
+                {
+                    int k_pos = kv_tile_start + c;
+                    // Mask out future positions (k > q)
+                    if (k_pos > q_pos)
+                    {
+                        scores_scratch[r * Bc + c] = MASKED;
+                    }
+                }
+            }
+        }
+
+        // Step 3: Per-row online softmax update
+        // Process each query row independently
+        for (int r = 0; r < Br; ++r)
+        {
+            int32_t *row_scores = scores_scratch + r * Bc;
+            int32_t *row_weights = weights_scratch + r * Bc;
+
+            // Find max in this row's scores
+            int32_t row_max = MASKED;
+            for (int c = 0; c < Bc; ++c)
+            {
+                if (row_scores[c] != MASKED && row_scores[c] > row_max)
+                {
+                    row_max = row_scores[c];
+                }
+            }
+
+            // Skip if all masked
+            if (row_max == MASKED)
+            {
+                std::memset(row_weights, 0, Bc * sizeof(int32_t));
+                continue;
+            }
+
+            // Check if we need to rescale
+            bool needs_rescale = false;
+            int32_t m_old = state.m[r];
+            int32_t m_new = state.m[r];
+
+            if (state.empty(r) || row_max > state.m[r])
+            {
+                m_new = row_max;
+                needs_rescale = !state.empty(r);
+            }
+
+            // Compute rescale factors if needed
+            int32_t scale_num = 1 << state.lut_value_bits;
+            int scale_shift = state.lut_value_bits;
+
+            if (needs_rescale)
+            {
+                online_softmax_compute_rescale(
+                    m_old, m_new, alpha,
+                    scale_num, scale_shift,
+                    state.frac_bits, state.lut_value_bits);
+
+                // Rescale running sum l
+                int64_t scaled_l = (static_cast<int64_t>(state.l[r]) * scale_num) >> scale_shift;
+                state.l[r] = scaled_l;
+
+                // Rescale existing context for this row
+                int32_t *row_context = context + r * context_stride;
+                q16_context_rescale(row_context, head_dim, scale_num, scale_shift);
+            }
+
+            // Compute weights for this row
+            int64_t row_sum = online_softmax_compute_block_weights(
+                row_scores, row_weights, Bc,
+                m_new, alpha,
+                state.frac_bits, state.lut_value_bits);
+
+            // Update state for this row
+            state.m[r] = m_new;
+            state.l[r] += row_sum;
+
+            // Count unmasked positions
+            for (int c = 0; c < Bc; ++c)
+            {
+                if (row_scores[c] != MASKED)
+                {
+                    ++state.count[r];
+                }
+            }
+
+            // Step 4: Accumulate P×V for this row
+            // Accumulate: context[r, :] += Σ_k weights[r, k] × V[k, :]
+            int32_t *row_context = context + r * context_stride;
+            const BlockType *V_tile = V + kv_tile_start * k_stride;
+
+            for (int k = 0; k < Bc; ++k)
+            {
+                if (row_weights[k] == 0)
+                    continue;
+
+                // Scale weight from LUT precision to usable range
+                int32_t w_scaled = row_weights[k] >> (state.lut_value_bits - 15);
+                if (w_scaled == 0 && row_weights[k] > 0)
+                {
+                    w_scaled = 1;
+                }
+
+                const BlockType *V_row = V_tile + k * k_stride;
+
+                // Accumulate w * V[k] into context
+                for (int b = 0; b < blocks_per_row; ++b)
+                {
+                    const int16_t *v_data = V_row[b].qs;
+                    int start = b * BLOCK_SIZE;
+                    int end = std::min(start + BLOCK_SIZE, head_dim);
+                    int count = end - start;
+
+                    for (int i = 0; i < count; ++i)
+                    {
+                        row_context[start + i] += w_scaled * static_cast<int32_t>(v_data[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    // ============================================================================
+    // FA2 Prefill Template Instantiations
+    // ============================================================================
+
+    template void fa2_prefill_process_kv_tile<Q16_1Block_64>(
+        const Q16_1Block_64 *, const Q16_1Block_64 *, const Q16_1Block_64 *,
+        int32_t *, OnlineSoftmaxStateBatch &, int32_t *, int32_t *,
+        int, int, int, int, int, int, int, int, float, bool, int);
+
+    template void fa2_prefill_process_kv_tile<Q16_1Block_128>(
+        const Q16_1Block_128 *, const Q16_1Block_128 *, const Q16_1Block_128 *,
+        int32_t *, OnlineSoftmaxStateBatch &, int32_t *, int32_t *,
+        int, int, int, int, int, int, int, int, float, bool, int);
+
 } // namespace llaminar2::kernels::q16_1::microkernels

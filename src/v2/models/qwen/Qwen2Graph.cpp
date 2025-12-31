@@ -414,6 +414,9 @@ namespace llaminar2
         config.rms_norm_eps = config_.rms_norm_eps;
         config.rope_theta = config_.rope_theta;
 
+        // Phase 5.4: VNNI-safe Q16 KV cache scale
+        config.kv_cache_scale = config_.kv_cache_scale;
+
         // KV cache state
         config.has_kv_cache = (input.kv_cache != nullptr);
         if (config.has_kv_cache)
@@ -873,6 +876,10 @@ namespace llaminar2
                 kv_append_params.num_tokens = total_tokens;
                 kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
                 kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
+
+                // Phase 5.4: VNNI-safe Q16 KV cache quantization parameters
+                kv_append_params.kv_cache_scale = config_.kv_cache_scale;
+                kv_append_params.head_dim = config_.head_dim;
 
                 // Hybrid mode: populate V_dequant during KV cache append (V→FP32 conversion)
                 // This avoids a separate dequantization pass since KVCacheAppend already converts V
@@ -1492,6 +1499,9 @@ namespace llaminar2
         config.vocab_size = config_.vocab_size;
         config.rms_norm_eps = config_.rms_norm_eps;
         config.rope_theta = config_.rope_theta;
+
+        // Phase 5.4: VNNI-safe Q16 KV cache scale
+        config.kv_cache_scale = config_.kv_cache_scale;
 
         // TP-adjusted local dimensions
         // Use local head counts when QKV is column-parallel

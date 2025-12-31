@@ -59,6 +59,7 @@ namespace llaminar2
         bool executeBF16(IDeviceContext *ctx, size_t num_elements);
         bool executeFP16(IDeviceContext *ctx, size_t num_elements);
         bool executeQ8_1(IDeviceContext *ctx, size_t num_elements);
+        bool executeQ16_1(IDeviceContext *ctx, size_t num_elements); // Phase 6: Full integer residual
 
         // Mixed-type implementations for hybrid precision modes
         bool executeFP32_Q8_1_to_Q8_1(IDeviceContext *ctx, size_t num_elements);

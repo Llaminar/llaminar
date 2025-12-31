@@ -129,6 +129,12 @@ namespace llaminar2
         graph_config.fused_attention_backend = effective_backend;
         LOG_DEBUG("[InferenceRunner] Fused attention backend: " << fusedAttentionBackendToString(effective_backend));
 
+        // Propagate kv_cache_scale for Q16_1 KV cache quantization
+        // This fixed scale determines the FP32 range that maps to INT16 [-32767, +32767]
+        graph_config.kv_cache_scale = config.kv_cache_scale;
+        LOG_DEBUG("[InferenceRunner] KV cache scale: " << config.kv_cache_scale
+                                                       << " (±" << config.kv_cache_scale << " FP32 range)");
+
         // Try to get d_ff from metadata (intermediate_size)
         if (model.hasMetadata("llama.feed_forward_length"))
         {

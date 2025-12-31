@@ -699,3 +699,132 @@ TEST_F(Test__Q16WoProjection, FP32Accuracy_NormalizationPreservation)
     // Normalization should preserve values very accurately (just scaling)
     EXPECT_LT(mean_error, 0.01) << "Normalization introduces too much error";
 }
+
+// ============================================================================
+// Cache-Aware Wo Tile Configuration Tests
+// ============================================================================
+
+/**
+ * @brief Test that compute_wo_tile_config returns reasonable tile sizes
+ */
+TEST_F(Test__Q16WoProjection, WoTileConfig_SanityCheck)
+{
+    // Test Qwen-0.5B dimensions: d_model=896, input_dim=896
+    {
+        auto cfg = compute_wo_tile_config(896, 896, 1);
+        EXPECT_GE(cfg.M_tile, 16) << "M_tile should be at least 16";
+        EXPECT_LE(cfg.M_tile, 256) << "M_tile should be at most 256";
+        EXPECT_GE(cfg.K_tile, 32) << "K_tile should be at least 32";
+        EXPECT_LE(cfg.K_tile, 512) << "K_tile should be at most 512";
+        EXPECT_EQ(cfg.N_tile, 1) << "N_tile should be 1 for decode";
+        EXPECT_EQ(cfg.M_tile % 16, 0) << "M_tile should be multiple of 16";
+        EXPECT_EQ(cfg.K_tile % 32, 0) << "K_tile should be multiple of 32";
+    }
+
+    // Test Qwen-7B dimensions: d_model=3584, input_dim=3584
+    {
+        auto cfg = compute_wo_tile_config(3584, 3584, 1);
+        EXPECT_GE(cfg.M_tile, 16);
+        EXPECT_GE(cfg.K_tile, 32);
+        EXPECT_EQ(cfg.N_tile, 1);
+    }
+
+    // Test with batch (prefill)
+    {
+        auto cfg = compute_wo_tile_config(896, 896, 16);
+        EXPECT_GE(cfg.N_tile, 1) << "N_tile should be at least 1";
+        EXPECT_LE(cfg.N_tile, 16) << "N_tile should be at most batch_size";
+    }
+}
+
+/**
+ * @brief Test that tile sizes respect L1 cache constraints
+ */
+TEST_F(Test__Q16WoProjection, WoTileConfig_L1CacheConstraint)
+{
+    const auto &cache = cache_info();
+
+    // Skip test if cache detection failed
+    if (cache.l1_size == 0)
+    {
+        GTEST_SKIP() << "Cache detection not available";
+    }
+
+    for (int d_model : {896, 2048, 3584})
+    {
+        for (int input_dim : {896, 2048, 3584})
+        {
+            auto cfg = compute_wo_tile_config(d_model, input_dim, 1);
+
+            // L1 working set (Wo tile + context tile) should fit in 50% of L1
+            size_t l1_working = cfg.l1_working_set();
+            size_t l1_target = cache.l1_size / 2;
+
+            EXPECT_LE(l1_working, l1_target)
+                << "L1 working set (" << l1_working << " bytes) exceeds 50% of L1 ("
+                << l1_target << " bytes) for d_model=" << d_model
+                << ", input_dim=" << input_dim;
+        }
+    }
+}
+
+/**
+ * @brief Test default tile config matches legacy constants
+ */
+TEST_F(Test__Q16WoProjection, WoTileConfig_DefaultMatchesLegacy)
+{
+    auto cfg = default_wo_tile_config(896, 896, 1);
+
+    EXPECT_EQ(cfg.M_tile, WO_M_TILE);
+    EXPECT_EQ(cfg.K_tile, WO_K_TILE);
+    EXPECT_EQ(cfg.N_tile, 1);
+    EXPECT_EQ(cfg.d_model, 896);
+    EXPECT_EQ(cfg.input_dim, 896);
+}
+
+/**
+ * @brief Test that N_tile scales with batch size
+ */
+TEST_F(Test__Q16WoProjection, WoTileConfig_BatchScaling)
+{
+    const int d_model = 896;
+    const int input_dim = 896;
+
+    // Decode: N_tile should be 1
+    {
+        auto cfg = compute_wo_tile_config(d_model, input_dim, 1);
+        EXPECT_EQ(cfg.N_tile, 1);
+    }
+
+    // Small batch: N_tile should grow
+    {
+        auto cfg_4 = compute_wo_tile_config(d_model, input_dim, 4);
+        auto cfg_8 = compute_wo_tile_config(d_model, input_dim, 8);
+        EXPECT_GE(cfg_4.N_tile, 1);
+        EXPECT_GE(cfg_8.N_tile, cfg_4.N_tile) << "N_tile should grow with batch";
+    }
+
+    // Large batch: N_tile should be capped
+    {
+        auto cfg = compute_wo_tile_config(d_model, input_dim, 1024);
+        EXPECT_LE(cfg.N_tile, 16) << "N_tile should be capped at 16";
+    }
+}
+
+/**
+ * @brief Test memory footprint calculations
+ */
+TEST_F(Test__Q16WoProjection, WoTileConfig_MemoryFootprint)
+{
+    auto cfg = compute_wo_tile_config(896, 896, 4);
+
+    // Verify memory calculations
+    size_t expected_wo_tile = static_cast<size_t>(cfg.M_tile) * cfg.K_tile * sizeof(int16_t);
+    size_t expected_context_tile = static_cast<size_t>(cfg.K_tile) * sizeof(int16_t);
+    size_t expected_accum_tile = static_cast<size_t>(cfg.M_tile) * cfg.N_tile * sizeof(int32_t);
+
+    EXPECT_EQ(cfg.wo_tile_bytes(), expected_wo_tile);
+    EXPECT_EQ(cfg.context_tile_bytes(), expected_context_tile);
+    EXPECT_EQ(cfg.accumulator_tile_bytes(), expected_accum_tile);
+    EXPECT_EQ(cfg.l1_working_set(), expected_wo_tile + expected_context_tile);
+}

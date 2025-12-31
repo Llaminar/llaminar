@@ -4617,7 +4617,9 @@ namespace llaminar2::primitives
             max_abs = 1e-20f;
 
         // common_scale: normalized so max_abs / common_scale ≈ 127
-        const float common_scale = max_abs / 127.0f;
+        // We add a safety factor of sqrt(2) (approx 1.415) to prevent saturation
+        // because RoPE rotation can increase component magnitude by up to sqrt(2).
+        const float common_scale = (max_abs * 1.415f) / 127.0f;
 
         // Step 2: Compute Q8 fixed-point scale ratios for each input block
         // ratio_q8 = (block_scale / common_scale) * 256, range [0, 256]
@@ -4753,7 +4755,8 @@ namespace llaminar2::primitives
         if (max_abs < 1e-20f)
             max_abs = 1e-20f;
 
-        const float common_scale = max_abs / 127.0f;
+        // We add a safety factor of sqrt(2) (approx 1.415) to prevent saturation
+        const float common_scale = (max_abs * 1.415f) / 127.0f;
 
         // Step 2 & 3: RoPE rotation using vectorized int16 arithmetic
         alignas(32) int16_t rotated[256]; // Max head_dim = 192
@@ -4944,7 +4947,8 @@ namespace llaminar2::primitives
         if (max_abs < 1e-20f)
             max_abs = 1e-20f;
 
-        const float common_scale = max_abs / 127.0f;
+        // We add a safety factor of sqrt(2) (approx 1.415) to prevent saturation
+        const float common_scale = (max_abs * 1.415f) / 127.0f;
 
         // Step 2 & 3: RoPE rotation using vectorized int16 arithmetic
         alignas(64) int16_t rotated[256];

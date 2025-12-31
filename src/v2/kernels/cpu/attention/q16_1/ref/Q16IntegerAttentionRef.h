@@ -167,14 +167,23 @@ namespace llaminar2::kernels::q16_1
 
         /**
          * @brief Get PV scale for context accumulation.
+         *
+         * The context accumulator holds: Σ w_scaled * V_int16
+         * where w_scaled = w_raw >> (lut_value_bits - 15) ≈ w_raw / 2^15
+         *
+         * After normalizing by l (scaled):
+         *   result_int = context / (l >> 15)
+         *              = Σ (w_raw/l) * V_int16
+         *
+         * To convert to FP32:
+         *   result_fp32 = result_int * s_v
+         *
+         * So pv_scale is just the V tensor's scale.
          */
         float get_pv_scale(int kv_head) const
         {
             float s_v = kv_head_scales ? kv_head_scales[kv_head] : 1.0f;
-            // P is INT16 weights from softmax (range [0, 32767])
-            // V is Q16_1 with scale s_v
-            // Result scale = s_v / 32767 (to account for weight normalization)
-            return s_v / 32767.0f;
+            return s_v;
         }
 
         bool is_decode() const { return seq_len_q == 1; }

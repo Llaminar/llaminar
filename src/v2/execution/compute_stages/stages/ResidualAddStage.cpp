@@ -77,6 +77,17 @@ namespace llaminar2
             return executeQ8_1_FP32_to_FP32(ctx, num_elements);
         }
 
+        // =================================================================
+        // PHASE 6: Pure Integer Residual Add (Q16_1 + Q16_1 → Q16_1)
+        // =================================================================
+        // This is the key operation for full integer residual stream.
+        // Both input (from Wo projection) and residual are Q16_1.
+        // Uses native q16_add_q16 SIMD operations - no FP32 intermediate!
+        if (input_type == TensorType::Q16_1 && residual_type == TensorType::Q16_1 && output_type == TensorType::Q16_1)
+        {
+            return executeQ16_1(ctx, num_elements);
+        }
+
         // Dispatch based on tensor type, passing num_elements through
         // Note: This assumes all three tensors have the same type
         switch (input_type)
@@ -337,6 +348,98 @@ namespace llaminar2
 
         // Use SIMD-optimized FP32 += Q8_1 addition (dequant-and-add in one pass)
         simd::fp32_add_q8_1(residual_data, delta_blocks, num_elements);
+
+        return true;
+    }
+
+    bool ResidualAddStage::executeQ16_1(IDeviceContext *ctx, size_t num_elements)
+    {
+        // =================================================================
+        // PHASE 6: Pure Integer Residual Add (Q16_1 + Q16_1 → Q16_1)
+        // =================================================================
+        // This is the key operation for full integer residual stream.
+        // Both input (from Wo/down projection) and residual are Q16_1.
+        // Uses native q16_add_q16 SIMD operations - NO FP32 intermediate!
+        //
+        // Mathematical operation per block:
+        //   out.qs[i] = a.qs[i] * (a.d / out_d) + b.qs[i] * (b.d / out_d)
+        //   where out_d = max(a.d, b.d) for precision preservation
+        //
+        // This is implemented in SIMDHelpers.h::q16_add_q16<BlockType>()
+        // with AVX2/AVX512 SIMD acceleration.
+
+        const auto *input_q16 = dynamic_cast<const Q16_1Tensor *>(params_.input);
+        const auto *residual_q16 = dynamic_cast<const Q16_1Tensor *>(params_.residual);
+        auto *output_q16 = dynamic_cast<Q16_1Tensor *>(params_.output);
+
+        if (!input_q16 || !residual_q16 || !output_q16)
+        {
+            LOG_ERROR("[ResidualAddStage::Q16_1] Failed to cast tensors");
+            return false;
+        }
+
+        // Verify block sizes match
+        if (input_q16->q16_block_size() != residual_q16->q16_block_size() ||
+            input_q16->q16_block_size() != output_q16->q16_block_size())
+        {
+            LOG_ERROR("[ResidualAddStage::Q16_1] Block size mismatch: input="
+                      << static_cast<int>(input_q16->q16_block_size())
+                      << " residual=" << static_cast<int>(residual_q16->q16_block_size())
+                      << " output=" << static_cast<int>(output_q16->q16_block_size()));
+            return false;
+        }
+
+        const Q16BlockSize block_size = input_q16->q16_block_size();
+        const size_t bs = static_cast<size_t>(block_size);
+        const size_t num_blocks = (num_elements + bs - 1) / bs;
+
+        LOG_DEBUG("[ResidualAddStage::Q16_1] Adding " << num_elements << " elements ("
+                                                      << num_blocks << " blocks, block_size=" << bs << ")");
+
+        // Dispatch based on block size
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32:
+        {
+            const Q16_1Block *input_blocks = static_cast<const Q16_1Block *>(input_q16->raw_data());
+            const Q16_1Block *residual_blocks = static_cast<const Q16_1Block *>(residual_q16->raw_data());
+            Q16_1Block *output_blocks = static_cast<Q16_1Block *>(output_q16->raw_mutable_data());
+
+            // Process blocks with SIMD
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                simd::q16_add_q16(&input_blocks[b], &residual_blocks[b], &output_blocks[b]);
+            }
+            break;
+        }
+        case Q16BlockSize::BLOCK_64:
+        {
+            const Q16_1Block_64 *input_blocks = static_cast<const Q16_1Block_64 *>(input_q16->raw_data());
+            const Q16_1Block_64 *residual_blocks = static_cast<const Q16_1Block_64 *>(residual_q16->raw_data());
+            Q16_1Block_64 *output_blocks = static_cast<Q16_1Block_64 *>(output_q16->raw_mutable_data());
+
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                simd::q16_add_q16(&input_blocks[b], &residual_blocks[b], &output_blocks[b]);
+            }
+            break;
+        }
+        case Q16BlockSize::BLOCK_128:
+        {
+            const Q16_1Block_128 *input_blocks = static_cast<const Q16_1Block_128 *>(input_q16->raw_data());
+            const Q16_1Block_128 *residual_blocks = static_cast<const Q16_1Block_128 *>(residual_q16->raw_data());
+            Q16_1Block_128 *output_blocks = static_cast<Q16_1Block_128 *>(output_q16->raw_mutable_data());
+
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                simd::q16_add_q16(&input_blocks[b], &residual_blocks[b], &output_blocks[b]);
+            }
+            break;
+        }
+        default:
+            LOG_ERROR("[ResidualAddStage::Q16_1] Unsupported block size: " << static_cast<int>(block_size));
+            return false;
+        }
 
         return true;
     }

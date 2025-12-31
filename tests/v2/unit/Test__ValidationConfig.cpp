@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "utils/DebugEnv.h"
+#include "utils/Assertions.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include "execution/GraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/DeviceContext.h"
@@ -84,19 +85,33 @@ namespace llaminar2::test
         std::string saved_fail_nan_;
     };
 
-    TEST_F(ValidationConfigTest, DefaultConfig_AllDisabled)
+    TEST_F(ValidationConfigTest, DefaultConfig_MatchesBuildType)
     {
         // Reload with cleared env vars
         ValidationConfig config;
 
+        // In Debug/Integration builds (LLAMINAR_ASSERTIONS_ACTIVE=1):
+        //   - validate_buffers defaults to true
+        //   - fail_on_nan defaults to true
+        // In Release builds:
+        //   - All defaults are false
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        EXPECT_TRUE(config.validate_buffers) << "Should be auto-enabled in Debug builds";
+        EXPECT_FALSE(config.fail_on_zero); // Still false by default
+        EXPECT_TRUE(config.fail_on_nan) << "Should be auto-enabled in Debug builds";
+#else
         EXPECT_FALSE(config.validate_buffers);
         EXPECT_FALSE(config.fail_on_zero);
         EXPECT_FALSE(config.fail_on_nan);
+#endif
     }
 
     TEST_F(ValidationConfigTest, ValidateBuffers_EnabledViaEnv)
     {
+        // Explicitly disable Debug defaults, then enable only validate_buffers
         setenv("LLAMINAR_VALIDATE_BUFFERS", "1", 1);
+        setenv("LLAMINAR_FAIL_ON_ZERO", "0", 1);
+        setenv("LLAMINAR_FAIL_ON_NAN", "0", 1);
 
         ValidationConfig config;
 
@@ -107,7 +122,10 @@ namespace llaminar2::test
 
     TEST_F(ValidationConfigTest, FailOnZero_EnabledViaEnv)
     {
+        // Explicitly disable Debug defaults, then enable only fail_on_zero
+        setenv("LLAMINAR_VALIDATE_BUFFERS", "0", 1);
         setenv("LLAMINAR_FAIL_ON_ZERO", "1", 1);
+        setenv("LLAMINAR_FAIL_ON_NAN", "0", 1);
 
         ValidationConfig config;
 
@@ -118,6 +136,9 @@ namespace llaminar2::test
 
     TEST_F(ValidationConfigTest, FailOnNaN_EnabledViaEnv)
     {
+        // Explicitly disable Debug defaults, then enable only fail_on_nan
+        setenv("LLAMINAR_VALIDATE_BUFFERS", "0", 1);
+        setenv("LLAMINAR_FAIL_ON_ZERO", "0", 1);
         setenv("LLAMINAR_FAIL_ON_NAN", "1", 1);
 
         ValidationConfig config;
@@ -142,6 +163,11 @@ namespace llaminar2::test
 
     TEST_F(ValidationConfigTest, Reload_UpdatesFromEnv)
     {
+        // Start with all disabled via env vars
+        setenv("LLAMINAR_VALIDATE_BUFFERS", "0", 1);
+        setenv("LLAMINAR_FAIL_ON_ZERO", "0", 1);
+        setenv("LLAMINAR_FAIL_ON_NAN", "0", 1);
+
         ValidationConfig config;
         EXPECT_FALSE(config.validate_buffers);
 

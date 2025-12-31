@@ -396,6 +396,60 @@ add_v2_test(V2_Unit_Q16_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
+# Test: Q16 Fixed-Scale SIMD Quantization (VNNI-safe clipping)
+# Tests SIMD implementations (Scalar, AVX2, AVX512) of fixed-scale quantization
+add_executable(v2_test_q16_fixed_scale_simd unit/tensors/Test__Q16FixedScaleSIMD.cpp)
+target_link_libraries(v2_test_q16_fixed_scale_simd
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16FixedScaleSIMD
+    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_simd>
+    LABELS "V2;Unit;Quantization;Q16_1;SIMD;AVX2;AVX512;VNNI;FixedScale;Safety"
+    MPI_PROCS 1
+)
+
+# Performance: Q16 Fixed-Scale SIMD Quantization
+add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
+target_link_libraries(v2_perf_q16_fixed_scale_simd
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_FixedScaleSIMD
+    COMMAND $<TARGET_FILE:v2_perf_q16_fixed_scale_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;VNNI"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Decode (Dequant) SIMD - Block to FP32 conversion
+# Tests SIMD implementations (Scalar, AVX2, AVX512) of Q16 block dequantization
+add_executable(v2_test_q16_decode_simd unit/tensors/Test__Q16DecodeSIMD.cpp)
+target_link_libraries(v2_test_q16_decode_simd
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16DecodeSIMD
+    COMMAND $<TARGET_FILE:v2_test_q16_decode_simd>
+    LABELS "V2;Unit;Quantization;Q16_1;SIMD;AVX2;AVX512;Dequantization;Decode"
+    MPI_PROCS 1
+)
+
+# Performance: Q16 Decode (Dequant) SIMD - Block to FP32 conversion
+add_executable(v2_perf_q16_decode_simd performance/tensors/Perf__Q16_DecodeSIMD.cpp)
+target_link_libraries(v2_perf_q16_decode_simd
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_DecodeSIMD
+    COMMAND $<TARGET_FILE:v2_perf_q16_decode_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;Dequantization"
+    MPI_PROCS 1
+)
+
 # Test: Q8_1 Block-Aligned Slicing for tensor-parallel GEMM
 # Phase 6.4: Validates slice_k_blocks() for k-dimension splitting at 32-element boundaries
 add_executable(v2_test_q8_1_block_aligned_slicing unit/tensors/Test__Q8_1_BlockAlignedSlicing.cpp)
@@ -2303,6 +2357,17 @@ add_v2_test(V2_Unit_FusedAttentionWoStage_Q16Backend
     MPI_PROCS 1
 )
 
+# Test: KVCacheAppendStage kv_cache_scale Propagation
+# Locks in the VNNI-safe quantization contract for Q16_1 KV cache
+# Tests default scale (8.0), custom scale propagation, and VNNI safety limits
+add_executable(v2_test_kv_cache_scale_propagation unit/stages/Test__KVCacheScalePropagation.cpp)
+target_link_libraries(v2_test_kv_cache_scale_propagation llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_KVCacheScalePropagation
+    COMMAND $<TARGET_FILE:v2_test_kv_cache_scale_propagation>
+    LABELS "V2;Unit;Execution;ComputeStage;KVCache;VNNI;Quantization;Q16_1;Scale"
+    MPI_PROCS 1
+)
+
 # Test: ResidualAddStage Precision Awareness
 # Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
 # Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
@@ -2311,6 +2376,17 @@ target_link_libraries(v2_test_residual_add_precision llaminar2_core GTest::gtest
 add_v2_test(V2_Unit_ResidualAddPrecision
     COMMAND $<TARGET_FILE:v2_test_residual_add_precision>
     LABELS "V2;Unit;Execution;ComputeStage;ResidualAdd;Precision;Q8_1;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: Pure Integer Residual Add (Q16_1 + Q16_1 → Q16_1)
+# Phase 6 of Q16 Integer Attention: Full integer residual stream
+# Tests block sizes 32/64/128, edge cases, error handling
+add_executable(v2_test_residual_add_q16_1 unit/stages/Test__ResidualAddStage_Q16_1.cpp)
+target_link_libraries(v2_test_residual_add_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ResidualAddQ16_1
+    COMMAND $<TARGET_FILE:v2_test_residual_add_q16_1>
+    LABELS "V2;Unit;Execution;ComputeStage;ResidualAdd;Q16_1;IntegerAttention;Phase6"
     MPI_PROCS 1
 )
 
@@ -3987,6 +4063,36 @@ target_link_libraries(v2_test_q16_online_softmax
 add_v2_test(V2_Unit_Q16OnlineSoftmax
     COMMAND $<TARGET_FILE:v2_test_q16_online_softmax>
     LABELS "V2;Unit;Kernels;Attention;Q16;OnlineSoftmax;FlashDecode;Integer"
+)
+
+# Test: Q16 Integer Attention (Full Kernel)
+# Complete attention kernel including Flash Decode and FA2 Prefill paths
+# Tests parameter validation, snapshot capture, and multi-head/GQA configurations
+add_executable(v2_test_q16_integer_attention unit/kernels/cpu/q16_attention/Test__Q16IntegerAttention.cpp)
+target_link_libraries(v2_test_q16_integer_attention
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16IntegerAttention
+    COMMAND $<TARGET_FILE:v2_test_q16_integer_attention>
+    LABELS "V2;Unit;Kernels;Attention;Q16;Integer;FlashDecode;FA2;Prefill"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Integer Attention Parity (vs FP32 Reference)
+# Compares Q16 attention output against FP32 reference implementation
+# Validates cosine similarity, RMSE, and softmax weight normalization
+add_executable(v2_test_q16_integer_attention_parity unit/kernels/cpu/q16_attention/Test__Q16IntegerAttentionParity.cpp)
+target_link_libraries(v2_test_q16_integer_attention_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16IntegerAttentionParity
+    COMMAND $<TARGET_FILE:v2_test_q16_integer_attention_parity>
+    LABELS "V2;Unit;Kernels;Attention;Q16;Parity;FP32;Cosine;RMSE"
+    MPI_PROCS 1
 )
 
 # Test: MLA (Multi-head Latent Attention) Microkernels - DeepSeek V3/Kimi K2

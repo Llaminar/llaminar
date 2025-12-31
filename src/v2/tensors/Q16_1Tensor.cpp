@@ -9,6 +9,7 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
+#include "../utils/Assertions.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -266,26 +268,81 @@ namespace llaminar2
         }
 
         const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
-        const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
-        const size_t blocks_per_row_ = (cols + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        const size_t bs = static_cast<size_t>(block_size_);
+        const size_t blocks_per_row = (cols + bs - 1) / bs;
 
-#pragma omp parallel for collapse(2) if (total_elements > 10000)
-        for (size_t r = 0; r < rows; ++r)
+        // Dispatch based on actual block size
+        switch (block_size_)
         {
-            for (size_t b = 0; b < blocks_per_row_; ++b)
+        case Q16BlockSize::BLOCK_32:
+        {
+            const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
+#pragma omp parallel for collapse(2) if (total_elements > 10000)
+            for (size_t r = 0; r < rows; ++r)
             {
-                const size_t col0 = b * Q16_1Block::BLOCK_SIZE;
-                if (col0 >= cols)
-                    continue;
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const size_t col0 = b * Q16_1Block::BLOCK_SIZE;
+                    if (col0 >= cols)
+                        continue;
 
-                const Q16_1Block &block = blocks[r * blocks_per_row_ + b];
+                    const Q16_1Block &block = blocks[r * blocks_per_row + b];
 
-                alignas(64) float tmp[Q16_1Block::BLOCK_SIZE];
-                decodeBlock(block, tmp);
+                    alignas(64) float tmp[Q16_1Block::BLOCK_SIZE];
+                    simd::decode_q16_block_to_fp32<Q16_1Block>(block, tmp);
 
-                const size_t copy = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), cols - col0);
-                std::memcpy(&dequant_cache_[r * cols + col0], tmp, copy * sizeof(float));
+                    const size_t copy = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), cols - col0);
+                    std::memcpy(&dequant_cache_[r * cols + col0], tmp, copy * sizeof(float));
+                }
             }
+            break;
+        }
+        case Q16BlockSize::BLOCK_64:
+        {
+            const Q16_1Block_64 *blocks = reinterpret_cast<const Q16_1Block_64 *>(data_ptr);
+#pragma omp parallel for collapse(2) if (total_elements > 10000)
+            for (size_t r = 0; r < rows; ++r)
+            {
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const size_t col0 = b * Q16_1Block_64::BLOCK_SIZE;
+                    if (col0 >= cols)
+                        continue;
+
+                    const Q16_1Block_64 &block = blocks[r * blocks_per_row + b];
+
+                    alignas(64) float tmp[Q16_1Block_64::BLOCK_SIZE];
+                    simd::decode_q16_block_to_fp32<Q16_1Block_64>(block, tmp);
+
+                    const size_t copy = std::min(static_cast<size_t>(Q16_1Block_64::BLOCK_SIZE), cols - col0);
+                    std::memcpy(&dequant_cache_[r * cols + col0], tmp, copy * sizeof(float));
+                }
+            }
+            break;
+        }
+        case Q16BlockSize::BLOCK_128:
+        {
+            const Q16_1Block_128 *blocks = reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
+#pragma omp parallel for collapse(2) if (total_elements > 10000)
+            for (size_t r = 0; r < rows; ++r)
+            {
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const size_t col0 = b * Q16_1Block_128::BLOCK_SIZE;
+                    if (col0 >= cols)
+                        continue;
+
+                    const Q16_1Block_128 &block = blocks[r * blocks_per_row + b];
+
+                    alignas(64) float tmp[Q16_1Block_128::BLOCK_SIZE];
+                    simd::decode_q16_block_to_fp32<Q16_1Block_128>(block, tmp);
+
+                    const size_t copy = std::min(static_cast<size_t>(Q16_1Block_128::BLOCK_SIZE), cols - col0);
+                    std::memcpy(&dequant_cache_[r * cols + col0], tmp, copy * sizeof(float));
+                }
+            }
+            break;
+        }
         }
 
         cache_dirty_ = false;
@@ -1433,6 +1490,12 @@ namespace llaminar2
             const float d = kv_cache_scale / 32767.0f;
             const float inv_d = 32767.0f / kv_cache_scale;
 
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            // Debug-build overflow detection: track clipping statistics
+            std::atomic<size_t> total_clipped{0};
+            std::atomic<size_t> total_processed{0};
+#endif
+
 #pragma omp parallel for if (n_blocks > 4)
             for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
             {
@@ -1444,11 +1507,23 @@ namespace llaminar2
                 // Fixed scale for ALL blocks (not adaptive!)
                 block.d = d;
 
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                size_t local_clipped = 0;
+#endif
+
                 int64_t sum_i64 = 0;
                 for (size_t i = 0; i < count; ++i)
                 {
                     // Quantize with fixed scale
                     const float scaled = src_data[offset + i] * inv_d;
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                    // Track if this value required clipping
+                    if (std::abs(scaled) > static_cast<float>(max_safe_int16))
+                    {
+                        ++local_clipped;
+                    }
+#endif
 
                     // CRITICAL: Clip to VNNI-safe range, NOT ±32767!
                     const float clamped = std::max(static_cast<float>(-max_safe_int16),
@@ -1465,7 +1540,35 @@ namespace llaminar2
                 }
 
                 block.sum_qs = static_cast<int32_t>(sum_i64);
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                total_clipped.fetch_add(local_clipped, std::memory_order_relaxed);
+                total_processed.fetch_add(count, std::memory_order_relaxed);
+#endif
             }
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            // Log warning if clipping occurs frequently (>1% of values)
+            const size_t clipped_count = total_clipped.load(std::memory_order_relaxed);
+            const size_t processed_count = total_processed.load(std::memory_order_relaxed);
+            if (processed_count > 0 && clipped_count > 0)
+            {
+                const float clip_rate = 100.0f * static_cast<float>(clipped_count) / static_cast<float>(processed_count);
+                if (clip_rate > 1.0f)
+                {
+                    LOG_WARN("[Q16_1Tensor] High clipping rate during fixed-scale quantization: "
+                             << clipped_count << "/" << processed_count << " values ("
+                             << clip_rate << "%) exceeded max_safe_int16=" << max_safe_int16
+                             << " (kv_cache_scale=" << kv_cache_scale << ")");
+                }
+                else
+                {
+                    LOG_DEBUG("[Q16_1Tensor] Fixed-scale quantization clipped "
+                              << clipped_count << "/" << processed_count << " values ("
+                              << clip_rate << "%)");
+                }
+            }
+#endif
         }
 
         /**

@@ -209,19 +209,22 @@ namespace llaminar2::kernels::q16_1
         const int head_dim = params.head_dim;
         const int blocks_per_row = params.q_blocks_per_row();
 
-        // FlashDecode block size
-        constexpr int KV_BLOCK_SIZE = microkernels::FLASH_DECODE_KV_BLOCK_SIZE;
+        // Compute cache-aware KV block size
+        const int KV_BLOCK_SIZE = microkernels::compute_flash_decode_kv_block_size(head_dim);
 
-        // Per-head scratch buffers (small, fixed size)
+        LOG_DEBUG("FlashDecode: KV_BLOCK_SIZE=" << KV_BLOCK_SIZE
+                                                << " (scratch=" << (KV_BLOCK_SIZE * 8) << " bytes)");
+
+        // Per-head scratch buffers (sized to computed block size)
         std::vector<int32_t> scores_scratch(KV_BLOCK_SIZE);
         std::vector<int32_t> weights_scratch(KV_BLOCK_SIZE);
         std::vector<int32_t> context(head_dim);
 
-        // For snapshots: need to accumulate all weights if requested
-        std::vector<int32_t> all_weights_unnorm;
+        // For snapshots: store scores (not weights) so we can recompute with final max
+        std::vector<int32_t> all_scores_raw;
         if (params.snapshot_weights || params.snapshot_scores)
         {
-            all_weights_unnorm.resize(kv_len, 0);
+            all_scores_raw.resize(kv_len, MASKED_SCORE);
         }
 
         // Process each head
@@ -269,12 +272,13 @@ namespace llaminar2::kernels::q16_1
                         kv_start, block_size,
                         head_dim, blocks_per_row, qk_scale);
 
-                    // Capture unnormalized weights for snapshot
+                    // Capture raw scores (before softmax) for snapshot
+                    // We'll recompute weights at the end using final max
                     if (params.snapshot_weights || params.snapshot_scores)
                     {
                         for (int i = 0; i < block_size; ++i)
                         {
-                            all_weights_unnorm[kv_start + i] = weights_scratch[i];
+                            all_scores_raw[kv_start + i] = scores_scratch[i];
                         }
                     }
                 }
@@ -301,11 +305,12 @@ namespace llaminar2::kernels::q16_1
                         kv_start, block_size,
                         head_dim, blocks_per_row, qk_scale);
 
+                    // Capture raw scores for snapshot
                     if (params.snapshot_weights || params.snapshot_scores)
                     {
                         for (int i = 0; i < block_size; ++i)
                         {
-                            all_weights_unnorm[kv_start + i] = weights_scratch[i];
+                            all_scores_raw[kv_start + i] = scores_scratch[i];
                         }
                     }
                 }
@@ -324,29 +329,85 @@ namespace llaminar2::kernels::q16_1
             // Final context = context / l (the running sum)
 
             // Snapshot: pre-softmax scores (if requested)
-            // Note: In online softmax, we don't have raw scores after the fact
-            // We store the final max and reconstruct approximate scores
+            // We stored raw INT32 scores, just need to convert to float
             if (params.snapshot_scores)
             {
                 for (int k = 0; k < kv_len; ++k)
                 {
-                    // Reconstruct approximate score from weight
-                    // This is lossy but useful for debugging
-                    float w_approx = static_cast<float>(all_weights_unnorm[k]) /
-                                     static_cast<float>(1U << state.lut_value_bits);
-                    float score_approx = (w_approx > 0) ? (-std::log2(w_approx) / qk_scale + state.m) : 0;
-                    params.snapshot_scores[h * kv_len + k] = score_approx * qk_scale;
+                    // Raw score is already in INT32 format, scale to FP32
+                    params.snapshot_scores[h * kv_len + k] =
+                        static_cast<float>(all_scores_raw[k]) * qk_scale;
                 }
             }
 
             // Snapshot: post-softmax weights (if requested)
+            // Recompute weights from stored scores using final max (state.m)
+            // This ensures all weights are relative to the same max
             if (params.snapshot_weights)
             {
+                // Ensure exp2 LUT is initialized
+                microkernels::ensure_exp2_lut_initialized(state.lut_value_bits);
+                const uint32_t *lut = microkernels::get_exp2_lut_data();
+
+                // Compute beta = alpha * log2(e) for exp2 conversion
+                constexpr double LOG2E = 1.4426950408889634073599246810018921;
+                double beta = static_cast<double>(qk_scale) * LOG2E;
+                int beta_scale_bits = 24;
+                int64_t M = static_cast<int64_t>(
+                    std::llround(beta * static_cast<double>(1ULL << beta_scale_bits)));
+                int shift_for_t = beta_scale_bits - state.frac_bits;
+                uint32_t one = static_cast<uint32_t>(1U << state.lut_value_bits);
+
+                // Recompute all weights using final max and accumulate sum
+                int64_t weight_sum = 0;
+                std::vector<int64_t> weights_recomputed(kv_len);
+
                 for (int k = 0; k < kv_len; ++k)
                 {
-                    // Normalize to [0, 1]
-                    float w_norm = (state.l > 0)
-                                       ? static_cast<float>(all_weights_unnorm[k]) / static_cast<float>(state.l)
+                    if (all_scores_raw[k] == MASKED_SCORE)
+                    {
+                        weights_recomputed[k] = 0;
+                        continue;
+                    }
+
+                    int32_t delta = state.m - all_scores_raw[k];
+
+                    if (delta <= 0)
+                    {
+                        // This is the max position
+                        weights_recomputed[k] = one;
+                        weight_sum += one;
+                        continue;
+                    }
+
+                    // t_fixed = delta * M in Q(frac_bits) format
+                    int64_t prod = static_cast<int64_t>(delta) * M;
+                    int64_t t_fixed = (shift_for_t >= 0)
+                                          ? (prod >> shift_for_t)
+                                          : (prod << (-shift_for_t));
+
+                    // Decompose: t = ip + frac
+                    int64_t ip = t_fixed >> state.frac_bits;
+                    int frac_idx = static_cast<int>(t_fixed & ((1 << state.frac_bits) - 1));
+
+                    // Underflow check
+                    if (ip >= 31)
+                    {
+                        weights_recomputed[k] = 0;
+                        continue;
+                    }
+
+                    // 2^(-t) = lut[frac] >> ip
+                    uint32_t w = lut[frac_idx] >> static_cast<int>(ip);
+                    weights_recomputed[k] = static_cast<int64_t>(w);
+                    weight_sum += w;
+                }
+
+                // Normalize to [0, 1]
+                for (int k = 0; k < kv_len; ++k)
+                {
+                    float w_norm = (weight_sum > 0)
+                                       ? static_cast<float>(weights_recomputed[k]) / static_cast<float>(weight_sum)
                                        : 0.0f;
                     params.snapshot_weights[h * kv_len + k] = w_norm;
                 }
@@ -392,6 +453,32 @@ namespace llaminar2::kernels::q16_1
     // FA2 Prefill Implementation (seq_len_q > 1)
     // ============================================================================
 
+    /**
+     * @brief TRUE FA2 Prefill with online softmax - tiled block-at-a-time processing.
+     *
+     * This is the FlashAttention-2 algorithm adapted for multi-query prefill:
+     * - Processes queries in tiles of Br rows (default 4)
+     * - Processes KV cache in tiles of Bc columns (default 32)
+     * - Maintains per-row online softmax state (m, l per query row)
+     * - Rescales previous context when running max changes
+     *
+     * Algorithm (for each query tile):
+     *   m[:] = -inf, l[:] = 0, O[:, :] = 0
+     *   for each KV tile:
+     *     S = Q_tile × K_tile^T                    [Br × Bc]
+     *     for each row r:
+     *       m_new[r] = max(m[r], max(S[r, :]))
+     *       if m_new[r] > m[r]:
+     *         correction = exp(m[r] - m_new[r])
+     *         l[r] *= correction
+     *         O[r, :] *= correction
+     *       for k in tile:
+     *         w = exp(S[r, k] - m_new[r])
+     *         l[r] += w
+     *         O[r, :] += w * V[k, :]
+     *       m[r] = m_new[r]
+     *   output[r, :] = O[r, :] / l[r]
+     */
     bool q16_integer_attention_prefill(const Q16IntegerAttentionParams &params)
     {
         // Validate
@@ -402,27 +489,287 @@ namespace llaminar2::kernels::q16_1
 
         LLAMINAR_ASSERT(!params.is_decode(), "Prefill path requires seq_len_q>1");
 
-        // TODO(v2): Implement tiled FA2 prefill with online softmax
-        // This requires:
-        // 1. Tiled Q×K^T with block sizes Br=4, Bc=32
-        // 2. Online softmax state tracking in INT32
-        // 3. Tiled P×V accumulation
-        // 4. Final Wo projection and residual add
+        const int seq_len_q = params.seq_len_q;
+        const int kv_len = params.kv_len;
+        const int num_heads = params.num_heads;
+        const int head_dim = params.head_dim;
+        const int blocks_per_row = params.q_blocks_per_row();
 
-        LOG_WARN("FA2 Prefill not yet implemented, falling back to per-query decode");
+        // Compute cache-aware tile sizes based on CPU cache hierarchy
+        const auto tile_cfg = microkernels::compute_fa2_tile_config(head_dim, kv_len);
+        const int TILE_BR = tile_cfg.Br;
+        const int TILE_BC = tile_cfg.Bc;
 
-        // Fallback: process each query position as decode
-        // This is suboptimal but correct
-        Q16IntegerAttentionParams decode_params = params;
-        decode_params.seq_len_q = 1;
+        LOG_DEBUG("FA2 Prefill: Br=" << TILE_BR << " Bc=" << TILE_BC
+                                     << " (scratch=" << tile_cfg.scratch_bytes() << " bytes"
+                                     << ", context=" << tile_cfg.context_bytes() << " bytes)");
 
-        for (int q = 0; q < params.seq_len_q; ++q)
+        // Per-tile scratch buffers (sized to computed tile dimensions)
+        std::vector<int32_t> scores_scratch(TILE_BR * TILE_BC);
+        std::vector<int32_t> weights_scratch(TILE_BR * TILE_BC);
+
+        // Per-row context accumulators (for current Q tile)
+        std::vector<int32_t> context_tile(TILE_BR * head_dim);
+
+        // For snapshots: store raw scores so we can recompute weights with final max
+        std::vector<int32_t> all_scores_raw;
+        if (params.snapshot_weights || params.snapshot_scores)
         {
-            // Adjust Q pointer for this query position
-            // TODO(v2): Implement proper pointer arithmetic for variable block sizes
-            if (!q16_integer_attention_decode(decode_params))
+            all_scores_raw.resize(seq_len_q * kv_len, MASKED_SCORE);
+        }
+
+        // Process each head
+        for (int h = 0; h < num_heads; ++h)
+        {
+            int kv_h = params.get_kv_head(h);
+
+            // Get scales for this head
+            float qk_scale = params.get_qk_scale(h, kv_h);
+            float pv_scale = params.get_pv_scale(kv_h);
+
+            // Process query sequence in tiles of TILE_BR
+            for (int q_tile_start = 0; q_tile_start < seq_len_q; q_tile_start += TILE_BR)
             {
-                return false;
+                int Br = std::min(TILE_BR, seq_len_q - q_tile_start);
+
+                // Initialize batch softmax state for this Q tile
+                microkernels::OnlineSoftmaxStateBatch state;
+                state.init(Br);
+
+                // Zero context tile
+                std::memset(context_tile.data(), 0, TILE_BR * head_dim * sizeof(int32_t));
+
+                // ================================================================
+                // FA2: Process KV cache in tiles of TILE_BC
+                // ================================================================
+
+                switch (params.block_size)
+                {
+                case Q16BlockSize::BLOCK_64:
+                {
+                    auto Q = reinterpret_cast<const Q16_1Block_64 *>(params.Q);
+                    auto K = reinterpret_cast<const Q16_1Block_64 *>(params.K);
+                    auto V = reinterpret_cast<const Q16_1Block_64 *>(params.V);
+
+                    // Q pointer for this head and Q tile
+                    const Q16_1Block_64 *Q_tile = Q + h * seq_len_q * blocks_per_row +
+                                                  q_tile_start * blocks_per_row;
+
+                    // K/V pointers for this KV head
+                    const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
+                    const Q16_1Block_64 *V_head = V + kv_h * kv_len * blocks_per_row;
+
+                    // Process KV in tiles
+                    for (int kv_tile_start = 0; kv_tile_start < kv_len; kv_tile_start += TILE_BC)
+                    {
+                        int Bc = std::min(TILE_BC, kv_len - kv_tile_start);
+
+                        microkernels::fa2_prefill_process_kv_tile<Q16_1Block_64>(
+                            Q_tile, K_head, V_head,
+                            context_tile.data(), state,
+                            scores_scratch.data(), weights_scratch.data(),
+                            kv_tile_start, Br, Bc,
+                            head_dim, blocks_per_row,
+                            blocks_per_row, // q_stride
+                            blocks_per_row, // k_stride
+                            head_dim,       // context_stride
+                            qk_scale,
+                            true,          // causal
+                            q_tile_start); // q_offset for causal mask
+
+                        // Capture raw scores (with causal mask applied) for snapshot
+                        // Note: microkernel uses r * Bc stride, not r * TILE_BC
+                        if (params.snapshot_weights || params.snapshot_scores)
+                        {
+                            for (int r = 0; r < Br; ++r)
+                            {
+                                for (int c = 0; c < Bc; ++c)
+                                {
+                                    int q_idx = q_tile_start + r;
+                                    int k_idx = kv_tile_start + c;
+                                    all_scores_raw[q_idx * kv_len + k_idx] =
+                                        scores_scratch[r * Bc + c];
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                case Q16BlockSize::BLOCK_128:
+                {
+                    auto Q = reinterpret_cast<const Q16_1Block_128 *>(params.Q);
+                    auto K = reinterpret_cast<const Q16_1Block_128 *>(params.K);
+                    auto V = reinterpret_cast<const Q16_1Block_128 *>(params.V);
+
+                    const Q16_1Block_128 *Q_tile = Q + h * seq_len_q * blocks_per_row +
+                                                   q_tile_start * blocks_per_row;
+                    const Q16_1Block_128 *K_head = K + kv_h * kv_len * blocks_per_row;
+                    const Q16_1Block_128 *V_head = V + kv_h * kv_len * blocks_per_row;
+
+                    for (int kv_tile_start = 0; kv_tile_start < kv_len; kv_tile_start += TILE_BC)
+                    {
+                        int Bc = std::min(TILE_BC, kv_len - kv_tile_start);
+
+                        microkernels::fa2_prefill_process_kv_tile<Q16_1Block_128>(
+                            Q_tile, K_head, V_head,
+                            context_tile.data(), state,
+                            scores_scratch.data(), weights_scratch.data(),
+                            kv_tile_start, Br, Bc,
+                            head_dim, blocks_per_row,
+                            blocks_per_row, blocks_per_row, head_dim,
+                            qk_scale, true, q_tile_start);
+
+                        // Capture raw scores for snapshot
+                        // Note: microkernel uses r * Bc stride, not r * TILE_BC
+                        if (params.snapshot_weights || params.snapshot_scores)
+                        {
+                            for (int r = 0; r < Br; ++r)
+                            {
+                                for (int c = 0; c < Bc; ++c)
+                                {
+                                    int q_idx = q_tile_start + r;
+                                    int k_idx = kv_tile_start + c;
+                                    all_scores_raw[q_idx * kv_len + k_idx] =
+                                        scores_scratch[r * Bc + c];
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                default:
+                    LOG_ERROR("Unsupported block size: " << static_cast<int>(params.block_size));
+                    return false;
+                }
+
+                // ================================================================
+                // Finalize: Store normalized context for this Q tile
+                // ================================================================
+
+                for (int r = 0; r < Br; ++r)
+                {
+                    int q_idx = q_tile_start + r;
+
+                    // Snapshot: pre-softmax scores (raw INT32)
+                    if (params.snapshot_scores)
+                    {
+                        for (int k = 0; k < kv_len; ++k)
+                        {
+                            int32_t score_raw = all_scores_raw[q_idx * kv_len + k];
+                            // Convert to FP32. Masked scores stay as large negative
+                            if (score_raw == MASKED_SCORE)
+                            {
+                                params.snapshot_scores[(h * seq_len_q + q_idx) * kv_len + k] = -1e9f;
+                            }
+                            else
+                            {
+                                params.snapshot_scores[(h * seq_len_q + q_idx) * kv_len + k] =
+                                    static_cast<float>(score_raw) * qk_scale;
+                            }
+                        }
+                    }
+
+                    // Snapshot: post-softmax weights
+                    // Recompute weights from scores using final max (state.m[r]) for this row
+                    if (params.snapshot_weights)
+                    {
+                        // Ensure exp2 LUT is initialized
+                        microkernels::ensure_exp2_lut_initialized(state.lut_value_bits);
+                        const uint32_t *lut = microkernels::get_exp2_lut_data();
+
+                        // Compute beta = alpha * log2(e)
+                        constexpr double LOG2E = 1.4426950408889634073599246810018921;
+                        double beta = static_cast<double>(qk_scale) * LOG2E;
+                        int beta_scale_bits = 24;
+                        int64_t M = static_cast<int64_t>(
+                            std::llround(beta * static_cast<double>(1ULL << beta_scale_bits)));
+                        int shift_for_t = beta_scale_bits - state.frac_bits;
+                        uint32_t one = static_cast<uint32_t>(1U << state.lut_value_bits);
+
+                        // Recompute all weights using final max and accumulate sum
+                        int64_t weight_sum = 0;
+                        std::vector<int64_t> weights_recomputed(kv_len);
+
+                        for (int k = 0; k < kv_len; ++k)
+                        {
+                            int32_t score_raw = all_scores_raw[q_idx * kv_len + k];
+                            if (score_raw == MASKED_SCORE)
+                            {
+                                weights_recomputed[k] = 0;
+                                continue;
+                            }
+
+                            int32_t delta = state.m[r] - score_raw;
+
+                            if (delta <= 0)
+                            {
+                                // This is the max position
+                                weights_recomputed[k] = one;
+                                weight_sum += one;
+                                continue;
+                            }
+
+                            // t_fixed = delta * M in Q(frac_bits) format
+                            int64_t prod = static_cast<int64_t>(delta) * M;
+                            int64_t t_fixed = (shift_for_t >= 0)
+                                                  ? (prod >> shift_for_t)
+                                                  : (prod << (-shift_for_t));
+
+                            // Decompose: t = ip + frac
+                            int64_t ip = t_fixed >> state.frac_bits;
+                            int frac_idx = static_cast<int>(t_fixed & ((1 << state.frac_bits) - 1));
+
+                            // Underflow check
+                            if (ip >= 31)
+                            {
+                                weights_recomputed[k] = 0;
+                                continue;
+                            }
+
+                            // 2^(-t) = lut[frac] >> ip
+                            uint32_t w = lut[frac_idx] >> static_cast<int>(ip);
+                            weights_recomputed[k] = static_cast<int64_t>(w);
+                            weight_sum += w;
+                        }
+
+                        // Normalize to [0, 1]
+                        for (int k = 0; k < kv_len; ++k)
+                        {
+                            float w_norm = (weight_sum > 0)
+                                               ? static_cast<float>(weights_recomputed[k]) / static_cast<float>(weight_sum)
+                                               : 0.0f;
+                            params.snapshot_weights[(h * seq_len_q + q_idx) * kv_len + k] = w_norm;
+                        }
+                    }
+
+                    // Snapshot: attention context
+                    if (params.snapshot_context)
+                    {
+                        int64_t l_val = state.l[r];
+                        int shift_amt = state.lut_value_bits - 15;
+                        int64_t l_shifted = l_val >> shift_amt;
+                        float context_scale = (l_shifted > 0)
+                                                  ? pv_scale / static_cast<float>(l_shifted)
+                                                  : 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            params.snapshot_context[(h * seq_len_q + q_idx) * head_dim + d] =
+                                static_cast<float>(context_tile[r * head_dim + d]) * context_scale;
+                        }
+                    }
+                }
+
+                // ================================================================
+                // Step 4: Wo projection → Q16_1 output (TODO)
+                // ================================================================
+
+                // TODO(v2): Implement Wo projection with VPDPWSSD
+
+                // ================================================================
+                // Step 5: Residual add (integer) (TODO)
+                // ================================================================
+
+                // TODO(v2): Implement integer residual add
             }
         }
 

@@ -584,6 +584,9 @@ namespace llaminar2
         case StageType::KVCacheAppend:
             resolved.int_params["layer_idx"] = layer_idx;
             resolved.int_params["num_tokens"] = runtime.batch_size * runtime.seq_len;
+            // Phase 5.4: VNNI-safe Q16 KV cache parameters
+            resolved.int_params["head_dim"] = runtime.head_dim;
+            resolved.float_params["kv_cache_scale"] = runtime.kv_cache_scale;
             break;
 
         case StageType::ResidualAdd:
@@ -693,6 +696,9 @@ namespace llaminar2
             params.num_tokens = stage.int_params.count("num_tokens") ? stage.int_params.at("num_tokens") : seq_len;
             params.batch_size = batch_size;
             params.seq_len = seq_len / batch_size;
+            // Phase 5.4: VNNI-safe Q16 KV cache parameters
+            params.head_dim = stage.int_params.count("head_dim") ? stage.int_params.at("head_dim") : 128;
+            params.kv_cache_scale = stage.float_params.count("kv_cache_scale") ? stage.float_params.at("kv_cache_scale") : 8.0f;
             return ComputeStageFactory::createKVCacheAppend(params);
         }
 

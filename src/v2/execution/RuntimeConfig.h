@@ -316,6 +316,31 @@ namespace llaminar2
          */
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
+        /**
+         * @brief Fixed scale for Q16_1 KV cache quantization
+         *
+         * Defines the FP32 range that maps to INT16 [-32767, +32767]:
+         * - 8.0f (default): ±8.0 range, good for most models
+         * - 4.0f: ±4.0 range, 2× better precision for smaller activations
+         *
+         * The scale is "fixed" meaning all K/V values across the entire inference
+         * session use this scale. This avoids the "growing scale" problem where
+         * new tokens with larger activations would require re-quantizing the
+         * entire KV cache.
+         *
+         * Use the KV activation profiling tool to determine optimal scale:
+         *   python python/tools/profile_kv_activations.py --model <model.gguf>
+         *
+         * Typical activation ranges by model:
+         * - Post-RMSNorm: typically [-3.0, 3.0]
+         * - Post-QKV projection: typically [-5.0, 5.0]
+         * - Default 8.0 provides ~60% headroom over typical maximums
+         *
+         * @note Only applies when activation_precision is HybridQ16.
+         * @see VNNISafetyConstants.h for VNNI overflow limits
+         */
+        float kv_cache_scale = 8.0f;
+
         // ===== Multi-Device Executor Feature Flags (Incremental Rollout) =====
 
         /**

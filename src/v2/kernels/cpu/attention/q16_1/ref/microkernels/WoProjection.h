@@ -23,13 +23,23 @@
  * - **Flash Decode**: GEMV pattern, stream Wo rows, context in L2
  * - **FA2 Prefill**: Batched GEMM, amortize Wo loads across queries
  *
+ * ## Cache-Aware Tiling
+ *
+ * The Wo projection uses cache-aware tiling based on detected CPU cache hierarchy:
+ *   - **Output tile (M_TILE)**: Number of output rows to process together
+ *     - Targets L2: accumulators [M_TILE × 4 bytes] + context [input_dim × 2 bytes]
+ *   - **Input tile (K_TILE)**: Reduction dimension chunk size
+ *     - Targets L1: partial Wo [M_TILE × K_TILE × 2 bytes] + context [K_TILE × 2 bytes]
+ *
  * @see docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md
  */
 
 #pragma once
 
 #include "tensors/BlockStructures.h"
+#include "utils/CPUFeatures.h"
 #include <cstdint>
+#include <algorithm>
 
 namespace llaminar2::kernels::q16_1::microkernels
 {
@@ -38,6 +48,163 @@ namespace llaminar2::kernels::q16_1::microkernels
     using llaminar2::Q16_1Block_128;
     using llaminar2::Q16_1Block_64;
     using llaminar2::Q16BlockSize;
+
+    // ============================================================================
+    // Wo Projection Cache-Aware Tile Configuration
+    // ============================================================================
+
+    /**
+     * @brief Cache-aware tile configuration for Wo projection.
+     *
+     * Wo projection is a GEMM/GEMV operation:
+     *   - Decode: output[d_model] = context[input_dim] × Wo^T[d_model, input_dim]
+     *   - Prefill: output[batch, d_model] = context[batch, input_dim] × Wo^T
+     *
+     * Tiling Strategy:
+     *   - **M_tile (output rows)**: Process M_tile outputs at once
+     *     - Accumulators [M_tile × 4 bytes] should fit in registers/L1
+     *   - **K_tile (reduction dim)**: Stream input in K_tile chunks
+     *     - Wo block [M_tile × K_tile × 2 bytes] + context [K_tile × 2 bytes] fit in L1
+     *   - **N_tile (batch dim, prefill only)**: Process queries together
+     *     - Amortizes Wo loads across multiple queries
+     *
+     * Memory Layout per tile:
+     *   - Context tile: K_tile × 2 bytes (INT16)
+     *   - Wo tile: M_tile × K_tile × 2 bytes (INT16)
+     *   - Accumulator tile: M_tile × N_tile × 4 bytes (INT32)
+     */
+    struct WoTileConfig
+    {
+        int M_tile;    ///< Output tile size (d_model dimension)
+        int K_tile;    ///< Reduction tile size (input_dim dimension)
+        int N_tile;    ///< Batch tile size (prefill only, =1 for decode)
+        int d_model;   ///< Total output dimension
+        int input_dim; ///< Total input dimension (n_heads × head_dim)
+
+        /// Memory footprint of Wo tile [M_tile × K_tile × 2 bytes]
+        size_t wo_tile_bytes() const
+        {
+            return static_cast<size_t>(M_tile) * K_tile * sizeof(int16_t);
+        }
+
+        /// Memory footprint of context tile [K_tile × 2 bytes] (per query)
+        size_t context_tile_bytes() const
+        {
+            return static_cast<size_t>(K_tile) * sizeof(int16_t);
+        }
+
+        /// Memory footprint of accumulator tile [M_tile × N_tile × 4 bytes]
+        size_t accumulator_tile_bytes() const
+        {
+            return static_cast<size_t>(M_tile) * N_tile * sizeof(int32_t);
+        }
+
+        /// Total L1 working set per query (Wo tile + context tile)
+        size_t l1_working_set() const
+        {
+            return wo_tile_bytes() + context_tile_bytes();
+        }
+    };
+
+    /**
+     * @brief Compute optimal Wo projection tile sizes based on cache hierarchy.
+     *
+     * Algorithm:
+     * 1. Start with M_tile from L2 constraint
+     * 2. Compute K_tile to fit [M_tile × K_tile × 2 + K_tile × 2] in L1
+     * 3. If K_tile is too small, reduce M_tile and retry
+     * 4. N_tile: Batch chunk to amortize Wo loads (prefill)
+     *
+     * @param d_model Output dimension (typically 896, 2048, etc.)
+     * @param input_dim Input dimension (n_heads × head_dim)
+     * @param batch_size Batch size (1 for decode, >1 for prefill)
+     * @return WoTileConfig with optimal tile sizes
+     */
+    inline WoTileConfig compute_wo_tile_config(int d_model, int input_dim, int batch_size = 1)
+    {
+        const auto &cache = cache_info();
+
+        WoTileConfig cfg;
+        cfg.d_model = d_model;
+        cfg.input_dim = input_dim;
+
+        const size_t l1_target = cache.l1_size / 2; // 50% of L1
+        const size_t l2_target = cache.l2_size / 4; // 25% of L2
+
+        // ===== Step 1: Initial M_tile from L2 constraint =====
+        // Accumulators [M_tile × N_tile × 4 bytes] should fit in L2
+        int M_tile = static_cast<int>(l2_target / (batch_size * sizeof(int32_t)));
+        M_tile = (M_tile / 16) * 16; // Round DOWN to multiple of 16
+        M_tile = std::clamp(M_tile, 16, 256);
+
+        // ===== Step 2: Compute K_tile to fit in L1 =====
+        // L1 working set: Wo tile [M_tile × K_tile × 2] + context tile [K_tile × 2]
+        // K_tile × (M_tile + 1) × 2 ≤ l1_target
+        // K_tile ≤ l1_target / ((M_tile + 1) × 2)
+        auto compute_k_tile = [&](int m_tile) -> int
+        {
+            int k = static_cast<int>(l1_target / ((m_tile + 1) * sizeof(int16_t)));
+            k = (k / 32) * 32; // Round DOWN to multiple of 32
+            return std::clamp(k, 32, 512);
+        };
+
+        int K_tile = compute_k_tile(M_tile);
+
+        // ===== Step 3: Reduce M_tile if K_tile is too small =====
+        // We want K_tile >= 64 for good SIMD utilization
+        while (K_tile < 64 && M_tile > 16)
+        {
+            M_tile -= 16;
+            K_tile = compute_k_tile(M_tile);
+        }
+
+        // Ensure K_tile doesn't exceed input_dim
+        if (K_tile > input_dim)
+        {
+            K_tile = (input_dim / 32) * 32;
+            if (K_tile == 0)
+                K_tile = input_dim;
+        }
+
+        cfg.M_tile = M_tile;
+        cfg.K_tile = K_tile;
+
+        // ===== Step 4: Determine N_tile (batch dimension) =====
+        if (batch_size <= 1)
+        {
+            cfg.N_tile = 1;
+        }
+        else
+        {
+            int N_tile = static_cast<int>(l2_target / (M_tile * sizeof(int32_t)));
+            cfg.N_tile = std::clamp(N_tile, 1, std::min(batch_size, 16));
+        }
+
+        return cfg;
+    }
+
+    /**
+     * @brief Get default Wo projection tile config (compile-time constants).
+     *
+     * Conservative defaults that work across most CPUs:
+     *   - M_tile=64: Good AVX-512 utilization
+     *   - K_tile=128: Fits in L1 with Wo tile
+     *   - N_tile=4: Moderate batch for prefill
+     */
+    inline constexpr WoTileConfig default_wo_tile_config(int d_model, int input_dim, int batch_size = 1)
+    {
+        return WoTileConfig{
+            64,                       // M_tile
+            128,                      // K_tile
+            (batch_size > 1) ? 4 : 1, // N_tile
+            d_model,
+            input_dim};
+    }
+
+    /// Legacy constants for backwards compatibility
+    /// @deprecated Use compute_wo_tile_config() instead
+    constexpr int WO_M_TILE = 64;
+    constexpr int WO_K_TILE = 128;
 
     // ============================================================================
     // Normalization: INT32 → INT16 for Wo multiply
