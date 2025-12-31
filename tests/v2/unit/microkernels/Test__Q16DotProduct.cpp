@@ -688,3 +688,304 @@ TEST_F(Test__Q16DotProduct, FP32Accuracy_CosineSimilarity_Block128)
     EXPECT_GT(mean_cosine_sim, 0.99) << "Mean cosine similarity too low for Q16 block128";
     EXPECT_GT(min_cosine_sim, 0.95) << "Worst-case cosine similarity too low";
 }
+
+// ============================================================================
+// q16_qk_gemm_tile Tests (FA2 Prefill Pattern)
+// ============================================================================
+
+TEST_F(Test__Q16DotProduct, GEMMTile_2x2_Block64)
+{
+    // Small 2x2 tile test
+    const int Br = 2; // Query tile size
+    const int Bc = 2; // Key tile size
+    const int head_dim = 64;
+    const int blocks_per_row = 1;
+
+    // Create Q tile [Br, blocks_per_row]
+    std::vector<Q16_1Block_64> Q(Br);
+    for (int q = 0; q < Br; ++q)
+    {
+        Q[q] = createRandomBlock64(1.0f);
+    }
+
+    // Create K tile [Bc, blocks_per_row]
+    std::vector<Q16_1Block_64> K(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k] = createRandomBlock64(1.0f);
+    }
+
+    // Compute scores tile [Br, Bc]
+    std::vector<int32_t> scores(Br * Bc);
+    q16_qk_gemm_tile<Q16_1Block_64>(
+        Q.data(), K.data(), scores.data(),
+        Br, Bc, head_dim, blocks_per_row,
+        1, 1); // stride = 1 block per row
+
+    // Verify each score
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int k = 0; k < Bc; ++k)
+        {
+            int32_t expected = computeExpectedDot(&Q[q], &K[k], head_dim, blocks_per_row);
+            EXPECT_EQ(scores[q * Bc + k], expected)
+                << "Mismatch at Q=" << q << ", K=" << k;
+        }
+    }
+}
+
+TEST_F(Test__Q16DotProduct, GEMMTile_4x8_Block64)
+{
+    // Larger tile: 4 queries × 8 keys
+    const int Br = 4;
+    const int Bc = 8;
+    const int head_dim = 64;
+    const int blocks_per_row = 1;
+
+    std::vector<Q16_1Block_64> Q(Br);
+    for (int q = 0; q < Br; ++q)
+    {
+        Q[q] = createRandomBlock64(1.0f);
+    }
+
+    std::vector<Q16_1Block_64> K(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k] = createRandomBlock64(1.0f);
+    }
+
+    std::vector<int32_t> scores(Br * Bc);
+    q16_qk_gemm_tile<Q16_1Block_64>(
+        Q.data(), K.data(), scores.data(),
+        Br, Bc, head_dim, blocks_per_row,
+        1, 1);
+
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int k = 0; k < Bc; ++k)
+        {
+            int32_t expected = computeExpectedDot(&Q[q], &K[k], head_dim, blocks_per_row);
+            EXPECT_EQ(scores[q * Bc + k], expected)
+                << "Mismatch at Q=" << q << ", K=" << k;
+        }
+    }
+}
+
+TEST_F(Test__Q16DotProduct, GEMMTile_4x8_Block128)
+{
+    // Same test for Block128
+    const int Br = 4;
+    const int Bc = 8;
+    const int head_dim = 128;
+    const int blocks_per_row = 1;
+
+    std::vector<Q16_1Block_128> Q(Br);
+    for (int q = 0; q < Br; ++q)
+    {
+        Q[q] = createRandomBlock128(1.0f);
+    }
+
+    std::vector<Q16_1Block_128> K(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k] = createRandomBlock128(1.0f);
+    }
+
+    std::vector<int32_t> scores(Br * Bc);
+    q16_qk_gemm_tile<Q16_1Block_128>(
+        Q.data(), K.data(), scores.data(),
+        Br, Bc, head_dim, blocks_per_row,
+        1, 1);
+
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int k = 0; k < Bc; ++k)
+        {
+            int32_t expected = computeExpectedDot(&Q[q], &K[k], head_dim, blocks_per_row);
+            EXPECT_EQ(scores[q * Bc + k], expected)
+                << "Mismatch at Q=" << q << ", K=" << k;
+        }
+    }
+}
+
+TEST_F(Test__Q16DotProduct, GEMMTileDispatch_Block64)
+{
+    const int Br = 4;
+    const int Bc = 4;
+    const int head_dim = 64;
+
+    std::vector<Q16_1Block_64> Q(Br);
+    for (int q = 0; q < Br; ++q)
+    {
+        Q[q] = createRandomBlock64(1.0f);
+    }
+
+    std::vector<Q16_1Block_64> K(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k] = createRandomBlock64(1.0f);
+    }
+
+    std::vector<int32_t> scores(Br * Bc);
+    q16_qk_gemm_tile_dispatch(
+        Q.data(), K.data(), scores.data(),
+        Br, Bc, head_dim, Q16BlockSize::BLOCK_64,
+        1, 1);
+
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int k = 0; k < Bc; ++k)
+        {
+            int32_t expected = computeExpectedDot(&Q[q], &K[k], head_dim, 1);
+            EXPECT_EQ(scores[q * Bc + k], expected)
+                << "Dispatch mismatch at Q=" << q << ", K=" << k;
+        }
+    }
+}
+
+TEST_F(Test__Q16DotProduct, GEMMTileDispatch_Block128)
+{
+    const int Br = 4;
+    const int Bc = 4;
+    const int head_dim = 128;
+
+    std::vector<Q16_1Block_128> Q(Br);
+    for (int q = 0; q < Br; ++q)
+    {
+        Q[q] = createRandomBlock128(1.0f);
+    }
+
+    std::vector<Q16_1Block_128> K(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        K[k] = createRandomBlock128(1.0f);
+    }
+
+    std::vector<int32_t> scores(Br * Bc);
+    q16_qk_gemm_tile_dispatch(
+        Q.data(), K.data(), scores.data(),
+        Br, Bc, head_dim, Q16BlockSize::BLOCK_128,
+        1, 1);
+
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int k = 0; k < Bc; ++k)
+        {
+            int32_t expected = computeExpectedDot(&Q[q], &K[k], head_dim, 1);
+            EXPECT_EQ(scores[q * Bc + k], expected)
+                << "Dispatch mismatch at Q=" << q << ", K=" << k;
+        }
+    }
+}
+
+TEST_F(Test__Q16DotProduct, GEMMTile_FP32Accuracy_CosineSimilarity)
+{
+    /**
+     * Test tiled GEMM accuracy using cosine similarity.
+     * Compares Q16 tiled scores against FP32 reference.
+     */
+    const int num_batches = 100;
+    const int Br = 4;
+    const int Bc = 8;
+    const int head_dim = 64;
+    const float scale = 1.0f / 128.0f;
+
+    double total_cosine_sim = 0.0;
+    double min_cosine_sim = 1.0;
+
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (int b = 0; b < num_batches; ++b)
+    {
+        // Generate random FP32 Q and K tiles
+        std::vector<std::vector<float>> Q_fp32(Br, std::vector<float>(head_dim));
+        std::vector<std::vector<float>> K_fp32(Bc, std::vector<float>(head_dim));
+
+        for (int q = 0; q < Br; ++q)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                Q_fp32[q][d] = dist(rng_);
+            }
+        }
+        for (int k = 0; k < Bc; ++k)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                K_fp32[k][d] = dist(rng_);
+            }
+        }
+
+        // FP32 reference scores
+        std::vector<double> ref_scores(Br * Bc);
+        for (int q = 0; q < Br; ++q)
+        {
+            for (int k = 0; k < Bc; ++k)
+            {
+                double dot = 0.0;
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    dot += Q_fp32[q][d] * K_fp32[k][d];
+                }
+                ref_scores[q * Bc + k] = dot;
+            }
+        }
+
+        // Quantize to Q16
+        std::vector<Q16_1Block_64> Q(Br);
+        std::vector<Q16_1Block_64> K(Bc);
+
+        for (int q = 0; q < Br; ++q)
+        {
+            Q[q].d = scale;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                Q[q].qs[d] = static_cast<int16_t>(std::clamp(
+                    std::round(Q_fp32[q][d] / scale), -32767.0f, 32767.0f));
+            }
+        }
+        for (int k = 0; k < Bc; ++k)
+        {
+            K[k].d = scale;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                K[k].qs[d] = static_cast<int16_t>(std::clamp(
+                    std::round(K_fp32[k][d] / scale), -32767.0f, 32767.0f));
+            }
+        }
+
+        // Q16 tiled GEMM
+        std::vector<int32_t> q16_scores_int(Br * Bc);
+        q16_qk_gemm_tile<Q16_1Block_64>(
+            Q.data(), K.data(), q16_scores_int.data(),
+            Br, Bc, head_dim, 1, 1, 1);
+
+        // Convert to FP32
+        std::vector<double> q16_scores(Br * Bc);
+        for (int i = 0; i < Br * Bc; ++i)
+        {
+            q16_scores[i] = static_cast<double>(q16_scores_int[i]) * scale * scale;
+        }
+
+        // Compute cosine similarity
+        double dot_ab = 0.0, norm_a = 0.0, norm_b = 0.0;
+        for (int i = 0; i < Br * Bc; ++i)
+        {
+            dot_ab += ref_scores[i] * q16_scores[i];
+            norm_a += ref_scores[i] * ref_scores[i];
+            norm_b += q16_scores[i] * q16_scores[i];
+        }
+
+        double cosine_sim = dot_ab / (std::sqrt(norm_a) * std::sqrt(norm_b) + 1e-10);
+        total_cosine_sim += cosine_sim;
+        min_cosine_sim = std::min(min_cosine_sim, cosine_sim);
+    }
+
+    double mean_cosine_sim = total_cosine_sim / num_batches;
+
+    std::cout << "  [Q16 GEMM Tile CosineSim] Mean: " << std::fixed << std::setprecision(6)
+              << mean_cosine_sim << ", Min: " << min_cosine_sim << std::endl;
+
+    EXPECT_GT(mean_cosine_sim, 0.999) << "Mean cosine similarity too low for tiled GEMM";
+    EXPECT_GT(min_cosine_sim, 0.99) << "Worst-case cosine similarity too low";
+}

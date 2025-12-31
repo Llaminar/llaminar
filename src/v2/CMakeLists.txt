@@ -650,6 +650,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulate.cpp        # v2: P×V integer accumulation microkernel
     kernels/cpu/attention/q16_1/ref/microkernels/WoProjection.cpp        # v2: Wo projection INT32→Q16_1 microkernel
     kernels/cpu/attention/q16_1/ref/microkernels/OnlineSoftmax.cpp       # v2: FlashDecode online softmax microkernel
+    kernels/cpu/attention/q16_1/ref/microkernels/MLAAttention.cpp        # v2: MLA (DeepSeek V3/Kimi K2) dual NOPE+ROPE attention
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)

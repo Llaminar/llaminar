@@ -265,7 +265,8 @@ TEST_F(Test__Q16OnlineSoftmax, ComputeRescale_NoChange)
     online_softmax_compute_rescale(1000, 1000, 0.01f, scale_num, scale_shift);
 
     // scale_num >> scale_shift ≈ 1.0 when interpreted as fixed-point
-    float factor = static_cast<float>(scale_num) / (1 << scale_shift);
+    // Use 1LL to avoid signed overflow when scale_shift >= 31
+    float factor = static_cast<float>(scale_num) / static_cast<float>(1LL << scale_shift);
     EXPECT_NEAR(factor, 1.0f, 0.01f);
 }
 
@@ -278,7 +279,9 @@ TEST_F(Test__Q16OnlineSoftmax, ComputeRescale_MaxIncreased)
     // correction = exp(-100 * 0.01) = exp(-1) ≈ 0.368
     online_softmax_compute_rescale(1000, 1100, 0.01f, scale_num, scale_shift);
 
-    float factor = static_cast<float>(scale_num) / (1 << scale_shift);
+    // Use 1LL to avoid signed overflow when scale_shift >= 31
+    // (default lut_value_bits=30, so scale_shift = 30 + ip can reach 31+)
+    float factor = static_cast<float>(scale_num) / static_cast<float>(1LL << scale_shift);
     float expected = std::exp(-100.0f * 0.01f);
 
     EXPECT_NEAR(factor, expected, 0.05f) << "Rescale factor mismatch";
@@ -601,4 +604,408 @@ TEST_F(Test__Q16OnlineSoftmax, EdgeCase_ExtremeScoreGap)
 
     // Match reference
     EXPECT_NEAR(online[0], ref[0], 0.01f);
+}
+
+// ============================================================================
+// online_softmax_update_block Tests (Direct API Coverage)
+// ============================================================================
+
+TEST_F(Test__Q16OnlineSoftmax, UpdateBlock_FirstBlock_NoRescale)
+{
+    // First block should never need rescaling
+    OnlineSoftmaxState state;
+    state.reset();
+
+    std::vector<int32_t> scores = {1000, 800, 600, 400};
+    std::vector<int32_t> weights(4);
+    float alpha = 0.01f;
+
+    int32_t scale_num;
+    int scale_shift;
+
+    bool needs_rescale = online_softmax_update_block(
+        state, scores.data(), weights.data(),
+        4, alpha, scale_num, scale_shift);
+
+    EXPECT_FALSE(needs_rescale) << "First block should never need rescaling";
+    EXPECT_EQ(state.m, 1000) << "Max should be highest score";
+    EXPECT_GT(state.l, 0) << "Sum should be positive";
+    EXPECT_EQ(state.count, 4) << "Should count all unmasked positions";
+}
+
+TEST_F(Test__Q16OnlineSoftmax, UpdateBlock_SecondBlock_TriggersRescale)
+{
+    // Process first block, then second with higher max
+    OnlineSoftmaxState state;
+    state.reset();
+    float alpha = 0.01f;
+
+    // First block
+    std::vector<int32_t> scores1 = {500, 400, 300, 200};
+    std::vector<int32_t> weights1(4);
+    int32_t scale_num;
+    int scale_shift;
+
+    online_softmax_update_block(
+        state, scores1.data(), weights1.data(),
+        4, alpha, scale_num, scale_shift);
+
+    int64_t l_after_first = state.l;
+    EXPECT_EQ(state.m, 500);
+
+    // Second block with higher max
+    std::vector<int32_t> scores2 = {1000, 900, 800, 700};
+    std::vector<int32_t> weights2(4);
+
+    bool needs_rescale = online_softmax_update_block(
+        state, scores2.data(), weights2.data(),
+        4, alpha, scale_num, scale_shift);
+
+    EXPECT_TRUE(needs_rescale) << "Should need rescaling when max increases";
+    EXPECT_EQ(state.m, 1000) << "Max should update to 1000";
+    EXPECT_LT(state.l, l_after_first * 2) << "Old sum should be rescaled down";
+    EXPECT_EQ(state.count, 8) << "Should count all positions";
+}
+
+TEST_F(Test__Q16OnlineSoftmax, UpdateBlock_AllMasked)
+{
+    OnlineSoftmaxState state;
+    state.reset();
+
+    std::vector<int32_t> scores = {MASKED, MASKED, MASKED, MASKED};
+    std::vector<int32_t> weights(4);
+    float alpha = 0.01f;
+
+    int32_t scale_num;
+    int scale_shift;
+
+    bool needs_rescale = online_softmax_update_block(
+        state, scores.data(), weights.data(),
+        4, alpha, scale_num, scale_shift);
+
+    EXPECT_FALSE(needs_rescale);
+    EXPECT_EQ(state.count, 0) << "No positions should be counted";
+
+    // All weights should be zero
+    for (int i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(weights[i], 0) << "Masked position " << i << " should have zero weight";
+    }
+}
+
+TEST_F(Test__Q16OnlineSoftmax, UpdateBlock_PartialMask)
+{
+    OnlineSoftmaxState state;
+    state.reset();
+
+    std::vector<int32_t> scores = {1000, MASKED, 800, MASKED};
+    std::vector<int32_t> weights(4);
+    float alpha = 0.01f;
+
+    int32_t scale_num;
+    int scale_shift;
+
+    online_softmax_update_block(
+        state, scores.data(), weights.data(),
+        4, alpha, scale_num, scale_shift);
+
+    EXPECT_EQ(state.m, 1000) << "Max should ignore masked";
+    EXPECT_EQ(state.count, 2) << "Only unmasked positions counted";
+    EXPECT_EQ(weights[1], 0) << "Masked should be zero";
+    EXPECT_EQ(weights[3], 0) << "Masked should be zero";
+    EXPECT_GT(weights[0], 0) << "Unmasked should have weight";
+    EXPECT_GT(weights[2], 0) << "Unmasked should have weight";
+}
+
+// ============================================================================
+// online_softmax_finalize_weights Tests
+// ============================================================================
+
+TEST_F(Test__Q16OnlineSoftmax, FinalizeWeights_Normalization)
+{
+    // Setup state manually
+    OnlineSoftmaxState state;
+    state.reset();
+    state.l = 100000; // Sum of unnormalized weights
+    state.count = 4;
+
+    // Input weights (unnormalized INT32)
+    std::vector<int32_t> block_weights = {40000, 30000, 20000, 10000};
+
+    // Output weights (normalized INT16)
+    std::vector<int16_t> final_weights(4);
+    int16_t weight_max = 32767;
+
+    int32_t total = online_softmax_finalize_weights(
+        state, block_weights.data(), final_weights.data(),
+        4, weight_max);
+
+    // Check normalization: w_final = block_weights * weight_max / l
+    // Expected: 40000 * 32767 / 100000 ≈ 13107
+    EXPECT_NEAR(final_weights[0], 13107, 100);
+    EXPECT_NEAR(final_weights[1], 9830, 100);
+    EXPECT_NEAR(final_weights[2], 6553, 100);
+    EXPECT_NEAR(final_weights[3], 3277, 100);
+
+    // Total should be close to weight_max (but not exact due to rounding)
+    EXPECT_GT(total, 0);
+    EXPECT_LE(total, weight_max * 4);
+}
+
+TEST_F(Test__Q16OnlineSoftmax, FinalizeWeights_ZeroSum)
+{
+    OnlineSoftmaxState state;
+    state.reset();
+    state.l = 0; // No unmasked positions
+
+    std::vector<int32_t> block_weights = {0, 0, 0, 0};
+    std::vector<int16_t> final_weights(4, 999); // Initialize to non-zero
+
+    int32_t total = online_softmax_finalize_weights(
+        state, block_weights.data(), final_weights.data(),
+        4, 32767);
+
+    EXPECT_EQ(total, 0);
+    for (int i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(final_weights[i], 0) << "Position " << i << " should be zero";
+    }
+}
+
+TEST_F(Test__Q16OnlineSoftmax, FinalizeWeights_SingleDominant)
+{
+    OnlineSoftmaxState state;
+    state.reset();
+    state.l = 1000000;
+
+    // One dominant position
+    std::vector<int32_t> block_weights = {990000, 5000, 3000, 2000};
+    std::vector<int16_t> final_weights(4);
+
+    online_softmax_finalize_weights(
+        state, block_weights.data(), final_weights.data(),
+        4, 32767);
+
+    // Dominant should get most of the weight
+    EXPECT_GT(final_weights[0], 30000);
+    EXPECT_LT(final_weights[1], 200);
+    EXPECT_LT(final_weights[2], 100);
+    EXPECT_LT(final_weights[3], 100);
+}
+
+// ============================================================================
+// flash_decode_process_kv_block Tests (End-to-End Block Processing)
+// ============================================================================
+
+TEST_F(Test__Q16OnlineSoftmax, FlashDecodeProcessBlock_SingleBlock_Block64)
+{
+    /**
+     * Test the complete flash_decode_process_kv_block function.
+     * This is the main entry point for FlashDecode attention.
+     */
+    const int head_dim = 64;
+    const int kv_block_size = 4;
+    const int blocks_per_row = 1;
+    const float alpha = 0.01f;
+
+    // Create Q vector
+    Q16_1Block_64 Q;
+    Q.d = 1.0f;
+    for (int i = 0; i < 64; ++i)
+    {
+        Q.qs[i] = static_cast<int16_t>(100 + i);
+    }
+
+    // Create K and V blocks [kv_block_size, blocks_per_row]
+    std::vector<Q16_1Block_64> K(kv_block_size);
+    std::vector<Q16_1Block_64> V(kv_block_size);
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int16_t> dist(-500, 500);
+
+    for (int k = 0; k < kv_block_size; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    // Initialize context and state
+    std::vector<int32_t> context(head_dim, 0);
+    OnlineSoftmaxState state;
+    state.reset();
+
+    // Scratch buffers
+    std::vector<int32_t> scores_scratch(kv_block_size);
+    std::vector<int32_t> weights_scratch(kv_block_size);
+
+    // Process block
+    flash_decode_process_kv_block<Q16_1Block_64>(
+        &Q, K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        0, kv_block_size,
+        head_dim, blocks_per_row, alpha);
+
+    // Verify state was updated
+    EXPECT_GT(state.m, std::numeric_limits<int32_t>::min()) << "Max should be set";
+    EXPECT_GT(state.l, 0) << "Sum should be positive";
+    EXPECT_EQ(state.count, kv_block_size) << "All positions counted";
+
+    // Context should have some non-zero values
+    bool has_nonzero = false;
+    for (int d = 0; d < head_dim; ++d)
+    {
+        if (context[d] != 0)
+            has_nonzero = true;
+    }
+    EXPECT_TRUE(has_nonzero) << "Context should have accumulated values";
+}
+
+TEST_F(Test__Q16OnlineSoftmax, FlashDecodeProcessBlock_MultipleBlocks_Block64)
+{
+    /**
+     * Test processing multiple KV blocks sequentially.
+     * This tests the online rescaling mechanism.
+     */
+    const int head_dim = 64;
+    const int kv_block_size = 4;
+    const int num_blocks = 4;
+    const int blocks_per_row = 1;
+    const float alpha = 0.01f;
+
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int16_t> dist(-500, 500);
+
+    // Create Q
+    Q16_1Block_64 Q;
+    Q.d = 1.0f;
+    for (int i = 0; i < 64; ++i)
+    {
+        Q.qs[i] = static_cast<int16_t>(dist(rng));
+    }
+
+    // Create K and V for all blocks
+    std::vector<Q16_1Block_64> K(kv_block_size * num_blocks);
+    std::vector<Q16_1Block_64> V(kv_block_size * num_blocks);
+
+    for (int k = 0; k < kv_block_size * num_blocks; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    // Process blocks sequentially
+    std::vector<int32_t> context(head_dim, 0);
+    OnlineSoftmaxState state;
+    state.reset();
+
+    std::vector<int32_t> scores_scratch(kv_block_size);
+    std::vector<int32_t> weights_scratch(kv_block_size);
+
+    for (int b = 0; b < num_blocks; ++b)
+    {
+        flash_decode_process_kv_block<Q16_1Block_64>(
+            &Q, K.data(), V.data(),
+            context.data(), state,
+            scores_scratch.data(), weights_scratch.data(),
+            b * kv_block_size, kv_block_size,
+            head_dim, blocks_per_row, alpha);
+    }
+
+    // Verify final state
+    EXPECT_EQ(state.count, kv_block_size * num_blocks);
+    EXPECT_GT(state.l, 0);
+
+    // Context should have accumulated from all blocks
+    double context_norm = 0.0;
+    for (int d = 0; d < head_dim; ++d)
+    {
+        context_norm += static_cast<double>(context[d]) * context[d];
+    }
+    EXPECT_GT(context_norm, 0.0) << "Context should have non-zero values";
+}
+
+TEST_F(Test__Q16OnlineSoftmax, FlashDecodeProcessBlock_Block128)
+{
+    /**
+     * Same test for Block128 variant.
+     */
+    const int head_dim = 128;
+    const int kv_block_size = 8;
+    const int blocks_per_row = 1;
+    const float alpha = 1.0f / std::sqrt(128.0f);
+
+    std::mt19937 rng(99999);
+    std::uniform_int_distribution<int16_t> dist(-300, 300);
+
+    Q16_1Block_128 Q;
+    Q.d = 1.0f;
+    for (int i = 0; i < 128; ++i)
+    {
+        Q.qs[i] = dist(rng);
+    }
+
+    std::vector<Q16_1Block_128> K(kv_block_size);
+    std::vector<Q16_1Block_128> V(kv_block_size);
+
+    for (int k = 0; k < kv_block_size; ++k)
+    {
+        K[k].d = 1.0f;
+        V[k].d = 1.0f;
+        for (int i = 0; i < 128; ++i)
+        {
+            K[k].qs[i] = dist(rng);
+            V[k].qs[i] = dist(rng);
+        }
+    }
+
+    std::vector<int32_t> context(head_dim, 0);
+    OnlineSoftmaxState state;
+    state.reset();
+
+    std::vector<int32_t> scores_scratch(kv_block_size);
+    std::vector<int32_t> weights_scratch(kv_block_size);
+
+    flash_decode_process_kv_block<Q16_1Block_128>(
+        &Q, K.data(), V.data(),
+        context.data(), state,
+        scores_scratch.data(), weights_scratch.data(),
+        0, kv_block_size,
+        head_dim, blocks_per_row, alpha);
+
+    EXPECT_EQ(state.count, kv_block_size);
+    EXPECT_GT(state.l, 0);
+
+    bool has_nonzero = false;
+    for (int d = 0; d < head_dim; ++d)
+    {
+        if (context[d] != 0)
+            has_nonzero = true;
+    }
+    EXPECT_TRUE(has_nonzero);
+}
+
+TEST_F(Test__Q16OnlineSoftmax, OnlineSoftmaxState_Empty)
+{
+    // Test the OnlineSoftmaxState::empty() method
+    OnlineSoftmaxState state;
+    state.reset();
+
+    EXPECT_TRUE(state.empty()) << "Fresh state should be empty";
+
+    state.count = 1;
+    EXPECT_FALSE(state.empty()) << "State with count > 0 should not be empty";
+
+    state.count = 0;
+    EXPECT_TRUE(state.empty()) << "State with count = 0 should be empty";
 }

@@ -3437,6 +3437,38 @@ namespace llaminar2
         // Used for embedding output where we only fill part of the buffer
         bool copyFrom_fp32_rows(const float *src_data, size_t num_rows);
 
+        /**
+         * @brief Copy from FP32 data using FIXED-SCALE quantization with VNNI-safe clipping
+         *
+         * CRITICAL: This method MUST be used for Q/K/V tensors in integer attention.
+         * Unlike copyFrom_fp32() which uses adaptive per-block scaling, this uses a
+         * fixed scale and clips INT16 values to prevent VNNI INT32 overflow.
+         *
+         * Formula: int16 = clip(round(fp32 * 32767 / kv_cache_scale), ±MAX_SAFE_INT16)
+         *
+         * See: kernels/cpu/attention/q16_1/VNNISafetyConstants.h for limits
+         * See: docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
+         *
+         * @param src_data Source FP32 data
+         * @param kv_cache_scale The fixed scale factor (e.g., 8.0 for ±8.0 FP32 range)
+         * @param head_dim The attention head dimension (for VNNI safety limits)
+         * @return true if successful
+         */
+        bool copyFrom_fp32_fixed_scale(const float *src_data, float kv_cache_scale, int head_dim);
+
+        /**
+         * @brief Copy from FP32 data for only the first num_rows rows with fixed-scale quantization
+         *
+         * CRITICAL: This method MUST be used for Q/K/V tensors in integer attention.
+         *
+         * @param src_data Source FP32 data
+         * @param num_rows Number of rows to copy
+         * @param kv_cache_scale The fixed scale factor (e.g., 8.0 for ±8.0 FP32 range)
+         * @param head_dim The attention head dimension (for VNNI safety limits)
+         * @return true if successful
+         */
+        bool copyFrom_fp32_rows_fixed_scale(const float *src_data, size_t num_rows, float kv_cache_scale, int head_dim);
+
     private:
         // Private view constructor
         Q16_1Tensor(const std::vector<size_t> &shape,

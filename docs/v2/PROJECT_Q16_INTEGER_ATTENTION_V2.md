@@ -1,6 +1,6 @@
 # Q16_1 Integer-Domain Attention Kernel v2
 
-**Status**: In Progress (Phase 5.3 - MLA Microkernel Support)  
+**Status**: In Progress (Phase 6 - Integer Residual Add)  
 **Created**: 2025-12-30  
 **Updated**: 2025-12-31  
 **Author**: Llaminar Team  
@@ -100,12 +100,47 @@
   - [x] `q16_pv_gemm_tile<BlockType>()`: FA2 tiled P×V path ✅
   - [x] `q16_context_rescale()`: Online softmax rescaling ✅
   - [x] `Test__PVAccumulate.cpp`: 12 unit tests (all passing) ✅
-- [ ] Phase 5.3: MLA (Multi-head Latent Attention) Support
-  - [ ] `MLAAttentionParams` struct with split NOPE/ROPE tensors
-  - [ ] `q16_qk_gemv_mla()`: Dual dot product (NOPE + ROPE)
-  - [ ] `q16_qk_gemm_tile_mla()`: Tiled MLA variant
-  - [ ] MLA-aware KV cache with separate NOPE/ROPE storage
-  - [ ] Integration tests with DeepSeek V3 / Kimi K2 configs
+- [x] Phase 5.3: MLA (Multi-head Latent Attention) Support ✅
+  - [x] `MLAAttention.h/.cpp`: MLA microkernel implementations ✅
+  - [x] `MLAConfig` struct with NOPE_DIM=128, ROPE_DIM=64, V_DIM=128 ✅
+  - [x] `MLAAttentionParams` struct with split NOPE/ROPE tensors ✅
+  - [x] `q16_dot_single_mla()`: Single MLA dot product (NOPE + ROPE) ✅
+  - [x] `q16_qk_gemv_mla()`: Flash Decode GEMV for MLA ✅
+  - [x] `q16_qk_gemm_tile_mla()`: FA2 Prefill tiled MLA variant ✅
+  - [x] `mla_apply_scales()`: Weighted scale application ✅
+  - [x] `Test__MLAAttention.cpp`: 20 unit tests (all passing) ✅
+  - [x] VNNI INT32 overflow constraints documented ✅
+  - [x] Safe value limits: MAX_SAFE_VALUE=3344 (192-dim), NOPE=4095, ROPE=5792 ✅
+  - [x] Sub-block accumulation (NOPE+ROPE separate partials) ✅
+- [x] Phase 5.4: Fixed-Scale Quantization with INT16 Clipping (CRITICAL) ✅
+  - [x] Create `src/v2/kernels/cpu/attention/q16_1/VNNISafetyConstants.h`:
+    - [x] `MAX_SAFE_INT16_64  = 23170` (head_dim=64,  safe FP32 ±5.66 with scale=8)
+    - [x] `MAX_SAFE_INT16_96  = 18918` (head_dim=96,  safe FP32 ±4.62 with scale=8)
+    - [x] `MAX_SAFE_INT16_128 = 16383` (head_dim=128, safe FP32 ±4.00 with scale=8)
+    - [x] `MAX_SAFE_INT16_192 = 13377` (head_dim=192, safe FP32 ±3.27 with scale=8)
+    - [x] `MAX_SAFE_INT16_DEFAULT = 13377` (conservative for head_dim ≤ 192)
+    - [x] `get_max_safe_int16(head_dim)` helper function
+    - [x] `clip_to_safe_int16(int32_t val, int head_dim)` helper function
+    - [x] Additional helpers: `compute_max_safe_int16()`, `get_safe_fp32_range()`, etc.
+  - [x] Add `Q16_1Tensor::copyFrom_fp32_fixed_scale(src, scale, head_dim)` method:
+    - [x] Uses `kv_cache_scale` instead of per-block `max_abs`
+    - [x] Clips INT16 values to `±MAX_SAFE_INT16` for given head_dim
+    - [x] All blocks share same scale factor `d = kv_cache_scale / 32767.0f`
+  - [x] Add `Q16_1Tensor::copyFrom_fp32_rows_fixed_scale()` for row-wise quantization
+  - [ ] Modify `KVCacheAppendStage` to use fixed scale:
+    - [ ] Pass `GraphSchema::kv_cache_scale` to quantization
+    - [ ] Pass `head_dim` for proper clipping limits
+  - [ ] Integrate `normalize_q16_head()` into `FusedQKVGEMMStage` for Q tensor
+  - [ ] Add debug-build overflow detection:
+    - [ ] Assert INT16 values ≤ MAX_SAFE_INT16 during quantization
+    - [ ] Log warning if clipping occurs frequently (>1% of values)
+  - [x] Unit tests (`Test__Q16FixedScaleQuantization.cpp`):
+    - [x] Verify INT16 values stay within safe bounds (22 tests passing)
+    - [x] Verify clipping behavior for outliers
+    - [x] Verify no INT32 overflow with clipped values (VNNI simulation)
+  - [ ] E2E test: verify no overflow with real model activations
+  - See: `tests/v2/unit/microkernels/Test__VNNIOverflowAnalysis.cpp` for derivation
+  - See: "VNNI OVERFLOW PREVENTION CONTRACT" section below for full contract
 - [ ] Phase 6: Implement integer residual add
 - [ ] Phase 7: FA2 Prefill tiled implementation
 - [ ] Phase 8: Unit tests for Q16IntegerAttention
@@ -717,15 +752,122 @@ The key advantage of our templated microkernel design:
 ### Implementation Checklist for MLA Support
 
 ```
-[ ] Phase 5.3: MLA Microkernel Support
-    [ ] Add MLAAttentionParams struct to Q16IntegerAttentionRef.h
-    [ ] Implement q16_qk_gemv_mla() in Q16DotProduct.cpp
-    [ ] Implement q16_qk_gemm_tile_mla() in Q16DotProduct.cpp  
-    [ ] Add compute_mla_qk_scale() helper
-    [ ] Extend UnifiedKVCache for separate NOPE/ROPE storage
-    [ ] Update GraphOrchestrator to detect MLA architecture from model config
-    [ ] Create Test__MLAAttention.cpp with DeepSeek V3 config
-    [ ] E2E parity test with PyTorch MLA reference
+[x] Phase 5.3: MLA Microkernel Support ✅ (Completed 2025-12-31)
+    [x] Add MLAConfig struct with NOPE_DIM=128, ROPE_DIM=64, V_DIM=128
+    [x] Add MLAAttentionParams struct to MLAAttention.h
+    [x] Implement q16_dot_single_mla() - combined NOPE+ROPE dot product
+    [x] Implement q16_qk_gemv_mla() - Flash Decode GEMV path
+    [x] Implement q16_qk_gemm_tile_mla() - FA2 Prefill tiled path
+    [x] Add mla_apply_scales() for weighted scale combination
+    [x] Create Test__MLAAttention.cpp with 20 unit tests
+    [x] DeepSeek V3 / Kimi K2 configuration tests
+    [x] VNNI-safe value limit documentation and tests
+    
+    Note: MLA-aware KV cache storage and E2E parity tests deferred to
+    integration phase when actual MLA models are available for testing.
+```
+
+### VNNI INT32 Overflow Prevention
+
+AVX-512 VNNI (`VPDPWSSD`) performs INT16×INT16→INT32 accumulation. For N dimensions,
+the maximum safe per-element int16 value is `floor(sqrt(INT32_MAX / N))`:
+
+| Configuration | Dimensions | Max Safe Value | Max Sum |
+|---------------|------------|----------------|---------|
+| MLA Combined | 192 | ±3344 | 2,146,344,960 |
+| NOPE Only | 128 | ±4095 | 2,146,467,840 |
+| ROPE Only | 64 | ±5792 | 2,146,467,872 |
+| INT32_MAX | - | - | 2,147,483,647 |
+
+**Implementation Strategy**: Sub-block accumulation
+- NOPE and ROPE are accumulated into separate int32 partials
+- Partials are summed at the end (2 int32 → 1 int32)
+- Each component stays within its per-component limit
+- Real model activations (bounded by `kv_cache_scale`) stay well within limits
+
+#### CRITICAL: The VNNI Contract (Three Parties)
+
+The INT32 overflow constraint creates a **contract** between three components:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    VNNI OVERFLOW PREVENTION CONTRACT                         │
+│                      (REVISED 2025-01-01 after analysis)                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│  KEY INSIGHT: VPDPWSSD accumulates 2 products per INT32 lane per instruction│
+│  Products per lane = head_dim / 16 (NOT head_dim!)                          │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│                                                                              │
+│  PARTY 1: kv_cache_scale Configuration (GraphSchema.h)                      │
+│  ─────────────────────────────────────────────────────────                  │
+│  Defines the expected FP32 activation range: [-scale, +scale]               │
+│  Default: ±8.0 (generous headroom for typical [-3, +3] activations)         │
+│                                                                              │
+│  PARTY 2: Fixed-Scale Quantization with CLIPPING                            │
+│  ─────────────────────────────────────────────────────────                  │
+│  Q16_1 quantization MUST use fixed scale AND clip outliers:                 │
+│    d = kv_cache_scale / 32767.0f  (FIXED)                                   │
+│    int16_val = clamp(round(fp32_val / d), -MAX_SAFE_INT16, +MAX_SAFE_INT16) │
+│                                                                              │
+│  MAX_SAFE_INT16 is computed from head_dim to guarantee no overflow:         │
+│    max_safe = floor(sqrt(INT32_MAX / (head_dim / 16)))                      │
+│                                                                              │
+│    head_dim │ Products/Lane │ MAX_SAFE_INT16 │ Equiv FP32 (scale=8)         │
+│    ─────────┼───────────────┼────────────────┼──────────────────────         │
+│         64  │             4 │         23170  │ ±5.66                         │
+│         96  │             6 │         18918  │ ±4.62                         │
+│        128  │             8 │         16383  │ ±4.00                         │
+│        192  │            12 │         13377  │ ±3.27                         │
+│        256  │            16 │         11585  │ ±2.83                         │
+│                                                                              │
+│  CONSERVATIVE DEFAULT: MAX_SAFE_INT16 = 13377 (safe for all head_dim ≤ 192) │
+│                                                                              │
+│  PARTY 3: Per-Head Scale Normalization                                      │
+│  ─────────────────────────────────────────────────────────                  │
+│  After quantization, normalize blocks within each head to unified scale.    │
+│  This allows integer-only attention without per-block scale tracking.       │
+│  Integration points:                                                         │
+│    - FusedQKVGEMMStage: Normalize Q after projection                        │
+│    - KVCacheAppendStage: Normalize K, V before cache write                  │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  CLIPPING IMPLEMENTATION:                                                   │
+│                                                                              │
+│  Option A: Clip FP32 before quantization                                    │
+│    float safe_range = MAX_SAFE_INT16 * kv_cache_scale / 32767.0f;           │
+│    fp32_val = clamp(fp32_val, -safe_range, +safe_range);                    │
+│    int16_val = round(fp32_val * 32767.0f / kv_cache_scale);                 │
+│                                                                              │
+│  Option B: Clip INT16 after quantization (PREFERRED - simpler)              │
+│    int16_val = round(fp32_val * 32767.0f / kv_cache_scale);                 │
+│    int16_val = clamp(int16_val, -MAX_SAFE_INT16, +MAX_SAFE_INT16);          │
+│                                                                              │
+│  Note: Clipping introduces small errors for outliers, but:                  │
+│    1. Outliers > 3σ are rare in well-normalized activations                 │
+│    2. Gradient clipping during training already bounds most values          │
+│    3. RMSNorm before attention keeps values in predictable range            │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  P×V WEIGHTED ACCUMULATION: PROVABLY SAFE (no clipping needed on P)         │
+│                                                                              │
+│  Softmax ensures Σ P[k] = 1.0 (= 32767 in INT16)                            │
+│  Even with MAX_SAFE_INT16 = 13377 for V:                                    │
+│    max |context[d]| = 32767 × 13377 = 438M << INT32_MAX (2.1B)             │
+│                                                                              │
+│  ✓ SAFE for ANY sequence length with any head_dim!                          │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  STATUS (as of 2025-01-01):                                                 │
+│    [✓] Party 1: kv_cache_scale defined in GraphSchema.h                     │
+│    [✗] Party 2: Q16_1Tensor uses ADAPTIVE scale (not fixed) - NEEDS FIX    │
+│    [✗] Party 2: No INT16 clipping implemented yet - NEEDS FIX              │
+│    [✓] Party 3: normalize_q16_head() implemented, NOT integrated - NEEDS FIX│
+│                                                                              │
+│  See Phase 5.4 in Progress section for remediation plan.                    │
+│  See tests/v2/unit/microkernels/Test__VNNIOverflowAnalysis.cpp for details. │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1779,15 +1921,15 @@ GraphSchema createSchema() const override {
 | Phase 5 | Wo projection microkernels | 2-3 hours | ✅ Complete |
 | Phase 5.1 | QK dot product microkernels | 2-3 hours | ✅ Complete |
 | Phase 5.2 | PV accumulation microkernels | 2-3 hours | ✅ Complete |
-| Phase 5.3 | **MLA microkernel support** | 3-4 hours | 🔜 Next |
-| Phase 6 | Integer residual add | 2-3 hours | Pending |
+| Phase 5.3 | MLA microkernel support | 3-4 hours | ✅ Complete |
+| Phase 6 | **Integer residual add** | 2-3 hours | 🔜 Next |
 | Phase 7 | FA2 Prefill tiled implementation | 4-6 hours | Pending |
 | Phase 8 | Unit tests for Q16IntegerAttention | 3-4 hours | Pending |
 | Phase 9 | E2E parity tests | 4-6 hours | Pending |
 | Phase 10 | KV Cache Scale Profiling Tool | 4-6 hours | Pending |
-| **Completed** | Phases 0-5.2 | **~22-28 hours** | ✅ |
-| **Remaining (core)** | Phases 5.3-9 | **~16-23 hours** | |
-| **Remaining (with profiling)** | Phases 5.3-10 | **~20-29 hours** | |
+| **Completed** | Phases 0-5.3 | **~25-32 hours** | ✅ |
+| **Remaining (core)** | Phases 6-9 | **~13-18 hours** | |
+| **Remaining (with profiling)** | Phases 6-10 | **~17-24 hours** | |
 
 ---
 

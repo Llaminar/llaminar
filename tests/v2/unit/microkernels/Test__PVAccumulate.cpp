@@ -827,3 +827,436 @@ TEST_F(Test__PVAccumulate, FP32Accuracy_ContextRescaling)
     // Max error can be high when reference is near zero
     EXPECT_LT(mean_rel_error, 0.1) << "Mean rescaling error too high";
 }
+
+// ============================================================================
+// q16_pv_accumulate_add Tests for Block128 (Coverage)
+// ============================================================================
+
+TEST_F(Test__PVAccumulate, AccumulateAdd_Block128_PreservesExisting)
+{
+    const int kv_len = 4;
+    const int head_dim = 128;
+    const int blocks_per_row = 1;
+
+    // Pre-initialize context
+    std::vector<int32_t> context(head_dim);
+    for (int d = 0; d < head_dim; ++d)
+    {
+        context[d] = d * 500;
+    }
+
+    // Zero weights
+    std::vector<int16_t> weights(kv_len, 0);
+    std::vector<Q16_1Block_128> V(kv_len);
+    for (int k = 0; k < kv_len; ++k)
+    {
+        V[k] = createRandomBlock128(1.0f);
+    }
+
+    q16_pv_accumulate_add<Q16_1Block_128>(
+        weights.data(), V.data(), context.data(),
+        kv_len, head_dim, blocks_per_row);
+
+    for (int d = 0; d < head_dim; ++d)
+    {
+        EXPECT_EQ(context[d], d * 500) << "Changed at dim " << d;
+    }
+}
+
+TEST_F(Test__PVAccumulate, AccumulateAdd_Block128_AddsToExisting)
+{
+    const int kv_len = 8;
+    const int head_dim = 128;
+    const int blocks_per_row = 1;
+
+    // Pre-initialize context
+    std::vector<int32_t> context(head_dim, 1000);
+
+    // Random weights
+    std::uniform_int_distribution<int16_t> wdist(1, 100);
+    std::vector<int16_t> weights(kv_len);
+    for (int k = 0; k < kv_len; ++k)
+    {
+        weights[k] = wdist(rng_);
+    }
+
+    // Random V
+    std::vector<Q16_1Block_128> V(kv_len);
+    for (int k = 0; k < kv_len; ++k)
+    {
+        V[k] = createRandomBlock128(1.0f);
+    }
+
+    // Compute expected (add to existing)
+    std::vector<int32_t> expected(head_dim, 1000);
+    for (int k = 0; k < kv_len; ++k)
+    {
+        int16_t w = weights[k];
+        for (int d = 0; d < head_dim; ++d)
+        {
+            expected[d] += static_cast<int32_t>(w) *
+                           static_cast<int32_t>(V[k].qs[d]);
+        }
+    }
+
+    q16_pv_accumulate_add<Q16_1Block_128>(
+        weights.data(), V.data(), context.data(),
+        kv_len, head_dim, blocks_per_row);
+
+    for (int d = 0; d < head_dim; ++d)
+    {
+        EXPECT_EQ(context[d], expected[d]) << "Mismatch at dim " << d;
+    }
+}
+
+// ============================================================================
+// q16_pv_gemm_tile Tests (FA2 Prefill Pattern)
+// ============================================================================
+
+TEST_F(Test__PVAccumulate, PVGEMMTile_2x2_Block64)
+{
+    // Small 2x2 tile test
+    const int Br = 2; // Query positions
+    const int Bc = 2; // Key/value positions
+    const int head_dim = 64;
+    const int blocks_per_row = 1;
+
+    // P matrix [Br, Bc] - attention weights
+    std::vector<int16_t> P(Br * Bc);
+    std::uniform_int_distribution<int16_t> wdist(0, 1000);
+    for (int i = 0; i < Br * Bc; ++i)
+    {
+        P[i] = wdist(rng_);
+    }
+
+    // V matrix [Bc, blocks_per_row]
+    std::vector<Q16_1Block_64> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        V[k] = createRandomBlock64(1.0f);
+    }
+
+    // Output context [Br, head_dim]
+    std::vector<int32_t> context(Br * head_dim, 0);
+
+    // Call tiled GEMM
+    q16_pv_gemm_tile<Q16_1Block_64>(
+        P.data(), V.data(), context.data(),
+        Br, Bc, head_dim, blocks_per_row,
+        Bc,             // p_stride = Bc (row-major P)
+        blocks_per_row, // v_stride
+        head_dim);      // context_stride
+
+    // Verify each query's context
+    for (int q = 0; q < Br; ++q)
+    {
+        std::vector<int32_t> expected(head_dim, 0);
+        for (int k = 0; k < Bc; ++k)
+        {
+            int16_t w = P[q * Bc + k];
+            for (int d = 0; d < head_dim; ++d)
+            {
+                expected[d] += static_cast<int32_t>(w) *
+                               static_cast<int32_t>(V[k].qs[d]);
+            }
+        }
+
+        for (int d = 0; d < head_dim; ++d)
+        {
+            EXPECT_EQ(context[q * head_dim + d], expected[d])
+                << "Mismatch at Q=" << q << ", dim=" << d;
+        }
+    }
+}
+
+TEST_F(Test__PVAccumulate, PVGEMMTile_4x8_Block64)
+{
+    const int Br = 4;
+    const int Bc = 8;
+    const int head_dim = 64;
+    const int blocks_per_row = 1;
+
+    std::vector<int16_t> P(Br * Bc);
+    std::uniform_int_distribution<int16_t> wdist(0, 500);
+    for (int i = 0; i < Br * Bc; ++i)
+    {
+        P[i] = wdist(rng_);
+    }
+
+    std::vector<Q16_1Block_64> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        V[k] = createRandomBlock64(1.0f);
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+
+    q16_pv_gemm_tile<Q16_1Block_64>(
+        P.data(), V.data(), context.data(),
+        Br, Bc, head_dim, blocks_per_row,
+        Bc, blocks_per_row, head_dim);
+
+    // Verify
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int32_t expected = 0;
+            for (int k = 0; k < Bc; ++k)
+            {
+                expected += static_cast<int32_t>(P[q * Bc + k]) *
+                            static_cast<int32_t>(V[k].qs[d]);
+            }
+            EXPECT_EQ(context[q * head_dim + d], expected)
+                << "Mismatch at Q=" << q << ", dim=" << d;
+        }
+    }
+}
+
+TEST_F(Test__PVAccumulate, PVGEMMTile_4x8_Block128)
+{
+    const int Br = 4;
+    const int Bc = 8;
+    const int head_dim = 128;
+    const int blocks_per_row = 1;
+
+    std::vector<int16_t> P(Br * Bc);
+    std::uniform_int_distribution<int16_t> wdist(0, 500);
+    for (int i = 0; i < Br * Bc; ++i)
+    {
+        P[i] = wdist(rng_);
+    }
+
+    std::vector<Q16_1Block_128> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        V[k] = createRandomBlock128(1.0f);
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+
+    q16_pv_gemm_tile<Q16_1Block_128>(
+        P.data(), V.data(), context.data(),
+        Br, Bc, head_dim, blocks_per_row,
+        Bc, blocks_per_row, head_dim);
+
+    // Verify
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int32_t expected = 0;
+            for (int k = 0; k < Bc; ++k)
+            {
+                expected += static_cast<int32_t>(P[q * Bc + k]) *
+                            static_cast<int32_t>(V[k].qs[d]);
+            }
+            EXPECT_EQ(context[q * head_dim + d], expected)
+                << "Mismatch at Q=" << q << ", dim=" << d;
+        }
+    }
+}
+
+TEST_F(Test__PVAccumulate, PVGEMMTileDispatch_Block64)
+{
+    const int Br = 4;
+    const int Bc = 4;
+    const int head_dim = 64;
+
+    std::vector<int16_t> P(Br * Bc);
+    std::uniform_int_distribution<int16_t> wdist(0, 500);
+    for (int i = 0; i < Br * Bc; ++i)
+    {
+        P[i] = wdist(rng_);
+    }
+
+    std::vector<Q16_1Block_64> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        V[k] = createRandomBlock64(1.0f);
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+
+    q16_pv_gemm_tile_dispatch(
+        P.data(), V.data(), context.data(),
+        Br, Bc, head_dim, Q16BlockSize::BLOCK_64,
+        Bc, 1, head_dim);
+
+    // Verify
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int32_t expected = 0;
+            for (int k = 0; k < Bc; ++k)
+            {
+                expected += static_cast<int32_t>(P[q * Bc + k]) *
+                            static_cast<int32_t>(V[k].qs[d]);
+            }
+            EXPECT_EQ(context[q * head_dim + d], expected)
+                << "Dispatch mismatch at Q=" << q << ", dim=" << d;
+        }
+    }
+}
+
+TEST_F(Test__PVAccumulate, PVGEMMTileDispatch_Block128)
+{
+    const int Br = 4;
+    const int Bc = 4;
+    const int head_dim = 128;
+
+    std::vector<int16_t> P(Br * Bc);
+    std::uniform_int_distribution<int16_t> wdist(0, 500);
+    for (int i = 0; i < Br * Bc; ++i)
+    {
+        P[i] = wdist(rng_);
+    }
+
+    std::vector<Q16_1Block_128> V(Bc);
+    for (int k = 0; k < Bc; ++k)
+    {
+        V[k] = createRandomBlock128(1.0f);
+    }
+
+    std::vector<int32_t> context(Br * head_dim, 0);
+
+    q16_pv_gemm_tile_dispatch(
+        P.data(), V.data(), context.data(),
+        Br, Bc, head_dim, Q16BlockSize::BLOCK_128,
+        Bc, 1, head_dim);
+
+    // Verify
+    for (int q = 0; q < Br; ++q)
+    {
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int32_t expected = 0;
+            for (int k = 0; k < Bc; ++k)
+            {
+                expected += static_cast<int32_t>(P[q * Bc + k]) *
+                            static_cast<int32_t>(V[k].qs[d]);
+            }
+            EXPECT_EQ(context[q * head_dim + d], expected)
+                << "Dispatch mismatch at Q=" << q << ", dim=" << d;
+        }
+    }
+}
+
+TEST_F(Test__PVAccumulate, PVGEMMTile_FP32Accuracy_CosineSimilarity)
+{
+    /**
+     * Test tiled P×V GEMM accuracy using cosine similarity.
+     */
+    const int num_batches = 100;
+    const int Br = 4;
+    const int Bc = 16;
+    const int head_dim = 64;
+    const float v_scale = 1.0f / 128.0f;
+
+    double total_cosine_sim = 0.0;
+    double min_cosine_sim = 1.0;
+
+    std::uniform_real_distribution<float> v_dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> w_dist(0.0f, 1.0f);
+
+    for (int b = 0; b < num_batches; ++b)
+    {
+        // Generate FP32 P (softmax-like weights per row)
+        std::vector<std::vector<float>> P_fp32(Br, std::vector<float>(Bc));
+        for (int q = 0; q < Br; ++q)
+        {
+            float row_sum = 0.0f;
+            for (int k = 0; k < Bc; ++k)
+            {
+                P_fp32[q][k] = w_dist(rng_);
+                row_sum += P_fp32[q][k];
+            }
+            for (int k = 0; k < Bc; ++k)
+            {
+                P_fp32[q][k] /= row_sum;
+            }
+        }
+
+        // Generate FP32 V
+        std::vector<std::vector<float>> V_fp32(Bc, std::vector<float>(head_dim));
+        for (int k = 0; k < Bc; ++k)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                V_fp32[k][d] = v_dist(rng_);
+            }
+        }
+
+        // FP32 reference context
+        std::vector<double> ref_context(Br * head_dim, 0.0);
+        for (int q = 0; q < Br; ++q)
+        {
+            for (int k = 0; k < Bc; ++k)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    ref_context[q * head_dim + d] += P_fp32[q][k] * V_fp32[k][d];
+                }
+            }
+        }
+
+        // Quantize P to INT16 (scale to use full range)
+        std::vector<int16_t> P_q16(Br * Bc);
+        for (int q = 0; q < Br; ++q)
+        {
+            for (int k = 0; k < Bc; ++k)
+            {
+                P_q16[q * Bc + k] = static_cast<int16_t>(
+                    std::round(P_fp32[q][k] * 32767.0f));
+            }
+        }
+
+        // Quantize V
+        std::vector<Q16_1Block_64> V_q16(Bc);
+        for (int k = 0; k < Bc; ++k)
+        {
+            V_q16[k].d = v_scale;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                V_q16[k].qs[d] = static_cast<int16_t>(std::clamp(
+                    std::round(V_fp32[k][d] / v_scale), -32767.0f, 32767.0f));
+            }
+        }
+
+        // Q16 tiled GEMM
+        std::vector<int32_t> context_q16_int(Br * head_dim, 0);
+        q16_pv_gemm_tile<Q16_1Block_64>(
+            P_q16.data(), V_q16.data(), context_q16_int.data(),
+            Br, Bc, head_dim, 1, Bc, 1, head_dim);
+
+        // Convert to FP32
+        std::vector<double> context_q16(Br * head_dim);
+        for (int i = 0; i < Br * head_dim; ++i)
+        {
+            context_q16[i] = static_cast<double>(context_q16_int[i]) *
+                             v_scale / 32767.0;
+        }
+
+        // Cosine similarity
+        double dot_ab = 0.0, norm_a = 0.0, norm_b = 0.0;
+        for (int i = 0; i < Br * head_dim; ++i)
+        {
+            dot_ab += ref_context[i] * context_q16[i];
+            norm_a += ref_context[i] * ref_context[i];
+            norm_b += context_q16[i] * context_q16[i];
+        }
+
+        double cosine_sim = dot_ab / (std::sqrt(norm_a) * std::sqrt(norm_b) + 1e-10);
+        total_cosine_sim += cosine_sim;
+        min_cosine_sim = std::min(min_cosine_sim, cosine_sim);
+    }
+
+    double mean_cosine_sim = total_cosine_sim / num_batches;
+
+    std::cout << "  [PVAccumulate GEMM Tile CosineSim] Mean: " << std::fixed << std::setprecision(6)
+              << mean_cosine_sim << ", Min: " << min_cosine_sim << std::endl;
+
+    EXPECT_GT(mean_cosine_sim, 0.99) << "Mean cosine similarity too low";
+    EXPECT_GT(min_cosine_sim, 0.95) << "Worst-case cosine similarity too low";
+}

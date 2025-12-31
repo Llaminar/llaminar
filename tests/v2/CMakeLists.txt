@@ -3082,6 +3082,78 @@ add_v2_test(V2_Perf_Q8_1_QuantizeSIMD
     LABELS "V2;Performance;Quantization;Q8_1;SIMD;AVX2;AVX512"
 )
 
+# Performance Test: Q16_1 Decode SIMD (Scalar/AVX2/AVX512 throughput comparison)
+add_executable(v2_perf_q16_1_decode_simd performance/tensors/Perf__Q16_1_DecodeSIMD.cpp)
+target_link_libraries(v2_perf_q16_1_decode_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_1_DecodeSIMD 
+    COMMAND $<TARGET_FILE:v2_perf_q16_1_decode_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;Decode"
+)
+
+# Performance Test: Q16_1 Quantize SIMD (Scalar/AVX2/AVX512 throughput comparison)
+add_executable(v2_perf_q16_1_quantize_simd performance/tensors/Perf__Q16_1_QuantizeSIMD.cpp)
+target_link_libraries(v2_perf_q16_1_quantize_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_1_QuantizeSIMD 
+    COMMAND $<TARGET_FILE:v2_perf_q16_1_quantize_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;Quantize"
+)
+
+# Performance Test: Q16_1 Quantize Partial SIMD (Scalar/AVX2/AVX512 for partial blocks)
+add_executable(v2_perf_q16_1_quantize_partial_simd performance/tensors/Perf__Q16_1_QuantizePartialSIMD.cpp)
+target_link_libraries(v2_perf_q16_1_quantize_partial_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_1_QuantizePartialSIMD 
+    COMMAND $<TARGET_FILE:v2_perf_q16_1_quantize_partial_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;Quantize;Partial"
+)
+
+# Performance Test: Q16 Variable Block Size SIMD (32/64/128 element blocks)
+add_executable(v2_perf_q16_variable_block_simd performance/tensors/Perf__Q16_VariableBlockSIMD.cpp)
+target_link_libraries(v2_perf_q16_variable_block_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_VariableBlockSIMD 
+    COMMAND $<TARGET_FILE:v2_perf_q16_variable_block_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;Quantize;VariableBlockSize"
+)
+
+# Performance Test: Q16 Fixed-Scale SIMD (VNNI-safe quantization)
+add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
+target_link_libraries(v2_perf_q16_fixed_scale_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q16_FixedScaleSIMD 
+    COMMAND $<TARGET_FILE:v2_perf_q16_fixed_scale_simd>
+    LABELS "V2;Performance;Quantization;Q16_1;SIMD;AVX2;AVX512;FixedScale;VNNI"
+)
+
+# Unit Test: Q16 Fixed-Scale SIMD Correctness
+add_executable(v2_test_q16_fixed_scale_simd unit/tensors/Test__Q16FixedScaleSIMD.cpp)
+target_link_libraries(v2_test_q16_fixed_scale_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16FixedScaleSIMD 
+    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_simd>
+    LABELS "V2;Unit;Quantization;Q16_1;SIMD;AVX2;AVX512;FixedScale;VNNI"
+)
+
 # Test: IQ4_XS Tensor Views
 add_executable(v2_test_iq4xs_views unit/tensors/Test__IQ4_XSTensor_Views.cpp)
 target_link_libraries(v2_test_iq4xs_views 
@@ -3987,4 +4059,59 @@ target_link_libraries(v2_test_q16_online_softmax
 add_v2_test(V2_Unit_Q16OnlineSoftmax
     COMMAND $<TARGET_FILE:v2_test_q16_online_softmax>
     LABELS "V2;Unit;Kernels;Attention;Q16;OnlineSoftmax;FlashDecode;Integer"
+)
+
+# Test: MLA (Multi-head Latent Attention) Microkernels - DeepSeek V3/Kimi K2
+# Split NOPE/ROPE Q×K^T with combined scoring for latent attention architectures
+add_executable(v2_test_mla_attention unit/microkernels/Test__MLAAttention.cpp)
+target_link_libraries(v2_test_mla_attention
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MLAAttention
+    COMMAND $<TARGET_FILE:v2_test_mla_attention>
+    LABELS "V2;Unit;Microkernels;Q16_1;MLA;DeepSeekV3;KimiK2;NOPE;ROPE;Integer"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Fixed-Scale Quantization Accuracy
+# Measures precision impact of VNNI-safe fixed-scale vs adaptive quantization
+add_executable(v2_test_q16_fixed_scale_accuracy unit/microkernels/Test__Q16FixedScaleAccuracy.cpp)
+target_link_libraries(v2_test_q16_fixed_scale_accuracy
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16FixedScaleAccuracy
+    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_accuracy>
+    LABELS "V2;Unit;Microkernels;Q16_1;Quantization;Accuracy;VNNI"
+    MPI_PROCS 1
+)
+
+# Test: VNNI Overflow Analysis
+# Comprehensive analysis of INT32 overflow risks in Q×K^T and P×V paths
+add_executable(v2_test_vnni_overflow_analysis unit/microkernels/Test__VNNIOverflowAnalysis.cpp)
+target_link_libraries(v2_test_vnni_overflow_analysis
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_VNNIOverflowAnalysis
+    COMMAND $<TARGET_FILE:v2_test_vnni_overflow_analysis>
+    LABELS "V2;Unit;Microkernels;Q16_1;VNNI;Overflow;Analysis"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Fixed-Scale Quantization with VNNI-safe clipping
+# Tests copyFrom_fp32_fixed_scale() and copyFrom_fp32_rows_fixed_scale()
+add_executable(v2_test_q16_fixed_scale_quantization unit/kernels/Test__Q16FixedScaleQuantization.cpp)
+target_link_libraries(v2_test_q16_fixed_scale_quantization
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16FixedScaleQuantization
+    COMMAND $<TARGET_FILE:v2_test_q16_fixed_scale_quantization>
+    LABELS "V2;Unit;Kernels;Q16_1;Quantization;VNNI;Safety"
+    MPI_PROCS 1
 )
