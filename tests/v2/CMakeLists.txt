@@ -4097,15 +4097,16 @@ add_v2_test(V2_Unit_Q16IntegerAttention
 # Test: Q16 Integer Attention Parity (vs FP32 Reference)
 # Compares Q16 attention output against FP32 reference implementation
 # Validates cosine similarity, RMSE, and softmax weight normalization
+# NOTE: This is an integration test due to long runtime (~270s)
 add_executable(v2_test_q16_integer_attention_parity unit/kernels/cpu/q16_attention/Test__Q16IntegerAttentionParity.cpp)
 target_link_libraries(v2_test_q16_integer_attention_parity
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Q16IntegerAttentionParity
+add_v2_test(V2_Integration_Q16IntegerAttentionParity
     COMMAND $<TARGET_FILE:v2_test_q16_integer_attention_parity>
-    LABELS "V2;Unit;Kernels;Attention;Q16;Parity;FP32;Cosine;RMSE"
+    LABELS "V2;Integration;Kernels;Attention;Q16;Parity;FP32;Cosine;RMSE"
     MPI_PROCS 1
 )
 

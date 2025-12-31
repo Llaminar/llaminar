@@ -2,7 +2,7 @@
 
 **Status**: In Progress (Phase 8 Complete - Moving to Phase 9)  
 **Created**: 2025-12-30  
-**Updated**: 2025-12-31  
+**Updated**: 2025-01-01  
 **Author**: Llaminar Team  
 **Supersedes**: [PROJECT_Q16_INTEGER_ATTENTION.md](./PROJECT_Q16_INTEGER_ATTENTION.md)
 
@@ -203,7 +203,8 @@
 - [x] Phase 8: Unit tests for Q16IntegerAttention ✅
   - [x] Create `tests/v2/unit/kernels/cpu/q16_attention/Test__Q16IntegerAttention.cpp` ✅
   - [x] Create `tests/v2/unit/kernels/cpu/q16_attention/Test__Q16IntegerAttentionParity.cpp` ✅
-  - [x] Register tests in CMakeLists.txt (V2_Unit_Q16IntegerAttention, V2_Unit_Q16IntegerAttentionParity)
+  - [x] Register tests in CMakeLists.txt (V2_Unit_Q16IntegerAttention, V2_Integration_Q16IntegerAttentionParity)
+    - NOTE: Parity test moved to Integration suite due to long runtime (~270s)
   - [x] Flash Decode tests (`q16_integer_attention_decode`) - ALL 8 PASSING:
     - [x] Single head, aligned block size (Block64, Block128) ✅
     - [x] Multi-head with GQA (num_kv_heads < num_heads) ✅
@@ -241,6 +242,12 @@
        but `compute_fa2_tile_config()` could return `Br` up to 8. This caused memory corruption
        where `lut_value_bits` was overwritten (30→69), producing ±inf outputs.
        **Fix**: Changed `FA2_TILE_BR` from 4 to 8 in `OnlineSoftmax.h`.
+    3. **Exp2Core precision loss**: The `Exp2Core` class used `float exp_value = std::exp2(float_x)` 
+       which performed extra fp32→fp64→fp32 conversions. Refactored to use `double` intermediates
+       throughout for maximum precision in critical 2^x computation. Added 10 new unit tests in
+       `Test__Exp2Core.cpp` validating: zero input, high precision at boundaries, NaN handling,
+       special values, negative range, and extreme values (-127.9f).
+       **Files**: `Exp2Core.h`, `Test__Exp2Core.cpp`
 - [ ] Phase 9: E2E parity tests
   - [ ] Create `tests/v2/e2e/Test__Q16IntegerAttentionParity.cpp`
   - [ ] PyTorch reference generation:
@@ -258,7 +265,30 @@
   - [ ] Performance regression tests:
     - [ ] Decode throughput vs FP32 baseline
     - [ ] Prefill throughput vs FP32 baseline
-- [ ] Phase 10: KV Cache Scale Profiling Tool
+- [ ] Phase 10: Batched Inference Support
+  - [ ] Add `batch_size` parameter to `Q16IntegerAttentionParams`
+  - [ ] Update tensor shapes from 3D to 4D:
+    - [ ] Q: `[seq_len_q, num_heads, head_dim]` → `[batch_size, seq_len_q, num_heads, head_dim]`
+    - [ ] K: `[kv_len, num_kv_heads, head_dim]` → `[batch_size, kv_len, num_kv_heads, head_dim]`
+    - [ ] V: `[kv_len, num_kv_heads, head_dim]` → `[batch_size, kv_len, num_kv_heads, head_dim]`
+    - [ ] Output: `[seq_len_q, d_model]` → `[batch_size, seq_len_q, d_model]`
+  - [ ] Update decode path (`q16_integer_attention_decode`):
+    - [ ] Add batch loop around head processing
+    - [ ] Per-batch KV cache position tracking
+  - [ ] Update prefill path (`q16_integer_attention_prefill`):
+    - [ ] Batch-aware FA2 tiling
+    - [ ] Independent online softmax state per batch element
+  - [ ] Update `UnifiedKVCache` for batched storage:
+    - [ ] Separate cache positions per batch element
+    - [ ] Batch-aware shift/eviction
+  - [ ] Unit tests:
+    - [ ] Batch size 1 matches unbatched behavior
+    - [ ] Batch sizes 2, 4, 8 with varying sequence lengths
+    - [ ] GQA with batching
+  - [ ] Performance tests:
+    - [ ] Throughput scaling with batch size
+    - [ ] Memory efficiency vs naive loop
+- [ ] Phase 11: KV Cache Scale Profiling Tool
   - [ ] Create `python/tools/profile_kv_activations.py` 
   - [ ] Extend existing PyTorch snapshot infrastructure
   - [ ] Collect per-layer, per-head K/V activation statistics (min, max, mean, std, percentiles)
