@@ -202,10 +202,10 @@ TEST(Test__StageBufferRequirements, DefaultConstruction)
 TEST(Test__StageBufferRequirements, BuilderChaining)
 {
     StageBufferRequirements reqs;
-    reqs.addInput("input", {16, 896})
-        .addOutput("output", {16, 896})
-        .addScratch("workspace", {1024})
-        .addWeight("gamma", {896});
+    reqs.addInput("input", {16, 896});
+    reqs.addOutput("output", {16, 896});
+    reqs.addScratch("workspace", {1024});
+    reqs.addWeight("gamma", {896});
 
     EXPECT_FALSE(reqs.empty());
     EXPECT_EQ(reqs.size(), 4);
@@ -214,12 +214,12 @@ TEST(Test__StageBufferRequirements, BuilderChaining)
 TEST(Test__StageBufferRequirements, GetByRole)
 {
     StageBufferRequirements reqs;
-    reqs.addInput("in1", {16, 896})
-        .addInput("in2", {16, 896})
-        .addOutput("out", {16, 896})
-        .addScratch("scratch1", {1024})
-        .addScratch("scratch2", {2048})
-        .addScratch("scratch3", {512});
+    reqs.addInput("in1", {16, 896});
+    reqs.addInput("in2", {16, 896});
+    reqs.addOutput("out", {16, 896});
+    reqs.addScratch("scratch1", {1024});
+    reqs.addScratch("scratch2", {2048});
+    reqs.addScratch("scratch3", {512});
 
     auto inputs = reqs.getByRole(BufferRole::INPUT);
     EXPECT_EQ(inputs.size(), 2);
@@ -237,8 +237,8 @@ TEST(Test__StageBufferRequirements, GetByRole)
 TEST(Test__StageBufferRequirements, GetByName)
 {
     StageBufferRequirements reqs;
-    reqs.addInput("activations", {16, 896})
-        .addOutput("logits", {16, 151936});
+    reqs.addInput("activations", {16, 896});
+    reqs.addOutput("logits", {16, 151936});
 
     auto *found = reqs.getByName("activations");
     ASSERT_NE(found, nullptr);
@@ -256,9 +256,9 @@ TEST(Test__StageBufferRequirements, GetByName)
 TEST(Test__StageBufferRequirements, TotalBytesCalculation)
 {
     StageBufferRequirements reqs;
-    reqs.addInput("input", {16, 896}, BufferTensorType::FP32)     // 16*896*4 = 57344
-        .addOutput("output", {16, 896}, BufferTensorType::FP32)   // 16*896*4 = 57344
-        .addScratch("workspace", {1024}, BufferTensorType::FP32); // 1024*4 = 4096
+    reqs.addInput("input", {16, 896}, BufferTensorType::FP32);     // 16*896*4 = 57344
+    reqs.addOutput("output", {16, 896}, BufferTensorType::FP32);   // 16*896*4 = 57344
+    reqs.addScratch("workspace", {1024}, BufferTensorType::FP32);  // 1024*4 = 4096
 
     EXPECT_EQ(reqs.totalInputBytes(), 57344);
     EXPECT_EQ(reqs.totalOutputBytes(), 57344);
@@ -299,9 +299,9 @@ TEST(Test__BufferRole, RMSNormStagePattern)
     const size_t d_model = 896;
 
     StageBufferRequirements reqs;
-    reqs.addInput("input", {seq_len, d_model})
-        .addOutput("output", {seq_len, d_model})
-        .addWeight("gamma", {d_model});
+    reqs.addInput("input", {seq_len, d_model});
+    reqs.addOutput("output", {seq_len, d_model});
+    reqs.addWeight("gamma", {d_model});
 
     EXPECT_EQ(reqs.size(), 3);
     EXPECT_EQ(reqs.getByRole(BufferRole::INPUT).size(), 1);
@@ -316,9 +316,9 @@ TEST(Test__BufferRole, SwiGLUStagePattern)
     const size_t d_ff = 4864;
 
     StageBufferRequirements reqs;
-    reqs.addInput("gate", {seq_len, d_ff})
-        .addInput("up", {seq_len, d_ff})
-        .addOutput("output", {seq_len, d_ff});
+    reqs.addInput("gate", {seq_len, d_ff});
+    reqs.addInput("up", {seq_len, d_ff});
+    reqs.addOutput("output", {seq_len, d_ff});
 
     EXPECT_EQ(reqs.size(), 3);
     EXPECT_EQ(reqs.totalInputBytes(), 2 * seq_len * d_ff * 4);
@@ -331,9 +331,9 @@ TEST(Test__BufferRole, GEMMStagePattern)
     const int m = 16, n = 4864, k = 896;
 
     StageBufferRequirements reqs;
-    reqs.addInput("A", {static_cast<size_t>(m), static_cast<size_t>(k)})
-        .addWeight("B", {static_cast<size_t>(k), static_cast<size_t>(n)}, BufferTensorType::Q8_1)
-        .addOutput("C", {static_cast<size_t>(m), static_cast<size_t>(n)});
+    reqs.addInput("A", {static_cast<size_t>(m), static_cast<size_t>(k)});
+    reqs.addWeight("B", {static_cast<size_t>(k), static_cast<size_t>(n)}, BufferTensorType::Q8_1);
+    reqs.addOutput("C", {static_cast<size_t>(m), static_cast<size_t>(n)});
 
     EXPECT_EQ(reqs.size(), 3);
 
@@ -351,12 +351,12 @@ TEST(Test__BufferRole, AttentionStagePattern)
     const size_t head_dim = 64;
 
     StageBufferRequirements reqs;
-    reqs.addInput("Q", {seq_len, n_heads * head_dim})
-        .addInput("K", {kv_len, n_heads * head_dim})
-        .addInput("V", {kv_len, n_heads * head_dim})
-        .addOutput("output", {seq_len, n_heads * head_dim})
-        .addScratch("scores", {n_heads, seq_len, kv_len})
-        .addScratch("context", {seq_len, head_dim});
+    reqs.addInput("Q", {seq_len, n_heads * head_dim});
+    reqs.addInput("K", {kv_len, n_heads * head_dim});
+    reqs.addInput("V", {kv_len, n_heads * head_dim});
+    reqs.addOutput("output", {seq_len, n_heads * head_dim});
+    reqs.addScratch("scores", {n_heads, seq_len, kv_len});
+    reqs.addScratch("context", {seq_len, head_dim});
 
     EXPECT_EQ(reqs.size(), 6);
     EXPECT_EQ(reqs.getByRole(BufferRole::INPUT).size(), 3);
@@ -377,8 +377,8 @@ TEST(Test__BufferRole, ResidualAddPattern)
     const size_t d_model = 896;
 
     StageBufferRequirements reqs;
-    reqs.addInput("input", {seq_len, d_model})
-        .addInout("residual", {seq_len, d_model});
+    reqs.addInput("input", {seq_len, d_model});
+    reqs.addInout("residual", {seq_len, d_model});
 
     EXPECT_EQ(reqs.size(), 2);
 
@@ -387,4 +387,103 @@ TEST(Test__BufferRole, ResidualAddPattern)
     EXPECT_EQ(residual->role, BufferRole::INOUT);
     EXPECT_FALSE(residual->isAliasable()); // INOUT cannot be aliased
     EXPECT_FALSE(residual->isReadOnly());  // INOUT is read-write
+}
+
+// ============================================================================
+// Layout Parameter Tests
+// ============================================================================
+
+/**
+ * @brief Test optional layout parameter in addInput/addOutput/addInout
+ *
+ * Validates the clean Option 1 API where layout is passed as optional
+ * parameter while maintaining backward compatibility and fluent chaining.
+ */
+TEST(Test__StageBufferRequirements, LayoutParameterAPI)
+{
+    StageBufferRequirements reqs;
+
+    // Use layout parameter with addInput
+    reqs.addInput("Q", {16, 896}, BufferTensorType::FP32, TensorLayout::Q_SEQ_HEAD_DIM)
+        .addInput("K", {32, 128}, BufferTensorType::FP32, TensorLayout::KV_POS_HEAD_DIM)
+        .addInput("V", {32, 128}, BufferTensorType::FP32, TensorLayout::KV_POS_HEAD_DIM)
+        .addOutput("output", {16, 896}, BufferTensorType::FP32, TensorLayout::ROW_MAJOR_2D)
+        .addInout("residual", {16, 896}, BufferTensorType::FP32, TensorLayout::ROW_MAJOR_2D);
+
+    // Verify layouts are captured correctly
+    auto *q = reqs.getByName("Q");
+    ASSERT_NE(q, nullptr);
+    EXPECT_EQ(q->expected_layout, TensorLayout::Q_SEQ_HEAD_DIM);
+
+    auto *k = reqs.getByName("K");
+    ASSERT_NE(k, nullptr);
+    EXPECT_EQ(k->expected_layout, TensorLayout::KV_POS_HEAD_DIM);
+
+    auto *v = reqs.getByName("V");
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->expected_layout, TensorLayout::KV_POS_HEAD_DIM);
+
+    auto *output = reqs.getByName("output");
+    ASSERT_NE(output, nullptr);
+    EXPECT_EQ(output->expected_layout, TensorLayout::ROW_MAJOR_2D);
+
+    auto *residual = reqs.getByName("residual");
+    ASSERT_NE(residual, nullptr);
+    EXPECT_EQ(residual->expected_layout, TensorLayout::ROW_MAJOR_2D);
+}
+
+/**
+ * @brief Test backward compatibility - layout defaults to UNKNOWN
+ */
+TEST(Test__StageBufferRequirements, LayoutDefaultsToUnknown)
+{
+    StageBufferRequirements reqs;
+
+    // No layout specified - should default to UNKNOWN
+    reqs.addInput("input", {16, 896})
+        .addOutput("output", {16, 896})
+        .addScratch("workspace", {1024})
+        .addWeight("gamma", {896});
+
+    auto *input = reqs.getByName("input");
+    ASSERT_NE(input, nullptr);
+    EXPECT_EQ(input->expected_layout, TensorLayout::UNKNOWN);
+
+    auto *output = reqs.getByName("output");
+    ASSERT_NE(output, nullptr);
+    EXPECT_EQ(output->expected_layout, TensorLayout::UNKNOWN);
+
+    auto *workspace = reqs.getByName("workspace");
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_EQ(workspace->expected_layout, TensorLayout::UNKNOWN);
+
+    auto *gamma = reqs.getByName("gamma");
+    ASSERT_NE(gamma, nullptr);
+    EXPECT_EQ(gamma->expected_layout, TensorLayout::UNKNOWN);
+}
+
+/**
+ * @brief Test mixing buffers with and without layouts
+ */
+TEST(Test__StageBufferRequirements, MixedLayoutDeclarations)
+{
+    StageBufferRequirements reqs;
+
+    // Some buffers have layouts, others don't
+    reqs.addInput("Q", {16, 896}, BufferTensorType::FP32, TensorLayout::Q_SEQ_HEAD_DIM)
+        .addInput("Wo", {896, 896})  // Weight - no layout
+        .addOutput("output", {16, 896}, BufferTensorType::FP32, TensorLayout::ROW_MAJOR_2D)
+        .addScratch("temp", {1024});  // Scratch - no layout
+
+    auto *q = reqs.getByName("Q");
+    EXPECT_EQ(q->expected_layout, TensorLayout::Q_SEQ_HEAD_DIM);
+
+    auto *wo = reqs.getByName("Wo");
+    EXPECT_EQ(wo->expected_layout, TensorLayout::UNKNOWN);
+
+    auto *output = reqs.getByName("output");
+    EXPECT_EQ(output->expected_layout, TensorLayout::ROW_MAJOR_2D);
+
+    auto *temp = reqs.getByName("temp");
+    EXPECT_EQ(temp->expected_layout, TensorLayout::UNKNOWN);
 }

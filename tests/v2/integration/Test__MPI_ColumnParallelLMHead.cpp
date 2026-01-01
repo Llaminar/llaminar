@@ -215,8 +215,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherStageIntegration)
     AllGatherStage::Params params;
     params.local_input = local_logits.get();
     params.full_output = full_logits.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = world_size;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = ComputeStageFactory::createAllGather(params);
     ASSERT_NE(stage, nullptr);
@@ -318,8 +317,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, FullForwardDataFlow)
     AllGatherStage::Params params;
     params.local_input = local_logits.get();
     params.full_output = full_logits.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = world_size;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = ComputeStageFactory::createAllGather(params);
 
@@ -394,8 +392,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherMultiRowInterleaving)
     AllGatherStage::Params params;
     params.local_input = local_logits.get();
     params.full_output = full_logits.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = world_size;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = ComputeStageFactory::createAllGather(params);
     ASSERT_NE(stage, nullptr);
@@ -464,8 +461,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherLargeSequence)
     AllGatherStage::Params params;
     params.local_input = local_logits.get();
     params.full_output = full_logits.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = world_size;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = ComputeStageFactory::createAllGather(params);
     bool success = stage->execute(nullptr);
@@ -517,8 +513,7 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherOutputConsistency)
     AllGatherStage::Params params;
     params.local_input = local_logits.get();
     params.full_output = full_logits.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = world_size;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = ComputeStageFactory::createAllGather(params);
     bool success = stage->execute(nullptr);

@@ -400,8 +400,8 @@ namespace llaminar2
                 allreduce.outputs.push_back(resolved.outputs[0]); // In-place
             }
 
-            // MPI parameters - store MPI_Comm directly as void*
-            allreduce.opaque_params["mpi_comm"] = static_cast<void *>(runtime.mpi_comm);
+            // MPI parameters - store typed MPIContext pointer
+            allreduce.opaque_params["mpi_ctx"] = const_cast<void *>(static_cast<const void *>(runtime.mpi_ctx));
 
             // Calculate allreduce count
             // For Wo/down_proj: [seq_len, d_model] - full d_model dimension
@@ -449,8 +449,8 @@ namespace llaminar2
             allgather.int_params["world_size"] = runtime.world_size;
             allgather.int_params["seq_len"] = runtime.batch_size * runtime.seq_len;
 
-            // MPI parameters - store MPI_Comm directly as void*
-            allgather.opaque_params["mpi_comm"] = static_cast<void *>(runtime.mpi_comm);
+            // MPI parameters - store typed MPIContext pointer
+            allgather.opaque_params["mpi_ctx"] = const_cast<void *>(static_cast<const void *>(runtime.mpi_ctx));
 
             LOG_TRACE("[GraphResolver] Inserting allgather after " << resolved.name);
             return allgather;
@@ -800,9 +800,9 @@ namespace llaminar2
         {
             AllreduceStage::Params params;
             params.buffer = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
-            if (stage.opaque_params.count("mpi_comm"))
+            if (stage.opaque_params.count("mpi_ctx"))
             {
-                params.mpi_comm = static_cast<MPI_Comm>(stage.opaque_params.at("mpi_comm"));
+                params.mpi_ctx = static_cast<const MPIContext *>(stage.opaque_params.at("mpi_ctx"));
             }
             params.count = stage.int_params.count("count") ? static_cast<size_t>(stage.int_params.at("count")) : 0;
             return ComputeStageFactory::createAllreduce(params);
@@ -813,11 +813,10 @@ namespace llaminar2
             AllGatherStage::Params params;
             params.local_input = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
             params.full_output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
-            if (stage.opaque_params.count("mpi_comm"))
+            if (stage.opaque_params.count("mpi_ctx"))
             {
-                params.mpi_comm = static_cast<MPI_Comm>(stage.opaque_params.at("mpi_comm"));
+                params.mpi_ctx = static_cast<const MPIContext *>(stage.opaque_params.at("mpi_ctx"));
             }
-            params.world_size = stage.int_params.count("world_size") ? stage.int_params.at("world_size") : 1;
             params.actual_seq_len = stage.int_params.count("actual_seq_len")
                                         ? static_cast<size_t>(stage.int_params.at("actual_seq_len"))
                                         : static_cast<size_t>(seq_len);

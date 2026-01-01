@@ -37,7 +37,6 @@
 #include <memory>
 #include <unordered_map>
 #include <functional>
-#include <mpi.h>
 
 namespace llaminar2
 {
@@ -98,10 +97,9 @@ namespace llaminar2
         // MPI / Tensor Parallelism
         // =================================================================
 
-        int world_size = 1;            ///< Number of MPI ranks
-        int rank = 0;                  ///< This rank's index
-        MPI_Comm mpi_comm = 0;         ///< MPI communicator (0 = MPI_COMM_WORLD)
-        MPIContext *mpi_ctx = nullptr; ///< Full MPI context (optional)
+        int world_size = 1;                  ///< Number of MPI ranks
+        int rank = 0;                        ///< This rank's index
+        const MPIContext *mpi_ctx = nullptr; ///< MPI context (required for TP)
 
         /// Weight sharding information, keyed by weight name
         std::unordered_map<std::string, ShardingInfo> weight_sharding;

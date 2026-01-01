@@ -8,6 +8,7 @@
 #include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/TensorVerification.h"
 #include "../../../tensors/UnifiedKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
@@ -96,6 +97,9 @@ namespace llaminar2
                                                           << ") must be divisible by n_kv_heads (" << params_.n_kv_heads << ")");
             return false;
         }
+
+        // Note: Layout validation is now handled declaratively via getLayoutExpectation()
+        // and getBufferRequirements().withLayout() - GraphExecutor validates automatically
 
         // Compute position offset for decode mode
         int position_offset = params_.position_offset;
@@ -387,58 +391,77 @@ namespace llaminar2
             }
 
             // ================================================================
-            // TRANSPOSE WORKAROUND: Convert position-major to head-major layout
+            // LAYOUT-AWARE K/V ACCESS
             // ================================================================
-            // The KV cache stores data in position-major layout:
-            //   [kv_len][n_kv_heads][head_dim] -> block[p * n_kv_heads + h]
-            // But Q16IntegerAttentionRef expects head-major layout:
+            // Q16IntegerAttentionRef expects head-major layout:
             //   [n_kv_heads][kv_len][head_dim] -> block[h * kv_len + p]
             //
-            // This workaround transposes K/V on-the-fly. For production, use HeadMajorKVCache.
-            // See PLAN_FIXED_SCALE_ROPE_Q16.md Addendum for details.
+            // If KV cache is HEAD_MAJOR, use data directly.
+            // If KV cache is POSITION_MAJOR, transpose on-the-fly.
             //
             const Q16BlockSize block_size = k_q16->q16_block_size();
             const size_t block_bytes = q16_block_size_bytes(block_size);
             const size_t block_elements = q16_block_size_elements(block_size);
             const int blocks_per_head = (params_.head_dim + static_cast<int>(block_elements) - 1) / static_cast<int>(block_elements);
-            const int total_blocks = effective_kv_len * params_.n_kv_heads * blocks_per_head;
 
-            // Allocate transposed buffers
-            std::vector<uint8_t> K_transposed_bytes(total_blocks * block_bytes);
-            std::vector<uint8_t> V_transposed_bytes(total_blocks * block_bytes);
+            // Check if KV cache is already in HEAD_MAJOR layout
+            const bool kv_is_head_major = params_.kv_cache &&
+                                          params_.kv_cache->kv_layout() == TensorLayout::KV_HEAD_POS_DIM;
 
-            const uint8_t *K_src = static_cast<const uint8_t *>(k_q16->raw_data());
-            const uint8_t *V_src = static_cast<const uint8_t *>(v_q16->raw_data());
+            // Storage for transposed data (only allocated if needed)
+            std::vector<uint8_t> K_transposed_bytes;
+            std::vector<uint8_t> V_transposed_bytes;
 
-            // Transpose: position-major [p][h] -> head-major [h][p]
-            for (int h = 0; h < params_.n_kv_heads; ++h)
+            if (kv_is_head_major)
             {
-                for (int p = 0; p < effective_kv_len; ++p)
-                {
-                    // Source index: position-major [p * n_kv_heads + h]
-                    const size_t src_block_idx = (static_cast<size_t>(p) * params_.n_kv_heads + h) * blocks_per_head;
-                    // Dest index: head-major [h * kv_len + p]
-                    const size_t dst_block_idx = (static_cast<size_t>(h) * effective_kv_len + p) * blocks_per_head;
+                // HEAD_MAJOR: use K/V data directly - already in correct layout
+                q16_params.K = k_q16->raw_data();
+                q16_params.V = v_q16->raw_data();
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " HEAD_MAJOR KV cache: no transpose needed"
+                                                           << " kv_len=" << effective_kv_len);
+            }
+            else
+            {
+                // POSITION_MAJOR: transpose from [kv_len][n_kv_heads][head_dim] to [n_kv_heads][kv_len][head_dim]
+                const int total_blocks = effective_kv_len * params_.n_kv_heads * blocks_per_head;
+                K_transposed_bytes.resize(total_blocks * block_bytes);
+                V_transposed_bytes.resize(total_blocks * block_bytes);
 
-                    // Copy all blocks for this head/position
-                    std::memcpy(K_transposed_bytes.data() + dst_block_idx * block_bytes,
-                                K_src + src_block_idx * block_bytes,
-                                blocks_per_head * block_bytes);
-                    std::memcpy(V_transposed_bytes.data() + dst_block_idx * block_bytes,
-                                V_src + src_block_idx * block_bytes,
-                                blocks_per_head * block_bytes);
+                const uint8_t *K_src = static_cast<const uint8_t *>(k_q16->raw_data());
+                const uint8_t *V_src = static_cast<const uint8_t *>(v_q16->raw_data());
+
+                // Transpose: position-major [p][h] -> head-major [h][p]
+                for (int h = 0; h < params_.n_kv_heads; ++h)
+                {
+                    for (int p = 0; p < effective_kv_len; ++p)
+                    {
+                        // Source index: position-major [p * n_kv_heads + h]
+                        const size_t src_block_idx = (static_cast<size_t>(p) * params_.n_kv_heads + h) * blocks_per_head;
+                        // Dest index: head-major [h * kv_len + p]
+                        const size_t dst_block_idx = (static_cast<size_t>(h) * effective_kv_len + p) * blocks_per_head;
+
+                        // Copy all blocks for this head/position
+                        std::memcpy(K_transposed_bytes.data() + dst_block_idx * block_bytes,
+                                    K_src + src_block_idx * block_bytes,
+                                    blocks_per_head * block_bytes);
+                        std::memcpy(V_transposed_bytes.data() + dst_block_idx * block_bytes,
+                                    V_src + src_block_idx * block_bytes,
+                                    blocks_per_head * block_bytes);
+                    }
                 }
+
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " TRANSPOSE WORKAROUND: kv_len=" << effective_kv_len
+                                                           << " n_kv_heads=" << params_.n_kv_heads
+                                                           << " blocks_per_head=" << blocks_per_head
+                                                           << " total_blocks=" << total_blocks);
+
+                q16_params.K = K_transposed_bytes.data();
+                q16_params.V = V_transposed_bytes.data();
             }
 
-            LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
-                                                       << " TRANSPOSE WORKAROUND: kv_len=" << effective_kv_len
-                                                       << " n_kv_heads=" << params_.n_kv_heads
-                                                       << " blocks_per_head=" << blocks_per_head
-                                                       << " total_blocks=" << total_blocks);
-
             q16_params.Q = q_q16->typed_data();
-            q16_params.K = K_transposed_bytes.data();
-            q16_params.V = V_transposed_bytes.data();
 
             // Wo weights - get VNNI packed weights via KernelFactory
             // Check if Wo implements IINT8Unpackable (quantized formats)
@@ -692,48 +715,64 @@ namespace llaminar2
     {
         StageBufferRequirements reqs;
 
-        // Input: Q, K, V (Q8_1)
+        // Input: Q - [seq_len][n_heads * head_dim] with Q_SEQ_HEAD_DIM layout
         if (params_.Q)
         {
             const size_t q_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
             const size_t q_cols = static_cast<size_t>(params_.n_heads * params_.head_dim);
             BufferTensorType buf_type = toBufferTensorType(params_.Q->native_type());
-            reqs.addInput("Q", {q_rows, q_cols}, buf_type);
+            reqs.addInput("Q", {q_rows, q_cols}, buf_type, TensorLayout::Q_SEQ_HEAD_DIM);
         }
 
+        // Input: K - [kv_len][n_kv_heads * head_dim] with KV_POS_HEAD_DIM layout
         if (params_.K)
         {
             const size_t k_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
             const size_t k_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
             BufferTensorType buf_type = toBufferTensorType(params_.K->native_type());
-            reqs.addInput("K", {k_rows, k_cols}, buf_type);
+            reqs.addInput("K", {k_rows, k_cols}, buf_type, TensorLayout::KV_POS_HEAD_DIM);
         }
 
+        // Input: V - [kv_len][n_kv_heads * head_dim] with KV_POS_HEAD_DIM layout
         if (params_.V)
         {
             const size_t v_rows = static_cast<size_t>(params_.batch_size * params_.kv_len);
             const size_t v_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
             BufferTensorType buf_type = toBufferTensorType(params_.V->native_type());
-            reqs.addInput("V", {v_rows, v_cols}, buf_type);
+            reqs.addInput("V", {v_rows, v_cols}, buf_type, TensorLayout::KV_POS_HEAD_DIM);
         }
 
-        // Input: Wo weight
+        // Input: Wo weight (no specific layout constraint)
         if (params_.Wo)
         {
             BufferTensorType buf_type = toBufferTensorType(params_.Wo->native_type());
             reqs.addInput("Wo", params_.Wo->shape(), buf_type);
         }
 
-        // Output: projected attention (FP32)
+        // Output: projected attention [seq_len][d_model] - generic 2D layout
         if (params_.output)
         {
             const size_t out_rows = static_cast<size_t>(params_.batch_size * params_.seq_len);
             const size_t out_cols = static_cast<size_t>(params_.d_model);
             BufferTensorType buf_type = toBufferTensorType(params_.output->native_type());
-            reqs.addOutput("output", {out_rows, out_cols}, buf_type);
+            reqs.addOutput("output", {out_rows, out_cols}, buf_type, TensorLayout::ROW_MAJOR_2D);
         }
 
         return reqs;
+    }
+
+    // =========================================================================
+    // Layout Expectation (Phase 3: Declarative Layout Validation)
+    // =========================================================================
+
+    verification::LayoutExpectation FusedAttentionWoStage::getLayoutExpectation() const
+    {
+        // Provide model dimensions for automatic layout validation
+        // GraphExecutor uses this with getBufferRequirements().withLayout() declarations
+        return verification::LayoutExpectation::forAttention(
+            params_.head_dim,
+            params_.n_heads,
+            params_.n_kv_heads);
     }
 
 } // namespace llaminar2

@@ -131,6 +131,76 @@ TEST_F(Test__UnifiedKVCache, FactoryQ16_1)
     EXPECT_EQ(cache->precision(), ActivationPrecision::Q16_1);
 }
 
+// =============================================================================
+// Test: Factory Layout Mode Selection
+// =============================================================================
+
+TEST_F(Test__UnifiedKVCache, Factory_DefaultLayoutMode_IsPositionMajor)
+{
+    // All precisions should default to POSITION_MAJOR when layout_mode not specified
+    auto fp32_cache = createUnifiedKVCache(ActivationPrecision::FP32, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    ASSERT_NE(fp32_cache, nullptr);
+    EXPECT_EQ(fp32_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    EXPECT_EQ(fp32_cache->kv_layout(), TensorLayout::KV_POS_HEAD_DIM);
+
+    auto bf16_cache = createUnifiedKVCache(ActivationPrecision::BF16, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    ASSERT_NE(bf16_cache, nullptr);
+    EXPECT_EQ(bf16_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+
+    auto fp16_cache = createUnifiedKVCache(ActivationPrecision::FP16, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    ASSERT_NE(fp16_cache, nullptr);
+    EXPECT_EQ(fp16_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+
+    auto q8_1_cache = createUnifiedKVCache(ActivationPrecision::Q8_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    ASSERT_NE(q8_1_cache, nullptr);
+    EXPECT_EQ(q8_1_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+
+    auto q16_1_cache = createUnifiedKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    ASSERT_NE(q16_1_cache, nullptr);
+    EXPECT_EQ(q16_1_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+}
+
+TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_Q16_1)
+{
+    // Q16_1 with explicit HEAD_MAJOR should use HEAD_MAJOR layout
+    // This is required for Q16IntegerAttention kernel compatibility
+    auto cache = createUnifiedKVCache(
+        ActivationPrecision::Q16_1, getTestMPIContext(),
+        2, 1, 16, 2, 64, -1,
+        KVCacheLayoutMode::HEAD_MAJOR);
+
+    ASSERT_NE(cache, nullptr);
+    EXPECT_EQ(cache->precision(), ActivationPrecision::Q16_1);
+    EXPECT_EQ(cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+    EXPECT_EQ(cache->kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
+
+    // Verify tensor shape matches HEAD_MAJOR: [n_kv_heads * max_seq_len, head_dim]
+    auto k_base = cache->get_k_base(0);
+    ASSERT_NE(k_base, nullptr);
+    EXPECT_EQ(k_base->rows(), 2u * 16u);  // n_kv_heads * max_seq_len
+    EXPECT_EQ(k_base->cols(), 64u);       // head_dim
+}
+
+TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_FP32)
+{
+    // FP32 with explicit HEAD_MAJOR should also work
+    auto cache = createUnifiedKVCache(
+        ActivationPrecision::FP32, getTestMPIContext(),
+        2, 1, 16, 4, 32, -1,
+        KVCacheLayoutMode::HEAD_MAJOR);
+
+    ASSERT_NE(cache, nullptr);
+    EXPECT_EQ(cache->precision(), ActivationPrecision::FP32);
+    EXPECT_EQ(cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+    EXPECT_EQ(cache->kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
+
+    // Verify tensor shape
+    auto k_base = cache->get_k_base(0);
+    ASSERT_NE(k_base, nullptr);
+    EXPECT_EQ(k_base->rows(), 4u * 16u);  // n_kv_heads * max_seq_len
+    EXPECT_EQ(k_base->cols(), 32u);       // head_dim
+}
+
 TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
 {
     // Test sharded factory for tensor parallelism
@@ -154,6 +224,40 @@ TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
     EXPECT_EQ(cache->n_kv_heads(), n_kv_heads);
     EXPECT_EQ(cache->local_n_kv_heads(), local_n_kv_heads);
     EXPECT_EQ(cache->kv_head_start(), kv_head_start);
+    // Default layout mode should be POSITION_MAJOR
+    EXPECT_EQ(cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+}
+
+TEST_F(Test__UnifiedKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
+{
+    // Test sharded factory with explicit HEAD_MAJOR layout
+    // This is what GraphOrchestrator should use for HybridQ16 mode
+    int n_layers = 4;
+    int batch_size = 1;
+    int max_seq_len = 64;
+    int n_kv_heads = 4;       // Total across all ranks
+    int local_n_kv_heads = 2; // This rank's portion
+    int kv_head_start = 0;    // Starting head index
+    int head_dim = 64;        // 1 block per head with BLOCK_64
+
+    auto cache = createShardedKVCache(
+        ActivationPrecision::Q16_1, getTestMPIContext(),
+        n_layers, batch_size, max_seq_len,
+        n_kv_heads, local_n_kv_heads, kv_head_start,
+        head_dim, -1,
+        KVCacheLayoutMode::HEAD_MAJOR);
+
+    ASSERT_NE(cache, nullptr);
+    EXPECT_EQ(cache->precision(), ActivationPrecision::Q16_1);
+    EXPECT_TRUE(cache->is_sharded());
+    EXPECT_EQ(cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+    EXPECT_EQ(cache->kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
+
+    // Verify tensor shape for sharded HEAD_MAJOR: [local_n_kv_heads * max_seq_len, head_dim]
+    auto k_base = cache->get_k_base(0);
+    ASSERT_NE(k_base, nullptr);
+    EXPECT_EQ(k_base->rows(), 2u * 64u);  // local_n_kv_heads * max_seq_len
+    EXPECT_EQ(k_base->cols(), 64u);       // head_dim
 }
 
 // =============================================================================
@@ -997,3 +1101,1035 @@ TEST_F(Test__UnifiedKVCache, Q16_1_OneBlockPerHead)
     EXPECT_EQ(k_q16->blocks_per_row(), static_cast<size_t>(n_kv_heads))
         << "With head-aligned block size, blocks_per_row should equal n_kv_heads";
 }
+
+// =============================================================================
+// Test: HEAD_MAJOR Layout Mode
+// =============================================================================
+
+TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_FP32)
+{
+    int n_layers = 2;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 4;
+    int head_dim = 32;
+
+    // Create cache with HEAD_MAJOR layout
+    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                             n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+    EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
+
+    // Verify tensor allocation shape: [n_kv_heads * max_seq_len, head_dim]
+    auto k_base = cache.get_k_base(0);
+    ASSERT_NE(k_base, nullptr);
+    EXPECT_EQ(k_base->rows(), static_cast<size_t>(n_kv_heads * max_seq_len));
+    EXPECT_EQ(k_base->cols(), static_cast<size_t>(head_dim));
+}
+
+TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_Q16_1)
+{
+    int n_layers = 2;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = 64;
+
+    // Create cache with HEAD_MAJOR layout for Q16 (optimal for Q16IntegerAttention)
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+    EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
+
+    // Verify tensor allocation shape: [n_kv_heads * max_seq_len, head_dim]
+    auto k_base = cache.get_k_base(0);
+    ASSERT_NE(k_base, nullptr);
+    EXPECT_EQ(k_base->rows(), static_cast<size_t>(n_kv_heads * max_seq_len));
+    EXPECT_EQ(k_base->cols(), static_cast<size_t>(head_dim));
+}
+
+TEST_F(Test__UnifiedKVCache, HeadMajorLayout_AppendScatterCopy_FP32)
+{
+    // Test that HEAD_MAJOR scatter-copies input from POSITION_MAJOR to HEAD_MAJOR storage
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = 4;
+    int kv_dim = n_kv_heads * head_dim;
+
+    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                             n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Create input in POSITION_MAJOR format: [seq_len, n_kv_heads * head_dim]
+    // Layout: [t=0][h=0,d=0..3], [t=0][h=1,d=0..3], [t=1][h=0,d=0..3], ...
+    int seq_len = 3;
+    auto k_in = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)}, -1);
+    auto v_in = factory.createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)}, -1);
+
+    // Fill with identifiable pattern: value = t * 100 + h * 10 + d
+    float *k_data = k_in->mutable_data();
+    float *v_data = v_in->mutable_data();
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                float val = static_cast<float>(t * 100 + h * 10 + d);
+                k_data[t * kv_dim + h * head_dim + d] = val;
+                v_data[t * kv_dim + h * head_dim + d] = val + 1000.0f;
+            }
+        }
+    }
+
+    // Append to cache
+    ASSERT_TRUE(cache.append_kv(0, k_in.get(), v_in.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
+
+    // Verify HEAD_MAJOR storage: [n_kv_heads * max_seq_len, head_dim]
+    // Expected layout: [h=0][t=0..2], [h=1][t=0..2], ...
+    auto k_cached = cache.get_k_typed(0);
+    auto v_cached = cache.get_v_typed(0);
+    ASSERT_NE(k_cached, nullptr);
+    ASSERT_NE(v_cached, nullptr);
+
+    const float *k_cache = k_cached->data();
+    const float *v_cache = v_cached->data();
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                // HEAD_MAJOR index: (h * max_seq_len + t) * head_dim + d
+                size_t cache_idx = (h * max_seq_len + t) * head_dim + d;
+                float expected_k = static_cast<float>(t * 100 + h * 10 + d);
+                float expected_v = expected_k + 1000.0f;
+
+                EXPECT_FLOAT_EQ(k_cache[cache_idx], expected_k)
+                    << "K mismatch at h=" << h << " t=" << t << " d=" << d;
+                EXPECT_FLOAT_EQ(v_cache[cache_idx], expected_v)
+                    << "V mismatch at h=" << h << " t=" << t << " d=" << d;
+            }
+        }
+    }
+}
+
+TEST_F(Test__UnifiedKVCache, HeadMajorLayout_IncrementalAppend_FP32)
+{
+    // Test incremental append (decode-style, 1 token at a time)
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = 4;
+    int kv_dim = n_kv_heads * head_dim;
+
+    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                             n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Append 5 tokens one at a time
+    for (int t = 0; t < 5; ++t)
+    {
+        auto k = factory.createFP32({1, static_cast<size_t>(kv_dim)}, -1);
+        auto v = factory.createFP32({1, static_cast<size_t>(kv_dim)}, -1);
+
+        // Fill with pattern: position * 100 + head * 10 + dim
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                float val = static_cast<float>(t * 100 + h * 10 + d);
+                k->mutable_data()[h * head_dim + d] = val;
+                v->mutable_data()[h * head_dim + d] = val;
+            }
+        }
+
+        ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+        EXPECT_EQ(cache.get_cached_tokens(0), t + 1);
+    }
+
+    // Verify all tokens are correctly placed in HEAD_MAJOR layout
+    auto k_cached = cache.get_k_typed(0);
+    const float *k_cache = k_cached->data();
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < 5; ++t)
+        {
+            size_t cache_idx = (h * max_seq_len + t) * head_dim;
+            float expected = static_cast<float>(t * 100 + h * 10); // First element of each position
+            EXPECT_FLOAT_EQ(k_cache[cache_idx], expected)
+                << "Incremental append mismatch at h=" << h << " t=" << t;
+        }
+    }
+}
+
+TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Eviction_FP32)
+{
+    // Test that eviction shifts data correctly in HEAD_MAJOR layout
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = 4;
+    int kv_dim = n_kv_heads * head_dim;
+
+    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                             n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Append 6 tokens
+    auto k = factory.createFP32({6, static_cast<size_t>(kv_dim)}, -1);
+    auto v = factory.createFP32({6, static_cast<size_t>(kv_dim)}, -1);
+
+    for (int t = 0; t < 6; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                float val = static_cast<float>(t * 100 + h * 10 + d);
+                k->mutable_data()[t * kv_dim + h * head_dim + d] = val;
+                v->mutable_data()[t * kv_dim + h * head_dim + d] = val;
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), 6);
+
+    // Evict 2 oldest tokens
+    cache.evict_oldest(2);
+    EXPECT_EQ(cache.get_cached_tokens(0), 4);
+
+    // Verify remaining tokens are positions 2-5 (originally t=2,3,4,5)
+    auto k_cached = cache.get_k_typed(0);
+    const float *k_cache = k_cached->data();
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < 4; ++t)
+        {
+            size_t cache_idx = (h * max_seq_len + t) * head_dim;
+            // After evicting 2, position t in cache = original position t+2
+            float expected = static_cast<float>((t + 2) * 100 + h * 10);
+            EXPECT_FLOAT_EQ(k_cache[cache_idx], expected)
+                << "Eviction mismatch at h=" << h << " t=" << t;
+        }
+    }
+}
+
+TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
+{
+    // Test HEAD_MAJOR with Q16_1 quantized data
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = 64; // 1 block per head with BLOCK_64
+    int kv_dim = n_kv_heads * head_dim;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Create Q16_1 input in POSITION_MAJOR format
+    int seq_len = 4;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 Q16BlockSize::BLOCK_64, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 Q16BlockSize::BLOCK_64, -1);
+
+    // Initialize with identifiable pattern
+    size_t blocks_per_row = n_kv_heads; // 1 block per head
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            size_t block_idx = t * blocks_per_row + h;
+            auto *k_block = reinterpret_cast<Q16_1Block_64 *>(k->raw_mutable_data()) + block_idx;
+            auto *v_block = reinterpret_cast<Q16_1Block_64 *>(v->raw_mutable_data()) + block_idx;
+
+            k_block->d = 0.01f * (t + 1);     // Different scale per position
+            v_block->d = 0.01f * (t + 1);
+            k_block->qs[0] = static_cast<int16_t>(t * 100 + h * 10); // Identifiable pattern
+            v_block->qs[0] = static_cast<int16_t>(t * 100 + h * 10 + 1000);
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
+
+    // Verify HEAD_MAJOR storage
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    // blocks_per_head = 1 (head_dim=64, BLOCK_64)
+    // HEAD_MAJOR index: (h * max_seq_len + t) * blocks_per_head
+    const auto *k_blocks = reinterpret_cast<const Q16_1Block_64 *>(k_q16->raw_data());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < seq_len; ++t)
+        {
+            size_t block_idx = (h * max_seq_len + t);
+            const auto &blk = k_blocks[block_idx];
+
+            float expected_d = 0.01f * (t + 1);
+            int16_t expected_qs0 = static_cast<int16_t>(t * 100 + h * 10);
+
+            EXPECT_FLOAT_EQ(blk.d, expected_d)
+                << "Q16 scale mismatch at h=" << h << " t=" << t;
+            EXPECT_EQ(blk.qs[0], expected_qs0)
+                << "Q16 qs[0] mismatch at h=" << h << " t=" << t;
+        }
+    }
+}
+
+TEST_F(Test__UnifiedKVCache, PositionMajorLayout_Default)
+{
+    // Verify default layout is POSITION_MAJOR
+    UnifiedKVCacheFP32 cache(getTestMPIContext(), 2, 1, 16, 4, 32, -1);
+
+    EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+    EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_POS_HEAD_DIM);
+
+    // Verify tensor shape: [max_seq_len, n_kv_heads * head_dim]
+    auto k_base = cache.get_k_base(0);
+    ASSERT_NE(k_base, nullptr);
+    EXPECT_EQ(k_base->rows(), 16u);          // max_seq_len
+    EXPECT_EQ(k_base->cols(), 4u * 32u);     // n_kv_heads * head_dim
+}
+
+// =============================================================================
+// Parameterized Tests: Q16 Block Size Variants for HEAD_MAJOR Layout
+// =============================================================================
+
+struct Q16BlockSizeTestParams
+{
+    Q16BlockSize block_size;
+    int head_dim;
+    std::string name;
+};
+
+class Test__UnifiedKVCache_Q16BlockSizes : public ::testing::TestWithParam<Q16BlockSizeTestParams>
+{
+  protected:
+    MPIContext getTestMPIContext()
+    {
+        return MPIContext(0, 1, MPI_COMM_WORLD);
+    }
+};
+
+TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_AppendAndVerify)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    // Get block element count for this block size
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = head_dim / block_elements;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Create Q16_1 input in POSITION_MAJOR format
+    int seq_len = 4;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    // Initialize with identifiable pattern per block
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    uint8_t *v_raw = static_cast<uint8_t *>(v->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(k->q16_block_size());
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t block_idx = t * blocks_per_row + h * blocks_per_head + b;
+
+                // Set scale (first 4 bytes of each block structure)
+                float scale_k = 0.01f * (t + 1) * (h + 1) * (b + 1);
+                float scale_v = 0.02f * (t + 1) * (h + 1) * (b + 1);
+                std::memcpy(k_raw + block_idx * block_bytes, &scale_k, sizeof(float));
+                std::memcpy(v_raw + block_idx * block_bytes, &scale_v, sizeof(float));
+
+                // Set first quantized value (after 4-byte scale)
+                int16_t qs_k = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                int16_t qs_v = static_cast<int16_t>(t * 1000 + h * 100 + b * 10 + 5000);
+                std::memcpy(k_raw + block_idx * block_bytes + sizeof(float), &qs_k, sizeof(int16_t));
+                std::memcpy(v_raw + block_idx * block_bytes + sizeof(float), &qs_v, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
+
+    // Verify HEAD_MAJOR storage
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                // HEAD_MAJOR index: (h * max_seq_len + t) * blocks_per_head + b
+                size_t cache_block_idx = (h * max_seq_len + t) * blocks_per_head + b;
+
+                float cached_scale;
+                int16_t cached_qs;
+                std::memcpy(&cached_scale, k_cache_raw + cache_block_idx * block_bytes, sizeof(float));
+                std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + sizeof(float), sizeof(int16_t));
+
+                float expected_scale = 0.01f * (t + 1) * (h + 1) * (b + 1);
+                int16_t expected_qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+
+                EXPECT_FLOAT_EQ(cached_scale, expected_scale)
+                    << "Scale mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " block_size=" << params.name;
+                EXPECT_EQ(cached_qs, expected_qs)
+                    << "qs[0] mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " block_size=" << params.name;
+            }
+        }
+    }
+}
+
+TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_IncrementalDecode)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = head_dim / block_elements;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Append 5 tokens one at a time (decode style)
+    for (int t = 0; t < 5; ++t)
+    {
+        auto k = factory.createQ16_1({1, static_cast<size_t>(kv_dim)}, params.block_size, -1);
+        auto v = factory.createQ16_1({1, static_cast<size_t>(kv_dim)}, params.block_size, -1);
+
+        uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+        size_t block_bytes = q16_block_size_bytes(k->q16_block_size());
+        size_t blocks_per_row = n_kv_heads * blocks_per_head;
+
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t block_idx = h * blocks_per_head + b;
+                float scale = 0.01f * (t + 1);
+                int16_t qs = static_cast<int16_t>(t * 100 + h * 10 + b);
+                std::memcpy(k_raw + block_idx * block_bytes, &scale, sizeof(float));
+                std::memcpy(k_raw + block_idx * block_bytes + sizeof(float), &qs, sizeof(int16_t));
+            }
+        }
+
+        ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+        EXPECT_EQ(cache.get_cached_tokens(0), t + 1);
+    }
+
+    // Verify all tokens
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+    size_t block_bytes = q16_block_size_bytes(k_q16->q16_block_size());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < 5; ++t)
+        {
+            size_t cache_block_idx = (h * max_seq_len + t) * blocks_per_head;
+            int16_t cached_qs;
+            std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + sizeof(float), sizeof(int16_t));
+
+            int16_t expected_qs = static_cast<int16_t>(t * 100 + h * 10);
+            EXPECT_EQ(cached_qs, expected_qs)
+                << "Incremental decode mismatch at h=" << h << " t=" << t
+                << " block_size=" << params.name;
+        }
+    }
+}
+
+TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_EvictionPreservesData)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 16;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = head_dim / block_elements;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Append 6 tokens
+    int seq_len = 6;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(k->q16_block_size());
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t block_idx = t * blocks_per_row + h * blocks_per_head + b;
+                float scale = 0.01f * (t + 1);
+                int16_t qs = static_cast<int16_t>(t * 100 + h * 10 + b);
+                std::memcpy(k_raw + block_idx * block_bytes, &scale, sizeof(float));
+                std::memcpy(k_raw + block_idx * block_bytes + sizeof(float), &qs, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), 6);
+
+    // Evict 2 oldest tokens
+    cache.evict_oldest(2);
+    EXPECT_EQ(cache.get_cached_tokens(0), 4);
+
+    // Verify remaining tokens are positions 2-5 (originally t=2,3,4,5)
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+    block_bytes = q16_block_size_bytes(k_q16->q16_block_size());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < 4; ++t)
+        {
+            size_t cache_block_idx = (h * max_seq_len + t) * blocks_per_head;
+            int16_t cached_qs;
+            std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + sizeof(float), sizeof(int16_t));
+
+            // After evicting 2, position t in cache = original position t+2
+            int16_t expected_qs = static_cast<int16_t>((t + 2) * 100 + h * 10);
+            EXPECT_EQ(cached_qs, expected_qs)
+                << "Eviction mismatch at h=" << h << " t=" << t
+                << " block_size=" << params.name;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Q16BlockSizeVariants,
+    Test__UnifiedKVCache_Q16BlockSizes,
+    ::testing::Values(
+        Q16BlockSizeTestParams{Q16BlockSize::BLOCK_32, 32, "BLOCK_32_head32"},
+        Q16BlockSizeTestParams{Q16BlockSize::BLOCK_64, 64, "BLOCK_64_head64"},
+        Q16BlockSizeTestParams{Q16BlockSize::BLOCK_128, 128, "BLOCK_128_head128"}),
+    [](const ::testing::TestParamInfo<Q16BlockSizeTestParams> &info)
+    {
+        return info.param.name;
+    });
+// =============================================================================
+// Extended Q16_1 Block Size Tests: Multi-Blocks-Per-Head
+// =============================================================================
+
+// These tests exercise cases where head_dim > block_size, resulting in
+// multiple blocks per head. This is important to catch pointer arithmetic bugs.
+
+struct Q16MultiBlockTestParams
+{
+    Q16BlockSize block_size;
+    int head_dim;
+    int expected_blocks_per_head;
+    std::string name;
+};
+
+class Test__UnifiedKVCache_Q16MultiBlock : public ::testing::TestWithParam<Q16MultiBlockTestParams>
+{
+  protected:
+    MPIContext getTestMPIContext()
+    {
+        return MPIContext(0, 1, MPI_COMM_WORLD);
+    }
+};
+
+TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 8;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = params.expected_blocks_per_head;
+    ASSERT_EQ(head_dim / block_elements, blocks_per_head) << "Test param mismatch";
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Create input with 3 tokens
+    int seq_len = 3;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    // Fill with unique pattern per block: encode (token, head, block_within_head)
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    uint8_t *v_raw = static_cast<uint8_t *>(v->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(params.block_size);
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t src_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+
+                // Use distinctive values to detect any reordering issues
+                float scale_k = 0.001f * (t * 100 + h * 10 + b);
+                float scale_v = 0.002f * (t * 100 + h * 10 + b);
+                
+                // Pattern encodes position: t*1000 + h*100 + b*10 + element_offset
+                int16_t qs_k_0 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                int16_t qs_k_1 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10 + 1);
+                int16_t qs_v_0 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10 + 5000);
+
+                std::memcpy(k_raw + src_block_idx * block_bytes, &scale_k, sizeof(float));
+                std::memcpy(v_raw + src_block_idx * block_bytes, &scale_v, sizeof(float));
+                
+                // Write first two int16 elements (after scale and sum_qs fields)
+                // Block layout: float d (4) + int32_t sum_qs (4) + int16_t qs[N]
+                size_t qs_offset = 8; // 4 bytes scale + 4 bytes sum_qs
+                std::memcpy(k_raw + src_block_idx * block_bytes + qs_offset, &qs_k_0, sizeof(int16_t));
+                std::memcpy(k_raw + src_block_idx * block_bytes + qs_offset + 2, &qs_k_1, sizeof(int16_t));
+                std::memcpy(v_raw + src_block_idx * block_bytes + qs_offset, &qs_v_0, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
+
+    // Verify HEAD_MAJOR storage - check all blocks are in correct positions
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                // HEAD_MAJOR: (h * max_seq_len + t) * blocks_per_head + b
+                size_t cache_block_idx = (h * max_seq_len + t) * blocks_per_head + b;
+
+                float cached_scale;
+                int16_t cached_qs_0, cached_qs_1;
+                
+                std::memcpy(&cached_scale, k_cache_raw + cache_block_idx * block_bytes, sizeof(float));
+                size_t qs_offset = 8;
+                std::memcpy(&cached_qs_0, k_cache_raw + cache_block_idx * block_bytes + qs_offset, sizeof(int16_t));
+                std::memcpy(&cached_qs_1, k_cache_raw + cache_block_idx * block_bytes + qs_offset + 2, sizeof(int16_t));
+
+                float expected_scale = 0.001f * (t * 100 + h * 10 + b);
+                int16_t expected_qs_0 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                int16_t expected_qs_1 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10 + 1);
+
+                EXPECT_NEAR(cached_scale, expected_scale, 1e-6f)
+                    << "Scale mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+                EXPECT_EQ(cached_qs_0, expected_qs_0)
+                    << "qs[0] mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+                EXPECT_EQ(cached_qs_1, expected_qs_1)
+                    << "qs[1] mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+            }
+        }
+    }
+}
+
+TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 8;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = params.expected_blocks_per_head;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    // Append 5 tokens
+    int seq_len = 5;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(params.block_size);
+    size_t qs_offset = 8;
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t src_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+                int16_t qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                std::memcpy(k_raw + src_block_idx * block_bytes + qs_offset, &qs, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), 5);
+
+    // Evict 2 oldest tokens
+    cache.evict_oldest(2);
+    EXPECT_EQ(cache.get_cached_tokens(0), 3);
+
+    // Verify remaining tokens (originally t=2,3,4) are correctly shifted
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < 3; ++t)  // 3 remaining tokens
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t cache_block_idx = (h * max_seq_len + t) * blocks_per_head + b;
+
+                int16_t cached_qs;
+                std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + qs_offset, sizeof(int16_t));
+
+                // After evicting 2, cache[t] = original[t+2]
+                int16_t expected_qs = static_cast<int16_t>((t + 2) * 1000 + h * 100 + b * 10);
+                EXPECT_EQ(cached_qs, expected_qs)
+                    << "Eviction mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+            }
+        }
+    }
+}
+
+TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_AppendMultiBlockPerHead)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 8;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = params.expected_blocks_per_head;
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+
+    // Use POSITION_MAJOR layout
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::POSITION_MAJOR);
+
+    EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    int seq_len = 3;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(params.block_size);
+    size_t qs_offset = 8;
+
+    // Fill with pattern
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t src_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+                int16_t qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                std::memcpy(k_raw + src_block_idx * block_bytes + qs_offset, &qs, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
+
+    // Verify POSITION_MAJOR storage: data should be contiguous by position
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                // POSITION_MAJOR: t * blocks_per_row + h * blocks_per_head + b
+                size_t cache_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+
+                int16_t cached_qs;
+                std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + qs_offset, sizeof(int16_t));
+
+                int16_t expected_qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                EXPECT_EQ(cached_qs, expected_qs)
+                    << "POSITION_MAJOR mismatch at t=" << t << " h=" << h << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+            }
+        }
+    }
+}
+
+TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_EvictionMultiBlockPerHead)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 8;
+    int n_kv_heads = 2;
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int block_elements = static_cast<int>(params.block_size);
+    int blocks_per_head = params.expected_blocks_per_head;
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::POSITION_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    int seq_len = 5;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(params.block_size);
+    size_t qs_offset = 8;
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t src_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+                int16_t qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                std::memcpy(k_raw + src_block_idx * block_bytes + qs_offset, &qs, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+    cache.evict_oldest(2);
+    EXPECT_EQ(cache.get_cached_tokens(0), 3);
+
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+
+    for (int t = 0; t < 3; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t cache_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+
+                int16_t cached_qs;
+                std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + qs_offset, sizeof(int16_t));
+
+                // After evicting 2, cache[t] = original[t+2]
+                int16_t expected_qs = static_cast<int16_t>((t + 2) * 1000 + h * 100 + b * 10);
+                EXPECT_EQ(cached_qs, expected_qs)
+                    << "POSITION_MAJOR eviction mismatch at t=" << t << " h=" << h << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+            }
+        }
+    }
+}
+
+// Test with 4 KV heads to exercise more complex scatter patterns
+TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
+{
+    const auto &params = GetParam();
+    int n_layers = 1;
+    int batch_size = 1;
+    int max_seq_len = 8;
+    int n_kv_heads = 4;  // More heads
+    int head_dim = params.head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int blocks_per_head = params.expected_blocks_per_head;
+    size_t blocks_per_row = n_kv_heads * blocks_per_head;
+
+    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
+
+    TensorFactory factory(getTestMPIContext());
+
+    int seq_len = 3;
+    auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+    auto v = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
+                                 params.block_size, -1);
+
+    uint8_t *k_raw = static_cast<uint8_t *>(k->raw_mutable_data());
+    size_t block_bytes = q16_block_size_bytes(params.block_size);
+    size_t qs_offset = 8;
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t src_block_idx = t * blocks_per_row + h * blocks_per_head + b;
+                int16_t qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                std::memcpy(k_raw + src_block_idx * block_bytes + qs_offset, &qs, sizeof(int16_t));
+            }
+        }
+    }
+
+    ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
+
+    auto k_cached = cache.get_k_base(0);
+    auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
+    ASSERT_NE(k_q16, nullptr);
+
+    const uint8_t *k_cache_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+
+    for (int h = 0; h < n_kv_heads; ++h)
+    {
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int b = 0; b < blocks_per_head; ++b)
+            {
+                size_t cache_block_idx = (h * max_seq_len + t) * blocks_per_head + b;
+
+                int16_t cached_qs;
+                std::memcpy(&cached_qs, k_cache_raw + cache_block_idx * block_bytes + qs_offset, sizeof(int16_t));
+
+                int16_t expected_qs = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
+                EXPECT_EQ(cached_qs, expected_qs)
+                    << "4-head mismatch at h=" << h << " t=" << t << " b=" << b
+                    << " (multi-block: " << params.name << ")";
+            }
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Q16MultiBlockVariants,
+    Test__UnifiedKVCache_Q16MultiBlock,
+    ::testing::Values(
+        // Multi-block scenarios using head_dim values where optimal_q16_block_size
+        // returns a smaller block, naturally creating multiple blocks per head.
+        //
+        // head_dim=96: optimal returns BLOCK_32 (96 % 32 == 0) -> 3 blocks
+        Q16MultiBlockTestParams{Q16BlockSize::BLOCK_32, 96, 3, "head96_BLOCK_32_3blocks"},
+        // head_dim=256: optimal returns BLOCK_128 (256 % 128 == 0) -> 2 blocks
+        Q16MultiBlockTestParams{Q16BlockSize::BLOCK_128, 256, 2, "head256_BLOCK_128_2blocks"},
+        // head_dim=384: optimal returns BLOCK_128 (384 % 128 == 0) -> 3 blocks
+        Q16MultiBlockTestParams{Q16BlockSize::BLOCK_128, 384, 3, "head384_BLOCK_128_3blocks"},
+        // head_dim=512: optimal returns BLOCK_128 (512 % 128 == 0) -> 4 blocks
+        Q16MultiBlockTestParams{Q16BlockSize::BLOCK_128, 512, 4, "head512_BLOCK_128_4blocks"},
+        // head_dim=192: optimal returns BLOCK_64 (192 % 64 == 0) -> 3 blocks
+        Q16MultiBlockTestParams{Q16BlockSize::BLOCK_64, 192, 3, "head192_BLOCK_64_3blocks"}),
+    [](const ::testing::TestParamInfo<Q16MultiBlockTestParams> &info)
+    {
+        return info.param.name;
+    });

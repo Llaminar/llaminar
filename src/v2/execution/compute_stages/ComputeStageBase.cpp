@@ -7,11 +7,23 @@
 #include "ComputeStageUtils.h"
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/Tensors.h"
+#include "../../tensors/TensorVerification.h"
 #include "../../utils/Logger.h"
 #include "../../kernels/KernelFactory.h"
 
 namespace llaminar2
 {
+
+    // =============================================================================
+    // Default Layout Expectation (Phase 3: Tensor Layout Contracts)
+    // =============================================================================
+
+    LayoutExpectation IComputeStage::getLayoutExpectation() const
+    {
+        // Default: return empty expectation (no automatic layout validation)
+        // Stages override this to enable declarative layout validation
+        return LayoutExpectation{};
+    }
 
     // =============================================================================
     // Stage Type Names

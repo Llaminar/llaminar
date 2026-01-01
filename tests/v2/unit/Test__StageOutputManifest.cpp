@@ -200,6 +200,7 @@ public:
     ComputeStageType type() const override { return ComputeStageType::COPY; }
     bool supportsBackend(ComputeBackendType) const override { return true; }
     size_t estimatedFlops() const override { return 0; }
+    StageDumpInfo getDumpInfo() const override { return {}; }
 };
 
 TEST_F(StageOutputManifestTest, DefaultStage_EmptyDeclaredOutputs)

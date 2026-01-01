@@ -124,10 +124,11 @@ TEST_F(Test__Q16BlockStructures, OptimalBlockSizeForMultiples)
 
 TEST_F(Test__Q16BlockStructures, OptimalBlockSizeFallback)
 {
-    // Non-standard dimensions should fall back to 64
-    EXPECT_EQ(optimal_q16_block_size(96), Q16BlockSize::BLOCK_64); // 96 not divisible by 128/192
-    EXPECT_EQ(optimal_q16_block_size(80), Q16BlockSize::BLOCK_64); // 80 not divisible by 128/192
-    EXPECT_EQ(optimal_q16_block_size(32), Q16BlockSize::BLOCK_64); // Use 64 as minimum for attention
+    // Non-standard dimensions should fall back based on divisibility
+    // Preference order: 128 > 64 > 32 > 64 (universal fallback)
+    EXPECT_EQ(optimal_q16_block_size(96), Q16BlockSize::BLOCK_32);  // 96 % 32 == 0
+    EXPECT_EQ(optimal_q16_block_size(80), Q16BlockSize::BLOCK_64);  // 80 % 32 != 0, fallback to 64
+    EXPECT_EQ(optimal_q16_block_size(32), Q16BlockSize::BLOCK_32);  // head_dim=32 uses BLOCK_32 (some older models)
 }
 
 TEST_F(Test__Q16BlockStructures, OptimalBlockSizeForRealModels)

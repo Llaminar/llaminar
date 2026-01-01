@@ -89,6 +89,7 @@
 #include "TensorKernels.h"
 #include "FP16Utils.h"
 #include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
+#include "TensorLayout.h"    // Tensor memory layout contracts
 #include "SIMDHelpers.h"
 #include "AlignedVector.h"
 #include <vector>
@@ -1207,6 +1208,36 @@ namespace llaminar2
          */
         const std::string &debugName() const { return debug_name_; }
 
+        // =========================================================================
+        // Tensor Layout Contract (Phase 3: Tensor Layout Contracts)
+        // =========================================================================
+
+        /**
+         * @brief Get the memory layout of this tensor
+         *
+         * Layouts define how multi-dimensional data is organized in memory.
+         * For attention tensors, this indicates whether data is sequence-major,
+         * head-major, position-major, etc.
+         *
+         * @return Current layout, or TensorLayout::UNKNOWN if not set
+         * @see TensorLayout.h for layout definitions
+         */
+        virtual TensorLayout layout() const { return layout_; }
+
+        /**
+         * @brief Set the memory layout of this tensor
+         *
+         * Call this when:
+         * - Creating Q/K/V tensors with specific layouts
+         * - After transposing tensor data
+         * - When reinterpreting tensor shape semantics
+         *
+         * @param layout New layout to set
+         * @note This only changes metadata, not the actual data layout.
+         *       Use transpose_to() for actual data reorganization.
+         */
+        virtual void setLayout(TensorLayout layout) { layout_ = layout; }
+
     protected:
         // Default constructor for derived classes
         TensorBase() = default;
@@ -1218,6 +1249,9 @@ namespace llaminar2
 #endif
         // Debug name for error messages (always present, minimal overhead)
         std::string debug_name_;
+
+        // Tensor layout contract (Phase 3)
+        TensorLayout layout_ = TensorLayout::UNKNOWN;
 
         // ===== Debug Validity Assertion Helper =====
 #ifndef NDEBUG

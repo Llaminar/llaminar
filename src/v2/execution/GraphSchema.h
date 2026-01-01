@@ -459,7 +459,7 @@ namespace llaminar2
         std::unordered_map<std::string, bool> bool_params;
         std::unordered_map<std::string, std::string> string_params;
         std::unordered_map<std::string, TensorBase *> tensor_params;
-        std::unordered_map<std::string, void *> opaque_params; // MPI_Comm, etc.
+        std::unordered_map<std::string, void *> opaque_params; // MPIContext*, IUnifiedKVCache*, etc.
     };
 
     /**

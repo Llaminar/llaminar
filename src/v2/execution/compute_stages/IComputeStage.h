@@ -33,6 +33,11 @@ namespace llaminar2
 {
 
     // Forward declarations
+    namespace verification
+    {
+        struct LayoutExpectation;
+    }
+    using verification::LayoutExpectation;
     class TensorBase;
     class IKVCache;
     class IUnifiedKVCache;
@@ -275,8 +280,13 @@ namespace llaminar2
          *
          * Returns comprehensive information about all buffers and parameters
          * used by this stage, enabling full reproducibility of execution.
+         *
+         * @note This is a REQUIRED method - all stages must implement it for
+         *       the TensorVerification framework to work correctly. Without
+         *       proper getDumpInfo(), entry/exit validation cannot inspect
+         *       stage inputs and outputs.
          */
-        virtual StageDumpInfo getDumpInfo() const { return StageDumpInfo{}; }
+        virtual StageDumpInfo getDumpInfo() const = 0;
 
         /**
          * @brief Get buffer requirements for this stage
@@ -288,6 +298,32 @@ namespace llaminar2
         {
             return StageBufferRequirements{};
         }
+
+        /**
+         * @brief Get layout expectation for automatic validation
+         *
+         * If a stage returns a non-empty LayoutExpectation, the GraphExecutor
+         * will automatically validate all input/output tensors with declared
+         * layouts (via getBufferRequirements().withLayout()) against this
+         * expectation at stage entry and exit.
+         *
+         * This enables declarative layout validation:
+         * 1. Stage declares expected layouts in getBufferRequirements():
+         *    @code
+         *    reqs.addInput("Q", ...).withLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+         *    @endcode
+         * 2. Stage returns model dimensions in getLayoutExpectation():
+         *    @code
+         *    return LayoutExpectation::forAttention(
+         *        params_.head_dim, params_.n_heads, params_.n_kv_heads,
+         *        local_heads, local_kv_heads);
+         *    @endcode
+         * 3. GraphExecutor automatically validates on each execute()
+         *
+         * @return LayoutExpectation with model dimensions, or empty (is_set()==false)
+         *         if no automatic validation is desired.
+         */
+        virtual LayoutExpectation getLayoutExpectation() const;
 
         /**
          * @brief Get output buffer descriptors for this stage
@@ -306,6 +342,24 @@ namespace llaminar2
          * Used for dependency analysis in tensor-parallel execution.
          */
         virtual bool requiresAllreduce() const { return false; }
+
+        /**
+         * @brief Whether this stage allows all-zero output tensors
+         *
+         * By default, all-zero outputs are treated as bugs (likely uninitialized
+         * buffers or upstream computation failures). However, some stages may
+         * legitimately produce all-zero outputs in specific scenarios:
+         *
+         * - KVCacheGatherStage: Before first token, cache may be empty
+         * - SwiGLU: Theoretically possible with extreme gate values (rare)
+         *
+         * Override this to return true if your stage has legitimate all-zero
+         * output scenarios. The GraphExecutor will skip zero-check validation
+         * for stages that return true.
+         *
+         * @return false by default (all-zero outputs are bugs)
+         */
+        virtual bool allowsZeroOutput() const { return false; }
 
         /**
          * @brief Update dynamic parameters for graph reuse

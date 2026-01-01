@@ -42,12 +42,15 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[AllreduceStage] Execute: buffer=" << params_.buffer
-                                                      << " count=" << count << " has_comm=" << (params_.mpi_comm != nullptr));
-        if (!params_.mpi_comm)
+                                                      << " count=" << count << " has_mpi_ctx=" << (params_.mpi_ctx != nullptr));
+        if (!params_.mpi_ctx)
         {
-            LOG_ERROR("[AllreduceStage] Null MPI communicator");
+            LOG_ERROR("[AllreduceStage] Null MPI context");
             return false;
         }
+
+        // Get MPI communicator from context
+        MPI_Comm comm = params_.mpi_ctx->comm();
 
         // Start timing if enabled
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -62,7 +65,6 @@ namespace llaminar2
             if (fp32_tensor)
             {
                 float *data_ptr = fp32_tensor->mutable_data();
-                MPI_Comm comm = static_cast<MPI_Comm>(params_.mpi_comm);
 
                 LOG_DEBUG("[AllreduceStage] FP32 path: before data[0:4]="
                           << data_ptr[0] << "," << data_ptr[1] << "," << data_ptr[2] << "," << data_ptr[3]);
@@ -85,7 +87,7 @@ namespace llaminar2
         {
             // Q16_1: Use MPIContext::allreduce_q16_1_inplace for efficient SIMD reduction
             auto *q16_tensor = dynamic_cast<Q16_1Tensor *>(params_.buffer);
-            if (q16_tensor && params_.mpi_ctx)
+            if (q16_tensor)
             {
                 Q16_1Block *blocks = q16_tensor->mutable_typed_data();
                 size_t n_blocks = (count + 31) / 32;
@@ -96,17 +98,12 @@ namespace llaminar2
                 params_.mpi_ctx->allreduce_q16_1_inplace(blocks, n_blocks);
                 success = true;
             }
-            else if (!params_.mpi_ctx)
-            {
-                LOG_ERROR("[AllreduceStage] Q16_1 tensor requires mpi_ctx for allreduce");
-                return false;
-            }
         }
         else if (params_.buffer->native_type() == TensorType::Q8_1)
         {
             // Q8_1: Use MPIContext::allreduce_q8_1_inplace for efficient SIMD reduction
             auto *q8_tensor = dynamic_cast<Q8_1Tensor *>(params_.buffer);
-            if (q8_tensor && params_.mpi_ctx)
+            if (q8_tensor)
             {
                 Q8_1Block *blocks = q8_tensor->mutable_typed_data();
                 size_t n_blocks = (count + 31) / 32;
@@ -116,11 +113,6 @@ namespace llaminar2
 
                 params_.mpi_ctx->allreduce_q8_1_inplace(blocks, n_blocks);
                 success = true;
-            }
-            else if (!params_.mpi_ctx)
-            {
-                LOG_ERROR("[AllreduceStage] Q8_1 tensor requires mpi_ctx for allreduce");
-                return false;
             }
         }
         else

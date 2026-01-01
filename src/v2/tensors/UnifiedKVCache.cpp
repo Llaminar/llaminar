@@ -68,9 +68,29 @@ namespace llaminar2
     {
         float *dst_data = dst->mutable_data();
         const float *src_data = src->data();
-        size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
-        size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(float);
-        std::memcpy(dst_data + offset, src_data, copy_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: scatter from [new_tokens, n_kv_heads * head_dim] to [n_kv_heads * max_seq_len, head_dim]
+            // Input: src[t * kv_dim_ + h * head_dim_ + d]
+            // Output: dst[(h * max_seq_len_ + offset_tokens + t) * head_dim_ + d]
+            for (int t = 0; t < new_tokens; ++t)
+            {
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    const float *src_head = src_data + t * kv_dim_ + h * head_dim_;
+                    float *dst_head = dst_data + (h * max_seq_len_ + offset_tokens + t) * head_dim_;
+                    std::memcpy(dst_head, src_head, head_dim_ * sizeof(float));
+                }
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous copy
+            size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
+            size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(float);
+            std::memcpy(dst_data + offset, src_data, copy_size);
+        }
     }
 
     template <>
@@ -79,9 +99,27 @@ namespace llaminar2
     {
         uint16_t *dst_data = dst->mutable_typed_data();
         const uint16_t *src_data = src->typed_data();
-        size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
-        size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(uint16_t);
-        std::memcpy(dst_data + offset, src_data, copy_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: scatter from [new_tokens, n_kv_heads * head_dim] to [n_kv_heads * max_seq_len, head_dim]
+            for (int t = 0; t < new_tokens; ++t)
+            {
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    const uint16_t *src_head = src_data + t * kv_dim_ + h * head_dim_;
+                    uint16_t *dst_head = dst_data + (h * max_seq_len_ + offset_tokens + t) * head_dim_;
+                    std::memcpy(dst_head, src_head, head_dim_ * sizeof(uint16_t));
+                }
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous copy
+            size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
+            size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(uint16_t);
+            std::memcpy(dst_data + offset, src_data, copy_size);
+        }
     }
 
     template <>
@@ -90,9 +128,27 @@ namespace llaminar2
     {
         uint16_t *dst_data = dst->mutable_typed_data();
         const uint16_t *src_data = src->typed_data();
-        size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
-        size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(uint16_t);
-        std::memcpy(dst_data + offset, src_data, copy_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: scatter from [new_tokens, n_kv_heads * head_dim] to [n_kv_heads * max_seq_len, head_dim]
+            for (int t = 0; t < new_tokens; ++t)
+            {
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    const uint16_t *src_head = src_data + t * kv_dim_ + h * head_dim_;
+                    uint16_t *dst_head = dst_data + (h * max_seq_len_ + offset_tokens + t) * head_dim_;
+                    std::memcpy(dst_head, src_head, head_dim_ * sizeof(uint16_t));
+                }
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous copy
+            size_t offset = static_cast<size_t>(offset_tokens) * kv_dim_;
+            size_t copy_size = static_cast<size_t>(new_tokens) * kv_dim_ * sizeof(uint16_t);
+            std::memcpy(dst_data + offset, src_data, copy_size);
+        }
     }
 
     template <>
@@ -102,12 +158,34 @@ namespace llaminar2
         Q8_1Block *dst_blocks = dst->mutable_typed_data();
         const Q8_1Block *src_blocks = src->typed_data();
 
-        size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
-        size_t copy_blocks = static_cast<size_t>(new_tokens) * blocks_per_row;
-        size_t copy_size = copy_blocks * sizeof(Q8_1Block);
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: scatter from [new_tokens, n_kv_heads * head_dim] to [n_kv_heads * max_seq_len, head_dim]
+            // Input has blocks_per_row = kv_dim / 32, output has blocks_per_head = head_dim / 32
+            const size_t blocks_per_head = (head_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const size_t src_blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
 
-        std::memcpy(dst_blocks + offset_blocks, src_blocks, copy_size);
+            for (int t = 0; t < new_tokens; ++t)
+            {
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    // Source: position-major [t][h] -> block index: t * src_blocks_per_row + h * blocks_per_head
+                    const Q8_1Block *src_head = src_blocks + t * src_blocks_per_row + h * blocks_per_head;
+                    // Dest: head-major [h][offset+t] -> block index: (h * max_seq_len_ + offset + t) * blocks_per_head
+                    Q8_1Block *dst_head = dst_blocks + (h * max_seq_len_ + offset_tokens + t) * blocks_per_head;
+                    std::memcpy(dst_head, src_head, blocks_per_head * sizeof(Q8_1Block));
+                }
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous copy
+            size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
+            size_t copy_blocks = static_cast<size_t>(new_tokens) * blocks_per_row;
+            size_t copy_size = copy_blocks * sizeof(Q8_1Block);
+            std::memcpy(dst_blocks + offset_blocks, src_blocks, copy_size);
+        }
     }
 
     template <>
@@ -122,13 +200,35 @@ namespace llaminar2
         uint8_t *dst_bytes = static_cast<uint8_t *>(dst->raw_mutable_data());
         const uint8_t *src_bytes = static_cast<const uint8_t *>(src->raw_data());
 
-        size_t blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
-        size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
-        size_t copy_blocks = static_cast<size_t>(new_tokens) * blocks_per_row;
-        size_t offset_bytes = offset_blocks * block_bytes;
-        size_t copy_size = copy_blocks * block_bytes;
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: scatter from [new_tokens, n_kv_heads * head_dim] to [n_kv_heads * max_seq_len, head_dim]
+            // Input has blocks_per_row = kv_dim / block_size, output has blocks_per_head = head_dim / block_size
+            const size_t blocks_per_head = (head_dim_ + block_elements - 1) / block_elements;
+            const size_t src_blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
 
-        std::memcpy(dst_bytes + offset_bytes, src_bytes, copy_size);
+            for (int t = 0; t < new_tokens; ++t)
+            {
+                for (int h = 0; h < local_n_kv_heads_; ++h)
+                {
+                    // Source: position-major [t][h] -> block index: t * src_blocks_per_row + h * blocks_per_head
+                    const uint8_t *src_head = src_bytes + (t * src_blocks_per_row + h * blocks_per_head) * block_bytes;
+                    // Dest: head-major [h][offset+t] -> block index: (h * max_seq_len_ + offset + t) * blocks_per_head
+                    uint8_t *dst_head = dst_bytes + (h * max_seq_len_ + offset_tokens + t) * blocks_per_head * block_bytes;
+                    std::memcpy(dst_head, src_head, blocks_per_head * block_bytes);
+                }
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous copy
+            size_t blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
+            size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
+            size_t copy_blocks = static_cast<size_t>(new_tokens) * blocks_per_row;
+            size_t offset_bytes_val = offset_blocks * block_bytes;
+            size_t copy_size = copy_blocks * block_bytes;
+            std::memcpy(dst_bytes + offset_bytes_val, src_bytes, copy_size);
+        }
     }
 
     // =========================================================================
@@ -140,9 +240,27 @@ namespace llaminar2
         FP32Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         float *data = tensor->mutable_data();
-        size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
-        size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(float);
-        std::memmove(data, data + evict_offset, keep_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: shift each head's data independently
+            // Layout: [n_kv_heads * max_seq_len, head_dim]
+            // Each head has [max_seq_len, head_dim] contiguous block
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                float *head_data = data + h * max_seq_len_ * head_dim_;
+                size_t evict_offset = static_cast<size_t>(tokens_to_evict) * head_dim_;
+                size_t keep_size = static_cast<size_t>(tokens_to_keep) * head_dim_ * sizeof(float);
+                std::memmove(head_data, head_data + evict_offset, keep_size);
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous shift
+            size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
+            size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(float);
+            std::memmove(data, data + evict_offset, keep_size);
+        }
     }
 
     template <>
@@ -150,9 +268,25 @@ namespace llaminar2
         BF16Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         uint16_t *data = tensor->mutable_typed_data();
-        size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
-        size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(uint16_t);
-        std::memmove(data, data + evict_offset, keep_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: shift each head's data independently
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                uint16_t *head_data = data + h * max_seq_len_ * head_dim_;
+                size_t evict_offset = static_cast<size_t>(tokens_to_evict) * head_dim_;
+                size_t keep_size = static_cast<size_t>(tokens_to_keep) * head_dim_ * sizeof(uint16_t);
+                std::memmove(head_data, head_data + evict_offset, keep_size);
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous shift
+            size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
+            size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(uint16_t);
+            std::memmove(data, data + evict_offset, keep_size);
+        }
     }
 
     template <>
@@ -160,9 +294,25 @@ namespace llaminar2
         FP16Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         uint16_t *data = tensor->mutable_typed_data();
-        size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
-        size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(uint16_t);
-        std::memmove(data, data + evict_offset, keep_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: shift each head's data independently
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                uint16_t *head_data = data + h * max_seq_len_ * head_dim_;
+                size_t evict_offset = static_cast<size_t>(tokens_to_evict) * head_dim_;
+                size_t keep_size = static_cast<size_t>(tokens_to_keep) * head_dim_ * sizeof(uint16_t);
+                std::memmove(head_data, head_data + evict_offset, keep_size);
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous shift
+            size_t evict_offset = static_cast<size_t>(tokens_to_evict) * kv_dim_;
+            size_t keep_size = static_cast<size_t>(tokens_to_keep) * kv_dim_ * sizeof(uint16_t);
+            std::memmove(data, data + evict_offset, keep_size);
+        }
     }
 
     template <>
@@ -170,11 +320,29 @@ namespace llaminar2
         Q8_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         Q8_1Block *blocks = tensor->mutable_typed_data();
-        size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
-        size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
-        size_t keep_size = keep_blocks * sizeof(Q8_1Block);
-        std::memmove(blocks, blocks + evict_blocks, keep_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: shift each head's data independently
+            const size_t blocks_per_head = (head_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                Q8_1Block *head_blocks = blocks + h * max_seq_len_ * blocks_per_head;
+                size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_head;
+                size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_head;
+                size_t keep_size = keep_blocks * sizeof(Q8_1Block);
+                std::memmove(head_blocks, head_blocks + evict_blocks, keep_size);
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous shift
+            size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
+            size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
+            size_t keep_size = keep_blocks * sizeof(Q8_1Block);
+            std::memmove(blocks, blocks + evict_blocks, keep_size);
+        }
     }
 
     template <>
@@ -187,12 +355,29 @@ namespace llaminar2
         const size_t block_elements = q16_block_size_elements(bs);
 
         uint8_t *data = static_cast<uint8_t *>(tensor->raw_mutable_data());
-        size_t blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
-        size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
-        size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
-        size_t evict_offset = evict_blocks * block_bytes;
-        size_t keep_size = keep_blocks * block_bytes;
-        std::memmove(data, data + evict_offset, keep_size);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            // HEAD_MAJOR: shift each head's data independently
+            const size_t blocks_per_head = (head_dim_ + block_elements - 1) / block_elements;
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                uint8_t *head_data = data + h * max_seq_len_ * blocks_per_head * block_bytes;
+                size_t evict_bytes = static_cast<size_t>(tokens_to_evict) * blocks_per_head * block_bytes;
+                size_t keep_bytes = static_cast<size_t>(tokens_to_keep) * blocks_per_head * block_bytes;
+                std::memmove(head_data, head_data + evict_bytes, keep_bytes);
+            }
+        }
+        else
+        {
+            // POSITION_MAJOR: simple contiguous shift
+            size_t blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
+            size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
+            size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
+            size_t evict_offset = evict_blocks * block_bytes;
+            size_t keep_size = keep_blocks * block_bytes;
+            std::memmove(data, data + evict_offset, keep_size);
+        }
     }
 
     // =========================================================================
@@ -202,11 +387,12 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     UnifiedKVCache<Precision>::UnifiedKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-        int n_kv_heads, int head_dim, int device_idx)
+        int n_kv_heads, int head_dim, int device_idx, KVCacheLayoutMode layout_mode)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads),
           kv_head_start_(0), head_dim_(head_dim),
-          kv_dim_(n_kv_heads * head_dim), is_sharded_(false)
+          kv_dim_(n_kv_heads * head_dim), is_sharded_(false),
+          layout_mode_(layout_mode)
     {
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
         layer_devices_.resize(n_layers_, device_idx);
@@ -221,17 +407,20 @@ namespace llaminar2
 
         LOG_DEBUG("UnifiedKVCache: n_layers=" << n_layers_ << ", batch_size=" << batch_size_
                                               << ", max_seq_len=" << max_seq_len_ << ", kv_dim=" << kv_dim_
-                                              << ", precision=" << static_cast<int>(Precision));
+                                              << ", precision=" << static_cast<int>(Precision)
+                                              << ", layout_mode=" << (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
     }
 
     template <ActivationPrecision Precision>
     UnifiedKVCache<Precision>::UnifiedKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-        int n_kv_heads, int head_dim, const std::vector<int> &attention_devices)
+        int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
+        KVCacheLayoutMode layout_mode)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads),
           kv_head_start_(0), head_dim_(head_dim),
-          kv_dim_(n_kv_heads * head_dim), is_sharded_(false)
+          kv_dim_(n_kv_heads * head_dim), is_sharded_(false),
+          layout_mode_(layout_mode)
     {
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
 
@@ -258,6 +447,7 @@ namespace llaminar2
         LOG_DEBUG("UnifiedKVCache: n_layers=" << n_layers_ << ", batch_size=" << batch_size_
                                               << ", max_seq_len=" << max_seq_len_ << ", kv_dim=" << kv_dim_
                                               << ", precision=" << static_cast<int>(Precision)
+                                              << ", layout_mode=" << (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR")
                                               << ", per-layer devices");
     }
 
@@ -269,11 +459,12 @@ namespace llaminar2
     UnifiedKVCache<Precision>::UnifiedKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-        int head_dim, int device_idx)
+        int head_dim, int device_idx, KVCacheLayoutMode layout_mode)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads),
           kv_head_start_(kv_head_start), head_dim_(head_dim),
-          kv_dim_(local_n_kv_heads * head_dim), is_sharded_(true)
+          kv_dim_(local_n_kv_heads * head_dim), is_sharded_(true),
+          layout_mode_(layout_mode)
     {
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
         layer_devices_.resize(n_layers_, device_idx);
@@ -292,18 +483,21 @@ namespace llaminar2
                                                         << ", local_n_kv_heads=" << local_n_kv_heads_
                                                         << ", kv_head_start=" << kv_head_start_
                                                         << ", kv_dim=" << kv_dim_
-                                                        << ", precision=" << static_cast<int>(Precision));
+                                                        << ", precision=" << static_cast<int>(Precision)
+                                                        << ", layout_mode=" << (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
     }
 
     template <ActivationPrecision Precision>
     UnifiedKVCache<Precision>::UnifiedKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-        int head_dim, const std::vector<int> &attention_devices)
+        int head_dim, const std::vector<int> &attention_devices,
+        KVCacheLayoutMode layout_mode)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads),
           kv_head_start_(kv_head_start), head_dim_(head_dim),
-          kv_dim_(local_n_kv_heads * head_dim), is_sharded_(true)
+          kv_dim_(local_n_kv_heads * head_dim), is_sharded_(true),
+          layout_mode_(layout_mode)
     {
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
 
@@ -317,6 +511,7 @@ namespace llaminar2
             layer_devices_.resize(n_layers_, -1);
             LOG_WARN("UnifiedKVCache (sharded): attention_devices size mismatch, defaulting all layers to CPU");
         }
+
 
         entries_.resize(n_layers_);
 
@@ -334,6 +529,7 @@ namespace llaminar2
                                                         << ", kv_head_start=" << kv_head_start_
                                                         << ", kv_dim=" << kv_dim_
                                                         << ", precision=" << static_cast<int>(Precision)
+                                                        << ", layout_mode=" << (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR")
                                                         << ", per-layer devices");
     }
 
@@ -348,8 +544,20 @@ namespace llaminar2
         for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
         {
             auto &entry = entries_[layer][seq_idx];
-            entry.K = allocate_tensor(max_seq_len_, kv_dim_, device_idx);
-            entry.V = allocate_tensor(max_seq_len_, kv_dim_, device_idx);
+            if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+            {
+                // HEAD_MAJOR: [n_kv_heads * max_seq_len, head_dim]
+                // Logically: [n_kv_heads][max_seq_len][head_dim] - head-contiguous
+                entry.K = allocate_tensor(local_n_kv_heads_ * max_seq_len_, head_dim_, device_idx);
+                entry.V = allocate_tensor(local_n_kv_heads_ * max_seq_len_, head_dim_, device_idx);
+            }
+            else
+            {
+                // POSITION_MAJOR: [max_seq_len, n_kv_heads * head_dim]
+                // Logically: [max_seq_len][n_kv_heads][head_dim] - position-contiguous
+                entry.K = allocate_tensor(max_seq_len_, kv_dim_, device_idx);
+                entry.V = allocate_tensor(max_seq_len_, kv_dim_, device_idx);
+            }
             entry.cached_tokens = 0;
         }
     }
@@ -357,6 +565,7 @@ namespace llaminar2
     // =========================================================================
     // Accessor Implementations
     // =========================================================================
+
 
     template <ActivationPrecision Precision>
     int UnifiedKVCache<Precision>::get_cached_tokens(int layer, int seq_idx) const
@@ -868,20 +1077,20 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
-        int device_idx)
+        int device_idx, KVCacheLayoutMode layout_mode)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::BF16:
-            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::FP16:
-            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx);
+            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         default:
             LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -893,20 +1102,20 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
-        const std::vector<int> &attention_devices)
+        const std::vector<int> &attention_devices, KVCacheLayoutMode layout_mode)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::BF16:
-            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::FP16:
-            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
+            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -922,25 +1131,25 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-        int head_dim, int device_idx)
+        int head_dim, int device_idx, KVCacheLayoutMode layout_mode)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
             return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::BF16:
             return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::FP16:
             return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q8_1:
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q16_1:
             return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         default:
             LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -953,29 +1162,30 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim,
-        const std::vector<int> &attention_devices)
+        const std::vector<int> &attention_devices, KVCacheLayoutMode layout_mode)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
             return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::BF16:
             return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::FP16:
             return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q8_1:
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q16_1:
             return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
         }
     }
+
 
 } // namespace llaminar2

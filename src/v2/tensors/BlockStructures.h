@@ -195,6 +195,8 @@ namespace llaminar2
      */
     constexpr Q16BlockSize optimal_q16_block_size(int head_dim)
     {
+        if (head_dim == 32)
+            return Q16BlockSize::BLOCK_32;
         if (head_dim == 64)
             return Q16BlockSize::BLOCK_64;
         if (head_dim == 128)
@@ -204,6 +206,8 @@ namespace llaminar2
             return Q16BlockSize::BLOCK_128;
         if (head_dim % 64 == 0)
             return Q16BlockSize::BLOCK_64;
+        if (head_dim % 32 == 0)
+            return Q16BlockSize::BLOCK_32;
         return Q16BlockSize::BLOCK_64; // Universal fallback (GCD of common head dims)
     }
 

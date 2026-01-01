@@ -343,8 +343,7 @@ namespace llaminar2
             AllGatherStage::Params allgather_params;
             allgather_params.local_input = buffers_.logits_local;
             allgather_params.full_output = buffers_.logits;
-            allgather_params.mpi_comm = mpi_ctx_->comm();
-            allgather_params.world_size = mpi_ctx_->world_size();
+            allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
 
             graph.addNode("lm_head_allgather",
@@ -388,7 +387,7 @@ namespace llaminar2
         // MPI / Tensor Parallelism
         config.world_size = mpi_ctx_ ? mpi_ctx_->world_size() : 1;
         config.rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-        config.mpi_comm = mpi_ctx_ ? mpi_ctx_->comm() : MPI_COMM_NULL;
+        config.mpi_ctx = mpi_ctx_.get();
 
         // Execution dimensions
         config.batch_size = input.batch_size;
@@ -656,8 +655,7 @@ namespace llaminar2
             AllGatherStage::Params allgather_params;
             allgather_params.local_input = logits_local;
             allgather_params.full_output = output_logits;
-            allgather_params.mpi_comm = mpi_ctx_->comm();
-            allgather_params.world_size = mpi_ctx_->world_size();
+            allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
 
             graph.addNode("lm_head_allgather",
@@ -1221,9 +1219,8 @@ namespace llaminar2
                                   ComputeStageFactory::createAllreduce(
                                       AllreduceStage::Params{
                                           allreduce_buffer,
-                                          getMPICommPtr(mpi_ctx_.get()),
-                                          allreduce_count,
-                                          mpi_ctx_.get()}),
+                                          mpi_ctx_.get(),
+                                          allreduce_count}),
                                   device_idx);
 
                     graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
@@ -1385,8 +1382,6 @@ namespace llaminar2
             if (needs_allreduce && has_multi_rank)
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
-                MPI_Comm comm = static_cast<MPI_Comm>(getMPICommPtr(mpi_ctx_.get()));
-
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
                           << config_.ffn_column_parallel << " down_is_row_sharded=" << down_is_row_sharded
                           << " count=" << allreduce_count);
@@ -1395,9 +1390,8 @@ namespace llaminar2
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
                                       buffers.attn_proj,
-                                      comm,
-                                      allreduce_count,
-                                      mpi_ctx_.get()}),
+                                      mpi_ctx_.get(),
+                                      allreduce_count}),
                               device_idx);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
@@ -1478,7 +1472,6 @@ namespace llaminar2
         {
             config.world_size = mpi_ctx_->world_size();
             config.rank = mpi_ctx_->rank();
-            config.mpi_comm = mpi_ctx_->comm();
             config.mpi_ctx = mpi_ctx_.get();
         }
 

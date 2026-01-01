@@ -24,6 +24,7 @@
 
 #include "Tensors.h"
 #include "TensorFactory.h"
+#include "TensorLayout.h"
 #include "../utils/MPIContext.h"
 #include "../execution/RuntimeConfig.h"
 #include <vector>
@@ -31,6 +32,36 @@
 
 namespace llaminar2
 {
+
+    // =========================================================================
+    // KV Cache Layout Mode
+    // =========================================================================
+
+    /**
+     * @brief Memory layout mode for KV cache storage
+     *
+     * Controls how K/V tensors are organized in memory:
+     *
+     * POSITION_MAJOR (default):
+     *   Storage: [position][n_kv_heads][head_dim]
+     *   Block indexing: block[p * n_kv_heads + h]
+     *   Best for: Sequential cache append (new positions at end)
+     *   Used by: FP32/BF16/FP16 attention backends
+     *
+     * HEAD_MAJOR:
+     *   Storage: [n_kv_heads][position][head_dim]
+     *   Block indexing: block[h * kv_len + p]
+     *   Best for: Per-head attention computation (head-contiguous access)
+     *   Used by: Q16_INTEGER attention kernel
+     *
+     * @note Choosing HEAD_MAJOR for Q16_1 caches eliminates the
+     *       transpose workaround in FusedAttentionWoStage.
+     */
+    enum class KVCacheLayoutMode : uint8_t
+    {
+        POSITION_MAJOR, ///< [position][n_kv_heads][head_dim] - cache-append friendly
+        HEAD_MAJOR      ///< [n_kv_heads][position][head_dim] - attention-compute friendly
+    };
 
     // =========================================================================
     // IUnifiedKVCache Interface
@@ -52,6 +83,10 @@ namespace llaminar2
         virtual int num_layers() const = 0;
         virtual int batch_size() const = 0;
         virtual int max_seq_len() const = 0;
+
+        // Layout mode
+        virtual KVCacheLayoutMode layout_mode() const = 0;
+        virtual TensorLayout kv_layout() const = 0;
 
         // Sharding (Tensor Parallelism) info
         virtual bool is_sharded() const = 0;      ///< True if using local KV heads
@@ -225,6 +260,7 @@ namespace llaminar2
      * - Supports efficient append without reallocation
      * - Per-sequence tracking for variable-length sequences
      * - Per-layer device placement for heterogeneous execution
+     * - Configurable layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
     template <ActivationPrecision Precision = ActivationPrecision::FP32>
     class UnifiedKVCache : public IUnifiedKVCache
@@ -243,15 +279,18 @@ namespace llaminar2
          * @param n_kv_heads Number of KV heads (GQA)
          * @param head_dim Dimension per head
          * @param device_idx Default device for all layers (-1 = CPU)
+         * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
          */
         UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-                       int n_kv_heads, int head_dim, int device_idx = -1);
+                       int n_kv_heads, int head_dim, int device_idx = -1,
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with per-layer device placement
          */
         UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
-                       int n_kv_heads, int head_dim, const std::vector<int> &attention_devices);
+                       int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with sharded (local) KV heads for tensor parallelism
@@ -268,23 +307,35 @@ namespace llaminar2
          * @param kv_head_start Starting KV head index for this rank
          * @param head_dim Dimension per head
          * @param device_idx Default device for all layers (-1 = CPU)
+         * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
          */
         UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-                       int head_dim, int device_idx = -1);
+                       int head_dim, int device_idx = -1,
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with sharded KV heads and per-layer device placement
          */
         UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-                       int head_dim, const std::vector<int> &attention_devices);
+                       int head_dim, const std::vector<int> &attention_devices,
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         // IUnifiedKVCache interface implementation
         ActivationPrecision precision() const override { return Precision; }
         int num_layers() const override { return n_layers_; }
         int batch_size() const override { return batch_size_; }
         int max_seq_len() const override { return max_seq_len_; }
+
+        // Layout mode accessors
+        KVCacheLayoutMode layout_mode() const override { return layout_mode_; }
+        TensorLayout kv_layout() const override
+        {
+            return (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+                       ? TensorLayout::KV_HEAD_POS_DIM
+                       : TensorLayout::KV_POS_HEAD_DIM;
+        }
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override;
 
@@ -298,6 +349,7 @@ namespace llaminar2
 
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override;
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override;
+
 
         // Bring in convenience methods from interface (would be hidden by overrides otherwise)
         using IUnifiedKVCache::append_kv;
@@ -375,6 +427,7 @@ namespace llaminar2
         int kv_dim_;      // local_n_kv_heads * head_dim (storage dimension)
         bool is_sharded_; // True if using local KV heads (TP enabled)
         int total_evicted_ = 0;
+        KVCacheLayoutMode layout_mode_; // Memory layout mode
 
         // Cache storage: [n_layers][batch_size]
         std::vector<std::vector<EntryT>> entries_;
@@ -411,13 +464,24 @@ namespace llaminar2
 
     /**
      * @brief Create unified KV cache with specified activation precision
+     *
+     * @param precision Activation precision (FP32, BF16, FP16, Q8_1, Q16_1)
+     * @param mpi_ctx MPI context for NUMA-aware allocation
+     * @param n_layers Number of transformer layers
+     * @param batch_size Maximum batch size
+     * @param max_seq_len Maximum sequence length
+     * @param n_kv_heads Number of KV heads (GQA)
+     * @param head_dim Dimension per head
+     * @param device_idx Device index for all layers (-1 for CPU)
+     * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
     std::unique_ptr<IUnifiedKVCache> createUnifiedKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
-        int device_idx = -1);
+        int device_idx = -1,
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
     /**
      * @brief Create unified KV cache with per-layer device placement
@@ -427,7 +491,8 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
-        const std::vector<int> &attention_devices);
+        const std::vector<int> &attention_devices,
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
     // ============================================================================
     // Sharded KV Cache Factory Functions (for Tensor Parallelism)
@@ -449,13 +514,15 @@ namespace llaminar2
      * @param kv_head_start Starting KV head index for this rank
      * @param head_dim Dimension per head
      * @param device_idx Device index for all layers (-1 for CPU)
+     * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
     std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-        int head_dim, int device_idx = -1);
+        int head_dim, int device_idx = -1,
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
     /**
      * @brief Create sharded unified KV cache with per-layer device placement
@@ -466,6 +533,7 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim,
-        const std::vector<int> &attention_devices);
+        const std::vector<int> &attention_devices,
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
 } // namespace llaminar2

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "../tensors/TensorLayout.h"
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -290,6 +291,14 @@ namespace llaminar2
         bool validate_populated = false;
 
         // =====================================================================
+        // Layout Contract Fields (Phase 3: Tensor Layout Contracts)
+        // =====================================================================
+
+        /// Expected TensorLayout for this buffer (UNKNOWN = no validation)
+        /// Used by GraphExecutor for automatic layout validation
+        TensorLayout expected_layout = TensorLayout::UNKNOWN;
+
+        // =====================================================================
         // Convenience Methods
         // =====================================================================
 
@@ -423,6 +432,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Declare expected tensor layout for this buffer
+         *
+         * Used by GraphExecutor for automatic layout validation in debug builds.
+         * When set, the executor verifies the tensor's declared layout matches
+         * this expectation and that the tensor's shape is consistent with the
+         * layout given the model's dimension parameters.
+         *
+         * @param layout Expected TensorLayout (UNKNOWN = no validation)
+         * @return Reference for chaining
+         *
+         * @code
+         * reqs.addInput("Q", {seq_len, qkv_dim}, BufferTensorType::FP32)
+         *     .withLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+         * @endcode
+         */
+        BufferDescriptor &withLayout(TensorLayout layout)
+        {
+            expected_layout = layout;
+            return *this;
+        }
+
+        /**
          * @brief Check if buffer has a declared producer
          */
         bool hasProducer() const
@@ -461,60 +492,102 @@ namespace llaminar2
 
         // =====================================================================
         // Builder Methods
+        // These return BufferDescriptor& to enable fluent chaining with
+        // .withLayout(), .withProducer(), .validatePopulated()
         // =====================================================================
 
         /**
          * @brief Add an INPUT buffer requirement
+         * @param name Buffer name (unique within stage)
+         * @param shape Required tensor shape
+         * @param type Tensor data type (default: FP32)
+         * @param layout Expected tensor layout (default: UNKNOWN = no validation)
+         * @return Reference to this for fluent chaining
          */
         StageBufferRequirements &addInput(const std::string &name,
                                           std::vector<size_t> shape,
-                                          BufferTensorType type = BufferTensorType::FP32)
+                                          BufferTensorType type = BufferTensorType::FP32,
+                                          TensorLayout layout = TensorLayout::UNKNOWN)
         {
-            buffers.push_back(BufferDescriptor::input(name, std::move(shape), type));
+            auto desc = BufferDescriptor::input(name, std::move(shape), type);
+            desc.expected_layout = layout;
+            buffers.push_back(std::move(desc));
             return *this;
         }
 
         /**
          * @brief Add an OUTPUT buffer requirement
+         * @param name Buffer name (unique within stage)
+         * @param shape Required tensor shape
+         * @param type Tensor data type (default: FP32)
+         * @param layout Expected tensor layout (default: UNKNOWN = no validation)
+         * @return Reference to this for fluent chaining
          */
         StageBufferRequirements &addOutput(const std::string &name,
                                            std::vector<size_t> shape,
-                                           BufferTensorType type = BufferTensorType::FP32)
+                                           BufferTensorType type = BufferTensorType::FP32,
+                                           TensorLayout layout = TensorLayout::UNKNOWN)
         {
-            buffers.push_back(BufferDescriptor::output(name, std::move(shape), type));
+            auto desc = BufferDescriptor::output(name, std::move(shape), type);
+            desc.expected_layout = layout;
+            buffers.push_back(std::move(desc));
             return *this;
         }
 
         /**
          * @brief Add an INOUT buffer requirement
+         * @param name Buffer name (unique within stage)
+         * @param shape Required tensor shape
+         * @param type Tensor data type (default: FP32)
+         * @param layout Expected tensor layout (default: UNKNOWN = no validation)
+         * @return Reference to this for fluent chaining
          */
         StageBufferRequirements &addInout(const std::string &name,
                                           std::vector<size_t> shape,
-                                          BufferTensorType type = BufferTensorType::FP32)
+                                          BufferTensorType type = BufferTensorType::FP32,
+                                          TensorLayout layout = TensorLayout::UNKNOWN)
         {
-            buffers.push_back(BufferDescriptor::inout(name, std::move(shape), type));
+            auto desc = BufferDescriptor::inout(name, std::move(shape), type);
+            desc.expected_layout = layout;
+            buffers.push_back(std::move(desc));
             return *this;
         }
 
         /**
          * @brief Add a SCRATCH buffer requirement
+         * @param name Buffer name (unique within stage)
+         * @param shape Required tensor shape
+         * @param type Tensor data type (default: FP32)
+         * @param layout Expected tensor layout (default: UNKNOWN = no validation)
+         * @return Reference to this for fluent chaining
          */
         StageBufferRequirements &addScratch(const std::string &name,
                                             std::vector<size_t> shape,
-                                            BufferTensorType type = BufferTensorType::FP32)
+                                            BufferTensorType type = BufferTensorType::FP32,
+                                            TensorLayout layout = TensorLayout::UNKNOWN)
         {
-            buffers.push_back(BufferDescriptor::scratch(name, std::move(shape), type));
+            auto desc = BufferDescriptor::scratch(name, std::move(shape), type);
+            desc.expected_layout = layout;
+            buffers.push_back(std::move(desc));
             return *this;
         }
 
         /**
          * @brief Add a WEIGHT buffer requirement
+         * @param name Buffer name (unique within stage)
+         * @param shape Required tensor shape
+         * @param type Tensor data type (default: FP32)
+         * @param layout Expected tensor layout (default: UNKNOWN = no validation)
+         * @return Reference to this for fluent chaining
          */
         StageBufferRequirements &addWeight(const std::string &name,
                                            std::vector<size_t> shape,
-                                           BufferTensorType type = BufferTensorType::FP32)
+                                           BufferTensorType type = BufferTensorType::FP32,
+                                           TensorLayout layout = TensorLayout::UNKNOWN)
         {
-            buffers.push_back(BufferDescriptor::weight(name, std::move(shape), type));
+            auto desc = BufferDescriptor::weight(name, std::move(shape), type);
+            desc.expected_layout = layout;
+            buffers.push_back(std::move(desc));
             return *this;
         }
 

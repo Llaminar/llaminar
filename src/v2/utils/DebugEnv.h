@@ -1278,7 +1278,7 @@ namespace llaminar2
     {
         bool validate_buffers = false;    ///< Enable buffer validation after stage execution
         bool validate_inputs = false;     ///< Enable input validation BEFORE stage execution (Phase 1)
-        bool fail_on_zero = false;        ///< Fail immediately when zero tensor detected
+        bool fail_on_zero = false;        ///< Fail immediately when all-zero OUTPUT tensor detected (auto-enabled in Debug)
         bool fail_on_nan = false;         ///< Fail immediately when NaN/Inf detected
         bool dump_on_failure = true;      ///< Dump all buffers to disk when verification fails
         int sample_rows = 8;              ///< Number of rows to sample for verification (efficiency)
@@ -1296,6 +1296,7 @@ namespace llaminar2
             validate_buffers = true;
             validate_inputs = true;  // Enable input validation in debug builds
             fail_on_nan = true;      // NaN/Inf is always a bug, fail by default
+            fail_on_zero = true;     // All-zero OUTPUTS are almost always bugs
 #endif
 
             // Environment variables can override the defaults

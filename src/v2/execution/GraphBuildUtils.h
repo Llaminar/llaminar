@@ -16,10 +16,8 @@
 #pragma once
 
 #include "../tensors/TensorSlice.h"
-#include "../utils/MPIContext.h"
 #include "../utils/Logger.h"
 #include <vector>
-#include <mpi.h>
 
 namespace llaminar2
 {
@@ -44,28 +42,6 @@ namespace llaminar2
             LOG_DEBUG("[isRowParallelSharded] weight=" << weight << " is_slice=" << (slice != nullptr)
                                                        << " is_row_parallel=" << (slice ? slice->is_row_parallel() : false)
                                                        << " result=" << result);
-            return result;
-        }
-
-        /**
-         * @brief Get MPI communicator as void* for stage parameters
-         *
-         * Many ComputeStage params take void* for MPI communicator to avoid
-         * requiring MPI headers in stage interfaces.
-         *
-         * @param mpi_ctx The MPI context (may be null)
-         * @return MPI_Comm cast to void*, or nullptr if mpi_ctx is null
-         */
-        inline void *getMPICommPtr(const MPIContext *mpi_ctx)
-        {
-            if (!mpi_ctx)
-            {
-                LOG_WARN("[getMPICommPtr] mpi_ctx is null!");
-                return nullptr;
-            }
-            MPI_Comm comm = mpi_ctx->comm();
-            void *result = static_cast<void *>(comm);
-            LOG_DEBUG("[getMPICommPtr] mpi_ctx=" << mpi_ctx << " comm=" << comm << " result=" << result);
             return result;
         }
 

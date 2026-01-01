@@ -27,8 +27,7 @@ namespace llaminar2
         {
             TensorBase *local_input = nullptr;
             TensorBase *full_output = nullptr;
-            void *mpi_comm = nullptr;
-            int world_size = 1;
+            const MPIContext *mpi_ctx = nullptr; ///< MPI context (required)
             size_t actual_seq_len = 0;
         };
 

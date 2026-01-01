@@ -37,15 +37,16 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.mpi_comm)
+        if (!params_.mpi_ctx)
         {
-            LOG_ERROR("[AllGatherStage] Null MPI communicator");
+            LOG_ERROR("[AllGatherStage] Null MPI context");
             return false;
         }
 
-        if (params_.world_size <= 0)
+        int world_size = params_.mpi_ctx->world_size();
+        if (world_size <= 0)
         {
-            LOG_ERROR("[AllGatherStage] Invalid world_size=" << params_.world_size);
+            LOG_ERROR("[AllGatherStage] Invalid world_size=" << world_size);
             return false;
         }
 
@@ -74,7 +75,7 @@ namespace llaminar2
             return false;
         }
 
-        size_t expected_vocab_full = vocab_local * static_cast<size_t>(params_.world_size);
+        size_t expected_vocab_full = vocab_local * static_cast<size_t>(world_size);
         if (vocab_full != expected_vocab_full)
         {
             LOG_WARN("[AllGatherStage] vocab_full=" << vocab_full
@@ -85,9 +86,9 @@ namespace llaminar2
         LOG_DEBUG("[AllGatherStage] Execute: seq_len=" << seq_len
                                                        << " vocab_local=" << vocab_local
                                                        << " vocab_full=" << vocab_full
-                                                       << " world_size=" << params_.world_size);
+                                                       << " world_size=" << world_size);
 
-        MPI_Comm comm = static_cast<MPI_Comm>(params_.mpi_comm);
+        MPI_Comm comm = params_.mpi_ctx->comm();
 
         // Get data pointers based on tensor type
         const float *send_ptr = nullptr;
@@ -174,7 +175,7 @@ namespace llaminar2
             LOG_INFO("[MPI] AllGather START: seq_len=" << seq_len
                                                        << " vocab_local=" << vocab_local
                                                        << " vocab_full=" << vocab_full
-                                                       << " world_size=" << params_.world_size);
+                                                       << " world_size=" << world_size);
         }
 
         // Start timing if enabled
@@ -209,7 +210,7 @@ namespace llaminar2
         {
             double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
             size_t total_elements = seq_len * vocab_local;
-            double bytes = total_elements * sizeof(float) * params_.world_size; // Total bytes gathered
+            double bytes = total_elements * sizeof(float) * world_size; // Total bytes gathered
             double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
             LOG_INFO("[MPI] AllGather timing: " << ms << " ms for " << total_elements
                                                 << " elements/rank (" << bandwidth_gbps << " GB/s aggregate)");
@@ -291,11 +292,10 @@ namespace llaminar2
             info.addOutput("full_output", params_.full_output, seq_len, params_.full_output->cols());
         }
 
-        info.addScalarInt("world_size", params_.world_size);
+        info.addScalarInt("world_size", params_.mpi_ctx ? params_.mpi_ctx->world_size() : 0);
         info.addScalarInt("actual_seq_len", static_cast<int>(params_.actual_seq_len));
 
         return info;
     }
-
 
 } // namespace llaminar2

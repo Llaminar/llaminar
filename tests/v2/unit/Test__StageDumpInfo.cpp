@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "utils/MPIContext.h"
 #include "../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -373,7 +374,7 @@ TEST_F(StageDumpInfoTest, AllreduceStage_GetDumpInfo)
 
     AllreduceStage::Params params;
     params.buffer = buffer.get();
-    params.mpi_comm = nullptr; // No actual MPI for unit test
+    params.mpi_ctx = nullptr; // No actual MPI for unit test
     params.count = count;
 
     AllreduceStage stage(params);
@@ -398,14 +399,16 @@ TEST_F(StageDumpInfoTest, AllGatherStage_GetDumpInfo)
     int world_size = 2;
     int full_cols = local_cols * world_size;
 
+    // Create a mock MPI context for testing
+    auto mpi_ctx = std::make_shared<MPIContext>(0, world_size, MPI_COMM_NULL);
+
     auto local_input = TestTensorFactory::createFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(local_cols)});
     auto full_output = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(full_cols)});
 
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
-    params.mpi_comm = nullptr;
-    params.world_size = world_size;
+    params.mpi_ctx = mpi_ctx.get();
     params.actual_seq_len = static_cast<size_t>(seq_len);
 
     AllGatherStage stage(params);
@@ -772,7 +775,7 @@ TEST_F(StageDumpInfoTest, AllreduceStage_GetDumpInfo_NullBuffer)
 {
     AllreduceStage::Params params;
     params.buffer = nullptr;
-    params.mpi_comm = nullptr;
+    params.mpi_ctx = nullptr;
     params.count = 100;
 
     AllreduceStage stage(params);

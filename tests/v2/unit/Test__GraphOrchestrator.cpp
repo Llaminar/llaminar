@@ -10,12 +10,14 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/execution/GraphOrchestrator.h"
+#include "../../../src/v2/execution/RuntimeConfig.h"
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"
 #include "../../../src/v2/backends/ComputeBackend.h"
 #include "../../../src/v2/utils/Logger.h"
 #include "../../../src/v2/utils/DebugEnv.h"
 #include "../../../src/v2/tensors/Tensors.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
+#include "../../../src/v2/tensors/UnifiedKVCache.h"
 #include <memory>
 
 using namespace llaminar2;
@@ -548,4 +550,92 @@ TEST_F(Test__GraphOrchestrator, InferenceStateMultipleBatches)
     {
         EXPECT_EQ(orchestrator->getPosition(b), 0);
     }
+}
+
+// =============================================================================
+// KV Cache Layout Mode Tests
+// =============================================================================
+
+TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
+{
+    // Create config with FP32 precision
+    auto fp32_config = config_;
+    fp32_config.activation_precision = ActivationPrecision::FP32;
+    auto orchestrator = std::make_unique<GraphOrchestrator>(fp32_config, nullptr);
+
+    // Initialize state
+    int batch_size = 1;
+    int max_seq_len = 64;
+    int device_idx = 0;
+
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->hasInferenceState());
+
+    // KV cache should exist and use POSITION_MAJOR layout
+    const auto &state = orchestrator->inferenceState();
+    ASSERT_NE(state.kv_cache, nullptr);
+    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+}
+
+TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
+{
+    // Create config with BF16 precision
+    auto bf16_config = config_;
+    bf16_config.activation_precision = ActivationPrecision::BF16;
+    auto orchestrator = std::make_unique<GraphOrchestrator>(bf16_config, nullptr);
+
+    // Initialize state
+    int batch_size = 1;
+    int max_seq_len = 64;
+    int device_idx = 0;
+
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->hasInferenceState());
+
+    // KV cache should use POSITION_MAJOR layout for BF16
+    const auto &state = orchestrator->inferenceState();
+    ASSERT_NE(state.kv_cache, nullptr);
+    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+}
+
+TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_HybridQ16_UsesHeadMajor)
+{
+    // Create config with HybridQ16 precision - this resolves KV cache to Q16_1
+    auto hybrid_config = config_;
+    hybrid_config.activation_precision = ActivationPrecision::HybridQ16;
+    auto orchestrator = std::make_unique<GraphOrchestrator>(hybrid_config, nullptr);
+
+    // Initialize state
+    int batch_size = 1;
+    int max_seq_len = 64;
+    int device_idx = 0;
+
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->hasInferenceState());
+
+    // KV cache should use HEAD_MAJOR layout for Q16_1 (required by Q16IntegerAttention)
+    const auto &state = orchestrator->inferenceState();
+    ASSERT_NE(state.kv_cache, nullptr);
+    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
+}
+
+TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_Hybrid_UsesPositionMajor)
+{
+    // Create config with Hybrid precision - KV cache should be BF16
+    auto hybrid_config = config_;
+    hybrid_config.activation_precision = ActivationPrecision::Hybrid;
+    auto orchestrator = std::make_unique<GraphOrchestrator>(hybrid_config, nullptr);
+
+    // Initialize state
+    int batch_size = 1;
+    int max_seq_len = 64;
+    int device_idx = 0;
+
+    ASSERT_TRUE(orchestrator->initializeInferenceState(batch_size, max_seq_len, device_idx));
+    ASSERT_TRUE(orchestrator->hasInferenceState());
+
+    // KV cache should use POSITION_MAJOR layout for Hybrid (BF16 KV cache)
+    const auto &state = orchestrator->inferenceState();
+    ASSERT_NE(state.kv_cache, nullptr);
+    EXPECT_EQ(state.kv_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }

@@ -94,11 +94,12 @@ namespace llaminar2::test
         // In Debug/Integration builds (LLAMINAR_ASSERTIONS_ACTIVE=1):
         //   - validate_buffers defaults to true
         //   - fail_on_nan defaults to true
+        //   - fail_on_zero defaults to true (catches uninitialized outputs)
         // In Release builds:
         //   - All defaults are false
 #if LLAMINAR_ASSERTIONS_ACTIVE
         EXPECT_TRUE(config.validate_buffers) << "Should be auto-enabled in Debug builds";
-        EXPECT_FALSE(config.fail_on_zero); // Still false by default
+        EXPECT_TRUE(config.fail_on_zero) << "All-zero outputs are usually bugs";
         EXPECT_TRUE(config.fail_on_nan) << "Should be auto-enabled in Debug builds";
 #else
         EXPECT_FALSE(config.validate_buffers);

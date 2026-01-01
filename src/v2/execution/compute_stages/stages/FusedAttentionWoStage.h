@@ -97,6 +97,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        verification::LayoutExpectation getLayoutExpectation() const override;
 
         void updateDynamicParams(int pos_offset, int seq_len) override
         {

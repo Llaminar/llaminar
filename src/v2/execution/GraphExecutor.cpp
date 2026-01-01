@@ -597,7 +597,7 @@ namespace llaminar2
         vconfig.check_all_zero = false;             // Zero inputs may be valid (first layer residual)
         vconfig.dump_on_failure = validation.dump_on_failure;
 
-        // Verify all inputs
+        // Verify all inputs (NaN/Inf/null checks)
         for (const auto &input : dump_info.inputs)
         {
             if (!input.data)
@@ -628,6 +628,51 @@ namespace llaminar2
                                           result.tensor_name, result.error_reason, dump_path);
             }
         }
+
+        // =====================================================================
+        // Phase 3: Automatic Layout Validation (declarative)
+        // If stage provides LayoutExpectation, validate all buffers with layouts
+        // =====================================================================
+        if (validation.validate_inputs)
+        {
+            auto layout_expect = node.stage->getLayoutExpectation();
+            if (layout_expect.is_set())
+            {
+                auto buf_reqs = node.stage->getBufferRequirements();
+                for (const auto &buf : buf_reqs.buffers)
+                {
+                    // Only validate buffers with declared layouts
+                    if (buf.expected_layout == TensorLayout::UNKNOWN)
+                        continue;
+
+                    // Only validate INPUT buffers at entry
+                    if (buf.role != BufferRole::INPUT && buf.role != BufferRole::INOUT)
+                        continue;
+
+                    auto result = validateBufferLayoutByShape(
+                        buf.shape, buf.name.c_str(),
+                        buf.expected_layout, layout_expect);
+
+                    if (!result.passed)
+                    {
+                        LOG_ERROR("[VERIFY] LAYOUT FAILED: layer=" << layer_idx
+                                                                   << " stage=" << node.name
+                                                                   << " buffer=" << buf.name
+                                                                   << " reason=" << result.error_reason);
+
+                        std::string dump_path;
+                        if (vconfig.dump_on_failure)
+                        {
+                            dump_path = dumpStageBuffers(node.name, layer_idx, "ENTRY_LAYOUT", dump_info,
+                                                         buf.name, result.error_reason);
+                        }
+
+                        throw VerificationFailure(node.name, layer_idx, "ENTRY_LAYOUT",
+                                                  buf.name, result.error_reason, dump_path);
+                    }
+                }
+            }
+        }
     }
 
     void GraphExecutor::verifyStageExit(const ComputeNode &node, int layer_idx)
@@ -643,10 +688,14 @@ namespace llaminar2
         vconfig.check_null = true;
         vconfig.check_nan = validation.fail_on_nan;
         vconfig.check_inf = validation.fail_on_nan;
-        vconfig.check_all_zero = validation.fail_on_zero; // Zero outputs are usually bugs
         vconfig.dump_on_failure = validation.dump_on_failure;
 
-        // Verify all outputs
+        // All-zero output check: enabled by config UNLESS stage explicitly allows zero outputs
+        // Most stages should never produce all-zero outputs (indicates bugs).
+        // Stages like KVCacheGatherStage can override allowsZeroOutput() to return true.
+        vconfig.check_all_zero = validation.fail_on_zero && !node.stage->allowsZeroOutput();
+
+        // Verify all outputs (NaN/Inf/null checks)
         for (const auto &output : dump_info.outputs)
         {
             if (!output.data)
@@ -675,6 +724,51 @@ namespace llaminar2
                 // Throw exception with full context
                 throw VerificationFailure(node.name, layer_idx, "EXIT",
                                           result.tensor_name, result.error_reason, dump_path);
+            }
+        }
+
+        // =====================================================================
+        // Phase 3: Automatic Layout Validation (declarative)
+        // Validate OUTPUT buffers with declared layouts at stage exit
+        // =====================================================================
+        if (validation.validate_buffers)
+        {
+            auto layout_expect = node.stage->getLayoutExpectation();
+            if (layout_expect.is_set())
+            {
+                auto buf_reqs = node.stage->getBufferRequirements();
+                for (const auto &buf : buf_reqs.buffers)
+                {
+                    // Only validate buffers with declared layouts
+                    if (buf.expected_layout == TensorLayout::UNKNOWN)
+                        continue;
+
+                    // Only validate OUTPUT buffers at exit
+                    if (buf.role != BufferRole::OUTPUT && buf.role != BufferRole::INOUT)
+                        continue;
+
+                    auto result = validateBufferLayoutByShape(
+                        buf.shape, buf.name.c_str(),
+                        buf.expected_layout, layout_expect);
+
+                    if (!result.passed)
+                    {
+                        LOG_ERROR("[VERIFY] LAYOUT FAILED: layer=" << layer_idx
+                                                                   << " stage=" << node.name
+                                                                   << " buffer=" << buf.name
+                                                                   << " reason=" << result.error_reason);
+
+                        std::string dump_path;
+                        if (vconfig.dump_on_failure)
+                        {
+                            dump_path = dumpStageBuffers(node.name, layer_idx, "EXIT_LAYOUT", dump_info,
+                                                         buf.name, result.error_reason);
+                        }
+
+                        throw VerificationFailure(node.name, layer_idx, "EXIT_LAYOUT",
+                                                  buf.name, result.error_reason, dump_path);
+                    }
+                }
             }
         }
     }

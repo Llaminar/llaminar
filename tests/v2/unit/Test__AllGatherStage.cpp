@@ -60,8 +60,7 @@ TEST_F(Test__AllGatherStage, StageTypeIsAllGather)
     AllGatherStage::Params params;
     params.local_input = nullptr;
     params.full_output = nullptr;
-    params.mpi_comm = nullptr;
-    params.world_size = 2;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -78,8 +77,7 @@ TEST_F(Test__AllGatherStage, SupportsAllBackends)
     AllGatherStage::Params params;
     params.local_input = nullptr;
     params.full_output = nullptr;
-    params.mpi_comm = nullptr;
-    params.world_size = 2;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -102,8 +100,7 @@ TEST_F(Test__AllGatherStage, FailsWithNullLocalInput)
     AllGatherStage::Params params;
     params.local_input = nullptr; // NULL
     params.full_output = full_output.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = 2;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -123,8 +120,7 @@ TEST_F(Test__AllGatherStage, FailsWithNullFullOutput)
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = nullptr; // NULL
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = 2;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -145,19 +141,18 @@ TEST_F(Test__AllGatherStage, FailsWithNullMpiComm)
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
-    params.mpi_comm = nullptr; // NULL
-    params.world_size = 2;
+    params.mpi_ctx = nullptr; // NULL
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
-    // Should fail due to null MPI communicator
+    // Should fail due to null MPI context
     EXPECT_FALSE(stage->execute(ctx_.get()));
 }
 
 /**
- * @test Verify AllGatherStage fails with invalid world_size
+ * @test Verify AllGatherStage fails with null MPI context (world_size now from mpi_ctx)
  */
-TEST_F(Test__AllGatherStage, FailsWithInvalidWorldSize)
+TEST_F(Test__AllGatherStage, FailsWithNullMpiContext)
 {
     // Create test buffers
     TensorFactory factory(*mpi_ctx_);
@@ -167,12 +162,11 @@ TEST_F(Test__AllGatherStage, FailsWithInvalidWorldSize)
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = 0; // Invalid
+    params.mpi_ctx = nullptr; // Invalid - null context
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
-    // Should fail due to invalid world_size
+    // Should fail due to null mpi_ctx
     EXPECT_FALSE(stage->execute(ctx_.get()));
 }
 
@@ -189,8 +183,7 @@ TEST_F(Test__AllGatherStage, BufferRequirementsAreCorrect)
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = 2;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = std::make_unique<AllGatherStage>(params);
 
@@ -213,8 +206,7 @@ TEST_F(Test__AllGatherStage, FactoryCreatesStage)
     AllGatherStage::Params params;
     params.local_input = local_input.get();
     params.full_output = full_output.get();
-    params.mpi_comm = MPI_COMM_WORLD;
-    params.world_size = 2;
+    params.mpi_ctx = mpi_ctx_.get();
 
     auto stage = ComputeStageFactory::createAllGather(params);
 

@@ -396,6 +396,19 @@ add_v2_test(V2_Unit_Q16_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
+# Test: TensorLayout enum and layout tracking (Phase 3 tensor contracts)
+add_executable(v2_test_tensor_layout unit/tensors/Test__TensorLayout.cpp)
+target_link_libraries(v2_test_tensor_layout
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorLayout
+    COMMAND $<TARGET_FILE:v2_test_tensor_layout>
+    LABELS "V2;Unit;TensorOperations;Layout;Contracts;Attention"
+    MPI_PROCS 1
+)
+
 # Test: Q16 Fixed-Scale SIMD Quantization (VNNI-safe clipping)
 # Tests SIMD implementations (Scalar, AVX2, AVX512) of fixed-scale quantization
 add_executable(v2_test_q16_fixed_scale_simd unit/tensors/Test__Q16FixedScaleSIMD.cpp)

@@ -41,6 +41,14 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageDumpInfo getDumpInfo() const override;
 
+        /**
+         * @brief Allow zero output because cache may be empty on first token
+         *
+         * Before any tokens have been processed, the KV cache is empty and
+         * gather produces a zero-length output. This is not a bug.
+         */
+        bool allowsZeroOutput() const override { return true; }
+
         int getMaxKVLen() const { return last_max_kv_len_; }
         const std::vector<int> &getPerSeqKVLens() const { return last_per_seq_kv_lens_; }
 

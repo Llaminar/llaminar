@@ -551,4 +551,295 @@ TEST_F(TensorVerificationTest, IntegrationNaNInjection)
     EXPECT_EQ(result.nan_count, 1u);
 }
 
+// =============================================================================
+// Layout Validation Tests (Phase 3 Extension)
+// =============================================================================
+
+TEST_F(TensorVerificationTest, LayoutExpectation_DefaultValues)
+{
+    LayoutExpectation expect;
+    EXPECT_EQ(expect.head_dim, 0);
+    EXPECT_EQ(expect.n_heads, 0);
+    EXPECT_EQ(expect.local_n_heads, -1);
+    EXPECT_FALSE(expect.is_set());
+    EXPECT_FALSE(expect.is_tensor_parallel());
+}
+
+TEST_F(TensorVerificationTest, LayoutExpectation_EffectiveHeads_NoTP)
+{
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+    expect.n_kv_heads = 4;
+    // local_n_heads = -1 (default)
+
+    EXPECT_TRUE(expect.is_set());
+    EXPECT_FALSE(expect.is_tensor_parallel());
+    EXPECT_EQ(expect.effective_n_heads(), 12);
+    EXPECT_EQ(expect.effective_n_kv_heads(), 4);
+    EXPECT_EQ(expect.local_qkv_dim(), 12 * 128);
+    EXPECT_EQ(expect.local_kv_dim(), 4 * 128);
+}
+
+TEST_F(TensorVerificationTest, LayoutExpectation_EffectiveHeads_WithTP)
+{
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+    expect.n_kv_heads = 4;
+    expect.local_n_heads = 6;     // Half the heads (2 ranks)
+    expect.local_n_kv_heads = 2;  // Half the KV heads
+
+    EXPECT_TRUE(expect.is_tensor_parallel());
+    EXPECT_EQ(expect.effective_n_heads(), 6);
+    EXPECT_EQ(expect.effective_n_kv_heads(), 2);
+    EXPECT_EQ(expect.local_qkv_dim(), 6 * 128);
+    EXPECT_EQ(expect.local_kv_dim(), 2 * 128);
+}
+
+TEST_F(TensorVerificationTest, LayoutExpectation_ForAttentionFactory)
+{
+    // Test the factory method
+    auto expect = LayoutExpectation::forAttention(
+        128,  // head_dim
+        12,   // n_heads
+        4,    // n_kv_heads
+        6,    // local_n_heads
+        2);   // local_n_kv_heads
+
+    EXPECT_EQ(expect.head_dim, 128);
+    EXPECT_EQ(expect.n_heads, 12);
+    EXPECT_EQ(expect.n_kv_heads, 4);
+    EXPECT_EQ(expect.local_n_heads, 6);
+    EXPECT_EQ(expect.local_n_kv_heads, 2);
+    EXPECT_TRUE(expect.is_tensor_parallel());
+    EXPECT_TRUE(expect.is_set());
+}
+
+TEST_F(TensorVerificationTest, LayoutExpectation_ForAttentionFactory_NoTP)
+{
+    // Test factory with default local values (no TP)
+    auto expect = LayoutExpectation::forAttention(128, 12, 4);
+
+    EXPECT_EQ(expect.head_dim, 128);
+    EXPECT_EQ(expect.local_n_heads, -1);
+    EXPECT_EQ(expect.local_n_kv_heads, -1);
+    EXPECT_FALSE(expect.is_tensor_parallel());
+    EXPECT_EQ(expect.effective_n_heads(), 12);
+    EXPECT_EQ(expect.effective_n_kv_heads(), 4);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_NullTensor)
+{
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+
+    auto result = validateTensorLayout(
+        nullptr, "null_tensor", TensorLayout::Q_SEQ_HEAD_DIM, expect);
+
+    EXPECT_FALSE(result.passed);
+    EXPECT_EQ(result.tensor_name, "null_tensor");
+    EXPECT_TRUE(result.error_reason.find("Null") != std::string::npos);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_ExpectationsNotSet)
+{
+    auto tensor = TestTensorFactory::createFP32({32, 128});
+    tensor->setLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+
+    LayoutExpectation expect; // Not configured (head_dim = 0)
+
+    auto result = validateTensorLayout(
+        tensor.get(), "unconfigured", TensorLayout::Q_SEQ_HEAD_DIM, expect);
+
+    EXPECT_TRUE(result.passed) << "Should skip validation when expect not set";
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_UnknownLayoutPermissive)
+{
+    auto tensor = TestTensorFactory::createFP32({32, 128});
+    // layout defaults to UNKNOWN
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "unknown_layout", expect);
+
+    EXPECT_TRUE(result.passed) << "UNKNOWN layout should be permissive";
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_Q_SEQ_HEAD_DIM_Valid)
+{
+    // Q: [seq_len=32][n_heads=12][head_dim=128] -> [32][1536]
+    auto tensor = TestTensorFactory::createFP32({32, 12 * 128});
+    tensor->setLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+    expect.n_kv_heads = 4;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "Q", TensorLayout::Q_SEQ_HEAD_DIM, expect);
+
+    EXPECT_TRUE(result.passed) << result.error_reason;
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_Q_SEQ_HEAD_DIM_Invalid)
+{
+    // Wrong column count: should be n_heads * head_dim = 1536, but is 1024
+    auto tensor = TestTensorFactory::createFP32({32, 1024});
+    tensor->setLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "Q_wrong_cols", TensorLayout::Q_SEQ_HEAD_DIM, expect);
+
+    EXPECT_FALSE(result.passed);
+    EXPECT_TRUE(result.error_reason.find("cols=1024") != std::string::npos);
+    EXPECT_TRUE(result.error_reason.find("expected 1536") != std::string::npos);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_Q_SEQ_HEAD_DIM_WithTP)
+{
+    // With tensor parallelism: local_n_heads=6, so cols should be 6*128=768
+    auto tensor = TestTensorFactory::createFP32({32, 6 * 128});
+    tensor->setLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+    expect.local_n_heads = 6;  // TP active
+
+    auto result = validateTensorLayout(
+        tensor.get(), "Q_tp", TensorLayout::Q_SEQ_HEAD_DIM, expect);
+
+    EXPECT_TRUE(result.passed) << result.error_reason;
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_KV_HEAD_POS_DIM_Valid)
+{
+    // KV: [n_kv_heads=4][pos=256][head_dim=128] -> [4*256][128] = [1024][128]
+    auto tensor = TestTensorFactory::createFP32({4 * 256, 128});
+    tensor->setLayout(TensorLayout::KV_HEAD_POS_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+    expect.n_kv_heads = 4;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "K", TensorLayout::KV_HEAD_POS_DIM, expect);
+
+    EXPECT_TRUE(result.passed) << result.error_reason;
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_KV_HEAD_POS_DIM_WrongHeadDim)
+{
+    // cols should be head_dim=128, but is 64
+    auto tensor = TestTensorFactory::createFP32({1024, 64});
+    tensor->setLayout(TensorLayout::KV_HEAD_POS_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_kv_heads = 4;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "K_wrong_dim", TensorLayout::KV_HEAD_POS_DIM, expect);
+
+    EXPECT_FALSE(result.passed);
+    EXPECT_TRUE(result.error_reason.find("cols=64") != std::string::npos);
+    EXPECT_TRUE(result.error_reason.find("head_dim=128") != std::string::npos);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_KV_HEAD_POS_DIM_RowsNotDivisible)
+{
+    // rows should be divisible by n_kv_heads=4, but 1023 is not
+    auto tensor = TestTensorFactory::createFP32({1023, 128});
+    tensor->setLayout(TensorLayout::KV_HEAD_POS_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_kv_heads = 4;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "K_bad_rows", TensorLayout::KV_HEAD_POS_DIM, expect);
+
+    EXPECT_FALSE(result.passed);
+    EXPECT_TRUE(result.error_reason.find("rows=1023") != std::string::npos);
+    EXPECT_TRUE(result.error_reason.find("divisible") != std::string::npos);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_KV_POS_HEAD_DIM_Valid)
+{
+    // KV: [pos=256][n_kv_heads=4][head_dim=128] -> [256][4*128] = [256][512]
+    auto tensor = TestTensorFactory::createFP32({256, 4 * 128});
+    tensor->setLayout(TensorLayout::KV_POS_HEAD_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_kv_heads = 4;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "V", TensorLayout::KV_POS_HEAD_DIM, expect);
+
+    EXPECT_TRUE(result.passed) << result.error_reason;
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_LayoutMismatch)
+{
+    // Tensor declares Q_SEQ_HEAD_DIM but we expect KV_HEAD_POS_DIM
+    auto tensor = TestTensorFactory::createFP32({32, 1536});
+    tensor->setLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "mismatch", TensorLayout::KV_HEAD_POS_DIM, expect);
+
+    EXPECT_FALSE(result.passed);
+    EXPECT_TRUE(result.error_reason.find("Layout mismatch") != std::string::npos);
+    EXPECT_TRUE(result.error_reason.find("Q_SHD") != std::string::npos);  // Short name
+    EXPECT_TRUE(result.error_reason.find("KV_HPD") != std::string::npos);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_ROW_MAJOR_2D_NoConstraints)
+{
+    // ROW_MAJOR_2D has no dimension constraints
+    auto tensor = TestTensorFactory::createFP32({123, 456});
+    tensor->setLayout(TensorLayout::ROW_MAJOR_2D);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+
+    auto result = validateTensorLayout(
+        tensor.get(), "generic", TensorLayout::ROW_MAJOR_2D, expect);
+
+    EXPECT_TRUE(result.passed);
+}
+
+TEST_F(TensorVerificationTest, LayoutValidation_ConvenienceOverload)
+{
+    // Use the convenience overload that takes tensor->layout()
+    auto tensor = TestTensorFactory::createFP32({32, 12 * 128});
+    tensor->setLayout(TensorLayout::Q_SEQ_HEAD_DIM);
+
+    LayoutExpectation expect;
+    expect.head_dim = 128;
+    expect.n_heads = 12;
+
+    auto result = validateTensorLayout(tensor.get(), "Q_auto", expect);
+
+    EXPECT_TRUE(result.passed) << result.error_reason;
+}
+
 #endif // LLAMINAR_ASSERTIONS_ACTIVE

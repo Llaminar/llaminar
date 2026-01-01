@@ -436,6 +436,180 @@ Location: `src/v2/tensors/TensorKernels.h`
 - `ITensorAttention` – Attention over Q/K/V
 - Other per-op interfaces (RMSNorm, SwiGLU, RoPE)
 
+### 4.3 TensorLayout Contracts
+
+Location: `src/v2/tensors/TensorLayout.h`
+
+Tensor memory layout contracts define canonical shapes for attention tensors. Layouts are orthogonal to quantization format—a Q16_1Tensor can have any layout depending on pipeline position.
+
+**Available Layouts:**
+
+| Layout | Shape | Use Case |
+|--------|-------|----------|
+| `Q_SEQ_HEAD_DIM` | `[seq_len][n_heads][head_dim]` | Query after GEMM |
+| `Q_HEAD_SEQ_DIM` | `[n_heads][seq_len][head_dim]` | Per-head parallel attention |
+| `KV_POS_HEAD_DIM` | `[position][n_kv_heads][head_dim]` | KV cache POSITION_MAJOR |
+| `KV_HEAD_POS_DIM` | `[n_kv_heads][position][head_dim]` | KV cache HEAD_MAJOR |
+| `ROW_MAJOR_2D` | `[rows][cols]` | Embeddings, hidden states |
+| `ROW_MAJOR_1D` | `[elements]` | Flat vectors |
+
+**Layout Validation:**
+
+```cpp
+// LayoutExpectation contains model dimensions for validation
+LayoutExpectation expect{
+    .head_dim = 128,
+    .n_heads = 32,
+    .n_kv_heads = 8,
+    .d_model = 4096
+};
+
+// Validate tensor shape matches expected layout
+auto result = validateTensorLayout(tensor, TensorLayout::Q_SEQ_HEAD_DIM, expect);
+if (!result.passed) {
+    throw LayoutValidationError(result.error_reason);
+}
+```
+
+### 4.4 TensorVerification System
+
+Location: `src/v2/tensors/TensorVerification.h`
+
+The verification system provides fail-fast validation at stage boundaries in Debug/Integration builds:
+
+**Build Type Behavior:**
+
+| Build Type | `LLAMINAR_ASSERTIONS_ACTIVE` | Verification Active | Behavior |
+|------------|------------------------------|---------------------|----------|
+| Debug | 1 | Yes | Throws `VerificationFailure` |
+| Integration | 1 | Yes | Throws `VerificationFailure` |
+| Release | 0 | No | Compiled out (zero overhead) |
+| E2ERelease | 0 | No | Compiled out |
+
+**Verification Checks:**
+
+- **NaN/Inf detection**: Sampled check for floating-point anomalies
+- **Null pointer detection**: Catches uninitialized buffers
+- **All-zero detection**: Warns on suspiciously empty tensors
+- **Layout validation**: Verifies shape matches expected layout
+
+**GraphExecutor Integration:**
+
+```cpp
+// Automatically called at stage boundaries
+void GraphExecutor::execute(ComputeGraph& graph, ExecutionContext& ctx) {
+    for (auto& stage : topological_order) {
+        // BEFORE stage execution
+        verifyStageEntry(stage, layer_idx);
+        
+        // Execute stage
+        stage->execute();
+        
+        // AFTER stage execution (before snapshot callback)
+        verifyStageExit(stage, layer_idx);
+        
+        // Snapshot callback (if enabled)
+        if (snapshot_callback_) {
+            invokeSnapshotCallback(stage);
+        }
+    }
+}
+```
+
+**VerificationFailure Exception:**
+
+When verification fails, a `VerificationFailure` exception is thrown with full context:
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║               TENSOR VERIFICATION FAILED                          ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Layer:  3
+║ Stage:  FusedAttentionWoStage
+║ Phase:  EXIT
+║ Tensor: attention_output
+║ Reason: Contains 5 NaN values in first 8 rows
+║
+║ Dump:   /tmp/llaminar_verification_dump/...
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLAMINAR_VALIDATE_BUFFERS` | Auto (Debug/Integration) | Enable/disable buffer validation |
+| `LLAMINAR_FAIL_ON_NAN` | 1 (Debug/Integration) | Throw on NaN/Inf detection |
+| `LLAMINAR_FAIL_ON_ZERO` | 0 | Throw on all-zero tensors |
+| `LLAMINAR_DUMP_ON_FAILURE` | 1 | Dump buffers to disk on failure |
+
+### 4.5 UnifiedKVCache and Layout Modes
+
+Location: `src/v2/tensors/UnifiedKVCache.h`
+
+The `UnifiedKVCache` manages KV cache storage with configurable memory layouts:
+
+**KVCacheLayoutMode:**
+
+```cpp
+enum class KVCacheLayoutMode : uint8_t {
+    POSITION_MAJOR,  // [position][n_kv_heads][head_dim] - cache-append friendly
+    HEAD_MAJOR       // [n_kv_heads][position][head_dim] - attention-compute friendly
+};
+```
+
+**Layout Selection:**
+
+| Layout | Memory Pattern | Best For |
+|--------|----------------|----------|
+| `POSITION_MAJOR` | Append is contiguous | FP32/BF16 attention (standard) |
+| `HEAD_MAJOR` | Per-head iteration is contiguous | Q16_INTEGER attention |
+
+**GraphOrchestrator Auto-Selection:**
+
+The `GraphOrchestrator` automatically selects the optimal layout based on KV cache precision:
+
+```cpp
+// In GraphOrchestrator::createKVCache()
+KVCacheLayoutMode layout_mode = (kv_precision == ActivationPrecision::Q16_1)
+    ? KVCacheLayoutMode::HEAD_MAJOR   // Optimal for Q16IntegerAttention
+    : KVCacheLayoutMode::POSITION_MAJOR;  // Default for FP32/BF16
+```
+
+**HEAD_MAJOR Benefits for Q16_INTEGER:**
+
+- Per-head K/V access via `get_k_for_kv_head(kv_head_idx)` returns contiguous buffer
+- Eliminates transpose for Q16 integer dot product kernel
+- Natural fit for `[n_kv_heads][position][head_dim]` attention iteration
+
+**Multi-Block Q16_1 Support:**
+
+For Q16_1 precision, the cache stores multi-block data per head when `head_dim > block_size`:
+
+```
+head_dim=256, BLOCK_128 → 2 blocks per head per position
+head_dim=384, BLOCK_128 → 3 blocks per head per position
+```
+
+**IUnifiedKVCache Interface:**
+
+```cpp
+class IUnifiedKVCache {
+    virtual void append(TensorBase* K, TensorBase* V, int seq_len) = 0;
+    virtual void shift(int positions_to_evict) = 0;
+    virtual int cached_tokens() const = 0;
+    virtual KVCacheLayoutMode layout_mode() const = 0;
+    
+    // HEAD_MAJOR accessors (returns nullptr for POSITION_MAJOR)
+    virtual TensorBase* get_k_for_kv_head(int kv_head_idx) = 0;
+    virtual TensorBase* get_v_for_kv_head(int kv_head_idx) = 0;
+    
+    // POSITION_MAJOR accessors
+    virtual TensorBase* get_k_cache() = 0;
+    virtual TensorBase* get_v_cache() = 0;
+};
+```
+
 ---
 
 ## 5. Kernels and KernelFactory
@@ -545,20 +719,149 @@ The attention compute stage encapsulates full attention computation:
 
 Created via `KernelFactory::createAttention()` which dispatches to the appropriate kernel based on tensor type and device.
 
+### 7.3 HybridQ16 Mode and Q16IntegerAttention
+
+Location: `src/v2/kernels/cpu/attention/q16/ref/Q16IntegerAttentionRef.h`
+
+**HybridQ16 Mode** is an experimental attention path that uses Q16_1 quantized activations with integer-only attention computation. This mode is designed for memory-efficient inference where:
+
+- Activations (Q, K, V) are stored as Q16_1 (16-bit quantized blocks)
+- KV cache uses Q16_1 precision with HEAD_MAJOR layout
+- Attention computation uses integer dot products avoiding FP32 dequantization
+
+**Activation Modes:**
+
+| Mode | Q/K/V Precision | KV Cache Layout | Attention Kernel |
+|------|-----------------|-----------------|------------------|
+| Standard (FP32) | FP32 | POSITION_MAJOR | `CpuAttentionKernelT<float>` |
+| BF16 | BF16 | POSITION_MAJOR | `CpuAttentionKernelT<bfloat16>` |
+| HybridQ16 | Q16_1 | HEAD_MAJOR | `Q16IntegerAttentionRef` |
+
+**Q16IntegerAttention Algorithm:**
+
+```cpp
+// Integer-only attention (no FP32 intermediate)
+// Q: [seq_q][n_heads][head_dim] as Q16_1
+// K: [n_kv_heads][kv_len][head_dim] as Q16_1 (HEAD_MAJOR)
+// V: [n_kv_heads][kv_len][head_dim] as Q16_1 (HEAD_MAJOR)
+
+for each query head h:
+    kv_head = h / (n_heads / n_kv_heads)  // GQA mapping
+    
+    // Integer dot product: Q[h] · K[kv_head]^T
+    scores = q16_dot_product(Q[h], K[kv_head])  // INT32 accumulator
+    
+    // Fixed-point softmax (avoids FP32)
+    weights = q16_softmax(scores)  // INT16 weights summing to 32767
+    
+    // Weighted sum: weights · V[kv_head]
+    context[h] = q16_weighted_sum(weights, V[kv_head])
+```
+
+**Status:** HybridQ16 is under active development. The pipeline is wired but numerical parity tests are pending (see `PROJECT_Q16_INTEGER_ATTENTION_V2.md`).
+
 ---
 
-## 8. Snapshot System
+## 8. Stage Debugging and Snapshot System
 
-### 8.1 Overview
+### 8.1 StageDumpInfo Infrastructure
 
-The snapshot system captures intermediate tensor states for debugging and parity testing:
+Location: `src/v2/execution/compute_stages/IComputeStage.h`
 
-- **Compile-time conditional** – Only in Debug/E2ERelease builds
-- **In-memory storage** – `std::map<std::string, std::vector<float>>`
-- **Zero overhead in Release** – Compiles away to NOOPs
+The **StageDumpInfo** system is the foundation for all stage debugging, introspection, and snapshot capture. Every `IComputeStage` must implement `getDumpInfo()` to expose its inputs, outputs, weights, and scalar parameters:
 
-### 8.2 Usage
+```cpp
+struct StageDumpInfo {
+    struct InputBuffer {
+        const char* name;
+        const void* data;
+        size_t rows, cols;
+        const char* dtype;  // "FP32", "Q8_1", "Q16_1", etc.
+    };
+    
+    struct OutputBuffer { /* same fields */ };
+    struct WeightBuffer { /* includes TensorBase* for full metadata */ };
+    struct ScalarParam { const char* name; double value; const char* dtype; };
+    
+    std::vector<InputBuffer> inputs;
+    std::vector<OutputBuffer> outputs;
+    std::vector<WeightBuffer> weights;
+    std::vector<ScalarParam> scalars;
+    
+    // Fluent builder API
+    StageDumpInfo& addInput(const char* name, const float* data, size_t rows, size_t cols);
+    StageDumpInfo& addOutput(const char* name, const TensorBase* tensor, size_t rows, size_t cols);
+    StageDumpInfo& addWeight(const char* name, const TensorBase* tensor);
+    StageDumpInfo& addScalarInt(const char* name, int value);
+};
+```
 
+**Every stage must implement getDumpInfo()** - This is required for:
+1. **TensorVerification** - Entry/exit validation of inputs and outputs
+2. **Snapshot callbacks** - E2E parity testing against PyTorch
+3. **StageDumper** - Full binary dumps for debugging
+
+### 8.2 StageDumper Utility
+
+Location: `src/v2/execution/StageDumper.h`
+
+The `StageDumper` provides comprehensive disk-based debugging of stage execution:
+
+**Output Structure:**
+```
+<dump_dir>/stage_<counter>_<type>_layer<N>_iter<I>/
+  metadata.txt        - Human-readable description
+  params.bin          - Binary parameters for replay
+  inputs/             - Input tensors directory
+    A.bin             - FP32 activation matrix
+    A_q8_1.bin        - Q8_1 block data
+  weights/            - Weight tensors directory
+    B_dequant.bin     - Dequantized weights (FP32)
+    B_raw.bin         - Raw quantized blocks
+    B_metadata.txt    - Quant type, shape, scale info
+  outputs/            - Output tensors directory
+    C.bin             - Output matrix
+```
+
+**Environment Variables:**
+
+| Variable | Effect |
+|----------|--------|
+| `LLAMINAR_STAGE_DUMP=1` | Enable stage dumping |
+| `LLAMINAR_STAGE_DUMP_DIR` | Output directory (default: `/tmp/llaminar_stage_dumps`) |
+| `LLAMINAR_STAGE_DUMP_TYPES` | Comma-separated stage types to dump (e.g., `GEMM,ATTENTION`) |
+| `LLAMINAR_STAGE_DUMP_LAYERS` | Comma-separated layer indices to dump |
+
+**Usage (automatic via GraphExecutor):**
+```bash
+LLAMINAR_STAGE_DUMP=1 LLAMINAR_STAGE_DUMP_LAYERS=0,1 ./build_v2/llaminar2 -m model.gguf -p "test"
+```
+
+### 8.3 Snapshot System (Subset of StageDumpInfo)
+
+The **snapshot system** uses `StageDumpInfo` outputs for E2E parity testing. It captures output tensors in-memory for comparison against PyTorch reference:
+
+**Architecture:**
+```
+StageDumpInfo.outputs  ->  GraphExecutor.snapshot_callback_  ->  In-memory storage
+                                     |
+                          IInferenceRunner.getSnapshot()  ->  E2E test comparison
+```
+
+- **Compile-time conditional** - Only in Debug/E2ERelease builds (`ENABLE_PIPELINE_SNAPSHOTS`)
+- **In-memory storage** - `std::map<std::string, std::vector<float>>`
+- **Zero overhead in Release** - Compiles away to NOOPs
+
+**GraphExecutor Integration:**
+```cpp
+// After stage execution, if snapshot callback is configured
+if (success && config_.snapshot_callback) {
+    auto dump_info = node.stage->getDumpInfo();  // Reuse StageDumpInfo
+    config_.snapshot_callback(node.name, dump_info);
+}
+```
+
+**API Usage:**
 ```cpp
 // Enable capture
 runner->enableSnapshotCapture("/tmp/snapshots");
@@ -571,16 +874,37 @@ auto keys = runner->getSnapshotKeys();
 for (const auto& key : keys) {
     size_t size;
     const float* data = runner->getSnapshot(key, size);
-    // Compare with reference...
+    // Compare with PyTorch reference...
 }
 ```
 
-### 8.3 Snapshot Keys
+### 8.4 Snapshot Keys
 
 - **Global:** `EMBEDDING`, `FINAL_NORM`, `LM_HEAD`
 - **Per-layer:** `layer{i}_{STAGE}` where stage is:
   - Attention: `ATTENTION_NORM`, `Q_PROJECTION`, `K_PROJECTION`, `V_PROJECTION`, `Q_ROPE`, `K_ROPE`, `ATTENTION_CONTEXT`, `ATTENTION_OUTPUT`, `ATTENTION_RESIDUAL`
   - FFN: `FFN_NORM`, `FFN_GATE`, `FFN_UP`, `FFN_SWIGLU`, `FFN_DOWN`, `FFN_RESIDUAL`
+
+### 8.5 Integration with TensorVerification
+
+The TensorVerification system (Section 4.4) also uses `StageDumpInfo`:
+
+```cpp
+void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
+    auto dump_info = node.stage->getDumpInfo();  // Get all outputs
+    
+    for (const auto& output : dump_info.outputs) {
+        auto result = verifyRawBuffer(output.data, output.rows, output.cols, ...);
+        if (!result.passed) {
+            // Dump ALL buffers for debugging (inputs + outputs + weights)
+            dumpStageBuffers(node.name, layer_idx, "EXIT", dump_info, ...);
+            throw VerificationFailure(...);
+        }
+    }
+}
+```
+
+**Key Insight:** `StageDumpInfo` is the single source of truth for stage introspection. Snapshots, verification, and debugging all consume the same data structure, ensuring consistency.
 
 ---
 
@@ -618,6 +942,10 @@ for (const auto& key : keys) {
 | `LLAMINAR_PROFILE_KERNELS=1` | Enable per-kernel timing in benchmark mode |
 | `LLAMINAR_LOG_LEVEL=DEBUG` | Set logging verbosity |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP=1` | Enable raw tensor dumps for debugging |
+| `LLAMINAR_VALIDATE_BUFFERS=1` | Enable buffer validation at stage boundaries |
+| `LLAMINAR_FAIL_ON_NAN=1` | Throw exception on NaN/Inf detection (default in Debug) |
+| `LLAMINAR_FAIL_ON_ZERO=1` | Throw exception on all-zero output tensors |
+| `LLAMINAR_DUMP_ON_FAILURE=1` | Dump buffers to disk when verification fails |
 
 ### 9.4 Running Tests
 

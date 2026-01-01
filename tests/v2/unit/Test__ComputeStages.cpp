@@ -940,7 +940,7 @@ TEST_F(ComputeStagesTest, AllreduceStage_TypeAndBackend)
 {
     AllreduceStage::Params params{
         .buffer = nullptr,
-        .mpi_comm = nullptr};
+        .mpi_ctx = nullptr};
 
     AllreduceStage stage(params);
 

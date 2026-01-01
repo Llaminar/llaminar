@@ -970,6 +970,15 @@ namespace llaminar2
             act_prec, HybridBufferType::KV_Cache, nullptr);
         LOG_DEBUG("[GraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
 
+        // Determine KV cache layout mode:
+        // - Q16_1 precision requires HEAD_MAJOR layout for Q16IntegerAttention kernel
+        // - Other precisions use POSITION_MAJOR (legacy layout)
+        KVCacheLayoutMode kv_layout_mode = (kv_cache_prec == ActivationPrecision::Q16_1)
+                                               ? KVCacheLayoutMode::HEAD_MAJOR
+                                               : KVCacheLayoutMode::POSITION_MAJOR;
+        LOG_DEBUG("[GraphOrchestrator] KV cache layout mode: "
+                  << (kv_layout_mode == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
+
         bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
         if (use_sharded_cache && mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
@@ -992,7 +1001,8 @@ namespace llaminar2
                 config.local_n_kv_heads,
                 kv_head_start,
                 head_dim,
-                device_idx);
+                device_idx,
+                kv_layout_mode);
         }
         else
         {
@@ -1005,7 +1015,8 @@ namespace llaminar2
                 max_seq_len,
                 n_kv_heads,
                 head_dim,
-                device_idx);
+                device_idx,
+                kv_layout_mode);
         }
 
         // Initialize position tracking

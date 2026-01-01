@@ -53,6 +53,10 @@ namespace llaminar2
             int batch_size() const override { return 1; }
             int max_seq_len() const override { return max_seq_len_; }
 
+            // Layout mode (mock returns POSITION_MAJOR)
+            KVCacheLayoutMode layout_mode() const override { return KVCacheLayoutMode::POSITION_MAJOR; }
+            TensorLayout kv_layout() const override { return TensorLayout::KV_POS_HEAD_DIM; }
+
             int get_cached_tokens(int layer, int seq_idx = 0) const override
             {
                 (void)seq_idx;
