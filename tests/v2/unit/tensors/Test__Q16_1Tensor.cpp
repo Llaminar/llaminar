@@ -201,7 +201,8 @@ TEST(Test__Q16_1Tensor, PrecomputedSumIsCorrect)
     ASSERT_NE(tensor, nullptr);
 
     // Check each block
-    const Q16_1Block *blocks = tensor->q16_1_blocks();
+    const Q16_1Block *blocks = tensor->as_block_32();
+    ASSERT_NE(blocks, nullptr);
     const size_t blocks_per_row = tensor->blocks_per_row();
     const size_t total_blocks = tensor->total_blocks();
 
@@ -429,7 +430,8 @@ TEST(Test__Q16_1Tensor, DecodeConsistency)
 
     ASSERT_NE(tensor, nullptr);
 
-    const Q16_1Block *blocks = tensor->q16_1_blocks();
+    const Q16_1Block *blocks = tensor->as_block_32();
+    ASSERT_NE(blocks, nullptr);
     const size_t total_blocks = tensor->total_blocks();
 
     // Decode each block with scalar and compare to main decode
@@ -601,10 +603,13 @@ TEST(Test__Q16_1Tensor, NativeQ16_1Addition)
         std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
         raw_output);
 
-    // Get raw block pointers using proper accessors
-    const Q16_1Block *blocks_a = tensor_a->q16_1_blocks();
-    const Q16_1Block *blocks_b = tensor_b->q16_1_blocks();
-    Q16_1Block *blocks_out = tensor_out->mutable_q16_1_blocks();
+    // Get raw block pointers using safe accessors
+    const Q16_1Block *blocks_a = tensor_a->as_block_32();
+    const Q16_1Block *blocks_b = tensor_b->as_block_32();
+    Q16_1Block *blocks_out = tensor_out->mutable_as_block_32();
+    ASSERT_NE(blocks_a, nullptr);
+    ASSERT_NE(blocks_b, nullptr);
+    ASSERT_NE(blocks_out, nullptr);
 
     // Perform native Q16_1 addition
     simd::q16_1_add_q16_1(blocks_a, blocks_b, blocks_out, elements);
@@ -665,12 +670,15 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddFP32)
 
     // Copy to mutable tensor
     std::vector<uint8_t> raw_residual(n_blocks * sizeof(Q16_1Block));
-    std::memcpy(raw_residual.data(), temp_tensor->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    const Q16_1Block *temp_blocks = temp_tensor->as_block_32();
+    ASSERT_NE(temp_blocks, nullptr);
+    std::memcpy(raw_residual.data(), temp_blocks, n_blocks * sizeof(Q16_1Block));
     auto residual = std::make_shared<Q16_1Tensor>(
         std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
         raw_residual);
 
-    Q16_1Block *blocks = residual->mutable_q16_1_blocks();
+    Q16_1Block *blocks = residual->mutable_as_block_32();
+    ASSERT_NE(blocks, nullptr);
 
     // Add FP32 delta in-place
     simd::q16_1_add_fp32(blocks, delta_fp32.data(), elements);
@@ -722,8 +730,9 @@ TEST(Test__Q16_1Tensor, Q16_1ToQ8_1Packed)
     // Allocate Q8_1 output
     std::vector<Q8_1Block> q8_blocks(n_blocks);
 
-    // Convert using SIMD function with proper accessor
-    const Q16_1Block *q16_blocks = q16_tensor->q16_1_blocks();
+    // Convert using SIMD function with safe accessor
+    const Q16_1Block *q16_blocks = q16_tensor->as_block_32();
+    ASSERT_NE(q16_blocks, nullptr);
     simd::q16_1_to_q8_1_packed(q16_blocks, q8_blocks.data(), n_blocks);
 
     // Dequantize Q8_1 result manually
@@ -776,9 +785,12 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddEdgeCases)
             std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
             raw_output);
 
-        const Q16_1Block *blocks_a = tensor_a->q16_1_blocks();
-        const Q16_1Block *blocks_b = tensor_b->q16_1_blocks();
-        Q16_1Block *blocks_out = tensor_out->mutable_q16_1_blocks();
+        const Q16_1Block *blocks_a = tensor_a->as_block_32();
+        const Q16_1Block *blocks_b = tensor_b->as_block_32();
+        Q16_1Block *blocks_out = tensor_out->mutable_as_block_32();
+        ASSERT_NE(blocks_a, nullptr);
+        ASSERT_NE(blocks_b, nullptr);
+        ASSERT_NE(blocks_out, nullptr);
 
         simd::q16_1_add_q16_1(blocks_a, blocks_b, blocks_out, elements);
 
@@ -807,9 +819,12 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddEdgeCases)
             std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
             raw_output);
 
-        const Q16_1Block *blocks_a = tensor_a->q16_1_blocks();
-        const Q16_1Block *blocks_b = tensor_b->q16_1_blocks();
-        Q16_1Block *blocks_out = tensor_out->mutable_q16_1_blocks();
+        const Q16_1Block *blocks_a = tensor_a->as_block_32();
+        const Q16_1Block *blocks_b = tensor_b->as_block_32();
+        Q16_1Block *blocks_out = tensor_out->mutable_as_block_32();
+        ASSERT_NE(blocks_a, nullptr);
+        ASSERT_NE(blocks_b, nullptr);
+        ASSERT_NE(blocks_out, nullptr);
 
         simd::q16_1_add_q16_1(blocks_a, blocks_b, blocks_out, elements);
 
@@ -866,7 +881,7 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1)
     auto temp_residual = Q16_1Tensor::quantize_from_fp32(
         residual_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
     std::vector<uint8_t> raw_residual(n_blocks * sizeof(Q16_1Block));
-    std::memcpy(raw_residual.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual.data(), temp_residual->as_block_32(), n_blocks * sizeof(Q16_1Block));
     auto residual = std::make_shared<Q16_1Tensor>(
         std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
         raw_residual);
@@ -875,8 +890,9 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1)
     auto delta = Q8_1Tensor::quantize_from_fp32(
         delta_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
 
-    // Get block pointers
-    Q16_1Block *residual_blocks = residual->mutable_q16_1_blocks();
+    // Get block pointers using safe accessors
+    Q16_1Block *residual_blocks = residual->mutable_as_block_32();
+    ASSERT_NE(residual_blocks, nullptr);
     const Q8_1Block *delta_blocks = delta->q8_1_blocks();
 
     // Add Q8_1 delta to Q16_1 residual in-place
@@ -932,8 +948,8 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_vs_TwoStep)
 
     std::vector<uint8_t> raw_residual1(n_blocks * sizeof(Q16_1Block));
     std::vector<uint8_t> raw_residual2(n_blocks * sizeof(Q16_1Block));
-    std::memcpy(raw_residual1.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
-    std::memcpy(raw_residual2.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual1.data(), temp_residual->as_block_32(), n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual2.data(), temp_residual->as_block_32(), n_blocks * sizeof(Q16_1Block));
 
     auto residual1 = std::make_shared<Q16_1Tensor>(
         std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
@@ -947,12 +963,12 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_vs_TwoStep)
         delta_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
 
     // Method 1: Native Q16_1 += Q8_1
-    simd::q16_1_add_q8_1(residual1->mutable_q16_1_blocks(), delta_q8->q8_1_blocks(), elements);
+    simd::q16_1_add_q8_1(residual1->mutable_as_block_32(), delta_q8->q8_1_blocks(), elements);
 
     // Method 2: Convert Q8_1 → FP32, then Q16_1 += FP32
     std::vector<float> delta_fp32_dequant(elements);
     delta_q8->to_fp32(delta_fp32_dequant.data());
-    simd::q16_1_add_fp32(residual2->mutable_q16_1_blocks(), delta_fp32_dequant.data(), elements);
+    simd::q16_1_add_fp32(residual2->mutable_as_block_32(), delta_fp32_dequant.data(), elements);
 
     // Dequantize both results
     std::vector<float> result1(elements);
@@ -1016,7 +1032,7 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_RealisticMagnitudes)
     auto temp_residual = Q16_1Tensor::quantize_from_fp32(
         residual_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
     std::vector<uint8_t> raw_residual(n_blocks * sizeof(Q16_1Block));
-    std::memcpy(raw_residual.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual.data(), temp_residual->as_block_32(), n_blocks * sizeof(Q16_1Block));
     auto residual = std::make_shared<Q16_1Tensor>(
         std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
         raw_residual);
@@ -1025,7 +1041,7 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_RealisticMagnitudes)
         delta_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
 
     // Add
-    simd::q16_1_add_q8_1(residual->mutable_q16_1_blocks(), delta->q8_1_blocks(), elements);
+    simd::q16_1_add_q8_1(residual->mutable_as_block_32(), delta->q8_1_blocks(), elements);
 
     // Compare
     std::vector<float> result(elements);

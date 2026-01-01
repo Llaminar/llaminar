@@ -8,6 +8,7 @@
 #include "GraphExecutor.h"
 #include "StageDumper.h"
 #include "../tensors/TensorValidation.h"
+#include "../tensors/TensorVerification.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include <algorithm>
@@ -501,6 +502,17 @@ namespace llaminar2
             return false;
         }
 
+        // Extract layer index from config
+        const int layer_idx = config_.current_layer_idx;
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        // ENTRY verification - validate inputs BEFORE execute()
+        if (debugEnv().validation.validate_inputs)
+        {
+            verifyStageEntry(node, layer_idx); // Throws VerificationFailure on error
+        }
+#endif
+
         // Check if stage dumping is enabled for this stage
         StageDumpContext dump_ctx;
         const bool should_dump = StageDumper::shouldDump(
@@ -540,11 +552,15 @@ namespace llaminar2
             StageDumper::finalizeDump(dump_ctx, ms);
         }
 
-        // Validate stage outputs if buffer validation is enabled
+        // EXIT verification - validate outputs AFTER execute()
         // (only compiles in Debug/Integration builds with assertions active)
 #if LLAMINAR_ASSERTIONS_ACTIVE
         if (success && debugEnv().validation.validate_buffers)
         {
+            // New exception-based validation (throws VerificationFailure)
+            verifyStageExit(node, layer_idx);
+
+            // Legacy bool-based validation (for compatibility)
             success = validateStageOutputs(node);
         }
 #endif
@@ -564,6 +580,105 @@ namespace llaminar2
     // =============================================================================
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
+
+    void GraphExecutor::verifyStageEntry(const ComputeNode &node, int layer_idx)
+    {
+        using namespace verification;
+
+        const auto &validation = debugEnv().validation;
+        auto dump_info = node.stage->getDumpInfo();
+
+        // Build verification config from global settings
+        VerificationConfig vconfig;
+        vconfig.sample_rows = validation.sample_rows;
+        vconfig.check_null = true;
+        vconfig.check_nan = validation.fail_on_nan;
+        vconfig.check_inf = validation.fail_on_nan; // Inf is also bad
+        vconfig.check_all_zero = false;             // Zero inputs may be valid (first layer residual)
+        vconfig.dump_on_failure = validation.dump_on_failure;
+
+        // Verify all inputs
+        for (const auto &input : dump_info.inputs)
+        {
+            if (!input.data)
+                continue; // Null inputs checked separately if needed
+
+            auto result = verifyRawBuffer(
+                input.data, input.rows, input.cols,
+                input.name, input.dtype, vconfig);
+
+            if (!result.passed)
+            {
+                LOG_ERROR("[VERIFY] ENTRY FAILED: layer=" << layer_idx
+                                                          << " stage=" << node.name
+                                                          << " tensor=" << result.tensor_name
+                                                          << " reason=" << result.error_reason);
+
+                // Dump all buffers for debugging
+                std::string dump_path;
+                if (vconfig.dump_on_failure)
+                {
+                    dump_path = dumpStageBuffers(node.name, layer_idx, "ENTRY", dump_info,
+                                                 result.tensor_name, result.error_reason);
+                    LOG_ERROR("[VERIFY] Buffers dumped to: " << dump_path);
+                }
+
+                // Throw exception with full context
+                throw VerificationFailure(node.name, layer_idx, "ENTRY",
+                                          result.tensor_name, result.error_reason, dump_path);
+            }
+        }
+    }
+
+    void GraphExecutor::verifyStageExit(const ComputeNode &node, int layer_idx)
+    {
+        using namespace verification;
+
+        const auto &validation = debugEnv().validation;
+        auto dump_info = node.stage->getDumpInfo();
+
+        // Build verification config from global settings
+        VerificationConfig vconfig;
+        vconfig.sample_rows = validation.sample_rows;
+        vconfig.check_null = true;
+        vconfig.check_nan = validation.fail_on_nan;
+        vconfig.check_inf = validation.fail_on_nan;
+        vconfig.check_all_zero = validation.fail_on_zero; // Zero outputs are usually bugs
+        vconfig.dump_on_failure = validation.dump_on_failure;
+
+        // Verify all outputs
+        for (const auto &output : dump_info.outputs)
+        {
+            if (!output.data)
+                continue;
+
+            auto result = verifyRawBuffer(
+                output.data, output.rows, output.cols,
+                output.name, output.dtype, vconfig);
+
+            if (!result.passed)
+            {
+                LOG_ERROR("[VERIFY] EXIT FAILED: layer=" << layer_idx
+                                                         << " stage=" << node.name
+                                                         << " tensor=" << result.tensor_name
+                                                         << " reason=" << result.error_reason);
+
+                // Dump all buffers for debugging
+                std::string dump_path;
+                if (vconfig.dump_on_failure)
+                {
+                    dump_path = dumpStageBuffers(node.name, layer_idx, "EXIT", dump_info,
+                                                 result.tensor_name, result.error_reason);
+                    LOG_ERROR("[VERIFY] Buffers dumped to: " << dump_path);
+                }
+
+                // Throw exception with full context
+                throw VerificationFailure(node.name, layer_idx, "EXIT",
+                                          result.tensor_name, result.error_reason, dump_path);
+            }
+        }
+    }
+
     bool GraphExecutor::validateStageOutputs(const ComputeNode &node)
     {
         if (!node.stage)

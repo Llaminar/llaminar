@@ -1276,9 +1276,12 @@ namespace llaminar2
      */
     struct ValidationConfig
     {
-        bool validate_buffers = false; ///< Enable buffer validation after stage execution
-        bool fail_on_zero = false;     ///< Fail immediately when zero tensor detected
-        bool fail_on_nan = false;      ///< Fail immediately when NaN/Inf detected
+        bool validate_buffers = false;    ///< Enable buffer validation after stage execution
+        bool validate_inputs = false;     ///< Enable input validation BEFORE stage execution (Phase 1)
+        bool fail_on_zero = false;        ///< Fail immediately when zero tensor detected
+        bool fail_on_nan = false;         ///< Fail immediately when NaN/Inf detected
+        bool dump_on_failure = true;      ///< Dump all buffers to disk when verification fails
+        int sample_rows = 8;              ///< Number of rows to sample for verification (efficiency)
 
         ValidationConfig()
         {
@@ -1291,7 +1294,8 @@ namespace llaminar2
             // This is the default for Debug and Integration builds
 #if LLAMINAR_ASSERTIONS_ACTIVE
             validate_buffers = true;
-            fail_on_nan = true; // NaN/Inf is always a bug, fail by default
+            validate_inputs = true;  // Enable input validation in debug builds
+            fail_on_nan = true;      // NaN/Inf is always a bug, fail by default
 #endif
 
             // Environment variables can override the defaults
@@ -1299,6 +1303,12 @@ namespace llaminar2
             if (validate_env)
             {
                 validate_buffers = (std::atoi(validate_env) != 0);
+            }
+
+            const char *validate_inputs_env = std::getenv("LLAMINAR_VALIDATE_INPUTS");
+            if (validate_inputs_env)
+            {
+                validate_inputs = (std::atoi(validate_inputs_env) != 0);
             }
 
             const char *fail_zero_env = std::getenv("LLAMINAR_FAIL_ON_ZERO");
@@ -1311,6 +1321,20 @@ namespace llaminar2
             if (fail_nan_env)
             {
                 fail_on_nan = (std::atoi(fail_nan_env) != 0);
+            }
+
+            const char *dump_env = std::getenv("LLAMINAR_DUMP_ON_FAILURE");
+            if (dump_env)
+            {
+                dump_on_failure = (std::atoi(dump_env) != 0);
+            }
+
+            const char *sample_rows_env = std::getenv("LLAMINAR_VALIDATION_SAMPLE_ROWS");
+            if (sample_rows_env)
+            {
+                sample_rows = std::atoi(sample_rows_env);
+                if (sample_rows < 1)
+                    sample_rows = 1;
             }
         }
     };

@@ -91,7 +91,8 @@ namespace llaminar2
             {
                 int16_t max_abs = 0;
                 const size_t n_blocks = tensor.total_blocks();
-                const auto *blocks = tensor.q16_1_blocks();
+                const auto *blocks = tensor.as_block_32();
+                EXPECT_NE(blocks, nullptr);
 
                 for (size_t b = 0; b < n_blocks; ++b)
                 {
@@ -107,7 +108,9 @@ namespace llaminar2
             bool verify_all_within_limit(const Q16_1Tensor &tensor, int16_t limit)
             {
                 const size_t n_blocks = tensor.total_blocks();
-                const auto *blocks = tensor.q16_1_blocks();
+                const auto *blocks = tensor.as_block_32();
+                if (!blocks)
+                    return false;
 
                 for (size_t b = 0; b < n_blocks; ++b)
                 {
@@ -126,7 +129,9 @@ namespace llaminar2
             bool verify_fixed_scale(const Q16_1Tensor &tensor, float expected_d, float tolerance = 1e-6f)
             {
                 const size_t n_blocks = tensor.total_blocks();
-                const auto *blocks = tensor.q16_1_blocks();
+                const auto *blocks = tensor.as_block_32();
+                if (!blocks)
+                    return false;
 
                 for (size_t b = 0; b < n_blocks; ++b)
                 {
@@ -299,8 +304,10 @@ namespace llaminar2
             ASSERT_TRUE(k_tensor->copyFrom_fp32_fixed_scale(k_data.data(), DEFAULT_KV_CACHE_SCALE, HEAD_DIM_64));
 
             // Simulate VNNI dot-product
-            const auto *q_blocks = q_tensor->q16_1_blocks();
-            const auto *k_blocks = k_tensor->q16_1_blocks();
+            const auto *q_blocks = q_tensor->as_block_32();
+            const auto *k_blocks = k_tensor->as_block_32();
+            ASSERT_NE(q_blocks, nullptr);
+            ASSERT_NE(k_blocks, nullptr);
 
             EXPECT_TRUE(simulate_vnni_dot_product(q_blocks[0].qs, k_blocks[0].qs, HEAD_DIM_64));
         }
@@ -320,9 +327,10 @@ namespace llaminar2
 
             // Extract INT16 values (first 4 blocks of 32 elements = 128)
             std::vector<int16_t> q_int16(128), k_int16(128);
-            const auto *q_blocks = q_tensor->q16_1_blocks();
-            const auto *k_blocks = k_tensor->q16_1_blocks();
-
+            const auto *q_blocks = q_tensor->as_block_32();
+            const auto *k_blocks = k_tensor->as_block_32();
+            ASSERT_NE(q_blocks, nullptr);
+            ASSERT_NE(k_blocks, nullptr);
             for (size_t b = 0; b < 4; ++b)
             {
                 for (size_t i = 0; i < 32; ++i)
@@ -360,7 +368,8 @@ namespace llaminar2
             ASSERT_TRUE(tensor->copyFrom_fp32_rows_fixed_scale(data.data(), 3, DEFAULT_KV_CACHE_SCALE, HEAD_DIM_64));
 
             // First 3 rows should be quantized (6 blocks of 32)
-            const auto *blocks = tensor->q16_1_blocks();
+            const auto *blocks = tensor->as_block_32();
+            ASSERT_NE(blocks, nullptr);
             EXPECT_NE(blocks[0].d, 0.0f); // First block should have scale set
         }
 
@@ -398,8 +407,10 @@ namespace llaminar2
             ASSERT_TRUE(adaptive_tensor->copyFrom_fp32(data.data()));
 
             // Check scales
-            const auto *fixed_blocks = fixed_tensor->q16_1_blocks();
-            const auto *adaptive_blocks = adaptive_tensor->q16_1_blocks();
+            const auto *fixed_blocks = fixed_tensor->as_block_32();
+            const auto *adaptive_blocks = adaptive_tensor->as_block_32();
+            ASSERT_NE(fixed_blocks, nullptr);
+            ASSERT_NE(adaptive_blocks, nullptr);
 
             // Fixed scale: d = 8.0 / 32767 ≈ 0.000244
             float expected_fixed_d = DEFAULT_KV_CACHE_SCALE / 32767.0f;
@@ -503,7 +514,8 @@ namespace llaminar2
             ASSERT_TRUE(tensor->copyFrom_fp32_fixed_scale(zeros.data(), DEFAULT_KV_CACHE_SCALE, HEAD_DIM_64));
 
             // All INT16 values should be 0
-            const auto *blocks = tensor->q16_1_blocks();
+            const auto *blocks = tensor->as_block_32();
+            ASSERT_NE(blocks, nullptr);
             for (int i = 0; i < 32; ++i)
             {
                 EXPECT_EQ(blocks[0].qs[i], 0);

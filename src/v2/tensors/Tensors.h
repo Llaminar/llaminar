@@ -3209,14 +3209,50 @@ namespace llaminar2
         static constexpr int static_type_id() { return TensorTypeId::Q16_1; }
 
         // ===== CRTP Implementation for TypedTensorBase =====
+        // NOTE: These delegate to the deprecated q16_1_blocks() methods.
+        // The TypedTensorBase::typed_data() interface is inherently unsafe for Q16_1Tensor
+        // because it always returns Q16_1Block* regardless of actual block size.
+        // Use as_block_32/64/128() or dispatchQ16Block() for safe access.
+
         /// Called by TypedTensorBase::typed_data() - returns Q16_1Block*
-        const Q16_1Block *data_impl() const { return q16_1_blocks(); }
+        /// @deprecated typed_data() is unsafe for Q16_1Tensor; use as_block_32/64/128()
+        const Q16_1Block *data_impl() const
+        {
+            // Delegate to deprecated accessor (which logs warning in debug builds)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            return q16_1_blocks();
+#pragma GCC diagnostic pop
+        }
         /// Called by TypedTensorBase::mutable_typed_data() - returns mutable Q16_1Block*
-        Q16_1Block *mutable_data_impl() { return mutable_q16_1_blocks(); }
+        /// @deprecated mutable_typed_data() is unsafe for Q16_1Tensor; use mutable_as_block_32/64/128()
+        Q16_1Block *mutable_data_impl()
+        {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            return mutable_q16_1_blocks();
+#pragma GCC diagnostic pop
+        }
 
         /// Convenience alias: blocks() returns typed_data()
-        const Q16_1Block *blocks() const { return typed_data(); }
-        Q16_1Block *mutable_blocks() { return mutable_typed_data(); }
+        /// @deprecated Use as_block_32/64/128() or dispatchQ16Block() for safe access
+        [[deprecated("Use as_block_32/64/128() or dispatchQ16Block() for safe block access")]]
+        const Q16_1Block *blocks() const
+        {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            return typed_data();
+#pragma GCC diagnostic pop
+        }
+        /// @deprecated Use mutable_as_block_32/64/128() for safe access
+        [[deprecated("Use mutable_as_block_32/64/128() for safe block access")]]
+        Q16_1Block *mutable_blocks()
+        {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            return mutable_typed_data();
+#pragma GCC diagnostic pop
+        }
 
         /// Construct from existing raw Q16_1 block data
         Q16_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -3333,25 +3369,158 @@ namespace llaminar2
         /// Get the block size enum value
         Q16BlockSize q16_block_size() const { return block_size_; }
 
-        // ===== Q16_1-Specific Native Accessors =====
+        // =================================================================
+        // Safe Block Accessors (Phase 2 API)
+        // Return nullptr if block size doesn't match - use for safe runtime dispatch
+        // =================================================================
 
+        /// Get Q16_1Block* if this tensor uses BLOCK_32, else nullptr
+        const Q16_1Block *as_block_32() const
+        {
+            if (block_size_ != Q16BlockSize::BLOCK_32)
+                return nullptr;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            return reinterpret_cast<const Q16_1Block *>(data_ptr);
+        }
+        Q16_1Block *mutable_as_block_32()
+        {
+            if (block_size_ != Q16BlockSize::BLOCK_32)
+                return nullptr;
+            clear_dequant_cache_and_parent();
+            uint8_t *data_ptr = is_view_
+                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
+                                    : raw_data_.data();
+            return reinterpret_cast<Q16_1Block *>(data_ptr);
+        }
+
+        /// Get Q16_1Block_64* if this tensor uses BLOCK_64, else nullptr
+        const Q16_1Block_64 *as_block_64() const
+        {
+            if (block_size_ != Q16BlockSize::BLOCK_64)
+                return nullptr;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            return reinterpret_cast<const Q16_1Block_64 *>(data_ptr);
+        }
+        Q16_1Block_64 *mutable_as_block_64()
+        {
+            if (block_size_ != Q16BlockSize::BLOCK_64)
+                return nullptr;
+            clear_dequant_cache_and_parent();
+            uint8_t *data_ptr = is_view_
+                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
+                                    : raw_data_.data();
+            return reinterpret_cast<Q16_1Block_64 *>(data_ptr);
+        }
+
+        /// Get Q16_1Block_128* if this tensor uses BLOCK_128, else nullptr
+        const Q16_1Block_128 *as_block_128() const
+        {
+            if (block_size_ != Q16BlockSize::BLOCK_128)
+                return nullptr;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            return reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
+        }
+        Q16_1Block_128 *mutable_as_block_128()
+        {
+            if (block_size_ != Q16BlockSize::BLOCK_128)
+                return nullptr;
+            clear_dequant_cache_and_parent();
+            uint8_t *data_ptr = is_view_
+                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
+                                    : raw_data_.data();
+            return reinterpret_cast<Q16_1Block_128 *>(data_ptr);
+        }
+
+        // =================================================================
+        // Generic Element Access (slower but always safe)
+        // =================================================================
+
+        /// Get dequantized element at (row, col) - handles any block size
+        float dequant_element(size_t row, size_t col) const
+        {
+            const size_t block_elems = q16_block_size_elements(block_size_);
+            const size_t block_bytes = q16_block_size_bytes(block_size_);
+            const size_t bpr = blocks_per_row();
+
+            const size_t b = col / block_elems;
+            const size_t i = col % block_elems;
+            const size_t block_idx = row * bpr + b;
+
+            const uint8_t *base_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const uint8_t *block_ptr = base_ptr + block_idx * block_bytes;
+            float d;
+            std::memcpy(&d, block_ptr, sizeof(float)); // Scale at offset 0
+            const int16_t *qs = reinterpret_cast<const int16_t *>(block_ptr + sizeof(float) + sizeof(int32_t));
+
+            return d * static_cast<float>(qs[i]);
+        }
+
+        /// Get quantized int16 element at (row, col)
+        int16_t quantized_element(size_t row, size_t col) const
+        {
+            const size_t block_elems = q16_block_size_elements(block_size_);
+            const size_t block_bytes = q16_block_size_bytes(block_size_);
+            const size_t bpr = blocks_per_row();
+
+            const size_t b = col / block_elems;
+            const size_t i = col % block_elems;
+            const size_t block_idx = row * bpr + b;
+
+            const uint8_t *base_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const uint8_t *block_ptr = base_ptr + block_idx * block_bytes;
+            const int16_t *qs = reinterpret_cast<const int16_t *>(block_ptr + sizeof(float) + sizeof(int32_t));
+
+            return qs[i];
+        }
+
+        /// Get block scale at (row, block_in_row)
+        float block_scale(size_t row, size_t block_in_row) const
+        {
+            const size_t block_bytes = q16_block_size_bytes(block_size_);
+            const size_t bpr = blocks_per_row();
+            const size_t block_idx = row * bpr + block_in_row;
+
+            const uint8_t *base_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const uint8_t *block_ptr = base_ptr + block_idx * block_bytes;
+            float d;
+            std::memcpy(&d, block_ptr, sizeof(float));
+            return d;
+        }
+
+        // ===== Q16_1-Specific Native Accessors (Legacy - use safe accessors above) =====
+        // WARNING: These methods assume BLOCK_32 and return Q16_1Block* unconditionally.
+        // For tensors with BLOCK_64 or BLOCK_128, using these methods leads to memory
+        // corruption. Use as_block_32/64/128() or dispatchQ16Block() instead.
+
+        /// @deprecated Use as_block_32() or dispatchQ16Block() for safe access
+        [[deprecated("Use as_block_32/64/128() or dispatchQ16Block() for safe block access")]]
         const Q16_1Block *q16_1_blocks() const
         {
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            if (block_size_ != Q16BlockSize::BLOCK_32)
+            {
+                LOG_ERROR("[Q16_1Tensor] q16_1_blocks() called on tensor with block_size="
+                          << static_cast<int>(block_size_) << " (expected 32)");
+                LOG_ERROR("[Q16_1Tensor] Use as_block_64() or as_block_128() for this tensor");
+            }
+#endif
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             return reinterpret_cast<const Q16_1Block *>(data_ptr);
         }
 
+        /// @deprecated Use mutable_as_block_32() or dispatchQ16BlockMutable() for safe access
+        [[deprecated("Use mutable_as_block_32/64/128() or dispatchQ16BlockMutable() for safe block access")]]
         Q16_1Block *mutable_q16_1_blocks()
         {
-            dequant_cache_.clear();
-            if (is_view_ && parent_)
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            if (block_size_ != Q16BlockSize::BLOCK_32)
             {
-                auto parent_q16_1 = std::dynamic_pointer_cast<Q16_1Tensor>(parent_);
-                if (parent_q16_1)
-                {
-                    parent_q16_1->clear_dequant_cache();
-                }
+                LOG_ERROR("[Q16_1Tensor] mutable_q16_1_blocks() called on tensor with block_size="
+                          << static_cast<int>(block_size_) << " (expected 32)");
+                LOG_ERROR("[Q16_1Tensor] Use mutable_as_block_64() or mutable_as_block_128() for this tensor");
             }
+#endif
+            clear_dequant_cache_and_parent();
             uint8_t *data_ptr = is_view_
                                     ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
                                     : raw_data_.data();
@@ -3428,6 +3597,20 @@ namespace llaminar2
         /// Block size for Q16_1 quantization (32, 64, 128, or 192 elements per block)
         /// Default is BLOCK_32 for backward compatibility with existing code
         Q16BlockSize block_size_ = Q16BlockSize::BLOCK_32;
+
+        /// Helper to clear dequant cache (and parent's cache if this is a view)
+        void clear_dequant_cache_and_parent()
+        {
+            dequant_cache_.clear();
+            if (is_view_ && parent_)
+            {
+                auto parent_q16_1 = std::dynamic_pointer_cast<Q16_1Tensor>(parent_);
+                if (parent_q16_1)
+                {
+                    parent_q16_1->clear_dequant_cache();
+                }
+            }
+        }
 
     public:
         // Copy from FP32 data (quantizes to Q16_1 blocks)

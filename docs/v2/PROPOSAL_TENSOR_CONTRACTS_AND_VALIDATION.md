@@ -2,8 +2,44 @@
 
 **Author**: David Sanftenberg  
 **Date**: January 2026  
-**Status**: Draft Proposal  
+**Status**: In Progress (Phase 2 Complete)  
 **Related Issues**: HybridQ16 ATTENTION_OUTPUT divergence, RoPE layout bugs, debug code block type mismatch
+
+---
+
+## Implementation Progress
+
+| Phase | Status | Date |
+|-------|--------|------|
+| Phase 1: Unified Tensor Verification | ✅ Complete | 2026-01-01 |
+| Phase 2: Safe Q16 Block Access | ✅ Complete | 2026-01-01 |
+| Phase 3: Tensor Layout Contracts | 🔄 In Progress | 2026-01-01 |
+| Phase 4: Typed Stage Parameters | ⬜ Not Started | - |
+| Phase 5: Documentation & Migration | ⬜ Not Started | - |
+
+### Phase 1 Deliverables
+- ✅ Created `src/v2/tensors/TensorVerification.h` with `VerificationResult`, `VerificationConfig`, `verifyRawBuffer()`, `dumpStageBuffers()`, `VerificationFailure` exception
+- ✅ Added `verifyStageEntry()` and `verifyStageExit()` to `GraphExecutor` with automatic entry/exit validation
+- ✅ Validation auto-enabled in Debug/Integration builds via `LLAMINAR_ASSERTIONS_ACTIVE`
+- ✅ Automatic buffer dumps to `/tmp/llaminar_verification_dump/` on verification failure
+- ✅ 26 unit tests in `tests/v2/unit/utils/Test__TensorVerification.cpp`
+- ✅ Updated `copilot-instructions.md` with verification system documentation
+
+### Phase 2 Deliverables (Complete)
+- ✅ Added safe block accessors to `Q16_1Tensor`: `as_block_32()`, `as_block_64()`, `as_block_128()` (const + mutable)
+- ✅ Added generic element access: `dequant_element(row, col)`, `quantized_element(row, col)`, `block_scale(row, block_in_row)`
+- ✅ Created `src/v2/tensors/Q16BlockDispatch.h` with `dispatchQ16Block()`, `forEachQ16Block()` template helpers
+- ✅ 29 unit tests in `tests/v2/unit/tensors/Test__Q16SafeBlockAccess.cpp` - ALL PASSING
+- ✅ Added `[[deprecated]]` attribute and runtime warnings to `q16_1_blocks()`, `mutable_q16_1_blocks()`, `blocks()`, `mutable_blocks()`, `data_impl()`, `mutable_data_impl()`
+- ✅ Migrated test code using unsafe `q16_1_blocks()` patterns to safe `as_block_*()` accessors
+- ✅ All 212 V2 unit tests pass with zero deprecation warnings
+
+### Phase 3 Deliverables (In Progress)
+- ⬜ Create `src/v2/tensors/TensorLayout.h` with `TensorLayout` enum
+- ⬜ Add `layoutName()` and `layoutsCompatible()` helper functions
+- ⬜ Add virtual `layout()` method to `TensorBase`
+- ⬜ Add layout tracking to key tensor types
+- ⬜ Unit tests in `tests/v2/unit/tensors/Test__TensorLayout.cpp`
 
 ---
 
@@ -671,7 +707,7 @@ struct ResolvedStage {
 
 ## Implementation Plan
 
-### Phase 1: Unified Tensor Verification System (2-3 days)
+### Phase 1: Unified Tensor Verification System (2-3 days) ✅ COMPLETE
 
 #### Code Research Findings
 

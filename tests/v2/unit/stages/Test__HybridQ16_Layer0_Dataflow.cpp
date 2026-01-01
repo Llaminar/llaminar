@@ -355,7 +355,7 @@ namespace
         }
 
         // Get Q16_1 blocks and inspect
-        const Q16_1Block *blocks = q16_residual->q16_1_blocks();
+        const Q16_1Block *blocks = q16_residual->as_block_32();
         ASSERT_NE(blocks, nullptr);
 
         const size_t blocks_per_row = (d_model_ + 31) / 32;

@@ -1614,6 +1614,19 @@ add_v2_test(V2_Unit_UnifiedKVCache
     MPI_PROCS 1
 )
 
+# Test: Q16SafeBlockAccess (Phase 2 - Safe Q16 block accessors and dispatch helpers)
+add_executable(v2_test_q16_safe_block_access unit/tensors/Test__Q16SafeBlockAccess.cpp)
+target_link_libraries(v2_test_q16_safe_block_access 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16SafeBlockAccess 
+    COMMAND $<TARGET_FILE:v2_test_q16_safe_block_access>
+    LABELS "V2;Unit;TensorOperations;Q16_1;Quantization;SafeBlockAccess;Phase2"
+    MPI_PROCS 1
+)
+
 # Test: ShardedKVCache (tensor parallelism support - local KV heads)
 add_executable(v2_test_sharded_kv_cache unit/Test__ShardedKVCache.cpp)
 target_link_libraries(v2_test_sharded_kv_cache 
@@ -2510,6 +2523,17 @@ target_link_libraries(v2_test_tensor_validation llaminar2_core GTest::gtest GTes
 add_v2_test(V2_Unit_TensorValidation
     COMMAND $<TARGET_FILE:v2_test_tensor_validation>
     LABELS "V2;Unit;TensorOperations;Validation;Debug"
+    MPI_PROCS 1
+)
+
+# Test: TensorVerification (unified tensor verification system)
+# Tests VerificationResult, verifyRawBuffer, VerificationFailure, dumpStageBuffers.
+# Part of Tensor Contracts and Validation Framework - Phase 1
+add_executable(v2_test_tensor_verification unit/utils/Test__TensorVerification.cpp)
+target_link_libraries(v2_test_tensor_verification llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TensorVerification
+    COMMAND $<TARGET_FILE:v2_test_tensor_verification>
+    LABELS "V2;Unit;Utils;TensorVerification;Validation;Debug"
     MPI_PROCS 1
 )
 

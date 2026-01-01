@@ -328,31 +328,37 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_SingleSequence)
     int batch_size = 1;
     int max_seq_len = 16;
     int n_kv_heads = 2;
-    int head_dim = 32; // Must be multiple of 32 for Q16_1 blocks
-    int kv_dim = n_kv_heads * head_dim;
+    int head_dim = 64;                  // Use 64 so optimal_q16_block_size returns BLOCK_64
+    int kv_dim = n_kv_heads * head_dim; // 128
 
     UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
-    // Create Q16_1 tensors for 4 tokens
-    auto k = factory.createQ16_1({4, static_cast<size_t>(kv_dim)});
-    auto v = factory.createQ16_1({4, static_cast<size_t>(kv_dim)});
+    // Create Q16_1 tensors for 4 tokens with BLOCK_64 to match cache
+    auto k = factory.createQ16_1({4, static_cast<size_t>(kv_dim)}, Q16BlockSize::BLOCK_64);
+    auto v = factory.createQ16_1({4, static_cast<size_t>(kv_dim)}, Q16BlockSize::BLOCK_64);
 
-    // Initialize Q16_1 blocks with test data
-    size_t blocks_per_row = (kv_dim + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+    // Initialize Q16_1Block_64 blocks with test data
+    const size_t block_elements = 64;
+    size_t blocks_per_row = (kv_dim + block_elements - 1) / block_elements;
+    auto *k_blocks_init = k->mutable_as_block_64();
+    auto *v_blocks_init = v->mutable_as_block_64();
+    ASSERT_NE(k_blocks_init, nullptr);
+    ASSERT_NE(v_blocks_init, nullptr);
+
     for (size_t row = 0; row < 4; ++row)
     {
         for (size_t b = 0; b < blocks_per_row; ++b)
         {
-            auto &k_block = k->mutable_q16_1_blocks()[row * blocks_per_row + b];
-            auto &v_block = v->mutable_q16_1_blocks()[row * blocks_per_row + b];
-            // Q16_1Block has: float d (scale), int32_t sum_qs, int16_t qs[32]
+            auto &k_block = k_blocks_init[row * blocks_per_row + b];
+            auto &v_block = v_blocks_init[row * blocks_per_row + b];
+            // Q16_1Block_64 has: float d (scale), int32_t sum_qs, int16_t qs[64]
             k_block.d = 1.0f;
             v_block.d = 2.0f;
             k_block.sum_qs = 0;
             v_block.sum_qs = 0;
-            for (int i = 0; i < Q16_1Block::BLOCK_SIZE; ++i)
+            for (int i = 0; i < 64; ++i)
             {
                 k_block.qs[i] = static_cast<int16_t>(row * 100 + i);
                 v_block.qs[i] = static_cast<int16_t>(-(row * 100 + i));
@@ -366,15 +372,19 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_SingleSequence)
     // Verify cached data
     auto cached_k = cache.get_k_typed(0);
     ASSERT_NE(cached_k, nullptr);
-    EXPECT_FLOAT_EQ(cached_k->q16_1_blocks()[0].d, 1.0f);
-    EXPECT_EQ(cached_k->q16_1_blocks()[0].qs[0], 0); // Row 0, element 0
-    EXPECT_EQ(cached_k->q16_1_blocks()[0].qs[1], 1); // Row 0, element 1
+    const auto *k_blocks = cached_k->as_block_64();
+    ASSERT_NE(k_blocks, nullptr) << "Cache should use BLOCK_64 for head_dim=64";
+    EXPECT_FLOAT_EQ(k_blocks[0].d, 1.0f);
+    EXPECT_EQ(k_blocks[0].qs[0], 0); // Row 0, element 0
+    EXPECT_EQ(k_blocks[0].qs[1], 1); // Row 0, element 1
 
     auto cached_v = cache.get_v_typed(0);
     ASSERT_NE(cached_v, nullptr);
-    EXPECT_FLOAT_EQ(cached_v->q16_1_blocks()[0].d, 2.0f);
-    EXPECT_EQ(cached_v->q16_1_blocks()[0].qs[0], 0);  // Row 0, element 0
-    EXPECT_EQ(cached_v->q16_1_blocks()[0].qs[1], -1); // Row 0, element 1
+    const auto *v_blocks = cached_v->as_block_64();
+    ASSERT_NE(v_blocks, nullptr) << "Cache should use BLOCK_64 for head_dim=64";
+    EXPECT_FLOAT_EQ(v_blocks[0].d, 2.0f);
+    EXPECT_EQ(v_blocks[0].qs[0], 0);  // Row 0, element 0
+    EXPECT_EQ(v_blocks[0].qs[1], -1); // Row 0, element 1
 }
 
 TEST_F(Test__UnifiedKVCache, AppendQ16_1_MultipleAppends)
@@ -455,28 +465,34 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_Batched)
     int batch_size = 3;
     int max_seq_len = 16;
     int n_kv_heads = 2;
-    int head_dim = 32;
-    int kv_dim = n_kv_heads * head_dim;
+    int head_dim = 64;                  // Use 64 so optimal_q16_block_size returns BLOCK_64
+    int kv_dim = n_kv_heads * head_dim; // 128
 
     UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
-    size_t blocks_per_row = (kv_dim + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+    const size_t block_elements = 64;
+    size_t blocks_per_row = (kv_dim + block_elements - 1) / block_elements;
 
     // Append different lengths to different sequences
     for (int seq = 0; seq < batch_size; ++seq)
     {
         int tokens = (seq + 1) * 2; // 2, 4, 6 tokens
-        auto k = factory.createQ16_1({static_cast<size_t>(tokens), static_cast<size_t>(kv_dim)});
-        auto v = factory.createQ16_1({static_cast<size_t>(tokens), static_cast<size_t>(kv_dim)});
+        auto k = factory.createQ16_1({static_cast<size_t>(tokens), static_cast<size_t>(kv_dim)}, Q16BlockSize::BLOCK_64);
+        auto v = factory.createQ16_1({static_cast<size_t>(tokens), static_cast<size_t>(kv_dim)}, Q16BlockSize::BLOCK_64);
+
+        auto *k_blocks = k->mutable_as_block_64();
+        auto *v_blocks = v->mutable_as_block_64();
+        ASSERT_NE(k_blocks, nullptr);
+        ASSERT_NE(v_blocks, nullptr);
 
         for (int row = 0; row < tokens; ++row)
         {
             for (size_t b = 0; b < blocks_per_row; ++b)
             {
-                k->mutable_q16_1_blocks()[row * blocks_per_row + b].d = static_cast<float>(seq + 1);
-                k->mutable_q16_1_blocks()[row * blocks_per_row + b].qs[0] = static_cast<int16_t>(seq * 1000 + row);
-                v->mutable_q16_1_blocks()[row * blocks_per_row + b].d = static_cast<float>(seq + 1);
+                k_blocks[row * blocks_per_row + b].d = static_cast<float>(seq + 1);
+                k_blocks[row * blocks_per_row + b].qs[0] = static_cast<int16_t>(seq * 1000 + row);
+                v_blocks[row * blocks_per_row + b].d = static_cast<float>(seq + 1);
             }
         }
 
@@ -493,14 +509,21 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_Batched)
     auto k1 = cache.get_k_typed(0, 1);
     auto k2 = cache.get_k_typed(0, 2);
 
-    EXPECT_FLOAT_EQ(k0->q16_1_blocks()[0].d, 1.0f);
-    EXPECT_EQ(k0->q16_1_blocks()[0].qs[0], 0);
+    const auto *k0_blocks = k0->as_block_64();
+    const auto *k1_blocks = k1->as_block_64();
+    const auto *k2_blocks = k2->as_block_64();
+    ASSERT_NE(k0_blocks, nullptr);
+    ASSERT_NE(k1_blocks, nullptr);
+    ASSERT_NE(k2_blocks, nullptr);
 
-    EXPECT_FLOAT_EQ(k1->q16_1_blocks()[0].d, 2.0f);
-    EXPECT_EQ(k1->q16_1_blocks()[0].qs[0], 1000);
+    EXPECT_FLOAT_EQ(k0_blocks[0].d, 1.0f);
+    EXPECT_EQ(k0_blocks[0].qs[0], 0);
 
-    EXPECT_FLOAT_EQ(k2->q16_1_blocks()[0].d, 3.0f);
-    EXPECT_EQ(k2->q16_1_blocks()[0].qs[0], 2000);
+    EXPECT_FLOAT_EQ(k1_blocks[0].d, 2.0f);
+    EXPECT_EQ(k1_blocks[0].qs[0], 1000);
+
+    EXPECT_FLOAT_EQ(k2_blocks[0].d, 3.0f);
+    EXPECT_EQ(k2_blocks[0].qs[0], 2000);
 }
 
 TEST_F(Test__UnifiedKVCache, EvictQ16_1)

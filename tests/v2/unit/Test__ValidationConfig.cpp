@@ -20,6 +20,7 @@
 #include "execution/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorValidation.h"
+#include "tensors/TensorVerification.h" // For VerificationFailure exception
 #include <cmath>
 
 namespace llaminar2::test
@@ -332,14 +333,14 @@ namespace llaminar2::test
                       std::make_unique<MockValidationStage>(data.data(), 4, 4),
                       0);
 
-        // Execute - should fail
+        // Execute - should throw VerificationFailure exception (fail-fast behavior)
         GraphExecutorConfig config;
         GraphExecutor executor(config);
         CPUDeviceContext ctx(0);
 
-        bool success = executor.execute(graph, &ctx);
-
-        EXPECT_FALSE(success);
+        EXPECT_THROW({
+            executor.execute(graph, &ctx);
+        }, verification::VerificationFailure);
     }
 
     TEST_F(GraphExecutorValidationTest, NaNOutput_WarnsButPasses_WhenFailDisabled)
@@ -392,14 +393,14 @@ namespace llaminar2::test
                       std::make_unique<MockValidationStage>(data.data(), 4, 4),
                       0);
 
-        // Execute - should fail
+        // Execute - should throw VerificationFailure exception (fail-fast behavior)
         GraphExecutorConfig config;
         GraphExecutor executor(config);
         CPUDeviceContext ctx(0);
 
-        bool success = executor.execute(graph, &ctx);
-
-        EXPECT_FALSE(success);
+        EXPECT_THROW({
+            executor.execute(graph, &ctx);
+        }, verification::VerificationFailure);
     }
 
     TEST_F(GraphExecutorValidationTest, ValidationDisabled_SkipsChecks)

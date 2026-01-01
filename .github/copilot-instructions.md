@@ -842,6 +842,70 @@ LLAMINAR_ASSERT_CAST(q_q16, "Q16_1Tensor", "Q tensor");
 const Q16_1Block* data = q_q16->typed_data();  // Type-safe access
 ```
 
+### Tensor Verification System (TensorVerification.h)
+
+The tensor verification system provides **automatic stage boundary validation** in Debug and Integration builds. It validates inputs BEFORE and outputs AFTER each stage execution, throwing `VerificationFailure` exceptions with full context on failure.
+
+**Automatic Behavior** (Debug/Integration builds):
+- `validate_buffers = true` - Validates stage outputs after execution
+- `validate_inputs = true` - Validates stage inputs before execution  
+- `fail_on_nan = true` - Throws exception immediately on NaN/Inf detection
+- `dump_on_failure = true` - Automatically dumps all stage buffers to disk
+
+**When a VerificationFailure Exception is Thrown**:
+
+The exception includes full context and a formatted error message:
+```
+╔══════════════════════════════════════════════════════════════════╗
+║               TENSOR VERIFICATION FAILED                          ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Layer:  3
+║ Stage:  FusedAttentionWoStage
+║ Phase:  EXIT
+║ Tensor: attention_output
+║ Reason: Contains 5 NaN values in first 8 rows
+║
+║ Dump:   /tmp/llaminar_verification_dump/20260101_143022_456_layer3_FusedAttentionWoStage_EXIT
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+**Finding and Analyzing Buffer Dumps**:
+
+When verification fails, buffers are dumped to `/tmp/llaminar_verification_dump/<timestamp>_layer<N>_<stage>_<phase>/`:
+
+```bash
+# List recent verification dumps
+ls -lt /tmp/llaminar_verification_dump/ | head
+
+# Examine dump contents
+cd /tmp/llaminar_verification_dump/20260101_143022_456_layer3_FusedAttentionWoStage_EXIT/
+cat manifest.json          # Lists all dumped tensors with shapes/types
+cat input_Q_metadata.txt   # Metadata for specific tensor
+xxd input_Q.bin | head     # Raw binary data
+
+# Analyze in Python
+python3 -c "
+import numpy as np
+data = np.fromfile('output_attention_output.bin', dtype=np.float32)
+print(f'Shape hint from manifest, check manifest.json')
+print(f'NaN count: {np.isnan(data).sum()}')
+print(f'Inf count: {np.isinf(data).sum()}')
+print(f'Min/Max: {data[~np.isnan(data)].min():.6f} / {data[~np.isnan(data)].max():.6f}')
+"
+```
+
+**Dump Directory Contents**:
+- `manifest.json` - JSON with all tensors, shapes, types, and verification results
+- `input_<name>.bin` - Raw binary data for each input tensor
+- `input_<name>_metadata.txt` - Shape, dtype, and element count
+- `output_<name>.bin` - Raw binary data for each output tensor
+- `output_<name>_metadata.txt` - Shape, dtype, and element count
+
+**Key Files**:
+- `src/v2/tensors/TensorVerification.h` - Verification system implementation
+- `src/v2/execution/GraphExecutor.cpp` - Integration with `verifyStageEntry()`/`verifyStageExit()`
+- `src/v2/utils/DebugEnv.h` - `ValidationConfig` struct with environment variable parsing
+
 ### Logging Standards
 
 ```cpp
@@ -889,8 +953,10 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing in benchmark mode | Disabled |
 | `LLAMINAR_EXECUTOR_PROFILING` | Enable per-stage profiling in GraphExecutor | Disabled |
 | `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
+| `LLAMINAR_VALIDATE_INPUTS` | Enable input validation before stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |
 | `LLAMINAR_FAIL_ON_NAN` | Fail on NaN/Inf during validation | Auto-ON in Debug/Integration |
+| `LLAMINAR_DUMP_ON_FAILURE` | Dump stage buffers to disk when verification fails | Enabled |
 | `LLAMINAR_STAGE_DUMP` | Dump per-stage tensor outputs | Disabled |
 | `LLAMINAR_DETERMINISTIC` | Force deterministic execution | Disabled |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk | Disabled |
