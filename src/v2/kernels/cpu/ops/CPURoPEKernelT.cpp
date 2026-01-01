@@ -789,6 +789,81 @@ namespace llaminar2
         return true;
     }
 
+    // --- Q8_1 apply_q8_1_to_q16_fixed_scale() (HybridQ16 mode with FIXED scale) ---
+    // All output blocks have d = kv_cache_scale / 32767 for integer attention
+    bool CPURoPEKernelT<ActivationPrecision::Q8_1>::apply_q8_1_to_q16_fixed_scale(
+        TensorBase *Q_in,
+        TensorBase *K_in,
+        TensorBase *Q_out,
+        TensorBase *K_out,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)mpi_ctx;
+        (void)device_idx;
+
+        // Validate Q inputs
+        if (!Q_in || Q_in->native_type() != TensorType::Q8_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_fixed_scale: Q_in must be Q8_1Tensor");
+            return false;
+        }
+        if (!Q_out || Q_out->native_type() != TensorType::Q16_1)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_fixed_scale: Q_out must be Q16_1Tensor");
+            return false;
+        }
+
+        auto *q_in_q8 = dynamic_cast<Q8_1Tensor *>(Q_in);
+        auto *q_out_q16 = dynamic_cast<Q16_1Tensor *>(Q_out);
+
+        const Q8_1Block *k_in_blocks = nullptr;
+        void *k_out_ptr = nullptr;
+
+        if (K_in && K_out)
+        {
+            if (K_in->native_type() != TensorType::Q8_1)
+            {
+                LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_fixed_scale: K_in must be Q8_1Tensor");
+                return false;
+            }
+            if (K_out->native_type() != TensorType::Q16_1)
+            {
+                LOG_ERROR("CPURoPEKernelT<Q8_1>::apply_q8_1_to_q16_fixed_scale: K_out must be Q16_1Tensor");
+                return false;
+            }
+            auto *k_in_q8 = dynamic_cast<Q8_1Tensor *>(K_in);
+            auto *k_out_q16 = dynamic_cast<Q16_1Tensor *>(K_out);
+            k_in_blocks = k_in_q8->typed_data();
+            k_out_ptr = k_out_q16->mutable_typed_data();
+        }
+
+        // Call the fixed-scale dispatch primitive
+        primitives::apply_rope_q8_1_to_q16_fixed_scale_dispatch(
+            q_in_q8->typed_data(),
+            k_in_blocks,
+            q_out_q16->mutable_typed_data(),
+            k_out_ptr,
+            block_size,
+            position_ids,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rope_theta,
+            kv_cache_scale);
+
+        return true;
+    }
+
     // ============================================================================
     // Q16_1 Specialization Implementation (High-Precision Integer)
     // ============================================================================

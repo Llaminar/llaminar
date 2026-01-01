@@ -7,6 +7,7 @@
  */
 
 #include "WoProjection.h"
+#include "kernels/cpu/gemm_v4/QuantisedGemmJit_M1.h" // For QuantisedPackedWeights
 #include "utils/Logger.h"
 
 #include <algorithm>
@@ -14,6 +15,10 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
 
 namespace llaminar2::kernels::q16_1::microkernels
 {
@@ -509,6 +514,271 @@ namespace llaminar2::kernels::q16_1::microkernels
     }
 
     // ============================================================================
+    // INT16 VNNI Wo Projection Implementation
+    // ============================================================================
+    //
+    // Uses existing QuantisedPackedWeights (INT8) but performs INT16×INT16 compute.
+    // The INT8 weights are sign-extended to INT16 at load time.
+    //
+    // Memory layout of QuantisedPackedWeights:
+    //   packed_data: [K/4][N][4] INT8 (groups of 4 for VPDPBUSD)
+    //   scales: [K/32][N] float
+    //   compensation: [K/32][N] int32
+    //
+    // For VPDPWSSD, we load INT8 and sign-extend to INT16.
+    // ============================================================================
+
+    int32_t wo_gemv_row_vnni_int16(
+        const int16_t *context_int16,
+        const QuantisedPackedWeights *Wo_packed,
+        int row,
+        int input_dim)
+    {
+        const int N = Wo_packed->N;
+        const int K = Wo_packed->K;
+        const int K_padded = ((K + 31) / 32) * 32;
+
+        // Packed layout: [K/4][N][4], but actually [N/64][K][64] after reorganization
+        // Let's navigate the actual layout
+        int n_blk = row / 64;
+        int n_rem = row % 64;
+
+        int32_t acc = 0;
+
+#ifdef __AVX512F__
+        // AVX-512 path using VPDPWSSD
+        __m512i acc_vec = _mm512_setzero_si512();
+
+        // Process 32 elements at a time (one ZMM of INT16)
+        int k = 0;
+        for (; k + 31 < input_dim; k += 32)
+        {
+            // Load 32 INT16 context values
+            __m512i ctx = _mm512_loadu_si512(context_int16 + k);
+
+            // Load 32 INT8 weight values and sign-extend to INT16
+            // Packed layout: base + n_blk * (K * 64) + k * 64 + n_rem * ???
+            // Actually the layout is [N/64][K/4][64][4]
+            // For row 'row' and k-position 'k':
+            //   offset = n_blk * (K_padded * 64) + (k/4) * (64 * 4) + n_rem * 4 + (k%4)
+            // But we need 32 consecutive k values, so we load 8 groups of 4
+
+            // Simpler approach: use scalar loads for reference, optimize later
+            alignas(64) int16_t wo_int16[32];
+            for (int i = 0; i < 32; ++i)
+            {
+                int ki = k + i;
+                size_t offset = (size_t)n_blk * (K_padded * 64) + (ki / 4) * (64 * 4) + n_rem * 4 + (ki % 4);
+                wo_int16[i] = static_cast<int16_t>(Wo_packed->packed_data[offset]);
+            }
+
+            __m512i wo = _mm512_load_si512(wo_int16);
+
+            // VPDPWSSD: acc += ctx[2i]*wo[2i] + ctx[2i+1]*wo[2i+1] for each dword
+            acc_vec = _mm512_dpwssd_epi32(acc_vec, ctx, wo);
+        }
+
+        // Horizontal sum of acc_vec (16 INT32 lanes)
+        // Reduce to 256-bit
+        __m256i acc_256 = _mm256_add_epi32(
+            _mm512_extracti32x8_epi32(acc_vec, 0),
+            _mm512_extracti32x8_epi32(acc_vec, 1));
+        // Reduce to 128-bit
+        __m128i acc_128 = _mm_add_epi32(
+            _mm256_extracti128_si256(acc_256, 0),
+            _mm256_extracti128_si256(acc_256, 1));
+        // Reduce to scalar
+        acc_128 = _mm_add_epi32(acc_128, _mm_shuffle_epi32(acc_128, 0x4E)); // 01 00 11 10
+        acc_128 = _mm_add_epi32(acc_128, _mm_shuffle_epi32(acc_128, 0xB1)); // 10 11 00 01
+        acc = _mm_cvtsi128_si32(acc_128);
+
+        // Process remaining elements (tail)
+        for (; k < input_dim; ++k)
+        {
+            size_t offset = (size_t)n_blk * (K_padded * 64) + (k / 4) * (64 * 4) + n_rem * 4 + (k % 4);
+            int16_t wo_val = static_cast<int16_t>(Wo_packed->packed_data[offset]);
+            acc += static_cast<int32_t>(context_int16[k]) * static_cast<int32_t>(wo_val);
+        }
+#else
+        // Scalar fallback
+        for (int k = 0; k < input_dim; ++k)
+        {
+            size_t offset = (size_t)n_blk * (K_padded * 64) + (k / 4) * (64 * 4) + n_rem * 4 + (k % 4);
+            int16_t wo_val = static_cast<int16_t>(Wo_packed->packed_data[offset]);
+            acc += static_cast<int32_t>(context_int16[k]) * static_cast<int32_t>(wo_val);
+        }
+#endif
+
+        return acc;
+    }
+
+    void wo_projection_vnni_int16(
+        const int32_t *context_int32,
+        float context_scale,
+        const QuantisedPackedWeights *Wo_packed,
+        void *output,
+        int d_model,
+        int input_dim,
+        Q16BlockSize block_size,
+        float *wo_output_fp32)
+    {
+        if (!Wo_packed || !context_int32 || !output)
+        {
+            LOG_ERROR("wo_projection_vnni_int16: null pointer");
+            return;
+        }
+
+        if (d_model != Wo_packed->N || input_dim > Wo_packed->K)
+        {
+            LOG_ERROR("wo_projection_vnni_int16: dimension mismatch. d_model=" << d_model
+                                                                               << " Wo_packed->N=" << Wo_packed->N
+                                                                               << " input_dim=" << input_dim << " Wo_packed->K=" << Wo_packed->K);
+            return;
+        }
+
+        const int K_blocks = (input_dim + 31) / 32;
+        const int bs = static_cast<int>(block_size);
+        const int blocks_per_output = (d_model + bs - 1) / bs;
+
+        LOG_DEBUG("wo_projection_vnni_int16: d_model=" << d_model << " input_dim=" << input_dim
+                                                       << " K_blocks=" << K_blocks << " context_scale=" << context_scale);
+
+        // Step 1: Normalize INT32 context to INT16 range
+        std::vector<int16_t> context_int16(input_dim);
+        float ctx_norm_scale;
+        q16_context_normalize_to_int16(context_int32, context_int16.data(), ctx_norm_scale, input_dim);
+
+        // Step 2: Compute projection for each output dimension
+        std::vector<int32_t> accumulators(d_model);
+        std::vector<float> wo_scales(d_model, 0.0f);
+
+        // Compute combined scale per output row
+        // Each output row uses scales from K_blocks input blocks
+        // For simplicity, we'll compute a single combined scale per row
+        for (int d = 0; d < d_model; ++d)
+        {
+            // Average the Wo scales for this row
+            float scale_sum = 0.0f;
+            int n_blk = d / 64;
+            int n_rem = d % 64;
+            for (int kb = 0; kb < K_blocks; ++kb)
+            {
+                // scales layout: [K/32][N_padded]
+                int N_padded = ((Wo_packed->N + 63) / 64) * 64;
+                size_t scale_idx = kb * N_padded + d;
+                if (scale_idx < Wo_packed->scales.size())
+                {
+                    scale_sum += Wo_packed->scales[scale_idx];
+                }
+            }
+            wo_scales[d] = (K_blocks > 0) ? (scale_sum / K_blocks) : 1.0f;
+        }
+
+#pragma omp parallel for schedule(static)
+        for (int d = 0; d < d_model; ++d)
+        {
+            accumulators[d] = wo_gemv_row_vnni_int16(context_int16.data(), Wo_packed, d, input_dim);
+        }
+
+        // Step 3: Apply scales and optionally snapshot to FP32
+        // Combined scale: ctx_norm_scale * context_scale * wo_scale
+        // - ctx_norm_scale: from INT32→INT16 normalization
+        // - context_scale: from attention softmax (passed in)
+        // - wo_scale: per-row Wo weight scale
+        if (wo_output_fp32)
+        {
+            for (int d = 0; d < d_model; ++d)
+            {
+                float combined_scale = ctx_norm_scale * context_scale * wo_scales[d];
+                wo_output_fp32[d] = static_cast<float>(accumulators[d]) * combined_scale;
+            }
+        }
+
+        // Step 4: Quantize to Q16_1 output
+        // The input_scale for quantization is the combined scale
+        float combined_scale = ctx_norm_scale * context_scale;
+        // We need to incorporate wo_scales into the quantization
+        // For simplicity, compute average wo_scale
+        float avg_wo_scale = 0.0f;
+        for (int d = 0; d < d_model; ++d)
+        {
+            avg_wo_scale += wo_scales[d];
+        }
+        avg_wo_scale /= d_model;
+        float quant_scale = combined_scale * avg_wo_scale;
+
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32:
+            q16_quantize_to_q16_1<Q16_1Block>(
+                accumulators.data(),
+                reinterpret_cast<Q16_1Block *>(output),
+                d_model, quant_scale, blocks_per_output);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            q16_quantize_to_q16_1<Q16_1Block_64>(
+                accumulators.data(),
+                reinterpret_cast<Q16_1Block_64 *>(output),
+                d_model, quant_scale, blocks_per_output);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            q16_quantize_to_q16_1<Q16_1Block_128>(
+                accumulators.data(),
+                reinterpret_cast<Q16_1Block_128 *>(output),
+                d_model, quant_scale, blocks_per_output);
+            break;
+        default:
+            LOG_ERROR("wo_projection_vnni_int16: unsupported block size");
+            break;
+        }
+
+        LOG_DEBUG("wo_projection_vnni_int16: complete, quant_scale=" << quant_scale);
+    }
+
+    void wo_projection_vnni_int16_batched(
+        const int32_t *context_int32,
+        const float *context_scales,
+        const QuantisedPackedWeights *Wo_packed,
+        void *output,
+        int batch_size,
+        int d_model,
+        int input_dim,
+        int context_stride,
+        int output_stride,
+        Q16BlockSize block_size,
+        float *wo_output_fp32)
+    {
+        // Process each batch element
+        for (int b = 0; b < batch_size; ++b)
+        {
+            const int32_t *ctx = context_int32 + b * context_stride;
+            float ctx_scale = context_scales ? context_scales[b] : 1.0f;
+
+            // Output pointer depends on block size
+            void *out;
+            switch (block_size)
+            {
+            case Q16BlockSize::BLOCK_32:
+                out = reinterpret_cast<Q16_1Block *>(output) + b * output_stride;
+                break;
+            case Q16BlockSize::BLOCK_64:
+                out = reinterpret_cast<Q16_1Block_64 *>(output) + b * output_stride;
+                break;
+            case Q16BlockSize::BLOCK_128:
+                out = reinterpret_cast<Q16_1Block_128 *>(output) + b * output_stride;
+                break;
+            default:
+                LOG_ERROR("wo_projection_vnni_int16_batched: unsupported block size");
+                return;
+            }
+
+            float *fp32_out = wo_output_fp32 ? (wo_output_fp32 + b * d_model) : nullptr;
+
+            wo_projection_vnni_int16(ctx, ctx_scale, Wo_packed, out, d_model, input_dim, block_size, fp32_out);
+        }
+    }
+
+    // ============================================================================
     // Explicit Template Instantiations
     // ============================================================================
 
@@ -522,6 +792,8 @@ namespace llaminar2::kernels::q16_1::microkernels
     template void q16_wo_row_gemv_tiled<Q16_1Block_128>(
         const int16_t *, const Q16_1Block_128 *, int32_t &, int, int, int);
 
+    template void q16_quantize_to_q16_1<Q16_1Block>(
+        const int32_t *, Q16_1Block *, int, float, int);
     template void q16_quantize_to_q16_1<Q16_1Block_64>(
         const int32_t *, Q16_1Block_64 *, int, float, int);
     template void q16_quantize_to_q16_1<Q16_1Block_128>(

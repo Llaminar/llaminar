@@ -7,11 +7,35 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/BlockStructures.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 
 namespace llaminar2
 {
+    // Helper to convert FP16 scale to FP32 for debug logging
+    static inline float debug_fp16_to_fp32(uint16_t h)
+    {
+        uint32_t sign = (h >> 15) & 0x1;
+        uint32_t exp = (h >> 10) & 0x1F;
+        uint32_t mant = h & 0x3FF;
+        if (exp == 0)
+        {
+            if (mant == 0)
+                return sign ? -0.0f : 0.0f;
+            // Denormal
+            float f = mant / 1024.0f;
+            f *= (1.0f / 16384.0f); // 2^-14
+            return sign ? -f : f;
+        }
+        if (exp == 31)
+        {
+            return mant ? NAN : (sign ? -INFINITY : INFINITY);
+        }
+        float f = 1.0f + mant / 1024.0f;
+        f *= std::pow(2.0f, static_cast<float>(exp) - 15);
+        return sign ? -f : f;
+    }
 
     // =============================================================================
     // RoPEStage Implementation (Type-Safe via KernelFactory)
@@ -95,23 +119,56 @@ namespace llaminar2
                 params_.device_idx);
         }
 
-        // HybridQ16 mode: use apply_q8_1_to_q16_1() for Q8_1 → Q16_1 with higher precision
+        // HybridQ16 mode: use apply_q8_1_to_q16_fixed_scale() for Q8_1 → Q16_1 with fixed scale
+        // This ensures Q and K have the same scale as V (kv_cache_scale / 32767), enabling integer attention
         if (hybrid_q16_mode)
         {
-            LOG_DEBUG("[RoPEStage] Using HybridQ16 mode: Q8_1 → Q16_1");
-            return kernel->apply_q8_1_to_q16_1(
+            // Use optimal block size matching the attention kernel (1 block per head for head_dim=64/128)
+            const Q16BlockSize block_size = optimal_q16_block_size(params_.head_dim);
+            LOG_DEBUG("[RoPEStage] Using HybridQ16 mode: Q8_1 → Q16_1 with fixed scale "
+                      << params_.kv_cache_scale
+                      << ", block_size=" << static_cast<int>(block_size));
+
+            // Debug: check INPUT Q8_1 data
+            auto *q8_in = dynamic_cast<Q8_1Tensor *>(params_.Q);
+            if (q8_in && q8_in->typed_data())
+            {
+                const auto &blk0 = q8_in->typed_data()[0];
+                LOG_DEBUG("[RoPEStage] Q8_1 INPUT blk0.d=" << debug_fp16_to_fp32(blk0.d)
+                                                           << " qs[0]=" << static_cast<int>(blk0.qs[0])
+                                                           << " qs[1]=" << static_cast<int>(blk0.qs[1]));
+            }
+
+            bool success = kernel->apply_q8_1_to_q16_fixed_scale(
                 params_.Q,
                 params_.K,
                 params_.Q_out,
                 params_.K_out,
+                block_size, // Match attention kernel's block size for head_dim
                 position_ids.data(),
                 seq_len,
                 params_.n_heads,
                 n_kv_heads,
                 params_.head_dim,
                 params_.theta_base,
+                params_.kv_cache_scale, // Fixed scale for integer attention
                 params_.mpi_ctx,
                 params_.device_idx);
+
+            // Debug: verify RoPE Q16_1 output
+            if (success)
+            {
+                auto *q16_out = dynamic_cast<Q16_1Tensor *>(params_.Q_out);
+                if (q16_out && q16_out->typed_data())
+                {
+                    const auto &blk0 = q16_out->typed_data()[0];
+                    LOG_DEBUG("[RoPEStage] HybridQ16 Q_out[0].d=" << blk0.d
+                                                                  << " qs[0]=" << blk0.qs[0]
+                                                                  << " Q_out ptr=" << static_cast<const void *>(params_.Q_out)
+                                                                  << " typed_data ptr=" << static_cast<const void *>(q16_out->typed_data()));
+                }
+            }
+            return success;
         }
 
         // Standard path: Apply RoPE via kernel's apply_tensor method (in-place)

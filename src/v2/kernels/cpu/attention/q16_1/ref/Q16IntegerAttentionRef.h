@@ -59,14 +59,16 @@
 #include <cmath>
 #include "tensors/BlockStructures.h"
 
-// Forward declaration - Wo projection will be added in a later phase
-namespace llaminar2::kernels::q16_1
+// Forward declaration for VNNI packed weights (in gemm_v4 namespace)
+namespace llaminar2::gemm_v4
 {
-    struct QuantisedPackedWeights; // Placeholder for Wo projection weights
+    struct QuantisedPackedWeights;
 }
 
 namespace llaminar2::kernels::q16_1
 {
+    // Import VNNI packed weights type for use in this namespace
+    using llaminar2::gemm_v4::QuantisedPackedWeights;
 
     // ============================================================================
     // Block Size Configuration (use canonical types from BlockStructures.h)
@@ -127,6 +129,9 @@ namespace llaminar2::kernels::q16_1
         // === Output projection weights ===
         const QuantisedPackedWeights *Wo_packed = nullptr; ///< Packed Wo weights for VPDPWSSD
 
+        // === Output buffer (Wo projection output) ===
+        void *output = nullptr; ///< [seq_len_q, d_model] as Q16_1 blocks (Wo projection output)
+
         // === Residual connection ===
         const void *residual_in = nullptr; ///< Input residual [seq_len_q, d_model] as Q16_1
         void *residual_out = nullptr;      ///< Output [seq_len_q, d_model] as Q16_1
@@ -143,10 +148,12 @@ namespace llaminar2::kernels::q16_1
         Q16BlockSize block_size = Q16BlockSize::BLOCK_128; ///< Block size for this model
 
         // === Optional: Snapshot buffers for debugging ===
-        float *snapshot_scores = nullptr;    ///< [seq_len_q, num_heads, kv_len] pre-softmax
-        float *snapshot_weights = nullptr;   ///< [seq_len_q, num_heads, kv_len] post-softmax
-        float *snapshot_context = nullptr;   ///< [seq_len_q, num_heads, head_dim] attention output
-        float *snapshot_projected = nullptr; ///< [seq_len_q, d_model] after Wo projection
+        float *snapshot_scores = nullptr;       ///< [seq_len_q, num_heads, kv_len] pre-softmax
+        float *snapshot_weights = nullptr;      ///< [seq_len_q, num_heads, kv_len] post-softmax
+        float *snapshot_context = nullptr;      ///< [seq_len_q, num_heads, head_dim] attention output
+        float *snapshot_projected = nullptr;    ///< [seq_len_q, d_model] after Wo projection
+        float *snapshot_wo_output = nullptr;    ///< [seq_len_q, d_model] Wo output before residual
+        float *snapshot_residual_out = nullptr; ///< [seq_len_q, d_model] after residual add
 
         // === Helper methods ===
 

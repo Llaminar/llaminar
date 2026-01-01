@@ -41,6 +41,12 @@
 #include <cstdint>
 #include <algorithm>
 
+// Forward declaration for VNNI packed weights
+namespace llaminar2::gemm_v4
+{
+    struct QuantisedPackedWeights;
+} // namespace llaminar2::gemm_v4
+
 namespace llaminar2::kernels::q16_1::microkernels
 {
 
@@ -48,6 +54,9 @@ namespace llaminar2::kernels::q16_1::microkernels
     using llaminar2::Q16_1Block_128;
     using llaminar2::Q16_1Block_64;
     using llaminar2::Q16BlockSize;
+
+    // Import VNNI packed weights type
+    using llaminar2::gemm_v4::QuantisedPackedWeights;
 
     // ============================================================================
     // Wo Projection Cache-Aware Tile Configuration
@@ -373,5 +382,94 @@ namespace llaminar2::kernels::q16_1::microkernels
         int context_stride,
         int output_stride,
         Q16BlockSize block_size);
+
+    // ============================================================================
+    // INT16 VNNI Wo Projection (using QuantisedPackedWeights)
+    // ============================================================================
+    //
+    // These functions use the existing INT8 VNNI-packed Wo weights but perform
+    // INT16×INT16 GEMV using VPDPWSSD. The INT8 weights are sign-extended to
+    // INT16 at load time, avoiding the need for a separate INT16 packing format.
+    //
+    // Flow:
+    //   1. INT32 context → normalize to INT16 range
+    //   2. Load INT8 Wo weights → vpmovsxbw → INT16
+    //   3. INT16 context × INT16 Wo → VPDPWSSD → INT32 accumulator
+    //   4. Apply scales, quantize to Q16_1 output
+    // ============================================================================
+
+    /**
+     * @brief Full Wo projection using VNNI-packed INT8 weights with INT16 compute.
+     *
+     * This is the main entry point for Wo projection in the Q16 integer pipeline.
+     * Uses existing QuantisedPackedWeights infrastructure but performs INT16×INT16
+     * dot products via VPDPWSSD for better precision than INT8×INT8.
+     *
+     * @param context_int32 INT32 context from attention [input_dim]
+     * @param context_scale Scale factor for context (from softmax normalization)
+     * @param Wo_packed VNNI-packed Wo weights from QuantisedGemmKernel
+     * @param output Q16_1 output blocks [d_model / block_size]
+     * @param d_model Output dimension (must equal Wo_packed->N)
+     * @param input_dim Input dimension (must equal Wo_packed->K)
+     * @param block_size Q16 block size for output quantization
+     * @param wo_output_fp32 Optional FP32 buffer for snapshot [d_model], nullptr to skip
+     */
+    void wo_projection_vnni_int16(
+        const int32_t *context_int32,
+        float context_scale,
+        const QuantisedPackedWeights *Wo_packed,
+        void *output,
+        int d_model,
+        int input_dim,
+        Q16BlockSize block_size,
+        float *wo_output_fp32 = nullptr);
+
+    /**
+     * @brief Batched Wo projection for prefill using VNNI INT16 compute.
+     *
+     * Projects multiple query contexts through Wo simultaneously, amortizing
+     * weight loads across the batch.
+     *
+     * @param context_int32 INT32 contexts [batch_size × input_dim]
+     * @param context_scales Per-query scale factors [batch_size]
+     * @param Wo_packed VNNI-packed Wo weights
+     * @param output Q16_1 output [batch_size × d_model / block_size]
+     * @param batch_size Number of queries
+     * @param d_model Output dimension per query
+     * @param input_dim Input dimension per query
+     * @param context_stride Stride between query contexts (in int32_t)
+     * @param output_stride Stride between query outputs (in blocks)
+     * @param block_size Q16 block size for output
+     * @param wo_output_fp32 Optional FP32 buffer [batch_size × d_model], nullptr to skip
+     */
+    void wo_projection_vnni_int16_batched(
+        const int32_t *context_int32,
+        const float *context_scales,
+        const QuantisedPackedWeights *Wo_packed,
+        void *output,
+        int batch_size,
+        int d_model,
+        int input_dim,
+        int context_stride,
+        int output_stride,
+        Q16BlockSize block_size,
+        float *wo_output_fp32 = nullptr);
+
+    /**
+     * @brief Single-row GEMV using VPDPWSSD (internal).
+     *
+     * Computes a single output element: output[row] = context · Wo[row, :]
+     *
+     * @param context_int16 Normalized INT16 context [input_dim]
+     * @param Wo_packed VNNI-packed weights
+     * @param row Output row index (0 to d_model-1)
+     * @param input_dim Reduction dimension
+     * @return INT32 dot product result
+     */
+    int32_t wo_gemv_row_vnni_int16(
+        const int16_t *context_int16,
+        const QuantisedPackedWeights *Wo_packed,
+        int row,
+        int input_dim);
 
 } // namespace llaminar2::kernels::q16_1::microkernels

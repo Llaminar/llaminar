@@ -119,6 +119,7 @@ protected:
                 }
 
                 // Weighted sum of V
+                // Output layout: [seq_len_q, num_heads, head_dim] to match pipeline
                 for (int d = 0; d < head_dim; ++d)
                 {
                     float val = 0.0f;
@@ -127,7 +128,7 @@ protected:
                         float v_val = V[(k_pos * num_kv_heads + kv_h) * head_dim + d];
                         val += scores[k_pos] * v_val;
                     }
-                    output[(h * seq_len_q + q_pos) * head_dim + d] = val;
+                    output[(q_pos * num_heads + h) * head_dim + d] = val;
                 }
             }
         }

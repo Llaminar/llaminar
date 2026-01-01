@@ -535,6 +535,24 @@ namespace llaminar2
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+        // HybridQ16 mode with FIXED scale: Q8_1 → Q16 with kv_cache_scale output
+        // All output blocks have d = kv_cache_scale / 32767, enabling integer attention
+        bool apply_q8_1_to_q16_fixed_scale(
+            TensorBase *Q_in,
+            TensorBase *K_in,
+            TensorBase *Q_out,
+            TensorBase *K_out,
+            Q16BlockSize block_size,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            float kv_cache_scale,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
     };
 
     // =========================================================================

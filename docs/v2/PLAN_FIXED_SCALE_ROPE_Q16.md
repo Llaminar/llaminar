@@ -375,3 +375,660 @@ Pure integer fixed-scale Q16 quantization for RoPE is the cleanest solution to t
 5. Is highly vectorizable with AVX-512 and VNNI
 
 The main risk is potential clipping for outlier activations, but the ±16384 safe range (with kv_cache_scale=8.0) covers values up to ±4.0, which is sufficient for typical transformer activations.
+
+---
+
+# ADDENDUM: KV Cache Layout Refactor for Q16_1
+
+## Problem Statement (2025-01-01)
+
+After implementing fixed-scale RoPE quantization (Phases 1-3 above), the `V2_Integration_HybridQ16Pipeline_vs_FP32` test still fails with **~0.0 cosine similarity** for `ATTENTION_CONTEXT`.
+
+**Root Cause**: Tensor layout mismatch between KV cache and attention kernel.
+
+### Layout Analysis
+
+**UnifiedKVCache** stores K/V in **position-major** layout:
+```
+Storage: [max_seq_len, n_kv_heads * head_dim]  → each row is one position
+
+Memory layout (example: kv_len=4, n_kv_heads=2, head_dim=64):
+Row 0: [head_0_pos_0, head_1_pos_0]  → 2 Q16 blocks
+Row 1: [head_0_pos_1, head_1_pos_1]  → 2 Q16 blocks
+Row 2: [head_0_pos_2, head_1_pos_2]  → 2 Q16 blocks
+Row 3: [head_0_pos_3, head_1_pos_3]  → 2 Q16 blocks
+
+Block indexing: block[p][h] = blocks[p * n_kv_heads + h]
+```
+
+**Q16IntegerAttentionRef** expects **head-major** layout:
+```cpp
+// Line 259 in Q16IntegerAttentionRef.cpp:
+const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
+
+Memory layout expected:
+Block 0-3:   head_0, positions 0-3
+Block 4-7:   head_1, positions 0-3
+
+Block indexing: block[h][p] = blocks[h * kv_len + p]
+```
+
+**Result**: The kernel reads the wrong K/V data, producing garbage attention scores.
+
+### Why Unit Tests Pass But Integration Fails
+
+The unit tests explicitly transpose K/V before passing to the kernel:
+```cpp
+// In Test__Q16IntegerAttentionParity.cpp (line 382):
+// Transpose K/V from [kv_len, num_kv_heads, head_dim] to [num_kv_heads, kv_len, head_dim]
+auto K_transposed = transposeKV(K_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+auto V_transposed = transposeKV(V_fp32, KV_LEN, NUM_KV_HEADS, HEAD_DIM);
+```
+
+The integration test uses the KV cache directly (without transpose), exposing the mismatch.
+
+---
+
+## Solution Options
+
+### Option A: Fix Kernel with Strided Access (Quick Fix)
+
+Modify `Q16IntegerAttentionRef` to use strided indexing:
+```cpp
+// Current (WRONG):
+const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
+K_block_p = K_head[p * blocks_per_row];
+
+// Fixed (correct strided access):
+// Layout: blocks[p * n_kv_heads + kv_h]
+K_block_p = K[(p * num_kv_heads + kv_h) * blocks_per_row];
+```
+
+**Pros**: Quick fix, minimal code changes
+**Cons**: 
+- Non-contiguous access for each head → cache inefficiency
+- ~2× memory bandwidth for n_kv_heads=2
+- Does not scale well for larger n_kv_heads
+
+### Option B: Head-Major KV Cache Layout (Recommended)
+
+Add a **separate head-major KV cache** for Q16_1 mode, optimized for the attention kernel's access pattern.
+
+**New layout**: `[n_kv_heads, max_seq_len, head_dim]` stored as separate per-head tensors.
+
+**Architecture**:
+```cpp
+// New specialized cache for Q16_INTEGER backend
+class HeadMajorKVCache : public IUnifiedKVCache {
+    // Storage: n_kv_heads separate tensors per layer
+    // entries_[layer][kv_head] = { K: [max_seq_len, head_dim], V: [max_seq_len, head_dim] }
+    std::vector<std::vector<HeadMajorKVCacheEntry>> entries_;
+    
+    // Interface: return contiguous K/V for a single head
+    Q16_1Tensor* get_k_head(int layer, int kv_head, int seq_idx = 0);
+    Q16_1Tensor* get_v_head(int layer, int kv_head, int seq_idx = 0);
+};
+```
+
+**Pros**:
+- Optimal memory access pattern (contiguous per-head)
+- Kernel code stays simple (no stride calculations)
+- Memory layout matches compute pattern
+- Better cache locality during attention computation
+
+**Cons**:
+- New class to implement and maintain
+- Need to update FusedAttentionWoStage to use new interface
+- Append operation more complex (multiple per-head appends)
+
+---
+
+## Recommended Approach: Option B (Head-Major Layout) via Layout Mode
+
+For production, head-major layout is the right design:
+1. **Performance**: Contiguous access per head is critical for vectorization
+2. **Simplicity**: Kernel code remains straightforward
+3. **Scalability**: Works well for any n_kv_heads value
+4. **Unified Implementation**: Single `UnifiedKVCache` class with selectable layout mode
+
+---
+
+## Implementation Plan: UnifiedKVCache Layout Mode
+
+**Key Change**: Instead of a separate `HeadMajorKVCache` class, we add a **layout mode** parameter to the existing `UnifiedKVCache` class. This keeps the codebase unified and avoids duplication.
+
+### Phase 6: Add Layout Mode to UnifiedKVCache
+
+**Modified File**: `src/v2/tensors/UnifiedKVCache.h`
+
+```cpp
+/**
+ * @brief KV cache storage layout mode
+ */
+enum class KVCacheLayoutMode {
+    POSITION_MAJOR,  ///< [position, n_kv_heads, head_dim] - cache-friendly for append
+    HEAD_MAJOR       ///< [n_kv_heads, position, head_dim] - attention-friendly for Q16
+};
+
+/**
+ * @brief Unified KV cache with selectable storage layout.
+ *
+ * Layout modes:
+ * - POSITION_MAJOR: [max_seq_len, n_kv_heads * head_dim] - optimal for sequential append
+ * - HEAD_MAJOR: n_kv_heads separate [max_seq_len, head_dim] tensors - optimal for Q16 attention
+ *
+ * The layout mode is selected at construction time based on the attention backend.
+ */
+template <ActivationPrecision Precision>
+class UnifiedKVCacheTensor : public IUnifiedKVCache {
+public:
+    // Constructor with layout mode selection
+    UnifiedKVCacheTensor(
+        const MPIContext& mpi_ctx,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int head_dim, int device_idx,
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR
+    );
+    
+    // Layout query
+    TensorLayout kv_layout() const override;
+    KVCacheLayoutMode layout_mode() const { return layout_mode_; }
+    
+    // ================================================================
+    // Head-specific accessors (HEAD_MAJOR mode)
+    // ================================================================
+    
+    /**
+     * @brief Get K tensor for a specific KV head (HEAD_MAJOR mode only)
+     * @return Tensor view of shape [cached_tokens, head_dim], or nullptr if POSITION_MAJOR
+     */
+    TensorT* get_k_head(int layer, int kv_head, int seq_idx = 0);
+    TensorT* get_v_head(int layer, int kv_head, int seq_idx = 0);
+    
+    /// Stride in bytes between consecutive heads (HEAD_MAJOR mode)
+    size_t head_stride_bytes() const;
+    
+private:
+    KVCacheLayoutMode layout_mode_;
+    
+    // For HEAD_MAJOR: separate per-head tensors
+    struct HeadEntry {
+        std::shared_ptr<TensorT> K;  // [max_seq_len, head_dim]
+        std::shared_ptr<TensorT> V;
+    };
+    std::vector<std::vector<HeadEntry>> head_entries_;  // [layer][kv_head]
+    
+    // For POSITION_MAJOR: existing flat storage (unchanged)
+};
+```
+
+**Key Implementation Details**:
+1. **Constructor**: Check `layout_mode_` and allocate storage accordingly
+   - POSITION_MAJOR: Single flat tensor `[max_seq_len, n_kv_heads * head_dim]` per layer
+   - HEAD_MAJOR: `n_kv_heads` separate tensors `[max_seq_len, head_dim]` per layer
+2. **append_kv**: Dispatch to appropriate append logic based on mode
+3. **get_k_head/get_v_head**: Return per-head tensor (HEAD_MAJOR) or nullptr (POSITION_MAJOR)
+4. **get_k_base/get_v_base**: Return correct view based on layout mode
+
+### Phase 7: Update FusedAttentionWoStage
+
+**File**: `src/v2/execution/compute_stages/stages/FusedAttentionWoStage.cpp`
+
+For Q16_INTEGER backend, check cache layout and use head-specific accessors:
+```cpp
+if (params_.backend == FusedAttentionBackend::Q16_INTEGER)
+{
+    // Check if cache supports head-major layout (no transpose needed)
+    if (params_.kv_cache && 
+        params_.kv_cache->kv_layout() == TensorLayout::KV_HEAD_POS_DIM)
+    {
+        auto* cache = dynamic_cast<UnifiedKVCacheTensor<ActivationPrecision::Q16_1>*>(
+            params_.kv_cache);
+        
+        // Direct access to head-major K/V - no transpose!
+        q16_params.K = cache->get_k_head(layer, 0)->typed_data();
+        q16_params.V = cache->get_v_head(layer, 0)->typed_data();
+        q16_params.kv_head_stride = cache->head_stride_bytes();
+        
+        LOG_DEBUG("[FusedAttentionWoStage] Using head-major KV cache (no transpose)");
+    }
+    else
+    {
+        // Fallback: transpose workaround for position-major cache
+        LOG_WARN("[FusedAttentionWoStage] KV cache is position-major, applying transpose");
+        // ... existing transpose code ...
+    }
+}
+```
+
+### Phase 8: Update Q16IntegerAttentionRef (Optional Simplification)
+
+With head-major layout, the kernel can directly iterate through contiguous head data:
+```cpp
+// Old (wrong with position-major):
+const Q16_1Block_64 *K_head = K + kv_h * kv_len * blocks_per_row;
+
+// New (correct with head-major):
+const Q16_1Block_64 *K_head = K + kv_h * head_stride_blocks;
+// where head_stride_blocks = kv_len * blocks_per_head
+```
+
+### Phase 9: Update GraphOrchestrator
+
+**File**: `src/v2/pipelines/qwen/GraphOrchestrator.cpp`
+
+Select layout mode based on attention backend:
+```cpp
+// Select KV cache layout based on attention backend
+KVCacheLayoutMode kv_layout_mode = 
+    (config_.attention_backend == FusedAttentionBackend::Q16_INTEGER)
+        ? KVCacheLayoutMode::HEAD_MAJOR    // Q16 kernel needs head-major
+        : KVCacheLayoutMode::POSITION_MAJOR;  // Other backends use position-major
+
+kv_cache_ = createUnifiedKVCache(
+    config_.kv_cache_precision,
+    mpi_ctx_, n_layers_, batch_size_, max_seq_len_,
+    n_kv_heads_, head_dim_, device_idx_,
+    kv_layout_mode);  // Pass layout mode
+
+LOG_INFO("[GraphOrchestrator] Created KV cache with layout mode: " 
+         << (kv_layout_mode == KVCacheLayoutMode::HEAD_MAJOR 
+             ? "HEAD_MAJOR" : "POSITION_MAJOR"));
+```
+
+**Benefits of Unified Approach** (vs. separate HeadMajorKVCache class):
+- **Single class to maintain**: No code duplication between cache implementations
+- **Existing tests work**: All `UnifiedKVCache` tests remain valid
+- **Clear intent**: Layout mode is explicit in constructor
+- **Backward compatible**: Default is POSITION_MAJOR (existing behavior)
+- **Flexible**: Can switch modes at runtime based on attention backend
+
+---
+
+## Memory Layout Comparison
+
+### Position-Major (Current UnifiedKVCache)
+
+```
+Logical: K[position][kv_head][element_in_head]
+Memory:  K[p * kv_dim + h * head_dim + e]
+
+For kv_len=4, n_kv_heads=2, head_dim=64, blocks_per_head=1 (Q16_1Block_64):
+Block layout:
+  Block[0]: pos=0, head=0
+  Block[1]: pos=0, head=1  
+  Block[2]: pos=1, head=0
+  Block[3]: pos=1, head=1
+  Block[4]: pos=2, head=0
+  Block[5]: pos=2, head=1
+  Block[6]: pos=3, head=0
+  Block[7]: pos=3, head=1
+
+Accessing head 0 across positions: Block[0], Block[2], Block[4], Block[6]  → STRIDED
+```
+
+### Head-Major (Proposed HeadMajorKVCache)
+
+```
+Logical: K[kv_head][position][element_in_head]
+Memory:  K[h * (kv_len * head_dim) + p * head_dim + e]
+
+For kv_len=4, n_kv_heads=2, head_dim=64:
+Head 0 tensor: [pos_0, pos_1, pos_2, pos_3]  → CONTIGUOUS
+Head 1 tensor: [pos_0, pos_1, pos_2, pos_3]  → CONTIGUOUS
+
+Accessing head 0 across positions: head_0_tensor[0..3]  → CONTIGUOUS
+```
+
+---
+
+## Effort Estimate
+
+| Phase | Effort | Files |
+|-------|--------|-------|
+| Phase 6: HeadMajorKVCache class | 3-4 hours | HeadMajorKVCache.h/.cpp |
+| Phase 7: FusedAttentionWoStage update | 1 hour | FusedAttentionWoStage.cpp |
+| Phase 8: Q16IntegerAttentionRef (optional) | 30 min | Q16IntegerAttentionRef.cpp |
+| Phase 9: GraphOrchestrator update | 30 min | GraphOrchestrator.cpp |
+| Unit tests | 1 hour | Test__HeadMajorKVCache.cpp |
+| Integration test fix | 30 min | Test__HybridQ16Pipeline_vs_FP32.cpp |
+
+**Total: ~7 hours**
+
+---
+
+## Alternative: Quick Fix for Validation
+
+Before implementing the full HeadMajorKVCache, we can validate the approach with a **transpose-on-read** workaround:
+
+**In FusedAttentionWoStage.cpp** (Q16_INTEGER path):
+```cpp
+// Allocate temporary head-major buffers
+std::vector<Q16_1Block_64> K_transposed(kv_len * n_kv_heads);
+std::vector<Q16_1Block_64> V_transposed(kv_len * n_kv_heads);
+
+// Transpose from position-major to head-major
+for (int h = 0; h < n_kv_heads; ++h) {
+    for (int p = 0; p < kv_len; ++p) {
+        // Source: position-major [p][h]
+        // Dest: head-major [h][p]
+        K_transposed[h * kv_len + p] = K_cache[(p * n_kv_heads + h)];
+        V_transposed[h * kv_len + p] = V_cache[(p * n_kv_heads + h)];
+    }
+}
+
+q16_params.K = K_transposed.data();
+q16_params.V = V_transposed.data();
+```
+
+**Pros**: Quick validation, no new classes
+**Cons**: O(kv_len * n_kv_heads) copy per layer per step, not viable for production
+
+This is useful to **confirm the layout is the root cause** before investing in HeadMajorKVCache.
+
+---
+
+## Conclusion
+
+The KV cache layout mismatch is the root cause of the HybridQ16 integration test failure. The recommended solution is:
+
+1. **Short term**: Use transpose-on-read workaround to validate the fix
+2. **Long term**: Implement `HeadMajorKVCache` class for optimal Q16_1 attention performance
+
+This layout refactor complements the fixed-scale RoPE work (Phases 1-5) to complete the HybridQ16 integer attention pipeline.
+
+---
+
+# ADDENDUM 2: Wo Projection and Residual Add Implementation (2025-01-01)
+
+## Problem Statement
+
+Investigation of `V2_Integration_HybridQ16Pipeline_vs_FP32` test failure revealed:
+
+| Stage | HybridQ16 Cosine | Hybrid Cosine | Status |
+|-------|------------------|---------------|--------|
+| `ATTENTION_CONTEXT` | ~0.05 | ~0.90+ | Wrong (Q layout issue) |
+| `ATTENTION_OUTPUT` | **0.000000** | ~0.93+ | **NOT IMPLEMENTED** |
+| `ATTENTION_RESIDUAL` | Variable | ~0.95+ | Depends on above |
+
+**Root Cause**: The `Q16IntegerAttentionRef` kernel has **TODO placeholders** for Steps 4 and 5:
+
+```cpp
+// In Q16IntegerAttentionRef.cpp, lines ~444-460 (decode) and ~780-790 (prefill):
+
+// ================================================================
+// Step 4: Wo projection → Q16_1 output
+// ================================================================
+
+// TODO(v2): Implement Wo projection with VPDPWSSD
+// For now, this is a placeholder
+// The Wo projection should:
+// 1. Take INT32 context [head_dim]
+// 2. Multiply by packed Wo weights
+// 3. Produce Q16_1 output [d_model]
+
+// ================================================================
+// Step 5: Residual add (integer)
+// ================================================================
+
+// TODO(v2): Implement integer residual add
+// Should handle scale alignment between attention output and residual
+```
+
+**Key Discovery**: The `WoProjection.h` microkernel header declares all necessary functions, and `WoProjection.cpp` implements them (802 lines), but they are **never called** from `Q16IntegerAttentionRef.cpp`!
+
+---
+
+## What's Already Implemented (Available Microkernels)
+
+### WoProjection.h/cpp (802 lines) - COMPLETE
+
+| Function | Purpose | Status |
+|----------|---------|--------|
+| `q16_context_normalize_to_int16()` | INT32→INT16 normalization | ✅ Implemented |
+| `q16_wo_row_gemv_tiled<BlockType>()` | Single-row GEMV (tiled) | ✅ Implemented |
+| `q16_wo_projection<BlockType>()` | Full Wo projection (GEMV) | ✅ Implemented |
+| `q16_wo_projection_batched<BlockType>()` | Batched Wo (GEMM for prefill) | ✅ Implemented |
+| `q16_quantize_to_q16_1<BlockType>()` | INT32→Q16_1 output | ✅ Implemented |
+| `wo_projection_vnni_int16()` | VNNI-accelerated Wo | ✅ Implemented |
+| `wo_projection_vnni_int16_batched()` | Batched VNNI Wo | ✅ Implemented |
+| `wo_gemv_row_vnni_int16()` | Single-row VNNI GEMV | ✅ Implemented |
+
+### What's Missing: Wiring in Q16IntegerAttentionRef
+
+The reference kernel computes attention context but **stops before Wo projection**:
+
+1. ❌ Call to `wo_projection_vnni_int16()` after context computation
+2. ❌ Integer residual add (`output_q16 + residual_in → residual_out`)
+3. ❌ Snapshot capture for `wo_output_snapshot` and `residual_out_snapshot`
+
+---
+
+## Implementation Plan: Wire Wo Projection + Residual Add
+
+### Phase 7: Complete Flash Decode Path (seq_len_q=1)
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp`
+
+Replace TODO at ~line 444-460 with:
+
+```cpp
+// ================================================================
+// Step 4: Wo projection → Q16_1 output
+// ================================================================
+
+// After processing all heads, concatenate contexts for Wo projection.
+// Input: per-head INT32 context [num_heads][head_dim]
+// Output: Q16_1 blocks [d_model / block_size]
+
+// Allocate concatenated context buffer (one-time per decode step)
+std::vector<int32_t> concat_context(params.d_model);
+
+// Concatenate all head contexts into d_model vector
+// (This happens outside the head loop - after all heads processed)
+```
+
+Then after the head loop:
+
+```cpp
+// Concatenate head contexts (done inside head loop by writing to concat_context)
+// Each head writes context[head_dim] to concat_context[h * head_dim]
+
+// Call VNNI Wo projection microkernel
+float context_scale = /* computed from PV accumulation */;
+
+microkernels::wo_projection_vnni_int16(
+    concat_context.data(),       // INT32 context [d_model]
+    context_scale,               // Scale factor
+    params.Wo_packed,            // VNNI-packed Wo weights
+    params.output,               // Q16_1 output [d_model / block_size]
+    params.d_model,              // Output dimension
+    params.d_model,              // Input dimension (num_heads * head_dim = d_model)
+    params.block_size,           // Q16 block size
+    params.snapshot_wo_output    // Optional FP32 snapshot buffer
+);
+
+// ================================================================
+// Step 5: Residual add (integer)
+// ================================================================
+
+// Add Wo output to residual_in, write to residual_out
+// All three are Q16_1 format with the same fixed scale (8.0 / 32767)
+
+auto *res_in = reinterpret_cast<const Q16_1Block_64*>(params.residual_in);
+auto *wo_out = reinterpret_cast<const Q16_1Block_64*>(params.output);
+auto *res_out = reinterpret_cast<Q16_1Block_64*>(params.residual_out);
+
+const int blocks_per_output = (params.d_model + 63) / 64;
+for (int b = 0; b < blocks_per_output; ++b) {
+    // Same scale → simple integer add
+    res_out[b].d = res_in[b].d;  // Preserve scale
+    for (int i = 0; i < 64; ++i) {
+        // Saturating add to prevent overflow
+        int32_t sum = static_cast<int32_t>(res_in[b].qs[i]) + 
+                      static_cast<int32_t>(wo_out[b].qs[i]);
+        res_out[b].qs[i] = static_cast<int16_t>(
+            std::clamp(sum, -32768, 32767));
+    }
+}
+
+// Snapshot: residual output
+if (params.snapshot_residual_out) {
+    // Dequantize to FP32 for snapshot
+    for (int b = 0; b < blocks_per_output; ++b) {
+        for (int i = 0; i < 64; ++i) {
+            params.snapshot_residual_out[b * 64 + i] = 
+                res_out[b].qs[i] * res_out[b].d;
+        }
+    }
+}
+```
+
+### Phase 8: Complete FA2 Prefill Path (seq_len_q > 1)
+
+Similar changes needed in `q16_integer_attention_prefill()` at ~line 780-790.
+
+Key differences:
+- Use `wo_projection_vnni_int16_batched()` for batch efficiency
+- Context array is `[batch_size, d_model]`
+- Residual add loops over `batch_size` rows
+
+### Phase 9: Context Accumulation Fix
+
+Currently context is computed **per-head** but Wo expects **concatenated** context.
+Need to:
+1. Allocate `concat_context[d_model]` outside head loop
+2. Inside head loop: write to `concat_context[h * head_dim : (h+1) * head_dim]`
+3. After head loop: call Wo projection on full `concat_context`
+
+### Phase 10: Scale Alignment Verification
+
+The residual add assumes matching scales:
+- **residual_in**: Q16_1 with d = `kv_cache_scale / 32767` (from previous layer)
+- **Wo output**: Q16_1 with d = ??? (from Wo projection)
+
+**Critical Question**: Does `wo_projection_vnni_int16()` output Q16_1 with matching scale?
+
+Need to verify or add parameter for output scale:
+```cpp
+// In wo_projection_vnni_int16():
+// Option 1: Use fixed output scale matching residual
+constexpr float OUTPUT_SCALE = 8.0f / 32767.0f;
+
+// Option 2: Compute data-adaptive scale (may need rescaling in residual add)
+```
+
+---
+
+## Testing Plan
+
+### Unit Test: Wo Projection Wiring
+
+```cpp
+TEST(Test__Q16IntegerAttention, WoProjectionProducesNonZeroOutput) {
+    // Setup: Create Q16 attention params with known inputs
+    // Execute: q16_integer_attention_reference(params)
+    // Assert: params.output is not all zeros
+    // Assert: Wo output has reasonable FP32 magnitude
+}
+```
+
+### Unit Test: Residual Add
+
+```cpp
+TEST(Test__Q16IntegerAttention, ResidualAddCorrectness) {
+    // Setup: Known Wo output Q16_1 + known residual_in Q16_1
+    // Execute: q16_integer_attention_reference(params)
+    // Assert: residual_out[i] ≈ wo_out[i] + res_in[i] (within quantization error)
+}
+```
+
+### Integration Test: Full Pipeline
+
+```cpp
+TEST(Test__HybridQ16Pipeline, AttentionOutputNonZero) {
+    // Run HybridQ16 pipeline prefill
+    // Check ATTENTION_OUTPUT snapshot is NOT all zeros
+    // Check ATTENTION_OUTPUT cosine vs FP32 > 0.9
+}
+```
+
+---
+
+## Estimated Effort
+
+| Phase | Effort | Description |
+|-------|--------|-------------|
+| Phase 7: Flash Decode | 2 hours | Wire Wo + residual add in decode path |
+| Phase 8: FA2 Prefill | 1.5 hours | Wire batched Wo + residual add |
+| Phase 9: Context concat | 30 min | Restructure context accumulation |
+| Phase 10: Scale alignment | 1 hour | Verify/fix scale matching |
+| Unit tests | 1 hour | Wo projection + residual add tests |
+| Integration test fix | 30 min | Update test expectations |
+
+**Total: ~6.5 hours**
+
+---
+
+## Implementation Order (Recommended)
+
+1. **Phase 7 (Decode)**: Wire Wo projection + residual add in decode path
+   - Simplest case (single query)
+   - Validates Wo microkernel integration
+   - Quick feedback loop
+
+2. **Phase 9 (Context concat)**: Fix context accumulation structure
+   - May be needed before Phase 7 can work
+   - Currently context is per-head, need concatenated
+
+3. **Phase 10 (Scale alignment)**: Verify output scales match
+   - Critical for residual add correctness
+   - May expose bugs in Wo projection
+
+4. **Phase 8 (Prefill)**: Wire batched Wo + residual add
+   - After decode works, generalize to batched
+   - Uses same microkernels, different calling convention
+
+5. **Unit tests**: Add targeted tests
+   - Wo output non-zero
+   - Residual add correctness
+   - Scale preservation
+
+6. **Integration test**: Run full pipeline
+   - ATTENTION_OUTPUT should no longer be 0.000000
+   - Cosine vs FP32 should improve dramatically
+
+---
+
+## Key Files to Modify
+
+| File | Changes |
+|------|---------|
+| `Q16IntegerAttentionRef.cpp` | Wire Wo projection + residual add (both paths) |
+| `Q16IntegerAttentionRef.h` | May need helper methods for context concatenation |
+| `Test__Q16IntegerAttentionParity.cpp` | Add Wo output + residual tests |
+| `Test__HybridQ16Pipeline_vs_FP32.cpp` | Update expected behavior |
+
+---
+
+## Success Criteria
+
+After implementation:
+
+1. ✅ `ATTENTION_OUTPUT` cosine > 0.90 (vs current 0.000000)
+2. ✅ `ATTENTION_RESIDUAL` cosine > 0.90
+3. ✅ `FFN_RESIDUAL` cosine improves (currently ~0.5 due to bad attention)
+4. ✅ Integration test `HybridQ16Pipeline_vs_FP32` passes
+5. ✅ Unit tests for Wo projection and residual add pass
+
+---
+
+## Conclusion
+
+The HybridQ16 pipeline failure has **three root causes**:
+
+1. **Q layout mismatch** (FIXED): RoPE now outputs head-major Q, uses `mutable_typed_data()`
+2. **KV cache layout** (Addendum 1): Position-major vs head-major - transpose workaround or HeadMajorKVCache
+3. **Missing Wo + residual** (THIS ADDENDUM): Microkernels exist but aren't called
+
+This addendum provides the plan to complete root cause #3. After this work, the Q16 integer attention kernel will produce actual output (not zeros) and the full HybridQ16 pipeline can be validated.

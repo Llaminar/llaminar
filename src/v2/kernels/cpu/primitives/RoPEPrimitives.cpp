@@ -5275,4 +5275,258 @@ namespace llaminar2::primitives
         }
     }
 
+    // ============================================================================
+    // Fixed-Scale Q8_1 → Q16 RoPE Implementation
+    // ============================================================================
+
+    /**
+     * @brief Per-head Q8_1→Q16 with FIXED output scale (pure integer per-element)
+     *
+     * This implementation uses:
+     * - O(head_dim/32) FP32 ops for per-block scale ratio computation
+     * - Pure int32 arithmetic for all per-element rescaling and rotation
+     *
+     * @see apply_rope_q8_1_to_q16_head_scalar() for the data-adaptive version
+     */
+    template <typename OutBlockType>
+    void apply_rope_q8_1_to_q16_head_fixed_scale(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float kv_cache_scale)
+    {
+        constexpr int Q8_BLOCK_SIZE = 32;
+        constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
+        const int q8_blocks_per_head = head_dim / Q8_BLOCK_SIZE;
+        const int q16_blocks_per_head = head_dim / OUT_BLOCK_SIZE;
+        const int half_dim = head_dim / 2;
+
+        // Fixed output scale (same for ALL blocks)
+        const float d_fixed = kv_cache_scale / 32767.0f;
+        const float inv_d_fixed = 32767.0f / kv_cache_scale;
+
+        // Step 1: Compute per-block scale ratios in Q16 fixed-point
+        // ratio_q16 = d_block / d_fixed * 65536
+        // This is O(blocks_per_head) FP32 ops, NOT per-element
+        std::vector<int32_t> scale_ratios(q8_blocks_per_head);
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const float d_block = fp16_to_fp32_rope(q8_in[b].d);
+            // ratio = d_block / d_fixed = d_block * (32767 / kv_cache_scale)
+            const float ratio = d_block * inv_d_fixed;
+            scale_ratios[b] = static_cast<int32_t>(ratio * 65536.0f + 0.5f);
+        }
+
+        // Step 2: Rescale all Q8 values to fixed scale (pure integer per-element)
+        // scaled[i] = (q8_qs[i] * ratio_q16 + 32768) >> 16
+        std::vector<int16_t> scaled(head_dim);
+        for (int b = 0; b < q8_blocks_per_head; ++b)
+        {
+            const int32_t ratio = scale_ratios[b];
+            for (int i = 0; i < Q8_BLOCK_SIZE; ++i)
+            {
+                const int32_t val = static_cast<int32_t>(q8_in[b].qs[i]); // int8 → int32
+                // Rescale with rounding: val * ratio >> 16
+                int32_t rescaled = (val * ratio + 32768) >> 16;
+                // Clamp to safe int16 range for subsequent multiply (±16383 allows headroom for rotation)
+                rescaled = std::max(-16383, std::min(16383, rescaled));
+                scaled[b * Q8_BLOCK_SIZE + i] = static_cast<int16_t>(rescaled);
+            }
+        }
+
+        // Step 3: Apply RoPE rotation in pure integer (Q15 sin/cos)
+        // x' = (x*cos - y*sin + 16384) >> 15 (round and descale)
+        // y' = (x*sin + y*cos + 16384) >> 15
+        std::vector<int16_t> rotated(head_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            const int32_t x = scaled[i];
+            const int32_t y = scaled[i + half_dim];
+            const int32_t c = cos_q15[i]; // Q15: range [-32767, 32767]
+            const int32_t s = sin_q15[i]; // Q15: range [-32767, 32767]
+
+            // Rotation: products are ~[-536M, 536M], sum is ~[-1B, 1B], fits int32
+            int32_t x_rot = (x * c - y * s + 16384) >> 15;
+            int32_t y_rot = (x * s + y * c + 16384) >> 15;
+
+            // Clamp to safe Q16 range (for VNNI accumulation)
+            rotated[i] = static_cast<int16_t>(std::max(-16383, std::min(16383, x_rot)));
+            rotated[i + half_dim] = static_cast<int16_t>(std::max(-16383, std::min(16383, y_rot)));
+        }
+
+        // Step 4: Pack into Q16 output blocks with FIXED scale
+        for (int b = 0; b < q16_blocks_per_head; ++b)
+        {
+            OutBlockType &out = q16_out[b];
+            out.d = d_fixed; // FIXED scale for ALL blocks
+
+            int32_t sum_qs = 0;
+            for (int i = 0; i < OUT_BLOCK_SIZE; ++i)
+            {
+                out.qs[i] = rotated[b * OUT_BLOCK_SIZE + i];
+                sum_qs += out.qs[i];
+            }
+            out.sum_qs = sum_qs;
+        }
+    }
+
+    // Explicit instantiations for fixed-scale
+    template void apply_rope_q8_1_to_q16_head_fixed_scale<Q16_1Block>(
+        const Q8_1Block *, Q16_1Block *, int, const int16_t *, const int16_t *, float);
+    template void apply_rope_q8_1_to_q16_head_fixed_scale<Q16_1Block_64>(
+        const Q8_1Block *, Q16_1Block_64 *, int, const int16_t *, const int16_t *, float);
+    template void apply_rope_q8_1_to_q16_head_fixed_scale<Q16_1Block_128>(
+        const Q8_1Block *, Q16_1Block_128 *, int, const int16_t *, const int16_t *, float);
+
+    /**
+     * @brief High-level wrapper for fixed-scale Q8_1→Q16 RoPE
+     */
+    template <typename OutBlockType>
+    void apply_rope_q8_1_to_q16_fixed_scale(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        OutBlockType *Q_out,
+        OutBlockType *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale)
+    {
+        constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
+        const int q8_blocks_per_head = head_dim / 32;
+        const int q16_blocks_per_head = head_dim / OUT_BLOCK_SIZE;
+        const int half_dim = head_dim / 2;
+        const int total_heads = n_heads + n_kv_heads;
+
+        // Pre-compute sin/cos tables for all positions
+        // For prefill we may have many positions, for decode typically just 1
+        int max_pos = 0;
+        if (position_ids)
+        {
+            for (int s = 0; s < seq_len; ++s)
+            {
+                max_pos = std::max(max_pos, position_ids[s]);
+            }
+        }
+        else
+        {
+            max_pos = seq_len - 1;
+        }
+        max_pos += 1;
+
+        // Generate sin/cos tables in Q15 format for all needed positions
+        std::vector<std::vector<int16_t>> cos_tables(max_pos);
+        std::vector<std::vector<int16_t>> sin_tables(max_pos);
+
+        for (int pos = 0; pos < max_pos; ++pos)
+        {
+            cos_tables[pos].resize(half_dim);
+            sin_tables[pos].resize(half_dim);
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                const float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * i) / head_dim);
+                const float angle = static_cast<float>(pos) * freq;
+                const float c = std::cos(angle);
+                const float s = std::sin(angle);
+                cos_tables[pos][i] = static_cast<int16_t>(std::round(c * 32767.0f));
+                sin_tables[pos][i] = static_cast<int16_t>(std::round(s * 32767.0f));
+            }
+        }
+
+        // Process all heads in parallel
+        auto do_work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int idx = 0; idx < seq_len * total_heads; ++idx)
+            {
+                const int s = idx / total_heads;
+                const int h = idx % total_heads;
+                const int pos = position_ids ? position_ids[s] : s;
+
+                if (h < n_heads && Q_in && Q_out)
+                {
+                    // Q head - output in head-major layout [heads][seq][dim] for attention kernel
+                    const Q8_1Block *q_in = Q_in + (s * n_heads + h) * q8_blocks_per_head;
+                    OutBlockType *q_out = Q_out + (h * seq_len + s) * q16_blocks_per_head;
+                    apply_rope_q8_1_to_q16_head_fixed_scale<OutBlockType>(
+                        q_in, q_out, head_dim,
+                        cos_tables[pos].data(), sin_tables[pos].data(),
+                        kv_cache_scale);
+                }
+                else if (h >= n_heads && K_in && K_out)
+                {
+                    // K head
+                    const int kv_h = h - n_heads;
+                    const Q8_1Block *k_in = K_in + (s * n_kv_heads + kv_h) * q8_blocks_per_head;
+                    OutBlockType *k_out = K_out + (s * n_kv_heads + kv_h) * q16_blocks_per_head;
+                    apply_rope_q8_1_to_q16_head_fixed_scale<OutBlockType>(
+                        k_in, k_out, head_dim,
+                        cos_tables[pos].data(), sin_tables[pos].data(),
+                        kv_cache_scale);
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
+    }
+
+    // Explicit instantiations
+    template void apply_rope_q8_1_to_q16_fixed_scale<Q16_1Block>(
+        const Q8_1Block *, const Q8_1Block *, Q16_1Block *, Q16_1Block *,
+        const int *, int, int, int, int, float, float);
+    template void apply_rope_q8_1_to_q16_fixed_scale<Q16_1Block_64>(
+        const Q8_1Block *, const Q8_1Block *, Q16_1Block_64 *, Q16_1Block_64 *,
+        const int *, int, int, int, int, float, float);
+    template void apply_rope_q8_1_to_q16_fixed_scale<Q16_1Block_128>(
+        const Q8_1Block *, const Q8_1Block *, Q16_1Block_128 *, Q16_1Block_128 *,
+        const int *, int, int, int, int, float, float);
+
+    /**
+     * @brief Runtime dispatch for fixed-scale Q8_1→Q16 RoPE
+     */
+    void apply_rope_q8_1_to_q16_fixed_scale_dispatch(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        void *Q_out,
+        void *K_out,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale)
+    {
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32:
+            apply_rope_q8_1_to_q16_fixed_scale<Q16_1Block>(
+                Q_in, K_in,
+                static_cast<Q16_1Block *>(Q_out), static_cast<Q16_1Block *>(K_out),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, kv_cache_scale);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            apply_rope_q8_1_to_q16_fixed_scale<Q16_1Block_64>(
+                Q_in, K_in,
+                static_cast<Q16_1Block_64 *>(Q_out), static_cast<Q16_1Block_64 *>(K_out),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, kv_cache_scale);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            apply_rope_q8_1_to_q16_fixed_scale<Q16_1Block_128>(
+                Q_in, K_in,
+                static_cast<Q16_1Block_128 *>(Q_out), static_cast<Q16_1Block_128 *>(K_out),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, kv_cache_scale);
+            break;
+        default:
+            LOG_ERROR("apply_rope_q8_1_to_q16_fixed_scale_dispatch: unsupported block size");
+            break;
+        }
+    }
+
 } // namespace llaminar2::primitives

@@ -1343,6 +1343,19 @@ add_v2_test(V2_Unit_Q8_1RoPE_Correctness
     MPI_PROCS 1  # RoPE is CPU-only, single rank
 )
 
+# Test: Fixed-Scale Q8_1 to Q16 RoPE (for integer attention)
+add_executable(v2_test_q8_1_to_q16_rope_fixed_scale unit/Test__Q8_1_to_Q16_RoPE_FixedScale.cpp)
+target_link_libraries(v2_test_q8_1_to_q16_rope_fixed_scale 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_to_Q16_RoPE_FixedScale 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_to_q16_rope_fixed_scale>
+    LABELS "V2;Unit;Primitives;RoPE;Q8_1;Q16_1;FixedScale;IntegerAttention;Correctness;CPU"
+    MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
 # Test: CPURoPEKernelT class interface
 add_executable(v2_test_cpu_rope_kernel unit/kernels/Test__CPURoPEKernelT.cpp)
 target_link_libraries(v2_test_cpu_rope_kernel 
@@ -3864,6 +3877,39 @@ target_link_libraries(v2_test_jit_wo_projection
 add_v2_test(V2_Unit_JitWoProjection 
     COMMAND $<TARGET_FILE:v2_test_jit_wo_projection>
     LABELS "V2;Unit;JIT;WoProjection;FusedAttention;AVX512;Q8_1;FP16;BF16;NumericalParity"
+    MPI_PROCS 1
+)
+
+# Q16 INT16 VNNI Wo Projection Unit Tests
+# Tests the Wo projection implementation in Q16IntegerAttentionRef:
+# - wo_projection_vnni_int16() for decode (single token GEMV)
+# - wo_projection_vnni_int16_batched() for prefill (batched GEMM)
+# - FP32 reference comparison for correctness validation
+add_executable(v2_test_q16_wo_projection unit/attention/Test__Q16WoProjection.cpp)
+target_link_libraries(v2_test_q16_wo_projection
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16WoProjection
+    COMMAND $<TARGET_FILE:v2_test_q16_wo_projection>
+    LABELS "V2;Unit;Q16;WoProjection;VNNI;INT16;NumericalParity"
+    MPI_PROCS 1
+)
+
+# Q16 Attention Output Composition Test (Level 2 Macrokernel)
+# Tests the FULL attention output path: Context → Wo Projection → Residual Add → Q16_1
+# This is the bridge between microkernel unit tests and full pipeline integration tests.
+# See: docs/v2/PLAN_FIXED_SCALE_ROPE_Q16.md "Addendum 2"
+add_executable(v2_test_q16_attention_output_composition unit/attention/Test__Q16AttentionOutput_Composition.cpp)
+target_link_libraries(v2_test_q16_attention_output_composition
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16AttentionOutput_Composition
+    COMMAND $<TARGET_FILE:v2_test_q16_attention_output_composition>
+    LABELS "V2;Unit;Q16;WoProjection;ResidualAdd;Composition;Macrokernel;NumericalParity"
     MPI_PROCS 1
 )
 

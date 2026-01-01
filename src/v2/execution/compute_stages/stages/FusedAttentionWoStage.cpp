@@ -14,7 +14,9 @@
 #include "../../../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
 #include "../../../kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h"
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 namespace llaminar2
 {
@@ -129,6 +131,16 @@ namespace llaminar2
             // Extract typed data from tensors - Q16 kernel expects Q16_1Block* for Q/K/V
             // Use dynamic_cast + typed_data() for type-safe extraction
             auto *q_q16 = dynamic_cast<Q16_1Tensor *>(params_.Q);
+            LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER params_.Q ptr="
+                      << static_cast<const void *>(params_.Q)
+                      << " dtype=" << (params_.Q ? params_.Q->dtype_name() : "null"));
+            if (q_q16 && q_q16->typed_data())
+            {
+                const auto &blk0 = q_q16->typed_data()[0];
+                LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER Q input: blk0.d=" << blk0.d
+                                                                                 << " blk0.qs[0]=" << blk0.qs[0]
+                                                                                 << " typed_data ptr=" << static_cast<const void *>(q_q16->typed_data()));
+            }
 
             // For Q16_INTEGER backend (HybridQ16 mode), fetch K/V from KV cache at runtime
             // The KV cache stores Q16_1 data (K from RoPE, V converted from Q8_1)
@@ -161,40 +173,65 @@ namespace llaminar2
 
             // Debug: spot-check quantization and saturation for layers that diverge.
             // Keep this extremely lightweight (small prefill seq_len) and only on selected layers.
+            // NOTE: Uses raw_data() and q16_block_size() to handle variable block sizes (32/64/128).
             if (params_.layer_idx == 0 || params_.layer_idx == 22 || params_.layer_idx == 23)
             {
-                auto dump_q16_stats = [&](const char *label,
-                                          const Q16_1Block *blocks,
-                                          int rows,
-                                          int blocks_per_row,
-                                          int max_rows)
+                // Template-based stats dump that handles variable Q16 block sizes
+                auto dump_q16_stats_typed = [&](const char *label,
+                                                const Q16_1Tensor *tensor,
+                                                int rows,
+                                                int dim_per_row,
+                                                int max_rows)
                 {
-                    if (!blocks || rows <= 0 || blocks_per_row <= 0)
+                    if (!tensor || rows <= 0 || dim_per_row <= 0)
                     {
                         LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx << " " << label
                                                                    << " stats: <invalid>");
                         return;
                     }
 
+                    const Q16BlockSize block_size = tensor->q16_block_size();
+                    const size_t block_elements = q16_block_size_elements(block_size);
+                    const size_t block_bytes = q16_block_size_bytes(block_size);
+                    const int blocks_per_row = (dim_per_row + static_cast<int>(block_elements) - 1) / static_cast<int>(block_elements);
                     const int rows_to_scan = std::min(rows, max_rows);
-                    float d_min = blocks[0].d;
-                    float d_max = blocks[0].d;
-                    int16_t qs_min = blocks[0].qs[0];
-                    int16_t qs_max = blocks[0].qs[0];
+
+                    const uint8_t *raw = static_cast<const uint8_t *>(tensor->raw_data());
+
+                    float d_min = 0.0f, d_max = 0.0f;
+                    int16_t qs_min = 0, qs_max = 0;
                     int sat_count = 0;
                     int total_qs = 0;
+                    bool first = true;
 
                     for (int r = 0; r < rows_to_scan; ++r)
                     {
-                        const Q16_1Block *row = blocks + r * blocks_per_row;
                         for (int b = 0; b < blocks_per_row; ++b)
                         {
-                            const Q16_1Block &blk = row[b];
-                            d_min = std::min(d_min, blk.d);
-                            d_max = std::max(d_max, blk.d);
-                            for (int i = 0; i < Q16_1Block::BLOCK_SIZE; ++i)
+                            const size_t block_idx = static_cast<size_t>(r) * blocks_per_row + b;
+                            const uint8_t *blk_ptr = raw + block_idx * block_bytes;
+
+                            // All Q16 block types have: float d, int16_t qs[N], int32_t sum_qs
+                            // d is at offset 0
+                            float d;
+                            std::memcpy(&d, blk_ptr, sizeof(float));
+
+                            // qs starts at offset 4 (after float d)
+                            const int16_t *qs = reinterpret_cast<const int16_t *>(blk_ptr + sizeof(float));
+
+                            if (first)
                             {
-                                const int16_t v = blk.qs[i];
+                                d_min = d_max = d;
+                                qs_min = qs_max = qs[0];
+                                first = false;
+                            }
+
+                            d_min = std::min(d_min, d);
+                            d_max = std::max(d_max, d);
+
+                            for (size_t i = 0; i < block_elements; ++i)
+                            {
+                                const int16_t v = qs[i];
                                 qs_min = std::min(qs_min, v);
                                 qs_max = std::max(qs_max, v);
                                 sat_count += (v == INT16_MIN || v == INT16_MAX) ? 1 : 0;
@@ -205,6 +242,7 @@ namespace llaminar2
 
                     LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx << " " << label
                                                                << " stats: rows_scanned=" << rows_to_scan
+                                                               << " block_size=" << static_cast<int>(block_size)
                                                                << " d[min,max]=" << d_min << "," << d_max
                                                                << " qs[min,max]=" << qs_min << "," << qs_max
                                                                << " sat=" << sat_count << "/" << total_qs);
@@ -212,22 +250,44 @@ namespace llaminar2
 
                 const int q_rows = params_.seq_len;
                 const int kv_rows = effective_kv_len;
-                const int q_blocks_per_row_dbg = (params_.n_heads * params_.head_dim) / Q16_1Block::BLOCK_SIZE;
-                const int kv_blocks_per_row_dbg = (params_.n_kv_heads * params_.head_dim) / Q16_1Block::BLOCK_SIZE;
+                const int q_dim_per_row = params_.n_heads * params_.head_dim;
+                const int kv_dim_per_row = params_.n_kv_heads * params_.head_dim;
+
+                // First block stats using tensor's actual block size
+                const Q16BlockSize q_block_size = q_q16->q16_block_size();
+                const uint8_t *q_raw = static_cast<const uint8_t *>(q_q16->raw_data());
+                float q0_d;
+                std::memcpy(&q0_d, q_raw, sizeof(float));
+                const int16_t *q0_qs = reinterpret_cast<const int16_t *>(q_raw + sizeof(float));
+
+                const Q16BlockSize k_block_size = k_q16->q16_block_size();
+                const uint8_t *k_raw = static_cast<const uint8_t *>(k_q16->raw_data());
+                float k0_d;
+                std::memcpy(&k0_d, k_raw, sizeof(float));
+                const int16_t *k0_qs = reinterpret_cast<const int16_t *>(k_raw + sizeof(float));
+
+                const Q16BlockSize v_block_size = v_q16->q16_block_size();
+                const uint8_t *v_raw = static_cast<const uint8_t *>(v_q16->raw_data());
+                float v0_d;
+                std::memcpy(&v0_d, v_raw, sizeof(float));
+                const int16_t *v0_qs = reinterpret_cast<const int16_t *>(v_raw + sizeof(float));
 
                 LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
-                                                           << " Q16_1 first scales: Q[0].d=" << q_q16->typed_data()[0].d
-                                                           << " K[0].d=" << k_q16->typed_data()[0].d
-                                                           << " V[0].d=" << v_q16->typed_data()[0].d);
+                                                           << " Q16_1 first scales (block_sizes: Q=" << static_cast<int>(q_block_size)
+                                                           << ", K=" << static_cast<int>(k_block_size)
+                                                           << ", V=" << static_cast<int>(v_block_size) << "):"
+                                                           << " Q[0].d=" << q0_d
+                                                           << " K[0].d=" << k0_d
+                                                           << " V[0].d=" << v0_d);
                 LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
-                                                           << " Q16_1 first qs: Q[0].qs[0]=" << q_q16->typed_data()[0].qs[0]
-                                                           << " K[0].qs[0]=" << k_q16->typed_data()[0].qs[0]
-                                                           << " V[0].qs[0]=" << v_q16->typed_data()[0].qs[0]);
+                                                           << " Q16_1 first qs: Q[0].qs[0]=" << q0_qs[0]
+                                                           << " K[0].qs[0]=" << k0_qs[0]
+                                                           << " V[0].qs[0]=" << v0_qs[0]);
 
                 // Scan only the small prefill window (seq_len/kv_len are tiny in parity tests).
-                dump_q16_stats("Q", q_q16->typed_data(), q_rows, q_blocks_per_row_dbg, /*max_rows=*/q_rows);
-                dump_q16_stats("K(cache)", k_q16->typed_data(), kv_rows, kv_blocks_per_row_dbg, /*max_rows=*/kv_rows);
-                dump_q16_stats("V(cache)", v_q16->typed_data(), kv_rows, kv_blocks_per_row_dbg, /*max_rows=*/kv_rows);
+                dump_q16_stats_typed("Q", q_q16, q_rows, q_dim_per_row, /*max_rows=*/q_rows);
+                dump_q16_stats_typed("K(cache)", k_q16, kv_rows, kv_dim_per_row, /*max_rows=*/kv_rows);
+                dump_q16_stats_typed("V(cache)", v_q16, kv_rows, kv_dim_per_row, /*max_rows=*/kv_rows);
 
                 // Diagnostic: compute a simple FP32 score/softmax summary from Q16_1 blocks
                 // for the last query row (most sensitive) and head0.
@@ -240,15 +300,20 @@ namespace llaminar2
                     const int kv_head = head / group_size;
                     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(params_.head_dim));
 
-                    auto q16_at = [&](const Q16_1Block *row_blocks, int col) -> float
+                    // Block size-aware element access for Q16 tensors
+                    auto q16_at_raw = [](const uint8_t *raw_data, Q16BlockSize block_size, int total_dim, int row, int col) -> float
                     {
-                        const int b = col / Q16_1Block::BLOCK_SIZE;
-                        const int i = col % Q16_1Block::BLOCK_SIZE;
-                        const Q16_1Block &blk = row_blocks[b];
-                        return blk.d * static_cast<float>(blk.qs[i]);
+                        const size_t block_bytes = q16_block_size_bytes(block_size);
+                        const int elems_per_block = q16_block_size_elements(block_size);
+                        const int blocks_per_row = (total_dim + elems_per_block - 1) / elems_per_block;
+                        const int b = col / elems_per_block;
+                        const int i = col % elems_per_block;
+                        const uint8_t *block_ptr = raw_data + (row * blocks_per_row + b) * block_bytes;
+                        float d;
+                        std::memcpy(&d, block_ptr, sizeof(float));
+                        const int16_t *qs = reinterpret_cast<const int16_t *>(block_ptr + sizeof(float));
+                        return d * static_cast<float>(qs[i]);
                     };
-
-                    const Q16_1Block *q_row_blocks = q_q16->typed_data() + row * q_blocks_per_row_dbg;
 
                     // Compute masked scores for kv positions [0..kv_len-1]
                     float max_score = -std::numeric_limits<float>::infinity();
@@ -261,13 +326,14 @@ namespace llaminar2
                             continue;
                         }
 
-                        const Q16_1Block *k_row_blocks = k_q16->typed_data() + t * kv_blocks_per_row_dbg;
                         float dot = 0.0f;
                         const int q_base = head * params_.head_dim;
                         const int k_base = kv_head * params_.head_dim;
                         for (int d = 0; d < params_.head_dim; ++d)
                         {
-                            dot += q16_at(q_row_blocks, q_base + d) * q16_at(k_row_blocks, k_base + d);
+                            float q_val = q16_at_raw(q_raw, q_block_size, q_dim_per_row, row, q_base + d);
+                            float k_val = q16_at_raw(k_raw, k_block_size, kv_dim_per_row, t, k_base + d);
+                            dot += q_val * k_val;
                         }
                         const float score = dot * attention_scale;
                         if (score > max_score)
@@ -291,13 +357,14 @@ namespace llaminar2
                         {
                             continue;
                         }
-                        const Q16_1Block *k_row_blocks = k_q16->typed_data() + t * kv_blocks_per_row_dbg;
                         float dot = 0.0f;
                         const int q_base = head * params_.head_dim;
                         const int k_base = kv_head * params_.head_dim;
                         for (int d = 0; d < params_.head_dim; ++d)
                         {
-                            dot += q16_at(q_row_blocks, q_base + d) * q16_at(k_row_blocks, k_base + d);
+                            float q_val = q16_at_raw(q_raw, q_block_size, q_dim_per_row, row, q_base + d);
+                            float k_val = q16_at_raw(k_raw, k_block_size, kv_dim_per_row, t, k_base + d);
+                            dot += q_val * k_val;
                         }
                         const float score = dot * attention_scale;
                         const float w = std::exp(score - max_score);
@@ -319,9 +386,59 @@ namespace llaminar2
                 }
             }
 
+            // ================================================================
+            // TRANSPOSE WORKAROUND: Convert position-major to head-major layout
+            // ================================================================
+            // The KV cache stores data in position-major layout:
+            //   [kv_len][n_kv_heads][head_dim] -> block[p * n_kv_heads + h]
+            // But Q16IntegerAttentionRef expects head-major layout:
+            //   [n_kv_heads][kv_len][head_dim] -> block[h * kv_len + p]
+            //
+            // This workaround transposes K/V on-the-fly. For production, use HeadMajorKVCache.
+            // See PLAN_FIXED_SCALE_ROPE_Q16.md Addendum for details.
+            //
+            const Q16BlockSize block_size = k_q16->q16_block_size();
+            const size_t block_bytes = q16_block_size_bytes(block_size);
+            const size_t block_elements = q16_block_size_elements(block_size);
+            const int blocks_per_head = (params_.head_dim + static_cast<int>(block_elements) - 1) / static_cast<int>(block_elements);
+            const int total_blocks = effective_kv_len * params_.n_kv_heads * blocks_per_head;
+
+            // Allocate transposed buffers
+            std::vector<uint8_t> K_transposed_bytes(total_blocks * block_bytes);
+            std::vector<uint8_t> V_transposed_bytes(total_blocks * block_bytes);
+
+            const uint8_t *K_src = static_cast<const uint8_t *>(k_q16->raw_data());
+            const uint8_t *V_src = static_cast<const uint8_t *>(v_q16->raw_data());
+
+            // Transpose: position-major [p][h] -> head-major [h][p]
+            for (int h = 0; h < params_.n_kv_heads; ++h)
+            {
+                for (int p = 0; p < effective_kv_len; ++p)
+                {
+                    // Source index: position-major [p * n_kv_heads + h]
+                    const size_t src_block_idx = (static_cast<size_t>(p) * params_.n_kv_heads + h) * blocks_per_head;
+                    // Dest index: head-major [h * kv_len + p]
+                    const size_t dst_block_idx = (static_cast<size_t>(h) * effective_kv_len + p) * blocks_per_head;
+
+                    // Copy all blocks for this head/position
+                    std::memcpy(K_transposed_bytes.data() + dst_block_idx * block_bytes,
+                                K_src + src_block_idx * block_bytes,
+                                blocks_per_head * block_bytes);
+                    std::memcpy(V_transposed_bytes.data() + dst_block_idx * block_bytes,
+                                V_src + src_block_idx * block_bytes,
+                                blocks_per_head * block_bytes);
+                }
+            }
+
+            LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                       << " TRANSPOSE WORKAROUND: kv_len=" << effective_kv_len
+                                                       << " n_kv_heads=" << params_.n_kv_heads
+                                                       << " blocks_per_head=" << blocks_per_head
+                                                       << " total_blocks=" << total_blocks);
+
             q16_params.Q = q_q16->typed_data();
-            q16_params.K = k_q16->typed_data();
-            q16_params.V = v_q16->typed_data();
+            q16_params.K = K_transposed_bytes.data();
+            q16_params.V = V_transposed_bytes.data();
 
             // Wo weights - get VNNI packed weights via KernelFactory
             // Check if Wo implements IINT8Unpackable (quantized formats)

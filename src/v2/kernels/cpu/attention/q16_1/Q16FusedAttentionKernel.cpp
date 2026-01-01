@@ -156,12 +156,20 @@ namespace llaminar2
             ref_params.q_head_scales = q_scales.data();
             ref_params.kv_head_scales = kv_scales.data();
 
-            // Wo weights: Q16IntegerAttentionRef does not yet implement Wo projection
-            // The Wo_packed field in Q16IntegerAttentionParams uses a different type
-            // that will be populated when Wo projection is implemented (Phase 7)
-            ref_params.Wo_packed = nullptr; // TODO: Wire up when Wo projection is implemented
+            // Wo weights: Convert from FusedAttentionWoParams to Q16IntegerAttentionParams
+            // Both use llaminar2::gemm_v4::QuantisedPackedWeights
+            ref_params.Wo_packed = params.Wo_packed;
 
-            // Residual pointers (not yet used by reference kernel - Phase 7)
+            // Output buffer for Wo projection: MUST be a separate temporary buffer!
+            // The residual add reads from both output (Wo result) and residual_in, then writes to residual_out.
+            // If output == residual_in == residual_out (aliasing), the residual add produces garbage.
+            // Allocate a temporary Q16_1 buffer for Wo output.
+            const int blocks_per_row = (params.d_model + 31) / 32; // Q16_1Block has 32 elements
+            const int total_blocks = params.seq_len_q * blocks_per_row;
+            std::vector<Q16_1Block> wo_output_buffer(total_blocks);
+            ref_params.output = wo_output_buffer.data();
+
+            // Residual pointers - these can alias (in-place: residual_in == residual_out)
             ref_params.residual_in = params.residual_in;
             ref_params.residual_out = params.residual_out;
 
@@ -181,6 +189,8 @@ namespace llaminar2
             ref_params.snapshot_weights = nullptr; // Not directly mapped in FusedAttentionWoParams
             ref_params.snapshot_context = params.context_snapshot;
             ref_params.snapshot_projected = params.wo_output_snapshot;
+            ref_params.snapshot_wo_output = params.wo_output_snapshot;
+            ref_params.snapshot_residual_out = params.attention_residual_snapshot;
 
             // Dispatch to decode or prefill based on seq_len_q
             bool success = q16_integer_attention_reference(ref_params);

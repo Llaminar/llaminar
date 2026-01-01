@@ -875,4 +875,95 @@ namespace llaminar2::primitives
         int head_dim,
         float rope_theta);
 
+    // ============================================================================
+    // Fixed-Scale Q8_1 → Q16 RoPE Primitives
+    // ============================================================================
+
+    /**
+     * @brief Per-head Q8_1→Q16 with FIXED output scale (pure integer per-element)
+     *
+     * Unlike apply_rope_q8_1_to_q16_head_scalar() which uses data-adaptive scaling,
+     * this function outputs Q16 blocks with a FIXED scale = kv_cache_scale / 32767.
+     * This ensures Q, K, and V all use the same scale factor for integer attention.
+     *
+     * Algorithm:
+     * 1. Compute per-block scale ratios: ratio_q16 = d_block / d_fixed * 65536 (O(head_dim/32) FP32)
+     * 2. Rescale Q8 to fixed scale: scaled = (q8 * ratio_q16 + 32768) >> 16 (pure integer)
+     * 3. Apply RoPE rotation: out = (x*cos - y*sin + 16384) >> 15 (pure integer)
+     * 4. Pack to Q16 with fixed d = kv_cache_scale / 32767
+     *
+     * @tparam OutBlockType Output Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param q8_in Input Q8_1 blocks [head_dim/32]
+     * @param q16_out Output Q16 blocks [head_dim/BLOCK_SIZE]
+     * @param head_dim Head dimension (must be multiple of 32)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     * @param kv_cache_scale Fixed scale for output (e.g., 8.0f)
+     */
+    template <typename OutBlockType>
+    void apply_rope_q8_1_to_q16_head_fixed_scale(
+        const Q8_1Block *q8_in,
+        OutBlockType *q16_out,
+        int head_dim,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15,
+        float kv_cache_scale);
+
+    /**
+     * @brief Apply fixed-scale RoPE to Q8_1 Q and K tensors, output to Q16
+     *
+     * High-level wrapper that processes all heads in parallel. All output Q16 blocks
+     * have d = kv_cache_scale / 32767, enabling true integer attention.
+     *
+     * LAYOUT NOTE:
+     * - Q output is HEAD-MAJOR [n_heads][seq_len][head_dim] for direct attention kernel use
+     * - K output is POSITION-MAJOR [seq_len][n_kv_heads][head_dim] for KV cache storage
+     *
+     * @tparam OutBlockType Output Q16 block type
+     * @param Q_in Q8_1 Q input [seq_len * n_heads * (head_dim/32)]
+     * @param K_in Q8_1 K input [seq_len * n_kv_heads * (head_dim/32)] or nullptr
+     * @param Q_out Q16 Q output HEAD-MAJOR [n_heads][seq_len][head_dim/BLOCK_SIZE]
+     * @param K_out Q16 K output position-major [seq_len][n_kv_heads][head_dim/BLOCK_SIZE] or nullptr
+     * @param position_ids Position indices [seq_len], nullptr = use index
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension
+     * @param rope_theta RoPE base frequency
+     * @param kv_cache_scale Fixed scale for all output blocks (e.g., 8.0f)
+     */
+    template <typename OutBlockType>
+    void apply_rope_q8_1_to_q16_fixed_scale(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        OutBlockType *Q_out,
+        OutBlockType *K_out,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale);
+
+    /**
+     * @brief Apply fixed-scale RoPE Q8_1→Q16 with runtime block size dispatch
+     *
+     * @param block_size Runtime block size selector
+     * @param kv_cache_scale Fixed scale for all output blocks
+     */
+    void apply_rope_q8_1_to_q16_fixed_scale_dispatch(
+        const Q8_1Block *Q_in,
+        const Q8_1Block *K_in,
+        void *Q_out,
+        void *K_out,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        float kv_cache_scale);
+
 } // namespace llaminar2::primitives

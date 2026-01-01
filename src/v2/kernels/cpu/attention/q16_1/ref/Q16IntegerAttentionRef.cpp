@@ -15,6 +15,7 @@
 #include "microkernels/PVAccumulate.h"
 #include "microkernels/WoProjection.h"
 #include "microkernels/OnlineSoftmax.h"
+#include "tensors/SIMDHelpers.h"
 #include "utils/Assertions.h"
 #include "utils/Logger.h"
 
@@ -219,6 +220,12 @@ namespace llaminar2::kernels::q16_1
         std::vector<int32_t> scores_scratch(KV_BLOCK_SIZE);
         std::vector<int32_t> weights_scratch(KV_BLOCK_SIZE);
         std::vector<int32_t> context(head_dim);
+
+        // Full context buffer for Wo projection [d_model]
+        // We accumulate all heads here with a common scale
+        const int d_model = params.d_model;
+        std::vector<int32_t> full_context_int32(d_model, 0);
+        std::vector<float> head_pv_scales(num_heads); // Store per-head scales for later
 
         // For snapshots: store scores (not weights) so we can recompute with final max
         std::vector<int32_t> all_scores_raw;
@@ -441,22 +448,85 @@ namespace llaminar2::kernels::q16_1
             }
 
             // ================================================================
-            // Step 4: Wo projection → Q16_1 output
+            // Accumulate head context for Wo projection
             // ================================================================
+            // Store the INT32 context and its scale for this head
+            // The full context will be used for Wo projection after all heads
+            head_pv_scales[h] = pv_scale;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                full_context_int32[h * head_dim + d] = context[d];
+            }
+        }
 
-            // TODO(v2): Implement Wo projection with VPDPWSSD
-            // For now, this is a placeholder
-            // The Wo projection should:
-            // 1. Take INT32 context [head_dim]
-            // 2. Multiply by packed Wo weights
-            // 3. Produce Q16_1 output [d_model]
+        // ====================================================================
+        // Step 4: Wo projection → Q16_1 output (AFTER all heads)
+        // ====================================================================
+        // Now we have full_context_int32[d_model] with all heads concatenated.
+        // The context scale varies per head, but for Wo projection we need a
+        // single scale. We use the average pv_scale as a common scale factor.
 
-            // ================================================================
-            // Step 5: Residual add (integer)
-            // ================================================================
+        if (params.Wo_packed && params.output)
+        {
+            // Compute average context scale
+            float avg_pv_scale = 0.0f;
+            for (int h = 0; h < num_heads; ++h)
+            {
+                avg_pv_scale += head_pv_scales[h];
+            }
+            avg_pv_scale /= static_cast<float>(num_heads);
 
-            // TODO(v2): Implement integer residual add
-            // Should handle scale alignment between attention output and residual
+            // The context_int32 values are: context[d] = (weighted_sum / weight_sum)
+            // where weighted_sum is in INT16 × INT32 units (V × softmax weight)
+            // To get FP32: fp32 = context_int32 * pv_scale
+            // For VNNI projection: we pass the scale so it can be applied post-GEMV
+
+            // Call Wo projection microkernel - outputs to 32-element Q16_1Block format
+            // The microkernel uses BLOCK_32 internally for compatibility with residual add
+            microkernels::wo_projection_vnni_int16(
+                full_context_int32.data(),
+                avg_pv_scale,
+                params.Wo_packed,
+                params.output,
+                d_model,
+                d_model,                    // input_dim = d_model for Qwen2 (n_heads * head_dim)
+                Q16BlockSize::BLOCK_32,     // Force 32-element output for residual compatibility
+                params.snapshot_wo_output); // Optional FP32 snapshot
+
+            LOG_DEBUG("FlashDecode: Wo projection complete, d_model=" << d_model);
+        }
+
+        // ====================================================================
+        // Step 5: Residual add (Q16_1 + Q16_1 → Q16_1)
+        // ====================================================================
+        // Add the Wo projection output to the input residual
+
+        if (params.residual_in && params.residual_out && params.output)
+        {
+            // The output from Wo projection and residual_in are both Q16_1 format
+            // Use the SIMD residual add helper
+            const auto *wo_output = reinterpret_cast<const Q16_1Block *>(params.output);
+            const auto *residual_in = reinterpret_cast<const Q16_1Block *>(params.residual_in);
+            auto *residual_out = reinterpret_cast<Q16_1Block *>(params.residual_out);
+
+            simd::q16_1_add_q16_1(wo_output, residual_in, residual_out, d_model);
+
+            // Snapshot: residual output (if requested)
+            if (params.snapshot_residual_out)
+            {
+                const int num_blocks = (d_model + 31) / 32;
+                for (int b = 0; b < num_blocks; ++b)
+                {
+                    float scale = residual_out[b].d;
+                    for (int i = 0; i < 32 && (b * 32 + i) < d_model; ++i)
+                    {
+                        params.snapshot_residual_out[b * 32 + i] =
+                            residual_out[b].qs[i] * scale;
+                    }
+                }
+            }
+
+            LOG_DEBUG("FlashDecode: Residual add complete");
         }
 
         return true;
@@ -775,19 +845,108 @@ namespace llaminar2::kernels::q16_1
                         }
                     }
                 }
-
-                // ================================================================
-                // Step 4: Wo projection → Q16_1 output (TODO)
-                // ================================================================
-
-                // TODO(v2): Implement Wo projection with VPDPWSSD
-
-                // ================================================================
-                // Step 5: Residual add (integer) (TODO)
-                // ================================================================
-
-                // TODO(v2): Implement integer residual add
             }
+        }
+
+        // ====================================================================
+        // Step 4: Wo projection → Q16_1 output (AFTER all heads)
+        // ====================================================================
+        // For prefill, we need to do Wo projection for each query position.
+        // The context data is in snapshot_context[seq_len_q, d_model] if populated,
+        // or we need to re-process. For now, we require snapshot_context for prefill Wo.
+
+        if (params.Wo_packed && params.output && params.snapshot_context)
+        {
+            const int d_model = params.d_model;
+            const int output_blocks_per_query = (d_model + 31) / 32; // Q16_1Block uses 32 elements
+
+            // Allocate buffer for batched INT32 context
+            std::vector<int32_t> batched_context_int32(seq_len_q * d_model);
+            std::vector<float> context_scales(seq_len_q);
+
+            // Convert FP32 snapshot_context back to INT32 for VNNI projection
+            // Use a common scale derived from the data range
+            for (int q = 0; q < seq_len_q; ++q)
+            {
+                float max_abs = 0.0f;
+                for (int d = 0; d < d_model; ++d)
+                {
+                    float val = params.snapshot_context[q * d_model + d];
+                    max_abs = std::max(max_abs, std::abs(val));
+                }
+
+                // Scale to INT32 range (leave headroom)
+                float scale = (max_abs > 1e-10f) ? (max_abs / 100000.0f) : 1e-6f;
+                context_scales[q] = scale;
+
+                for (int d = 0; d < d_model; ++d)
+                {
+                    float val = params.snapshot_context[q * d_model + d];
+                    batched_context_int32[q * d_model + d] =
+                        static_cast<int32_t>(val / scale);
+                }
+            }
+
+            // Call batched Wo projection microkernel - outputs to 32-element Q16_1Block format
+            // for compatibility with residual add (which uses 32-element blocks)
+            microkernels::wo_projection_vnni_int16_batched(
+                batched_context_int32.data(),
+                context_scales.data(),
+                params.Wo_packed,
+                params.output,
+                seq_len_q,
+                d_model,
+                d_model,                 // input_dim
+                d_model,                 // context_stride (in int32_t)
+                output_blocks_per_query, // output_stride (in blocks)
+                Q16BlockSize::BLOCK_32,  // Force 32-element output for residual compatibility
+                params.snapshot_wo_output);
+
+            LOG_DEBUG("FA2 Prefill: Wo projection complete, batch=" << seq_len_q << ", d_model=" << d_model);
+        }
+
+        // ====================================================================
+        // Step 5: Residual add (Q16_1 + Q16_1 → Q16_1)
+        // ====================================================================
+
+        if (params.residual_in && params.residual_out && params.output)
+        {
+            const int d_model = params.d_model;
+            const int blocks_per_row_out = (d_model + 31) / 32;
+
+            const auto *wo_output = reinterpret_cast<const Q16_1Block *>(params.output);
+            const auto *residual_in = reinterpret_cast<const Q16_1Block *>(params.residual_in);
+            auto *residual_out = reinterpret_cast<Q16_1Block *>(params.residual_out);
+
+            // Process each query position
+            for (int q = 0; q < seq_len_q; ++q)
+            {
+                simd::q16_1_add_q16_1(
+                    wo_output + q * blocks_per_row_out,
+                    residual_in + q * blocks_per_row_out,
+                    residual_out + q * blocks_per_row_out,
+                    d_model);
+            }
+
+            // Snapshot: residual output (if requested)
+            if (params.snapshot_residual_out)
+            {
+                for (int q = 0; q < seq_len_q; ++q)
+                {
+                    for (int b = 0; b < blocks_per_row_out; ++b)
+                    {
+                        const auto &block = residual_out[q * blocks_per_row_out + b];
+                        float scale = block.d;
+                        for (int i = 0; i < 32 && (b * 32 + i) < d_model; ++i)
+                        {
+                            params.snapshot_residual_out[q * d_model + b * 32 + i] =
+                                block.qs[i] * scale;
+                        }
+                    }
+                }
+            }
+
+            LOG_DEBUG("FA2 Prefill: Residual add complete");
         }
 
         return true;

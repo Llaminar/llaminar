@@ -2213,6 +2213,69 @@ namespace llaminar2
         }
 
         /**
+         * @brief Apply RoPE to Q8_1 input, output to Q16 with FIXED scale
+         *
+         * Pure integer arithmetic implementation with fixed output scale.
+         * All output Q16 blocks have d = kv_cache_scale / 32767, matching
+         * the KV cache quantization scale. This enables true integer attention
+         * where Q, K, and V all use identical scales.
+         *
+         * Algorithm:
+         * 1. Compute per-block scale ratios (O(head_dim/32) FP32 ops)
+         * 2. Rescale Q8 to fixed scale (pure integer per-element)
+         * 3. Apply RoPE rotation (pure integer)
+         * 4. Pack to Q16 with fixed d = kv_cache_scale / 32767
+         *
+         * @param Q_in Q8_1 Q input tensor [seq_len, n_heads * head_dim]
+         * @param K_in Q8_1 K input tensor [seq_len, n_kv_heads * head_dim] or nullptr
+         * @param Q_out Q16 Q output tensor [seq_len, n_heads * head_dim]
+         * @param K_out Q16 K output tensor [seq_len, n_kv_heads * head_dim] or nullptr
+         * @param block_size Q16 output block size (32, 64, 128, or 192)
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param rope_theta RoPE frequency base
+         * @param kv_cache_scale Fixed scale for all output blocks (e.g., 8.0f)
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply_q8_1_to_q16_fixed_scale(
+            TensorBase *Q_in,
+            TensorBase *K_in,
+            TensorBase *Q_out,
+            TensorBase *K_out,
+            Q16BlockSize block_size,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            float kv_cache_scale,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q_in;
+            (void)K_in;
+            (void)Q_out;
+            (void)K_out;
+            (void)block_size;
+            (void)position_ids;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)rope_theta;
+            (void)kv_cache_scale;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Default: not supported
+        }
+
+        /**
          * @brief Apply RoPE using tensor objects with automatic type dispatch
          *
          * Inspects Q/K tensor native_type() and dispatches to the appropriate

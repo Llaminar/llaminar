@@ -38,6 +38,9 @@ namespace llaminar2
             float theta_base = 10000.0f; ///< RoPE theta base
             int seq_len = 0;             ///< Explicit sequence length (for pre-allocated buffers)
 
+            // Fixed-scale quantization for HybridQ16 mode (used when Q_out is Q16_1)
+            float kv_cache_scale = 8.0f; ///< Fixed scale for Q16 output (d = kv_cache_scale / 32767)
+
             // Optional MPI context for distributed execution
             const MPIContext *mpi_ctx = nullptr;
             int device_idx = -1;
